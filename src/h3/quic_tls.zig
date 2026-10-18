@@ -14,40 +14,44 @@ const alpn_h3 = "\x02h3";
 /// HTTP/0.9 over QUIC, which the QUIC interop runner's tests speak.
 const alpn_hq = "\x0ahq-interop";
 
+/// Mutual TLS: the client certificates a listener asks for and accepts.
+pub const ClientAuth = struct {
+    /// The CAs that verify client certificates: DER certificates back to
+    /// back (`std.crypto.Certificate.Bundle.bytes`). Copied by `init`.
+    ca_der: []const u8,
+    /// `.require` refuses a client that sends no certificate; `.request`
+    /// asks for one and accepts none. A certificate that is sent must
+    /// verify either way.
+    mode: enum { request, require } = .require,
+};
+
+pub const ServerOptions = struct {
+    /// The leaf certificate followed by any intermediates.
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    /// Also accept ALPN "hq-interop" (after "h3").
+    hq_interop: bool = false,
+    client_auth: ?ClientAuth = null,
+};
+
 pub const Context = struct {
     ctx: *c.SSL_CTX,
 
-    /// `cert_pem`: the leaf certificate followed by any intermediates.
-    /// `hq_interop` also accepts ALPN "hq-interop" (after "h3").
-    pub fn init(cert_pem: []const u8, key_pem: []const u8, hq_interop: bool) !Context {
+    /// Everything a listener's handshakes share, built in one place: a
+    /// certificate reload builds a new `Context` from new options.
+    pub fn init(options: ServerOptions) !Context {
         c.ERR_clear_error();
         const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.OutOfMemory;
         errdefer c.SSL_CTX_free(ctx);
         // TLS 1.3 only, and the QUIC method, key callbacks and settings.
         if (c.ngtcp2_crypto_boringssl_configure_server_context(ctx) != 0) return error.TlsSetupFailed;
         _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
-        c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpn, @ptrCast(@constCast(if (hq_interop) &accept_h3_hq else &accept_h3)));
+        c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpn, @ptrCast(@constCast(if (options.hq_interop) &accept_h3_hq else &accept_h3)));
         const sid_ctx = "anole h3";
         _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
-
-        const cert_bio = c.BIO_new_mem_buf(cert_pem.ptr, @intCast(cert_pem.len)) orelse return error.OutOfMemory;
-        defer _ = c.BIO_free(cert_bio);
-        const cert = c.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.TlsInvalidCertificate;
-        defer c.X509_free(cert);
-        if (c.SSL_CTX_use_certificate(ctx, cert) != 1) return error.TlsInvalidCertificate;
-        while (c.PEM_read_bio_X509(cert_bio, null, null, null)) |x| {
-            defer c.X509_free(x);
-            if (c.SSL_CTX_add1_chain_cert(ctx, x) != 1) return error.TlsInvalidCertificate;
-        }
-        // The loop ends on "no start line", the normal end of the file.
-        c.ERR_clear_error();
-
-        const key_bio = c.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse return error.OutOfMemory;
-        defer _ = c.BIO_free(key_bio);
-        const key = c.PEM_read_bio_PrivateKey(key_bio, null, null, null) orelse return error.TlsInvalidPrivateKey;
-        defer c.EVP_PKEY_free(key);
-        if (c.SSL_CTX_use_PrivateKey(ctx, key) != 1) return error.TlsInvalidPrivateKey;
+        try useIdentity(.ctx, ctx, options.cert_pem, options.key_pem);
         if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsKeyMismatch;
+        if (options.client_auth) |ca| try requestClientCertificates(ctx, ca);
         return .{ .ctx = ctx };
     }
 
@@ -101,13 +105,90 @@ fn selectAlpn(
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
+/// The listener's policy, as the TCP listener's (src/tls/dusty_tls.zig)
+/// sets it per connection: verify against `ca.ca_der`, and name those CAs
+/// in the CertificateRequest so a client holding several certificates can
+/// pick the right one.
+fn requestClientCertificates(ctx: *c.SSL_CTX, ca: ClientAuth) !void {
+    const store = c.X509_STORE_new() orelse return error.OutOfMemory;
+    // The context holds its own reference from here.
+    defer c.X509_STORE_free(store);
+    const names = c.sk_CRYPTO_BUFFER_new_null() orelse return error.OutOfMemory;
+    var names_owned = true;
+    defer if (names_owned) c.sk_CRYPTO_BUFFER_pop_free(names, c.CRYPTO_BUFFER_free);
+    var p: [*c]const u8 = ca.ca_der.ptr;
+    const end = ca.ca_der.ptr + ca.ca_der.len;
+    while (p != end) {
+        const x = c.d2i_X509(null, &p, @intCast(end - p)) orelse break;
+        defer c.X509_free(x);
+        _ = c.X509_STORE_add_cert(store, x);
+        var name_der: [*c]const u8 = undefined;
+        var name_len: usize = 0;
+        if (c.X509_NAME_get0_der(c.X509_get_subject_name(x), &name_der, &name_len) != 1) continue;
+        const buf = c.CRYPTO_BUFFER_new(name_der, name_len, null) orelse return error.OutOfMemory;
+        if (c.sk_CRYPTO_BUFFER_push(names, buf) == 0) {
+            c.CRYPTO_BUFFER_free(buf);
+            return error.OutOfMemory;
+        }
+    }
+    c.ERR_clear_error();
+    if (c.SSL_CTX_set1_verify_cert_store(ctx, store) != 1) return error.OutOfMemory;
+    c.SSL_CTX_set0_client_CAs(ctx, names);
+    names_owned = false;
+    const mode: c_int = switch (ca.mode) {
+        .request => c.SSL_VERIFY_PEER,
+        .require => c.SSL_VERIFY_PEER | c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+    };
+    c.SSL_CTX_set_verify(ctx, mode, null);
+}
+
+/// A certificate chain (leaf first) and its key, from PEM, onto a server's
+/// context or a client's connection.
+fn useIdentity(comptime on: enum { ctx, ssl }, target: if (on == .ctx) *c.SSL_CTX else *c.SSL, cert_pem: []const u8, key_pem: []const u8) !void {
+    const cert_bio = c.BIO_new_mem_buf(cert_pem.ptr, @intCast(cert_pem.len)) orelse return error.OutOfMemory;
+    defer _ = c.BIO_free(cert_bio);
+    const cert = c.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.TlsInvalidCertificate;
+    defer c.X509_free(cert);
+    const use_cert = if (on == .ctx) c.SSL_CTX_use_certificate else c.SSL_use_certificate;
+    const add_chain = if (on == .ctx) c.SSL_CTX_add1_chain_cert else c.SSL_add1_chain_cert;
+    const use_key = if (on == .ctx) c.SSL_CTX_use_PrivateKey else c.SSL_use_PrivateKey;
+    if (use_cert(target, cert) != 1) return error.TlsInvalidCertificate;
+    while (c.PEM_read_bio_X509(cert_bio, null, null, null)) |x| {
+        defer c.X509_free(x);
+        if (add_chain(target, x) != 1) return error.TlsInvalidCertificate;
+    }
+    // The loop ends on "no start line", the normal end of the file.
+    c.ERR_clear_error();
+
+    const key_bio = c.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse return error.OutOfMemory;
+    defer _ = c.BIO_free(key_bio);
+    const key = c.PEM_read_bio_PrivateKey(key_bio, null, null, null) orelse return error.TlsInvalidPrivateKey;
+    defer c.EVP_PKEY_free(key);
+    if (use_key(target, key) != 1) return error.TlsInvalidPrivateKey;
+}
+
+/// The client's certificate (the leaf, DER) once the handshake has
+/// verified one, else null. Owned by the `SSL`'s session, which a server
+/// never replaces, so valid until `SSL_free`.
+pub fn peerCertificate(ssl: *const c.SSL) ?[]const u8 {
+    const certs = c.SSL_get0_peer_certificates(ssl) orelse return null;
+    if (c.sk_CRYPTO_BUFFER_num(certs) == 0) return null;
+    const leaf = c.sk_CRYPTO_BUFFER_value(certs, 0);
+    return c.CRYPTO_BUFFER_data(leaf)[0..c.CRYPTO_BUFFER_len(leaf)];
+}
+
 pub const ClientOptions = struct {
     /// The server's name: SNI (unless an IP literal) and the certificate
     /// check.
     host: []const u8,
     root_ca: std.crypto.Certificate.Bundle = .empty,
     insecure_skip_verify: bool = false,
+    /// A certificate to present when the server asks (mutual TLS).
+    certificate: ?Identity = null,
 };
+
+/// A certificate chain (leaf first) and its private key, in PEM.
+pub const Identity = struct { cert_pem: []const u8, key_pem: []const u8 };
 
 /// A client-side `SSL` for one QUIC connection, offering ALPN "h3". As with
 /// `Context.newSession`, `conn_ref` must stay put for the life of the `SSL`.
@@ -153,6 +234,10 @@ pub fn clientSession(conn_ref: *c.ngtcp2_crypto_conn_ref, options: ClientOptions
     }
     // RFC 6066: SNI carries host names only, never IP literals.
     if (!host_is_ip and c.SSL_set_tlsext_host_name(ssl, host.ptr) != 1) return error.TlsInvalidHostname;
+    if (options.certificate) |id| {
+        try useIdentity(.ssl, ssl, id.cert_pem, id.key_pem);
+        if (c.SSL_check_private_key(ssl) != 1) return error.TlsKeyMismatch;
+    }
     return ssl;
 }
 

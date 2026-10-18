@@ -26,6 +26,7 @@ const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const handoff = @import("handoff.zig");
 const blocking = @import("blocking.zig");
+const sd_notify = @import("sd_notify.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 
 /// The zio configuration Anole is built for. An executable declares it in
@@ -54,11 +55,12 @@ pub const Options = struct {
     executors: ExecutorCount = .auto,
     /// The process's arguments and environment (`init.minimal`). With them
     /// the server takes listening sockets handed over by systemd socket
-    /// activation or by the process it replaces (`LISTEN_FDS`), and
-    /// restarts without downtime on SIGUSR2: a new copy of the program
-    /// takes the sockets, and this one drains once it is serving. Without
-    /// them, neither. (With them, listeners are single sockets, not one
-    /// per core.)
+    /// activation or by the process it replaces (`LISTEN_FDS`), restarts
+    /// without downtime on SIGUSR2 (a new copy of the program takes the
+    /// sockets, and this one drains once it is serving), and tells systemd
+    /// how it is doing when `NOTIFY_SOCKET` is set (`Type=notify`). Without
+    /// them, none of these. (With them, listeners are single sockets, not
+    /// one per core.)
     process: ?std.process.Init.Minimal = null,
     /// How long a restart waits for the new process to be serving before
     /// giving up on it and carrying on.
@@ -237,9 +239,16 @@ pub fn Server(comptime Ctx: type) type {
                 if (comptime !features.http3) return error.Http3NotBuilt;
                 if (comptime features.http3) {
                     const https = opts.https orelse return error.Http3NeedsHttps;
-                    // The QUIC endpoint does not ask for client certificates
-                    // yet, so HTTP/3 would be a way around mutual TLS.
-                    if (https.client_auth != null) return error.Http3WithClientAuth;
+                    // Mutual TLS: the same CAs and mode as the TCP listener,
+                    // loaded once more here (dusty loads its own when it
+                    // starts listening).
+                    var client_ca: ?std.crypto.Certificate.Bundle = null;
+                    defer if (client_ca) |*b| b.deinit(gpa);
+                    if (https.client_auth) |ca| client_ca = try ca.ca.load(gpa, rt_io);
+                    // The UDP socket: inherited (`h3`, or by position after
+                    // the TCP listeners), with the predecessor's secret.
+                    const h3_fd: ?handoff.Fd = if (inherited) |inh| inh.find("h3", listeners.items.len) else null;
+                    const secret: ?[32]u8 = if (h3_fd != null) handoff.inheritedSecret(opts.process.?.environ) else null;
                     const tls_config = listeners.items[listeners.items.len - 1].tls.?;
                     var cert_pem: []const u8 = undefined;
                     var key_pem: []const u8 = undefined;
@@ -258,6 +267,15 @@ pub fn Server(comptime Ctx: type) type {
                         .validate_address = q.validate_address,
                         .idle_timeout_ms = q.idle_timeout_ms,
                         .hq_interop_root = q.hq_interop_root,
+                        .client_auth = if (https.client_auth) |ca| .{
+                            .ca_der = client_ca.?.bytes.items,
+                            .mode = switch (ca.mode) {
+                                .request => .request,
+                                .require => .require,
+                            },
+                        } else null,
+                        .fd = h3_fd,
+                        .secret = secret,
                         // The same drain deadline as HTTP/1.1 and HTTP/2.
                         .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
                             @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
@@ -266,6 +284,7 @@ pub fn Server(comptime Ctx: type) type {
                     });
                     errdefer ep.deinit();
                     endpoint = ep;
+                    if (handoff_mode) try held.append(a, .{ .fd = ep.udp.socket.handle, .name = "h3" });
                     if (q.alt_svc) {
                         const alt = try a.create(AltSvc);
                         alt.* = .{ .value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{ep.address().getPort()}) };
@@ -395,10 +414,10 @@ pub fn Server(comptime Ctx: type) type {
             if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
             const restartable = self.process != null and self.held.len > 0;
             if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
-            // A successor started by a predecessor tells it when it is
-            // serving.
-            var notify: ?std.Io.Future(void) = if (restartable)
-                try rt_io.concurrent(notifyWhenReady, .{ self.server, rt_io, self.process.? })
+            // Once serving: systemd hears (`NOTIFY_SOCKET`), and a successor
+            // tells the predecessor that started it.
+            var notify: ?std.Io.Future(void) = if (self.process) |p|
+                try rt_io.concurrent(notifyWhenReady, .{ self.server, rt_io, p })
             else
                 null;
             defer if (notify) |*n| n.cancel(rt_io);
@@ -410,6 +429,13 @@ pub fn Server(comptime Ctx: type) type {
                 if (self.restart()) break done;
                 try sel.concurrent(.restart, waitForSignal, .{.user2});
             };
+            if (first == .restart) {
+                // HTTP/3 cannot drain beside the successor on one UDP
+                // socket: its connections close now and it stops reading.
+                if (comptime features.http3) if (self.h3) |ep| ep.handOver();
+            } else if (self.process) |p| {
+                sd_notify.stopping(p.environ);
+            }
             // Cancels the server's run, which drains, then the watchers.
             sel.cancelDiscard();
             switch (first) {
@@ -424,14 +450,22 @@ pub fn Server(comptime Ctx: type) type {
         /// did not, and this process keeps serving.
         fn restart(self: *Self) bool {
             const log = std.log.scoped(.anole);
-            const successor = handoff.spawn(self.gpa, self.rt.io(), self.process.?, self.held) catch |err| {
+            const environ = self.process.?.environ;
+            sd_notify.reloading(environ);
+            const h3_secret: ?*const [32]u8 = if (comptime features.http3)
+                (if (self.h3) |ep| &ep.secret else null)
+            else
+                null;
+            const successor = handoff.spawn(self.gpa, self.rt.io(), self.process.?, self.held, h3_secret) catch |err| {
                 log.err("restart: could not start the new process: {t}", .{err});
+                sd_notify.ready(environ, null);
                 return false;
             };
             log.info("restart: started process {d}; waiting for it to serve", .{successor.pid});
             if (!successor.waitReady(self.rt.io(), self.restart_timeout_ms)) {
                 log.err("restart: process {d} did not report serving; stopped it and carrying on", .{successor.pid});
                 successor.abandon();
+                sd_notify.ready(environ, null);
                 return false;
             }
             return true;
@@ -439,6 +473,10 @@ pub fn Server(comptime Ctx: type) type {
 
         fn notifyWhenReady(server: *http.Server(Ctx), rt_io: std.Io, process: std.process.Init.Minimal) void {
             server.ready.wait(rt_io) catch return;
+            // A successor names itself the main process before its
+            // predecessor starts to exit.
+            const successor = handoff.isSuccessor(process.environ);
+            sd_notify.ready(process.environ, if (successor) std.c.getpid() else null);
             handoff.notifyReady(process.environ);
         }
 
@@ -513,14 +551,136 @@ test "anole.Server: one call each to serve HTTP/1.1 and HTTPS, routes and middle
     try client_future.await(app.io());
 }
 
-test "anole.Server: HTTP/3 is refused beside mutual TLS, which QUIC does not check yet" {
-    if (comptime !features.http3) return error.SkipZigTest;
-    try std.testing.expectError(error.Http3WithClientAuth, Server(void).init(std.testing.allocator, .{
+/// The client's certificate as the handler sees it: the DER, or "none".
+fn handlePeerCertificate(req: *http.Request, res: *http.Response) !void {
+    res.body = req.peerCertificate() orelse "none";
+}
+
+test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client certificate in handlers" {
+    if (comptime !features.http3 or !features.http2) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pem = try tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    // The self-signed certificate is CA:TRUE: it is the server's identity,
+    // the client's, and the CA that verifies both. dusty reads CAs and
+    // client certificates from files.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = pem.cert });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = pem.key });
+
+    var app = try Server(void).init(gpa, .{
         .http = null,
-        .https = .{ .port = 0, .cert = .dev_self_signed, .client_auth = .{ .ca = .system } },
-        .http3 = .{ .port = 0 },
-        .executors = .exact(1),
-    }, {}));
+        .https = .{
+            .port = 0,
+            .cert = .{ .pem = .{ .cert = pem.cert, .key = pem.key } },
+            .client_auth = .{ .ca = .{ .file = .{ .path = "cert.pem", .dir = tmp.dir } } },
+        },
+        .http3 = .{ .port = 0, .alt_svc = false },
+        .executors = .exact(2),
+    }, {});
+    defer app.deinit();
+    app.get("/peer", handlePeerCertificate);
+
+    const Check = struct {
+        fn run(a: *Server(void), p: *const tls.Pem, dir: std.Io.Dir) !void {
+            defer a.stop();
+            const io_ = a.io();
+            const alloc = std.testing.allocator;
+            try a.waitReady();
+            var bundle = try tls.testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
+            defer bundle.deinit(alloc);
+            // The certificate's DER: the bundle holds exactly it.
+            const der = bundle.bytes.items;
+            const port = a.addresses()[0].ip.getPort();
+
+            // HTTP/1.1, without a certificate and with one.
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/peer", .{port});
+            const ca: http.dusty_module.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
+            {
+                var anon = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
+                defer anon.deinit();
+                if (anon.fetch(url, .{})) |r| {
+                    var resp = r;
+                    resp.deinit();
+                    return error.ServedWithoutClientCertificate;
+                } else |_| {}
+            }
+            {
+                var authed = http.Client.init(alloc, io_, .{ .tls = .{
+                    .ca = ca,
+                    .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = dir },
+                } });
+                defer authed.deinit();
+                var resp = try authed.fetch(url, .{});
+                defer resp.deinit();
+                try std.testing.expectEqualSlices(u8, der, (try resp.body()).?);
+            }
+
+            // HTTP/2.
+            const h2c = @import("h2/client.zig");
+            {
+                const conn = try h2c.ClientConnection.connect(alloc, io_, .{
+                    .host = "localhost",
+                    .port = port,
+                    .tls = .{ .root_ca = bundle, .certificate = .{ .cert_pem = p.cert, .key_pem = p.key } },
+                });
+                defer conn.close();
+                const s = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/peer" },
+                    .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer s.release();
+                try s.waitHead();
+                const body = try s.reader().allocRemaining(alloc, .unlimited);
+                defer alloc.free(body);
+                try std.testing.expectEqualSlices(u8, der, body);
+            }
+
+            // HTTP/3: refused without a certificate (at the handshake, or on
+            // the first request, which the server's verdict overtakes)...
+            const q = a.http3Address().?;
+            if (h3.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .address = q,
+                .port = q.getPort(),
+                .tls = .{ .root_ca = bundle },
+                .handshake_timeout_ms = 3000,
+            })) |conn| {
+                defer conn.close();
+                if (h3Get(conn, alloc)) |body| {
+                    alloc.free(body);
+                    return error.ServedWithoutClientCertificate;
+                } else |_| {}
+            } else |_| {}
+            // ...and served with one, which the handler sees.
+            const conn = try h3.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .address = q,
+                .port = q.getPort(),
+                .tls = .{ .root_ca = bundle, .certificate = .{ .cert_pem = p.cert, .key_pem = p.key } },
+            });
+            defer conn.close();
+            const body = try h3Get(conn, alloc);
+            defer alloc.free(body);
+            try std.testing.expectEqualSlices(u8, der, body);
+        }
+
+        fn h3Get(conn: *h3.ClientConnection, alloc: std.mem.Allocator) ![]u8 {
+            const s = try conn.request(&.{
+                .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/peer" },
+                .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+            }, .{});
+            defer s.release();
+            try s.waitHead();
+            if (s.status != 200) return error.UnexpectedStatus;
+            return s.reader().allocRemaining(alloc, .unlimited);
+        }
+    };
+    var client_future = try app.io().concurrent(Check.run, .{ &app, &pem, tmp.dir });
+    try app.run();
+    try client_future.await(app.io());
 }
 
 test "anole.Server: with a blocking pool, one executor serves other requests while a job runs" {

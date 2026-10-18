@@ -63,6 +63,9 @@ pub const ConnectOptions = struct {
     pub const Tls = struct {
         root_ca: std.crypto.Certificate.Bundle = .empty,
         insecure_skip_verify: bool = false,
+        /// A certificate (and key, PEM) to present when the server asks
+        /// for one: mutual TLS.
+        certificate: ?quic_tls.Identity = null,
     };
 };
 
@@ -169,6 +172,7 @@ pub const ClientConnection = struct {
             .host = options.host,
             .root_ca = options.tls.root_ca,
             .insecure_skip_verify = options.tls.insecure_skip_verify,
+            .certificate = options.tls.certificate,
         });
         errdefer c.SSL_free(self.ssl);
         c.ngtcp2_conn_set_tls_native_handle(self.q, self.ssl);

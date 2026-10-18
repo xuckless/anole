@@ -40,7 +40,13 @@ pub const ConnectOptions = struct {
     pub const Tls = struct {
         root_ca: std.crypto.Certificate.Bundle = .empty,
         insecure_skip_verify: bool = false,
+        /// A certificate (and key, PEM) to present when the server asks
+        /// for one: mutual TLS.
+        certificate: ?Identity = null,
     };
+
+    /// A certificate chain (leaf first) and its private key, in PEM.
+    pub const Identity = struct { cert_pem: []const u8, key_pem: []const u8 };
 };
 
 pub const Error = error{ ConnectionClosed, StreamReset, NoH2, OutOfMemory, Unexpected };
@@ -92,10 +98,18 @@ pub const ClientConnection = struct {
         if (options.tls) |t| {
             if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
             var rng: std.Random.IoSource = .{ .io = io };
+            // The handshake takes its own references to the certificate
+            // and key.
+            var identity: ?tls.config.CertKeyPair = if (t.certificate) |id|
+                try tls.config.CertKeyPair.fromSlice(gpa, io, id.cert_pem, id.key_pem)
+            else
+                null;
+            defer if (identity) |*id| id.deinit(gpa);
             self.tls_conn = try tls.client(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
                 .host = options.host,
                 .root_ca = t.root_ca,
                 .insecure_skip_verify = t.insecure_skip_verify,
+                .auth = if (identity) |*id| id else null,
                 .now = std.Io.Clock.real.now(io),
                 .rng = rng.interface(),
                 .alpn_protocols = &.{"h2"},

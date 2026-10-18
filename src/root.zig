@@ -86,6 +86,7 @@ test {
     _ = @import("server.zig");
     _ = @import("handoff.zig");
     _ = blocking;
+    _ = @import("sd_notify.zig");
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = http;

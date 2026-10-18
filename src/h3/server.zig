@@ -84,6 +84,18 @@ pub const Options = struct {
     /// under this directory: what the QUIC interop runner's tests use. Only
     /// for interop testing; it bypasses the router and every middleware.
     hq_interop_root: ?[]const u8 = null,
+    /// Mutual TLS: ask for client certificates and verify them, as the TCP
+    /// listener does. Handlers read the certificate with
+    /// `Request.peerCertificate`.
+    client_auth: ?quic_tls.ClientAuth = null,
+    /// Serve this UDP socket, opened elsewhere (systemd, or the process
+    /// this one replaces), instead of binding `address`.
+    fd: ?std.posix.fd_t = null,
+    /// The key for stateless reset and address validation tokens; random
+    /// when null. A process that takes over the socket gets its
+    /// predecessor's, so the predecessor's clients accept the stateless
+    /// resets it sends them.
+    secret: ?[32]u8 = null,
 };
 
 /// One HTTP/3 listener, serving `server`'s router.
@@ -110,6 +122,9 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// The connections' driver tasks.
         group: std.Io.Group = .init,
         draining: bool = false,
+        /// The socket goes to another process: close every connection at
+        /// once and stop reading (see `handOver`).
+        hand_over: std.atomic.Value(bool) = .init(false),
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
@@ -119,9 +134,17 @@ pub fn Endpoint(comptime Ctx: type) type {
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tls = try quic_tls.Context.init(options.cert_pem, options.key_pem, options.hq_interop_root != null);
+            var tls = try quic_tls.Context.init(.{
+                .cert_pem = options.cert_pem,
+                .key_pem = options.key_pem,
+                .hq_interop = options.hq_interop_root != null,
+                .client_auth = options.client_auth,
+            });
             errdefer tls.deinit();
-            const socket = try options.address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+            const socket = if (options.fd) |fd|
+                try adoptSocket(io, fd, options.address)
+            else
+                try options.address.bind(io, .{ .mode = .dgram, .protocol = .udp });
             self.* = .{
                 .gpa = gpa,
                 .io = io,
@@ -133,9 +156,41 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .secret = undefined,
                 .listener = .{ .address = .{ .ip = socket.address } },
             };
-            io.random(&self.secret);
+            if (options.secret) |secret| self.secret = secret else io.random(&self.secret);
             net.rand_io = io;
             return self;
+        }
+
+        /// Wraps a UDP socket this process did not open. Under zio, which
+        /// drives its own sockets non-blocking, it is made so too.
+        fn adoptSocket(io: std.Io, fd: std.posix.fd_t, configured: std.Io.net.IpAddress) !std.Io.net.Socket {
+            const sc = std.c;
+            var kind: c_int = 0;
+            var kind_len: std.posix.socklen_t = @sizeOf(c_int);
+            if (sc.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.TYPE, @ptrCast(&kind), &kind_len) != 0 or
+                kind != std.posix.SOCK.DGRAM) return error.InheritedSocketNotDatagram;
+            if (placement.executorCount(io) != null) {
+                const flags = sc.fcntl(fd, sc.F.GETFL, @as(c_int, 0));
+                if (flags < 0) return error.InvalidInheritedSocket;
+                _ = sc.fcntl(fd, sc.F.SETFL, flags | @as(c_int, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK")));
+            }
+            var storage: std.Io.Threaded.PosixAddress = undefined;
+            var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+            const bound: std.Io.net.IpAddress = if (sc.getsockname(fd, &storage.any, &len) == 0 and
+                (storage.any.family == std.posix.AF.INET or storage.any.family == std.posix.AF.INET6))
+                std.Io.Threaded.addressFromPosix(&storage)
+            else
+                configured;
+            return .{ .handle = fd, .address = bound };
+        }
+
+        /// For a restart that passes the socket to a new process: when
+        /// `run` is canceled next, every connection gets a final GOAWAY and
+        /// a CONNECTION_CLOSE at once, and the endpoint stops reading, so
+        /// every datagram goes to the new process. Requests in flight are
+        /// cut. Safe from any task or thread.
+        pub fn handOver(self: *Self) void {
+            self.hand_over.store(true, .release);
         }
 
         pub fn deinit(self: *Self) void {
@@ -180,6 +235,17 @@ pub fn Endpoint(comptime Ctx: type) type {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
             self.draining = true;
+            if (self.hand_over.load(.acquire)) {
+                // Not another read: what arrives now is the new process's.
+                const conns = self.liveConns();
+                for (conns) |conn| {
+                    conn.handOver();
+                    conn.unref();
+                }
+                self.gpa.free(conns);
+                self.group.cancel(self.io);
+                return;
+            }
             const live = self.liveConns();
             for (live) |conn| {
                 conn.beginDrain();
@@ -752,6 +818,18 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.kick();
             }
 
+            /// The final GOAWAY, sent, then CONNECTION_CLOSE: for a hand-over,
+            /// which cannot wait for requests to finish.
+            fn handOver(conn: *Conn) void {
+                conn.lock();
+                if (conn.state == .open) if (conn.h3) |hc| {
+                    _ = h.nghttp3_conn_shutdown(hc);
+                };
+                conn.unlock();
+                conn.flush();
+                conn.abort();
+            }
+
             /// CONNECTION_CLOSE with H3_NO_ERROR. Locked.
             fn closeGracefully(conn: *Conn) void {
                 c.ngtcp2_ccerr_set_application_error(&conn.last_error, h.NGHTTP3_H3_NO_ERROR, null, 0);
@@ -1167,6 +1245,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 server.applyForwardedFrom(&request, conn.remote.ip());
                 // The client is on our TLS, whatever proxies say.
                 request.secure = true;
+                conn.lock();
+                request.peer_certificate = quic_tls.peerCertificate(conn.ssl);
+                conn.unlock();
 
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {

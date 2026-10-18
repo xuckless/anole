@@ -12,6 +12,10 @@ pub const nghttp3 = @import("nghttp3.zig");
 /// The HTTP/3 server endpoint for a dusty server's router.
 pub const Endpoint = @import("server.zig").Endpoint;
 pub const EndpointOptions = @import("server.zig").Options;
+/// Mutual TLS for an endpoint (`EndpointOptions.client_auth`).
+pub const ClientAuth = @import("quic_tls.zig").ClientAuth;
+/// A client certificate and key for `ConnectOptions.tls.certificate`.
+pub const Identity = @import("quic_tls.zig").Identity;
 /// An HTTP/3 client connection: many concurrent requests over one QUIC
 /// connection.
 pub const ClientConnection = @import("client.zig").ClientConnection;

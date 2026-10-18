@@ -5,6 +5,11 @@
 //! both); the new process tells it through a pipe (`ANOLE_READY_FD`) when it
 //! is serving, and only then does the old one stop accepting and drain.
 //! Connections never see a closed port: the sockets stay open throughout.
+//!
+//! HTTP/3's UDP socket is passed the same way (named `h3`), with the key
+//! for its stateless resets and address validation tokens through a pipe
+//! of its own (`ANOLE_H3_SECRET_FD`): see `Server.run` for what happens to
+//! the QUIC connections.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
@@ -43,6 +48,29 @@ pub fn inherited(environ: std.process.Environ) ?Inherited {
         _ = c.fcntl(out.fds[i], c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
     }
     return out;
+}
+
+/// The HTTP/3 endpoint's secret, if the predecessor passed one: read once,
+/// and its pipe closed. Only when the sockets were passed to this process
+/// (`inherited` is not null), so a stale variable cannot name some other
+/// file.
+pub fn inheritedSecret(environ: std.process.Environ) ?[32]u8 {
+    const text = environ.getPosix("ANOLE_H3_SECRET_FD") orelse return null;
+    const fd = std.fmt.parseInt(Fd, text, 10) catch return null;
+    defer _ = c.close(fd);
+    var secret: [32]u8 = undefined;
+    var got: usize = 0;
+    while (got < secret.len) {
+        const n = c.read(fd, secret[got..].ptr, secret.len - got);
+        if (n <= 0) return null;
+        got += @intCast(n);
+    }
+    return secret;
+}
+
+/// Whether a predecessor started this process and waits for it to serve.
+pub fn isSuccessor(environ: std.process.Environ) bool {
+    return environ.getPosix("ANOLE_READY_FD") != null;
 }
 
 /// Tells the predecessor that this process is serving, if it is waiting.
@@ -85,8 +113,8 @@ pub const Successor = struct {
 };
 
 /// Starts a new copy of this program, with the same arguments and
-/// environment, holding `listeners`.
-pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minimal, listeners: []const Listener) !Successor {
+/// environment, holding `listeners`, and `h3_secret` if given.
+pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minimal, listeners: []const Listener, h3_secret: ?*const [32]u8) !Successor {
     if (listeners.len == 0 or listeners.len > max_listeners) return error.TooManyListeners;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -100,13 +128,38 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
     var pipe: [2]Fd = undefined;
     if (c.pipe(&pipe) != 0) return error.PipeFailed;
     _ = c.fcntl(pipe[0], c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+    _ = c.fcntl(pipe[1], c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
     const ready_target: Fd = @intCast(3 + listeners.len);
+    // The secret waits in a pipe of its own (32 bytes fit any pipe's
+    // buffer), not in the environment, which other processes may read.
+    var secret_pipe: [2]Fd = .{ -1, -1 };
+    if (h3_secret) |secret| {
+        if (c.pipe(&secret_pipe) != 0) {
+            _ = c.close(pipe[0]);
+            _ = c.close(pipe[1]);
+            return error.PipeFailed;
+        }
+        for (secret_pipe) |fd| _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+        const written = c.write(secret_pipe[1], secret, secret.len);
+        _ = c.close(secret_pipe[1]);
+        if (written != secret.len) {
+            _ = c.close(secret_pipe[0]);
+            _ = c.close(pipe[0]);
+            _ = c.close(pipe[1]);
+            return error.PipeFailed;
+        }
+    }
+    defer if (secret_pipe[0] >= 0) {
+        _ = c.close(secret_pipe[0]);
+    };
+    const passed: usize = listeners.len + 1 + @intFromBool(h3_secret != null);
 
     // The environment, made now: after fork only async-signal-safe calls.
     var env: std.ArrayList(?[*:0]const u8) = .empty;
     for (process.environ.block.slice) |entry| {
         const e = std.mem.span(entry.?);
-        if (std.mem.startsWith(u8, e, "LISTEN_") or std.mem.startsWith(u8, e, "ANOLE_READY_FD=")) continue;
+        if (std.mem.startsWith(u8, e, "LISTEN_") or std.mem.startsWith(u8, e, "ANOLE_READY_FD=") or
+            std.mem.startsWith(u8, e, "ANOLE_H3_SECRET_FD=")) continue;
         try env.append(arena, entry);
     }
     try env.append(arena, try std.fmt.allocPrintSentinel(arena, "LISTEN_FDS={d}", .{listeners.len}, 0));
@@ -117,6 +170,8 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
     }
     try env.append(arena, try std.fmt.allocPrintSentinel(arena, "LISTEN_FDNAMES={s}", .{names.items}, 0));
     try env.append(arena, try std.fmt.allocPrintSentinel(arena, "ANOLE_READY_FD={d}", .{ready_target}, 0));
+    if (h3_secret != null)
+        try env.append(arena, try std.fmt.allocPrintSentinel(arena, "ANOLE_H3_SECRET_FD={d}", .{ready_target + 1}, 0));
     // Filled in by the child with its own pid.
     const pid_entry = try arena.allocSentinel(u8, "LISTEN_PID=".len + 20, 0);
     @memcpy(pid_entry[0.."LISTEN_PID=".len], "LISTEN_PID=");
@@ -136,10 +191,15 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
     if (pid == 0) {
         // The child: move everything high first so the dup2s below cannot
         // close a socket still to be moved, then into place from fd 3.
-        var high: [max_listeners + 1]Fd = undefined;
+        var high: [max_listeners + 2]Fd = undefined;
         for (fds[0..listeners.len], 0..) |fd, i| high[i] = c.fcntl(fd, c.F.DUPFD, @as(c_int, 100));
         high[listeners.len] = c.fcntl(pipe[1], c.F.DUPFD, @as(c_int, 100));
-        for (high[0 .. listeners.len + 1], 0..) |fd, i| _ = c.dup2(fd, @intCast(3 + i));
+        if (h3_secret != null) high[listeners.len + 1] = c.fcntl(secret_pipe[0], c.F.DUPFD, @as(c_int, 100));
+        // dup2 clears close-on-exec on the copies at 3...
+        for (high[0..passed], 0..) |fd, i| _ = c.dup2(fd, @intCast(3 + i));
+        // ...and the copies at 100.. would otherwise stay open in the new
+        // program (F_DUPFD does not copy the flag), holding the sockets.
+        for (high[0..passed]) |fd| _ = c.close(fd);
         // LISTEN_PID=<this process>.
         var n: u64 = @intCast(c.getpid());
         var digits: [20]u8 = undefined;
@@ -174,4 +234,26 @@ test "Inherited.find: by name, else by position" {
     plain.names[0] = "";
     plain.names[1] = "";
     try std.testing.expectEqual(@as(?Fd, 4), plain.find("https", 1));
+}
+
+test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
+    var p: [2]Fd = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.pipe(&p));
+    defer _ = c.close(p[1]);
+    var secret: [32]u8 = undefined;
+    for (&secret, 0..) |*b, i| b.* = @intCast(i * 7);
+    try std.testing.expectEqual(@as(isize, 32), c.write(p[1], &secret, secret.len));
+
+    var entry_buf: [32]u8 = undefined;
+    const entry = try std.fmt.bufPrintSentinel(&entry_buf, "ANOLE_H3_SECRET_FD={d}", .{p[0]}, 0);
+    const entries = [_:null]?[*:0]const u8{ "ANOLE_READY_FD=9", entry.ptr };
+    const environ: std.process.Environ = .{ .block = .{ .slice = &entries } };
+    try std.testing.expect(isSuccessor(environ));
+    try std.testing.expectEqualSlices(u8, &secret, &(inheritedSecret(environ).?));
+    // Its read end is closed now.
+    try std.testing.expect(c.fcntl(p[0], c.F.GETFD) < 0);
+
+    const none: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{"PATH=/bin"} } };
+    try std.testing.expect(inheritedSecret(none) == null);
+    try std.testing.expect(!isSuccessor(none));
 }
