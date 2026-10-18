@@ -644,8 +644,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn takePending(self: *Self, comptime what: []const u8) !Options {
             return self.pending orelse {
+                // Not the end of the server: `run` still serves those.
                 std.log.scoped(.anole).info(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
-                return self.failStart(error.ListenersAlreadySet);
+                return error.ListenersAlreadySet;
             };
         }
 
@@ -1158,7 +1159,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and
         /// drains the requests in flight (bounded by `timeout.shutdown`).
-        /// Call it from the thread that called `init`.
+        /// Sets up the listeners first when `init` left them (127.0.0.1:8080
+        /// unless `listen` or `listenTls` named others). Call it from the
+        /// thread that called `init`.
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
             self.addHelperRoutes();

@@ -240,10 +240,19 @@ test "anole.Server(State): (req, res) and (state, req, res) handlers, function m
     app.get("/stateful", StateRoutes.stateful);
     var impl: StateRoutes.Health = .{ .status = "known" };
     if (features.grpc) app.grpc(grpc.health.pb.Health, &impl);
-    // The listeners came from init's options.
+    // The listeners came from init's options...
     try std.testing.expectError(error.ListenersAlreadySet, app.listen(":0"));
-    // ...which also ends a wait for the server to start.
-    try std.testing.expectError(error.ListenersAlreadySet, app.waitReady());
+    // ...and `run` still serves them.
+    const Check = struct {
+        fn run(a: *Server(State)) !void {
+            defer a.stop();
+            try a.waitReady();
+            try std.testing.expect(a.addresses()[0].ip.getPort() != 0);
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.run();
+    try checking.await(app.io());
 }
 
 test "anole.Server(State): served" {
