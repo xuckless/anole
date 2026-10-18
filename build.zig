@@ -560,7 +560,10 @@ const Core = struct {
     tls_seam: ?*std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize }).module("zio");
+        // Pinned by default (zio's own default is work stealing), so a
+        // program that declares no `zio_options` still gets what Anole needs;
+        // anole.Server refuses to compile with work stealing declared.
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned }).module("zio");
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,

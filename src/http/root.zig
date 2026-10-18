@@ -21,6 +21,9 @@ pub const middleware = dusty.middleware;
 pub const Middleware = dusty.Middleware;
 pub const Client = dusty.Client;
 pub const ClientConfig = dusty.ClientConfig;
+/// Options for `Server.static` / `Router.static` and `Server.embedded`.
+pub const StaticOptions = dusty.StaticOptions;
+pub const EmbeddedOptions = dusty.EmbeddedOptions;
 
 /// The whole dusty module, for anything not re-exported above.
 pub const dusty_module = dusty;

@@ -7,7 +7,9 @@
 #   - the UDP socket goes to the successor: an HTTP/3 connection open
 #     across the restart is closed by the old process (CONNECTION_CLOSE,
 #     H3_NO_ERROR) at once, and new ones reach the successor;
-#   - TCP and HTTP/3 serve throughout, and a second restart works too.
+#   - TCP and HTTP/3 serve throughout, and a second restart works too;
+#   - SIGHUP reloads the certificate (RELOADING=1, then READY=1) and the
+#     process goes on serving.
 #   tests/restart/run.sh [path-to-hello]
 # Needs python3 and curl; aioquic is installed into a throwaway venv.
 set -eu
@@ -48,6 +50,14 @@ pids="$pids $first"
 await_notify "^READY=1$"
 check_all "first process"
 echo "PASS READY=1, then HTTP/1.1, HTTPS and HTTP/3"
+
+lines=$(wc -l <"$work/notify.log")
+kill -HUP $first
+await_notify "^RELOADING=1 MONOTONIC_USEC=[0-9]+$" $lines
+await_notify "^READY=1$" $lines
+grep -q "certificates reloaded" "$work/server.log" || fail "no reload logged after SIGHUP"
+check_all "after SIGHUP"
+echo "PASS SIGHUP: RELOADING=1, certificates reloaded, READY=1, still serving"
 
 restart() {
   old=$1
