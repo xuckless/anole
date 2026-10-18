@@ -4,8 +4,13 @@
     .fingerprint = 0xe9214b117feef58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Core, always used, pinned by commit. zio: main HEAD on 2026-10-17
-        // (its v0.19.x tags are the Zig 0.16 line). dusty: Anole's fork
+        // Core, always used, pinned by commit. zio: Anole's fork
+        // xuckless/zio, branch `anole`: lalinsky/zio 4e4e1ed (main HEAD on
+        // 2026-10-17; its v0.19.x tags are the Zig 0.16 line) plus pinned
+        // scheduling that keeps a ring and its overflow one FIFO queue (the
+        // HTTP/1.1 p99 at 256+ connections per executor), and an accept loop
+        // that keeps up on a busy executor (direct accept with its own
+        // budget, spawn backpressure every 64 spawns). dusty: Anole's fork
         // xuckless/dusty, branch `anole`: lalinsky/dusty d3cb485 plus the
         // patches Anole needs. Open upstream (lalinsky/dusty #263-#270): TLS
         // teardown, server ALPN, in-memory PEM, handshake log level, nghttp2
@@ -13,8 +18,8 @@
         // server engine. Fork-only since: h2c, PROXY protocol, inherited
         // listeners, HTTP/3 seams, TLS close_notify and the rest.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#4e4e1ed10da974f15b119207d346a78cc6c363e4",
-            .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
+            .url = "git+https://github.com/xuckless/zio#4ed4b8d39769f2646518c54ded4db7e15b5f1a24",
+            .hash = "zio-0.19.0-xHbVVMPaLACJ4tW7SxBGwyhGgLgQ0CatxXNCUPrtVoC4",
         },
         .dusty = .{
             .url = "git+https://github.com/xuckless/dusty#b7ad1ff1a181301a7f638de1e16e71de7d1f925e",

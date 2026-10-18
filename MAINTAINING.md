@@ -9,7 +9,7 @@ that happens promptly.
 
 | Component | Pinned in | Form |
 | --- | --- | --- |
-| zio | build.zig.zon | upstream commit (`git+https://`) |
+| zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` |
 | dusty | build.zig.zon | commit of the xuckless/dusty fork, branch `anole` |
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
@@ -89,6 +89,12 @@ against lalinsky/dusty (#263-#270) are left as they are.
   test runner has no fuzzer; CI's `fuzz` job runs them from the pinned
   package. C compiled into the dusty module breaks Zig 0.17's fuzzer, so
   C goes in a static library the module links (as llhttp and nghttp2 do).
+- **zio**: after a change, run its suite in both scheduling modes
+  (`./check.sh` and `./check.sh --scheduling pinned` in the fork; Anole
+  runs pinned). Its changes: the pinned mode's run queue (`pinned-fifo`), and
+  accepting on a busy executor (`accept-now`: a direct accept with its own
+  budget, and spawn backpressure every 64 spawns instead of on every one).
+  `bench/` measures both (`conns`, `raw`).
 - **nghttp2**, **ngtcp2**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.
