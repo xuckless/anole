@@ -4,8 +4,10 @@
 //!     const user = try anole.json.parse(User, arena, body, .{});
 //!     const text = try anole.json.stringify(arena, user, .{});
 //!
-//! In a handler: `try anole.json.readBody(User, req)` and
-//! `try anole.json.respond(res, value)`.
+//! In a handler, `req.bind(User)` and `res.json(value)` (std.json, in every
+//! build) are the usual way; `try anole.json.readBody(User, req)` and
+//! `try anole.json.respond(res, value)` are the same contract on yyjson,
+//! for large documents.
 //!
 //! Everything is allocated from the allocator given, which should be an
 //! arena (the request's): yyjson's document lives there, and parsed strings
@@ -224,17 +226,16 @@ fn toValue(doc: *c.yyjson_mut_doc, value: anytype, options: StringifyOptions) Er
     return v orelse error.OutOfMemory;
 }
 
-/// The request body parsed as a `T`, in the request's arena. A body that
-/// is missing or does not fit `T` fails with an error the server answers
-/// with 400 when the handler returns it (the std.json names dusty maps):
-/// `UnexpectedEndOfInput`, `UnexpectedToken` for a value of the wrong
-/// type, `InvalidNumber` for one out of range, or `parse`'s own.
+/// The request body parsed as a `T` with yyjson, in the request's arena:
+/// `req.bind(T)`'s contract on the faster parser. Unknown fields are
+/// ignored; a request without a body fails with `error.MissingBody`, and
+/// one that is not JSON or does not fit `T` with `error.InvalidJsonBody`,
+/// both answered 400.
 pub fn readBody(comptime T: type, req: *dusty.Request) !T {
-    const body = (try req.body()) orelse return error.UnexpectedEndOfInput;
+    const body = (try req.body()) orelse return error.MissingBody;
     return parse(T, req.arena, body, .{}) catch |err| switch (err) {
-        error.UnexpectedType => error.UnexpectedToken,
-        error.Overflow => error.InvalidNumber,
-        else => |e| e,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidJsonBody,
     };
 }
 
@@ -274,6 +275,24 @@ test "parse: structs, defaults, optionals, slices, enums and numbers" {
     try std.testing.expectError(error.Overflow, parse(u8, arena, "300", .{}));
     try std.testing.expectError(error.UnexpectedType, parse(u8, arena, "\"7\"", .{}));
     try std.testing.expectError(error.SyntaxError, parse(u8, arena, "{", .{}));
+}
+
+test "readBody: bind's contract, answered 400 by the server" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .parser = undefined, .transport = undefined };
+    const T = struct { name: []const u8 };
+    req._body_read = true;
+    req._body = null;
+    try std.testing.expectError(error.MissingBody, readBody(T, &req));
+    req._body = "{\"name\":\"ann\",\"extra\":1}";
+    try std.testing.expectEqualStrings("ann", (try readBody(T, &req)).name);
+    req._body = "{\"name\":7}";
+    try std.testing.expectError(error.InvalidJsonBody, readBody(T, &req));
+    req._body = "{";
+    try std.testing.expectError(error.InvalidJsonBody, readBody(T, &req));
+    try std.testing.expectEqual(dusty.Status.bad_request, dusty.errorStatus(error.InvalidJsonBody).?);
+    try std.testing.expectEqual(dusty.Status.bad_request, dusty.errorStatus(error.MissingBody).?);
 }
 
 test "stringify round-trips through parse" {

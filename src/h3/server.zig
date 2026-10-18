@@ -1321,7 +1321,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                     }
                 }
 
-                log.debug("Received (h3 stream {d}): {f} {s}", .{ s.id, request.method, request.url });
                 server.dispatch(&request, &response) catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,

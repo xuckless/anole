@@ -55,20 +55,40 @@ pub fn excluded(req: *const dusty.Request, list: []const []const u8) bool {
 }
 
 /// The status the client got for this response: the handler's, or for an
-/// error the one dusty answers it with (its 4xx for request faults, else
-/// 500), unless the head had already gone out, which the error cannot
-/// change. An HTTP/2 extended CONNECT (RFC 8441) answered with a 2xx opened
+/// error the one dusty answers it with (`errorStatus`: a status-named
+/// error's own, 4xx for request-body faults, else 500), unless the head had
+/// already gone out, which the error cannot change. An HTTP/2 extended CONNECT (RFC 8441) answered with a 2xx opened
 /// its tunnel, as an HTTP/1.1 upgrade does with a 101, and is recorded as
 /// the 101, so a WebSocket reads the same on both. An app's own
 /// `uncaughtError` may still choose another.
 pub fn statusOf(req: *const dusty.Request, res: *const dusty.Response, result: anytype) u16 {
     if (result) |_| {} else |err| if (!res.headers_written) {
-        const answer = dusty.clientError(err) orelse return 500;
-        return @intCast(@backingInt(answer.status));
+        const status = dusty.errorStatus(err) orelse return 500;
+        return @intCast(@backingInt(status));
     }
     const status: u16 = @intCast(@backingInt(res.status));
     if (req.protocol != null and status >= 200 and status < 300) return 101;
     return status;
+}
+
+test "statusOf: status-named errors as sent, a stray SyntaxError as 500" {
+    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var res: dusty.Response = .{ .arena = std.testing.allocator, .conn = undefined };
+    const E = error{ Unauthorized, TooManyRequests, InvalidJsonBody, SyntaxError, OutOfMemory };
+    const cases = [_]struct { E, u16 }{
+        .{ error.Unauthorized, 401 },
+        .{ error.TooManyRequests, 429 },
+        .{ error.InvalidJsonBody, 400 },
+        .{ error.SyntaxError, 500 },
+        .{ error.OutOfMemory, 500 },
+    };
+    for (cases) |c| {
+        const result: E!void = c[0];
+        try std.testing.expectEqual(c[1], statusOf(&req, &res, result));
+    }
+    const fine: E!void = {};
+    res.status = .created;
+    try std.testing.expectEqual(@as(u16, 201), statusOf(&req, &res, fine));
 }
 
 test "excluded: exact paths, prefixes, the query aside" {

@@ -88,6 +88,16 @@ pub const Options = struct {
     /// the executors, at most this many at once. Password hashing uses it.
     /// Null: none, and such work runs on the request's executor.
     blocking: ?blocking.Options = null,
+    /// How the server writes its own error answers (404, 405, the status
+    /// an error maps to, `res.fail`): `.auto` sends `{"error":"..."}` to a
+    /// request that takes JSON and text to others, `.json` and `.text`
+    /// always. Replaces `server.errors`.
+    errors: http.ErrorFormat = .auto,
+    /// Answers handler and middleware errors in place of the default
+    /// mapping, which it can fall back on with `anole.defaultError(req,
+    /// res, err)`: no `Ctx` with `uncaughtError` needed. Replaces
+    /// `server.error_handler` when set.
+    error_handler: ?http.ErrorHandler = null,
     /// The rest of dusty's server configuration: timeouts, limits,
     /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
     /// replaced by the fields above.
@@ -210,9 +220,9 @@ pub fn Server(comptime Ctx: type) type {
                         return .{ .cert = cert_pem, .key = try gpa.dupe(u8, p.key) };
                     },
                     .files => |f| {
-                        const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io_, f.cert_path, gpa, .limited(max_pem_len));
+                        const cert_pem = try readPem(gpa, io_, f.cert_path, "certificate");
                         errdefer gpa.free(cert_pem);
-                        return .{ .cert = cert_pem, .key = try std.Io.Dir.cwd().readFileAlloc(io_, f.key_path, gpa, .limited(max_pem_len)) };
+                        return .{ .cert = cert_pem, .key = try readPem(gpa, io_, f.key_path, "key") };
                     },
                     .dev_self_signed => {
                         if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
@@ -220,6 +230,15 @@ pub fn Server(comptime Ctx: type) type {
                         return .{ .cert = made.cert, .key = made.key };
                     },
                 }
+            }
+
+            /// A PEM file, with its path in the log line when it cannot
+            /// be read.
+            fn readPem(gpa: std.mem.Allocator, io_: std.Io, path: []const u8, what: []const u8) ![]u8 {
+                return std.Io.Dir.cwd().readFileAlloc(io_, path, gpa, .limited(max_pem_len)) catch |err| {
+                    std.log.scoped(.anole).err("cannot read the TLS {s} \"{s}\": {t}", .{ what, path, err });
+                    return err;
+                };
             }
 
             fn setSource(state: *CertState, cert: Options.Cert) !void {
@@ -335,6 +354,8 @@ pub fn Server(comptime Ctx: type) type {
             var server_config = opts.server;
             server_config.listeners = listeners.items;
             server_config.http2 = opts.http2;
+            server_config.errors = opts.errors;
+            if (opts.error_handler) |h| server_config.error_handler = h;
             const server = try a.create(http.Server(Ctx));
             server.* = .init(gpa, rt_io, server_config, ctx);
             const stopped = try a.create(std.Io.Event);
@@ -374,6 +395,13 @@ pub fn Server(comptime Ctx: type) type {
                     });
                     errdefer ep.deinit();
                     endpoint = ep;
+                    // Named in the HTTPS listener's startup line.
+                    const tcp = &listeners.items[listeners.items.len - 1];
+                    const udp_port = ep.address().getPort();
+                    tcp.extra_protocols = if (udp_port == tcp.address.ip.getPort())
+                        &.{"HTTP/3"}
+                    else
+                        try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
                     if (handoff_mode) try held.append(a, .{ .fd = ep.udp.socket.handle, .name = "h3" });
                     if (q.alt_svc) {
                         const alt = try a.create(AltSvc);
@@ -424,6 +452,8 @@ pub fn Server(comptime Ctx: type) type {
         fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: std.Io.net.IpAddress) !?handoff.Fd {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
+            // SO_REUSEPORT would share the port with whoever has it.
+            try http.checkAddressFree(address);
             const s = try address.listen(io_, .{ .reuse_address = true });
             return s.socket.handle;
         }

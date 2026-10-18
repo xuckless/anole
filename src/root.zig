@@ -26,8 +26,14 @@ pub const zio_options = @import("server.zig").zio_options;
 /// Blocking or CPU-heavy work on a pool thread while the request's
 /// coroutine waits (`Options.blocking`); password hashing uses it.
 pub const blocking = @import("blocking.zig");
-/// Log output with the underlying libraries' scopes renamed to Anole's:
-/// `pub const std_options: std.Options = .{ .logFn = anole.logFn };`.
+/// Optional, in the executable's root file: `pub const std_options =
+/// anole.std_options;`. Keeps the runtime's per-thread start and stop lines
+/// and Anole's per-connection debug lines out of a Debug build's output;
+/// warnings, errors and info (the startup line, the access log) stay.
+pub const std_options = @import("log.zig").std_options;
+/// Anole's libraries log under Anole's own scopes (`anole`, `access`,
+/// `anole_h2`, `anole_h3`); this log function is kept for programs that set
+/// it, and renames the scopes older builds used.
 pub const logFn = @import("log.zig").logFn;
 
 /// HTTP/1.1 and HTTP/2 server, router and client (the xuckless/dusty fork of
@@ -37,6 +43,13 @@ pub const Request = http.Request;
 pub const Response = http.Response;
 pub const middleware = http.middleware;
 pub const Middleware = http.Middleware;
+/// The answer the server gives a handler error when nothing else does
+/// (status-named errors such as `error.Unauthorized` to their status,
+/// request-body faults to 4xx, the rest to 500), for an `uncaughtError` or
+/// `Options.error_handler` to fall back on.
+pub const defaultError = http.defaultError;
+/// The status a handler error stands for, or null for a 500.
+pub const errorStatus = http.errorStatus;
 
 /// TLS on BoringSSL (-Dtls=boringssl): the bindings, the module dusty uses for
 /// HTTPS, and `selfSigned` for development certificates.
@@ -84,6 +97,7 @@ pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 
 test {
     _ = @import("server.zig");
+    _ = @import("api_test.zig");
     _ = @import("handoff.zig");
     _ = blocking;
     _ = @import("sd_notify.zig");

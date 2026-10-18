@@ -30,6 +30,20 @@ pub const TlsConfig = dusty.TlsConfig;
 /// directory, or PEM in memory.
 pub const TlsCa = dusty.TlsCa;
 
+/// How the server writes its own error answers (`ServerConfig.errors`).
+pub const ErrorFormat = dusty.ErrorFormat;
+/// `ServerConfig.error_handler`: a function that answers handler errors.
+pub const ErrorHandler = dusty.ErrorHandler;
+/// Per-request values (`Request.locals`).
+pub const Locals = dusty.Locals;
+/// The status a handler error stands for, or null for a 500.
+pub const errorStatus = dusty.errorStatus;
+/// The default answer to a handler error, to fall back on.
+pub const defaultError = dusty.defaultError;
+/// Fails with `error.AddressInUse` when a socket already listens on the
+/// address (which SO_REUSEPORT would silently share).
+pub const checkAddressFree = dusty.checkAddressFree;
+
 /// The whole dusty module, for anything not re-exported above.
 pub const dusty_module = dusty;
 
