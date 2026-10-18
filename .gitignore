@@ -1,0 +1,33 @@
+# Zig build output
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Secrets and local config — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+secrets/
+.secrets/
+
+# Test certificates are generated at test time, not committed
+test/certs/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local agent settings
+.claude/settings.local.json
+
+AGENTS.md
+TODO.md
