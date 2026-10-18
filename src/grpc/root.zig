@@ -46,6 +46,8 @@ test {
     _ = deadline;
     _ = @import("compression.zig");
     _ = server;
+    _ = @import("transcode.zig");
+    _ = @import("transcode_test.zig");
     _ = health;
     _ = client;
     if (features.http2) _ = @import("server_test.zig");

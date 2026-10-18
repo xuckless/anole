@@ -10,7 +10,8 @@
 //! each call: request frames decoded into messages, the handler, response
 //! messages framed back, and the status in the trailers. A unary method
 //! marked `option idempotency_level = NO_SIDE_EFFECTS` also gets a GET
-//! route, for Connect's GET form.
+//! route, for Connect's GET form, and a method annotated with
+//! `google.api.http` gets REST routes that speak JSON (transcode.zig).
 //!
 //! Unary methods run on the stream's task. A streaming method's handler, its
 //! request reader and its response writer run as tasks of one group, joined
@@ -23,7 +24,9 @@ const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
 const deadline = @import("deadline.zig");
 const Compression = @import("compression.zig").Compression;
+const transcode = @import("transcode.zig");
 const features = @import("build_options");
+const placement = dusty.placement;
 
 const Code = status_mod.Code;
 const log = std.log.scoped(.anole_grpc);
@@ -41,6 +44,9 @@ pub const RegisterOptions = struct {
     /// handlers that serve more than one registration (`Health` keeps its
     /// registry here).
     data: ?*anyopaque = null,
+    /// REST routes for the methods annotated with `google.api.http` (JSON
+    /// transcoding). False registers the gRPC routes alone.
+    transcode: bool = true,
 };
 
 const default_options: RegisterOptions = .{};
@@ -155,6 +161,10 @@ pub const Protocol = enum {
     connect,
     /// Connect streaming: enveloped messages, an end-stream message.
     connect_stream,
+    /// JSON transcoding (`google.api.http`): a REST request, the response
+    /// as JSON (a server stream as one JSON array), errors as
+    /// google.rpc.Status JSON.
+    http_json,
 };
 
 pub const Codec = enum { proto, json };
@@ -217,6 +227,9 @@ pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Ser
         }.h;
         router.addRoute(.post, path, route, registration);
         if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) router.addRoute(.get, path, route, registration);
+        if (comptime transcode.annotated(Service, name)) {
+            if (options.transcode) transcode.registerMethod(Ctx, router, Service, name, M, handler, registration);
+        }
     }
 }
 
@@ -291,6 +304,8 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         // HTTP's own Content-Encoding: dusty decodes the request body and
         // compresses the response (JSON; protobuf is not on its list).
         .connect => res.compress = true,
+        // Only `serveTranscoded` makes these.
+        .http_json => unreachable,
     }
 
     var timeout_ns: ?u64 = null;
@@ -523,7 +538,141 @@ fn finish(call: *Call, result: anyerror!void) !void {
                 call.res.body = try std.fmt.allocPrint(call.arena, "{{\"code\":\"{s}\",\"message\":{f}}}", .{ connectCode(call.status), std.json.fmt(call.status_message, .{}) });
             }
         },
+        .http_json => {
+            if (call.out) |*o| {
+                // A server stream's array has started, under a 200: an error
+                // now can only cut it short, which the client sees as a
+                // reset stream (HTTP/2) or a body without its last chunk
+                // (HTTP/1.1), never as a complete array. Envoy does the same.
+                // `error.Canceled` is what dusty aborts a response on without
+                // calling it a server fault: HTTP/2 resets the stream
+                // (CANCEL), HTTP/1.1 closes the connection.
+                if (call.status != .ok) {
+                    if (call.res.peerGone()) return;
+                    const path = call.req.url[0 .. std.mem.indexOfScalar(u8, call.req.url, '?') orelse call.req.url.len];
+                    log.warn("{s}: JSON stream cut short by {t}: {s}", .{ path, call.status, call.status_message });
+                    return error.Canceled;
+                }
+                for (call.trailers.items) |t| try call.res.trailer(t.key, t.value);
+                try writeBytes(call, "]");
+                o.end() catch {};
+            } else {
+                // Trailing metadata as headers, as grpc-gateway sends it.
+                for (call.trailers.items) |t| {
+                    try call.res.header(try std.fmt.allocPrint(call.arena, "grpc-trailer-{s}", .{t.key}), t.value);
+                }
+                if (call.status == .ok) {
+                    // A server stream that sent nothing is an empty array.
+                    call.res.body = call.unary_response orelse "[]";
+                } else {
+                    call.res.status = connectHttpStatus(call.status);
+                    call.res.body = try transcode.errorBody(call.arena, @backingInt(call.status), call.status_message);
+                }
+            }
+        },
     }
+}
+
+/// A request a `google.api.http` binding matched (transcode.zig): the
+/// request message from the path, the query and the body, the handler, and
+/// the response (or each message of a server stream, as elements of one
+/// array) as JSON. Client and bidirectional streaming are not transcoded:
+/// they answer UNIMPLEMENTED (501).
+pub fn serveTranscoded(
+    comptime M: type,
+    comptime handler: anytype,
+    comptime body: []const u8,
+    comptime response_body: []const u8,
+    ctx: ?*anyopaque,
+    req: *dusty.Request,
+    res: *dusty.Response,
+    captures: []const transcode.Capture,
+    options: *const RegisterOptions,
+) !void {
+    var call: Call = .{
+        .req = req,
+        .res = res,
+        .arena = req.arena,
+        .io = req.io,
+        .ctx = ctx,
+        .data = options.data,
+        .max_message_size = options.max_message_size,
+        .protocol = .http_json,
+        .codec = .json,
+    };
+    res.status = .ok;
+    try res.header("content-type", "application/json");
+    // HTTP's own Content-Encoding, both ways (dusty decodes the request).
+    res.compress = true;
+    const streaming_request = comptime M.kind == .client_streaming or M.kind == .bidi_streaming;
+    if (streaming_request) return finish(&call, call.fail(.unimplemented, unimplemented_streaming));
+
+    if (req.headers.get("grpc-timeout")) |value| {
+        const ns = deadline.parseTimeout(value) catch
+            return finish(&call, call.fail(.invalid_argument, "malformed grpc-timeout"));
+        const d = std.Io.Clock.Timestamp.now(req.io, .awake).addDuration(.{ .raw = .fromNanoseconds(@intCast(@min(ns, std.math.maxInt(i64)))), .clock = .awake });
+        call.deadline = d;
+        req.setTimeout(.{ .deadline = d });
+    } else {
+        req.setTimeout(.none);
+    }
+
+    const request = transcodedRequest(M.Request, body, &call, captures) catch |err| return finish(&call, err);
+    const result = switch (M.kind) {
+        .unary => runTranscodedUnary(M, handler, response_body, &call, request),
+        .server_streaming => runTranscodedStream(M, handler, response_body, &call, request),
+        .client_streaming, .bidi_streaming => call.fail(.unimplemented, unimplemented_streaming),
+    };
+    return finish(&call, result);
+}
+
+const unimplemented_streaming = "client and bidirectional streaming methods are not transcoded; call them over gRPC, gRPC-Web or Connect";
+
+/// The request message of a transcoded call; a request that does not make
+/// one fails the call with INVALID_ARGUMENT.
+fn transcodedRequest(comptime Req: type, comptime body: []const u8, call: *Call, captures: []const transcode.Capture) !Req {
+    var body_text: []const u8 = "";
+    if (body.len > 0) {
+        var in_buf: [16 * 1024]u8 = undefined;
+        var reader = try call.req.reader(&in_buf);
+        body_text = reader.interface.allocRemaining(call.arena, .limited(call.max_message_size + 1)) catch |err| switch (err) {
+            error.StreamTooLong => return error.MessageTooLarge,
+            else => |e| return e,
+        };
+        if (body_text.len > call.max_message_size) return error.MessageTooLarge;
+    }
+    const query = if (std.mem.indexOfScalar(u8, call.req.url, '?')) |q| call.req.url[q + 1 ..] else "";
+    var diag: transcode.Diagnostic = .{};
+    return transcode.decodeRequest(Req, call.arena, body, body_text, captures, query, &diag) catch |err| switch (err) {
+        error.InvalidArgument => call.fail(.invalid_argument, diag.message),
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn runTranscodedUnary(comptime M: type, comptime handler: anytype, comptime response_body: []const u8, call: *Call, request: M.Request) !void {
+    const response = try handler(call, request);
+    call.unary_response = try transcode.encodeResponse(M.Response, call.arena, response, response_body);
+}
+
+/// A server stream as one JSON array, sent element by element: `[` with
+/// the first message, `,` before each next one, and `]` from `finish`.
+fn runTranscodedStream(comptime M: type, comptime handler: anytype, comptime response_body: []const u8, call: *Call, request: M.Request) !void {
+    var buf: [queue_len]M.Response = undefined;
+    var responses: std.Io.Queue(M.Response) = .init(&buf);
+    var group: std.Io.Group = .init;
+    defer group.cancel(call.io);
+    var handler_result: anyerror!void = {};
+    try placement.concurrent(&group, call.io, .local, Tasks(M, handler).serverStreaming, .{ call, request, &responses, &handler_result });
+    while (true) {
+        const message = responses.getOne(call.io) catch |err| switch (err) {
+            error.Closed => break,
+            error.Canceled => return error.Canceled,
+        };
+        const json = try transcode.encodeResponse(M.Response, call.arena, message, response_body);
+        try writeBytes(call, try std.mem.concat(call.arena, u8, &.{ if (call.out == null) "[" else ",", json }));
+    }
+    try group.await(call.io);
+    return handler_result;
 }
 
 /// Connect's name for a code: gRPC's, but "canceled".
