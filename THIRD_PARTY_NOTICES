@@ -164,6 +164,11 @@ src/grpc/gen/grpc/health/v1.pb.zig)
   Licence:  Apache License 2.0 (text in part E). Copyright 2015 The gRPC Authors
   Source:   https://github.com/grpc/grpc-proto, commit 8133308
 
+tests/grpc/proto/grpc/testing/*.proto (and tests/grpc/gen/grpc/testing.pb.zig)
+  The gRPC interop test service, for tests only (not part of the library).
+  Licence:  Apache License 2.0 (text in part E). Copyright The gRPC Authors
+  Source:   https://github.com/grpc/grpc-proto, commit 8133308
+
 src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
   The Connection.Reader/Writer vtables follow tls.zig's src/connection.zig,
   and the declarations mirror the tls.zig API that dusty compiles against.

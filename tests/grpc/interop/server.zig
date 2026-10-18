@@ -1,0 +1,128 @@
+//! grpc.testing.TestService for the gRPC interop suite
+//! (https://github.com/grpc/grpc/blob/master/doc/interop-test-descriptions.md),
+//! on cleartext HTTP/2. tests/grpc/interop/run.sh drives it with grpc-go's
+//! interop client.
+const std = @import("std");
+const anole = @import("anole");
+const pb = @import("anole_interop_pb");
+
+pub const zio_options = anole.zio_options;
+pub const std_options: std.Options = .{
+    .logFn = anole.logFn,
+    .log_level = .info,
+    .log_scope_levels = &.{ .{ .scope = .zio, .level = .info }, .{ .scope = .dusty_access, .level = .warn } },
+};
+
+const Call = anole.grpc.Call;
+const TestService = pb.TestService(Call, anyerror);
+const UnimplementedService = pb.UnimplementedService(Call, anyerror);
+
+fn payload(call: *Call, size: i32) !pb.Payload {
+    if (size < 0) return call.fail(.invalid_argument, "negative size");
+    const body = try call.arena.alloc(u8, @intCast(size));
+    @memset(body, 0);
+    return .{ .type = .COMPRESSABLE, .body = body };
+}
+
+/// Echoes the metadata the interop client asks to have echoed.
+fn echoMetadata(call: *Call) !void {
+    if (call.metadata("x-grpc-test-echo-initial")) |v| try call.addHeader("x-grpc-test-echo-initial", v);
+    if (call.metadata("x-grpc-test-echo-trailing-bin")) |v| try call.addTrailer("x-grpc-test-echo-trailing-bin", v);
+}
+
+fn echoStatus(call: *Call, status: ?pb.EchoStatus) !void {
+    const s = status orelse return;
+    if (s.code == 0) return;
+    return call.fail(anole.grpc.Code.fromInt(@intCast(s.code)), s.message);
+}
+
+fn emptyCall(call: *Call, _: pb.Empty) anyerror!pb.Empty {
+    try echoMetadata(call);
+    return .{};
+}
+
+fn unaryCall(call: *Call, req: pb.SimpleRequest) anyerror!pb.SimpleResponse {
+    try echoMetadata(call);
+    if (req.expect_compressed) |e| if (e.value and call.request_compression == .identity)
+        return call.fail(.invalid_argument, "expected a compressed request");
+    try echoStatus(call, req.response_status);
+    return .{ .payload = try payload(call, req.response_size) };
+}
+
+fn streamingOutputCall(call: *Call, req: pb.StreamingOutputCallRequest, out: *std.Io.Queue(pb.StreamingOutputCallResponse)) anyerror!void {
+    try echoMetadata(call);
+    for (req.response_parameters.items) |p| {
+        if (p.interval_us > 0) try call.io.sleep(.fromMicroseconds(p.interval_us), .awake);
+        try out.putOne(call.io, .{ .payload = try payload(call, p.size) });
+    }
+    try echoStatus(call, req.response_status);
+}
+
+fn streamingInputCall(call: *Call, in: *std.Io.Queue(pb.StreamingInputCallRequest)) anyerror!pb.StreamingInputCallResponse {
+    try echoMetadata(call);
+    var total: i32 = 0;
+    while (true) {
+        const req = in.getOne(call.io) catch |err| switch (err) {
+            error.Closed => break,
+            else => |e| return e,
+        };
+        if (req.payload) |p| total += @intCast(p.body.len);
+    }
+    return .{ .aggregated_payload_size = total };
+}
+
+fn fullDuplexCall(call: *Call, in: *std.Io.Queue(pb.StreamingOutputCallRequest), out: *std.Io.Queue(pb.StreamingOutputCallResponse)) anyerror!void {
+    try echoMetadata(call);
+    while (true) {
+        const req = in.getOne(call.io) catch |err| switch (err) {
+            error.Closed => return,
+            else => |e| return e,
+        };
+        try echoStatus(call, req.response_status);
+        for (req.response_parameters.items) |p| {
+            if (p.interval_us > 0) try call.io.sleep(.fromMicroseconds(p.interval_us), .awake);
+            try out.putOne(call.io, .{ .payload = try payload(call, p.size) });
+        }
+    }
+}
+
+fn halfDuplexCall(call: *Call, in: *std.Io.Queue(pb.StreamingOutputCallRequest), out: *std.Io.Queue(pb.StreamingOutputCallResponse)) anyerror!void {
+    var all: std.ArrayList(pb.StreamingOutputCallRequest) = .empty;
+    while (true) {
+        const req = in.getOne(call.io) catch |err| switch (err) {
+            error.Closed => break,
+            else => |e| return e,
+        };
+        try all.append(call.arena, req);
+    }
+    for (all.items) |req| for (req.response_parameters.items) |p| {
+        try out.putOne(call.io, .{ .payload = try payload(call, p.size) });
+    };
+}
+
+fn unimplemented(call: *Call, _: pb.Empty) anyerror!pb.Empty {
+    return call.fail(.unimplemented, "not implemented");
+}
+
+pub fn main(init: std.process.Init) !void {
+    var port: u16 = 10000;
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
+    var app = try anole.Server(void).init(init.gpa, .{
+        .http = .{ .address = "127.0.0.1", .port = port, .h2c = true },
+    }, {});
+    defer app.deinit();
+    anole.grpc.register(void, app.router, TestService, .{
+        .EmptyCall = emptyCall,
+        .UnaryCall = unaryCall,
+        .CacheableUnaryCall = unaryCall,
+        .StreamingOutputCall = streamingOutputCall,
+        .StreamingInputCall = streamingInputCall,
+        .FullDuplexCall = fullDuplexCall,
+        .HalfDuplexCall = halfDuplexCall,
+        .UnimplementedCall = unimplemented,
+    });
+    std.log.info("interop server on 127.0.0.1:{d}", .{port});
+    try app.run();
+}

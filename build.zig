@@ -232,10 +232,41 @@ pub fn build(b: *std.Build) void {
                 .destination_directory = b.path("tests/grpc/gen"),
                 .generator = dep.artifact("protoc-gen-zig"),
             });
+            const gen_interop = pb.RunProtocStep.create(b, target, .{
+                .source_files = &.{b.path("tests/grpc/proto/grpc/testing/test.proto")},
+                .include_directories = &.{b.path("tests/grpc/proto")},
+                .destination_directory = b.path("tests/grpc/gen"),
+                .generator = dep.artifact("protoc-gen-zig"),
+            });
             const gen = b.step("gen-proto", "Regenerate the Zig for Anole's .proto files (committed)");
             gen.dependOn(gen_health.step);
             gen.dependOn(gen_test.step);
+            gen.dependOn(gen_interop.step);
         };
+    }
+
+    // tests/grpc/interop: grpc.testing.TestService for grpc-go's interop
+    // client (tests/grpc/interop/run.sh).
+    if (features.grpc) {
+        const interop = b.addExecutable(.{
+            .name = "grpc-interop-server",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/grpc/interop/server.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "anole", .module = anole_mod },
+                    .{ .name = "anole_interop_pb", .module = b.createModule(.{
+                        .root_source_file = b.path("tests/grpc/gen/grpc/testing.pb.zig"),
+                        .target = target,
+                        .optimize = optimize,
+                        .imports = &.{.{ .name = "protobuf", .module = c_mods.protobuf.? }},
+                    }) },
+                },
+            }),
+        });
+        b.step("grpc-interop-server", "Build the gRPC interop server (tests/grpc/interop/run.sh runs grpc-go's client)").dependOn(&b.addInstallArtifact(interop, .{}).step);
+        test_step.dependOn(&interop.step);
     }
 
     // tests/autobahn: the WebSocket echo peer for the Autobahn suite.

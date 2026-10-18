@@ -99,3 +99,21 @@ jobs:
       # case that is not OK, NON-STRICT or INFORMATIONAL.
       - name: Autobahn fuzzing client
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
+
+  grpc-interop:
+    name: gRPC interop (grpc-go client, cleartext HTTP/2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: grpc-interop
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Build the interop server
+        run: zig build grpc-interop-server -Doptimize=ReleaseSafe --summary all
+      # grpc-go's interop client (v1.84.0), one test case at a time.
+      - name: Interop test cases
+        run: tests/grpc/interop/run.sh ./zig-out/bin/grpc-interop-server

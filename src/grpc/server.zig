@@ -47,6 +47,11 @@ pub const Call = struct {
     max_message_size: usize,
     request_compression: Compression = .identity,
     response_compression: Compression = .identity,
+    /// The response body, started by the first message (so initial
+    /// metadata can be added until then).
+    out: ?dusty.StreamingBodyWriter = null,
+    out_buf: [16 * 1024]u8 = undefined,
+    write_mutex: std.Io.Mutex = .init,
 
     pub const Error = error{GrpcStatus};
 
@@ -65,6 +70,12 @@ pub const Call = struct {
         self.status = code;
         self.status_message = message;
         return error.GrpcStatus;
+    }
+
+    /// Adds initial metadata (a response header). Only before the first
+    /// response message is sent.
+    pub fn addHeader(self: *Call, name: []const u8, value: []const u8) !void {
+        try self.res.header(name, value);
     }
 
     /// Adds trailing metadata, sent with the status.
@@ -165,10 +176,10 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
     if (req.headers.get("grpc-encoding")) |enc| {
         call.request_compression = Compression.parse(enc) orelse {
             try res.header("grpc-accept-encoding", acceptEncoding());
-            return finish(&call, null, call.fail(.unimplemented, "unsupported grpc-encoding"));
+            return finish(&call, call.fail(.unimplemented, "unsupported grpc-encoding"));
         };
         if (call.request_compression == .gzip and !features.compression)
-            return finish(&call, null, call.fail(.unimplemented, "gzip is not built in"));
+            return finish(&call, call.fail(.unimplemented, "gzip is not built in"));
     }
     if (features.compression) if (req.headers.get("grpc-accept-encoding")) |accepted| {
         if (std.mem.indexOf(u8, accepted, "gzip") != null) call.response_compression = .gzip;
@@ -178,7 +189,7 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
 
     if (req.headers.get("grpc-timeout")) |value| {
         const ns = deadline.parseTimeout(value) catch
-            return finish(&call, null, call.fail(.internal, "malformed grpc-timeout"));
+            return finish(&call, call.fail(.internal, "malformed grpc-timeout"));
         const d = std.Io.Clock.Timestamp.now(req.io, .awake).addDuration(.{ .raw = .fromNanoseconds(@intCast(@min(ns, std.math.maxInt(i64)))), .clock = .awake });
         call.deadline = d;
         req.setTimeout(.{ .deadline = d });
@@ -188,18 +199,16 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         req.setTimeout(.none);
     }
 
-    var out_buf: [16 * 1024]u8 = undefined;
-    var out = try res.stream(&out_buf);
     var in_buf: [16 * 1024]u8 = undefined;
     var body = try req.reader(&in_buf);
 
     const result = switch (M.kind) {
-        .unary => runUnary(M, handler, &call, &body, &out),
-        .server_streaming => runServerStreaming(M, handler, &call, &body, &out),
-        .client_streaming => runClientStreaming(M, handler, &call, &body, &out),
-        .bidi_streaming => runBidi(M, handler, &call, &body, &out),
+        .unary => runUnary(M, handler, &call, &body),
+        .server_streaming => runServerStreaming(M, handler, &call, &body),
+        .client_streaming => runClientStreaming(M, handler, &call, &body),
+        .bidi_streaming => runBidi(M, handler, &call, &body),
     };
-    return finish(&call, &out, result);
+    return finish(&call, result);
 }
 
 fn acceptEncoding() []const u8 {
@@ -208,7 +217,7 @@ fn acceptEncoding() []const u8 {
 
 /// Sends the status (and trailing metadata) as trailers and ends the
 /// stream. Runs even when the call's task was canceled by its deadline.
-fn finish(call: *Call, out: ?*dusty.StreamingBodyWriter, result: anyerror!void) !void {
+fn finish(call: *Call, result: anyerror!void) !void {
     const protection = call.io.swapCancelProtection(.blocked);
     defer _ = call.io.swapCancelProtection(protection);
     if (result) |_| {} else |err| switch (err) {
@@ -246,7 +255,7 @@ fn finish(call: *Call, out: ?*dusty.StreamingBodyWriter, result: anyerror!void) 
     try call.res.trailer("grpc-status", code_text);
     if (call.status_message.len > 0) try call.res.trailer("grpc-message", try percentEncode(call.arena, call.status_message));
     for (call.trailers.items) |t| try call.res.trailer(t.key, t.value);
-    if (out) |o| {
+    if (call.out) |*o| {
         o.end() catch {};
     } else {
         // Nothing streamed yet: the status goes out with an empty body.
@@ -273,26 +282,30 @@ fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader) 
     return Req.decode(&reader, call.arena) catch error.DecodeFailed;
 }
 
-fn writeResponse(comptime Resp: type, call: *Call, out: *dusty.StreamingBodyWriter, message: Resp) !void {
+fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
     var encoded: std.Io.Writer.Allocating = .init(call.arena);
     try message.encode(&encoded.writer, call.arena);
     const payload = encoded.written();
     const framed = try frame.encodeWithCompression(call.arena, payload, call.response_compression);
+    try call.write_mutex.lock(call.io);
+    defer call.write_mutex.unlock(call.io);
+    if (call.out == null) call.out = try call.res.stream(&call.out_buf);
+    const out = &call.out.?;
     out.interface.writeAll(framed) catch return out.err orelse error.WriteFailed;
     out.interface.flush() catch return out.err orelse error.WriteFailed;
 }
 
-fn runUnary(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader, out: *dusty.StreamingBodyWriter) !void {
+fn runUnary(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
     const request = (try readRequest(M.Request, call, body)) orelse
         return call.fail(.unimplemented, "a unary call needs one request message");
     if (try readRequest(M.Request, call, body) != null) return error.ExpectedUnaryMessage;
     const response = try handler(call, request);
-    try writeResponse(M.Response, call, out, response);
+    try writeResponse(M.Response, call, response);
 }
 
 const queue_len = 16;
 
-fn runServerStreaming(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader, out: *dusty.StreamingBodyWriter) !void {
+fn runServerStreaming(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
     const request = (try readRequest(M.Request, call, body)) orelse
         return call.fail(.unimplemented, "a server-streaming call needs one request message");
     if (try readRequest(M.Request, call, body) != null) return error.ExpectedUnaryMessage;
@@ -302,7 +315,7 @@ fn runServerStreaming(comptime M: type, comptime handler: anytype, call: *Call, 
     defer group.cancel(call.io);
     var handler_result: anyerror!void = {};
     try group.concurrent(call.io, Tasks(M, handler).serverStreaming, .{ call, request, &responses, &handler_result });
-    try pumpResponses(M.Response, call, out, &responses);
+    try pumpResponses(M.Response, call, &responses);
     try group.await(call.io);
     return handler_result;
 }
@@ -346,17 +359,17 @@ fn Tasks(comptime M: type, comptime handler: anytype) type {
 }
 
 /// Frames each response the handler queues until it closes the queue.
-fn pumpResponses(comptime Resp: type, call: *Call, out: *dusty.StreamingBodyWriter, responses: *std.Io.Queue(Resp)) !void {
+fn pumpResponses(comptime Resp: type, call: *Call, responses: *std.Io.Queue(Resp)) !void {
     while (true) {
         const message = responses.getOne(call.io) catch |err| switch (err) {
             error.Closed => return,
             error.Canceled => return error.Canceled,
         };
-        try writeResponse(Resp, call, out, message);
+        try writeResponse(Resp, call, message);
     }
 }
 
-fn runClientStreaming(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader, out: *dusty.StreamingBodyWriter) !void {
+fn runClientStreaming(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
     var buf: [queue_len]M.Request = undefined;
     var requests: std.Io.Queue(M.Request) = .init(&buf);
     var group: std.Io.Group = .init;
@@ -371,10 +384,10 @@ fn runClientStreaming(comptime M: type, comptime handler: anytype, call: *Call, 
     requests.close(call.io);
     try group.await(call.io);
     try reader_result;
-    try writeResponse(M.Response, call, out, response);
+    try writeResponse(M.Response, call, response);
 }
 
-fn runBidi(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader, out: *dusty.StreamingBodyWriter) !void {
+fn runBidi(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
     var in_buf: [queue_len]M.Request = undefined;
     var requests: std.Io.Queue(M.Request) = .init(&in_buf);
     var out_buf: [queue_len]M.Response = undefined;
@@ -385,7 +398,7 @@ fn runBidi(comptime M: type, comptime handler: anytype, call: *Call, body: *dust
     var handler_result: anyerror!void = {};
     try group.concurrent(call.io, Tasks(M, handler).readRequests, .{ call, body, &requests, &reader_result });
     try group.concurrent(call.io, Tasks(M, handler).bidi, .{ call, &requests, &responses, &handler_result });
-    try pumpResponses(M.Response, call, out, &responses);
+    try pumpResponses(M.Response, call, &responses);
     try group.await(call.io);
     try reader_result;
     return handler_result;
