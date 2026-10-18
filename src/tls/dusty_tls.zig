@@ -6,14 +6,19 @@
 //! and Writer adapters follow tls.zig's `Connection.Reader`/`Writer` (MIT,
 //! 60d0ced), so dusty's buffer swapping and error descent work unchanged.
 //!
-//! I/O: each SSL gets a custom BIO that reads and writes dusty's ciphertext
-//! `std.Io.Reader`/`Writer` directly. Under zio a BIO read or write yields the
-//! coroutine inside `SSL_do_handshake`/`SSL_read`/`SSL_write`, so the TLS code
-//! is straight-line and BoringSSL never sees WANT_READ/WANT_WRITE.
+//! I/O: one reader task and one writer task may use a connection at the same
+//! time, possibly on different executor threads (HTTP/2 does), which is the
+//! guarantee tls.zig gives. BoringSSL allows one caller per SSL at a time, so:
 //!
-//! BoringSSL's error queue is per OS thread. Every SSL call below clears it
-//! first and reads it before anything can yield, and zio's pinned scheduling
-//! keeps a coroutine on its thread across the yields inside a call.
+//! - every `SSL_*` call runs under the connection's spin lock, which is never
+//!   held across I/O, and BoringSSL's per-thread error queue is cleared and
+//!   read inside it;
+//! - the BIO never waits. Its read callback hands over only ciphertext that the
+//!   reader task already has buffered (WANT_READ otherwise, and the reader
+//!   refills from the socket with the lock released); its write callback
+//!   appends to a pending buffer that only the writer side sends, so ciphertext
+//!   leaves in the order BoringSSL produced it. Output that `SSL_read` itself
+//!   produces (alerts, KeyUpdate) goes out with the next write.
 const std = @import("std");
 const c = @import("anole_boringssl_c");
 
@@ -173,7 +178,7 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     c.ERR_clear_error();
     const ssl = c.SSL_new(auth.server_ctx) orelse return error.OutOfMemory;
     errdefer c.SSL_free(ssl);
-    try attachBio(ssl, input, output);
+    const shared = try attachShared(ssl, input, output);
     c.SSL_set_accept_state(ssl);
 
     if (opt.client_auth) |ca| {
@@ -191,8 +196,8 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     _ = c.SSL_set_ex_data(ssl, alpn_ex_index, @ptrCast(&alpn));
     defer _ = c.SSL_set_ex_data(ssl, alpn_ex_index, null);
 
-    try handshake(ssl);
-    return .{ .ssl = ssl, .alpn_protocol = selectedAlpn(ssl, opt.alpn_protocols) };
+    try handshake(shared);
+    return .{ .shared = shared, .alpn_protocol = selectedAlpn(ssl, opt.alpn_protocols) };
 }
 
 pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client) HandshakeError!Connection {
@@ -200,7 +205,7 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
     c.ERR_clear_error();
     const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
     errdefer c.SSL_free(ssl);
-    try attachBio(ssl, input, output);
+    const shared = try attachShared(ssl, input, output);
     c.SSL_set_connect_state(ssl);
 
     var host_buf: [256]u8 = undefined;
@@ -243,15 +248,18 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
         if (c.SSL_set_alpn_protos(ssl, bytes.ptr, bytes.len) != 0) return error.OutOfMemory;
     }
 
-    try handshake(ssl);
-    return .{ .ssl = ssl, .alpn_protocol = selectedAlpn(ssl, opt.alpn_protocols) };
+    try handshake(shared);
+    return .{ .shared = shared, .alpn_protocol = selectedAlpn(ssl, opt.alpn_protocols) };
 }
 
-/// One TLS connection: owns its SSL (and through it the BIO). dusty stores it
-/// in place after the handshake and frees it with `deinit` (dusty fork patch:
-/// TLS state teardown).
+/// One TLS connection: owns its SSL (and through it the BIO and the shared
+/// state). dusty stores it in place after the handshake and frees it with
+/// `deinit` (dusty fork patch: TLS state teardown).
+///
+/// After the handshake, one task may read while another writes. `deinit`
+/// and `close` must not overlap either of them: join both first.
 pub const Connection = struct {
-    ssl: ?*c.SSL = null,
+    shared: ?*Shared = null,
     /// The negotiated ALPN protocol: one of the strings the caller passed in
     /// `alpn_protocols`, so it outlives the connection.
     alpn_protocol: ?[]const u8 = null,
@@ -271,21 +279,28 @@ pub const Connection = struct {
     };
     pub const WriteError = error{ WriteFailed, TlsFailure };
 
+    /// Frees the SSL, which frees the BIO and the shared state with it.
     pub fn deinit(self: *Connection) void {
-        if (self.ssl) |ssl| c.SSL_free(ssl);
-        self.ssl = null;
+        if (self.shared) |sh| c.SSL_free(sh.ssl);
+        self.shared = null;
     }
 
-    /// Sends close_notify. Best effort: the peer may already be gone.
+    /// Sends close_notify. Best effort: the peer may already be gone. Belongs
+    /// to the writing side.
     pub fn close(self: *Connection) void {
-        const ssl = self.ssl orelse return;
+        const sh = self.shared orelse return;
+        sh.lock();
         c.ERR_clear_error();
-        _ = c.SSL_shutdown(ssl);
+        _ = c.SSL_shutdown(sh.ssl);
         c.ERR_clear_error();
+        sh.unlock();
+        sh.sendPending() catch return;
+        sh.output.flush() catch {};
     }
 
     /// Cleartext into `buf`; 0 means the peer ended the stream, with
-    /// close_notify or by closing the transport between records.
+    /// close_notify or by closing the transport between records. Belongs to
+    /// the reading side.
     ///
     /// A transport EOF without close_notify is taken as a clean end, as
     /// tls.zig does by default: many peers skip close_notify, and HTTP's own
@@ -293,47 +308,67 @@ pub const Connection = struct {
     /// BoringSSL does not say whether the EOF fell inside a record, so
     /// `TlsConnectionTruncated` is never reported.
     fn read(self: *Connection, buf: []u8) ReadError!usize {
-        const ssl = self.ssl.?;
+        const sh = self.shared.?;
         const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
-        c.ERR_clear_error();
-        const rc = c.SSL_read(ssl, buf.ptr, len);
-        if (rc > 0) return @intCast(rc);
-        const bio = bioState(ssl);
-        switch (c.SSL_get_error(ssl, rc)) {
-            c.SSL_ERROR_ZERO_RETURN => return 0,
-            c.SSL_ERROR_SYSCALL => {
-                if (bio.read_failed) return error.ReadFailed;
-                if (bio.eof) return 0;
-                return error.TlsFailure;
-            },
-            else => return switch (queuedError("SSL_read")) {
-                error.TlsBadRecordMac => error.TlsBadRecordMac,
-                error.TlsAlert => error.TlsAlert,
-                else => error.TlsFailure,
-            },
+        while (true) {
+            sh.lock();
+            c.ERR_clear_error();
+            const rc = c.SSL_read(sh.ssl, buf.ptr, len);
+            const code = if (rc > 0) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
+            const failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_read") else null;
+            c.ERR_clear_error();
+            const eof = sh.input_eof;
+            sh.unlock();
+
+            switch (code) {
+                c.SSL_ERROR_NONE => return @intCast(rc),
+                c.SSL_ERROR_WANT_READ => sh.fill() catch |err| switch (err) {
+                    error.ReadFailed => return error.ReadFailed,
+                },
+                c.SSL_ERROR_ZERO_RETURN => return 0,
+                c.SSL_ERROR_SYSCALL => return if (eof) 0 else error.TlsFailure,
+                else => return switch (failure orelse error.TlsFailure) {
+                    error.TlsBadRecordMac => error.TlsBadRecordMac,
+                    error.TlsAlert => error.TlsAlert,
+                    else => error.TlsFailure,
+                },
+            }
         }
     }
 
-    /// Writes all of `bytes` as TLS records into the ciphertext writer,
-    /// without flushing it.
+    /// Encrypts all of `bytes` and hands the records to the ciphertext
+    /// writer, without flushing it. Belongs to the writing side.
     fn writeAll(self: *Connection, bytes: []const u8) WriteError!void {
-        const ssl = self.ssl.?;
+        const sh = self.shared.?;
         var rest = bytes;
         while (rest.len > 0) {
             const n = @min(rest.len, max_plaintext_len);
+            sh.lock();
             c.ERR_clear_error();
-            const rc = c.SSL_write(ssl, rest.ptr, @intCast(n));
-            if (rc <= 0) {
-                if (c.SSL_get_error(ssl, rc) == c.SSL_ERROR_SYSCALL and bioState(ssl).write_failed) return error.WriteFailed;
-                logErrors("SSL_write");
-                return error.TlsFailure;
-            }
+            const rc = c.SSL_write(sh.ssl, rest.ptr, @intCast(n));
+            if (rc <= 0) logErrors("SSL_write");
+            c.ERR_clear_error();
+            sh.unlock();
+            // The memory BIO cannot fail a write, so any failure is TLS-level.
+            if (rc <= 0) return error.TlsFailure;
             rest = rest[@intCast(rc)..];
+            try sh.sendPending();
         }
     }
 
+    /// Sends everything queued. A zero-length SSL_write first makes
+    /// BoringSSL emit anything the reading side queued without writing it
+    /// (a KeyUpdate reply rides on the next write; ssl.h `SSL_write`), so a
+    /// connection that only reads still answers its peer.
     fn flush(self: *Connection) WriteError!void {
-        bioState(self.ssl.?).output.flush() catch return error.WriteFailed;
+        const sh = self.shared.?;
+        sh.lock();
+        c.ERR_clear_error();
+        _ = c.SSL_write(sh.ssl, "", 0);
+        c.ERR_clear_error();
+        sh.unlock();
+        try sh.sendPending();
+        sh.output.flush() catch return error.WriteFailed;
     }
 
     /// dusty passes an empty buffer and later swaps `interface.buffer`,
@@ -430,29 +465,34 @@ pub const Connection = struct {
 // ---------------------------------------------------------------------------
 // Handshake helpers
 
-fn handshake(ssl: *c.SSL) HandshakeError!void {
-    c.ERR_clear_error();
-    const rc = c.SSL_do_handshake(ssl);
-    if (rc == 1) return;
-    const bio = bioState(ssl);
-    switch (c.SSL_get_error(ssl, rc)) {
-        c.SSL_ERROR_SYSCALL => {
-            if (bio.read_failed) return error.ReadFailed;
-            if (bio.write_failed) return error.WriteFailed;
-            if (bio.eof) return error.EndOfStream;
-            return error.TlsFailure;
-        },
-        c.SSL_ERROR_ZERO_RETURN => return error.EndOfStream,
-        else => {
-            const err = queuedError("SSL_do_handshake");
-            // A verification failure is pushed with the reason code
-            // SSL_R_CERTIFICATE_VERIFY_FAILED; the X.509 detail is here.
-            if (err == error.TlsCertificateVerifyFailed) {
-                const v = c.SSL_get_verify_result(ssl);
-                log.debug("certificate verification failed: {s}", .{std.mem.span(c.X509_verify_cert_error_string(v))});
-            }
-            return err;
-        },
+fn handshake(sh: *Shared) HandshakeError!void {
+    while (true) {
+        sh.lock();
+        c.ERR_clear_error();
+        const rc = c.SSL_do_handshake(sh.ssl);
+        const code = if (rc == 1) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
+        const failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_do_handshake") else null;
+        if (failure != null and failure.? == error.TlsCertificateVerifyFailed) {
+            // The reason code is SSL_R_CERTIFICATE_VERIFY_FAILED; the X.509 detail is here.
+            const v = c.SSL_get_verify_result(sh.ssl);
+            log.debug("certificate verification failed: {s}", .{std.mem.span(c.X509_verify_cert_error_string(v))});
+        }
+        c.ERR_clear_error();
+        const eof = sh.input_eof;
+        sh.unlock();
+
+        // Send each flight, and on failure the alert explaining it, before
+        // waiting for the peer.
+        sh.sendPending() catch return error.WriteFailed;
+        sh.output.flush() catch return error.WriteFailed;
+
+        switch (code) {
+            c.SSL_ERROR_NONE => return,
+            c.SSL_ERROR_WANT_READ => try sh.fill(),
+            c.SSL_ERROR_ZERO_RETURN => return error.EndOfStream,
+            c.SSL_ERROR_SYSCALL => return if (eof) error.EndOfStream else error.TlsFailure,
+            else => return failure orelse error.TlsFailure,
+        }
     }
 }
 
@@ -597,18 +637,74 @@ fn trustStore(bundle: std.crypto.Certificate.Bundle) HandshakeError!*c.X509_STOR
 }
 
 // ---------------------------------------------------------------------------
-// The BIO over std.Io
+// Shared state and the BIO
 
-/// Per-SSL BIO state, heap-allocated because the Connection holding the SSL
-/// is copied after the handshake. Freed by the BIO's destroy callback when
-/// SSL_free releases the BIO.
-const BioState = struct {
+/// Per-SSL state shared by the reading and writing sides. Heap-allocated
+/// because the Connection holding it is copied after the handshake; freed by
+/// the BIO's destroy callback when SSL_free releases the BIO.
+const Shared = struct {
+    ssl: *c.SSL,
+    /// dusty's ciphertext reader. Only the reading side touches it: `fill`
+    /// with the lock released, the BIO read callback with it held.
     input: *std.Io.Reader,
+    /// dusty's ciphertext writer. Only the writing side touches it.
     output: *std.Io.Writer,
-    /// What the last read or write saw, for mapping SSL_ERROR_SYSCALL.
-    read_failed: bool = false,
-    write_failed: bool = false,
-    eof: bool = false,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    // Guarded by `mutex`.
+    /// The socket reached end of stream; the BIO reports EOF once `input`
+    /// is drained.
+    input_eof: bool = false,
+    /// Set while `fill` reads into `input`, so the BIO leaves it alone.
+    filling: bool = false,
+    /// Records BoringSSL produced, not yet handed to `output`.
+    pending: std.ArrayList(u8) = .empty,
+
+    /// Owned by the writing side: the other half of the double buffer.
+    sending: std.ArrayList(u8) = .empty,
+
+    fn lock(sh: *Shared) void {
+        while (!sh.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(sh: *Shared) void {
+        sh.mutex.unlock();
+    }
+
+    /// Reads more ciphertext from the socket, with the lock released. Called
+    /// by the reading side after WANT_READ, when the BIO has consumed
+    /// everything buffered.
+    fn fill(sh: *Shared) error{ReadFailed}!void {
+        sh.lock();
+        sh.filling = true;
+        sh.unlock();
+        const result = sh.input.fillMore();
+        sh.lock();
+        sh.filling = false;
+        if (result) |_| {} else |err| switch (err) {
+            error.EndOfStream => sh.input_eof = true,
+            error.ReadFailed => {},
+        }
+        sh.unlock();
+        return result catch |err| switch (err) {
+            error.EndOfStream => {},
+            error.ReadFailed => error.ReadFailed,
+        };
+    }
+
+    /// Hands every pending record to `output`. Writing side only: swapping
+    /// the buffers under the lock and writing with it released keeps records
+    /// in order, since nothing else takes from `pending`.
+    fn sendPending(sh: *Shared) error{WriteFailed}!void {
+        sh.lock();
+        std.mem.swap(std.ArrayList(u8), &sh.pending, &sh.sending);
+        sh.unlock();
+        defer sh.sending.clearRetainingCapacity();
+        if (sh.sending.items.len == 0) return;
+        sh.output.writeAll(sh.sending.items) catch return error.WriteFailed;
+        // An idle connection keeps at most a modest buffer.
+        if (sh.sending.capacity > 64 * 1024) sh.sending.clearAndFree(std.heap.c_allocator);
+    }
 };
 
 var bio_method: ?*c.BIO_METHOD = null;
@@ -630,74 +726,67 @@ fn bioMethod() HandshakeError!*c.BIO_METHOD {
     return m;
 }
 
-fn attachBio(ssl: *c.SSL, input: *std.Io.Reader, output: *std.Io.Writer) HandshakeError!void {
-    const state = std.heap.c_allocator.create(BioState) catch return error.OutOfMemory;
-    state.* = .{ .input = input, .output = output };
+fn attachShared(ssl: *c.SSL, input: *std.Io.Reader, output: *std.Io.Writer) HandshakeError!*Shared {
+    const sh = std.heap.c_allocator.create(Shared) catch return error.OutOfMemory;
+    sh.* = .{ .ssl = ssl, .input = input, .output = output };
     const bio = c.BIO_new(try bioMethod()) orelse {
-        std.heap.c_allocator.destroy(state);
+        std.heap.c_allocator.destroy(sh);
         return error.OutOfMemory;
     };
-    c.BIO_set_data(bio, state);
+    c.BIO_set_data(bio, sh);
     c.BIO_set_init(bio, 1);
     // The SSL takes the one reference for both directions.
     c.SSL_set_bio(ssl, bio, bio);
+    return sh;
 }
 
-fn bioState(ssl: *c.SSL) *BioState {
-    return @ptrCast(@alignCast(c.BIO_get_data(c.SSL_get_rbio(ssl)).?));
+fn bioShared(bio: ?*c.BIO) *Shared {
+    return @ptrCast(@alignCast(c.BIO_get_data(bio).?));
 }
 
+/// Runs inside an SSL call, so with the lock held. Hands over what the
+/// reading side has buffered; never reads the socket.
 fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
-    const state: *BioState = @ptrCast(@alignCast(c.BIO_get_data(bio).?));
+    const sh = bioShared(bio);
     c.BIO_clear_retry_flags(bio);
-    // Whatever is buffered, or one read from the socket: never wait for more
-    // than the peer has sent (BoringSSL asks for up to a whole record).
-    const got = state.input.peekGreedy(1) catch |err| switch (err) {
-        error.EndOfStream => {
-            state.eof = true;
-            return 0;
-        },
-        error.ReadFailed => {
-            state.read_failed = true;
-            return -1;
-        },
-    };
+    const got = if (sh.filling) "" else sh.input.buffered();
+    if (got.len == 0) {
+        if (sh.input_eof and !sh.filling) return 0;
+        c.BIO_set_retry_read(bio);
+        return -1;
+    }
     const n = @min(got.len, @as(usize, @intCast(len)));
     @memcpy(out[0..n], got[0..n]);
-    state.input.toss(n);
+    sh.input.toss(n);
     return @intCast(n);
 }
 
+/// Runs inside an SSL call, so with the lock held. Queues the records for
+/// the writing side.
 fn bioWrite(bio: ?*c.BIO, in: [*c]const u8, len: c_int) callconv(.c) c_int {
-    const state: *BioState = @ptrCast(@alignCast(c.BIO_get_data(bio).?));
+    const sh = bioShared(bio);
     c.BIO_clear_retry_flags(bio);
-    state.output.writeAll(in[0..@intCast(len)]) catch {
-        state.write_failed = true;
-        return -1;
-    };
+    sh.pending.appendSlice(std.heap.c_allocator, in[0..@intCast(len)]) catch return -1;
     return len;
 }
 
 fn bioCtrl(bio: ?*c.BIO, cmd: c_int, larg: c_long, parg: ?*anyopaque) callconv(.c) c_long {
+    _ = bio;
     _ = larg;
     _ = parg;
-    switch (cmd) {
-        c.BIO_CTRL_FLUSH => {
-            const state: *BioState = @ptrCast(@alignCast(c.BIO_get_data(bio).?));
-            state.output.flush() catch {
-                state.write_failed = true;
-                return 0;
-            };
-            return 1;
-        },
-        else => return 0,
-    }
+    // Flushing is the writing side's job (`sendPending`, `Connection.flush`).
+    return switch (cmd) {
+        c.BIO_CTRL_FLUSH => 1,
+        else => 0,
+    };
 }
 
 fn bioDestroy(bio: ?*c.BIO) callconv(.c) c_int {
     if (c.BIO_get_data(bio)) |data| {
-        const state: *BioState = @ptrCast(@alignCast(data));
-        std.heap.c_allocator.destroy(state);
+        const sh: *Shared = @ptrCast(@alignCast(data));
+        sh.pending.deinit(std.heap.c_allocator);
+        sh.sending.deinit(std.heap.c_allocator);
+        std.heap.c_allocator.destroy(sh);
         c.BIO_set_data(bio, null);
     }
     return 1;

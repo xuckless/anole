@@ -17,6 +17,18 @@ pub const c = @import("anole_boringssl_c");
 /// dusty's `tls` module, on BoringSSL (src/tls/dusty_tls.zig).
 pub const dusty_tls = @import("anole_dusty_tls");
 
+/// Test helpers that other test binaries reuse.
+pub const testing = struct {
+    /// Full-duplex check of `dusty_tls` (also run multi-threaded by tests/tls_duplex.zig).
+    pub const duplex = @import("duplex_check.zig");
+};
+
+test "TLS: one connection read and written at once (one executor, tasks interleaved)" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.run(std.testing.allocator, rt.io(), .{ .bytes_per_direction = 2 * 1024 * 1024 });
+}
+
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {
