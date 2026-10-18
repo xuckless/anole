@@ -121,3 +121,23 @@ jobs:
         run: tests/grpc/interop/run.sh ./zig-out/bin/grpc-interop-server
       - name: Interop test cases (Anole client, grpc-go server)
         run: tests/grpc/interop/run-client.sh ./zig-out/bin/grpc-interop-client
+
+  redis:
+    name: Redis and Valkey (live client and session store tests)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["redis:7", "valkey/valkey:8"]
+    services:
+      redis:
+        image: ${{ matrix.image }}
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: redis
+      - name: Tests with a live server
+        run: zig build test -Dredis-test-port=6379 --summary all

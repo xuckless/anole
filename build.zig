@@ -26,6 +26,8 @@ const ngtcp2_build = @import("build/ngtcp2.zig");
 const nghttp3_build = @import("build/nghttp3.zig");
 const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
+const yyjson_build = @import("build/yyjson.zig");
+const hiredis_build = @import("build/hiredis.zig");
 
 /// This file's struct, for `b.lazyImport` (which must name the build.zig that declares the dependency).
 const build_zig = @This();
@@ -54,13 +56,18 @@ pub const Features = struct {
     /// gzip/deflate (zlib-ng) and zstd: response compression and request
     /// decompression.
     compression: bool,
+    /// JSON on yyjson (`anole.json`).
+    json: bool,
+    /// Redis/Valkey on hiredis (`anole.redis`): session and rate-limit
+    /// stores.
+    redis: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .json = false, .redis = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .json = true, .redis = false },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .json = true, .redis = true },
         };
     }
 
@@ -75,12 +82,13 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3 or f.compression;
+        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
-            (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc);
+            (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
+            (!f.json or have.json) and (!f.redis or have.redis);
     }
 };
 
@@ -129,11 +137,13 @@ pub fn build(b: *std.Build) void {
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
     const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .public = true });
 
+    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
+
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port }),
     });
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
@@ -312,6 +322,8 @@ fn resolveFeatures(b: *std.Build) Features {
     const websocket = b.option(bool, "websocket", "WebSocket (overrides the profile)");
     const auth = b.option(bool, "auth", "Auth: JWT, OIDC, sessions, API keys (overrides the profile)");
     const compression = b.option(bool, "compression", "gzip/deflate (zlib-ng) and zstd (overrides the profile)");
+    const json = b.option(bool, "json", "JSON on yyjson (overrides the profile)");
+    const redis = b.option(bool, "redis", "Redis/Valkey client on hiredis (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -321,6 +333,8 @@ fn resolveFeatures(b: *std.Build) Features {
     if (websocket) |v| f.websocket = v;
     if (auth) |v| f.auth = v;
     if (compression) |v| f.compression = v;
+    if (json) |v| f.json = v;
+    if (redis) |v| f.redis = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
@@ -445,6 +459,10 @@ const CModules = struct {
     websocket: ?*std.Build.Module = null,
     /// Arwalk/zig-protobuf's runtime (grpc).
     protobuf: ?*std.Build.Module = null,
+    /// yyjson.h (json)
+    yyjson: ?*std.Build.Module = null,
+    /// hiredis.h (redis)
+    hiredis: ?*std.Build.Module = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -462,6 +480,8 @@ const CModules = struct {
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
         const websocket_dep = if (f.websocket) b.lazyDependency("websocket_zig", .{ .target = target, .optimize = optimize }) else null;
         const protobuf_dep = if (f.grpc) b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) else null;
+        const yyjson_dep = if (f.json) b.lazyDependency("yyjson", .{}) else null;
+        const hiredis_dep = if (f.redis) b.lazyDependency("hiredis", .{}) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
@@ -470,6 +490,8 @@ const CModules = struct {
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
+        if (f.json and yyjson_dep == null) return null;
+        if (f.redis and hiredis_dep == null) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
@@ -494,6 +516,14 @@ const CModules = struct {
             });
             m.zlib = zlib_mod;
             m.zlib_c = c_mod;
+        }
+        if (hiredis_dep) |up| {
+            const lib = hiredis_build.library(b, up, target, optimize);
+            m.hiredis = hiredis_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
+        if (yyjson_dep) |up| {
+            const lib = yyjson_build.library(b, up, target, optimize);
+            m.yyjson = yyjson_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
         if (zstd_dep) |up| {
             const lib = zstd_build.library(b, up, target, optimize);
@@ -549,6 +579,7 @@ const AnoleModuleOptions = struct {
     public: bool = false,
     /// Add test-only imports (the h3 layout probe).
     for_test: bool = false,
+    redis_test_port: ?u16 = null,
 };
 
 /// src/root.zig with its own build_options and only the binding modules its
@@ -563,6 +594,11 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "websocket", f.websocket);
     options.addOption(bool, "auth", f.auth);
     options.addOption(bool, "compression", f.compression);
+    options.addOption(bool, "json", f.json);
+    options.addOption(bool, "redis", f.redis);
+    // A live Redis/Valkey for tests (`-Dredis-test-port=6379`), else those
+    // tests skip.
+    options.addOption(?u16, "redis_test_port", o.redis_test_port);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
@@ -577,6 +613,8 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.http2) mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
     if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
+    if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
+    if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
     // The generated test service (tests/grpc/gen), outside src/.
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),

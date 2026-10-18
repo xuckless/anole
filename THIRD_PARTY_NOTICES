@@ -88,6 +88,17 @@ zstd 1.5.7 (Zstandard)
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
 
+yyjson (JSON reader and writer)
+  Licence:  MIT. Copyright (c) 2020 YaoYuan
+  Source:   https://github.com/ibireme/yyjson (tag archive 0.13.0)
+  Linked:   -Djson=true
+
+hiredis (RESP reader and command formatter)
+  Licence:  BSD-3-Clause (text in part F). Copyright (c) 2009-2011 Salvatore
+            Sanfilippo, (c) 2010-2011 Pieter Noordhuis, and contributors
+  Source:   https://github.com/redis/hiredis (tag archive v1.5.0)
+  Linked:   -Dredis=true
+
 zig-protobuf (protobuf runtime and protoc-gen-zig; protoc release zips)
   Licence:  MIT. Copyright (c) 2021 Arwalk
   Source:   https://github.com/Arwalk/zig-protobuf
@@ -168,6 +179,12 @@ tests/grpc/proto/grpc/testing/*.proto (and tests/grpc/gen/grpc/testing.pb.zig)
   The gRPC interop test service, for tests only (not part of the library).
   Licence:  Apache License 2.0 (text in part E). Copyright The gRPC Authors
   Source:   https://github.com/grpc/grpc-proto, commit 8133308
+
+src/session/root.zig (cookie encryption)
+  The sealed-cookie layout (nonce, ciphertext, tag; XChaCha20-Poly1305)
+  follows jetzig's src/jetzig/http/Session.zig.
+  Licence:  MIT. Copyright 2023-2024 Robert Farrell
+  Source:   https://github.com/jetzig-framework/jetzig, commit f114b07
 
 src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
   The Connection.Reader/Writer vtables follow tls.zig's src/connection.zig,
@@ -436,8 +453,8 @@ not compiled into BoringSSL and so is not reproduced here.
    limitations under the License.
 
 
-F. BSD-3-Clause licence text (zstd)
------------------------------------
+F. BSD-3-Clause licence text (zstd, hiredis)
+--------------------------------------------
 
 Copied verbatim from the LICENSE file of zstd 1.5.7.
 
@@ -465,6 +482,38 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
 ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
 DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Copied verbatim from the COPYING file of hiredis 1.5.0.
+
+Copyright (c) 2009-2011, Salvatore Sanfilippo <antirez at gmail dot com>
+Copyright (c) 2010-2011, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of Redis nor the names of its contributors may be used
+  to endorse or promote products derived from this software without specific
+  prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
 ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
 LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON

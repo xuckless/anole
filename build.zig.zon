@@ -81,6 +81,16 @@
             .hash = "protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv",
             .lazy = true,
         },
+        .yyjson = .{
+            .url = "https://github.com/ibireme/yyjson/archive/refs/tags/0.13.0.tar.gz",
+            .hash = "N-V-__8AABFlbgB11C3wOoHo9lqDatPMvTuIdHI0vwVxDpTe",
+            .lazy = true,
+        },
+        .hiredis = .{
+            .url = "https://github.com/redis/hiredis/archive/refs/tags/v1.5.0.tar.gz",
+            .hash = "N-V-__8AAPwwCwC-qD60sHS0_NF1XJZ_qtzgIE_XlRCts2kn",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
