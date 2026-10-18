@@ -341,3 +341,67 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expect(saw_draining.load(.acquire));
 }
+
+var route_ended_clean: std.atomic.Value(bool) = .init(false);
+
+/// `route`'s handler shape: a `next` loop, which ends with null on the
+/// peer's close.
+fn nextEcho(ws: *websocket.Socket) !void {
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+    route_ended_clean.store(ws.end_error == null, .release);
+}
+
+test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 answered ends the loop" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    route_ended_clean.store(false, .release);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .timeout = .{ .shutdown = .fromSeconds(20) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", websocket.route(void, nextEcho, .{}));
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try client.sendFrame(.text, "through next");
+    try std.testing.expectEqualStrings("through next", try client.nextFrame(&op, &buf));
+    try client.sendFrame(.ping, "p");
+    try std.testing.expectEqualStrings("p", try client.nextFrame(&op, &buf));
+    try std.testing.expectEqual(wsc.Opcode.pong, op);
+
+    var drain = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(io_));
+        }
+    }.run, .{ &server_future, io });
+    const closing = try client.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
+    try client.sendFrame(.close, &.{ 0x03, 0xe9 });
+    client.finished = true;
+    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
+    try drain.await(io);
+    // The loop ended on the close, not on an error.
+    try std.testing.expect(route_ended_clean.load(.acquire));
+}
