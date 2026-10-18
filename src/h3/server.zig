@@ -826,7 +826,18 @@ pub fn Endpoint(comptime Ctx: type) type {
                         .closing, .draining => conn.period_end,
                         .closed => 0,
                     };
-                    if (state == .open and conn.drain != .none) deadline = @min(deadline, conn.drainStep(t));
+                    if (state == .open and conn.drain != .none) {
+                        deadline = @min(deadline, conn.drainStep(t));
+                        // The drain may have closed the connection, its
+                        // CONNECTION_CLOSE written at a later time than
+                        // `t`. ngtcp2 must never see time go back (it
+                        // asserts so, and its timers assume it), so `t` is
+                        // done with: start over.
+                        if (conn.state != .open) {
+                            conn.unlock();
+                            continue;
+                        }
+                    }
                     if (state == .closed) {
                         conn.unlock();
                         return;
