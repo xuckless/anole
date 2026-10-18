@@ -1,0 +1,26 @@
+name: Advisories
+
+# Known vulnerabilities in the bundled C libraries at the pinned versions
+# (tools/advisories.py): weekly, so new advisories surface between pushes,
+# and whenever a pin changes.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [build.zig.zon, tools/advisories.py, .github/workflows/advisories.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Advisories for the pinned C libraries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: GitHub advisories and OSV
+        run: tools/advisories.py
+        env:
+          GH_TOKEN: ${{ github.token }}
