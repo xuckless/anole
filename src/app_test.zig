@@ -291,6 +291,7 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
     var app = try App.init(alloc, .{ .executors = .exact(2) });
     defer app.deinit();
     app.get("/hello", AppRoutes.hello);
+    app.post("/hello", AppRoutes.hello);
 
     const Check = struct {
         fn run(a: *App) !void {
@@ -307,6 +308,16 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
             if (comptime !features.http3) {
                 try std.testing.expect(resp.headers().get("Alt-Svc") == null);
                 return;
+            }
+            {
+                // With HTTP/3 on, early data's guard is too, on every
+                // route: an unsafe request a proxy took early gets 425.
+                var early = try http.Headers.init(alloc, 2);
+                defer early.deinit(alloc);
+                try early.put("Early-Data", "1");
+                var too_early = try dc.fetch(try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/hello", .{port}), .{ .method = .post, .headers = &early, .body = "" });
+                defer too_early.deinit();
+                try std.testing.expectEqual(@as(u16, 425), @intFromEnum(too_early.status()));
             }
             const q = a.http3Address().?;
             var alt_buf: [64]u8 = undefined;
