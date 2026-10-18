@@ -3,18 +3,24 @@
 //! core), builds the listeners (cleartext with h2c, TLS with ALPN), and
 //! `run` serves until SIGINT, SIGTERM or `stop`, then drains.
 //!
-//!     pub const zio_options = anole.zio_options;
-//!
 //!     pub fn main(init: std.process.Init) !void {
-//!         var app = try anole.Server(void).init(init.gpa, .{
-//!             .http = .{ .port = 8080 },
-//!             .https = .{ .port = 8443, .cert = .dev_self_signed },
-//!         }, {});
+//!         var app = try anole.App.init(init.gpa, .{});
 //!         defer app.deinit();
 //!         app.use(anole.middleware.RequestId.init(.{}));
 //!         app.get("/users/:id", getUser);
-//!         try app.run();
+//!         try app.listen(":3000");
 //!     }
+//!
+//! `anole.App` is `Server(void)` with a two-argument `init`. With state,
+//! `Server(App).init(gpa, options, &state)`; the listeners can also be set
+//! in `options` (`http`, `https`, `http3`) and served with `run`:
+//!
+//!     var app = try anole.Server(void).init(init.gpa, .{
+//!         .http = .{ .port = 8080 },
+//!         .https = .{ .port = 8443, .cert = .dev_self_signed },
+//!     }, {});
+//!     ...
+//!     try app.run();
 //!
 //! Everything dusty offers stays reachable: `app.router` is dusty's router,
 //! `app.server` dusty's server, and `anole.http` the whole of dusty.
@@ -28,6 +34,17 @@ const handoff = @import("handoff.zig");
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
+const address_mod = @import("address.zig");
+const handlers = @import("handlers.zig");
+const client_mod = @import("client.zig");
+const observe = @import("observe/root.zig");
+const websocket = if (features.websocket) @import("websocket/root.zig") else struct {
+    pub const UpgradeOptions = struct {};
+};
+const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
+    pub const Health = void;
+    pub const RegisterOptions = struct {};
+};
 
 /// The zio configuration Anole is built for. An executable declares it in
 /// its root file: `pub const zio_options = anole.zio_options;`. Pinned: a
@@ -84,6 +101,10 @@ pub const Options = struct {
     /// How long a restart waits for the new process to be serving before
     /// giving up on it and carrying on.
     restart_timeout_ms: u32 = 10_000,
+    /// Whether `listenTls` also serves HTTP/3 on the same port number (UDP),
+    /// advertised with `Alt-Svc`, when HTTP/3 is built in (the default
+    /// `full` profile): with `http3`'s settings when set, else the defaults.
+    listen_tls_http3: bool = true,
     /// A blocking pool (`anole.blocking`): jobs that run on threads beside
     /// the executors, at most this many at once. Password hashing uses it.
     /// Null: none, and such work runs on the request's executor.
@@ -149,10 +170,31 @@ pub const Options = struct {
         /// A fresh self-signed certificate for localhost, held in memory:
         /// for development only.
         dev_self_signed,
+
+        /// PEM files, read when the server starts (and again by
+        /// `reloadCertificates` and SIGHUP).
+        pub fn fromFiles(cert_path: []const u8, key_path: []const u8) Cert {
+            return .{ .files = .{ .cert_path = cert_path, .key_path = key_path } };
+        }
+
+        /// PEM text in memory.
+        pub fn fromPem(cert: []const u8, key: []const u8) Cert {
+            return .{ .pem = .{ .cert = cert, .key = key } };
+        }
     };
 };
 
+/// `Server(void)` with `init(gpa, options)`: a server without state, for
+/// handlers that take `(req, res)`.
+pub const App = ServerOf(void, true);
+
 pub fn Server(comptime Ctx: type) type {
+    return ServerOf(Ctx, false);
+}
+
+/// `Server(Ctx)`, or with `app_init` `App`: the same server, whose `init`
+/// takes no state.
+fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     comptime checkZioOptions();
     return struct {
         const Self = @This();
@@ -182,6 +224,31 @@ pub fn Server(comptime Ctx: type) type {
         /// Middleware the server copied (`use`, `group`, `middleware`),
         /// deinitialized with it.
         owned_middleware: std.ArrayList(http.Middleware(Ctx)) = .empty,
+        /// What `init` was given when it named no listener (neither
+        /// `http` nor `https`): `listen`, `listenTls` or `run` sets them up
+        /// from it. Null once they are.
+        pending: ?Options = null,
+        /// The `Alt-Svc` middleware, once there is one.
+        alt_svc: ?*AltSvc = null,
+        /// What the one-line helpers made (`client`, `metrics`, `health`,
+        /// `grpcHealth`, `tracing`, `staticDir`), freed with the server.
+        extras: *Extras,
+
+        const Extras = struct {
+            /// The outbound client (`client()`, `anole.client(req)`).
+            client: http.Client,
+            client_entry: client_mod.Entry,
+            client_registered: bool,
+            metrics: ?*observe.metrics.Registry = null,
+            metrics_path: []const u8 = "",
+            health: ?*observe.Health = null,
+            /// `metrics` and `health` register their routes when serving
+            /// starts, so `use` can still follow them.
+            routes_added: bool = false,
+            grpc_health: ?*grpc_mod.Health = null,
+            exporter: ?*observe.trace.Exporter = null,
+            dirs: std.ArrayList(std.Io.Dir) = .empty,
+        };
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
 
@@ -269,17 +336,29 @@ pub fn Server(comptime Ctx: type) type {
         /// A certificate or key file larger than this is refused.
         const max_pem_len = 1 << 20;
 
-        /// `Alt-Svc` on responses that did not come over HTTP/3.
+        /// `Alt-Svc` on responses that did not come over HTTP/3, once
+        /// HTTP/3 is set up (`value`).
         const AltSvc = struct {
-            value: []const u8,
+            value: ?[]const u8 = null,
 
             pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
-                if (req.version_major != 3) try res.header("Alt-Svc", self.value);
+                if (self.value) |v| if (req.version_major != 3) try res.header("Alt-Svc", v);
                 return executor.next();
             }
         };
 
-        pub fn init(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) !Self {
+        /// `App.init(gpa, options)`, or `Server(Ctx).init(gpa, options,
+        /// state)`: the runtime, the server and the routes' home. The
+        /// listeners `options` names (`http`, `https`, `http3`) are set up
+        /// here; with neither `http` nor `https`, by `listen`, `listenTls`
+        /// or `run` (127.0.0.1:8080).
+        pub const init = if (app_init) initApp else initState;
+
+        fn initApp(gpa: std.mem.Allocator, opts: Options) !Self {
+            return initState(gpa, opts, {});
+        }
+
+        fn initState(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) !Self {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
@@ -297,6 +376,73 @@ pub fn Server(comptime Ctx: type) type {
             server_on_thread = true;
             errdefer server_on_thread = false;
 
+            var server_config = opts.server;
+            server_config.listeners = &.{};
+            server_config.http2 = opts.http2;
+            server_config.errors = opts.errors;
+            if (opts.error_handler) |h| server_config.error_handler = h;
+            const server = try a.create(http.Server(Ctx));
+            server.* = .init(gpa, rt_io, server_config, ctx);
+            errdefer server.deinit();
+            const stopped = try a.create(std.Io.Event);
+            stopped.* = .unset;
+
+            var pool: ?*blocking.Pool = null;
+            if (opts.blocking) |b| {
+                const p = try a.create(blocking.Pool);
+                try p.init(rt, b);
+                pool = p;
+            }
+            errdefer if (pool) |p| p.deinit();
+
+            const extras = try a.create(Extras);
+            extras.* = .{ .client = http.Client.init(gpa, rt_io, .{}), .client_entry = undefined, .client_registered = false };
+            extras.client_entry = .{ .rt = rt, .client = &extras.client };
+            extras.client_registered = client_mod.register(&extras.client_entry);
+            errdefer {
+                if (extras.client_registered) client_mod.unregister(&extras.client_entry);
+                extras.client.deinit();
+            }
+
+            var self: Self = .{
+                .gpa = gpa,
+                .rt = rt,
+                .arena = arena,
+                .server = server,
+                .router = &server.router,
+                .stopped = stopped,
+                .process = opts.process,
+                .restart_timeout_ms = opts.restart_timeout_ms,
+                .h3 = if (features.http3) null else {},
+                .blocking_pool = pool,
+                .extras = extras,
+            };
+            if (opts.http == null and opts.https == null) {
+                self.pending = opts;
+                // `listenTls` turns HTTP/3 on once routes exist, when no
+                // middleware can be added any more: its `Alt-Svc` goes in
+                // now, silent until then.
+                if (features.http3 and (opts.http3 != null or opts.listen_tls_http3)) self.alt_svc = self.addAltSvc();
+            } else {
+                try self.listenOn(opts);
+            }
+            return self;
+        }
+
+        fn addAltSvc(self: *Self) *AltSvc {
+            const alt = self.arena.allocator().create(AltSvc) catch @panic("OOM");
+            alt.* = .{};
+            self.router.use(http.Middleware(Ctx).init(alt));
+            return alt;
+        }
+
+        /// Sets up the listeners `opts` names (`http`, `https`, `http3`;
+        /// 127.0.0.1:8080 when it names none). Once, before serving.
+        fn listenOn(self: *Self, opts: Options) !void {
+            const gpa = self.gpa;
+            const a = self.arena.allocator();
+            const rt_io = self.rt.io();
+            const server = self.server;
             // One accept loop per executor (dusty's default on zio); on
             // Linux each with its own SO_REUSEPORT socket, so the kernel
             // spreads connections over the executors.
@@ -351,15 +497,8 @@ pub fn Server(comptime Ctx: type) type {
             // The HTTPS listener comes last; the list grows no more.
             if (cert_state) |cs| cs.listener = &listeners.items[listeners.items.len - 1];
 
-            var server_config = opts.server;
-            server_config.listeners = listeners.items;
-            server_config.http2 = opts.http2;
-            server_config.errors = opts.errors;
-            if (opts.error_handler) |h| server_config.error_handler = h;
-            const server = try a.create(http.Server(Ctx));
-            server.* = .init(gpa, rt_io, server_config, ctx);
-            const stopped = try a.create(std.Io.Event);
-            stopped.* = .unset;
+            server.config.listeners = listeners.items;
+            errdefer server.config.listeners = &.{};
 
             var endpoint: H3Endpoint = if (features.http3) null else {};
             if (opts.http3) |q| {
@@ -404,32 +543,15 @@ pub fn Server(comptime Ctx: type) type {
                         try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
                     if (handoff_mode) try held.append(a, .{ .fd = ep.udp.socket.handle, .name = "h3" });
                     if (q.alt_svc) {
-                        const alt = try a.create(AltSvc);
-                        alt.* = .{ .value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{ep.address().getPort()}) };
-                        server.router.use(http.Middleware(Ctx).init(alt));
+                        const alt = self.alt_svc orelse self.addAltSvc();
+                        self.alt_svc = alt;
+                        alt.value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{ep.address().getPort()});
                     }
                 }
             }
-            var pool: ?*blocking.Pool = null;
-            if (opts.blocking) |b| {
-                const p = try a.create(blocking.Pool);
-                try p.init(rt, b);
-                pool = p;
-            }
-            return .{
-                .gpa = gpa,
-                .rt = rt,
-                .arena = arena,
-                .server = server,
-                .router = &server.router,
-                .stopped = stopped,
-                .process = opts.process,
-                .held = held.items,
-                .restart_timeout_ms = opts.restart_timeout_ms,
-                .h3 = endpoint,
-                .blocking_pool = pool,
-                .cert = cert_state,
-            };
+            self.held = held.items;
+            self.h3 = endpoint;
+            self.cert = cert_state;
         }
 
         /// The HTTP/3 endpoint's mutual TLS settings: the TCP listener's
@@ -459,6 +581,10 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            const extras = self.extras;
+            // First: it sends what is queued through the client, on the
+            // runtime.
+            if (extras.exporter) |e| e.deinit();
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
             // Last added, first freed.
@@ -467,6 +593,11 @@ pub fn Server(comptime Ctx: type) type {
                 i -= 1;
                 self.owned_middleware.items[i].deinit();
             }
+            if (extras.metrics) |r| r.deinit();
+            if (comptime features.grpc) if (extras.grpc_health) |h| h.deinit();
+            if (extras.client_registered) client_mod.unregister(&extras.client_entry);
+            extras.client.deinit();
+            for (extras.dirs.items) |d| d.close(self.rt.io());
             if (self.cert) |cs| cs.deinit();
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
@@ -481,13 +612,69 @@ pub fn Server(comptime Ctx: type) type {
             return self.rt.io();
         }
 
-        /// A copy of `value`, a middleware (a struct with `execute`), that
-        /// the server owns: freed with it, after its `deinit` if it has one.
-        /// The handle can go into several groups. A handle given in place of
-        /// a value is returned as it is.
+        /// Serves on `address`, in Go's notation, until SIGINT, SIGTERM or
+        /// `stop`, as `run` does: ":3000" is every IPv4 interface (as in
+        /// a container), "127.0.0.1:3000" or "localhost:3000" this machine
+        /// only, "[::]:3000" every IPv6 interface. HTTP/1.1, and HTTP/2 for
+        /// clients that open with its preface (h2c). For a server whose
+        /// `init` options named no listener.
+        pub fn listen(self: *Self, address: []const u8) !void {
+            var opts = try self.takePending("listen");
+            const at = address_mod.parse(address) catch |err| return self.failStart(err);
+            opts.http = .{ .address = at.host, .port = at.port };
+            try self.configure(opts);
+            return self.run();
+        }
+
+        /// `listen`, over TLS with `cert`: HTTP/2 and HTTP/1.1 by ALPN, and
+        /// HTTP/3 on the same port number over UDP (advertised with
+        /// `Alt-Svc`) when it is built in, unless `Options.listen_tls_http3`
+        /// is off.
+        ///
+        ///     try app.listenTls(":443", .fromFiles("cert.pem", "key.pem"));
+        ///     try app.listenTls("localhost:8443", .dev_self_signed);
+        pub fn listenTls(self: *Self, address: []const u8, cert: Options.Cert) !void {
+            var opts = try self.takePending("listenTls");
+            const at = address_mod.parse(address) catch |err| return self.failStart(err);
+            opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
+            if (features.http3 and opts.listen_tls_http3 and opts.http3 == null) opts.http3 = .{};
+            try self.configure(opts);
+            return self.run();
+        }
+
+        fn takePending(self: *Self, comptime what: []const u8) !Options {
+            return self.pending orelse {
+                std.log.scoped(.anole).info(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
+                return self.failStart(error.ListenersAlreadySet);
+            };
+        }
+
+        /// The listeners `init` left for later; a failure also ends
+        /// `waitReady`.
+        fn configure(self: *Self, opts: Options) !void {
+            self.pending = null;
+            self.listenOn(opts) catch |err| return self.failStart(err);
+        }
+
+        /// `err`, also for whoever waits in `waitReady`: the server will
+        /// not start.
+        fn failStart(self: *Self, err: anyerror) anyerror {
+            if (!self.server.settled.isSet()) {
+                self.server.start_error = err;
+                self.server.settled.set(self.rt.io());
+            }
+            return err;
+        }
+
+        /// A copy of `value`, a middleware (a struct with `execute`, or a
+        /// function: see `anole.func`), that the server owns: freed with
+        /// it, after its `deinit` if it has one. The handle can go into
+        /// several groups. A handle given in place of a value is returned
+        /// as it is.
         pub fn middleware(self: *Self, value: anytype) http.Middleware(Ctx) {
             const T = @TypeOf(value);
             if (T == http.Middleware(Ctx)) return value;
+            if (comptime handlers.isFn(T)) return self.middleware(handlers.func(value));
             const copy = self.arena.allocator().create(T) catch @panic("OOM");
             copy.* = value;
             const handle = http.Middleware(Ctx).init(copy);
@@ -497,46 +684,98 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Adds a global middleware, run before every route, in the order
         /// added. Before the routes, as `Router.use` requires. A value is
-        /// copied and owned by the server (see `middleware`).
+        /// copied and owned by the server (see `middleware`); a function
+        /// `fn (req, res, next: anole.Next) !void` is taken too.
         pub fn use(self: *Self, value: anytype) void {
             self.router.use(self.middleware(value));
         }
 
-        pub fn get(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.get(path, handler);
+        /// `handler` as the router takes it: a plain `(req, res)` handler
+        /// is taken on a server with state too.
+        fn route(comptime handler: anytype) Handler {
+            return handlers.adapt(Ctx, handler);
         }
-        pub fn head(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.head(path, handler);
+
+        pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.get(path, route(handler));
         }
-        pub fn post(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.post(path, handler);
+        pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.head(path, route(handler));
         }
-        pub fn put(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.put(path, handler);
+        pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.post(path, route(handler));
         }
-        pub fn patch(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.patch(path, handler);
+        pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.put(path, route(handler));
         }
-        pub fn delete(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.delete(path, handler);
+        pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.patch(path, route(handler));
         }
-        pub fn options(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.options(path, handler);
+        pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.delete(path, route(handler));
+        }
+        pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.options(path, route(handler));
         }
         /// The HTTP QUERY method (a GET with a body).
-        pub fn query(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.query(path, handler);
+        pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.query(path, route(handler));
         }
-        pub fn any(self: *Self, path: []const u8, handler: Handler) void {
-            self.router.any(path, handler);
+        pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.router.any(path, route(handler));
+        }
+
+        /// A WebSocket endpoint at `path`, over HTTP/1.1 and HTTP/2
+        /// (RFC 8441): `handler` gets the open socket, which is closed
+        /// when it returns, and with 1001 when the server drains. A plain
+        /// HTTP request there gets 426 Upgrade Required. `handler` is
+        /// `fn (ws: *anole.websocket.Socket, req: *anole.Request) !void`
+        /// (the request may be left out; the server's state may come
+        /// first):
+        ///
+        ///     fn echo(ws: *anole.websocket.Socket, _: *anole.Request) !void {
+        ///         while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+        ///     }
+        ///     app.ws("/echo", echo);
+        pub fn ws(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.wsWith(path, handler, .{});
+        }
+
+        /// `ws` with upgrade options (message size limit, compression,
+        /// timeout, the drain close).
+        pub fn wsWith(self: *Self, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+            if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+            self.router.get(path, websocket.route(Ctx, handler, upgrade));
         }
 
         /// Serves the files under `dir` below `prefix`: ranges, ETags and
         /// conditional requests, and precompressed copies (`style.css.br`,
         /// `.zst`, `.gz`) when `opts.precompressed` lists them. `dir` must
-        /// stay open while the server runs.
+        /// stay open while the server runs; `staticDir` opens and closes
+        /// one for you.
         pub fn static(self: *Self, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
             self.router.static(prefix, dir, opts);
+        }
+
+        /// `static` from the directory at `path` (relative to the working
+        /// directory), which the server opens now and closes with itself.
+        ///
+        ///     try app.staticDir("/", "public", .{});
+        pub fn staticDir(self: *Self, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
+            self.router.static(prefix, try self.openDir(path), opts);
+        }
+
+        fn openDir(self: *Self, path: []const u8) !std.Io.Dir {
+            const io_ = self.rt.io();
+            const dir = std.Io.Dir.cwd().openDir(io_, path, .{}) catch |err| {
+                std.log.scoped(.anole).err("cannot open the static directory \"{s}\": {t}", .{ path, err });
+                return err;
+            };
+            self.extras.dirs.append(self.arena.allocator(), dir) catch {
+                dir.close(io_);
+                return error.OutOfMemory;
+            };
+            return dir;
         }
 
         /// Serves `data` (usually `@embedFile`) at `path`.
@@ -548,9 +787,18 @@ pub fn Server(comptime Ctx: type) type {
         /// ones): a tuple whose values are copied and owned by the server,
         /// as with `use`, and whose handles (`middleware`, or
         /// `anole.Middleware(Ctx).init(&value)` for a value you keep) are
-        /// taken as they are. A slice of handles works too.
+        /// taken as they are; functions are taken as with `use`. A slice
+        /// of handles works too.
         pub fn group(self: *Self, prefix: []const u8, middlewares: anytype) Group {
             return .{ .server = self, .inner = self.router.group(prefix, self.handles(middlewares)) };
+        }
+
+        /// Routes behind `middlewares` with no prefix: middleware for the
+        /// routes registered through it alone.
+        ///
+        ///     app.with(.{requireAdmin}).delete("/users/:id", deleteUser);
+        pub fn with(self: *Self, middlewares: anytype) Group {
+            return self.group("", middlewares);
         }
 
         /// `middlewares` (a tuple of values and handles, or a slice or array
@@ -579,40 +827,246 @@ pub fn Server(comptime Ctx: type) type {
             pub fn group(g: Group, prefix: []const u8, middlewares: anytype) Group {
                 return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
             }
-            pub fn get(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.get(path, handler);
+            /// Routes behind more middleware, with no further prefix.
+            pub fn with(g: Group, middlewares: anytype) Group {
+                return g.group("", middlewares);
             }
-            pub fn head(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.head(path, handler);
+            pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.get(path, route(handler));
             }
-            pub fn post(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.post(path, handler);
+            pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.head(path, route(handler));
             }
-            pub fn put(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.put(path, handler);
+            pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.post(path, route(handler));
             }
-            pub fn patch(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.patch(path, handler);
+            pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.put(path, route(handler));
             }
-            pub fn delete(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.delete(path, handler);
+            pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.patch(path, route(handler));
             }
-            pub fn options(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.options(path, handler);
+            pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.delete(path, route(handler));
             }
-            pub fn query(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.query(path, handler);
+            pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.options(path, route(handler));
             }
-            pub fn any(g: Group, path: []const u8, handler: Handler) void {
-                g.inner.any(path, handler);
+            pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.query(path, route(handler));
+            }
+            pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.inner.any(path, route(handler));
+            }
+            pub fn ws(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.wsWith(path, handler, .{});
+            }
+            pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+                if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                g.inner.get(path, websocket.route(Ctx, handler, upgrade));
             }
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
                 g.inner.static(prefix, dir, opts);
+            }
+            pub fn staticDir(g: Group, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
+                g.inner.static(prefix, try g.server.openDir(path), opts);
             }
             pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
                 g.inner.embedded(path, data, opts);
             }
         };
+
+        /// The server's outbound HTTP client, made with the server and
+        /// shared by every handler; `anole.client(req)` finds the same one
+        /// from a request.
+        pub fn client(self: *Self) client_mod.Client {
+            return .{ .http = &self.extras.client };
+        }
+
+        /// Serves the gRPC service `Service` with the handlers in `impl`,
+        /// over gRPC (HTTP/2), gRPC-Web, Connect (Connect GET for methods
+        /// marked `NO_SIDE_EFFECTS`), and as REST routes for methods
+        /// annotated with `google.api.http` (JSON transcoding).
+        ///
+        /// `Service` is the generated service (`pb.Greeter`, or an
+        /// instance `pb.Greeter(anole.grpc.Call, anyerror)`). `impl` holds
+        /// the handlers, `fn (call: *anole.grpc.Call, request) !Response`
+        /// and the streaming shapes: a struct literal
+        /// (`.{ .SayHello = sayHello }`), a type that declares them by
+        /// method name, or a pointer to a value whose methods take it first
+        /// (`fn (self: *Greeter, call, request)`).
+        pub fn grpc(self: *Self, comptime Service: anytype, impl: anytype) void {
+            self.grpcWith(Service, impl, .{});
+        }
+
+        /// `grpc`, with options for this registration (the message size
+        /// limit, transcoding off).
+        pub fn grpcWith(self: *Self, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+            if (comptime !features.grpc) @compileError("app.grpc needs gRPC (-Dgrpc, on in the full profile)");
+            const Svc = if (@TypeOf(Service) == type) Service else Service(grpc_mod.Call, anyerror);
+            const I = @TypeOf(impl);
+            if (@typeInfo(I) == .pointer and @typeInfo(@typeInfo(I).pointer.child) == .@"struct") {
+                // Methods on a value: the registration carries the pointer
+                // (`Call.data`) to them.
+                var with_data = opts;
+                with_data.data = @ptrCast(@constCast(impl));
+                grpc_mod.registerWith(Ctx, self.router, Svc, comptime boundMethods(Svc, @typeInfo(I).pointer.child), with_data);
+            } else if (I == type) {
+                grpc_mod.registerWith(Ctx, self.router, Svc, comptime declaredMethods(Svc, impl), opts);
+            } else {
+                grpc_mod.registerWith(Ctx, self.router, Svc, comptime listedMethods(Svc, impl), opts);
+            }
+        }
+
+        /// The service's handlers from a struct literal naming each one.
+        fn listedMethods(comptime Svc: type, comptime impl: anytype) Svc {
+            if (@TypeOf(impl) == Svc) return impl;
+            var out: Svc = undefined;
+            for (@typeInfo(Svc).@"struct".field_names) |name| {
+                if (!@hasField(@TypeOf(impl), name)) @compileError("no handler for " ++ Svc.service_name ++ "." ++ name ++ " in " ++ @typeName(@TypeOf(impl)));
+                @field(out, name) = @field(impl, name);
+            }
+            return out;
+        }
+
+        /// The service's handlers from `Impl`'s declarations.
+        fn declaredMethods(comptime Svc: type, comptime Impl: type) Svc {
+            var out: Svc = undefined;
+            for (@typeInfo(Svc).@"struct".field_names) |name| {
+                if (!@hasDecl(Impl, name)) @compileError(@typeName(Impl) ++ " has no handler for " ++ Svc.service_name ++ "." ++ name);
+                @field(out, name) = @field(Impl, name);
+            }
+            return out;
+        }
+
+        /// The service's handlers from `T`'s methods, each called on the
+        /// value the registration carries.
+        fn boundMethods(comptime Svc: type, comptime T: type) Svc {
+            var out: Svc = undefined;
+            const info = @typeInfo(Svc).@"struct";
+            for (info.field_names, info.field_types) |name, F| {
+                if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " has no method for " ++ Svc.service_name ++ "." ++ name);
+                const method = @field(T, name);
+                const f = @typeInfo(@typeInfo(F).pointer.child).@"fn";
+                const R = f.return_type.?;
+                const Call = grpc_mod.Call;
+                @field(out, name) = if (f.param_types.len == 2) struct {
+                    fn call(c: *Call, a: f.param_types[1].?) R {
+                        return method(@as(*T, @ptrCast(@alignCast(c.data.?))), c, a);
+                    }
+                }.call else struct {
+                    fn call(c: *Call, a: f.param_types[1].?, b: f.param_types[2].?) R {
+                        return method(@as(*T, @ptrCast(@alignCast(c.data.?))), c, a, b);
+                    }
+                }.call;
+            }
+            return out;
+        }
+
+        /// The routes `metrics` and `health` left for when serving starts.
+        fn addHelperRoutes(self: *Self) void {
+            const extras = self.extras;
+            if (extras.routes_added) return;
+            extras.routes_added = true;
+            if (extras.metrics) |r| r.serveOn(Ctx, self.router, extras.metrics_path);
+            if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
+        }
+
+        /// The standard gRPC health service (grpc.health.v1), owned by the
+        /// server: the server as a whole ("") is SERVING, and every service
+        /// turns NOT_SERVING when the server drains. Set a service's status
+        /// through what it returns.
+        pub fn grpcHealth(self: *Self) *grpc_mod.Health {
+            if (comptime !features.grpc) @compileError("app.grpcHealth needs gRPC (-Dgrpc, on in the full profile)");
+            if (self.extras.grpc_health) |h| return h;
+            const h = self.arena.allocator().create(grpc_mod.Health) catch @panic("OOM");
+            h.* = .init(self.gpa, self.rt.io());
+            h.registerOn(Ctx, self.router);
+            self.extras.grpc_health = h;
+            return h;
+        }
+
+        pub const MetricsOptions = struct {
+            /// Where Prometheus scrapes.
+            path: []const u8 = "/metrics",
+            /// Count every request (`anole_http_*`), through a middleware.
+            /// Off: `/metrics` serves only what is added to the registry.
+            http: bool = true,
+            /// Paths the HTTP metrics leave out.
+            exclude: []const []const u8 = &observe.probe_paths,
+        };
+
+        /// Prometheus metrics at `/metrics`, with the HTTP request counts,
+        /// durations and requests in flight. Returns the registry, owned by
+        /// the server, for metrics of your own. It adds a middleware: call
+        /// it with the other `use` calls, before the routes. (The
+        /// `/metrics` route itself is added when serving starts.)
+        pub fn metrics(self: *Self, opts: MetricsOptions) *observe.metrics.Registry {
+            if (self.extras.metrics) |r| return r;
+            if (opts.http and self.router.has_routes) @panic("app.metrics() adds a middleware, so it goes before the routes, with app.use()");
+            const r = self.arena.allocator().create(observe.metrics.Registry) catch @panic("OOM");
+            r.* = .init(self.gpa, self.rt.io());
+            self.extras.metrics = r;
+            self.extras.metrics_path = opts.path;
+            if (opts.http) self.use(observe.metrics.HttpMetrics.init(r, .{ .exclude = opts.exclude }) catch @panic("OOM"));
+            return r;
+        }
+
+        /// `/healthz` (alive) and `/readyz` (every readiness check passes
+        /// and the server is not draining). Returns them, owned by the
+        /// server, for `addCheck`. The routes are added when serving
+        /// starts, after everything `use` adds.
+        pub fn health(self: *Self, opts: observe.Health.Options) *observe.Health {
+            if (self.extras.health) |h| return h;
+            const h = self.arena.allocator().create(observe.Health) catch @panic("OOM");
+            h.* = .init(opts);
+            self.extras.health = h;
+            return h;
+        }
+
+        pub const TracingOptions = struct {
+            /// The collector's OTLP/HTTP base URL. Null: the
+            /// `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (read
+            /// through `Options.process`), else http://localhost:4318.
+            endpoint: ?[]const u8 = null,
+            /// Null: `OTEL_SERVICE_NAME` (as above), else "anole".
+            service_name: ?[]const u8 = null,
+            /// Record every request, or only those whose caller sampled.
+            sample_all: bool = true,
+            /// Paths not traced.
+            exclude: []const []const u8 = &observe.probe_paths,
+            batch_size: usize = 256,
+            interval_ms: u32 = 2000,
+            queue_len: usize = 4096,
+        };
+
+        /// OpenTelemetry traces: a span per request (W3C `traceparent` in
+        /// and out), sent in batches to an OTLP/HTTP collector through the
+        /// server's client. The exporter is owned by the server, which
+        /// sends what is left when it is freed. It adds a middleware: call
+        /// it with the other `use` calls, before the routes.
+        pub fn tracing(self: *Self, opts: TracingOptions) !*observe.trace.Exporter {
+            if (self.extras.exporter) |e| return e;
+            if (self.router.has_routes) @panic("app.tracing() adds a middleware, so it goes before the routes, with app.use()");
+            const env = if (self.process) |p| p.environ else null;
+            const e = try self.arena.allocator().create(observe.trace.Exporter);
+            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), &self.extras.client, .{
+                .endpoint = opts.endpoint orelse (if (env) |v| v.getPosix("OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
+                .service_name = opts.service_name orelse (if (env) |v| v.getPosix("OTEL_SERVICE_NAME") else null) orelse "anole",
+                .sample_all = opts.sample_all,
+                .exclude = opts.exclude,
+                .batch_size = opts.batch_size,
+                .interval_ms = opts.interval_ms,
+                .queue_len = opts.queue_len,
+            });
+            e.start() catch |err| {
+                e.deinit();
+                return err;
+            };
+            self.extras.exporter = e;
+            self.use(observe.trace.Middleware.init(e));
+            return e;
+        }
 
         /// Loads the TLS certificate and key again (from their files, for
         /// `.files`) and the client CAs of `https.client_auth` (from theirs),
@@ -706,6 +1160,8 @@ pub fn Server(comptime Ctx: type) type {
         /// drains the requests in flight (bounded by `timeout.shutdown`).
         /// Call it from the thread that called `init`.
         pub fn run(self: *Self) !void {
+            if (self.pending) |opts| try self.configure(opts);
+            self.addHelperRoutes();
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,
@@ -751,6 +1207,8 @@ pub fn Server(comptime Ctx: type) type {
             } else if (self.process) |p| {
                 sd_notify.stopping(p.environ);
             }
+            // gRPC health watchers hear of the drain before it starts.
+            if (comptime features.grpc) if (self.extras.grpc_health) |h| h.shutdown();
             // Cancels the server's run, which drains, then the watchers.
             sel.cancelDiscard();
             switch (first) {
@@ -1257,10 +1715,13 @@ test "anole.Server: a second server on the same thread is refused, and one after
     second.deinit();
 }
 
-test "anole.Server: http listens on 127.0.0.1:8080 when nothing is set" {
+test "anole.Server: http listens on 127.0.0.1:8080 when nothing is set, from run on" {
     const gpa = std.testing.allocator;
     var app = try Server(void).init(gpa, .{ .executors = .exact(1) }, {});
     defer app.deinit();
+    // Left for `listen`, `listenTls` or `run`.
+    try std.testing.expectEqual(@as(usize, 0), app.server.config.listeners.len);
+    try app.configure(app.pending.?);
     const listeners = app.server.config.listeners;
     try std.testing.expectEqual(@as(usize, 1), listeners.len);
     try std.testing.expectEqual(@as(u16, 8080), listeners[0].address.ip.getPort());

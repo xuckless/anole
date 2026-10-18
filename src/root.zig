@@ -19,7 +19,24 @@ pub const zio = @import("zio");
 /// The server: runtime, listeners, signals and drain in one call. See
 /// `server.zig`.
 pub const Server = @import("server.zig").Server;
+/// A server without state: `anole.App.init(gpa, .{})`, then routes, then
+/// `app.listen(":3000")`.
+pub const App = @import("server.zig").App;
 pub const ServerOptions = @import("server.zig").Options;
+/// A TLS certificate for `listenTls` and `ServerOptions.https`:
+/// `.fromFiles("cert.pem", "key.pem")`, `.fromPem(cert, key)` or
+/// `.dev_self_signed`.
+pub const Cert = ServerOptions.Cert;
+/// Middleware as a function, `fn (req, res, next: anole.Next) !void`;
+/// `use`, `group` and `with` also take the bare function.
+pub const func = @import("handlers.zig").func;
+pub const Next = @import("handlers.zig").Next;
+/// The server's outbound HTTP client, from a request or a `std.Io` of the
+/// server's runtime: `anole.client(req).fetch(url, .{})`.
+pub const client = @import("client.zig").client;
+pub const Client = @import("client.zig").Client;
+pub const ClientResponse = @import("client.zig").Response;
+pub const FetchOptions = @import("client.zig").FetchOptions;
 /// Declare in the executable's root file: `pub const zio_options =
 /// anole.zio_options;` (pinned scheduling).
 pub const zio_options = @import("server.zig").zio_options;
@@ -98,6 +115,10 @@ pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 test {
     _ = @import("server.zig");
     _ = @import("api_test.zig");
+    _ = @import("address.zig");
+    _ = @import("handlers.zig");
+    _ = @import("client.zig");
+    _ = @import("app_test.zig");
     _ = @import("handoff.zig");
     _ = blocking;
     _ = @import("sd_notify.zig");
