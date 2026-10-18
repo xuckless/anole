@@ -2,6 +2,8 @@
 
     peer_server.py PORT CERT KEY
 
+It issues session tickets, and takes 0-RTT on them.
+
 /download?n=N  N bytes (i % 251)
 /echo          the request body back
 /trailers      "body" and the trailer x-checksum: abc
@@ -66,7 +68,15 @@ async def main():
     port, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
     config = QuicConfiguration(alpn_protocols=H3_ALPN, is_client=False, max_datagram_frame_size=65536)
     config.load_cert_chain(cert, key)
-    await serve("127.0.0.1", port, configuration=config, create_protocol=Handler)
+    tickets = {}
+    await serve(
+        "127.0.0.1",
+        port,
+        configuration=config,
+        create_protocol=Handler,
+        session_ticket_handler=lambda t: tickets.__setitem__(t.ticket, t),
+        session_ticket_fetcher=lambda label: tickets.pop(label, None),
+    )
     print("listening", flush=True)
     await asyncio.Future()
 

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Anole's HTTP/3 server against aioquic's client (an independent QUIC and
 # HTTP/3 stack): downloads, uploads with checksums, echoes, many streams at
-# once, a drain that lets a download in flight finish, and Retry. Then
+# once, a drain that lets a download in flight finish, Retry, resumption and
+# 0-RTT. Then
 # anole.h3's client against aioquic's server.
 #   tests/h3/run.sh [path-to-h3-test-server] [path-to-h3-test-client]
 # Needs python3; aioquic is installed into a throwaway venv.
@@ -16,7 +17,7 @@ peer=""
 python3 -m venv "$work/venv"
 "$work/venv/bin/pip" install -q aioquic==1.7.0
 py="$work/venv/bin/python -I $here/client.py"
-port=18543
+port=${ANOLE_H3_PORT:-18543}
 url=https://127.0.0.1:$port
 
 start() { "$server" $port "$@" >"$work/server.log" 2>&1 & pid=$!; sleep 1; }
@@ -79,6 +80,26 @@ for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with retry"
 pid=""
 echo "PASS address validation (Retry)"
+# Resumption and 0-RTT: a ticket from a first connection, then requests in
+# 0-RTT on a second. A GET may run before the handshake completes; a POST
+# waits for it (so it is never a replay, and says "late").
+start early
+ticket="$work/ticket"
+out=$($py "$url/early" --session-ticket "$ticket" | tail -1)
+[ "$out" = "resumed 0 early 0" ] || fail "first connection: $out"
+[ -s "$ticket" ] || fail "no session ticket"
+out=$($py "$url/early" --session-ticket "$ticket" --zero-rtt)
+echo "$out" | grep -q "^status 200" || fail "0-RTT GET: $out"
+[ "$(echo "$out" | tail -1)" = "resumed 1 early 1" ] || fail "0-RTT GET: $out"
+echo "PASS 0-RTT GET (body: $(echo "$out" | sed -n 's/^body ([0-9]* bytes): //p'))"
+out=$($py "$url/early" --method POST --data x --session-ticket "$ticket" --zero-rtt)
+echo "$out" | grep -q "^body (4 bytes): late" || fail "0-RTT POST: $out"
+[ "$(echo "$out" | tail -1)" = "resumed 1 early 1" ] || fail "0-RTT POST: $out"
+echo "PASS 0-RTT POST held until the handshake"
+kill -TERM $pid
+for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
+grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with 0-RTT"
+pid=""
 # Bound to every interface: replies must leave from the address each client
 # wrote to (PKTINFO). On Linux all of 127/8 is local, so 127.0.0.2 is a
 # second address to write to.
@@ -119,6 +140,13 @@ echo "PASS client trailers"
 out=$("$client" many $port "$ca" "/download?n=100000" 200)
 [ "$out" = "ok 200" ] || pfail "client streams: $out"
 echo "PASS client 200 streams on one connection"
+want=$(python3 -I -c "p=bytes(range(251)); print(sum((p*40)[:10000]) & 0xffffffff)")
+out=$("$client" zerortt $port "$ca" "/download?n=10000")
+[ "$out" = "status 200 bytes 10000 sum $want
+resumed 0 early none
+status 200 bytes 10000 sum $want
+resumed 1 early accepted" ] || pfail "client 0-RTT: $out"
+echo "PASS client resumption and 0-RTT"
 kill $peer
 peer=""
 

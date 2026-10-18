@@ -1,6 +1,7 @@
 //! The server side of the QUIC interop runner's endpoint
 //! (tests/interop/run_endpoint.sh): the files under a directory, over
-//! HTTP/3 and over hq-interop (HTTP/0.9), on one port.
+//! HTTP/3 and over hq-interop (HTTP/0.9), on one port, with 0-RTT on (the
+//! `zerortt` case; GETs only, which run from early data at once).
 //!
 //!   h3-interop-server CERT KEY WWW PORT [retry]
 const std = @import("std");
@@ -28,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
         .https = .{ .address = "0.0.0.0", .port = port, .cert = .{ .files = .{ .cert_path = cert, .key_path = key } } },
-        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000 },
+        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000, .early_data = true },
     }, {});
     defer app.deinit();
     const dir = try std.Io.Dir.cwd().openDir(app.io(), www, .{});

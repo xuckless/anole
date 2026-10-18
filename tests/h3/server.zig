@@ -2,9 +2,10 @@
 //! (tests/h3/client.py on aioquic): downloads, uploads and echoes of any
 //! size, beside HTTP/1.1 and HTTP/2 on the same routes.
 //!
-//!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry] [drain=MS] [ADDRESS]
+//!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry] [early] [drain=MS] [ADDRESS]
 //!
 //! With `retry`, every new client proves its address with a Retry first.
+//! With `early`, clients that resume may send 0-RTT.
 //! `drain=MS` bounds the shutdown drain (default 30 s). ADDRESS (default
 //! 127.0.0.1) is where it listens, 0.0.0.0 for every interface.
 const std = @import("std");
@@ -38,6 +39,12 @@ fn download(req: *http.Request, res: *http.Response) !void {
         left -= k;
     }
     try w.end();
+}
+
+/// GET /early, POST /early: whether the request may be a replay of 0-RTT
+/// data ("early"), or not ("late").
+fn early(req: *http.Request, res: *http.Response) !void {
+    res.body = if (anole.early_data.isEarly(req)) "early" else "late";
 }
 
 /// POST /upload: the body's length and a checksum.
@@ -75,11 +82,14 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     var retry = false;
+    var early_data = false;
     var drain: ?std.Io.Duration = .fromSeconds(30);
     var address: []const u8 = "127.0.0.1";
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "retry")) {
             retry = true;
+        } else if (std.mem.eql(u8, a, "early")) {
+            early_data = true;
         } else if (std.mem.startsWith(u8, a, "drain=")) {
             drain = .fromMilliseconds(try std.fmt.parseInt(i64, a["drain=".len..], 10));
         } else address = a;
@@ -87,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
         .https = .{ .address = address, .port = port, .cert = .dev_self_signed },
-        .http3 = .{ .validate_address = retry },
+        .http3 = .{ .validate_address = retry, .early_data = early_data },
         .server = .{ .timeout = .{ .shutdown = drain } },
     }, {});
     defer app.deinit();
@@ -95,6 +105,8 @@ pub fn main(init: std.process.Init) !void {
     app.get("/slow", slow);
     app.post("/upload", upload);
     app.post("/echo", echo);
+    app.get("/early", early);
+    app.post("/early", early);
     std.log.info("h3 test server on https://{s}:{d} (TCP and UDP)", .{ address, port });
     try app.run();
 }

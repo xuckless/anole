@@ -5,9 +5,12 @@
 //!   h3-test-client get PORT CA PATH          one GET
 //!   h3-test-client post PORT CA PATH FILE    one POST with FILE as body
 //!   h3-test-client many PORT CA PATH N       N GETs at once, one connection
+//!   h3-test-client zerortt PORT CA PATH      a GET, then a GET in 0-RTT on a
+//!                                            second connection that resumes
 //!
 //! A response prints as "status S bytes N sum X" (X: the byte sum, mod
-//! 2^32), then "trailer NAME VALUE" for each trailer.
+//! 2^32), then "trailer NAME VALUE" for each trailer; `zerortt` adds
+//! "resumed 0|1 early E" after each (E: what became of 0-RTT).
 const std = @import("std");
 const anole = @import("anole");
 
@@ -47,6 +50,30 @@ pub fn main(init: std.process.Init) !void {
     const ca_pem = try std.Io.Dir.cwd().readFileAlloc(io, args.next() orelse return error.Usage, gpa, .limited(1 << 20));
     defer gpa.free(ca_pem);
     const path = args.next() orelse return error.Usage;
+
+    if (std.mem.eql(u8, cmd, "zerortt")) {
+        var cache: h3.SessionCache = .init(gpa, io);
+        defer cache.deinit();
+        for (0..2) |i| {
+            const conn = try h3.ClientConnection.connect(gpa, io, .{
+                .host = "localhost",
+                .address = .{ .ip4 = .loopback(port) },
+                .port = port,
+                .tls = .{ .ca = .{ .pem = ca_pem } },
+                .session_cache = &cache,
+                .early_data = true,
+            });
+            defer conn.close();
+            try fetch(gpa, io, conn, "GET", path, null, w);
+            // The ticket comes after the handshake; wait for it once.
+            if (i == 0) for (0..200) |_| {
+                if (cache.count() > 0) break;
+                try io.sleep(.fromMilliseconds(10), .awake);
+            };
+            try w.print("resumed {d} early {t}\n", .{ @intFromBool(conn.resumed()), conn.earlyData() });
+        }
+        return;
+    }
 
     const conn = try h3.ClientConnection.connect(gpa, io, .{
         .host = "localhost",

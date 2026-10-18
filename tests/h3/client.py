@@ -4,9 +4,16 @@ of each response; exits non-zero if a request fails.
 
     python3 tests/h3/client.py https://127.0.0.1:8443/ [more URLs...]
         [--method POST] [--data TEXT | --data-file PATH] [--repeat N] [--parallel N]
+        [--session-ticket FILE [--zero-rtt]]
+
+With --session-ticket, a ticket in FILE resumes the session, and the
+server's tickets are saved there; with --zero-rtt too, the requests go in
+0-RTT. Either prints "resumed 0|1 early 0|1" last.
 """
 import argparse
 import asyncio
+import os
+import pickle
 import ssl
 import sys
 from urllib.parse import urlparse
@@ -69,15 +76,34 @@ async def main():
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--parallel", type=int, default=1)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--session-ticket")
+    ap.add_argument("--zero-rtt", action="store_true")
     args = ap.parse_args()
     config = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     config.verify_mode = ssl.CERT_NONE
+    save_ticket = None
+    if args.session_ticket:
+        if os.path.exists(args.session_ticket):
+            with open(args.session_ticket, "rb") as f:
+                config.session_ticket = pickle.load(f)
+
+        def save_ticket(ticket):
+            with open(args.session_ticket, "wb") as f:
+                pickle.dump(ticket, f)
+
     u = urlparse(args.urls[0])
     data = args.data.encode() if args.data is not None else None
     if args.data_file:
         with open(args.data_file, "rb") as f:
             data = f.read()
-    async with connect(u.hostname, u.port or 443, configuration=config, create_protocol=Client) as client:
+    async with connect(
+        u.hostname,
+        u.port or 443,
+        configuration=config,
+        create_protocol=Client,
+        session_ticket_handler=save_ticket,
+        wait_connected=not args.zero_rtt,
+    ) as client:
         ok = 0
         for _ in range(args.repeat):
             jobs = [client.request(args.method, url, data) for url in args.urls for _ in range(args.parallel)]
@@ -95,6 +121,9 @@ async def main():
                     print(f"body ({len(body)} bytes):", body[:200].decode(errors="replace").encode("ascii", "replace").decode())
                 ok += 1
         print(f"{ok} responses")
+        if args.session_ticket:
+            tls = client._quic.tls
+            print(f"resumed {int(tls.session_resumed)} early {int(tls.early_data_accepted)}")
 
 
 asyncio.run(main())
