@@ -145,12 +145,16 @@ pub const Limits = struct {
     /// on the way, or its handler not yet accepting), on one connection.
     /// Past it, such streams are refused.
     buffered_streams: usize = 32,
-    /// Datagrams kept for a session's handler; past it, new ones are
-    /// dropped (datagrams are unreliable).
-    datagrams_in: usize = 64,
+    /// Datagrams kept for a session's handler, and their bytes; past
+    /// either, new ones are dropped (datagrams are unreliable). A burst of
+    /// small ones (a client's requests, say) arrives faster than any
+    /// handler answers them, so the count is generous and the bytes bound
+    /// the memory.
+    datagrams_in: usize = 256,
+    datagrams_in_bytes: usize = 1 << 20,
     /// Datagrams waiting to go out on one connection; `sendDatagram` waits
-    /// while there are this many.
-    datagrams_out: usize = 64,
+    /// while there are this many. Each is at most a packet.
+    datagrams_out: usize = 256,
 };
 
 /// The bytes a peer's stream started with while its first varint is not
@@ -336,12 +340,16 @@ pub const Core = struct {
         const qsid = getVarint(data) orelse return;
         if (qsid.value >= 1 << 60) return;
         const session = core.sessions.get(@intCast(qsid.value * 4)) orelse return;
-        if (session.state != .open or session.datagrams_in.items.len >= core.limits.datagrams_in) return;
-        const copy = core.gpa.dupe(u8, data[qsid.len..]) catch return;
+        const payload = data[qsid.len..];
+        if (session.state != .open or
+            session.datagrams_in.items.len >= core.limits.datagrams_in or
+            session.datagrams_in_bytes + payload.len > core.limits.datagrams_in_bytes) return;
+        const copy = core.gpa.dupe(u8, payload) catch return;
         session.datagrams_in.append(core.gpa, copy) catch {
             core.gpa.free(copy);
             return;
         };
+        session.datagrams_in_bytes += copy.len;
         core.host.kick();
     }
 
@@ -570,6 +578,7 @@ pub const Session = struct {
     /// Every stream of the session that QUIC or a handler still holds.
     members: std.ArrayList(*Stream) = .empty,
     datagrams_in: std.ArrayList([]u8) = .empty,
+    datagrams_in_bytes: usize = 0,
     /// Unregistered from the core (`deinit`).
     detached: bool = false,
 
@@ -826,6 +835,7 @@ pub const Session = struct {
                     return error.NoSpaceLeft;
                 }
                 _ = self.datagrams_in.orderedRemove(0);
+                self.datagrams_in_bytes -= d.len;
                 core.host.unlock();
                 @memcpy(buf[0..d.len], d);
                 core.gpa.free(d);
