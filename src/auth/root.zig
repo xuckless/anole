@@ -21,6 +21,9 @@ pub const Keyring = @import("keyring.zig").Keyring;
 /// JWT bearer tokens (RFC 6750): `RequireJwt`, a middleware.
 pub const bearer = @import("bearer.zig");
 pub const RequireJwt = bearer.RequireJwt;
+/// The token `RequireJwt` verified for this request, and its `sub`.
+pub const claims = bearer.claims;
+pub const subject = bearer.subject;
 
 /// OpenID Connect sign-in (relying party): PKCE, state, nonce, ID tokens;
 /// Google and Apple presets.

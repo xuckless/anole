@@ -1,5 +1,6 @@
-//! `RequireJwt` end to end: the RFC 6750 answers, claims into the session
-//! for the handler only, scopes.
+//! `RequireJwt` end to end: the RFC 6750 answers, the token in the
+//! request's locals (`claims`, `subject`), the deprecated claims in the
+//! session for the handler only, scopes.
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
@@ -41,7 +42,9 @@ const FakeSession = struct {
 };
 
 fn handler(req: *dusty.Request, res: *dusty.Response) !void {
-    res.body = try std.fmt.allocPrint(req.arena, "sub={s} user={s} role={s}", .{
+    res.body = try std.fmt.allocPrint(req.arena, "subject={s} alg={t} sub={s} user={s} role={s}", .{
+        bearer.subject(req) orelse "-",
+        bearer.claims(req).?.alg,
         req.session.get("jwt_sub") orelse "-",
         req.session.get("user") orelse "-",
         req.session.get("role") orelse "-",
@@ -138,13 +141,13 @@ test "RequireJwt: RFC 6750 answers, claims for the handler only, scopes" {
     // session's own "user" is untouched, before and after.
     resp = try exchange(io, port, "/plain/me", try std.fmt.allocPrint(arena, "bearer  {s}", .{good}), &out);
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
-    try std.testing.expect(std.mem.endsWith(u8, resp, "sub=alice user=from-session role=-"));
+    try std.testing.expect(std.mem.endsWith(u8, resp, "subject=alice alg=HS256 sub=alice user=from-session role=-"));
     try std.testing.expectEqualStrings("from-session", after[0..after_len]);
 
     // A mapping over the session's own key: the handler sees the token's,
     // the session gets its own back.
     resp = try exchange(io, port, "/mapped/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{good}), &out);
-    try std.testing.expect(std.mem.endsWith(u8, resp, "sub=- user=alice role=editor"));
+    try std.testing.expect(std.mem.endsWith(u8, resp, "subject=alice alg=HS256 sub=- user=alice role=editor"));
     try std.testing.expectEqualStrings("from-session", after[0..after_len]);
     // Too few scopes: 403 insufficient_scope, naming the ones needed.
     resp = try exchange(io, port, "/mapped/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{narrow}), &out);

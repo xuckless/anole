@@ -82,7 +82,8 @@ test "CSRF: a token from the session, required on POST" {
 }
 
 fn owner(req: *dusty.Request, res: *dusty.Response) !void {
-    res.body = req.session.get("api_key_owner") orelse "none";
+    // The accessor, and the deprecated session copy (kept for 0.1).
+    res.body = try std.fmt.allocPrint(req.arena, "{s} {s}", .{ apikey.owner(req) orelse "none", req.session.get("api_key_owner") orelse "none" });
 }
 
 test "API key: the owner reaches the handler but never a session cookie" {
@@ -114,7 +115,7 @@ test "API key: the owner reaches the handler but never a session cookie" {
     var out: [4096]u8 = undefined;
     const ok = try send(io, port, "GET /owner HTTP/1.1\r\nHost: x\r\nX-API-Key: k1\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
-    try std.testing.expect(std.mem.endsWith(u8, ok, "svc-a"));
+    try std.testing.expect(std.mem.endsWith(u8, ok, "svc-a svc-a"));
     try std.testing.expect(std.mem.indexOf(u8, ok, "Set-Cookie") == null);
     const refused = try send(io, port, "GET /owner HTTP/1.1\r\nHost: x\r\nX-API-Key: nope\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, refused, "HTTP/1.1 401"));

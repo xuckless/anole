@@ -1,11 +1,11 @@
 //! JWT bearer tokens (RFC 6750): a middleware that requires
 //! `Authorization: Bearer <JWT>`, verified with fixed keys or a `Keyring`
-//! and checked against a claims policy, and hands chosen claims to the
-//! handler through `req.session`, for this request only.
+//! and checked against a claims policy, and hands the verified token to the
+//! handler through the request's locals.
 //!
-//!     var bearer = anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = iss, .audience = "api" }, .{});
-//!     app.group("/api", &.{.init(&bearer)}).get("/me", me);
-//!     // in the handler: req.session.get("jwt_sub")
+//!     const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = iss, .audience = "api" }, .{})});
+//!     api.get("/me", me);
+//!     // in the handler: anole.auth.subject(req).?, or anole.auth.claims(req).?.string("email")
 //!
 //! Refusals follow RFC 6750 section 3: no token is 401 with a bare
 //! `WWW-Authenticate: Bearer`, a bad one 401 `error="invalid_token"`, a
@@ -18,7 +18,26 @@ const Keyring = @import("keyring.zig").Keyring;
 
 const log = std.log.scoped(.anole_auth);
 
-/// A claim copied into `req.session` under `key`.
+/// Where `RequireJwt` keeps the verified token in `req.locals`; read it
+/// with `claims`.
+pub const claims_key = "anole.auth.jwt";
+
+/// The token `RequireJwt` verified for this request (its claims, header,
+/// algorithm and key ID), or null on a route without it. Lives in the
+/// request's arena.
+pub fn claims(req: *const dusty.Request) ?*const jws.Verified {
+    return req.locals.getPtr(jws.Verified, claims_key);
+}
+
+/// The verified token's `sub` claim: who the request is from.
+pub fn subject(req: *const dusty.Request) ?[]const u8 {
+    const v = claims(req) orelse return null;
+    return v.string("sub");
+}
+
+/// A claim copied into `req.session` under `key`. Deprecated: read the
+/// token with `claims(req)` or `subject(req)`. The copy into the session
+/// goes after 0.1.
 pub const Claim = struct {
     claim: []const u8,
     key: []const u8,
@@ -42,10 +61,13 @@ pub const Keys = union(enum) {
 };
 
 pub const Options = struct {
-    /// Claims copied into `req.session` (string claims only). The entries
-    /// are there for the handler and taken out again when it returns,
-    /// with whatever the session held under those keys put back, so a
-    /// session middleware in front never saves them.
+    /// Claims copied into `req.session` (string claims only); a `required`
+    /// one also refuses a token without it. The entries are there for the
+    /// handler and taken out again when it returns, with whatever the
+    /// session held under those keys put back, so a session middleware in
+    /// front never saves them. Deprecated as a way to read claims (use
+    /// `claims(req)` and `subject(req)`); the default copy of `sub` into
+    /// "jwt_sub" goes after 0.1.
     claims: []const Claim = &.{.{ .claim = "sub", .key = "jwt_sub", .required = true }},
     /// Every one of these must be in the token's `scope` claim (a
     /// space-separated string, RFC 8693); 403 otherwise.
@@ -114,19 +136,21 @@ pub const RequireJwt = struct {
             }
         }
 
+        try req.setLocal(claims_key, v);
+
         // Copy the claims in, remembering what the session held.
-        const claims = self.options.claims;
-        const saved = try req.arena.alloc(?[]const u8, claims.len);
-        for (claims, saved) |c, *prev| prev.* = req.session.get(c.key);
+        const mapped = self.options.claims;
+        const saved = try req.arena.alloc(?[]const u8, mapped.len);
+        for (mapped, saved) |c, *prev| prev.* = req.session.get(c.key);
         const was_modified = req.session.modified;
         defer {
             const handler_modified = req.session.modified;
-            for (claims, saved) |c, prev| {
+            for (mapped, saved) |c, prev| {
                 if (prev) |p| req.session.set(c.key, p) catch {} else req.session.remove(c.key);
             }
             req.session.modified = handler_modified;
         }
-        for (claims) |c| {
+        for (mapped) |c| {
             if (v.string(c.claim)) |value| {
                 try req.session.set(c.key, value);
             } else {

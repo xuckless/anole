@@ -126,11 +126,14 @@ fn logout(_: *App, req: *http.Request, res: *http.Response) !void {
 }
 
 fn apiMe(_: *App, req: *http.Request, res: *http.Response) !void {
-    try res.print(.text, "token subject: {s}, role: {s}\n", .{ req.session.get("user").?, req.session.get("role") orelse "-" });
+    // The token RequireJwt verified, from the request's locals.
+    const token = auth.claims(req) orelse return error.Unauthorized;
+    try res.print(.text, "token subject: {s}, role: {s}\n", .{ auth.subject(req) orelse "-", token.string("role") orelse "-" });
 }
 
 fn serviceStats(_: *App, req: *http.Request, res: *http.Response) !void {
-    try res.print(.text, "stats for {s}: 42 requests\n", .{req.session.get("api_key_owner").?});
+    const owner = auth.apikey.owner(req) orelse return error.Unauthorized;
+    try res.print(.text, "stats for {s}: 42 requests\n", .{owner});
 }
 
 /// API key owners by key digest; a real app looks the digest up in its
@@ -187,12 +190,9 @@ pub fn main(init: std.process.Init) !void {
     defer limiter.deinit();
     var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
     var can_write = auth.rbac.Require.init(&policy, "notes:write", .{ .roles = rolesOf });
-    // Bearer tokens: the subject and role claims go into `req.session` for
-    // the handler (this group has no session middleware, so nothing is
-    // stored or sent back as a cookie).
-    var bearer = auth.RequireJwt.init(.{ .static = &jwt_keys }, .{ .issuer = issuer, .audience = "api" }, .{
-        .claims = &.{ .{ .claim = "sub", .key = "user", .required = true }, .{ .claim = "role", .key = "role" } },
-    });
+    // Bearer tokens: the handler reads the verified token with
+    // `auth.claims(req)` and `auth.subject(req)`.
+    var bearer = auth.RequireJwt.init(.{ .static = &jwt_keys }, .{ .issuer = issuer, .audience = "api" }, .{});
     var api_keys = auth.apikey.Middleware.init(.{ .ptr = &app, .lookup = lookupKey });
 
     const M = http.Middleware(App);

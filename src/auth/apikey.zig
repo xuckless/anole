@@ -42,10 +42,21 @@ pub fn fromRequest(req: *dusty.Request) ?[]const u8 {
     return req.headers.get("X-API-Key");
 }
 
-/// Requires a valid key: 401 without one. The owner is put in the
-/// request's session data as "api_key_owner" for handlers to read, for
-/// this request only: it is taken out again before a session middleware
-/// in front could save it into a cookie.
+/// Where `Middleware` keeps the key's owner in `req.locals`; read it with
+/// `owner`.
+pub const owner_key = "anole.auth.api_key_owner";
+
+/// The owner `Middleware` found for this request's key, or null on a route
+/// without it.
+pub fn owner(req: *const dusty.Request) ?[]const u8 {
+    return req.local([]const u8, owner_key);
+}
+
+/// Requires a valid key: 401 without one. The owner goes into the
+/// request's locals (`owner(req)`). It is also in the request's session
+/// data as "api_key_owner" for this request only (taken out again before a
+/// session middleware in front could save it into a cookie); that copy is
+/// deprecated and goes after 0.1.
 pub const Middleware = struct {
     lookup: Lookup,
 
@@ -55,9 +66,10 @@ pub const Middleware = struct {
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         const key = fromRequest(req) orelse return unauthorized(res);
-        const owner = (try self.lookup.lookup(self.lookup.ptr, req.arena, digest(key))) orelse return unauthorized(res);
+        const found = (try self.lookup.lookup(self.lookup.ptr, req.arena, digest(key))) orelse return unauthorized(res);
+        try req.setLocal(owner_key, found);
         const was_modified = req.session.modified;
-        try req.session.set("api_key_owner", owner);
+        try req.session.set("api_key_owner", found);
         req.session.modified = was_modified;
         defer {
             const handler_modified = req.session.modified;
