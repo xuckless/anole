@@ -675,11 +675,6 @@ const Core = struct {
             // zstd for responses and request bodies, on Anole's zstd.
             .use_zstd = zstd != null,
         }).module("dusty");
-        // Never instrumented for `zig build test --fuzz`: Zig 0.17's fuzzer
-        // cannot take clang's coverage tables from the C (llhttp) compiled
-        // into this module beside Zig's ("pc counters length and pcs length
-        // do not match"). Anole's fuzz targets do not go through dusty.
-        mod.fuzz = false;
         // Replace dusty's zio stub so its timeouts use zio.AutoCancel.
         mod.addImport("zio", zio_mod);
         if (tls) |m| mod.addImport("tls", m);
