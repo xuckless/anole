@@ -799,3 +799,82 @@ test "TLS hello: a returning client resumes its session with a ticket" {
     try RawClient.onThread(io, Returning.run, .{ server.address.ip.getPort(), @as(u16, c.TLS1_3_VERSION) });
     try RawClient.onThread(io, Returning.run, .{ server.address.ip.getPort(), @as(u16, c.TLS1_2_VERSION) });
 }
+
+test "TLS hello: a certificate reload serves the new certificate, and tickets from before it still resume" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    const gpa = std.testing.allocator;
+    var next = try selfSigned(gpa, .{});
+    defer next.deinit(gpa);
+    // The configuration the server reads again on a reload.
+    var listeners = [_]dusty.Listener{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }};
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &listeners }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const Client = struct {
+        var latest: ?*c.SSL_SESSION = null;
+        ctx: *c.SSL_CTX,
+        /// The leaf certificate (DER) the last handshake was served.
+        leaf: [4096]u8 = undefined,
+        leaf_len: usize = 0,
+        reused: bool = false,
+
+        fn onNewSession(_: ?*c.SSL, session: ?*c.SSL_SESSION) callconv(.c) c_int {
+            if (latest) |old| c.SSL_SESSION_free(old);
+            latest = session;
+            return 1;
+        }
+
+        fn visit(cl: *@This(), port: u16, session: ?*c.SSL_SESSION) !void {
+            const conn = try RawClient.connect(cl.ctx, port, session);
+            defer conn.close();
+            try std.testing.expect((try conn.get()).hello);
+            cl.reused = c.SSL_session_reused(conn.ssl) == 1;
+            const certs = c.SSL_get0_peer_certificates(conn.ssl) orelse return error.NoCertificate;
+            const leaf = c.sk_CRYPTO_BUFFER_value(certs, 0);
+            cl.leaf_len = c.CRYPTO_BUFFER_len(leaf);
+            @memcpy(cl.leaf[0..cl.leaf_len], c.CRYPTO_BUFFER_data(leaf)[0..cl.leaf_len]);
+        }
+    };
+
+    for ([_]u16{ c.TLS1_3_VERSION, c.TLS1_2_VERSION }) |version| {
+        const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+        defer c.SSL_CTX_free(ctx);
+        _ = c.SSL_CTX_set_min_proto_version(ctx, version);
+        _ = c.SSL_CTX_set_max_proto_version(ctx, version);
+        _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
+        c.SSL_CTX_sess_set_new_cb(ctx, Client.onNewSession);
+        defer if (Client.latest) |sess| {
+            c.SSL_SESSION_free(sess);
+            Client.latest = null;
+        };
+        const port = server.address.ip.getPort();
+
+        listeners[0].tls.?.pem = .{ .cert = h.pem.cert, .key = h.pem.key };
+        try server.reloadTls();
+        var before: Client = .{ .ctx = ctx };
+        try RawClient.onThread(io, Client.visit, .{ &before, port, null });
+        // The ticket sealed before the reload, kept apart from the ones
+        // issued after it.
+        const sealed_before = Client.latest orelse return error.NoSession;
+        Client.latest = null;
+        defer c.SSL_SESSION_free(sealed_before);
+
+        listeners[0].tls.?.pem = .{ .cert = next.cert, .key = next.key };
+        try server.reloadTls();
+        // A new handshake gets the new certificate...
+        var fresh: Client = .{ .ctx = ctx };
+        try RawClient.onThread(io, Client.visit, .{ &fresh, port, null });
+        try std.testing.expect(!fresh.reused);
+        try std.testing.expect(!std.mem.eql(u8, before.leaf[0..before.leaf_len], fresh.leaf[0..fresh.leaf_len]));
+        // ...and a ticket sealed before the reload still resumes.
+        var returning: Client = .{ .ctx = ctx };
+        try RawClient.onThread(io, Client.visit, .{ &returning, port, sealed_before });
+        try std.testing.expect(returning.reused);
+    }
+}

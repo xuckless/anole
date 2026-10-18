@@ -114,6 +114,13 @@ pub const config = struct {
             };
         }
 
+        /// A certificate reload (dusty fork, `Server.reloadTls`): this new
+        /// pair takes over the session ticket keys of the `old` one it
+        /// replaces, so tickets issued before the reload still resume.
+        pub fn carryOver(self: *CertKeyPair, old: *const CertKeyPair) void {
+            carryTicketKeys(self.server_ctx, old.server_ctx);
+        }
+
         pub fn deinit(self: *CertKeyPair, gpa: Allocator) void {
             c.SSL_CTX_free(self.server_ctx);
             c.X509_free(self.cert);
@@ -692,7 +699,186 @@ fn newServerCtx() !*c.SSL_CTX {
     // executor thread would share.
     _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_OFF);
     c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, null);
+    try installTicketKeys(ctx);
     return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// Session ticket keys
+
+/// The keys that seal a server's session tickets. BoringSSL keeps its own
+/// inside the SSL_CTX, so a new SSL_CTX (a certificate reload) would start
+/// with new ones and every ticket issued before would stop resuming. These
+/// live beside the SSL_CTX instead: a reload hands them to the new one
+/// (`carryTicketKeys`), and any number of SSL_CTXs can share them.
+///
+/// Used the way BoringSSL uses its default keys (ssl/ssl_session.cc): AES-128-CBC
+/// and HMAC-SHA256 with 16-byte keys, a new key every two days, and the
+/// previous one still accepted, its tickets renewed, until the rotation
+/// after. In memory only, so tickets do not survive a restart.
+///
+/// Reference-counted: each SSL_CTX using them holds a reference, which
+/// BoringSSL's ex_data free callback drops when the SSL_CTX is freed.
+const TicketKeys = struct {
+    refs: std.atomic.Value(u32) = .init(1),
+    mutex: std.atomic.Mutex = .unlocked,
+    current: Key,
+    previous: ?Key = null,
+
+    const Key = struct {
+        name: [16]u8,
+        hmac_key: [16]u8,
+        aes_key: [16]u8,
+        /// Seconds on the monotonic clock.
+        created: i64,
+
+        fn fresh(now: i64) error{TlsFailure}!Key {
+            var k: Key = .{ .name = undefined, .hmac_key = undefined, .aes_key = undefined, .created = now };
+            if (c.RAND_bytes(&k.name, k.name.len) != 1 or
+                c.RAND_bytes(&k.hmac_key, k.hmac_key.len) != 1 or
+                c.RAND_bytes(&k.aes_key, k.aes_key.len) != 1) return error.TlsFailure;
+            return k;
+        }
+    };
+
+    /// BoringSSL's SSL_DEFAULT_TICKET_KEY_ROTATION_INTERVAL.
+    const rotation_interval: i64 = 2 * std.time.s_per_day;
+
+    fn create() error{ OutOfMemory, TlsFailure }!*TicketKeys {
+        const keys = std.heap.c_allocator.create(TicketKeys) catch return error.OutOfMemory;
+        errdefer std.heap.c_allocator.destroy(keys);
+        keys.* = .{ .current = try .fresh(monotonicSeconds()) };
+        return keys;
+    }
+
+    fn unref(keys: *TicketKeys) void {
+        if (keys.refs.fetchSub(1, .acq_rel) != 1) return;
+        std.crypto.secureZero(u8, std.mem.asBytes(keys));
+        std.heap.c_allocator.destroy(keys);
+    }
+
+    fn lock(keys: *TicketKeys) void {
+        while (!keys.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// The key to seal a new ticket with, rotated first if it is due.
+    fn sealing(keys: *TicketKeys, now: i64) error{TlsFailure}!Key {
+        keys.lock();
+        defer keys.mutex.unlock();
+        if (now - keys.current.created >= rotation_interval) {
+            const next = try Key.fresh(now);
+            // A current key two intervals old has nothing worth keeping.
+            keys.previous = if (now - keys.current.created < 2 * rotation_interval) keys.current else null;
+            keys.current = next;
+        }
+        return keys.current;
+    }
+
+    /// The key a ticket names, and whether it is the current one; null for
+    /// a key rotated out (or never ours).
+    fn opening(keys: *TicketKeys, name: *const [16]u8, now: i64) ?struct { key: Key, current: bool } {
+        keys.lock();
+        defer keys.mutex.unlock();
+        if (std.mem.eql(u8, name, &keys.current.name)) return .{ .key = keys.current, .current = true };
+        const prev = keys.previous orelse return null;
+        if (now - prev.created >= 2 * rotation_interval) return null;
+        if (std.mem.eql(u8, name, &prev.name)) return .{ .key = prev, .current = false };
+        return null;
+    }
+};
+
+fn monotonicSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @intCast(ts.sec);
+}
+
+/// The SSL_CTX ex_data slot holding a `*TicketKeys`; -1 until created.
+var ticket_keys_index: std.atomic.Value(c_int) = .init(-1);
+
+fn ticketKeysIndex() error{TlsFailure}!c_int {
+    lockGlobal();
+    defer global_lock.unlock();
+    const existing = ticket_keys_index.load(.acquire);
+    if (existing >= 0) return existing;
+    const index = c.SSL_CTX_get_ex_new_index(0, null, null, null, freeTicketKeys);
+    if (index < 0) return error.TlsFailure;
+    ticket_keys_index.store(index, .release);
+    return index;
+}
+
+fn freeTicketKeys(_: ?*anyopaque, ptr: ?*anyopaque, _: ?*c.CRYPTO_EX_DATA, _: c_int, _: c_long, _: ?*anyopaque) callconv(.c) void {
+    const keys: *TicketKeys = @ptrCast(@alignCast(ptr orelse return));
+    keys.unref();
+}
+
+fn ticketKeysOf(ctx: *const c.SSL_CTX) ?*TicketKeys {
+    const index = ticket_keys_index.load(.acquire);
+    if (index < 0) return null;
+    return @ptrCast(@alignCast(c.SSL_CTX_get_ex_data(ctx, index) orelse return null));
+}
+
+/// Gives a server's SSL_CTX session ticket keys of its own (`TicketKeys`).
+/// `ctx` is an `SSL_CTX` from any of Anole's bindings of BoringSSL (the
+/// HTTP/3 endpoint's comes from ngtcp2's).
+pub fn installTicketKeys(ctx_any: *anyopaque) error{ OutOfMemory, TlsFailure }!void {
+    const ctx: *c.SSL_CTX = @ptrCast(ctx_any);
+    const index = try ticketKeysIndex();
+    const keys = try TicketKeys.create();
+    if (c.SSL_CTX_set_ex_data(ctx, index, keys) != 1) {
+        keys.unref();
+        return error.OutOfMemory;
+    }
+    _ = c.SSL_CTX_set_tlsext_ticket_key_cb(ctx, ticketKeyCallback);
+}
+
+/// For a certificate reload: `new` (a server SSL_CTX that has had
+/// `installTicketKeys`) seals and opens tickets with `old`'s keys from now
+/// on, before any handshake uses it. Both from any of Anole's bindings.
+pub fn carryTicketKeys(new_any: *anyopaque, old_any: *anyopaque) void {
+    const new: *c.SSL_CTX = @ptrCast(new_any);
+    const old: *c.SSL_CTX = @ptrCast(old_any);
+    const keys = ticketKeysOf(old) orelse return;
+    const replaced = ticketKeysOf(new);
+    if (replaced == keys) return;
+    _ = keys.refs.fetchAdd(1, .monotonic);
+    // The slot already exists (`installTicketKeys` filled it), so this
+    // allocates nothing and cannot fail.
+    if (c.SSL_CTX_set_ex_data(new, ticket_keys_index.load(.acquire), keys) != 1) {
+        keys.unref();
+        return;
+    }
+    if (replaced) |r| r.unref();
+    _ = c.SSL_CTX_set_tlsext_ticket_key_cb(new, ticketKeyCallback);
+}
+
+/// BoringSSL's ticket key callback (`SSL_CTX_set_tlsext_ticket_key_cb`):
+/// sets up `cipher_ctx` and `hmac_ctx` to seal a ticket (`encrypt` 1) or
+/// to open one whose key `name` names. Returns 1, 2 (opened with the
+/// previous key: issue a new ticket), 0 (not our key: a full handshake) or
+/// -1 (an error).
+fn ticketKeyCallback(
+    ssl: ?*c.SSL,
+    name: [*c]u8,
+    iv: [*c]u8,
+    cipher_ctx: ?*c.EVP_CIPHER_CTX,
+    hmac_ctx: ?*c.HMAC_CTX,
+    encrypt: c_int,
+) callconv(.c) c_int {
+    const keys = ticketKeysOf(c.SSL_get_SSL_CTX(ssl) orelse return -1) orelse return -1;
+    const now = monotonicSeconds();
+    if (encrypt == 1) {
+        const key = keys.sealing(now) catch return -1;
+        if (c.RAND_bytes(iv, 16) != 1) return -1;
+        @memcpy(name[0..16], &key.name);
+        if (c.EVP_EncryptInit_ex(cipher_ctx, c.EVP_aes_128_cbc(), null, &key.aes_key, iv) != 1) return -1;
+        if (c.HMAC_Init_ex(hmac_ctx, &key.hmac_key, key.hmac_key.len, c.EVP_sha256(), null) != 1) return -1;
+        return 1;
+    }
+    const found = keys.opening(name[0..16], now) orelse return 0;
+    if (c.HMAC_Init_ex(hmac_ctx, &found.key.hmac_key, found.key.hmac_key.len, c.EVP_sha256(), null) != 1) return -1;
+    if (c.EVP_DecryptInit_ex(cipher_ctx, c.EVP_aes_128_cbc(), null, &found.key.aes_key, iv) != 1) return -1;
+    return if (found.current) 1 else 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -2,9 +2,11 @@
 #include <openssl/base.h>
 #include <openssl/bio.h>
 #include <openssl/bytestring.h>
+#include <openssl/cipher.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ec_key.h>
+#include <openssl/hmac.h>
 #include <openssl/nid.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
