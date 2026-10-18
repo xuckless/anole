@@ -5,6 +5,8 @@ const std = @import("std");
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
 const fdf = protobuf.fdf;
+/// import package google.api
+const google_api = @import("google/api.pb.zig");
 
 pub const HelloRequest = struct {
     name: []const u8 = &.{},
@@ -151,6 +153,21 @@ pub fn Greeter(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "greeter";
         pub const service_name = "Greeter";
 
+        /// Options of the methods that have some (`google.protobuf.MethodOptions`).
+        pub const _method_options = .{
+            .SayHello = .{
+                .@"#raw" = "\x82\xd3\xe4\x93\x02\"\x12\x10/v1/hello/{name}Z\x0e\"\t/v1/hello:\x01*",
+                .@"google.api.http" = .{
+                    .get = "/v1/hello/{name}",
+                    .additional_bindings = .{.{
+                        .post = "/v1/hello",
+                        .body = "*",
+                    }},
+                },
+            },
+        };
+        /// Also a REST route, by JSON transcoding: GET /v1/hello/Ada, or a POST
+        /// with the request as its JSON body.
         SayHello: *const fn (userdata: *UserDataType, request: HelloRequest) ErrorSet!HelloReply,
     };
 }

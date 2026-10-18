@@ -12,9 +12,15 @@
 //!   curl -H 'Content-Type: application/json' -d '{}' \
 //!     http://localhost:8083/grpc.health.v1.Health/Check
 //!
+//! SayHello is also a REST route, from its `google.api.http` annotation
+//! (JSON transcoding):
+//!
+//!   curl http://localhost:8083/v1/hello/Ada
+//!   curl -d '{"name":"Ada"}' http://localhost:8083/v1/hello
+//!
 //! And with grpcurl (h2c):
 //!
-//!   grpcurl -plaintext -import-path examples/grpc/proto -proto greeter.proto \
+//!   grpcurl -plaintext -import-path examples/grpc/proto -import-path src/grpc/proto -proto greeter.proto \
 //!     -d '{"name":"Ada"}' localhost:8083 greeter.Greeter/SayHello
 //!
 //! SayHello shows the parts of `anole.grpc.Call` a handler uses most:

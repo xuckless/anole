@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package greeter;
 
+import "google/api/annotations.proto";
+
 message HelloRequest {
   string name = 1;
 }
@@ -11,5 +13,12 @@ message HelloReply {
 }
 
 service Greeter {
-  rpc SayHello(HelloRequest) returns (HelloReply);
+  // Also a REST route, by JSON transcoding: GET /v1/hello/Ada, or a POST
+  // with the request as its JSON body.
+  rpc SayHello(HelloRequest) returns (HelloReply) {
+    option (google.api.http) = {
+      get: "/v1/hello/{name}"
+      additional_bindings { post: "/v1/hello" body: "*" }
+    };
+  }
 }

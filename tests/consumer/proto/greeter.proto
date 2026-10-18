@@ -2,6 +2,9 @@ syntax = "proto3";
 
 package greeter;
 
+// Anole's addProtoGen puts google/api/*.proto on the include path.
+import "google/api/annotations.proto";
+
 message HelloRequest {
   string name = 1;
 }
@@ -11,5 +14,7 @@ message HelloReply {
 }
 
 service Greeter {
-  rpc SayHello(HelloRequest) returns (HelloReply);
+  rpc SayHello(HelloRequest) returns (HelloReply) {
+    option (google.api.http) = { get: "/v1/hello/{name}" };
+  }
 }
