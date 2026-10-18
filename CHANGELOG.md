@@ -159,8 +159,12 @@ for macOS and Linux.
 
 - CI on Linux and macOS: unit tests for every flag combination, dusty's own
   test suite on Anole's TLS and C libraries, h2spec, Autobahn, gRPC interop,
-  HTTP/3 against aioquic, the QUIC interop runner, fuzzing of the parsers,
-  a clean-consumer build, and a weekly check of the C libraries' pins
+  HTTP/3 against aioquic, the QUIC interop runner, fuzzing of the parsers
+  and shim boundaries (HTTP/1.1 requests whole and in pieces, a whole
+  connection over HTTP/1.1 and HTTP/2, the PROXY protocol, WebSocket over
+  HTTP/2 and permessage-deflate, gRPC frames, metadata and timeouts, JSON,
+  session cookies, traceparent, JWS and JWK Sets, OIDC discovery, token
+  responses and ID token claims, `LISTEN_FDS`), a clean-consumer build, and a weekly check of the C libraries' pins
   against known advisories.
 
 ### Not yet

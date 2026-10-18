@@ -73,7 +73,12 @@ against lalinsky/dusty (#263-#270) are left as they are.
 
 - **dusty**: after a change, run its own suite under Zig 0.17 and 0.16
   (`zig build test` in the fork), and Anole's `zig build dusty-test`, which
-  runs that suite on Anole's TLS, nghttp2, zlib-ng and zstd.
+  runs that suite on Anole's TLS, nghttp2, zlib-ng and zstd. Its fuzz
+  targets ("fuzz:" tests, src/fuzz.zig as in Anole) run through
+  `zig build fuzz -Duse_http2=true --fuzz=200K` in the fork, since its own
+  test runner has no fuzzer; CI's `fuzz` job runs them from the pinned
+  package. C compiled into the dusty module breaks Zig 0.17's fuzzer, so
+  C goes in a static library the module links (as llhttp and nghttp2 do).
 - **nghttp2**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.
