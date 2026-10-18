@@ -476,7 +476,7 @@ is valid for the request. Parse it with `std.crypto.Certificate` to get the
 subject or a SAN:
 
 ```zig
-fn whoami(req: *anole.http.Request, res: *anole.http.Response) !void {
+fn whoami(req: *anole.Request, res: *anole.Response) !void {
     const der = req.peerCertificate() orelse return res.print(.text, "anonymous", .{});
     const cert: std.crypto.Certificate = .{ .buffer = der, .index = 0 };
     const parsed = try cert.parse();

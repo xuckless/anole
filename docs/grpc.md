@@ -308,7 +308,7 @@ grpcurl -plaintext -import-path examples/grpc/proto -import-path src/grpc/proto 
 
 ## gRPC-Web and Connect
 
-You need nothing extra on the server: the routes `register` adds serve them.
+You need nothing extra on the server: the routes `app.grpc` adds serve them.
 
 - gRPC-Web, binary and text (base64), works over HTTP/1.1 and HTTP/2. The
   status comes in a last body frame flagged `0x80`, so browsers can call the

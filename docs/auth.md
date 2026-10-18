@@ -199,9 +199,9 @@ try req.session.set("user", id.subject); // the stable account key
 try anole.session.regenerate(req);       // a new session id for the signed-in session
 ```
 
-`refuse` is your own function that sets a 400 and a body: an error returned
-from a handler becomes a 500 (only `error.NotFound` becomes a 404, and
-request faults such as `error.BodyTooBig` their 4xx).
+`refuse` is your own function that answers 400 with a body, such as
+`res.fail(.bad_request, "sign-in failed")`. Returning `error.BadRequest`
+from the handler gives the same status with the status line as the body.
 
 `Identity` holds `subject`, `email`, `email_verified`, `name`, every claim,
 and the access and refresh tokens. Key accounts on `subject`. Trust `email`

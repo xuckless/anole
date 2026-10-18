@@ -337,7 +337,7 @@ Handlers get the server's `std.Io` as `req.io`. A client call through it
 suspends that request only; the executor serves others meanwhile.
 
 - Use `anole.client(req)`, or keep an `anole.http.Client` of your own in
-  your context, created with `server.io()`, as `examples/io` does. Its
+  your context, created with `app.io()`, as `examples/io` does. Its
   `/fanout` route makes two calls at once with `io.concurrent`.
 - Keep HTTP/2 and HTTP/3 connections in your context too, rather than one per
   request: connecting costs a handshake. `examples/clients` opens one per

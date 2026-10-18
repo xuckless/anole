@@ -456,9 +456,9 @@ To answer with a message of your own, `res.fail(status, message)` sets the
 status and replaces whatever was written:
 
 ```zig
-fn requireKey(req: *anole.Request, res: *anole.Response, executor: anytype) !void {
+fn requireKey(req: *anole.Request, res: *anole.Response, next: anole.Next) !void {
     if (req.headers.get("X-Api-Key") == null) return res.fail(.unauthorized, "missing API key");
-    return executor.next();
+    return next.call();
 }
 ```
 
@@ -550,7 +550,7 @@ fn slow(req: *anole.Request, res: *anole.Response) !void {
 ```
 
 Anything written against `std.Io` works this way: `std.Io.Dir` and
-`std.Io.File`, `std.Io.net`, dusty's HTTP client (`anole.http.Client`; see
+`std.Io.File`, `std.Io.net`, the server's HTTP client (`anole.client(req)`; see
 [clients.md](clients.md)) and database drivers built on them. A C library
 that blocks in its own system calls holds the executor's thread until it
 returns.
