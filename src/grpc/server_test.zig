@@ -280,3 +280,129 @@ test "gRPC: unary, server, client and bidi streaming; status and trailers; deadl
         try std.testing.expectEqualStrings("squeeze me", (try cl.responses(a))[0].message);
     }
 }
+
+/// One request with dusty's HTTP/1.1 client; the body and selected headers.
+const Http1 = struct {
+    status: u16,
+    body: []const u8,
+    content_type: []const u8,
+    trailer_echoed: ?[]const u8,
+};
+
+fn http1(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, port: u16, path: []const u8, content_type: []const u8, body: []const u8) !Http1 {
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var headers = try dusty.Headers.init(gpa, 8);
+    defer headers.deinit(gpa);
+    try headers.put("Content-Type", content_type);
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+    var resp = try client.fetch(url, .{ .method = .post, .headers = &headers, .body = body });
+    defer resp.deinit();
+    const h = resp.headers();
+    return .{
+        .status = @intCast(@backingInt(resp.status())),
+        .body = try arena.dupe(u8, (try resp.body()) orelse ""),
+        .content_type = try arena.dupe(u8, h.get("Content-Type") orelse ""),
+        .trailer_echoed = if (h.get("trailer-x-echoed")) |v| try arena.dupe(u8, v) else null,
+    };
+}
+
+fn encodeReq(arena: std.mem.Allocator, req: pb.EchoRequest) ![]const u8 {
+    var enc: std.Io.Writer.Allocating = .init(arena);
+    try req.encode(&enc.writer, arena);
+    return grpc.frame.encode(arena, enc.written());
+}
+
+test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1.1" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+    const port = server.address.ip.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        // gRPC-Web, binary: a message frame, then the trailers frame.
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/grpc-web+proto", try encodeReq(arena, .{ .message = "web" }));
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("application/grpc-web+proto", r.content_type);
+        var reader: std.Io.Reader = .fixed(r.body);
+        const msg = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        var mr: std.Io.Reader = .fixed(msg.payload);
+        try std.testing.expectEqualStrings("web", (try pb.EchoResponse.decode(&mr, arena)).message);
+        const rest = reader.buffered();
+        try std.testing.expectEqual(@as(u8, 0x80), rest[0]);
+        try std.testing.expectEqualStrings("grpc-status:0\r\nx-echoed:yes\r\n", rest[5..]);
+    }
+    {
+        // gRPC-Web text: base64 both ways; three streamed messages.
+        const framed = try encodeReq(arena, .{ .message = "t", .repeat = 3 });
+        const text = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(framed.len));
+        _ = std.base64.standard.Encoder.encode(text, framed);
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/ServerStream", "application/grpc-web-text", text);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        var reader: std.Io.Reader = .fixed(try decodeChunks(arena, r.body));
+        var count: usize = 0;
+        while (reader.buffered().len > 0 and reader.buffered()[0] != 0x80) {
+            _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), count);
+        try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "grpc-status:0") != null);
+    }
+    {
+        // Connect unary, JSON.
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/json", "{\"message\":\"json!\"}");
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("application/json", r.content_type);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"message\":\"json!\"") != null);
+        try std.testing.expectEqualStrings("yes", r.trailer_echoed.?);
+    }
+    {
+        // Connect unary error: HTTP status and a JSON error.
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/json", "{\"message\":\"fail\"}");
+        try std.testing.expectEqual(@as(u16, 404), r.status);
+        try std.testing.expectEqualStrings("{\"code\":\"not_found\",\"message\":\"no such thing: fail\"}", r.body);
+    }
+    {
+        // Connect streaming: envelopes, then the end-of-stream message.
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/ServerStream", "application/connect+proto", try encodeReq(arena, .{ .message = "s", .repeat = 2 }));
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        var reader: std.Io.Reader = .fixed(r.body);
+        _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        const end = reader.buffered();
+        try std.testing.expectEqual(@as(u8, 0x02), end[0]);
+        try std.testing.expectEqualStrings("{}", end[5..]);
+    }
+}
+
+fn decodeChunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i + 4 <= text.len) : (i += 4) {
+        var bytes: [3]u8 = undefined;
+        const len = try std.base64.standard.Decoder.calcSizeForSlice(text[i..][0..4]);
+        try std.base64.standard.Decoder.decode(bytes[0..len], text[i..][0..4]);
+        try out.appendSlice(arena, bytes[0..len]);
+    }
+    return out.items;
+}
