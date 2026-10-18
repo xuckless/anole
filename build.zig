@@ -201,61 +201,67 @@ fn resolveFeatures(b: *std.Build) Features {
 
 const Core = struct {
     zio: *std.Build.Module,
-    /// dusty with TLS compiled out (-Dtls=none).
-    dusty_plain: *std.Build.Module,
-    /// dusty whose `tls` import is Anole's BoringSSL module (-Dtls=boringssl);
-    /// null when BoringSSL is not part of this build.
-    dusty_tls: ?*std.Build.Module,
-    /// src/tls/dusty_tls.zig, the module dusty_tls imports as `tls`.
+    /// dusty instances by [tls][http2]. One exists for each combination this
+    /// build can satisfy: TLS needs BoringSSL in the build, HTTP/2 needs
+    /// nghttp2. Different arguments give separate dusty instances, so
+    /// test-flags can build every combination side by side.
+    dusty_by: [2][2]?*std.Build.Module,
+    /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize }).module("zio");
-        var core: Core = .{
-            .zio = zio_mod,
-            .dusty_plain = dustyModule(b, zio_mod, false, target, optimize),
-            .dusty_tls = null,
-            .tls_seam = null,
-        };
-        if (c_mods.boringssl) |bssl| {
-            const seam = b.createModule(.{
-                .root_source_file = b.path("src/tls/dusty_tls.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-                .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
-            });
-            const dusty_tls = dustyModule(b, zio_mod, true, target, optimize);
-            dusty_tls.addImport("tls", seam);
-            core.dusty_tls = dusty_tls;
-            core.tls_seam = seam;
+        const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
+            .root_source_file = b.path("src/tls/dusty_tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
+        }) else null;
+        var core: Core = .{ .zio = zio_mod, .dusty_by = .{ .{ null, null }, .{ null, null } }, .tls_seam = seam };
+        for ([_]bool{ false, true }) |tls| {
+            if (tls and seam == null) continue;
+            for ([_]bool{ false, true }) |http2| {
+                if (http2 and c_mods.nghttp2 == null) continue;
+                core.dusty_by[@intFromBool(tls)][@intFromBool(http2)] =
+                    dustyModule(b, zio_mod, if (tls) seam else null, if (http2) c_mods.nghttp2 else null, target, optimize);
+            }
         }
         return core;
     }
 
     fn dusty(core: Core, f: Features) *std.Build.Module {
-        return if (f.needsTls()) core.dusty_tls.? else core.dusty_plain;
+        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)].?;
     }
 
-    /// Different arguments give separate dusty instances, so the TLS and
-    /// non-TLS builds coexist (test-flags builds both).
-    fn dustyModule(b: *std.Build, zio_mod: *std.Build.Module, tls: bool, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    fn dustyModule(
+        b: *std.Build,
+        zio_mod: *std.Build.Module,
+        tls: ?*std.Build.Module,
+        nghttp2: ?*std.Build.Module,
+        target: std.Build.ResolvedTarget,
+        optimize: std.builtin.OptimizeMode,
+    ) *std.Build.Module {
         const mod = b.dependency("dusty", .{
             .target = target,
             .optimize = optimize,
             // With TLS, the `tls` import is injected (Anole's BoringSSL
             // module) instead of dusty's bundled tls.zig, which is then
             // never fetched.
-            .use_tls = tls,
+            .use_tls = tls != null,
             .use_bundled_tls = false,
-            // Never set: Anole builds nghttp2 1.70.0 itself, and dusty's vendored
-            // 1.69.0 would collide with it at link time.
-            .use_http2 = false,
+            // With HTTP/2, the `nghttp2` import is Anole's nghttp2 1.70.0
+            // module (which links the library) instead of dusty's vendored
+            // 1.69.0, so only one copy is linked.
+            .use_http2 = nghttp2 != null,
+            .use_bundled_nghttp2 = false,
             // Anole standardises on zlib-ng for deflate, so don't fetch dusty's zlib.zig.
             .use_zlib = false,
         }).module("dusty");
         // Replace dusty's zio stub so its timeouts use zio.AutoCancel.
         mod.addImport("zio", zio_mod);
+        if (tls) |m| mod.addImport("tls", m);
+        if (nghttp2) |m| mod.addImport("nghttp2", m);
         return mod;
     }
 };

@@ -8,15 +8,15 @@
         // (its v0.19.x tags are the Zig 0.16 line). dusty: Anole's fork
         // xuckless/dusty, branch `anole`, which is lalinsky/dusty d3cb485 plus
         // the patches Anole needs (TLS state teardown, server ALPN, in-memory
-        // PEM, handshake log level), each open upstream as lalinsky/dusty
-        // PRs #263-#266.
+        // PEM, handshake log level, nghttp2 injection), each open upstream as
+        // lalinsky/dusty PRs #263-#267.
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#4e4e1ed10da974f15b119207d346a78cc6c363e4",
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#11e74d93eec544faaf8bdf774f3eb054bfaa1458",
-            .hash = "dusty-0.4.0-Qdw7Rl32IwD1aPzk8kdV4a7Qu9oUSNp1ZGoKoIfsPngP",
+            .url = "git+https://github.com/xuckless/dusty#ab9e58ab8394d1df6ee0477d8bcc05930df445bf",
+            .hash = "dusty-0.4.0-Qdw7Rhv6IwCiL_RfhPSFLK2vqOM6z40O0RpcYMbbhOPQ",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
