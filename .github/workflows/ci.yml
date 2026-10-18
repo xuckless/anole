@@ -155,6 +155,41 @@ jobs:
           path: ${{ runner.temp }}/interop/logs
           retention-days: 7
 
+  webtransport-interop:
+    name: WebTransport interop runner (Anole's server, flupke; Chrome and Firefox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: webtransport-interop
+      - name: Install tshark
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/nightly
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark
+      - name: tests/interop/webtransport/run.sh flupke-webtransport
+        run: tests/interop/webtransport/run.sh flupke-webtransport
+        env:
+          ANOLE_INTEROP_WORK: ${{ runner.temp }}/wt-interop
+      # Not a gate yet: the browser images have not been run against Anole
+      # (they are x86_64 only, and were built on an arm64 Mac).
+      - name: tests/interop/webtransport/run.sh chrome,firefox
+        continue-on-error: true
+        run: tests/interop/webtransport/run.sh chrome,firefox
+        env:
+          ANOLE_INTEROP_WORK: ${{ runner.temp }}/wt-interop-browsers
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webtransport-interop-logs
+          path: |
+            ${{ runner.temp }}/wt-interop/logs
+            ${{ runner.temp }}/wt-interop-browsers/logs
+          retention-days: 7
+
   consumer:
     name: A project that adds Anole with zig fetch (fresh cache)
     # The commit must be fetchable from this repository, so pushes only.

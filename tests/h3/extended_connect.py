@@ -257,4 +257,5 @@ async def main():
         await (wt if kind == "wt" else ws)(c, sub)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
