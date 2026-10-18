@@ -89,7 +89,8 @@ pub const Verified = struct {
         const v = self.claims.get(name) orelse return null;
         return switch (v) {
             .integer => |i| i,
-            .float => |f| if (@floor(f) == f) @intFromFloat(f) else null,
+            // A whole number that fits; 1e300 is whole and does not.
+            .float => |f| if (@floor(f) == f and f >= -0x1p63 and f < 0x1p63) @intFromFloat(f) else null,
             else => null,
         };
     }
@@ -149,14 +150,15 @@ pub fn verify(arena: std.mem.Allocator, token: []const u8, keys: []const Key, po
 }
 
 fn checkClaims(v: Verified, policy: Policy, now: i64) Error!void {
+    // Saturating: the claims are any i64 the issuer wrote.
     const leeway = policy.leeway_seconds;
     if (v.integer("exp")) |exp| {
-        if (now - leeway >= exp) return error.Expired;
+        if (now -| leeway >= exp) return error.Expired;
     } else if (policy.require_exp) return error.MissingExpiry;
-    if (v.integer("nbf")) |nbf| if (now + leeway < nbf) return error.NotYetValid;
+    if (v.integer("nbf")) |nbf| if (now +| leeway < nbf) return error.NotYetValid;
     if (v.integer("iat")) |iat| {
-        if (now + leeway < iat) return error.IssuedInFuture;
-        if (policy.max_age_seconds) |max| if (now - iat > max + leeway) return error.TooOld;
+        if (now +| leeway < iat) return error.IssuedInFuture;
+        if (policy.max_age_seconds) |max| if (now -| iat > max +| leeway) return error.TooOld;
     } else if (policy.max_age_seconds != null) return error.TooOld;
     if (policy.issuer) |iss| {
         const got = v.string("iss") orelse return error.WrongIssuer;
@@ -370,6 +372,21 @@ test "verify: ES256 and EdDSA signed here, keys from a JWKS" {
         try std.testing.expectEqualStrings("u1", v.string("sub").?);
         try std.testing.expectEqualStrings(case[1], v.kid.?);
     }
+}
+
+test "claims: times past what an i64 holds are refused, not a crash" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const claims = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"exp":1e300,"nbf":-1e300,"iat":-9223372036854775808,"big":9.3e18,"whole":1.7e9}
+    , .{});
+    const v: Verified = .{ .header = .empty, .claims = claims.object, .alg = .HS256, .kid = null };
+    try std.testing.expectEqual(@as(?i64, null), v.integer("exp"));
+    try std.testing.expectEqual(@as(?i64, null), v.integer("big"));
+    try std.testing.expectEqual(@as(?i64, 1700000000), v.integer("whole"));
+    try std.testing.expectError(error.MissingExpiry, checkClaims(v, .{}, 1700000000));
+    try std.testing.expectError(error.TooOld, checkClaims(v, .{ .require_exp = false, .max_age_seconds = 60 }, 1700000000));
 }
 
 test "fuzz: JWS verification and JWK Sets" {
