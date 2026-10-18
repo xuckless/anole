@@ -155,14 +155,11 @@ pub fn main(init: std.process.Init) !void {
     const rt = try anole.zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var bundle: std.crypto.Certificate.Bundle = .empty;
-    defer bundle.deinit(init.gpa);
-    if (ca_path) |path| try bundle.addCertsFromFilePath(init.gpa, io, std.Io.Clock.real.now(io), std.Io.Dir.cwd(), path);
     const conn = try anole.h2.ClientConnection.connect(init.gpa, io, .{
         .host = if (ca_path != null) "localhost" else "127.0.0.1",
         .address = .{ .ip4 = .loopback(port) },
         .port = port,
-        .tls = if (ca_path != null) .{ .root_ca = bundle } else null,
+        .tls = if (ca_path) |path| .{ .ca = .{ .file = .{ .path = path } } } else null,
     });
     defer conn.close();
     var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost", .scheme = if (ca_path != null) "https" else "http" };

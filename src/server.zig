@@ -929,12 +929,12 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             }
 
             // HTTP/2.
-            const h2c = @import("h2/client.zig");
+            const h2c = @import("anole_h2_client");
             {
                 const conn = try h2c.ClientConnection.connect(alloc, io_, .{
                     .host = "localhost",
                     .port = port,
-                    .tls = .{ .root_ca = bundle, .certificate = .{ .cert_pem = p.cert, .key_pem = p.key } },
+                    .tls = .{ .ca = .{ .pem = p.cert }, .client_certificate = .{ .pem = .{ .cert = p.cert, .key = p.key } } },
                 });
                 defer conn.close();
                 const s = try conn.request(&.{
@@ -955,8 +955,8 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
                 .host = "localhost",
                 .address = q,
                 .port = q.getPort(),
-                .tls = .{ .root_ca = bundle },
-                .handshake_timeout_ms = 3000,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+                .connect_timeout = .fromSeconds(3),
             })) |conn| {
                 defer conn.close();
                 if (h3Get(conn, alloc)) |body| {
@@ -969,7 +969,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
                 .host = "localhost",
                 .address = q,
                 .port = q.getPort(),
-                .tls = .{ .root_ca = bundle, .certificate = .{ .cert_pem = p.cert, .key_pem = p.key } },
+                .tls = .{ .ca = .{ .pem = p.cert }, .client_certificate = .{ .pem = .{ .cert = p.cert, .key = p.key } } },
             });
             defer conn.close();
             const body = try h3Get(conn, alloc);
@@ -1055,7 +1055,7 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
 /// Certificate reload checks: GETs over each protocol, trusting one CA.
 const ReloadCheck = struct {
     const alloc = std.testing.allocator;
-    const h2c = @import("h2/client.zig");
+    const h2c = @import("anole_h2_client");
 
     fn request(conn: anytype) !void {
         const s = try conn.request(&.{
@@ -1080,22 +1080,23 @@ const ReloadCheck = struct {
         try std.testing.expectEqualStrings("reloaded", (try resp.body()).?);
     }
 
-    fn h2(io_: std.Io, port: u16, ca: std.crypto.Certificate.Bundle) !*h2c.ClientConnection {
-        return h2c.ClientConnection.connect(alloc, io_, .{ .host = "localhost", .port = port, .tls = .{ .root_ca = ca } });
+    /// `ca`: the one CA certificate to trust, PEM.
+    fn h2(io_: std.Io, port: u16, ca: []const u8) !*h2c.ClientConnection {
+        return h2c.ClientConnection.connect(alloc, io_, .{ .host = "localhost", .port = port, .tls = .{ .ca = .{ .pem = ca } } });
     }
 
-    fn h3c(io_: std.Io, q: std.Io.net.IpAddress, ca: std.crypto.Certificate.Bundle) !*h3.ClientConnection {
+    fn h3c(io_: std.Io, q: std.Io.net.IpAddress, ca: []const u8) !*h3.ClientConnection {
         return h3.ClientConnection.connect(alloc, io_, .{
             .host = "localhost",
             .address = q,
             .port = q.getPort(),
-            .tls = .{ .root_ca = ca },
-            .handshake_timeout_ms = 3000,
+            .tls = .{ .ca = .{ .pem = ca } },
+            .connect_timeout = .fromSeconds(3),
         });
     }
 
     /// New connections over all three protocols verify against `ca` alone.
-    fn serves(a: *Server(void), dir: std.Io.Dir, ca_name: []const u8, ca: std.crypto.Certificate.Bundle) !void {
+    fn serves(a: *Server(void), dir: std.Io.Dir, ca_name: []const u8, ca: []const u8) !void {
         const io_ = a.io();
         const port = a.addresses()[0].ip.getPort();
         try h1(io_, port, dir, ca_name);
@@ -1153,20 +1154,15 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
         fn run(a: *Server(void), p: *const [4]tls.Pem, dir: std.Io.Dir) !void {
             defer a.stop();
             const io_ = a.io();
-            const alloc = std.testing.allocator;
             try a.waitReady();
-            var cas: [4]std.crypto.Certificate.Bundle = undefined;
-            var loaded: usize = 0;
-            defer for (cas[0..loaded]) |*b| b.deinit(alloc);
-            while (loaded < cas.len) : (loaded += 1) cas[loaded] = try tls.testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p[loaded].cert);
             const port = a.addresses()[0].ip.getPort();
 
-            try ReloadCheck.serves(a, dir, "ca0.pem", cas[0]);
+            try ReloadCheck.serves(a, dir, "ca0.pem", p[0].cert);
             // Connections that outlive the reloads.
-            const old2 = try ReloadCheck.h2(io_, port, cas[0]);
+            const old2 = try ReloadCheck.h2(io_, port, p[0].cert);
             defer old2.close();
             try ReloadCheck.request(old2);
-            const old3 = try ReloadCheck.h3c(io_, a.http3Address().?, cas[0]);
+            const old3 = try ReloadCheck.h3c(io_, a.http3Address().?, p[0].cert);
             defer old3.close();
             try ReloadCheck.request(old3);
 
@@ -1174,7 +1170,7 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[1].cert });
             try dir.writeFile(io_, .{ .sub_path = "key.pem", .data = p[1].key });
             try a.reloadCertificates();
-            try ReloadCheck.serves(a, dir, "ca1.pem", cas[1]);
+            try ReloadCheck.serves(a, dir, "ca1.pem", p[1].cert);
             try std.testing.expect(std.meta.isError(ReloadCheck.h1(io_, port, dir, "ca0.pem")));
             try ReloadCheck.request(old2);
             try ReloadCheck.request(old3);
@@ -1183,7 +1179,7 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
             // nothing changes.
             try dir.writeFile(io_, .{ .sub_path = "key.pem", .data = p[2].key });
             try std.testing.expect(std.meta.isError(a.reloadCertificates()));
-            try ReloadCheck.serves(a, dir, "ca1.pem", cas[1]);
+            try ReloadCheck.serves(a, dir, "ca1.pem", p[1].cert);
 
             // SIGHUP, once `run` listens for it.
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[2].cert });
@@ -1204,11 +1200,11 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
                 try io_.sleep(.fromMilliseconds(10), .awake);
             } else false;
             try std.testing.expect(switched);
-            try ReloadCheck.serves(a, dir, "ca2.pem", cas[2]);
+            try ReloadCheck.serves(a, dir, "ca2.pem", p[2].cert);
 
             // setCertificate: PEM in memory.
             try a.setCertificate(.{ .pem = .{ .cert = p[3].cert, .key = p[3].key } });
-            try ReloadCheck.serves(a, dir, "ca3.pem", cas[3]);
+            try ReloadCheck.serves(a, dir, "ca3.pem", p[3].cert);
             try ReloadCheck.request(old2);
             try ReloadCheck.request(old3);
         }

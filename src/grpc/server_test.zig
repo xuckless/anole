@@ -739,7 +739,7 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
     var server_future = try startServer(&server, io);
     defer server_future.cancel(io) catch {};
 
-    const h2 = @import("../h2/client.zig");
+    const h2 = @import("anole_h2_client");
     const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
     defer conn.close();
     var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };

@@ -16,8 +16,6 @@ pub const EndpointOptions = @import("server.zig").Options;
 pub const ClientAuth = @import("quic_tls.zig").ClientAuth;
 /// A listener's TLS context; see `Endpoint.loadTls` and `Endpoint.useTls`.
 pub const TlsContext = @import("quic_tls.zig").Context;
-/// A client certificate and key for `ConnectOptions.tls.certificate`.
-pub const Identity = @import("quic_tls.zig").Identity;
 /// An HTTP/3 client connection: many concurrent requests over one QUIC
 /// connection. The same names as `anole.h2`'s.
 pub const ClientConnection = @import("client.zig").ClientConnection;

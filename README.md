@@ -28,7 +28,7 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
 - HTTPS through BoringSSL: TLS 1.3 and 1.2, ALPN, certificate verification,
   mutual TLS (also over HTTP/3, with the client certificate for handlers),
   session tickets and close_notify, for both the server and
-  dusty's HTTP client, whose own test suite (515 tests) passes on it;
+  dusty's HTTP client, whose own test suite (526 tests) passes on it;
 - HTTP/2 on nghttp2, over TLS (ALPN "h2") and cleartext (prior knowledge), on
   the same router and handlers, with streaming bodies, flow control and
   trailers; h2spec 2.6.0 passes every case in strict mode, over h2c and TLS;

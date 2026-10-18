@@ -278,7 +278,7 @@ test "h3 server: a request that outlives timeout.request is reset" {
     try std.testing.expectEqualStrings("hello over h3", body);
 }
 
-test "h3 server: mutual TLS in request mode, and the client certificate in handlers" {
+test "h3 server: mutual TLS in request mode, and the client certificate in handlers (PEM or files)" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -301,6 +301,26 @@ test "h3 server: mutual TLS in request mode, and the client certificate in handl
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
             .tls = .{ .ca = .{ .pem = f.pem.cert }, .client_certificate = .{ .pem = .{ .cert = f.pem.cert, .key = f.pem.key } } },
+        });
+        defer conn.close();
+        const body = try get(conn, "/peer", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualSlices(u8, f.bundle.bytes.items, body);
+    }
+    // The same certificate and the CA from files.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = f.pem.cert });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = f.pem.key });
+        const conn = try client.ClientConnection.connect(gpa, io, .{
+            .host = "localhost",
+            .address = f.ep.address(),
+            .port = f.ep.address().getPort(),
+            .tls = .{
+                .ca = .{ .file = .{ .path = "cert.pem", .dir = tmp.dir } },
+                .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = tmp.dir },
+            },
         });
         defer conn.close();
         const body = try get(conn, "/peer", gpa);
