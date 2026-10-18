@@ -70,9 +70,12 @@ pub const SelfSignedOptions = struct {
     /// subjectAltName entries, in OpenSSL config syntax.
     alt_names: []const u8 = "DNS:localhost,IP:127.0.0.1,IP:::1",
     valid_for_seconds: i64 = 7 * 24 * 3600,
+    /// P-256 is fast to make and to use; RSA-4096 is the heaviest key a
+    /// handshake meets in practice (and takes a second or more to make).
+    key: enum { p256, rsa4096 } = .p256,
 };
 
-/// A fresh P-256 key and a self-signed certificate for it, for development
+/// A fresh key and a self-signed certificate for it, for development
 /// and tests: nothing touches the disk. The certificate is its own CA
 /// (`CA:TRUE`), so a client can trust it directly.
 pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
@@ -80,12 +83,26 @@ pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
     defer c.ERR_clear_error();
     const pkey = c.EVP_PKEY_new() orelse return error.OutOfMemory;
     defer c.EVP_PKEY_free(pkey);
-    {
-        const ec = c.EC_KEY_new_by_curve_name(c.NID_X9_62_prime256v1) orelse return error.OutOfMemory;
-        if (c.EC_KEY_generate_key(ec) != 1 or c.EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
-            c.EC_KEY_free(ec);
-            return error.TlsKeyGenerationFailed;
-        }
+    switch (opt.key) {
+        .p256 => {
+            const ec = c.EC_KEY_new_by_curve_name(c.NID_X9_62_prime256v1) orelse return error.OutOfMemory;
+            if (c.EC_KEY_generate_key(ec) != 1 or c.EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+                c.EC_KEY_free(ec);
+                return error.TlsKeyGenerationFailed;
+            }
+        },
+        .rsa4096 => {
+            const rsa = c.RSA_new() orelse return error.OutOfMemory;
+            const e = c.BN_new() orelse {
+                c.RSA_free(rsa);
+                return error.OutOfMemory;
+            };
+            defer c.BN_free(e);
+            if (c.BN_set_word(e, 65537) != 1 or c.RSA_generate_key_ex(rsa, 4096, e, null) != 1 or c.EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+                c.RSA_free(rsa);
+                return error.TlsKeyGenerationFailed;
+            }
+        },
     }
 
     const x = c.X509_new() orelse return error.OutOfMemory;
@@ -377,10 +394,14 @@ const Https = struct {
     tmp: std.testing.TmpDir,
 
     fn init() !Https {
+        return initWith(.{});
+    }
+
+    fn initWith(opt: SelfSignedOptions) !Https {
         const gpa = std.testing.allocator;
         const rt = try zio.Runtime.init(gpa, .{});
         errdefer rt.deinit();
-        var pem = try selfSigned(gpa, .{});
+        var pem = try selfSigned(gpa, opt);
         errdefer pem.deinit(gpa);
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
@@ -396,6 +417,71 @@ const Https = struct {
 
     fn caFile(self: *Https) dusty.TlsCa {
         return .{ .file = .{ .path = "cert.pem", .dir = self.tmp.dir } };
+    }
+};
+
+/// A blocking BoringSSL client over a plain socket, for tests that need to
+/// see what dusty's client hides. Run it off the runtime (`onThread`): its
+/// I/O blocks.
+const RawClient = struct {
+    fd: c_int,
+    ssl: *c.SSL,
+
+    fn connect(ctx: *c.SSL_CTX, port: u16, session: ?*c.SSL_SESSION) !RawClient {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = std.c.close(fd);
+        var addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
+        const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
+        errdefer c.SSL_free(ssl);
+        _ = c.SSL_set_fd(ssl, fd);
+        if (session) |sess| _ = c.SSL_set_session(ssl, sess);
+        // Unverified: these clients look at the protocol, not the identity.
+        if (c.SSL_connect(ssl) != 1) return error.Handshake;
+        return .{ .fd = fd, .ssl = ssl };
+    }
+
+    /// One `Connection: close` GET of "/"; true when the hello came back.
+    /// Reads to the end, so a TLS 1.3 session ticket has arrived.
+    fn get(self: RawClient) !struct { hello: bool, close_notify: bool } {
+        const req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        if (c.SSL_write(self.ssl, req, req.len) != req.len) return error.Write;
+        var hello = false;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = c.SSL_read(self.ssl, &buf, buf.len);
+            if (n > 0) {
+                if (std.mem.indexOf(u8, buf[0..@intCast(n)], "hello over tls") != null) hello = true;
+                continue;
+            }
+            // ZERO_RETURN: close_notify; SYSCALL with no error: a bare EOF.
+            return .{ .hello = hello, .close_notify = c.SSL_get_error(self.ssl, n) == c.SSL_ERROR_ZERO_RETURN };
+        }
+    }
+
+    fn close(self: RawClient) void {
+        _ = c.SSL_shutdown(self.ssl);
+        c.SSL_free(self.ssl);
+        _ = std.c.close(self.fd);
+    }
+
+    /// Runs `func(args)` on a thread of its own and waits for it without
+    /// blocking the runtime's executors.
+    fn onThread(io: std.Io, comptime func: anytype, args: anytype) !void {
+        const Wrap = struct {
+            done: std.atomic.Value(bool) = .init(false),
+            result: anyerror!void = {},
+            fn run(w: *@This(), a: @TypeOf(args)) void {
+                w.result = @call(.auto, func, a);
+                w.done.store(true, .release);
+            }
+        };
+        var w: Wrap = .{};
+        const thread = try std.Thread.spawn(.{}, Wrap.run, .{ &w, args });
+        while (!w.done.load(.acquire)) try io.sleep(.fromMilliseconds(2), .awake);
+        thread.join();
+        return w.result;
     }
 };
 
@@ -555,25 +641,13 @@ test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" 
     defer server_future.cancel(io) catch {};
     try server.ready.wait(io);
 
-    // A plain BoringSSL client on its own thread (blocking socket I/O must
-    // not hold up the runtime), which only reads what the server asked for.
+    // Reads what the server asked for, in the cert callback: the requested
+    // CAs are readable only during the handshake.
     const Probe = struct {
-        port: u16,
         names: usize = 0,
         matches: bool = false,
-        failed: ?anyerror = null,
-        done: std.atomic.Value(bool) = .init(false),
+        expected: []const u8,
 
-        expected: []const u8 = &.{},
-
-        fn run(p: *@This()) void {
-            defer p.done.store(true, .release);
-            p.probe() catch |err| {
-                p.failed = err;
-            };
-        }
-
-        /// The requested CAs are readable only during the handshake.
         fn certCb(ssl: ?*c.SSL, arg: ?*anyopaque) callconv(.c) c_int {
             const p: *@This() = @ptrCast(@alignCast(arg.?));
             const names = c.SSL_get0_server_requested_CAs(ssl) orelse return 1;
@@ -586,21 +660,12 @@ test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" 
             return 1;
         }
 
-        fn probe(p: *@This()) !void {
-            const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-            if (fd < 0) return error.Socket;
-            defer _ = std.c.close(fd);
-            var addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, p.port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
-            if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
+        fn run(p: *@This(), port: u16) !void {
             const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
             defer c.SSL_CTX_free(ctx);
             c.SSL_CTX_set_cert_cb(ctx, certCb, p);
-            const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
-            defer c.SSL_free(ssl);
-            _ = c.SSL_set_fd(ssl, fd);
-            // Unverified: this client only looks at the request.
-            if (c.SSL_connect(ssl) != 1) return error.Handshake;
-            _ = c.SSL_shutdown(ssl);
+            const conn = try RawClient.connect(ctx, port, null);
+            conn.close();
         }
     };
 
@@ -613,11 +678,8 @@ test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" 
     var subject_len: usize = 0;
     try std.testing.expectEqual(1, c.X509_NAME_get0_der(c.X509_get_subject_name(x), &subject_der, &subject_len));
 
-    var probe: Probe = .{ .port = server.address.ip.getPort(), .expected = subject_der[0..subject_len] };
-    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
-    while (!probe.done.load(.acquire)) try io.sleep(.fromMilliseconds(2), .awake);
-    thread.join();
-    if (probe.failed) |err| return err;
+    var probe: Probe = .{ .expected = subject_der[0..subject_len] };
+    try RawClient.onThread(io, Probe.run, .{ &probe, server.address.ip.getPort() });
     try std.testing.expectEqual(1, probe.names);
     try std.testing.expect(probe.matches);
 }
@@ -635,55 +697,105 @@ test "TLS hello: a connection the server closes ends with close_notify" {
     defer server_future.cancel(io) catch {};
     try server.ready.wait(io);
 
-    // A plain BoringSSL client on its own thread: one request with
-    // `Connection: close`, then reads to the end and notes how it ended.
     const Peer = struct {
-        port: u16,
-        clean_close: bool = false,
-        got_response: bool = false,
-        failed: ?anyerror = null,
-        done: std.atomic.Value(bool) = .init(false),
-
-        fn run(p: *@This()) void {
-            defer p.done.store(true, .release);
-            p.talk() catch |err| {
-                p.failed = err;
-            };
-        }
-
-        fn talk(p: *@This()) !void {
-            const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-            if (fd < 0) return error.Socket;
-            defer _ = std.c.close(fd);
-            var addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, p.port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
-            if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
+        fn run(port: u16) !void {
             const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
             defer c.SSL_CTX_free(ctx);
-            const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
-            defer c.SSL_free(ssl);
-            _ = c.SSL_set_fd(ssl, fd);
-            if (c.SSL_connect(ssl) != 1) return error.Handshake;
-            const req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-            if (c.SSL_write(ssl, req, req.len) != req.len) return error.Write;
-            var buf: [4096]u8 = undefined;
-            while (true) {
-                const n = c.SSL_read(ssl, &buf, buf.len);
-                if (n > 0) {
-                    if (std.mem.indexOf(u8, buf[0..@intCast(n)], "hello over tls") != null) p.got_response = true;
-                    continue;
-                }
-                // ZERO_RETURN: close_notify; SYSCALL with no error: a bare EOF.
-                p.clean_close = c.SSL_get_error(ssl, n) == c.SSL_ERROR_ZERO_RETURN;
-                return;
-            }
+            const conn = try RawClient.connect(ctx, port, null);
+            defer conn.close();
+            const got = try conn.get();
+            try std.testing.expect(got.hello);
+            try std.testing.expect(got.close_notify);
         }
     };
+    try RawClient.onThread(io, Peer.run, .{server.address.ip.getPort()});
+}
 
-    var peer: Peer = .{ .port = server.address.ip.getPort() };
-    const thread = try std.Thread.spawn(.{}, Peer.run, .{&peer});
-    while (!peer.done.load(.acquire)) try io.sleep(.fromMilliseconds(2), .awake);
-    thread.join();
-    if (peer.failed) |err| return err;
-    try std.testing.expect(peer.got_response);
-    try std.testing.expect(peer.clean_close);
+test "TLS hello: an RSA-4096 handshake fits the default coroutine stacks on both ends" {
+    // The heaviest key a handshake meets in practice: signing on the server
+    // and verifying on the client both run on zio coroutine stacks of the
+    // default size. Overflowing one would crash here.
+    var h = try Https.initWith(.{ .key = .rsa4096 });
+    defer h.deinit();
+    const io = h.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+            // Two clients, so two connections and two full handshakes.
+            for (0..2) |_| {
+                var client = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
+                defer client.deinit();
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqualStrings("hello over tls", (try response.body()).?);
+            }
+        }
+    }.run, .{ &server, io, h.caFile() });
+    try client_future.await(io);
+}
+
+test "TLS hello: a returning client resumes its session with a ticket" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const Returning = struct {
+        /// The latest session the server issued: in TLS 1.3 sessions come
+        /// in NewSessionTicket messages after the handshake, and BoringSSL
+        /// hands them to this callback rather than to `SSL_get1_session`.
+        var latest: ?*c.SSL_SESSION = null;
+
+        fn onNewSession(_: ?*c.SSL, session: ?*c.SSL_SESSION) callconv(.c) c_int {
+            if (latest) |old| c.SSL_SESSION_free(old);
+            latest = session;
+            return 1; // keeps the reference
+        }
+
+        fn run(port: u16, version: u16) !void {
+            const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+            defer c.SSL_CTX_free(ctx);
+            _ = c.SSL_CTX_set_min_proto_version(ctx, version);
+            _ = c.SSL_CTX_set_max_proto_version(ctx, version);
+            // Client sessions reach the callback only with a client cache
+            // mode set.
+            _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
+            c.SSL_CTX_sess_set_new_cb(ctx, onNewSession);
+            defer if (latest) |sess| {
+                c.SSL_SESSION_free(sess);
+                latest = null;
+            };
+
+            const first = try RawClient.connect(ctx, port, null);
+            const got = try first.get();
+            try std.testing.expect(got.hello);
+            try std.testing.expectEqual(0, c.SSL_session_reused(first.ssl));
+            first.close();
+            const session = latest orelse return error.NoSession;
+
+            const second = try RawClient.connect(ctx, port, session);
+            defer second.close();
+            try std.testing.expectEqual(1, c.SSL_session_reused(second.ssl));
+            try std.testing.expect((try second.get()).hello);
+        }
+    };
+    try RawClient.onThread(io, Returning.run, .{ server.address.ip.getPort(), @as(u16, c.TLS1_3_VERSION) });
+    try RawClient.onThread(io, Returning.run, .{ server.address.ip.getPort(), @as(u16, c.TLS1_2_VERSION) });
 }
