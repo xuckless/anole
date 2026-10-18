@@ -403,7 +403,7 @@ fn connectCode(code: Code) []const u8 {
 fn connectHttpStatus(code: Code) dusty.Status {
     return switch (code) {
         .ok => .ok,
-        .cancelled => @enumFromInt(499),
+        .cancelled => @fromBackingInt(@intCast(499)),
         .unknown, .internal, .data_loss => .internal_server_error,
         .invalid_argument, .failed_precondition, .out_of_range => .bad_request,
         .deadline_exceeded => .gateway_timeout,
