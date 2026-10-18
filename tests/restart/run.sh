@@ -22,7 +22,7 @@ py="$work/venv/bin/python -I"
 port=18580
 tls_port=18581
 
-fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[h]ello $port"; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
+fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[h]ello $port" || true; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
 # Waits up to 10 s for a line matching $1 in the notification log, after
 # its first $2 lines.
 await_notify() {
@@ -54,6 +54,7 @@ restart() {
   rm -f "$work/go"
   $py "$here/across.py" 127.0.0.1 $tls_port "$work/go" >"$work/across" 2>&1 &
   across=$!
+  pids="$pids $across"
   for i in $(seq 1 100); do grep -q "before 200" "$work/across" && break; sleep 0.05; done
   grep -q "before 200" "$work/across" || fail "across: $(cat "$work/across")"
   lines=$(wc -l <"$work/notify.log")
