@@ -165,6 +165,180 @@ pub fn addProtoGen(step: *std.Build.Step, anole_dep: *std.Build.Dependency, opti
     step.dependOn(run.step);
 }
 
+/// One .proto file as a module of generated Zig, for `addApp` and
+/// `addProtoModule`.
+pub const Proto = struct {
+    /// What the program imports it as: `@import("greeter_pb")`.
+    name: []const u8,
+    /// The .proto file. protoc resolves its imports from its directory,
+    /// `include_directories`, and Anole's google/api protos.
+    file: std.Build.LazyPath,
+    /// Its `package` statement, which names the generated file. Read from
+    /// `file` when null, which then must be in the project.
+    package: ?[]const u8 = null,
+    include_directories: []const std.Build.LazyPath = &.{},
+};
+
+/// For a project that depends on Anole: Zig generated from `proto.file`
+/// as a module importing "protobuf", made in the cache by `zig build`
+/// itself whenever the .proto changes (nothing to commit, no separate
+/// step), with the protoc and protoc-gen-zig Anole pins. Anole must be
+/// fetched with gRPC on (the default profile). `addApp` calls it for its
+/// `protos`; `addProtoGen` writes the code into the source tree instead.
+pub fn addProtoModule(b: *std.Build, anole_dep: *std.Build.Dependency, proto: Proto) *std.Build.Module {
+    // Lazy, as in `addProtoGen`: the first configure pass has none of
+    // these, and nothing is compiled then.
+    const pb_dep = anole_dep.builder.lazyDependency("protobuf", .{ .target = b.graph.host }) orelse return b.createModule(.{});
+    const protoc = protocBinary(pb_dep.builder) orelse return b.createModule(.{});
+    const package = proto.package orelse protoPackage(b, proto.file) orelse
+        std.debug.panic("addProtoModule: no `package` statement found in the .proto for \"{s}\"; set `.package`", .{proto.name});
+
+    const run = b.addRunFile(protoc);
+    run.setName(b.fmt("protoc {s}", .{proto.name}));
+    run.addPrefixedArtifactArg("--plugin=protoc-gen-zig=", pb_dep.artifact("protoc-gen-zig"));
+    const out = run.addPrefixedOutputDirectoryArg("--zig_out=", proto.name);
+    for (proto.include_directories) |dir| {
+        run.addArg("-I");
+        run.addDirectoryArg(dir);
+    }
+    run.addArg("-I");
+    run.addDirectoryArg(proto.file.dirname());
+    run.addArg("-I");
+    run.addDirectoryArg(anole_dep.path("src/grpc/proto"));
+    run.addFileArg(proto.file);
+
+    // protoc-gen-zig names the file after the package: a.b -> a/b.pb.zig.
+    const dir_path = b.fmt("{s}", .{package});
+    std.mem.replaceScalar(u8, dir_path, '.', '/');
+    const file_name = b.fmt("{s}.pb.zig", .{dir_path});
+    return b.createModule(.{
+        .root_source_file = out.path(b, file_name),
+        .imports = &.{.{ .name = "protobuf", .module = anole_dep.module("protobuf") }},
+    });
+}
+
+/// zig-protobuf's pinned protoc for the machine running the build (its
+/// `build_util.getProtocBin`, which its build.zig does not export).
+fn protocBinary(pb_builder: *std.Build) ?std.Build.LazyPath {
+    const os = switch (builtin.os.tag) {
+        .macos => "osx",
+        .linux => "linux",
+        else => @compileError("protoc: Anole builds on Linux and macOS"),
+    };
+    const arch = switch (builtin.cpu.arch) {
+        .aarch64 => "aarch_64",
+        .x86_64 => "x86_64",
+        .x86 => "x86_32",
+        else => @compileError("protoc: no pinned binary for this CPU"),
+    };
+    const dep = pb_builder.lazyDependency("protoc-" ++ os ++ "-" ++ arch, .{}) orelse return null;
+    return dep.path("bin/protoc");
+}
+
+/// The `package` a .proto file in the project declares, or null. The
+/// configure step reruns when the file changes.
+fn protoPackage(b: *std.Build, file: std.Build.LazyPath) ?[]const u8 {
+    const src = switch (file) {
+        .src_path => |sp| sp,
+        else => return null,
+    };
+    src.owner.dependOnFileContents(file);
+    const root = src.owner.root;
+    const path = if (root.sub_path.len == 0) src.sub_path else b.pathJoin(&.{ root.sub_path, src.sub_path });
+    const text = root.root_dir.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(4 << 20)) catch return null;
+    return parseProtoPackage(text);
+}
+
+fn parseProtoPackage(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "package")) continue;
+        const rest = std.mem.trim(u8, line["package".len..], " \t");
+        const end = std.mem.indexOfScalar(u8, rest, ';') orelse continue;
+        const name = std.mem.trim(u8, rest[0..end], " \t");
+        if (name.len > 0 and rest.len > 0 and line.len > "package".len and (line["package".len] == ' ' or line["package".len] == '\t')) return name;
+    }
+    return null;
+}
+
+/// What `addApp` builds.
+pub const AppOptions = struct {
+    name: []const u8,
+    root_source_file: std.Build.LazyPath,
+    /// Null: `b.standardTargetOptions(.{})` and
+    /// `b.standardOptimizeOption(.{})`, so `-Dtarget` and `-Doptimize` work.
+    /// Pass them when build.zig already declares those options.
+    target: ?std.Build.ResolvedTarget = null,
+    optimize: ?std.builtin.Optimize = null,
+    /// Anole's name in build.zig.zon.
+    dependency: []const u8 = "anole",
+    /// Anole's feature preset (`-Dprofile`); null takes Anole's default,
+    /// `full`.
+    profile: ?Profile = null,
+    /// .proto files, each a module the program imports by its `name`,
+    /// generated by `zig build` (see `addProtoModule`).
+    protos: []const Proto = &.{},
+    /// More imports for the program.
+    imports: []const std.Build.Module.Import = &.{},
+    /// Add `zig build run` (arguments after `--` go to the program).
+    run_step: bool = true,
+};
+
+/// What `addApp` made.
+pub const App = struct {
+    exe: *std.Build.Step.Compile,
+    /// The Anole dependency it uses. Reuse it (`addProtoGen`, more
+    /// executables) rather than asking `b.dependency` again with other
+    /// arguments: two instances of Anole in one build collide.
+    anole: *std.Build.Dependency,
+};
+
+/// For a project that depends on Anole: the executable, importing "anole"
+/// and the modules generated from `protos`, installed, with a `run` step.
+/// The whole build.zig of a gRPC server:
+///
+///     const std = @import("std");
+///     pub fn build(b: *std.Build) void {
+///         _ = @import("anole").addApp(b, .{
+///             .name = "api",
+///             .root_source_file = b.path("src/main.zig"),
+///             .protos = &.{.{ .name = "greeter_pb", .file = b.path("proto/greeter.proto") }},
+///         });
+///     }
+pub fn addApp(b: *std.Build, options: AppOptions) App {
+    const target = options.target orelse b.standardTargetOptions(.{});
+    const optimize = options.optimize orelse b.standardOptimizeOption(.{});
+    const anole_dep = if (options.profile) |profile|
+        b.dependency(options.dependency, .{ .target = target, .optimize = optimize, .profile = profile })
+    else
+        b.dependency(options.dependency, .{ .target = target, .optimize = optimize });
+    const exe = b.addExecutable(.{
+        .name = options.name,
+        .root_module = b.createModule(.{
+            .root_source_file = options.root_source_file,
+            .target = target,
+            .optimize = optimize,
+            .imports = options.imports,
+        }),
+    });
+    exe.root_module.addImport("anole", anole_dep.module("anole"));
+    for (options.protos) |proto| {
+        const m = addProtoModule(b, anole_dep, proto);
+        m.resolved_target = target;
+        m.optimize = optimize;
+        exe.root_module.addImport(proto.name, m);
+    }
+    b.installArtifact(exe);
+    if (options.run_step) {
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(b.getInstallStep());
+        run.addPassthruArgs();
+        b.step("run", b.fmt("Run {s}", .{options.name})).dependOn(&run.step);
+    }
+    return .{ .exe = exe, .anole = anole_dep };
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

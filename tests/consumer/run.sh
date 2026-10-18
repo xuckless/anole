@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # tests/consumer as a user gets Anole: a copy of the project outside this
 # repository, with the path dependency replaced by `zig fetch --save` of a
-# git URL, then `zig build gen-proto` and `zig build`.
+# git URL, then `zig build` (which generates the protobuf code) and `zig
+# build gen-proto` (the same into src/gen).
 #
 #   tests/consumer/run.sh [URL]
 #
-# URL defaults to this checkout's HEAD on GitHub, which must be pushed.
+# URL defaults to this checkout's HEAD on GitHub, which must be pushed; a
+# local directory (a checkout) works too.
 # ANOLE_CONSUMER_FRESH_CACHE=1 also starts from an empty global cache, so
 # every pinned hash and lazy download is checked as on a new machine.
 set -euo pipefail
@@ -35,7 +37,8 @@ assert '.path =' not in s, s
 open(p, 'w').write(s)
 PY
 "$zig" fetch --save=anole "$url"
-"$zig" build gen-proto
 "$zig" build
 test -x zig-out/bin/consumer
+"$zig" build gen-proto
+test -f src/gen/greeter.pb.zig
 echo "consumer built against $url"
