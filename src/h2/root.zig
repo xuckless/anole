@@ -3,11 +3,20 @@
 //! fork.
 const std = @import("std");
 
+const client = @import("anole_h2_client");
+
 /// An HTTP/2 client connection (cleartext or TLS), many streams at once.
-pub const ClientConnection = @import("client.zig").ClientConnection;
-pub const Stream = @import("client.zig").Stream;
-pub const Header = @import("client.zig").Header;
-pub const ConnectOptions = @import("client.zig").ConnectOptions;
+/// `anole.h3` has the same names for HTTP/3.
+pub const ClientConnection = client.ClientConnection;
+/// One request and its response.
+pub const Stream = client.Stream;
+/// `Stream`, by the name it once had in `anole.h3`.
+pub const ClientStream = client.Stream;
+pub const Header = client.Header;
+pub const ConnectOptions = client.ConnectOptions;
+pub const RequestOptions = client.ClientConnection.RequestOptions;
+/// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
+pub const StreamError = client.StreamError;
 
 /// The translated nghttp2.h.
 pub const c = @import("anole_nghttp2_c");

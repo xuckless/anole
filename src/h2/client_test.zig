@@ -5,7 +5,7 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const features = @import("build_options");
-const h2 = @import("client.zig");
+const h2 = @import("anole_h2_client");
 
 fn hello(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "hello over h2";
@@ -39,13 +39,76 @@ fn get(conn: *h2.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]
     return s.reader().allocRemaining(gpa, .unlimited);
 }
 
+fn slow(req: *dusty.Request, res: *dusty.Response) !void {
+    try req.io.sleep(.fromSeconds(5), .awake);
+    res.body = "too late";
+}
+
+/// The head and some of the body, then nothing for a while.
+fn stall(req: *dusty.Request, res: *dusty.Response) !void {
+    var out_buf: [256]u8 = undefined;
+    var out = try res.stream(&out_buf);
+    try out.interface.writeAll("part of it");
+    try out.interface.flush();
+    try req.io.sleep(.fromSeconds(5), .awake);
+    try out.end();
+}
+
+fn redirect(_: *dusty.Request, res: *dusty.Response) !void {
+    res.status = .found;
+    try res.header("Location", "/hello");
+}
+
 fn startServer(gpa: std.mem.Allocator, io: std.Io, listeners: []const dusty.Listener) !*dusty.Server(void) {
     const server = try gpa.create(dusty.Server(void));
     server.* = .init(gpa, io, .{ .listeners = listeners }, {});
     server.router.get("/hello", hello);
     server.router.post("/echo", echo);
     server.router.get("/trailers", withTrailers);
+    server.router.get("/slow", slow);
+    server.router.get("/stall", stall);
+    server.router.get("/redirect", redirect);
     return server;
+}
+
+/// A server on a zio runtime, stopped (and freed) by `stop`.
+const Running = struct {
+    server: *dusty.Server(void),
+    future: std.Io.Future(anyerror!void),
+
+    fn start(gpa: std.mem.Allocator, io: std.Io, listeners: []const dusty.Listener) !Running {
+        const server = try startServer(gpa, io, listeners);
+        errdefer {
+            server.deinit();
+            gpa.destroy(server);
+        }
+        const future = try io.concurrent(run, .{server});
+        try server.ready.wait(io);
+        return .{ .server = server, .future = future };
+    }
+
+    fn run(s: *dusty.Server(void)) anyerror!void {
+        try s.run();
+    }
+
+    fn port(r: Running) u16 {
+        return r.server.address.ip.getPort();
+    }
+
+    fn stop(r: *Running, gpa: std.mem.Allocator, io: std.Io) void {
+        r.future.cancel(io) catch {};
+        r.server.deinit();
+        gpa.destroy(r.server);
+    }
+};
+
+const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+
+fn request(conn: *h2.ClientConnection, path: []const u8, options: h2.ClientConnection.RequestOptions) !*h2.Stream {
+    return conn.request(&.{
+        .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, options);
 }
 
 test "h2 client: GET, a large streamed echo, trailers and 20 concurrent streams" {
@@ -145,13 +208,11 @@ test "h2 client: over TLS with ALPN h2" {
     defer server_future.cancel(io) catch {};
     try server.ready.wait(io);
 
-    var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
-    defer bundle.deinit(gpa);
     const conn = try h2.ClientConnection.connect(gpa, io, .{
         .host = "localhost",
         .address = server.address.ip,
         .port = server.address.ip.getPort(),
-        .tls = .{ .root_ca = bundle },
+        .tls = .{ .ca = .{ .pem = pem.cert } },
     });
     defer conn.close();
     const body = try get(conn, "/hello", gpa);
@@ -254,5 +315,228 @@ test "h2 engine: a client's RST_STREAM or a lost connection cancels the stream's
         const closed_at: std.Io.Clock.Timestamp = .now(io, .awake);
         socket.close(io);
         try Sleeper.expectCanceledWithin(io, closed_at, 3000);
+    }
+}
+
+test "h2 client: request timeouts, for the head and for the body, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try Running.start(gpa, io, &.{.{ .address = loopback, .http2_prior_knowledge = true }});
+    defer srv.stop(gpa, io);
+
+    // The connection's default: every request gets 300 ms.
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port(), .timeout = .fromMilliseconds(300) });
+    defer conn.close();
+
+    const started = std.Io.Clock.awake.now(io);
+    {
+        const s = try request(conn, "/slow", .{});
+        defer s.release();
+        try std.testing.expectError(error.Timeout, s.waitHead());
+    }
+    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+
+    // The head in time, the body not: the read fails, and says why.
+    {
+        const s = try request(conn, "/stall", .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } } });
+        defer s.release();
+        try s.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), s.status);
+        try std.testing.expectError(error.ReadFailed, s.reader().allocRemaining(gpa, .unlimited));
+        try std.testing.expectEqual(@as(?h2.StreamError, error.Timeout), s.readError());
+    }
+
+    // `.none` lifts the default; this one ends in time anyway.
+    {
+        const s = try request(conn, "/hello", .{ .timeout = .none });
+        defer s.release();
+        try s.waitHead();
+        const body = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("hello over h2", body);
+    }
+    // A canceled stream says so.
+    {
+        const s = try request(conn, "/slow", .{});
+        defer s.release();
+        s.cancel();
+        try std.testing.expectError(error.Canceled, s.waitHead());
+        try std.testing.expectError(error.ReadFailed, s.reader().allocRemaining(gpa, .unlimited));
+        try std.testing.expectEqual(@as(?h2.StreamError, error.Canceled), s.readError());
+    }
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h2", body);
+}
+
+test "h2 client: connect_timeout bounds a TLS handshake that never answers" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    // Accepts, then says nothing.
+    var listener = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{});
+    defer listener.deinit(io);
+    const started = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, h2.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = listener.socket.address,
+        .port = listener.socket.address.getPort(),
+        .tls = .{ .insecure_skip_verify = true },
+        .connect_timeout = .fromMilliseconds(200),
+    }));
+    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+}
+
+test "h2 client: the system trust store by default, a CA in memory, mutual TLS from memory and from files" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const anole_tls = @import("../tls/root.zig");
+    var server_pem = try anole_tls.selfSigned(gpa, .{});
+    defer server_pem.deinit(gpa);
+    // The client's own self-signed certificate, which the server trusts.
+    var client_pem = try anole_tls.selfSigned(gpa, .{ .common_name = "client" });
+    defer client_pem.deinit(gpa);
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // The default is the system store, which has certificates in it and
+    // does not trust a development certificate.
+    const system = (try anole_tls.dusty_tls.clientStore(gpa, io, @as(dusty.TlsCa, .system))).?;
+    defer anole_tls.dusty_tls.releaseStore(system);
+    try std.testing.expect(anole_tls.dusty_tls.storeCertCount(system) > 0);
+
+    var srv = try Running.start(gpa, io, &.{.{ .address = loopback, .tls = .{
+        .pem = .{ .cert = server_pem.cert, .key = server_pem.key },
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+        .client_auth = .{ .ca = .{ .pem = client_pem.cert } },
+    } }});
+    defer srv.stop(gpa, io);
+    const base: h2.ConnectOptions = .{ .host = "localhost", .address = srv.server.address.ip, .port = srv.port() };
+
+    var opts = base;
+    opts.tls = .{};
+    try std.testing.expectError(error.CertificateIssuerNotFound, h2.ClientConnection.connect(gpa, io, opts));
+    opts.tls = .{ .ca = .none };
+    try std.testing.expectError(error.NoCertificateAuthority, h2.ClientConnection.connect(gpa, io, opts));
+
+    // Trusted, but with no certificate of its own the server turns it
+    // away: at the handshake, or (TLS 1.3) at the first request.
+    opts.tls = .{ .ca = .{ .pem = server_pem.cert } };
+    if (h2.ClientConnection.connect(gpa, io, opts)) |conn| {
+        defer conn.close();
+        try std.testing.expect(if (get(conn, "/hello", gpa)) |b| blk: {
+            gpa.free(b);
+            break :blk false;
+        } else |_| true);
+    } else |_| {}
+
+    // The certificate as PEM in memory.
+    opts.tls = .{ .ca = .{ .pem = server_pem.cert }, .client_certificate = .{ .pem = .{ .cert = client_pem.cert, .key = client_pem.key } } };
+    {
+        const conn = try h2.ClientConnection.connect(gpa, io, opts);
+        defer conn.close();
+        const body = try get(conn, "/hello", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("hello over h2", body);
+    }
+
+    // And from files, the CA too.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ca.pem", .data = server_pem.cert });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.pem", .data = client_pem.cert });
+    try tmp.dir.writeFile(io, .{ .sub_path = "client.key", .data = client_pem.key });
+    opts.tls = .{
+        .ca = .{ .file = .{ .path = "ca.pem", .dir = tmp.dir } },
+        .client_certificate = .{ .cert_path = "client.pem", .key_path = "client.key", .dir = tmp.dir },
+    };
+    {
+        const conn = try h2.ClientConnection.connect(gpa, io, opts);
+        defer conn.close();
+        const body = try get(conn, "/hello", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("hello over h2", body);
+    }
+}
+
+test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout, and HTTP/1.1 where h2 is not offered" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const anole_tls = @import("../tls/root.zig");
+    var pem = try anole_tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try Running.start(gpa, io, &.{
+        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{ "h2", "http/1.1" } } },
+        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{"http/1.1"} } },
+    });
+    defer srv.stop(gpa, io);
+    const h2_port = srv.server.addresses[0].ip.getPort();
+    const h1_port = srv.server.addresses[1].ip.getPort();
+
+    var client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = .{ .pem = pem.cert } }, .http2 = true });
+    defer client.deinit();
+    var url_buf: [128]u8 = undefined;
+
+    {
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{});
+        defer response.deinit();
+        try std.testing.expectEqual(.ok, response.status());
+        try std.testing.expectEqual(@as(u8, 2), response.version().major);
+        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+        try std.testing.expect(response.headers().get("content-length") != null);
+    }
+    // The same connection, from the pool.
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    {
+        const big = try gpa.alloc(u8, 300 * 1024);
+        defer gpa.free(big);
+        for (big, 0..) |*b, i| b.* = @truncate(i *% 7);
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/echo", .{h2_port}), .{ .method = .post, .body = big });
+        defer response.deinit();
+        try std.testing.expectEqual(.ok, response.status());
+        try std.testing.expect(std.mem.eql(u8, big, (try response.body()).?));
+    }
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    {
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{ .method = .head });
+        defer response.deinit();
+        try std.testing.expectEqual(.ok, response.status());
+        try std.testing.expectEqual(@as(?[]const u8, null), try response.body());
+    }
+    {
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/redirect", .{h2_port}), .{});
+        defer response.deinit();
+        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+    }
+    {
+        // Streamed, and released with the body unread: the stream is
+        // reset and the connection kept.
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/stall", .{h2_port}), .{ .stream = true });
+        var buf: [4]u8 = undefined;
+        var r = try response.reader(&buf);
+        try std.testing.expectEqualStrings("part", try r.interface.take(4));
+        response.deinit();
+    }
+    try std.testing.expectError(error.Timeout, client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/slow", .{h2_port}), .{
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } },
+    }));
+    {
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{});
+        defer response.deinit();
+        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+    }
+    {
+        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h1_port}), .{});
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 1), response.version().major);
+        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
     }
 }

@@ -24,6 +24,11 @@ pub const ClientConfig = dusty.ClientConfig;
 /// Options for `Server.static` / `Router.static` and `Server.embedded`.
 pub const StaticOptions = dusty.StaticOptions;
 pub const EmbeddedOptions = dusty.EmbeddedOptions;
+/// `ClientConfig.tls`; `anole.h2` and `anole.h3` take the same fields.
+pub const TlsConfig = dusty.TlsConfig;
+/// Where a client's trusted CAs come from: the system store, a file, a
+/// directory, or PEM in memory.
+pub const TlsCa = dusty.TlsCa;
 
 /// The whole dusty module, for anything not re-exported above.
 pub const dusty_module = dusty;

@@ -223,6 +223,9 @@ pub fn build(b: *std.Build) void {
         var imports = dusty_full.import_table.iterator();
         while (imports.next()) |e| test_mod.addImport(e.key_ptr.*, e.value_ptr.*);
         test_mod.addAnonymousImport("zio", .{ .root_source_file = dusty_root.dirname().path(b, "zio_stub.zig") });
+        // And its stub for the HTTP/2 client: Anole's imports this dusty's
+        // sources a second time.
+        test_mod.addAnonymousImport("h2_client", .{ .root_source_file = dusty_root.dirname().path(b, "h2_client_stub.zig") });
         test_mod.include_dirs.appendSlice(b.allocator, dusty_full.include_dirs.items) catch @panic("OOM");
         test_mod.c_macros.appendSlice(b.allocator, dusty_full.c_macros.items) catch @panic("OOM");
         test_mod.link_objects.appendSlice(b.allocator, dusty_full.link_objects.items) catch @panic("OOM");
@@ -556,6 +559,9 @@ const Core = struct {
     /// dusty instances, so test-flags can build every combination side by
     /// side.
     dusty_by: [2][2][2]?*std.Build.Module,
+    /// src/h2/client.zig for each HTTP/2 dusty instance, which imports it as
+    /// `h2_client` (and it imports that dusty back), by the same index.
+    h2_client_by: [2][2][2]?*std.Build.Module,
     /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
 
@@ -571,20 +577,29 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .dusty_by = @splat(@splat(@splat(null))), .tls_seam = seam };
+        var core: Core = .{ .zio = zio_mod, .dusty_by = @splat(@splat(@splat(null))), .h2_client_by = @splat(@splat(@splat(null))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
                 if (http2 and c_mods.nghttp2 == null) continue;
                 for ([_]bool{ false, true }) |compression| {
                     if (compression and c_mods.zlib == null) continue;
-                    core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)] = dustyModule(
+                    const dusty_mod = dustyModule(
                         b,
                         zio_mod,
                         if (tls) seam else null,
                         if (http2) c_mods.nghttp2 else null,
                         if (compression) c_mods.zlib else null,
                         if (compression) c_mods.zstd else null,
+                        target,
+                        optimize,
+                    );
+                    core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)] = dusty_mod;
+                    if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)] = h2ClientModule(
+                        b,
+                        dusty_mod,
+                        c_mods.nghttp2.?,
+                        if (tls) seam else null,
                         target,
                         optimize,
                     );
@@ -596,6 +611,37 @@ const Core = struct {
 
     fn dusty(core: Core, f: Features) *std.Build.Module {
         return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
+    }
+
+    fn h2Client(core: Core, f: Features) *std.Build.Module {
+        return core.h2_client_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
+    }
+
+    /// The HTTP/2 client, as its own module so dusty's client can take it
+    /// (`h2_client`): a TLS connection on which ALPN picks "h2" is handed
+    /// to it. The two modules import each other.
+    fn h2ClientModule(
+        b: *std.Build,
+        dusty_mod: *std.Build.Module,
+        nghttp2: *std.Build.Module,
+        tls: ?*std.Build.Module,
+        target: std.Build.ResolvedTarget,
+        optimize: std.builtin.OptimizeMode,
+    ) *std.Build.Module {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/h2/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const opts = b.addOptions();
+        opts.addOption(bool, "tls", tls != null);
+        mod.addOptions("anole_h2_options", opts);
+        mod.addImport("anole_nghttp2_c", nghttp2);
+        mod.addImport("dusty", dusty_mod);
+        if (tls) |m| mod.addImport("anole_dusty_tls", m);
+        dusty_mod.addImport("h2_client", mod);
+        return mod;
     }
 
     fn dustyModule(
@@ -825,7 +871,10 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
-    if (f.http2) mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
+    if (f.http2) {
+        mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
+        mod.addImport("anole_h2_client", o.core.h2Client(f));
+    }
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
     if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);

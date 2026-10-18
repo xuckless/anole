@@ -17,7 +17,7 @@
 //! The method table is the generated service type the server side uses;
 //! its handlers are not called here, only its names and message types.
 const std = @import("std");
-const h2 = @import("../h2/client.zig");
+const h2 = @import("anole_h2_client");
 const frame = @import("frame.zig");
 const status_mod = @import("status.zig");
 const deadline = @import("deadline.zig");
@@ -37,7 +37,8 @@ pub const Channel = struct {
 };
 
 pub const CallOptions = struct {
-    /// Sent as grpc-timeout; the server ends the call past it.
+    /// Sent as grpc-timeout; the server ends the call past it, and the
+    /// client resets the stream past it (DEADLINE_EXCEEDED either way).
     timeout: ?std.Io.Duration = null,
     /// Extra request metadata, lower-case names.
     metadata: []const h2.Header = &.{},
@@ -213,14 +214,23 @@ pub fn open(comptime Req: type, comptime Resp: type, channel: *Channel, method_p
         try headers.append(arena, .{ .name = "grpc-timeout", .value = try arena.dupe(u8, deadline.formatTimeout(&buf, ns)) });
     }
     try headers.appendSlice(arena, options.metadata);
-    const s = try channel.conn.request(headers.items, .{ .body = true });
     const io = channel.conn.io;
+    const call_deadline: ?std.Io.Clock.Timestamp = if (options.timeout) |t|
+        std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = t, .clock = .awake })
+    else
+        null;
+    // The deadline bounds the stream on this side too; a call without one
+    // may stream for as long as it likes.
+    const s = try channel.conn.request(headers.items, .{
+        .body = true,
+        .timeout = if (call_deadline) |d| .{ .deadline = d } else .none,
+    });
     return .{
         .channel = channel,
         .stream = s,
         .arena = arena,
         .compression = options.compression,
-        .deadline = if (options.timeout) |t| std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = t, .clock = .awake }) else null,
+        .deadline = call_deadline,
     };
 }
 
