@@ -9,9 +9,6 @@ import (
 	"github.com/xuckless/anole/bench/tools/internal/video"
 )
 
-// The test clip's bitrate (bench/media/gen.sh): 25 Mbit/s.
-const videoBitrate = 25e6
-
 // Video: the 4K clip from /static/video/, per protocol the server serves
 // natively. Unpaced: as many bytes as the server can push (downloads of the
 // whole file). Paced: viewers that play in real time with a 30 s buffer,
@@ -83,7 +80,7 @@ func (s *Suite) Video() {
 				time.Sleep(2 * time.Second)
 				idle := srv.MemNowMB()
 				smp := srv.Sample(500*time.Millisecond, false)
-				pr, err := video.Play(video.Options{Base: base, Proto: rn.proto, Kind: rn.kind, BitrateBps: videoBitrate,
+				pr, err := video.Play(video.Options{Base: base, Proto: rn.proto, Kind: rn.kind,
 					Ahead: 30 * time.Second, StartBuffer: 2 * time.Second, Chunk: 2 << 20}, viewers, 10*time.Second, 2*s.Profile.Run)
 				pu := smp.Stop()
 				c := Case{Scenario: "video", Server: name, Mode: mode, Proto: proto, Tier: tier.Name, Endpoint: rn.kind,

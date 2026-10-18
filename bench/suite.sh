@@ -33,6 +33,7 @@ mkdir -p "$bench/.data/media" "$bench/results"
 
 if [ -z "${NO_BUILD:-}" ]; then
   for s in $(echo "$servers" | tr , ' '); do
+    case "$s" in *@*) continue ;; esac # a tagged image (name@tag) is used as built
     echo "building anole-bench/$s" >&2
     docker build -q -f "$bench/servers/$s/Dockerfile" -t "anole-bench/$s" "$root" >/dev/null
   done
@@ -60,7 +61,7 @@ mkdir -p "$out"
   printf '  "images": {'
   sep=
   for s in $(echo "$servers" | tr , ' ') loadgen; do
-    printf '%s"%s": "%s"' "$sep" "$s" "$(docker image inspect -f '{{.Id}}' "anole-bench/$s" 2>/dev/null | cut -c8-19)"
+    printf '%s"%s": "%s"' "$sep" "$s" "$(docker image inspect -f '{{.Id}}' "anole-bench/$(echo "$s" | tr @ :)" 2>/dev/null | cut -c8-19)"
     sep=', '
   done
   printf '}\n}\n'

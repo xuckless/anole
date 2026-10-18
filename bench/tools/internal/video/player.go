@@ -22,11 +22,14 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
+// ClipSeconds is the test clip's length (bench/media/gen.sh).
+const ClipSeconds = 60
+
 type Options struct {
-	Base        string // https://127.0.0.1:8443 or http://127.0.0.1:8080
-	Proto       string // "h1", "h2" (TLS), "h3"
-	Kind        string // "mp4" or "hls"
-	BitrateBps  float64
+	Base        string  // https://127.0.0.1:8443 or http://127.0.0.1:8080
+	Proto       string  // "h1", "h2" (TLS), "h3"
+	Kind        string  // "mp4" or "hls"
+	BitrateBps  float64 // 0: the MP4's size over ClipSeconds
 	Ahead       time.Duration
 	StartBuffer time.Duration
 	Chunk       int64 // Range request size for mp4 (browsers ask ~1-4 MB at a time once playing)
@@ -232,6 +235,9 @@ func Play(o Options, viewers int, ramp, d time.Duration) (Result, error) {
 	size, segs, err := Probe(o)
 	if err != nil {
 		return Result{}, err
+	}
+	if o.BitrateBps == 0 {
+		o.BitrateBps = float64(size) * 8 / ClipSeconds
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ramp+d)
 	defer cancel()

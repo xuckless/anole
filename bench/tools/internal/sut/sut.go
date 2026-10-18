@@ -40,7 +40,17 @@ type Manifest struct {
 	Static  string            `json:"static"`
 }
 
+// Image is the Docker image for a server name: "anole" is anole-bench/anole,
+// "anole@after" the tag anole-bench/anole:after (for before/after runs).
+func Image(name string) string {
+	if base, tag, ok := strings.Cut(name, "@"); ok {
+		return "anole-bench/" + base + ":" + tag
+	}
+	return "anole-bench/" + name
+}
+
 func LoadManifest(benchDir, name string) (Manifest, error) {
+	name, _, _ = strings.Cut(name, "@")
 	var m Manifest
 	b, err := os.ReadFile(filepath.Join(benchDir, "servers", name, "manifest.json"))
 	if err != nil {
@@ -95,7 +105,7 @@ func Start(cfg Config, name, mode string, tier Tier, env map[string]string, memM
 	for k, v := range env {
 		args = append(args, "-e", k+"="+v)
 	}
-	args = append(args, "anole-bench/"+name)
+	args = append(args, Image(name))
 	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("docker run %s: %v: %s", name, err, out)
