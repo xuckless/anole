@@ -522,6 +522,12 @@ test "transcoding: REST routes over HTTP/1.1 and HTTP/2" {
         var resp = try client.fetch(url, .{ .method = .post, .headers = &headers, .body = "{\"name\":\"c\"}" });
         defer resp.deinit();
         try std.testing.expectEqual(@as(u16, 200), @as(u16, @intCast(@backingInt(resp.status()))));
+        // Connect's JSON is protojson too: a oneof member is a field of
+        // the message, not nested under the oneof's name.
+        const update = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/transcode.Library/UpdateBook", .{port});
+        var oneof = try client.fetch(update, .{ .method = .post, .headers = &headers, .body = "{\"book\":{\"title\":\"T\"},\"mask\":\"978\"}" });
+        defer oneof.deinit();
+        try std.testing.expectEqualStrings("{\"title\":\"T\",\"isbn\":\"978\"}", (try oneof.body()).?);
     }
 
     if (features.http2) {

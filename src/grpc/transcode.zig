@@ -692,8 +692,7 @@ pub fn jsonDepthWithin(text: []const u8, limit: usize) bool {
 // The response
 // ---------------------------------------------------------------------------
 
-/// The proto3 JSON mapping: oneof members as fields of the message.
-const json_options: protobuf.json.Options = .{ .emit_oneof_field_name = false };
+const json_options = server.json_options;
 
 /// The response message as JSON, or its `response_body` field alone.
 pub fn encodeResponse(comptime Resp: type, arena: std.mem.Allocator, message: Resp, comptime response_body: []const u8) ![]const u8 {

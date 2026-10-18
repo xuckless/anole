@@ -771,6 +771,11 @@ fn decodeBase64Chunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.items;
 }
 
+/// JSON as the proto3 mapping writes it (protojson, which Connect and JSON
+/// transcoding both speak): a oneof's member is a field of the message.
+/// zig-protobuf's default nests it in an object named after the oneof.
+pub const json_options: @import("protobuf").json.Options = .{ .emit_oneof_field_name = false };
+
 fn encodeMessage(comptime Msg: type, call: *Call, message: Msg) ![]const u8 {
     switch (call.codec) {
         .proto => {
@@ -778,7 +783,7 @@ fn encodeMessage(comptime Msg: type, call: *Call, message: Msg) ![]const u8 {
             try message.encode(&encoded.writer, call.arena);
             return encoded.written();
         },
-        .json => return message.jsonEncode(.{}, .{}, call.arena),
+        .json => return message.jsonEncode(.{}, json_options, call.arena),
     }
 }
 
