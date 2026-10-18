@@ -42,7 +42,9 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   against Anole and Anole's client passes 11/11 against grpc-go's server,
   over h2c and TLS;
   `zig build` runs protoc and the Zig code generator, so nothing extra to install;
-- an HTTP/2 client (nghttp2), used by the gRPC client;
+- an HTTP/2 client (nghttp2), used by the gRPC client and, when a server
+  picks h2, by dusty's HTTP client; all clients trust the system store by
+  default and take CAs and client certificates from files or memory;
 - JSON on yyjson, a Redis/Valkey client on hiredis, server-side sessions in
   memory or Redis and sealed cookie sessions;
 - rate limiting (token buckets in memory or Redis, a 429 middleware);
