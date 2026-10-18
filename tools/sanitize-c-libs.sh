@@ -56,6 +56,7 @@ for lib in "${libs[@]}"; do
       git -c advice.detachedHead=false checkout -q FETCH_HEAD
       git submodule update -q --init --depth 1
       cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=ON \
+        -DENABLE_OPENSSL=OFF -DENABLE_GNUTLS=OFF -DENABLE_BORINGSSL=OFF -DENABLE_PICOTLS=OFF -DENABLE_WOLFSSL=OFF \
         -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" >/dev/null
       cmake --build build -j"$jobs" --target main >/dev/null
       build/tests/main | tail -1

@@ -166,8 +166,10 @@ jobs:
         with:
           version: 0.17.0
           use-cache: false
+      # Retried for the same occasional NameServerFailure in Zig's own
+      # git fetches; a real failure fails all three runs.
       - name: tests/consumer/run.sh
-        run: tests/consumer/run.sh "git+https://github.com/${{ github.repository }}#${{ github.sha }}"
+        run: for i in 1 2 3; do tests/consumer/run.sh "git+https://github.com/${{ github.repository }}#${{ github.sha }}" && exit 0; sleep $((i * 10)); done; exit 1
         env:
           ANOLE_CONSUMER_FRESH_CACHE: "1"
 
@@ -248,5 +250,9 @@ jobs:
         with:
           version: 0.17.0
           cache-key: redis
+      # Zig fetches git dependencies itself on a cold cache, and its DNS
+      # lookups fail now and then on the runners (NameServerFailure).
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Tests with a live server
         run: zig build test -Dredis-test-port=6379 --summary all
