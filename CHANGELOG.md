@@ -47,6 +47,17 @@ for macOS and Linux.
   Linux, per-request timeouts, a GOAWAY drain and mutual TLS. The QUIC interop runner
   passes every server case it was given against ngtcp2's and quic-go's
   clients.
+- HTTP/3 0-RTT, opt-in (`http3.early_data`), after RFC 8470: GET, HEAD and
+  OPTIONS from early data run at once, marked `Early-Data: 1`; other methods
+  wait for the handshake, which a replay never completes.
+  `anole.early_data.TooEarly` answers 425 on routes that want no early data
+  at all, and every route answers 425 to unsafe requests a proxy marked
+  `Early-Data` (`anole.early_data.Guard`). Session resumption works without
+  it. The interop runner's `resumption` and `zerortt` cases pass.
+- HTTP/3 connection migration: clients may move to a new address or port;
+  the server validates the path, answers on it (closing included), hands
+  out a new token when the IP address changed, and reports the new address
+  to handlers.
 - TLS through BoringSSL, built from source by Zig: TLS 1.3 and 1.2, ALPN,
   mutual TLS (with the acceptable CAs named in the request, and the client's
   certificate for handlers through `req.peerCertificate()` on HTTP/1.1,
@@ -220,6 +231,9 @@ for macOS and Linux.
   `tls.client_certificate`, dusty's shape (`.pem = .{ .cert, .key }` or
   `cert_path`/`key_path`); the HTTP/3 client's `handshake_timeout_ms` is
   `connect_timeout`.
+- The HTTP/3 client resumes sessions from an `anole.h3.SessionCache`, sends
+  0-RTT when asked (`early_data`), and sends again what a server refused in
+  early data; `rebind` moves a connection to a new socket (a migration).
 
 ### Auth, state and limits
 
@@ -290,7 +304,7 @@ for macOS and Linux.
 
 ### Not yet
 
-- HTTP/3: 0-RTT, connection migration and WebTransport.
+- HTTP/3: WebTransport, and keeping ticket keys (so 0-RTT) across restarts.
 - gRPC over HTTP/3; JSON transcoding of client and bidirectional streaming
   methods.
 - Benchmarks on a dedicated Linux machine (the first results, on a Mac, are

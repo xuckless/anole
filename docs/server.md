@@ -395,21 +395,73 @@ address and port, and every response that did not come over HTTP/3 carries
 
 `http3` fields: `address` and `port` (`https`'s when null), `alt_svc`
 (true), `max_streams_bidi` (100 concurrent requests per connection),
-`idle_timeout_ms` (30 000), and `validate_address` (false). With
-`validate_address`, every new client must prove its address with a Retry
-first, which costs a round trip and resists floods from spoofed sources.
-`hq_interop_root` is for the QUIC interop runner only.
+`idle_timeout_ms` (30 000), `validate_address` (false) and `early_data`
+(false). With `validate_address`, every new client must prove its address
+with a Retry first, which costs a round trip and resists floods from
+spoofed sources. `hq_interop_root` is for the QUIC interop runner only.
 
-Supported: QUIC v1 and v2, Retry, stateless reset, ECN, NAT rebinding, key
-update, GSO/GRO on Linux, a GOAWAY drain, mutual TLS (the `https` listener's
+Supported: QUIC v1 and v2, Retry, stateless reset, ECN, session resumption,
+0-RTT (opt-in, below), connection migration and NAT rebinding, key update,
+GSO/GRO on Linux, a GOAWAY drain, mutual TLS (the `https` listener's
 `client_auth`, see [TLS](#tls)), certificate reloads (the same) and SIGUSR2
 restarts (see
 [below](#zero-downtime-restart-and-socket-activation)). Not yet:
+WebTransport, and gRPC over HTTP/3.
 
-- 0-RTT (early data);
-- connection migration to an address the client chooses (no preferred
-  address is advertised);
-- WebTransport, and gRPC over HTTP/3.
+### 0-RTT
+
+A client that resumes a session can send its first requests with the
+handshake, in 0-RTT, and save a round trip. `.http3 = .{ .early_data = true }`
+takes them. Anyone who records that first flight can send it again, and TLS
+does not stop the copy, so Anole does what RFC 8470 asks of a server:
+
+- GET, HEAD and OPTIONS that arrive in 0-RTT run at once. Their headers
+  carry `Early-Data: 1`, as a proxy would mark them, and
+  `anole.early_data.isEarly(req)` says so.
+- Every other method waits until the handshake completes. A replay never
+  completes it (it lacks the client's keys), so a replayed POST never
+  reaches its handler; the real client's POST runs one round trip later and
+  is not marked.
+- A route whose GET has effects that must not repeat takes the
+  `anole.early_data.TooEarly` middleware, which answers 425 Too Early to any
+  marked request; the client sends it again after its handshake:
+
+  ```zig
+  const pay = app.group("/pay", .{anole.early_data.TooEarly{}});
+  ```
+
+- Behind a proxy that takes early data itself (nginx's `ssl_early_data`),
+  requests arrive marked `Early-Data: 1` on any HTTP version. `anole.Server`
+  answers 425 to the unsafe ones on every route
+  (`anole.early_data.Guard`, RFC 8470 §5.1), since waiting cannot make them
+  safe.
+
+Tickets are sealed with the same keys as every other ticket (see
+[TLS](#tls)): they rotate every two days and carry over a certificate
+reload, so 0-RTT goes on across one. A ticket is tied to the server's limits
+and HTTP/3 settings, so after a change (such as a new `max_streams_bidi`)
+old tickets still resume but without 0-RTT. Keys are not kept across a
+restart or shared between machines: the first connection after either is a
+full handshake.
+
+### Connection migration
+
+Packets reach their connection by connection ID, whatever address they come
+from, so a client may move: a NAT rebinding, or a phone switching networks.
+The server validates the new path, sends from then on to where the client is
+now, gives it a fresh address-validation token when its IP address changed,
+and requests see the new address in `req.remote_address`. The server
+advertises no preferred address of its own. The QUIC interop runner's
+`connectionmigration` case, which is about a preferred address, is therefore
+left out of CI; with one advertised it would still fail on ngtcp2's servers,
+because the runner wants a PATH_CHALLENGE as the first packet on the new path
+and ngtcp2 sends the PATH_RESPONSE first, as RFC 9000 allows
+(quic-interop-runner issues #424 and #500).
+
+One known gap, in ngtcp2 1.25.0: a client that migrates while the server is
+still validating the path of a NAT rebinding moments before can be closed
+with CONNECTION_ID_LIMIT_ERROR (the server counts a connection ID it has
+already retired). Seconds apart, the two are fine.
 
 The endpoint runs on one executor for now, so HTTP/3 uses one core.
 

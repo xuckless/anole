@@ -52,8 +52,7 @@ pub const Guard = struct {
 /// 425 for every request marked as early data: for routes that must not
 /// run before the client's handshake completes, whatever the method.
 ///
-///     var too_early: anole.early_data.TooEarly = .{};
-///     const g = app.router.group("/pay", &.{anole.Middleware(void).init(&too_early)});
+///     const pay = app.group("/pay", .{anole.early_data.TooEarly{}});
 pub const TooEarly = struct {
     pub fn execute(_: *const TooEarly, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (isEarly(req)) return tooEarly(res);

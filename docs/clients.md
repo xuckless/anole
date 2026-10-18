@@ -172,8 +172,52 @@ HTTP/2. The other `ConnectOptions` are `stream_window` (256 KiB), `max_data`
 `anole.h2` does: `ClientConnection`, `Stream` (also as `ClientStream`),
 `Header`, `ConnectOptions`, `RequestOptions` and `StreamError`.
 
-The client does not discover HTTP/3 from `Alt-Svc`, retry over TCP, or send
-0-RTT data. Connect to it when you know the server speaks it.
+The client does not discover HTTP/3 from `Alt-Svc` or retry over TCP.
+Connect to it when you know the server speaks it.
+
+### Resumption and 0-RTT
+
+Give connections an `anole.h3.SessionCache` and they keep the session
+tickets servers send, filed by host, port and TLS settings. The next
+connection to that server resumes: no certificate, one round trip less.
+With `early_data = true` as well, it also sends its first requests in 0-RTT,
+with the handshake:
+
+```zig
+var cache: anole.h3.SessionCache = .init(gpa, io);
+defer cache.deinit();
+const conn = try anole.h3.ClientConnection.connect(gpa, io, .{
+    .host = "example.com",
+    .port = 443,
+    .session_cache = &cache,
+    .early_data = true,
+});
+```
+
+With a ticket that allows 0-RTT, `connect` returns at once, before the
+handshake. `request` then sends GET, HEAD and OPTIONS straight away and
+holds other methods until the handshake completes. `RequestOptions.early`
+overrides that per request: `true` sends it early, `false` waits. Early data
+can be recorded and replayed by anyone on the path, so send early only what
+is harmless to repeat. If the server refuses the early data (a new process
+with new ticket keys, changed settings), the requests go again once the
+handshake is done, bodies included. `conn.earlyData()` reports `.none`,
+`.pending`, `.accepted` or `.rejected`; `conn.resumed()` says whether the
+session was resumed; and `conn.waitConnected()` waits for the handshake.
+
+Each ticket is used once. One cache can serve any number of connections at
+once. A server may answer 425 Too Early to a request it got in early data;
+send it again after `waitConnected`.
+
+### Changing networks
+
+`conn.rebind(.migrate)` moves the connection to a new UDP socket (a new
+local port) as a client whose network changed: QUIC switches to a fresh
+connection ID and validates the new path, and requests in flight carry on.
+It needs the handshake to be done and a spare connection ID from the server;
+otherwise it fails with `error.MigrationRefused` and the connection stays
+where it was. `conn.rebind(.nat)` changes the port without telling QUIC, as a
+NAT rebinding looks; it exists for tests.
 
 ## TLS options
 
