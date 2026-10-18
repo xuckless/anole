@@ -33,13 +33,15 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 Add middleware with `use` before any route: the router panics on a `use`
-after a route. Call `run` from the thread that called `init`. Create one
-`Server` per process; two alive at once on one thread trip an assertion in
-zio when the first is freed.
+after a route. Call `run` from the thread that called `init`. One `Server`
+can be alive on a thread at a time: its runtime makes the thread one of its
+executors, so `init` on a thread that already has one fails with
+`error.ServerAlreadyOnThread`. Start a second server on a thread of its own,
+or after the first's `deinit`.
 
 ## Root declarations
 
-`zio_options` is required in your executable's root file:
+`zio_options` in your executable's root file sets zio's configuration:
 
 ```zig
 pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned }
@@ -49,9 +51,10 @@ zio reads it at compile time, as std reads `std_options`. Pinned scheduling
 runs many executors (OS threads), and a task never leaves the executor that
 started it. Anole relies on that: a connection and every task it spawns stay
 on one thread, so nghttp2 sessions, BoringSSL's per-thread error queue and
-zig-protobuf's thread-locals need no locking. Without the declaration zio
-falls back to work stealing, where tasks move between threads, and nothing
-checks this at compile time. To set other zio options, keep `.pinned`:
+zig-protobuf's thread-locals need no locking. Anole builds zio with pinned
+scheduling as the default, so the declaration can be left out; a root file
+that declares work stealing fails to compile, with a message that says what
+to write instead. To set other zio options, keep `.pinned`:
 
 ```zig
 pub const zio_options: anole.zio.Options = .{ .scheduling = .pinned, .debug_cancel = true };
@@ -78,7 +81,7 @@ while holding one: a livelock or a recursive-lock abort.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `http` | `.{}`, 127.0.0.1:8080 | The cleartext listener; `null` for none. |
+| `http` | `null` | The cleartext listener. With neither it nor `https` set, 127.0.0.1:8080. |
 | `https` | `null` | The TLS listener. Needs `-Dtls=boringssl`. |
 | `http3` | `null` | HTTP/3 over QUIC. Needs `-Dhttp3` and `https`. |
 | `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
@@ -88,9 +91,11 @@ while holding one: a livelock or a recursive-lock abort.
 | `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
 | `server` | `.{}` | The rest of dusty's `ServerConfig`: timeouts, limits, proxies. |
 
-`http` is on by default, so a TLS-only server must say `.http = null`. Both
-listeners bind to `127.0.0.1` unless given an `address`; use `"0.0.0.0"` or
-`"::"` to accept connections from other machines.
+You get the listeners you name. `.{}` alone serves cleartext HTTP on
+127.0.0.1:8080, `.{ .https = ... }` serves HTTPS only, and a server that
+wants both names both. Both listeners bind to `127.0.0.1` unless given an
+`address`; use `"0.0.0.0"` or `"::"` to accept connections from other
+machines.
 
 ```zig
 var app = try anole.Server(void).init(init.gpa, .{
@@ -118,7 +123,8 @@ var app = try anole.Server(void).init(init.gpa, .{
 - `.{ .pem = .{ .cert = ..., .key = ... } }`: PEM text in memory, copied by
   `init`, for keys from a secret store or the environment.
 - `.{ .files = .{ .cert_path = ..., .key_path = ... } }`: PEM files (chain
-  leaf first), read when the server starts, relative to the working directory.
+  leaf first), read by `init` and by every reload, relative to the working
+  directory.
 - `.dev_self_signed`: a fresh P-256 key and certificate for `localhost`,
   `127.0.0.1` and `::1`, held only in memory. For development; clients need
   `curl -k`.
@@ -205,17 +211,20 @@ With a zio runtime of your own, start a pool on it with
 
 | Member | What it does |
 | --- | --- |
-| `use(middleware)` | Adds a global middleware (copied), before any route. |
-| `get`, `head`, `post`, `put`, `patch`, `delete`, `options`, `any` | Register a route. |
-| `group(prefix, middlewares)` | A route group. |
-| `router`, `server` | dusty's router (for `static`, `embedded`, `query`) and server. |
+| `use(middleware)` | Adds a global middleware (copied, owned by the server), before any route. |
+| `get`, `head`, `post`, `put`, `patch`, `delete`, `options`, `query`, `any` | Register a route (`query` is the HTTP QUERY method). |
+| `static(prefix, dir, options)`, `embedded(path, data, options)` | Serve a directory, or one file compiled in. |
+| `group(prefix, .{ middleware, ... })` | A route group; see [routing.md](routing.md#groups). |
+| `middleware(value)` | A server-owned copy of a middleware, as a handle to share between groups. |
+| `reloadCertificates()`, `setCertificate(cert)` | Swap the TLS certificate while serving; see [TLS](#tls). |
+| `router`, `server` | dusty's router and server. |
 | `io()` | The runtime's `std.Io`, for work beside the server. |
 | `run()` | Serves until a signal or `stop`, then drains. |
 | `stop()` | Ends `run` as a signal would; safe from any task or thread of the runtime. |
 | `waitReady()` | Waits until the listeners are bound. |
 | `addresses()` | Each listener's bound address (`http` first), once serving. |
 | `http3Address()` | The HTTP/3 UDP address, or null. |
-| `deinit()` | Frees everything, the runtime included. |
+| `deinit()` | Frees everything, the runtime included, and calls `deinit` on the middleware it copied. |
 
 A listener given port 0 gets a free port, which `addresses()` reports after
 `waitReady()`. A test can start a task with `app.io().concurrent`, wait for
@@ -228,8 +237,10 @@ executor runs its own accept loop on its own `SO_REUSEPORT` socket, so the
 kernel spreads new connections over the cores and a connection never leaves
 the executor that accepted it. On macOS the accept loops share one socket.
 
-`run` handles SIGINT and SIGTERM (and SIGUSR2 when `process` is set). The
-first of these, or `stop()`, starts a graceful drain:
+`run` handles SIGINT and SIGTERM (and SIGUSR2 when `process` is set), and
+SIGHUP when there is an `https` listener, which reloads its certificate
+(see [TLS](#tls)) and goes on serving. The first of SIGINT, SIGTERM and
+SIGUSR2, or `stop()`, starts a graceful drain:
 
 1. The listeners stop accepting.
 2. HTTP/1.1 connections finish the request in flight.
@@ -290,7 +301,8 @@ first, which costs a round trip and resists floods from spoofed sources.
 
 Supported: QUIC v1 and v2, Retry, stateless reset, ECN, NAT rebinding, key
 update, GSO/GRO on Linux, a GOAWAY drain, mutual TLS (the `https` listener's
-`client_auth`, see [TLS](#tls)) and SIGUSR2 restarts (see
+`client_auth`, see [TLS](#tls)), certificate reloads (the same) and SIGUSR2
+restarts (see
 [below](#zero-downtime-restart-and-socket-activation)). Not yet:
 
 - 0-RTT (early data);
@@ -310,11 +322,32 @@ outside `minimal`).
   offer shares nothing with it gets no ALPN answer and HTTP/1.1, rather than
   a refusal.
 - Resumption uses stateless session tickets only, with no server-side cache.
-  The ticket keys live in the process, so tickets do not survive a restart or
-  carry over to another machine.
+  The ticket keys live in the process and rotate every two days, as
+  BoringSSL's own do; tickets survive a certificate reload, but not a
+  restart, and do not carry over to another machine.
 - A handshake has the same deadline as a request (`timeout.request`). Failed
   handshakes are logged at `info`, since any client can cause them.
-- No hot certificate reload; a SIGUSR2 restart picks up new files.
+
+**Certificate reload.** `app.reloadCertificates()` loads the certificate and
+key again (from their files, for `.files`) and the `client_auth` CAs (from
+theirs), and switches the HTTPS listener and HTTP/3 to them without a
+restart. SIGHUP does the same while `run` serves, so a renewal hook can run
+`kill -HUP <pid>` (or `systemctl kill -s HUP myapp`). With `process` set,
+systemd hears `RELOADING=1` and then `READY=1`.
+
+- New connections get the new certificate. Connections already open,
+  handshakes in progress included, keep the one they started with, which is
+  freed when the last of them closes.
+- Session tickets issued before still resume: the ticket keys carry over.
+- A reload that fails (a file missing, a key that does not match the
+  certificate) returns the error, or logs it on SIGHUP, and the server goes
+  on with the certificate it had.
+- `app.setCertificate(cert)` switches to a different source the same way:
+  new PEM from a secret store (`.{ .pem = ... }`), other files, or a fresh
+  `.dev_self_signed`. Later reloads read that source.
+
+Call either from a task of the server's runtime, such as a handler or a task
+started with `app.io().concurrent`. One reload runs at a time.
 
 Mutual TLS verifies client certificates against the CAs you give:
 

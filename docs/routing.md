@@ -17,9 +17,9 @@ app.get("/files/*path", getFile);
 app.any("/legacy/*path", legacy); // every method
 ```
 
-The server has `get`, `head`, `post`, `put`, `patch`, `delete`, `options`
-and `any`; `app.router` also has `query` (the HTTP QUERY method), `static`
-and `embedded`.
+The server has `get`, `head`, `post`, `put`, `patch`, `delete`, `options`,
+`query` (the HTTP QUERY method: a GET with a body) and `any`, plus `static`
+and `embedded` ([below](#static-files)).
 
 - A literal segment matches itself, `:name` one segment, and `*name` the
   rest of the path (one or more segments).
@@ -55,18 +55,26 @@ A group adds a prefix and middleware to the routes registered through it.
 Groups nest, and a nested group adds its middleware after its parent's.
 
 ```zig
-const require_token: RequireToken = .{ .token = "Bearer secret" };
-const admin_mw = [_]anole.Middleware(void){.init(&require_token)};
-
-const admin = app.group("/admin", &admin_mw);
+const admin = app.group("/admin", .{RequireToken{ .token = "Bearer secret" }});
 admin.get("/stats", adminStats); // GET /admin/stats
-const reports = admin.group("/reports", &.{});
+const reports = admin.group("/reports", .{});
 reports.get("/:year", report); // GET /admin/reports/:year
 ```
 
-Unlike `use`, `group` does not copy: the middleware values and the slice
-must outlive the server. Locals in `main` before `run` are fine. With a
-context, use `anole.Middleware(App)`.
+As with `use`, the middleware values in the tuple are copied: the server owns
+the copies and calls their `deinit`, if they have one, in its own. A value
+listed in two groups is two copies. To share one, take a handle with
+`app.middleware(value)` (one copy, owned by the server) and list the handle:
+
+```zig
+const sessions = app.middleware(anole.session.Middleware.init(.{ .key = key }));
+app.group("", .{sessions}).get("/me", me);
+app.group("", .{ sessions, anole.auth.csrf.Middleware.init(.{}) }).post("/notes", addNote);
+```
+
+A handle you make yourself, `anole.Middleware(Ctx).init(&value)`, points at a
+value you keep alive and free; a slice of such handles works in place of the
+tuple. With a context, use `anole.Middleware(App)`.
 
 ## Middleware
 
@@ -256,13 +264,12 @@ WebSockets are in [websocket.md](websocket.md).
 
 ## Static files
 
-`router.static` serves a directory, which must stay open while the server
-runs:
+`static` serves a directory, which must stay open while the server runs:
 
 ```zig
 var public = try std.Io.Dir.cwd().openDir(io, "public", .{});
 defer public.close(io);
-app.router.static("/assets", public, .{
+app.static("/assets", public, .{
     .precompressed = &.{ .br, .zstd, .gzip },
     .cache_control = "public, max-age=3600",
 });
@@ -282,14 +289,14 @@ app.router.static("/assets", public, .{
   This is the only way to serve Brotli; there is no runtime Brotli encoder.
 - `cache_control` goes out with 200, 206 and 304.
 
-`router.embedded` serves one file compiled into the binary, with the same
+`embedded` serves one file compiled into the binary, with the same
 conditional and range handling and an `ETag` hashed from the content. Its
 options are `content_type`, precompressed `br`, `zstd` and `gzip` copies,
 `version` (a request whose `?v=` matches is cached for good) and
 `cache_control`.
 
 ```zig
-app.router.embedded("/favicon.ico", @embedFile("favicon.ico"), .{ .cache_control = "public, max-age=86400" });
+app.embedded("/favicon.ico", @embedFile("favicon.ico"), .{ .cache_control = "public, max-age=86400" });
 ```
 
 ## Compression
@@ -334,11 +341,14 @@ req.setTimeout(.none); // a WebSocket or event stream
 | `max_body_size` | 1 MiB | `body()`, `json()` and forms fail: 413. Counted after decoding. |
 | `max_content_length` | none | A larger declared `Content-Length` is a 413 before the handler runs. Bounds streams too. |
 | `buffer_size` | 16 KiB | The request line and headers must fit: 431. |
-| `max_header_count` | 32 | Request headers: 431. Also caps the headers a response can set (`TooManyHeaders`). |
+| `max_header_count` | 32 | Request headers: 431. |
 | `max_param_count`, `max_query_count` | 8, 32 | Path parameters and query values: 400. |
 | `max_form_count`, `max_multiform_count` | 32, 32 | Form fields. |
 
-HTTP/2's limits are in `ServerOptions.http2` ([server.md](server.md#http2)).
+`response.max_header_count` (64) caps the headers a response can carry,
+those the server adds included; past it `res.header` fails with
+`TooManyHeaders`. HTTP/2's limits are in `ServerOptions.http2`
+([server.md](server.md#http2)).
 
 ## Error handling
 

@@ -35,6 +35,11 @@ for macOS and Linux.
   certificate for handlers through `req.peerCertificate()` on HTTP/1.1,
   HTTP/2 and HTTP/3), stateless session tickets, close_notify on graceful closes, and a development
   certificate generated in memory (`.dev_self_signed`).
+- Certificate reload without a restart: `Server.reloadCertificates()`, also
+  on SIGHUP, and `Server.setCertificate(cert)` for new PEM or files. The
+  HTTPS listener and HTTP/3 switch together; connections already open keep
+  their certificate, session tickets from before still resume, and a reload
+  that fails changes nothing.
 - Response compression with zstd or gzip (zlib-ng) by the client's q-values,
   and compressed request bodies.
 - The PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies.
@@ -42,6 +47,16 @@ for macOS and Linux.
   sockets, HTTP/3's UDP socket included; HTTP/3 connections are closed and
   reconnect), systemd socket activation, and systemd's readiness protocol
   (`READY=1`, `RELOADING=1`, `MAINPID=`, `STOPPING=1`) without libsystemd.
+- `anole.Server` conveniences: `static`, `embedded` and `query` routes;
+  `group(prefix, .{ ... })` and `use` copy their middleware and the server
+  calls its `deinit`; `middleware(value)` for one copy shared by several
+  groups. `Options.http` defaults to none when `https` is set (HTTP on
+  127.0.0.1:8080 only when neither is). Anole's zio defaults to pinned
+  scheduling, so `zio_options` is optional, and declaring work stealing is a
+  compile error. A second `Server` on a thread that has one fails with
+  `error.ServerAlreadyOnThread` instead of an assertion in zio.
+- A response can carry 64 headers (`response.max_header_count`), no longer
+  capped by the request's `max_header_count` (32).
 - An opt-in blocking pool (`Options.blocking`, `anole.blocking.run`):
   CPU-heavy or blocking calls run on zio's thread pool, capped at a set
   number at once, while the request's executor goes on serving.
@@ -137,6 +152,5 @@ for macOS and Linux.
 
 - HTTP/3: 0-RTT, connection migration and WebTransport.
 - gRPC: JSON transcoding (`google.api.http`) and gRPC over HTTP/3.
-- Hot certificate reload without a restart.
 - Benchmarks on a dedicated Linux machine (the first results, on a Mac, are
   in the README).

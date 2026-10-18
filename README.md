@@ -64,8 +64,8 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   handshake and transfer loss and corruption, ECN, port and address
   rebinding, v2), and the 16 of them quic-go's client runs.
 
-0-RTT, connection migration and WebTransport are still to come, as are gRPC
-JSON transcoding and hot certificate reload.
+0-RTT, connection migration and WebTransport are still to come, as is gRPC
+JSON transcoding.
 Nothing is stable before 1.0.
 
 ## Requirements
