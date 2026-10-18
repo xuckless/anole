@@ -38,6 +38,9 @@ for macOS and Linux.
 - The PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies.
 - Zero-downtime restart on SIGUSR2 (the new process inherits the listening
   sockets) and systemd socket activation.
+- An opt-in blocking pool (`Options.blocking`, `anole.blocking.run`):
+  CPU-heavy or blocking calls run on zio's thread pool, capped at a set
+  number at once, while the request's executor goes on serving.
 
 ### WebSockets
 
@@ -63,10 +66,15 @@ for macOS and Linux.
 
 ### Auth, state and limits
 
-- JWS/JWT verification with one pinned algorithm per key and JWKS keyrings;
-  OIDC sign-in as a relying party (PKCE, Google and Apple presets); CSRF
-  tokens; Argon2id passwords; API keys; RBAC.
-- Sessions in memory or Redis/Valkey, and sealed cookie sessions.
+- JWS/JWT verification with one pinned algorithm per key and JWKS keyrings
+  that fetch outside their lock, one fetch at a time; a bearer-token
+  middleware (`anole.auth.RequireJwt`) with RFC 6750 errors, scopes and
+  claims handed to the handler; OIDC sign-in as a relying party (PKCE,
+  Google and Apple presets); CSRF tokens; Argon2id passwords, hashed on the
+  blocking pool when there is one; API keys; RBAC with roles from the
+  application's state.
+- Sessions in memory or Redis/Valkey, and sealed cookie sessions;
+  `anole.session.regenerate` issues a new session ID at sign-in.
 - Rate limiting with token buckets in memory or Redis and a 429 middleware.
 - JSON on yyjson and a Redis/Valkey client on hiredis.
 

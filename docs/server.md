@@ -85,6 +85,7 @@ while holding one: a livelock or a recursive-lock abort.
 | `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
 | `process` | `null` | `init.minimal` enables socket activation and SIGUSR2 restarts. |
 | `restart_timeout_ms` | 10 000 | How long a restart waits for the new process. |
+| `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
 | `server` | `.{}` | The rest of dusty's `ServerConfig`: timeouts, limits, proxies. |
 
 `http` is on by default, so a TLS-only server must say `.http = null`. Both
@@ -159,6 +160,46 @@ atomics or a lock. Prefer `std.Io.Mutex` or `std.Io.RwLock` to
 of blocking its executor's thread. `Ctx` can also declare `notFound`,
 `methodNotAllowed`, `uncaughtError` and `dispatch`; see
 [routing.md](routing.md#error-handling).
+
+## Blocking work
+
+A handler that computes for a long time, or calls a C library that blocks,
+holds its executor's thread, and every other connection on that executor
+waits. Password hashing is the usual case: an Argon2id hash takes about
+150 ms in a Debug build, and less in ReleaseFast.
+
+Set `blocking` and such work runs beside the executors instead:
+
+```zig
+var app = try anole.Server(App).init(gpa, .{ .blocking = .{} }, &state); // .{ .threads = 4 }
+
+fn report(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const total = try anole.blocking.run(req.io, crunch, .{ app.data });
+    try res.print(.text, "{d}\n", .{total});
+}
+```
+
+`anole.blocking.run(io, func, args)` calls `func(args...)` on a pool thread.
+The request's task waits without holding its executor, which goes on
+serving. The result is `func`'s, with `error.Canceled` added. The pool
+lets `threads` jobs run at once, by default half the CPUs and at least 2;
+more wait their turn. Without a pool, `run` calls `func` directly, so
+library code can use it whether or not the application set one up.
+`anole.auth.password` does.
+
+The threads are zio's own thread pool, the one it runs file I/O and DNS
+on, so the pool adds no threads of its own and the cap keeps heavy jobs
+from crowding out that work. A job runs outside any coroutine, so it may
+block. A `std.Io` call in it blocks only its own thread.
+
+A job is never interrupted. When a request is canceled while its job runs,
+for example because the client reset its HTTP/2 stream, the task still
+waits for the job to finish, because the job may use the task's memory,
+and then gets `error.Canceled`. `deinit` waits for running jobs too.
+
+With a zio runtime of your own, start a pool on it with
+`var pool: anole.blocking.Pool = undefined; try pool.init(rt, .{});` and
+`defer pool.deinit();`.
 
 ## The server value
 

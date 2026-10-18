@@ -55,9 +55,40 @@ The result, `Verified`, gives you the header and claims as JSON objects,
 plus `string("sub")` and `integer("exp")`. They live in the arena you pass,
 which is usually `req.arena`.
 
-Anole has no bearer-token middleware yet. `RequireJwt` in the example is
-one in about 25 lines: it reads `Authorization: Bearer`, calls `verify`, and
-answers 401 with `WWW-Authenticate` on any error.
+### Bearer tokens
+
+`anole.auth.RequireJwt` is a middleware that requires
+`Authorization: Bearer <JWT>`. It verifies the token with your keys or a
+`Keyring`, checks it against a `Policy` (the required issuer and audience
+go there), and refuses the request as RFC 6750 says:
+
+| Request | Answer |
+| --- | --- |
+| No `Authorization`, or another scheme | 401, `WWW-Authenticate: Bearer` |
+| `Bearer` with no token, or more than one | 400, `error="invalid_request"` |
+| A token that does not verify, or misses a required claim | 401, `error="invalid_token"` (expired ones also get an `error_description`) |
+| A token without the required scopes | 403, `error="insufficient_scope"` |
+| The keyring could not fetch the keys | 503, so the client keeps its token |
+
+```zig
+var bearer = anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
+    .claims = &.{ .{ .claim = "sub", .key = "user", .required = true }, .{ .claim = "role", .key = "role" } },
+    .scopes = &.{"notes:read"},   // all of these in the `scope` claim
+    .realm = "api",
+});
+const api = [_]M{.init(&bearer)};
+app.group("/api", &api).get("/me", me);
+```
+
+Keys are `.{ .static = &keys }` or `.{ .keyring = &keyring }`. The handler
+reads the claims you list from `req.session` (string claims only; by
+default `sub` as `"jwt_sub"`, required). They are there for this request
+only: when the handler returns, the middleware takes them out again and
+puts back whatever the session held under those keys, so a session
+middleware in front never saves them into a cookie. For claims that are
+arrays or objects, set `.hook = .{ .ptr = ..., .func = ... }`: it gets the
+whole `Verified` before the handler, and an error from it refuses the
+token.
 
 ### Signing
 
@@ -96,8 +127,11 @@ defer keyring.deinit();
 const v = try keyring.verify(req.arena, token, .{ .issuer = "https://issuer.example", .audience = "api" });
 ```
 
-The keyring holds one lock while it fetches, so requests that verify tokens
-wait for that fetch.
+A fetch runs outside the keyring's lock, one at a time. Requests that
+need it, because there are no keys yet, the keys are past their TTL, or the
+token's `kid` is new, wait for that one fetch. If it fails, they get
+`error.JwksFetchFailed`. Requests the current keys can verify don't wait,
+and verification itself runs outside the lock.
 
 ## OIDC sign-in (Google, Apple)
 
@@ -152,6 +186,7 @@ const id = rp.finish(req.arena, req.io, &app.client, callback, saved) catch |err
 };
 for ([_][]const u8{ "oidc_state", "oidc_nonce", "oidc_verifier" }) |k| req.session.remove(k);
 try req.session.set("user", id.subject); // the stable account key
+try anole.session.regenerate(req);       // a new session id for the signed-in session
 ```
 
 `refuse` is your own function that sets a 400 and a body: an error returned
@@ -237,9 +272,29 @@ var sessions = anole.session.Middleware.init(.{ .store = rs.store() });
 A store is a vtable of `load`, `save` and `destroy` (`anole.session.Store`),
 so you can bring your own.
 
-A server-side session keeps its ID when someone signs in. There is no call
-yet to issue a new ID, so with a store, clear the session on sign-in, or
-use the sealed cookie for the signed-in state.
+### A new session at sign-in
+
+Call `anole.session.regenerate(req)` when someone signs in, or when their
+privileges change. Otherwise an attacker who planted a session ID in the
+victim's browser before the sign-in would share the signed-in session
+(session fixation). With a store, the middleware destroys the old ID in the
+store when it saves the response, then saves the data under a fresh ID and
+sends the new cookie. The data itself carries over.
+
+```zig
+try req.session.set("user", user.name);
+try anole.session.regenerate(req);
+```
+
+A sealed cookie has no ID. `regenerate` makes the middleware seal it afresh
+(a new nonce), which it does on every save anyway. A copy of the old cookie
+stays valid until it expires, but it holds only what the session held
+before the sign-in, and nobody can forge one with a user in it without the
+key.
+
+`regenerate` uses one of the session's 16 entries, under
+`anole.session.regenerate_key`, until the response is saved. The middleware
+takes it out before saving.
 
 ## CSRF
 
@@ -276,9 +331,14 @@ if (ok and anole.auth.password.needsRehash(stored)) { ... hash again and store .
 ```
 
 Pass a thread-safe allocator such as `init.gpa`, not `req.arena`: each call
-allocates 19 MiB and frees it again. A hash runs on the request's executor
-and keeps that thread busy, about 150 ms in a Debug build and much less in
-ReleaseFast. A malformed stored hash counts as no match.
+allocates 19 MiB and frees it again. A hash takes about 150 ms in a Debug
+build and much less in ReleaseFast. With the server's blocking pool
+(`.blocking = .{}` in the server options, see
+[server.md](server.md#blocking-work)), `hash` and `verify` run on a pool
+thread while the request waits, and the executor goes on serving. Without
+it, they keep the request's executor busy for that long. `hashHere` and
+`verifyHere` always run on the calling thread. A malformed stored hash
+counts as no match, and so does a request canceled while `verify` runs.
 
 When the user name is unknown, verify against a dummy hash anyway, so the
 answer takes as long as a wrong password does.
@@ -320,12 +380,17 @@ policy.allows("editor", "notes:write"); // true
 ```
 
 `rbac.Require` is a middleware that answers 403 unless one of the request's
-roles grants `permission`. Your `roles` function decides where the roles
-come from: the session, a token's claims or an API key's owner. It returns
-a slice that lives in `req.arena`.
+roles grants `permission`. Your roles function decides where the roles
+come from: the session, a token's claims, an API key's owner or your app's
+state. It gets the `ptr` you pass with it, and returns a slice in
+`req.arena` or longer-lived memory. An error from it becomes a 500.
 
 ```zig
-var can_write: anole.auth.rbac.Require = .{ .policy = &policy, .permission = "notes:write", .roles = rolesOf };
+fn rolesOf(ctx: ?*anyopaque, req: *anole.Request) anyerror![]const []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    return app.rolesOfUser(req.arena, req.session.get("user") orelse return &.{});
+}
+var can_write = anole.auth.rbac.Require.init(&policy, "notes:write", .{ .ptr = &app, .roles = rolesOf });
 ```
 
 ## Rate limiting
