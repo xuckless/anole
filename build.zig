@@ -80,7 +80,7 @@ pub const Features = struct {
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
-            (!f.compression or have.compression) and (!f.websocket or have.websocket);
+            (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc);
     }
 };
 
@@ -213,6 +213,30 @@ pub fn build(b: *std.Build) void {
     const run_io = b.addRunArtifact(io_example);
     run_io.addPassthruArgs();
     b.step("run-io", "Run examples/io (pass a port after --, default 8081)").dependOn(&run_io.step);
+
+    // `zig build gen-proto`: Zig for Anole's own .proto files (the health
+    // service, the test service), through zig-protobuf's protoc-gen-zig and
+    // its pinned protoc. The output is committed; rerun after a proto or
+    // zig-protobuf change.
+    if (features.grpc) {
+        if (b.lazyImport(@This(), "protobuf")) |pb| if (b.lazyDependency("protobuf", .{ .target = target })) |dep| {
+            const gen_health = pb.RunProtocStep.create(b, target, .{
+                .source_files = &.{b.path("src/grpc/proto/grpc/health/v1/health.proto")},
+                .include_directories = &.{b.path("src/grpc/proto")},
+                .destination_directory = b.path("src/grpc/gen"),
+                .generator = dep.artifact("protoc-gen-zig"),
+            });
+            const gen_test = pb.RunProtocStep.create(b, target, .{
+                .source_files = &.{b.path("tests/grpc/proto/echo.proto")},
+                .include_directories = &.{b.path("tests/grpc/proto")},
+                .destination_directory = b.path("tests/grpc/gen"),
+                .generator = dep.artifact("protoc-gen-zig"),
+            });
+            const gen = b.step("gen-proto", "Regenerate the Zig for Anole's .proto files (committed)");
+            gen.dependOn(gen_health.step);
+            gen.dependOn(gen_test.step);
+        };
+    }
 
     // tests/autobahn: the WebSocket echo peer for the Autobahn suite.
     if (features.websocket) {
@@ -374,6 +398,8 @@ const CModules = struct {
     /// xuckless/websocket-zig, the sans-IO frame codec for WebSocket over
     /// HTTP/2 (websocket). Pure Zig, but fetched lazily like the C libraries.
     websocket: ?*std.Build.Module = null,
+    /// Arwalk/zig-protobuf's runtime (grpc).
+    protobuf: ?*std.Build.Module = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -390,6 +416,7 @@ const CModules = struct {
         // vendored zlib).
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
         const websocket_dep = if (f.websocket) b.lazyDependency("websocket_zig", .{ .target = target, .optimize = optimize }) else null;
+        const protobuf_dep = if (f.grpc) b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
@@ -397,12 +424,14 @@ const CModules = struct {
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
         if (f.websocket and websocket_dep == null) return null;
+        if (f.grpc and protobuf_dep == null) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
 
         var m: CModules = .{};
         if (websocket_dep) |dep| m.websocket = dep.module("websocket");
+        if (protobuf_dep) |dep| m.protobuf = dep.module("protobuf");
         if (!f.needsTranslateC()) return m;
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
@@ -502,6 +531,14 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("dusty", o.core.dusty(f));
     if (f.http2) mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
+    if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
+    // The generated test service (tests/grpc/gen), outside src/.
+    if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
+        .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
+        .target = o.target,
+        .optimize = o.optimize,
+        .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
+    }));
     if (f.compression) {
         mod.addImport("anole_zlib", o.c.zlib.?);
         mod.addImport("anole_zlib_c", o.c.zlib_c.?);

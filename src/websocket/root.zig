@@ -23,6 +23,14 @@
 //! streamed response; this file is the message layer over it, with dusty's
 //! semantics: pings are answered and pongs dropped inside `receive`, a close
 //! is echoed and returned, a text message must be valid UTF-8.
+//!
+//! The HTTP/2 engine advertises extended CONNECT, and a browser that sees it
+//! (Firefox does) opens WebSockets over HTTP/2: answer upgrades with
+//! `upgrade` here, not dusty's HTTP/1.1-only `res.upgradeWebSocket`, or turn
+//! `http2.enable_connect_protocol` off.
+//!
+//! permessage-deflate (RFC 7692) is accepted when offered and
+//! `-Dcompression` is on (`UpgradeOptions.compression`), on either version.
 const std = @import("std");
 const dusty = @import("dusty");
 const features = @import("build_options");
@@ -37,38 +45,83 @@ pub const CloseCode = WebSocket.CloseCode;
 pub const Client = dusty.WebSocketClient;
 
 pub const UpgradeOptions = struct {
-    /// The largest message `receive` assembles; a bigger one is answered
-    /// with close 1009.
+    /// The largest message `receive` assembles (after inflating); a bigger
+    /// one is answered with close 1009.
     max_message_size: usize = WebSocket.default_max_message_size,
     /// Replaces the request's timeout once the socket is open: a socket
     /// outlives `timeout.request`. Set a deadline here, or call
     /// `req.setTimeout` before each `receive` for an idle limit.
     timeout: std.Io.Timeout = .none,
+    /// Accept permessage-deflate (RFC 7692) when the client offers it.
+    /// Needs `-Dcompression`.
+    compression: bool = features.compression,
+    deflate: DeflateOptions = .{},
+};
+
+pub const DeflateOptions = if (features.compression) deflate_impl.Options else struct {};
+const deflate_impl = if (features.compression) @import("deflate.zig") else struct {
+    pub const Deflate = void;
 };
 
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
-pub const Socket = union(enum) {
-    h1: WebSocket,
-    h2: *H2Socket,
+pub const Socket = struct {
+    conn: union(enum) {
+        h1: WebSocket,
+        h2: *H2Socket,
+    },
+    /// permessage-deflate, when negotiated.
+    deflate: if (features.compression) ?*deflate_impl.Deflate else void =
+        if (features.compression) null else {},
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    max_message_size: usize,
+    /// Held across compressing and sending a message, so tasks sending on
+    /// one socket (a `Rooms.broadcast` beside the socket's own handler) do
+    /// not interleave on the compressor.
+    send_mutex: std.Io.Mutex = .init,
 
     /// The next text, binary or close message. Pings are answered and
-    /// pongs dropped on the way.
+    /// pongs dropped on the way; a compressed message is inflated.
     pub fn receive(self: *Socket) !Message {
-        return switch (self.*) {
-            .h1 => |*ws| ws.receive(),
-            .h2 => |ws| ws.receive(),
+        var msg = switch (self.conn) {
+            .h1 => |*ws| try ws.receive(),
+            .h2 => |ws| try ws.receive(),
         };
+        if (!msg.compressed) return msg;
+        if (comptime !features.compression) unreachable;
+        const d = self.deflate orelse unreachable; // RSV1 is refused unless negotiated
+        msg.data = d.decompress(self.allocator, msg.data, self.max_message_size) catch |err| {
+            self.close(if (err == error.MessageTooLarge) .too_large else .invalid_payload, "") catch {};
+            return err;
+        };
+        msg.compressed = false;
+        if (msg.type == .text and !std.unicode.utf8ValidateSlice(msg.data)) {
+            self.close(.invalid_payload, "") catch {};
+            return error.InvalidUtf8;
+        }
+        return msg;
     }
 
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
-        return switch (self.*) {
+        try self.send_mutex.lock(self.io);
+        defer self.send_mutex.unlock(self.io);
+        if (comptime features.compression) {
+            if (self.deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
+                const packed_data = try d.compress(self.allocator, data);
+                return switch (self.conn) {
+                    .h1 => |*ws| ws.sendCompressed(msg_type, packed_data),
+                    .h2 => |ws| ws.sendMessage(msg_type, packed_data, true),
+                };
+            };
+        }
+        return switch (self.conn) {
             .h1 => |*ws| ws.send(msg_type, data),
             .h2 => |ws| ws.send(msg_type, data),
         };
     }
 
     pub fn ping(self: *Socket, data: []const u8) !void {
-        return switch (self.*) {
+        return switch (self.conn) {
             .h1 => |*ws| ws.ping(data),
             .h2 => |ws| ws.ping(data),
         };
@@ -77,14 +130,15 @@ pub const Socket = union(enum) {
     /// Sends a close frame. The peer's answer still arrives through
     /// `receive`.
     pub fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
-        return switch (self.*) {
+        return switch (self.conn) {
             .h1 => |*ws| ws.close(code, reason),
             .h2 => |ws| ws.close(code, reason),
         };
     }
 
     pub fn deinit(self: *Socket) void {
-        switch (self.*) {
+        if (comptime features.compression) if (self.deflate) |d| d.deinit(self.allocator);
+        switch (self.conn) {
             .h1 => |*ws| ws.deinit(),
             .h2 => |ws| ws.deinit(),
         }
@@ -96,19 +150,129 @@ pub const Socket = union(enum) {
 /// handler answers it as it sees fit). The socket lives as long as the
 /// handler: the request's arena holds it.
 pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions) !?Socket {
-    if (req.protocol) |protocol| {
-        if (!features.http2 or !std.ascii.eqlIgnoreCase(protocol, "websocket")) return null;
+    const h2 = req.protocol != null;
+    if (h2) {
+        if (!features.http2 or !std.ascii.eqlIgnoreCase(req.protocol.?, "websocket")) return null;
         const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
         if (!std.mem.eql(u8, version, "13")) return null;
-        const socket = try H2Socket.accept(req, res, options);
-        req.setTimeout(options.timeout);
-        return .{ .h2 = socket };
     }
-    var ws = (try res.upgradeWebSocket(req)) orelse return null;
-    ws.max_message_size = options.max_message_size;
+
+    // permessage-deflate: the first offer we can take, answered in the
+    // handshake's response.
+    var deflate: if (features.compression) ?*deflate_impl.Deflate else void = if (features.compression) null else {};
+    if (comptime features.compression) if (options.compression) {
+        if (req.headers.get("Sec-WebSocket-Extensions")) |offers| {
+            var buf: [160]u8 = undefined;
+            if (deflate_impl.negotiate(offers, options.deflate, &buf)) |accepted| {
+                try res.header("Sec-WebSocket-Extensions", try req.arena.dupe(u8, accepted.response));
+                const d = try req.arena.create(deflate_impl.Deflate);
+                d.* = .init(accepted.config, options.deflate);
+                deflate = d;
+            }
+        }
+    };
+    const negotiated = if (comptime features.compression) deflate != null else false;
+
+    var socket: Socket = .{
+        .conn = undefined,
+        .deflate = deflate,
+        .allocator = req.arena,
+        .io = req.io,
+        .max_message_size = options.max_message_size,
+    };
+    if (h2) {
+        socket.conn = .{ .h2 = try H2Socket.accept(req, res, options, negotiated) };
+    } else {
+        var ws = (try res.upgradeWebSocket(req)) orelse return null;
+        ws.max_message_size = options.max_message_size;
+        ws.rsv1_allowed = negotiated;
+        socket.conn = .{ .h1 = ws };
+    }
     req.setTimeout(options.timeout);
-    return .{ .h1 = ws };
+    return socket;
 }
+
+/// Named groups of sockets for publish/subscribe: a handler joins its
+/// socket to rooms, and anything may broadcast to a room. Safe from any task
+/// or thread of the runtime.
+///
+/// A broadcast sends to every member in turn while holding the rooms' lock,
+/// so a member that has left (and whose handler has returned) is never sent
+/// to; a slow member slows the broadcast down. A member's send failing is
+/// that member's affair: its own `receive` sees the connection end.
+pub const Rooms = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    rooms: std.StringHashMapUnmanaged(std.ArrayList(*Socket)) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Rooms {
+        return .{ .allocator = allocator, .io = io };
+    }
+
+    pub fn deinit(self: *Rooms) void {
+        var it = self.rooms.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.rooms.deinit(self.allocator);
+    }
+
+    /// Adds `socket` to `room`. Leave before the socket goes away:
+    /// `defer rooms.leave(room, &ws)`.
+    pub fn join(self: *Rooms, room: []const u8, socket: *Socket) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = try self.rooms.getOrPut(self.allocator, room);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = self.allocator.dupe(u8, room) catch |err| {
+                self.rooms.removeByPtr(entry.key_ptr);
+                return err;
+            };
+            entry.value_ptr.* = .empty;
+        }
+        try entry.value_ptr.append(self.allocator, socket);
+    }
+
+    pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const members = self.rooms.getPtr(room) orelse return;
+        for (members.items, 0..) |m, i| if (m == socket) {
+            _ = members.swapRemove(i);
+            break;
+        };
+        if (members.items.len == 0) {
+            const key = self.rooms.getKey(room).?;
+            members.deinit(self.allocator);
+            _ = self.rooms.remove(room);
+            self.allocator.free(key);
+        }
+    }
+
+    /// Sends one message to every member of `room` but `except`. Returns
+    /// how many it reached.
+    pub fn broadcast(self: *Rooms, room: []const u8, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const members = self.rooms.get(room) orelse return 0;
+        var reached: usize = 0;
+        for (members.items) |m| {
+            if (m == except) continue;
+            m.send(msg_type, data) catch continue;
+            reached += 1;
+        }
+        return reached;
+    }
+
+    /// How many sockets are in `room`.
+    pub fn count(self: *Rooms, room: []const u8) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return if (self.rooms.get(room)) |m| m.items.len else 0;
+    }
+};
 
 /// A WebSocket on an HTTP/2 stream (RFC 8441): frames arrive in the
 /// request body and leave in the streamed response.
@@ -126,7 +290,7 @@ pub const H2Socket = struct {
     closed: bool = false,
     write_mutex: std.Io.Mutex = .init,
 
-    fn accept(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions) !*H2Socket {
+    fn accept(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, deflate: bool) !*H2Socket {
         const self = try req.arena.create(H2Socket);
         self.* = .{
             .io = req.io,
@@ -135,7 +299,8 @@ pub const H2Socket = struct {
             .out = undefined,
             .in_buf = undefined,
             .out_buf = undefined,
-            .frames = .init(.{}),
+            // RSV1 is allowed once permessage-deflate is in use.
+            .frames = .init(.{ .extension = if (deflate) .{ .permessage_deflate = .init } else null }),
             .max_message_size = options.max_message_size,
         };
         // A 200 accepts the extended CONNECT (RFC 8441 §5); the stream
@@ -190,11 +355,12 @@ pub const H2Socket = struct {
             },
             .data_end => |end| {
                 const msg_type: MessageType = if (end.opcode == .text) .text else .binary;
-                if (msg_type == .text and !std.unicode.utf8ValidateSlice(self.message.items)) {
+                // A compressed text message is checked once inflated.
+                if (!end.compressed and msg_type == .text and !std.unicode.utf8ValidateSlice(self.message.items)) {
                     self.fail(.invalid_payload);
                     return error.InvalidUtf8;
                 }
-                return .{ .type = msg_type, .data = self.message.items };
+                return .{ .type = msg_type, .data = self.message.items, .compressed = end.compressed };
             },
             .ping => |payload| {
                 try self.writeFrame(.pong, payload);
@@ -220,6 +386,11 @@ pub const H2Socket = struct {
     }
 
     pub fn send(self: *H2Socket, msg_type: MessageType, data: []const u8) !void {
+        return self.sendMessage(msg_type, data, false);
+    }
+
+    /// `send`, with RSV1 set when `compressed` (permessage-deflate).
+    pub fn sendMessage(self: *H2Socket, msg_type: MessageType, data: []const u8, compressed: bool) !void {
         const opcode: codec.Opcode = switch (msg_type) {
             .text => .text,
             .binary => .binary,
@@ -228,7 +399,7 @@ pub const H2Socket = struct {
             .close => return self.close(.normal, data),
             else => return error.InvalidOpcode,
         };
-        try self.writeFrame(opcode, data);
+        try self.writeFrameOpts(.{ .opcode = opcode, .compressed = compressed }, data);
     }
 
     pub fn ping(self: *H2Socket, data: []const u8) !void {
@@ -255,17 +426,23 @@ pub const H2Socket = struct {
     }
 
     fn writeFrame(self: *H2Socket, opcode: codec.Opcode, payload: []const u8) !void {
+        return self.writeFrameOpts(.{ .opcode = opcode }, payload);
+    }
+
+    fn writeFrameOpts(self: *H2Socket, opts: codec.WriteFrameOptions, payload: []const u8) !void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
         const w = &self.out.interface;
-        codec.writeFrame(w, payload, .{ .opcode = opcode }) catch return self.out.err orelse error.WriteFailed;
+        codec.writeFrame(w, payload, opts) catch return self.out.err orelse error.WriteFailed;
         w.flush() catch return self.out.err orelse error.WriteFailed;
     }
 };
 
 test {
+    _ = @import("rooms_test.zig");
     if (features.http2) _ = @import("h2_test.zig");
+    if (features.compression) _ = @import("deflate.zig");
 }
 
 test "WebSocket accept key matches RFC 6455 section 1.3" {

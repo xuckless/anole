@@ -16,8 +16,8 @@
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#31ff22b2b7e4ec24394119ab9151aaf17a85437e",
-            .hash = "dusty-0.4.0-Qdw7RsFkJwCIn_cawdjhSt9VyykzOlUnf2ec4WqxEIZn",
+            .url = "git+https://github.com/xuckless/dusty#2de8733450bb3bc51f83263b8e5f556780fa0b71",
+            .hash = "dusty-0.4.0-Qdw7RghxJwCgahDUxGPzvLPGOr4ALaWVk9XbmCfM42GB",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -74,6 +74,11 @@
         .websocket_zig = .{
             .url = "git+https://github.com/xuckless/websocket-zig#4bd0e5c4f46466ded5478afb0db3a2f72a264ae8",
             .hash = "websocket-0.0.0-UEQdXjgDAgCbGTdVLwvvGXjiu9jsUWjjxE-ACul9M8HV",
+            .lazy = true,
+        },
+        .protobuf = .{
+            .url = "git+https://github.com/Arwalk/zig-protobuf#e9e18c7664b8c950e5fc679259c968dd66ccc48b",
+            .hash = "protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv",
             .lazy = true,
         },
     },

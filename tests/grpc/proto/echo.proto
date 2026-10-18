@@ -1,0 +1,21 @@
+// Anole's gRPC test service: one method per call mode.
+syntax = "proto3";
+
+package anole.test;
+
+message EchoRequest {
+  string message = 1;
+  int32 repeat = 2;
+}
+
+message EchoResponse {
+  string message = 1;
+  int32 index = 2;
+}
+
+service Echo {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse);
+}

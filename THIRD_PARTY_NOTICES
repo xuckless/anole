@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit 31ff22b2b7e4ec24394119ab9151aaf17a85437e of the fork
+  Pinned:   commit 2de8733450bb3bc51f83263b8e5f556780fa0b71 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -88,6 +88,14 @@ zstd 1.5.7 (Zstandard)
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
 
+zig-protobuf (protobuf runtime and protoc-gen-zig; protoc release zips)
+  Licence:  MIT. Copyright (c) 2021 Arwalk
+  Source:   https://github.com/Arwalk/zig-protobuf
+  Pinned:   commit e9e18c7664b8c950e5fc679259c968dd66ccc48b
+  Linked:   -Dgrpc=true (protoc and protoc-gen-zig run at build time only,
+            for `zig build gen-proto`; protoc is Google's BSD-3-Clause
+            release binary, pinned by hash in zig-protobuf's build.zig.zon)
+
 websocket-zig (sans-IO WebSocket frame codec, for WebSocket over HTTP/2)
   Licence:  MIT. Copyright (c) 2026 Matt Robenolt
   Source:   https://github.com/mattrobenolt/websocket-zig
@@ -143,6 +151,18 @@ build/zstd.zig
   build.zig (commit 4ccb01e, release 1.5.7-2).
   Licence:  MIT (Expat). Copyright (c) contributors
   Source:   https://github.com/allyourcodebase/zstd
+
+src/grpc/status.zig, metadata.zig, deadline.zig, compression.zig, frame.zig
+  Copied from grpc-lite's src/ (frame.zig changed to gzip through zlib-ng
+  and to read messages off a std.Io.Reader).
+  Licence:  MIT. Copyright (c) 2026 grpc-lite contributors
+  Source:   https://github.com/fanyang89/grpc-lite, commit db3c400
+
+src/grpc/proto/grpc/health/v1/health.proto (and the Zig generated from it,
+src/grpc/gen/grpc/health/v1.pb.zig)
+  The standard gRPC health service definition.
+  Licence:  Apache License 2.0 (text in part E). Copyright 2015 The gRPC Authors
+  Source:   https://github.com/grpc/grpc-proto, commit 8133308
 
 src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
   The Connection.Reader/Writer vtables follow tls.zig's src/connection.zig,
@@ -201,8 +221,8 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 
 
-E. Apache License 2.0 (BoringSSL, fiat-crypto)
-----------------------------------------------
+E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto's health.proto)
+-------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of the pinned BoringSSL tree (commit
 22a0079b). That file also covers Go-licensed TLS test-suite code, which is
