@@ -157,6 +157,41 @@ pub fn build(b: *std.Build) void {
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
 
+    // dusty-test: dusty's own test suite on what Anole injects into it
+    // (BoringSSL through src/tls/dusty_tls.zig, nghttp2 1.70.0, zlib-ng,
+    // zstd): a conformance check of those seams.
+    if (core.dusty_by[1][1][1]) |dusty_full| {
+        // A second instance of the same sources and imports, but with
+        // dusty's own zio stub: its tests run on std.testing.io, and the
+        // real zio's timers need a zio task.
+        const dusty_root = dusty_full.root_source_file.?;
+        const test_mod = b.createModule(.{
+            .root_source_file = dusty_root,
+            .target = target,
+            .optimize = optimize,
+            .link_libc = dusty_full.link_libc,
+        });
+        var imports = dusty_full.import_table.iterator();
+        while (imports.next()) |e| test_mod.addImport(e.key_ptr.*, e.value_ptr.*);
+        test_mod.addAnonymousImport("zio", .{ .root_source_file = dusty_root.dirname().path(b, "zio_stub.zig") });
+        test_mod.include_dirs.appendSlice(b.allocator, dusty_full.include_dirs.items) catch @panic("OOM");
+        test_mod.c_macros.appendSlice(b.allocator, dusty_full.c_macros.items) catch @panic("OOM");
+        test_mod.link_objects.appendSlice(b.allocator, dusty_full.link_objects.items) catch @panic("OOM");
+        // dusty's own test runner, as its build uses (some tests log at
+        // err on purpose).
+        const dusty_tests = b.addTest(.{
+            .name = "dusty-test",
+            .root_module = test_mod,
+            .test_runner = .{ .path = dusty_root.dirname().dirname().path(b, "test_runner.zig"), .mode = .simple },
+        });
+        const run_dusty_tests = b.addRunArtifact(dusty_tests);
+        run_dusty_tests.skip_foreign_checks = true;
+        // Its tests open fixtures (examples/certs/...) relative to dusty's
+        // package root.
+        run_dusty_tests.setCwd(dusty_root.dirname().dirname());
+        b.step("dusty-test", "Run dusty's own tests on Anole's TLS, nghttp2, zlib-ng and zstd").dependOn(&run_dusty_tests.step);
+    }
+
     // test-flags: one test binary per preset and edge combination. Each gets its
     // own build_options module; the C libraries in `c_mods` are shared, so each
     // compiles once per target.

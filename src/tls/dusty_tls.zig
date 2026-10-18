@@ -140,12 +140,17 @@ pub const config = struct {
     pub const ClientAuth = struct {
         root_ca: std.crypto.Certificate.Bundle,
         auth_type: enum { request, require } = .require,
+        /// `root_ca` loaded once (dusty sets it when the module has
+        /// `TrustStore`); without it each handshake looks `root_ca` up.
+        trust: ?*const TrustStore = null,
     };
 
     /// Client handshake options, as dusty builds them (client.zig `Connection.init`).
     pub const Client = struct {
         host: []const u8,
         root_ca: std.crypto.Certificate.Bundle,
+        /// `root_ca` loaded once, as in `ClientAuth.trust`.
+        trust: ?*const TrustStore = null,
         insecure_skip_verify: bool = false,
         auth: ?*CertKeyPair = null,
         now: std.Io.Timestamp,
@@ -165,13 +170,114 @@ pub const HandshakeError = error{
     WriteFailed,
     EndOfStream,
     OutOfMemory,
-    TlsAlert,
     TlsBadRecordMac,
     TlsCertificateVerifyFailed,
     TlsNoApplicationProtocol,
     TlsInvalidHostname,
     TlsFailure,
+} || AlertError || VerifyError;
+
+/// An alert the peer sent, by tls.zig's names (protocol.zig `toError`), so
+/// code written against tls.zig sees the same errors.
+pub const AlertError = error{
+    TlsAlertUnexpectedMessage,
+    TlsAlertBadRecordMac,
+    TlsAlertRecordOverflow,
+    TlsAlertHandshakeFailure,
+    TlsAlertBadCertificate,
+    TlsAlertUnsupportedCertificate,
+    TlsAlertCertificateRevoked,
+    TlsAlertCertificateExpired,
+    TlsAlertCertificateUnknown,
+    TlsAlertIllegalParameter,
+    TlsAlertUnknownCa,
+    TlsAlertAccessDenied,
+    TlsAlertDecodeError,
+    TlsAlertDecryptError,
+    TlsAlertProtocolVersion,
+    TlsAlertInsufficientSecurity,
+    TlsAlertInternalError,
+    TlsAlertInappropriateFallback,
+    TlsAlertMissingExtension,
+    TlsAlertUnsupportedExtension,
+    TlsAlertUnrecognizedName,
+    TlsAlertBadCertificateStatusResponse,
+    TlsAlertUnknownPskIdentity,
+    TlsAlertCertificateRequired,
+    TlsAlertNoApplicationProtocol,
+    TlsAlertUnknown,
 };
+
+/// Why the peer's certificate did not verify, by the names of
+/// `std.crypto.Certificate` (what tls.zig reports); anything else is
+/// `TlsCertificateVerifyFailed`.
+pub const VerifyError = error{
+    CertificateIssuerNotFound,
+    CertificateExpired,
+    CertificateNotYetValid,
+    CertificateHostMismatch,
+    CertificateSignatureInvalid,
+};
+
+fn alertError(description: c_int) AlertError {
+    return switch (description) {
+        c.SSL_AD_UNEXPECTED_MESSAGE => error.TlsAlertUnexpectedMessage,
+        c.SSL_AD_BAD_RECORD_MAC => error.TlsAlertBadRecordMac,
+        c.SSL_AD_RECORD_OVERFLOW => error.TlsAlertRecordOverflow,
+        c.SSL_AD_HANDSHAKE_FAILURE => error.TlsAlertHandshakeFailure,
+        c.SSL_AD_BAD_CERTIFICATE => error.TlsAlertBadCertificate,
+        c.SSL_AD_UNSUPPORTED_CERTIFICATE => error.TlsAlertUnsupportedCertificate,
+        c.SSL_AD_CERTIFICATE_REVOKED => error.TlsAlertCertificateRevoked,
+        c.SSL_AD_CERTIFICATE_EXPIRED => error.TlsAlertCertificateExpired,
+        c.SSL_AD_CERTIFICATE_UNKNOWN => error.TlsAlertCertificateUnknown,
+        c.SSL_AD_ILLEGAL_PARAMETER => error.TlsAlertIllegalParameter,
+        c.SSL_AD_UNKNOWN_CA => error.TlsAlertUnknownCa,
+        c.SSL_AD_ACCESS_DENIED => error.TlsAlertAccessDenied,
+        c.SSL_AD_DECODE_ERROR => error.TlsAlertDecodeError,
+        c.SSL_AD_DECRYPT_ERROR => error.TlsAlertDecryptError,
+        c.SSL_AD_PROTOCOL_VERSION => error.TlsAlertProtocolVersion,
+        c.SSL_AD_INSUFFICIENT_SECURITY => error.TlsAlertInsufficientSecurity,
+        c.SSL_AD_INTERNAL_ERROR => error.TlsAlertInternalError,
+        c.SSL_AD_INAPPROPRIATE_FALLBACK => error.TlsAlertInappropriateFallback,
+        c.SSL_AD_MISSING_EXTENSION => error.TlsAlertMissingExtension,
+        c.SSL_AD_UNSUPPORTED_EXTENSION => error.TlsAlertUnsupportedExtension,
+        c.SSL_AD_UNRECOGNIZED_NAME => error.TlsAlertUnrecognizedName,
+        c.SSL_AD_BAD_CERTIFICATE_STATUS_RESPONSE => error.TlsAlertBadCertificateStatusResponse,
+        c.SSL_AD_UNKNOWN_PSK_IDENTITY => error.TlsAlertUnknownPskIdentity,
+        c.SSL_AD_CERTIFICATE_REQUIRED => error.TlsAlertCertificateRequired,
+        c.SSL_AD_NO_APPLICATION_PROTOCOL => error.TlsAlertNoApplicationProtocol,
+        else => error.TlsAlertUnknown,
+    };
+}
+
+fn verifyError(result: c_long) HandshakeError {
+    return switch (result) {
+        c.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT,
+        c.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+        c.X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE,
+        c.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT,
+        c.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN,
+        => error.CertificateIssuerNotFound,
+        c.X509_V_ERR_CERT_HAS_EXPIRED => error.CertificateExpired,
+        c.X509_V_ERR_CERT_NOT_YET_VALID => error.CertificateNotYetValid,
+        c.X509_V_ERR_HOSTNAME_MISMATCH, c.X509_V_ERR_IP_ADDRESS_MISMATCH => error.CertificateHostMismatch,
+        c.X509_V_ERR_CERT_SIGNATURE_FAILURE => error.CertificateSignatureInvalid,
+        else => error.TlsCertificateVerifyFailed,
+    };
+}
+
+/// `err` if it is an alert the peer sent, for the read path's narrower set.
+fn asAlert(err: HandshakeError) ?AlertError {
+    return switch (err) {
+        inline else => |e| if (comptime inSet(AlertError, e)) @errorCast(e) else null,
+    };
+}
+
+fn inSet(comptime Set: type, comptime err: anyerror) bool {
+    @setEvalBranchQuota(100_000);
+    for (@typeInfo(Set).error_set.error_names.?) |name| if (std.mem.eql(u8, name, @errorName(err))) return true;
+    return false;
+}
 
 pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server) HandshakeError!Connection {
     const auth = opt.auth orelse return error.TlsFailure;
@@ -184,7 +290,7 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     if (opt.client_auth) |ca| {
         // The CertificateRequest also names the acceptable CAs, so a client
         // holding several certificates can pick the right one.
-        const trust = try trustStore(ca.root_ca, true);
+        const trust = if (ca.trust) |t| try t.share(true) else try trustStore(ca.root_ca, true);
         defer c.X509_STORE_free(trust.store);
         if (c.SSL_set1_verify_cert_store(ssl, trust.store) != 1) return error.OutOfMemory;
         c.SSL_set0_client_CAs(ssl, trust.names);
@@ -221,7 +327,9 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
     if (opt.insecure_skip_verify) {
         c.SSL_set_verify(ssl, c.SSL_VERIFY_NONE, null);
     } else {
-        try setVerifyStore(ssl, opt.root_ca);
+        if (opt.trust) |t| {
+            if (c.SSL_set1_verify_cert_store(ssl, t.store) != 1) return error.OutOfMemory;
+        } else try setVerifyStore(ssl, opt.root_ca);
         c.SSL_set_verify(ssl, c.SSL_VERIFY_PEER, null);
         const ok = if (host_is_ip)
             c.X509_VERIFY_PARAM_set1_ip_asc(c.SSL_get0_param(ssl), host.ptr)
@@ -279,9 +387,8 @@ pub const Connection = struct {
         ReadFailed,
         TlsConnectionTruncated,
         TlsBadRecordMac,
-        TlsAlert,
         TlsFailure,
-    };
+    } || AlertError;
     pub const WriteError = error{ WriteFailed, TlsFailure };
 
     /// Frees the SSL, which frees the BIO and the shared state with it.
@@ -332,10 +439,10 @@ pub const Connection = struct {
                 },
                 c.SSL_ERROR_ZERO_RETURN => return 0,
                 c.SSL_ERROR_SYSCALL => return if (eof) 0 else error.TlsFailure,
-                else => return switch (failure orelse error.TlsFailure) {
-                    error.TlsBadRecordMac => error.TlsBadRecordMac,
-                    error.TlsAlert => error.TlsAlert,
-                    else => error.TlsFailure,
+                else => {
+                    const f = failure orelse return error.TlsFailure;
+                    if (asAlert(f)) |alert| return alert;
+                    return if (f == error.TlsBadRecordMac) error.TlsBadRecordMac else error.TlsFailure;
                 },
             }
         }
@@ -476,11 +583,12 @@ fn handshake(sh: *Shared) HandshakeError!void {
         c.ERR_clear_error();
         const rc = c.SSL_do_handshake(sh.ssl);
         const code = if (rc == 1) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
-        const failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_do_handshake") else null;
+        var failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_do_handshake") else null;
         if (failure != null and failure.? == error.TlsCertificateVerifyFailed) {
             // The reason code is SSL_R_CERTIFICATE_VERIFY_FAILED; the X.509 detail is here.
             const v = c.SSL_get_verify_result(sh.ssl);
             log.debug("certificate verification failed: {s}", .{std.mem.span(c.X509_verify_cert_error_string(v))});
+            failure = verifyError(v);
         }
         c.ERR_clear_error();
         const eof = sh.input_eof;
@@ -632,40 +740,69 @@ fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) Handshake
         if (e.hash == hash and e.len == der.len) return trustFrom(e, want_names);
     }
 
-    const store = c.X509_STORE_new() orelse return error.OutOfMemory;
-    errdefer c.X509_STORE_free(store);
-    const names = c.sk_CRYPTO_BUFFER_new_null() orelse return error.OutOfMemory;
-    errdefer c.sk_CRYPTO_BUFFER_pop_free(names, c.CRYPTO_BUFFER_free);
-    // The bundle is DER certificates back to back.
-    var p: [*c]const u8 = der.ptr;
-    const end = der.ptr + der.len;
-    while (p != end) {
-        const x = c.d2i_X509(null, &p, @intCast(end - p)) orelse break;
-        defer c.X509_free(x);
-        _ = c.X509_STORE_add_cert(store, x);
-        var name_der: [*c]const u8 = undefined;
-        var name_len: usize = 0;
-        if (c.X509_NAME_get0_der(c.X509_get_subject_name(x), &name_der, &name_len) != 1) continue;
-        const buf = c.CRYPTO_BUFFER_new(name_der, name_len, null) orelse return error.OutOfMemory;
-        if (c.sk_CRYPTO_BUFFER_push(names, buf) == 0) {
-            c.CRYPTO_BUFFER_free(buf);
-            return error.OutOfMemory;
-        }
-    }
-    c.ERR_clear_error();
-
+    const built = try TrustStore.fromDer(der);
     const slot = &store_cache[store_cache_next];
     store_cache_next = (store_cache_next + 1) % store_cache.len;
     if (slot.*) |old| {
-        c.X509_STORE_free(old.store);
-        c.sk_CRYPTO_BUFFER_pop_free(old.names, c.CRYPTO_BUFFER_free);
+        var t: TrustStore = .{ .store = old.store, .names = old.names };
+        t.deinit();
     }
-    slot.* = .{ .hash = hash, .len = der.len, .store = store, .names = names };
+    slot.* = .{ .hash = hash, .len = der.len, .store = built.store, .names = built.names };
     return trustFrom(slot.*.?, want_names);
 }
 
-/// New references to a cached entry's store and, if asked, its names.
-/// Under the global lock.
+/// A trust store loaded once from a bundle, for dusty to keep beside the
+/// bundle and hand to every handshake (`config.Client.trust`,
+/// `config.ClientAuth.trust`), so none of them converts or looks up the
+/// bundle. Immutable after `init`; any thread may use it.
+pub const TrustStore = struct {
+    store: *c.X509_STORE,
+    /// The certificates' subject names (DER), for a server's client CA list.
+    names: *c.struct_stack_st_CRYPTO_BUFFER,
+
+    pub fn init(bundle: std.crypto.Certificate.Bundle) error{OutOfMemory}!TrustStore {
+        return fromDer(bundle.bytes.items);
+    }
+
+    pub fn deinit(self: *TrustStore) void {
+        c.X509_STORE_free(self.store);
+        c.sk_CRYPTO_BUFFER_pop_free(self.names, c.CRYPTO_BUFFER_free);
+        self.* = undefined;
+    }
+
+    /// The bundle's bytes: DER certificates back to back.
+    fn fromDer(der: []const u8) error{OutOfMemory}!TrustStore {
+        const store = c.X509_STORE_new() orelse return error.OutOfMemory;
+        errdefer c.X509_STORE_free(store);
+        const names = c.sk_CRYPTO_BUFFER_new_null() orelse return error.OutOfMemory;
+        errdefer c.sk_CRYPTO_BUFFER_pop_free(names, c.CRYPTO_BUFFER_free);
+        var p: [*c]const u8 = der.ptr;
+        const end = der.ptr + der.len;
+        while (p != end) {
+            const x = c.d2i_X509(null, &p, @intCast(end - p)) orelse break;
+            defer c.X509_free(x);
+            _ = c.X509_STORE_add_cert(store, x);
+            var name_der: [*c]const u8 = undefined;
+            var name_len: usize = 0;
+            if (c.X509_NAME_get0_der(c.X509_get_subject_name(x), &name_der, &name_len) != 1) continue;
+            const buf = c.CRYPTO_BUFFER_new(name_der, name_len, null) orelse return error.OutOfMemory;
+            if (c.sk_CRYPTO_BUFFER_push(names, buf) == 0) {
+                c.CRYPTO_BUFFER_free(buf);
+                return error.OutOfMemory;
+            }
+        }
+        c.ERR_clear_error();
+        return .{ .store = store, .names = names };
+    }
+
+    /// New references to the store and, if asked, the names.
+    fn share(self: *const TrustStore, want_names: bool) HandshakeError!Trust {
+        return trustFrom(.{ .hash = 0, .len = 0, .store = self.store, .names = self.names }, want_names);
+    }
+};
+
+/// New references to an entry's store and, if asked, its names. Under the
+/// global lock for a cached entry.
 fn trustFrom(e: StoreEntry, want_names: bool) HandshakeError!Trust {
     var names: ?*c.struct_stack_st_CRYPTO_BUFFER = null;
     if (want_names) {
@@ -858,7 +995,8 @@ fn queuedError(what: []const u8) HandshakeError {
     logErrors(what);
     if (first == 0 or errLib(first) != c.ERR_LIB_SSL) return error.TlsFailure;
     const reason = errReason(first);
-    if (reason >= c.SSL_AD_REASON_OFFSET) return error.TlsAlert;
+    // A received alert's reason is the offset plus its description.
+    if (reason >= c.SSL_AD_REASON_OFFSET) return alertError(@intCast(reason - c.SSL_AD_REASON_OFFSET));
     return switch (reason) {
         c.SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC => error.TlsBadRecordMac,
         c.SSL_R_CERTIFICATE_VERIFY_FAILED => error.TlsCertificateVerifyFailed,

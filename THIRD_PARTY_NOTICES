@@ -4,9 +4,10 @@ Third-party notices for Anole
 Anole is MIT-licensed (see LICENSE). It is built from the components below.
 Nothing in this list is vendored into this repository: each package is
 fetched by `zig build` from the pinned URL in build.zig.zon. Most packages
-keep their own licence file, but the zio and dusty packages ship no LICENSE
-(their build.zig.zon .paths leave it out), so this file carries their
-notices: the copyright lines in part A and the MIT text in part C. Files in
+keep their own licence file, but the zio package ships no LICENSE (its
+build.zig.zon .paths leave it out; Anole's dusty fork now ships one), so this
+file carries the notices of both: the copyright lines in part A and the MIT
+text in part C. Files in
 this repository that adapt third-party code carry an attribution header and
 are listed in part B.
 
@@ -30,7 +31,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches; the first ones are open
             upstream as lalinsky/dusty #263-#270, the rest are fork-only)
-  Pinned:   commit 64895efcd3da6a50ca6c1b6af2fee6ab439437da of the fork
+  Pinned:   commit 5085df32e52b20a926cb8eb6b4d7077ae1458d71 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)

@@ -478,7 +478,7 @@ test "TLS hello: a client that does not trust the certificate is refused" {
             defer client.deinit();
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
-            try std.testing.expectError(error.TlsCertificateVerifyFailed, client.fetch(url, .{}));
+            try std.testing.expectError(error.CertificateIssuerNotFound, client.fetch(url, .{}));
         }
     }.run, .{ &server, io, h.tmp.dir });
     try client_future.await(io);
@@ -522,7 +522,7 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
                     resp.deinit();
                     return error.ServedWithoutClientCertificate;
                 } else |err| switch (err) {
-                    error.TlsAlert => {},
+                    error.TlsAlertCertificateRequired => {},
                     else => return err,
                 }
             }

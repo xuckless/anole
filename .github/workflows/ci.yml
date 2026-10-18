@@ -30,6 +30,10 @@ jobs:
         run: zig build test --summary all
       - name: Every preset and edge flag combination
         run: zig build test-flags --summary all
+      # dusty's own suite on the TLS (BoringSSL), nghttp2, zlib-ng and zstd
+      # Anole injects into it.
+      - name: dusty's tests on Anole's seams
+        run: zig build dusty-test --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
