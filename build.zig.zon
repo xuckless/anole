@@ -46,8 +46,11 @@
         // `anole`: the v1.25.0 tag plus its generated version.h and a patch
         // that keeps the connection ID a server falls back to when a client
         // migrates right after a NAT rebinding (stock 1.25.0 retires it and
-        // then closes with CONNECTION_ID_LIMIT_ERROR). nghttp3 1.18.0: the
-        // release tarball.
+        // then closes with CONNECTION_ID_LIMIT_ERROR). nghttp3 1.18.0 from
+        // Anole's fork xuckless/nghttp3, branch `anole`: the v1.18.0 tag plus
+        // the release's generated version.h and bundled sfparse, and
+        // nghttp3_conn_add_extra_setting, which sends the SETTINGS
+        // WebTransport needs (0x2b603742 for Chrome and Firefox).
         .ngtcp2 = .{
             .url = "https://github.com/xuckless/ngtcp2/archive/591e959bc67820226651ee8f009a265899bfc71c.tar.gz",
             .hash = "N-V-__8AABJoQwBrzAagy2GLO39dOB29jJX9PivETrPyVl0y",
@@ -72,6 +75,8 @@
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
             .lazy = true,
         },
+        // Until the fork's branch is pushed: a local checkout of it. Then
+        // https://github.com/xuckless/nghttp3/archive/<commit>.tar.gz.
         .nghttp3 = .{
             .url = "https://github.com/xuckless/nghttp3/archive/de4bcb905eca28cdfe0e6ef4280b355e1c29660d.tar.gz",
             .hash = "N-V-__8AAEFLFQDX6X1kJVbgLtI2HqUnToQWeqwqMuAlG7Oa",

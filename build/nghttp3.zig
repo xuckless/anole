@@ -1,5 +1,8 @@
-//! nghttp3 (HTTP/3 + QPACK, MIT) built from the official v1.18.0 release tarball, which
-//! ships lib/includes/nghttp3/version.h and the vendored lib/sfparse.
+//! nghttp3 (HTTP/3 + QPACK, MIT) built from Anole's fork (xuckless/nghttp3, branch
+//! `anole`): the v1.18.0 tag plus, as in the release tarball,
+//! lib/includes/nghttp3/version.h and the vendored lib/sfparse, and
+//! nghttp3_conn_add_extra_setting (SETTINGS for WebTransport). The GitHub archive of
+//! the pinned commit is a lazy dependency.
 //!
 //! The source list and macro set are adapted from kingwill101/server_native (MIT),
 //! zig/protocol_sources.zig and zig/protocol_dependencies.zig. Differences from
@@ -45,7 +48,7 @@ pub const sources = [_][]const u8{
 
 const c_flags = [_][]const u8{"-std=c11"};
 
-/// Builds libnghttp3.a. `upstream` is the lazy `nghttp3` dependency (release tarball root).
+/// Builds libnghttp3.a. `upstream` is the lazy `nghttp3` dependency (the fork's tree).
 pub fn library(
     b: *std.Build,
     upstream: *std.Build.Dependency,

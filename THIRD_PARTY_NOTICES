@@ -82,8 +82,12 @@ ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
 
 nghttp3 1.18.0 (HTTP/3 and QPACK)
   Licence:  MIT. Copyright (c) 2019 nghttp3 contributors
-  Source:   https://github.com/ngtcp2/nghttp3
-            (release tarball nghttp3-1.18.0.tar.xz)
+  Source:   https://github.com/ngtcp2/nghttp3, used through Anole's fork
+            https://github.com/xuckless/nghttp3 (branch anole: tag v1.18.0,
+            the release's generated version.h and bundled sfparse, and
+            Anole's nghttp3_conn_add_extra_setting, for WebTransport's
+            SETTINGS)
+  Pinned:   commit de4bcb905eca28cdfe0e6ef4280b355e1c29660d of the fork
   Linked:   -Dhttp3=true
 
 zlib-ng 2.3.3 (gzip/deflate, zlib-compat mode)
