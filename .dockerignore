@@ -1,0 +1,11 @@
+.git
+**/.zig-cache
+**/zig-cache
+**/zig-out
+**/zig-pkg
+bench/.data
+bench/results
+bench/media/out
+**/node_modules
+**/target
+**/__pycache__

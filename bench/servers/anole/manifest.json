@@ -1,0 +1,16 @@
+{
+  "name": "anole",
+  "label": "Anole (Zig, zio)",
+  "modes": {
+    "h1": "anole (dusty HTTP/1.1; h2c on the same port)",
+    "h2c": "anole (nghttp2, prior knowledge)",
+    "tls": "anole (BoringSSL, ALPN h2 + http/1.1)",
+    "h3": "anole (ngtcp2 + nghttp3, BoringSSL)"
+  },
+  "tls_alpn": ["h2", "http/1.1"],
+  "ws": "anole.websocket (RFC 6455)",
+  "ws_h2": true,
+  "grpc": "anole gRPC (tests/grpc/interop server)",
+  "twelve": "bench-local Postgres wire client (src/pg.zig) + anole.auth.verify",
+  "static": "app.staticDir (sendfile on cleartext, Range/If-Range)"
+}

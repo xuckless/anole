@@ -1,0 +1,13 @@
+{
+  "name": "fiber",
+  "label": "Go Fiber v3.6.1",
+  "modes": {
+    "h1": "fiber v3.6.1 (fasthttp v1.75.0)",
+    "tls": "fiber v3.6.1 (fasthttp v1.75.0, crypto/tls)"
+  },
+  "tls_alpn": ["http/1.1"],
+  "ws": "gofiber/contrib/v3/websocket v1.2.8 (fasthttp/websocket v1.5.12)",
+  "ws_h2": false,
+  "twelve": "pgx/v5 v5.11.0 pgxpool + golang-jwt/v5 v5.3.1",
+  "static": "fiber static middleware (fasthttp.FS, ByteRange: true)"
+}

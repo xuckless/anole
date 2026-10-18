@@ -1,0 +1,17 @@
+{
+  "name": "nginx",
+  "label": "nginx 1.30.1 (baseline)",
+  "modes": {
+    "h1": "nginx 1.30.1",
+    "tls": "nginx 1.30.1 (OpenSSL, ALPN h2 + http/1.1)",
+    "h3": "nginx 1.30.1 (ngx_http_v3_module)"
+  },
+  "tls_alpn": ["h2", "http/1.1"],
+  "ws": "",
+  "ws_h2": false,
+  "grpc": "",
+  "twelve": "",
+  "static": "sendfile on, tcp_nopush on",
+  "baseline": true,
+  "baseline_note": "/plaintext and /json are fixed strings (no handler, no serialization); only the static routes are like-for-like."
+}

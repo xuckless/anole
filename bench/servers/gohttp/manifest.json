@@ -1,0 +1,17 @@
+{
+  "name": "gohttp",
+  "label": "Go net/http (go1.27.2)",
+  "modes": {
+    "h1": "net/http (go1.27.2)",
+    "h2c": "net/http (go1.27.2, http.Protocols UnencryptedHTTP2)",
+    "tls": "net/http (go1.27.2, crypto/tls, h2 + http/1.1)",
+    "h3": "quic-go v0.64.0 http3",
+    "grpc": "grpc-go v1.84.0"
+  },
+  "tls_alpn": ["h2", "http/1.1"],
+  "ws": "coder/websocket v1.8.15",
+  "ws_h2": false,
+  "grpc": "grpc-go v1.84.0",
+  "twelve": "pgx/v5 v5.11.0 pgxpool + golang-jwt/v5 v5.3.1",
+  "static": "net/http FileServer"
+}

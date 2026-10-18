@@ -1,0 +1,17 @@
+{
+  "name": "axum",
+  "label": "Axum 0.8.9 (hyper 1.12.0, tokio 1.53.3, Rust 1.99.1)",
+  "modes": {
+    "h1":   "axum::serve 0.8.9 (hyper 1.12.0 + hyper-util 0.1.21 auto; h2c on the same port)",
+    "h2c":  "axum::serve 0.8.9 (hyper 1.12.0 / h2 0.4.20, prior knowledge)",
+    "tls":  "axum-server 0.8.0 (hyper 1.12.0, rustls 0.23.46 + aws-lc-rs, ALPN h2 + http/1.1)",
+    "h3":   "h3 0.0.8 + h3-quinn 0.0.10 (quinn 0.11.12, rustls 0.23.46) serving the same Router",
+    "grpc": "tonic 0.14.6 (prost 0.14.4)"
+  },
+  "tls_alpn": ["h2", "http/1.1"],
+  "ws": "axum::extract::ws (tokio-tungstenite 0.29.0)",
+  "ws_h2": true,
+  "grpc": "tonic 0.14.6",
+  "twelve": "sqlx 0.9.0 PgPool + jsonwebtoken 11.1.0",
+  "static": "tower-http 0.7.1 ServeDir (Range/206)"
+}

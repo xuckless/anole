@@ -1,0 +1,15 @@
+{
+  "name": "fastify",
+  "label": "Fastify 5.12.7 (Node 24.22.0)",
+  "modes": {
+    "h1":  "fastify 5.12.7 on node:http (Node 24.22.0)",
+    "h2c": "fastify 5.12.7 on node:http2 (http2: true, prior knowledge)",
+    "tls": "fastify 5.12.7 on node:http2 secure server (allowHTTP1, OpenSSL)"
+  },
+  "tls_alpn": ["h2", "http/1.1"],
+  "ws": "@fastify/websocket 11.3.4 (ws 8.22.0)",
+  "ws_h2": false,
+  "grpc": "@grpc/grpc-js 1.14.6 + @grpc/proto-loader 0.8.1",
+  "twelve": "pg 8.23.1 Pool + @fastify/jwt 10.2.5 (fast-jwt 6.3.5)",
+  "static": "@fastify/static 10.1.6"
+}

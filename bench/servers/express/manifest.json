@@ -1,0 +1,13 @@
+{
+  "name": "express",
+  "label": "Express 5.3.0 (Node 24.22.0)",
+  "modes": {
+    "h1":  "express 5.3.0 on node:http (Node 24.22.0)",
+    "tls": "express 5.3.0 on node:https (Node 24.22.0, OpenSSL, http/1.1)"
+  },
+  "tls_alpn": ["http/1.1"],
+  "ws": "ws 8.22.0",
+  "ws_h2": false,
+  "twelve": "pg 8.23.1 Pool + jsonwebtoken 9.0.3",
+  "static": "express.static (serve-static 2.2.1)"
+}
