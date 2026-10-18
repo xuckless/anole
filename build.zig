@@ -127,9 +127,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const features = resolveFeatures(b);
 
-    // Declared before the lazy-dependency return below: an option first
-    // declared after it is "invalid" on a fresh cache's first pass.
+    // Options are declared before the lazy-dependency return below: one
+    // first declared after it is "invalid" on a fresh cache's first pass.
     const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
+    // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
+    // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
+    // would see none ("pcs_len was zero").
+    const use_llvm = b.option(bool, "llvm", "Build the unit tests with LLVM (needed for --fuzz on x86_64-linux)");
 
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
@@ -144,10 +148,6 @@ pub fn build(b: *std.Build) void {
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
-    // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
-    // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
-    // would see none ("pcs_len was zero").
-    const use_llvm = b.option(bool, "llvm", "Build the unit tests with LLVM (needed for --fuzz on x86_64-linux)");
     const tests = b.addTest(.{
         .name = "anole-test",
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port }),
