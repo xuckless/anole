@@ -62,42 +62,14 @@ const policy: auth.rbac.Policy = .{ .roles = &.{
     .{ .name = "editor", .grants = &.{"notes:*"}, .includes = &.{"reader"} },
 } };
 
-/// The request's roles: the session's (or the token's) one role.
-fn rolesOf(req: *http.Request) []const []const u8 {
+/// The request's roles: the session's one role. (`Roles.ptr` could carry
+/// the app, to look roles up in its state instead.)
+fn rolesOf(_: ?*anyopaque, req: *http.Request) anyerror![]const []const u8 {
     const role = req.session.get("role") orelse return &.{};
-    const roles = req.arena.alloc([]const u8, 1) catch return &.{};
+    const roles = try req.arena.alloc([]const u8, 1);
     roles[0] = role;
     return roles;
 }
-
-/// Requires a JWT bearer token signed with one of `keys` and valid under
-/// `policy`; its subject and role go into `req.session` for the handler
-/// and for `rolesOf`. (This route group has no session middleware, so
-/// nothing is stored or sent back as a cookie.)
-const RequireJwt = struct {
-    keys: []const auth.Key,
-    policy: auth.Policy,
-
-    pub fn execute(self: *const RequireJwt, req: *http.Request, res: *http.Response, executor: anytype) !void {
-        const header = req.headers.get("Authorization") orelse return unauthorized(res);
-        if (!std.ascii.startsWithIgnoreCase(header, "Bearer ")) return unauthorized(res);
-        const token = std.mem.trim(u8, header["Bearer ".len..], " ");
-        const now = std.Io.Clock.real.now(req.io).toSeconds();
-        const v = auth.verify(req.arena, token, self.keys, self.policy, now) catch |err| {
-            std.log.info("bearer token refused: {t}", .{err});
-            return unauthorized(res);
-        };
-        try req.session.set("user", v.string("sub") orelse return unauthorized(res));
-        if (v.string("role")) |role| try req.session.set("role", role);
-        return executor.next();
-    }
-
-    fn unauthorized(res: *http.Response) !void {
-        res.status = .unauthorized;
-        try res.header("WWW-Authenticate", "Bearer error=\"invalid_token\"");
-        try res.print(.text, "401 Unauthorized\n", .{});
-    }
-};
 
 const form_html =
     \\<!doctype html><title>Sign in</title>
@@ -125,7 +97,10 @@ fn login(app: *App, req: *http.Request, res: *http.Response) !void {
     }
     try req.session.set("user", user.?.name);
     try req.session.set("role", user.?.role);
-    // A new CSRF token after signing in; /me hands it out.
+    // A new session at sign-in (against session fixation: with a store, a
+    // new id; this sealed cookie is sealed afresh), and a new CSRF token,
+    // which /me hands out.
+    try anole.session.regenerate(req);
     req.session.remove(auth.csrf.session_key);
     try res.print(.text, "signed in as {s}\n", .{user.?.name});
 }
@@ -173,7 +148,9 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     var app: App = .{ .gpa = init.gpa };
-    var server = try anole.Server(App).init(init.gpa, .{ .http = .{ .port = port } }, &app);
+    // A blocking pool: password hashes run beside the executors, which
+    // go on serving other requests meanwhile.
+    var server = try anole.Server(App).init(init.gpa, .{ .http = .{ .port = port }, .blocking = .{} }, &app);
     defer server.deinit();
     const io = server.io();
 
@@ -209,8 +186,13 @@ pub fn main(init: std.process.Init) !void {
     var limiter = anole.ratelimit.MemoryLimiter.init(init.gpa, io, .{});
     defer limiter.deinit();
     var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
-    var can_write: auth.rbac.Require = .{ .policy = &policy, .permission = "notes:write", .roles = rolesOf };
-    var bearer: RequireJwt = .{ .keys = &jwt_keys, .policy = .{ .issuer = issuer, .audience = "api" } };
+    var can_write = auth.rbac.Require.init(&policy, "notes:write", .{ .roles = rolesOf });
+    // Bearer tokens: the subject and role claims go into `req.session` for
+    // the handler (this group has no session middleware, so nothing is
+    // stored or sent back as a cookie).
+    var bearer = auth.RequireJwt.init(.{ .static = &jwt_keys }, .{ .issuer = issuer, .audience = "api" }, .{
+        .claims = &.{ .{ .claim = "sub", .key = "user", .required = true }, .{ .claim = "role", .key = "role" } },
+    });
     var api_keys = auth.apikey.Middleware.init(.{ .ptr = &app, .lookup = lookupKey });
 
     const M = http.Middleware(App);

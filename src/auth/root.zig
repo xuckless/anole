@@ -18,6 +18,10 @@ pub const jwt = @import("anole_jwt");
 /// A JWK Set fetched from a URL and kept, refreshed on rotation.
 pub const Keyring = @import("keyring.zig").Keyring;
 
+/// JWT bearer tokens (RFC 6750): `RequireJwt`, a middleware.
+pub const bearer = @import("bearer.zig");
+pub const RequireJwt = bearer.RequireJwt;
+
 /// OpenID Connect sign-in (relying party): PKCE, state, nonce, ID tokens;
 /// Google and Apple presets.
 pub const oidc = @import("oidc.zig");
@@ -33,6 +37,8 @@ pub const rbac = @import("rbac.zig");
 
 test {
     _ = jws;
+    _ = @import("keyring.zig");
+    _ = bearer;
     _ = csrf;
     _ = password;
     _ = apikey;
