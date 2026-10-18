@@ -90,6 +90,9 @@ pub const Options = struct {
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
         idle_timeout_ms: u32 = 30_000,
+        /// QUIC interop runner tests only: also speak "hq-interop"
+        /// (HTTP/0.9), serving the files under this directory.
+        hq_interop_root: ?[]const u8 = null,
     };
 
     pub const Https = struct {
@@ -244,6 +247,7 @@ pub fn Server(comptime Ctx: type) type {
                         .max_streams_bidi = q.max_streams_bidi,
                         .validate_address = q.validate_address,
                         .idle_timeout_ms = q.idle_timeout_ms,
+                        .hq_interop_root = q.hq_interop_root,
                         // The same drain deadline as HTTP/1.1 and HTTP/2.
                         .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
                             @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))

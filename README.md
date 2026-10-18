@@ -51,8 +51,13 @@ and Linux (x86_64), and cross-compiles for aarch64 Linux:
 - operations: zero-downtime restart on SIGUSR2 (the new process inherits the
   listening sockets), and systemd socket activation;
 - HTTP/3 on ngtcp2 and nghttp3: the same handlers over QUIC, advertised with
-  `Alt-Svc`, with Retry, stateless reset and a GOAWAY drain, and an HTTP/3
-  client with the HTTP/2 client's API; both checked against aioquic.
+  `Alt-Svc`, with Retry, stateless reset, QUIC v2, ECN and a GOAWAY drain,
+  and an HTTP/3 client with the HTTP/2 client's API; both checked against
+  aioquic. In the QUIC interop runner the server passes all 18 cases it
+  takes against ngtcp2's client (handshake, transfer, long RTT, ChaCha20,
+  multiplexing, Retry, HTTP/3, amplification limit, blackhole, key update,
+  handshake and transfer loss and corruption, ECN, port and address
+  rebinding, v2), and the 16 of them quic-go's client runs.
 
 0-RTT, connection migration and WebTransport are still to come, as is gRPC
 JSON transcoding.

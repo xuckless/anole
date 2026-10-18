@@ -58,6 +58,8 @@ const burst = 10;
 const stateless_reset_burst = 100;
 /// Largest UDP payload read.
 const max_datagram = 65527;
+/// QUIC v2 first when the client offers both.
+const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
@@ -77,6 +79,10 @@ pub const Options = struct {
     drain_timeout_ms: u32 = 10_000,
     /// Largest request header section.
     max_field_section_size: u64 = 64 * 1024,
+    /// Also speak HTTP/0.9 over QUIC (ALPN "hq-interop"), serving the files
+    /// under this directory: what the QUIC interop runner's tests use. Only
+    /// for interop testing; it bypasses the router and every middleware.
+    hq_interop_root: ?[]const u8 = null,
 };
 
 /// One HTTP/3 listener, serving `server`'s router.
@@ -112,7 +118,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tls = try quic_tls.Context.init(options.cert_pem, options.key_pem);
+            var tls = try quic_tls.Context.init(options.cert_pem, options.key_pem, options.hq_interop_root != null);
             errdefer tls.deinit();
             const socket = try options.address.bind(io, .{ .mode = .dgram, .protocol = .udp });
             self.* = .{
@@ -351,7 +357,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             var unused: [1]u8 = undefined;
             self.io.random(&unused);
             // A reserved version (RFC 9000 §15) first, as greasing.
-            const versions = [_]u32{ (vc.version & 0xf0f0f0f0) | 0x0a0a0a0a, c.NGTCP2_PROTO_VER_V1 };
+            const versions = [_]u32{ (vc.version & 0xf0f0f0f0) | 0x0a0a0a0a, c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
             const n = c.ngtcp2_pkt_write_version_negotiation(&buf, buf.len, unused[0], vc.scid, vc.scidlen, vc.dcid, vc.dcidlen, &versions, versions.len);
             if (n > 0) self.send(to, buf[0..@intCast(n)]);
         }
@@ -428,6 +434,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             group: std.Io.Group = .init,
             tx: []u8,
             drain: enum { none, notice, final } = .none,
+            /// The connection speaks "hq-interop", not HTTP/3.
+            hq: bool = false,
+            hq_streams: std.AutoArrayHashMapUnmanaged(i64, *HqStream) = .empty,
             drain_at: u64 = 0,
 
             const State = enum { open, closing, draining, closed };
@@ -460,6 +469,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.token_type = token_type;
                 settings.rand_ctx = .{ .native_handle = conn };
                 settings.max_window = 6 * ep.options.max_data;
+                // QUIC v2 (RFC 9369) when the client offers it, through
+                // compatible version negotiation; v1 otherwise.
+                settings.preferred_versions = &preferred_versions;
+                settings.preferred_versionslen = preferred_versions.len;
                 settings.max_stream_window = 6 * ep.options.max_stream_data;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
@@ -510,6 +523,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Frees everything. Nothing may reach the connection anymore.
             fn destroy(conn: *Conn) void {
                 const gpa = conn.ep.gpa;
+                for (conn.hq_streams.values()) |hs| hs.free(gpa);
+                conn.hq_streams.deinit(gpa);
                 var it = conn.streams.valueIterator();
                 while (it.next()) |s| s.*.free();
                 conn.streams.deinit(gpa);
@@ -848,6 +863,91 @@ pub fn Endpoint(comptime Ctx: type) type {
                 bridge.consume(conn.q, stream_id, n);
             }
 
+            // -- hq-interop (HTTP/0.9), for the QUIC interop runner -------
+
+            /// A request line in; once complete, the file it names becomes
+            /// the response. Locked (inside an ngtcp2 callback).
+            fn hqRecv(conn: *Conn, flags: u32, stream_id: i64, data: []const u8) c_int {
+                const gpa = conn.ep.gpa;
+                bridge.consume(conn.q, stream_id, data.len);
+                const hs = conn.hq_streams.get(stream_id) orelse return 0;
+                if (hs.ready) return 0;
+                hs.request.appendSlice(gpa, data) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                const fin = flags & c.NGTCP2_STREAM_DATA_FLAG_FIN != 0;
+                const line_end = std.mem.indexOfScalar(u8, hs.request.items, '\n');
+                if (line_end == null and !fin) {
+                    if (hs.request.items.len > 4096) _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream_id, 0);
+                    return 0;
+                }
+                const line = std.mem.trim(u8, hs.request.items[0 .. line_end orelse hs.request.items.len], " \r\n");
+                hs.response = conn.hqLoad(line) catch |err| blk: {
+                    log.debug("hq-interop {s}: {t}", .{ line, err });
+                    break :blk &.{};
+                };
+                hs.ready = true;
+                conn.kick();
+                return 0;
+            }
+
+            /// "GET /path": the file at path under the root, or an error.
+            fn hqLoad(conn: *Conn, line: []const u8) ![]u8 {
+                const root = conn.ep.options.hq_interop_root.?;
+                if (!std.mem.startsWith(u8, line, "GET /")) return error.BadRequest;
+                const file = line["GET /".len..];
+                var parts = std.mem.splitScalar(u8, file, '/');
+                while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return error.BadPath;
+                const io = conn.ep.io;
+                var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+                defer dir.close(io);
+                return dir.readFileAlloc(io, file, conn.ep.gpa, .limited(1 << 30));
+            }
+
+            /// Like `bridge.writePacket`, with the hq streams' responses for
+            /// data. Locked (inside `flush`).
+            fn hqWritePacket(conn: *Conn, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, dest_len: usize, ts: u64) c.ngtcp2_ssize {
+                var next: usize = 0;
+                while (true) {
+                    var picked: ?*HqStream = null;
+                    var stream_id: i64 = -1;
+                    while (next < conn.hq_streams.count()) : (next += 1) {
+                        const hs = conn.hq_streams.values()[next];
+                        if (hs.ready and !hs.fin_sent) {
+                            picked = hs;
+                            stream_id = conn.hq_streams.keys()[next];
+                            break;
+                        }
+                    }
+                    var vec: [1]c.ngtcp2_vec = undefined;
+                    var datav: []const c.ngtcp2_vec = &.{};
+                    var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+                    if (picked) |hs| {
+                        const rest = hs.response[hs.sent..];
+                        vec[0] = .{ .base = @constCast(rest.ptr), .len = rest.len };
+                        datav = &vec;
+                        flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
+                    }
+                    var data_len: c.ngtcp2_ssize = -1;
+                    const n = ngtcp2.connWritevStream(conn.q, p, pi, dest[0..dest_len], &data_len, flags, stream_id, datav, ts);
+                    if (picked) |hs| if (data_len >= 0) {
+                        hs.sent += @intCast(data_len);
+                        if (hs.sent == hs.response.len) hs.fin_sent = true;
+                    };
+                    if (n < 0) switch (n) {
+                        // This one waits for credit or is gone; try the next.
+                        c.NGTCP2_ERR_STREAM_DATA_BLOCKED, c.NGTCP2_ERR_STREAM_SHUT_WR => {
+                            next += 1;
+                            continue;
+                        },
+                        c.NGTCP2_ERR_WRITE_MORE => continue,
+                        else => {
+                            c.ngtcp2_ccerr_set_liberr(&conn.last_error, @intCast(n), null, 0);
+                            return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                        },
+                    };
+                    return n;
+                }
+            }
+
             fn streamOf(conn: *Conn, stream_id: i64) ?*Stream {
                 return conn.streams.get(stream_id);
             }
@@ -862,6 +962,23 @@ pub fn Endpoint(comptime Ctx: type) type {
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
                     conn.kick();
                 };
+            }
+        };
+
+        /// An hq-interop request: its line in, then the file out.
+        const HqStream = struct {
+            request: std.ArrayList(u8) = .empty,
+            /// The file; stays until the stream closes (ngtcp2 resends
+            /// from it until the peer acknowledges).
+            response: []u8 = &.{},
+            sent: usize = 0,
+            ready: bool = false,
+            fin_sent: bool = false,
+
+            fn free(hs: *HqStream, gpa: std.mem.Allocator) void {
+                hs.request.deinit(gpa);
+                if (hs.response.len > 0) gpa.free(hs.response);
+                gpa.destroy(hs);
             }
         };
 
@@ -1394,7 +1511,9 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            return bridge.recvStreamData(conn.side(), flags, stream_id, if (len == 0) &.{} else data[0..len]);
+            const bytes: []const u8 = if (len == 0) &.{} else data[0..len];
+            if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
+            return bridge.recvStreamData(conn.side(), flags, stream_id, bytes);
         }
 
         fn onAckedStreamDataOffset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, len: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
@@ -1407,6 +1526,15 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onStreamOpen(_: ?*c.ngtcp2_conn, stream_id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (c.ngtcp2_is_bidi_stream(stream_id) == 0) return 0;
+            if (conn.hq) {
+                const hs = conn.ep.gpa.create(HqStream) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                hs.* = .{};
+                conn.hq_streams.put(conn.ep.gpa, stream_id, hs) catch {
+                    conn.ep.gpa.destroy(hs);
+                    return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                };
+                return 0;
+            }
             const s = Stream.create(conn, stream_id) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
             conn.streams.put(conn.ep.gpa, stream_id, s) catch {
                 s.free();
@@ -1419,6 +1547,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             const rv = bridge.closeStream(conn.side(), flags, stream_id, rx_code, tx_code);
             if (rv != 0) return rv;
+            if (conn.hq_streams.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 if (conn.streamOf(stream_id)) |s| {
@@ -1478,6 +1607,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onExtendMaxStreamData(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
+            // More credit: the driver writes again.
+            if (conn.hq) conn.kick();
             const hc = conn.h3 orelse return 0;
             if (h.nghttp3_conn_unblock_stream(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
@@ -1486,12 +1617,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvTxKey(_: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
             if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
             const conn = connOf(user_data);
+            if (quic_tls.isHq(conn.ssl)) {
+                conn.hq = true;
+                return 0;
+            }
             conn.setupHttp3() catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
 
         fn writePkt(_: ?*c.ngtcp2_conn, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, len: usize, ts: c.ngtcp2_tstamp, user_data: ?*anyopaque) callconv(.c) c.ngtcp2_ssize {
-            return bridge.writePacket(connOf(user_data).side(), p, pi, dest, len, ts);
+            const conn = connOf(user_data);
+            if (conn.hq) return conn.hqWritePacket(p, pi, dest, len, ts);
+            return bridge.writePacket(conn.side(), p, pi, dest, len, ts);
         }
 
         // -- nghttp3 callbacks: inside nghttp3_conn_* calls, locked.

@@ -119,6 +119,34 @@ jobs:
       - name: Server and client against aioquic
         run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
 
+  quic-interop:
+    name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: quic-interop
+      # The runner reads its traces with pyshark; it needs a current tshark
+      # (its own CI uses this PPA).
+      - name: Install tshark
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/nightly
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark
+      - name: tests/interop/run.sh
+        run: tests/interop/run.sh ngtcp2,quic-go
+        env:
+          ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
+      - name: Keep the logs of a failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quic-interop-logs
+          path: ${{ runner.temp }}/interop/logs
+          retention-days: 7
+
   fuzz:
     name: Fuzz the parsers (200K runs per target)
     runs-on: ubuntu-latest
@@ -131,7 +159,7 @@ jobs:
       # The fuzz targets are the "fuzz:" tests (src/fuzz.zig); a plain
       # `zig build test` runs them on their seeds and fixed mutations only.
       - name: zig build test --fuzz=200K
-        run: zig build test --fuzz=200K
+        run: zig build test -Dllvm=true --fuzz=200K
 
   grpc-interop:
     name: gRPC interop (both directions with grpc-go, cleartext HTTP/2)

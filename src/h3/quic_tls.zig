@@ -11,19 +11,22 @@ const log = std.log.scoped(.anole_h3);
 
 /// "h3" in ALPN wire format.
 const alpn_h3 = "\x02h3";
+/// HTTP/0.9 over QUIC, which the QUIC interop runner's tests speak.
+const alpn_hq = "\x0ahq-interop";
 
 pub const Context = struct {
     ctx: *c.SSL_CTX,
 
     /// `cert_pem`: the leaf certificate followed by any intermediates.
-    pub fn init(cert_pem: []const u8, key_pem: []const u8) !Context {
+    /// `hq_interop` also accepts ALPN "hq-interop" (after "h3").
+    pub fn init(cert_pem: []const u8, key_pem: []const u8, hq_interop: bool) !Context {
         c.ERR_clear_error();
         const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.OutOfMemory;
         errdefer c.SSL_CTX_free(ctx);
         // TLS 1.3 only, and the QUIC method, key callbacks and settings.
         if (c.ngtcp2_crypto_boringssl_configure_server_context(ctx) != 0) return error.TlsSetupFailed;
         _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
-        c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpn, null);
+        c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpn, @ptrCast(@constCast(if (hq_interop) &accept_h3_hq else &accept_h3)));
         const sid_ctx = "anole h3";
         _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
 
@@ -65,28 +68,36 @@ pub const Context = struct {
     }
 };
 
-/// Picks "h3" from the client's offer, or refuses the handshake: an
-/// HTTP/3 endpoint speaks nothing else.
+/// What a listener accepts, in its order of preference.
+const Accept = struct { protocols: []const []const u8 };
+const accept_h3: Accept = .{ .protocols = &.{alpn_h3} };
+const accept_h3_hq: Accept = .{ .protocols = &.{ alpn_h3, alpn_hq } };
+
+/// Picks the first protocol of ours (`arg`) the client offers, or refuses
+/// the handshake: an HTTP/3 endpoint speaks nothing else.
 fn selectAlpn(
     _: ?*c.SSL,
     out: [*c][*c]const u8,
     out_len: [*c]u8,
     in: [*c]const u8,
     in_len: c_uint,
-    _: ?*anyopaque,
+    arg: ?*anyopaque,
 ) callconv(.c) c_int {
-    var offer = in[0..in_len];
-    while (offer.len > 0) {
-        const n = offer[0];
-        if (1 + @as(usize, n) > offer.len) break;
-        if (std.mem.eql(u8, offer[0 .. 1 + n], alpn_h3)) {
-            out.* = offer[1..].ptr;
-            out_len.* = n;
-            return c.SSL_TLSEXT_ERR_OK;
+    const accept: *const Accept = @ptrCast(@alignCast(arg.?));
+    for (accept.protocols) |want| {
+        var offer = in[0..in_len];
+        while (offer.len > 0) {
+            const n = offer[0];
+            if (1 + @as(usize, n) > offer.len) break;
+            if (std.mem.eql(u8, offer[0 .. 1 + n], want)) {
+                out.* = offer[1..].ptr;
+                out_len.* = n;
+                return c.SSL_TLSEXT_ERR_OK;
+            }
+            offer = offer[1 + n ..];
         }
-        offer = offer[1 + n ..];
     }
-    log.debug("client offered no h3 ALPN", .{});
+    log.debug("client offered no ALPN we speak", .{});
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
@@ -151,4 +162,9 @@ pub fn negotiated(ssl: *c.SSL) []const u8 {
     var n: c_uint = 0;
     c.SSL_get0_alpn_selected(ssl, &p, &n);
     return if (n == 0) "" else p[0..n];
+}
+
+/// The connection negotiated "hq-interop" (HTTP/0.9), not "h3".
+pub fn isHq(ssl: *c.SSL) bool {
+    return std.mem.eql(u8, negotiated(ssl), alpn_hq[1..]);
 }

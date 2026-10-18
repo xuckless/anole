@@ -144,9 +144,14 @@ pub fn build(b: *std.Build) void {
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
+    // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
+    // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
+    // would see none ("pcs_len was zero").
+    const use_llvm = b.option(bool, "llvm", "Build the unit tests with LLVM (needed for --fuzz on x86_64-linux)");
     const tests = b.addTest(.{
         .name = "anole-test",
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port }),
+        .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
@@ -249,6 +254,18 @@ pub fn build(b: *std.Build) void {
         });
         b.step("h3-test-client", "Build the HTTP/3 test client (tests/h3/run.sh drives it against aioquic)").dependOn(&b.addInstallArtifact(h3_client, .{}).step);
         test_step.dependOn(&h3_client.step);
+        // The QUIC interop runner's server endpoint (tests/interop).
+        const h3_interop = b.addExecutable(.{
+            .name = "h3-interop-server",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/h3/interop.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        b.step("h3-interop-server", "Build the QUIC interop runner's server (tests/interop/build.sh)").dependOn(&b.addInstallArtifact(h3_interop, .{}).step);
+        test_step.dependOn(&h3_interop.step);
     }
 
     // examples/io: handlers that wait on timers, files and outbound requests
