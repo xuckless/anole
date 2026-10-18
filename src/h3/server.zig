@@ -774,7 +774,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.close_pkts_seen += 1;
                         if (conn.close_pkts_seen >= conn.close_next_reply and conn.close_pkt.len > 0) {
                             conn.close_next_reply *= 2;
-                            conn.ep.udp.send(conn.ep.io, remote.ip(), conn.local.ip(), 0, conn.close_pkt, conn.close_pkt.len);
+                            // Back the way the packet came: the client may
+                            // have moved since the connection began.
+                            conn.ep.udp.send(conn.ep.io, remote.ip(), local, 0, conn.close_pkt, conn.close_pkt.len);
                         }
                         return;
                     },
@@ -979,7 +981,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.enterPeriod(.closing);
                 if (n > 0) {
                     conn.close_pkt = conn.ep.gpa.dupe(u8, buf[0..@intCast(n)]) catch &.{};
-                    conn.ep.udp.send(conn.ep.io, conn.remote.ip(), conn.local.ip(), 0, buf[0..@intCast(n)], @intCast(n));
+                    // On the path in use now, which a migration may have
+                    // changed since the connection began.
+                    const to = Addr.fromNgtcp2(ps.path.remote).ip();
+                    const from = Addr.fromNgtcp2(ps.path.local).ip();
+                    conn.ep.udp.send(conn.ep.io, to, from, 0, buf[0..@intCast(n)], @intCast(n));
                 }
             }
 
@@ -1385,12 +1391,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return response.write();
                     };
                 }
-                server.applyForwardedFrom(&request, conn.remote.ip());
-                // The client is on our TLS, whatever proxies say.
-                request.secure = true;
+                // Where the client is now: a migration moves it.
                 conn.lock();
+                const peer = Addr.fromNgtcp2(c.ngtcp2_conn_get_path2(conn.q).*.remote).ip();
                 request.peer_certificate = quic_tls.peerCertificate(conn.ssl);
                 conn.unlock();
+                server.applyForwardedFrom(&request, peer);
+                // The client is on our TLS, whatever proxies say.
+                request.secure = true;
 
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
@@ -1747,6 +1755,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             cb.get_new_connection_id2 = onGetNewConnectionId;
             cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
             cb.stream_close2 = onStreamClose;
+            cb.path_validation = onPathValidation;
             break :blk cb;
         };
 
