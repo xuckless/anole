@@ -2,9 +2,11 @@
 //! (tests/h3/client.py on aioquic): downloads, uploads and echoes of any
 //! size, beside HTTP/1.1 and HTTP/2 on the same routes.
 //!
-//!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry]
+//!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry] [ADDRESS]
 //!
 //! With `retry`, every new client proves its address with a Retry first.
+//! ADDRESS (default 127.0.0.1) is where it listens, 0.0.0.0 for every
+//! interface.
 const std = @import("std");
 const anole = @import("anole");
 const http = anole.http;
@@ -65,16 +67,20 @@ pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
-    const retry = if (args.next()) |a| std.mem.eql(u8, a, "retry") else false;
+    var retry = false;
+    var address: []const u8 = "127.0.0.1";
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "retry")) retry = true else address = a;
+    }
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
-        .https = .{ .port = port, .cert = .dev_self_signed },
+        .https = .{ .address = address, .port = port, .cert = .dev_self_signed },
         .http3 = .{ .validate_address = retry },
     }, {});
     defer app.deinit();
     app.get("/download", download);
     app.post("/upload", upload);
     app.post("/echo", echo);
-    std.log.info("h3 test server on https://127.0.0.1:{d} (TCP and UDP)", .{port});
+    std.log.info("h3 test server on https://{s}:{d} (TCP and UDP)", .{ address, port });
     try app.run();
 }

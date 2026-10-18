@@ -67,6 +67,19 @@ for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with retry"
 pid=""
 echo "PASS address validation (Retry)"
+# Bound to every interface: replies must leave from the address each client
+# wrote to (PKTINFO). On Linux all of 127/8 is local, so 127.0.0.2 is a
+# second address to write to.
+start 0.0.0.0
+hosts=127.0.0.1
+[ "$(uname)" = Linux ] && hosts="127.0.0.1 127.0.0.2"
+for host in $hosts; do
+  out=$($py "https://$host:$port/download?n=1000000" --quiet | head -1)
+  [ "$out" = "status 200 bytes 1000000" ] || fail "wildcard via $host: $out"
+  echo "PASS wildcard bind, via $host"
+done
+kill -9 $pid
+pid=""
 # anole.h3's client against aioquic's server.
 "$client" cert "$work"
 "$work/venv/bin/python" -I "$here/peer_server.py" $port "$work/cert.pem" "$work/key.pem" >"$work/peer.log" 2>&1 &

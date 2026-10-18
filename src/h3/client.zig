@@ -71,7 +71,9 @@ pub const Error = error{ ConnectionClosed, StreamReset, OutOfMemory, Unexpected 
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    socket: std.Io.net.Socket,
+    udp: net.Udp,
+    /// The socket's address; every path uses it as is, so the connection
+    /// never looks migrated.
     local: Addr,
     remote: Addr,
     q: *c.ngtcp2_conn = undefined,
@@ -113,7 +115,7 @@ pub const ClientConnection = struct {
         self.* = .{
             .gpa = gpa,
             .io = io,
-            .socket = socket,
+            .udp = .init(socket),
             .local = .from(socket.address),
             .remote = .from(remote_ip),
             .tx = tx,
@@ -232,7 +234,7 @@ pub const ClientConnection = struct {
         }
         c.ngtcp2_conn_del(self.q);
         c.SSL_free(self.ssl);
-        self.socket.close(io);
+        self.udp.socket.close(io);
         self.gpa.free(self.tx);
         self.gpa.free(self.rx);
         self.gpa.destroy(self);
@@ -330,8 +332,9 @@ pub const ClientConnection = struct {
     // -- In: the reader task -------------------------------------------------
 
     fn readerLoop(self: *ClientConnection) std.Io.Cancelable!void {
+        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
         while (true) {
-            const msg = self.socket.receive(self.io, self.rx) catch |err| switch (err) {
+            var dg = self.udp.receive(self.io, self.rx, &control, .none) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => {
                     log.debug("HTTP/3 client receive: {t}", .{err});
@@ -341,17 +344,18 @@ pub const ClientConnection = struct {
                     return;
                 },
             };
-            self.onPacket(msg.from, msg.data);
+            while (dg.next()) |data| self.onPacket(dg.from, dg.ecn, data);
         }
     }
 
-    fn onPacket(self: *ClientConnection, from: std.Io.net.IpAddress, data: []u8) void {
+    fn onPacket(self: *ClientConnection, from: std.Io.net.IpAddress, ecn: u8, data: []u8) void {
         self.lock();
         defer self.unlock();
         if (self.state == .closed) return;
         var remote: Addr = .from(from);
         var p: c.ngtcp2_path = .{ .local = self.local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
-        const rv = ngtcp2.connReadPkt(self.q, &p, null, data, now(self.io));
+        const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
+        const rv = ngtcp2.connReadPkt(self.q, &p, &pi, data, now(self.io));
         if (rv != 0) {
             log.debug("HTTP/3 client read_pkt: {s}", .{c.ngtcp2_strerror(rv)});
             switch (rv) {
@@ -431,14 +435,7 @@ pub const ClientConnection = struct {
             self.unlock();
             if (n == 0) return;
             // Only this task uses `tx`.
-            const to = self.remote.ip();
-            var rest = self.tx[0..@intCast(n)];
-            const step = if (gso == 0) rest.len else gso;
-            while (rest.len > 0) {
-                const k = @min(step, rest.len);
-                self.socket.send(self.io, &to, rest[0..k]) catch |err| log.debug("HTTP/3 client send: {t}", .{err});
-                rest = rest[k..];
-            }
+            self.udp.send(self.io, self.remote.ip(), null, pi.ecn, self.tx[0..@intCast(n)], gso);
         }
     }
 
@@ -455,8 +452,7 @@ pub const ClientConnection = struct {
         var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
         const n = ngtcp2.connWriteConnectionClose(self.q, &ps.path, &pi, &buf, &self.last_error, now(self.io));
         if (n > 0) {
-            const to = self.remote.ip();
-            self.socket.send(self.io, &to, buf[0..@intCast(n)]) catch {};
+            self.udp.send(self.io, self.remote.ip(), null, 0, buf[0..@intCast(n)], @intCast(n));
         }
     }
 

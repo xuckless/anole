@@ -89,7 +89,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         io: std.Io,
         http: *HttpServer,
         options: Options,
-        socket: std.Io.net.Socket,
+        udp: net.Udp,
+        /// The local address of the datagram the endpoint task is handling
+        /// (wildcard binds only), for its stateless replies.
+        reply_from: ?std.Io.net.IpAddress = null,
         local: Addr,
         tls: quic_tls.Context,
         /// Keys stateless reset tokens and address validation tokens.
@@ -117,7 +120,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .io = io,
                 .http = http,
                 .options = options,
-                .socket = socket,
+                .udp = .init(socket),
                 .local = .from(socket.address),
                 .tls = tls,
                 .secret = undefined,
@@ -129,7 +132,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.socket.close(self.io);
+            self.udp.socket.close(self.io);
             self.conns.deinit(self.gpa);
             self.tls.deinit();
             self.gpa.destroy(self);
@@ -137,7 +140,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// The bound address (the real port when 0 was asked for).
         pub fn address(self: *const Self) std.Io.net.IpAddress {
-            return self.socket.address;
+            return self.udp.socket.address;
         }
 
         /// Serves until canceled, then drains: every connection gets a
@@ -146,20 +149,27 @@ pub fn Endpoint(comptime Ctx: type) type {
         pub fn run(self: *Self) !void {
             const buf = try self.gpa.alloc(u8, max_datagram);
             defer self.gpa.free(buf);
+            var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
             while (true) {
-                const msg = self.socket.receive(self.io, buf) catch |err| switch (err) {
+                var dg = self.udp.receive(self.io, buf, &control, .none) catch |err| switch (err) {
                     error.Canceled => break,
                     else => {
                         log.debug("receive: {t}", .{err});
                         continue;
                     },
                 };
-                self.onPacket(msg.from, msg.data);
+                self.onDatagram(&dg);
             }
-            self.shutdown(buf);
+            self.shutdown(buf, &control);
         }
 
-        fn shutdown(self: *Self, buf: []u8) void {
+        fn onDatagram(self: *Self, dg: *net.Udp.Datagram) void {
+            self.reply_from = dg.local;
+            defer self.reply_from = null;
+            while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data);
+        }
+
+        fn shutdown(self: *Self, buf: []u8, control: *align(std.Io.net.cmsg_align) net.Udp.Control) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
             self.draining = true;
@@ -177,11 +187,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const remaining = self.conns.count();
                 self.map_mutex.unlock(self.io);
                 if (remaining == 0) break;
-                const msg = self.socket.receiveTimeout(self.io, buf, .{ .duration = .{
+                var dg = self.udp.receive(self.io, buf, control, .{ .duration = .{
                     .raw = .fromMilliseconds(50),
                     .clock = .awake,
                 } }) catch continue;
-                self.onPacket(msg.from, msg.data);
+                self.onDatagram(&dg);
             }
             // Whatever is left is closed now.
             const left = self.liveConns();
@@ -227,13 +237,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = self.conns.remove(key);
         }
 
+        /// A stateless reply from the endpoint task.
         fn send(self: *Self, to: std.Io.net.IpAddress, data: []const u8) void {
-            self.socket.send(self.io, &to, data) catch |err| log.debug("send: {t}", .{err});
+            self.udp.send(self.io, to, self.reply_from, 0, data, data.len);
         }
 
         // -- Packets in ------------------------------------------------------
 
-        fn onPacket(self: *Self, from: std.Io.net.IpAddress, data: []u8) void {
+        fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
             var vc: c.ngtcp2_version_cid = undefined;
             switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, scid_len)) {
                 0 => {},
@@ -246,14 +257,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             const remote: Addr = .from(from);
             if (self.lookup(.of(vc.dcid[0..vc.dcidlen]))) |conn| {
                 defer conn.unref();
-                conn.onPacket(remote, data);
+                conn.onPacket(remote, local, ecn, data);
                 return;
             }
             if (self.draining) return;
-            self.accept(remote, data, &vc);
+            self.accept(remote, local, ecn, data, &vc);
         }
 
-        fn accept(self: *Self, remote_in: Addr, data: []u8, vc: *const c.ngtcp2_version_cid) void {
+        fn accept(self: *Self, remote_in: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, vc: *const c.ngtcp2_version_cid) void {
             var remote = remote_in;
             var hd: c.ngtcp2_pkt_hd = undefined;
             if (c.ngtcp2_accept(&hd, data.ptr, data.len) != 0) {
@@ -302,14 +313,15 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
-            const conn = Conn.create(self, remote, &hd, pocid, token_type) catch |err| {
+            const conn = Conn.create(self, remote, local, &hd, pocid, token_type) catch |err| {
                 log.debug("new connection: {t}", .{err});
                 return;
             };
             // From here the connection is reached through the map; the
             // driver holds the first reference.
             conn.lock();
-            const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), null, data, now(self.io));
+            const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
+            const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), &pi, data, now(self.io));
             if (rv != 0) {
                 conn.unlock();
                 if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, data.len * 3);
@@ -420,7 +432,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             const State = enum { open, closing, draining, closed };
 
-            fn create(ep: *Self, remote: Addr, hd: *const c.ngtcp2_pkt_hd, ocid: ?*const c.ngtcp2_cid, token_type: c.ngtcp2_token_type) !*Conn {
+            fn create(ep: *Self, remote: Addr, local: ?std.Io.net.IpAddress, hd: *const c.ngtcp2_pkt_hd, ocid: ?*const c.ngtcp2_cid, token_type: c.ngtcp2_token_type) !*Conn {
                 const gpa = ep.gpa;
                 const conn = try gpa.create(Conn);
                 errdefer gpa.destroy(conn);
@@ -432,7 +444,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .ssl = undefined,
                     .conn_ref = .{ .get_conn = getConn, .user_data = conn },
                     .scid = undefined,
-                    .local = ep.local,
+                    .local = if (local) |l| .from(l) else ep.local,
                     .remote = remote,
                     .tx = tx,
                 };
@@ -556,7 +568,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // -- In: a packet from the endpoint task --------------------
 
-            fn onPacket(conn: *Conn, remote: Addr, data: []u8) void {
+            fn onPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
                 conn.lock();
                 defer conn.unlock();
                 switch (conn.state) {
@@ -567,15 +579,17 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.close_pkts_seen += 1;
                         if (conn.close_pkts_seen >= conn.close_next_reply and conn.close_pkt.len > 0) {
                             conn.close_next_reply *= 2;
-                            conn.ep.send(remote.ip(), conn.close_pkt);
+                            conn.ep.udp.send(conn.ep.io, remote.ip(), conn.local.ip(), 0, conn.close_pkt, conn.close_pkt.len);
                         }
                         return;
                     },
                     .draining, .closed => return,
                 }
                 var r = remote;
-                var p: c.ngtcp2_path = .{ .local = conn.local.ngtcp2Addr(), .remote = r.ngtcp2Addr(), .user_data = null };
-                const rv = ngtcp2.connReadPkt(conn.q, &p, null, data, now(conn.ep.io));
+                var l: Addr = if (local) |a| .from(a) else conn.local;
+                var p: c.ngtcp2_path = .{ .local = l.ngtcp2Addr(), .remote = r.ngtcp2Addr(), .user_data = null };
+                const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
+                const rv = ngtcp2.connReadPkt(conn.q, &p, &pi, data, now(conn.ep.io));
                 if (rv != 0) {
                     switch (rv) {
                         c.NGTCP2_ERR_DRAINING => {
@@ -671,13 +685,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unlock();
                     if (n == 0) return;
                     const to = Addr.fromNgtcp2(ps.path.remote).ip();
-                    var rest = conn.tx[0..@intCast(n)];
-                    const step = if (gso == 0) rest.len else gso;
-                    while (rest.len > 0) {
-                        const k = @min(step, rest.len);
-                        ep.send(to, rest[0..k]);
-                        rest = rest[k..];
-                    }
+                    const from = Addr.fromNgtcp2(ps.path.local).ip();
+                    ep.udp.send(ep.io, to, from, pi.ecn, conn.tx[0..@intCast(n)], gso);
                 }
             }
 
@@ -763,7 +772,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.enterPeriod(.closing);
                 if (n > 0) {
                     conn.close_pkt = conn.ep.gpa.dupe(u8, buf[0..@intCast(n)]) catch &.{};
-                    conn.ep.send(conn.remote.ip(), buf[0..@intCast(n)]);
+                    conn.ep.udp.send(conn.ep.io, conn.remote.ip(), conn.local.ip(), 0, buf[0..@intCast(n)], @intCast(n));
                 }
             }
 

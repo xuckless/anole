@@ -176,5 +176,6 @@ fn layoutTest() !void {
 
 test {
     _ = @import("bridge.zig");
+    _ = @import("net.zig");
     _ = @import("client_test.zig");
 }
