@@ -7,10 +7,14 @@
     "tls": "anole (BoringSSL, ALPN h2 + http/1.1)",
     "h3": "anole (ngtcp2 + nghttp3, BoringSSL)"
   },
-  "tls_alpn": ["h2", "http/1.1"],
+  "tls_alpn": [
+    "h2",
+    "http/1.1"
+  ],
   "ws": "anole.websocket (RFC 6455)",
   "ws_h2": true,
   "grpc": "anole gRPC (tests/grpc/interop server)",
   "twelve": "bench-local Postgres wire client (src/pg.zig) + anole.auth.verify",
-  "static": "app.staticDir (sendfile on cleartext, Range/If-Range)"
+  "static": "app.staticDir (sendfile on cleartext, Range/If-Range)",
+  "webtransport": "anole (draft-02, ngtcp2 + nghttp3)"
 }

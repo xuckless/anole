@@ -15,6 +15,9 @@ RUN --mount=type=cache,target=/root/go/pkg/mod go mod download
 COPY bench/tools/ ./
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -o /out/benchctl ./cmd/benchctl
+# wtload: its own module (it pins the last draft-02 webtransport-go).
+RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    cd wtload && CGO_ENABLED=0 go build -o /out/wtload .
 
 FROM fedora:44
 RUN dnf -q install -y nghttp2 curl jq openssl procps-ng iproute bash findutils ffmpeg-free \
@@ -32,6 +35,6 @@ RUN curl -fsSL -o /usr/local/bin/oha https://github.com/hatoo/oha/releases/downl
  && curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-$DOCKER.tgz \
     | tar -xz -C /usr/local/bin --strip-components=1 docker/docker
 COPY --from=wrk /usr/local/bin/wrk /usr/local/bin/wrk
-COPY --from=tools /out/benchctl /usr/local/bin/benchctl
+COPY --from=tools /out/benchctl /out/wtload /usr/local/bin/
 WORKDIR /bench
 ENTRYPOINT ["benchctl"]

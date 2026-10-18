@@ -1,0 +1,12 @@
+{
+  "name": "axum-wt",
+  "label": "wtransport 0.7.2 (quinn 0.11.12, tokio 1.53.3, Rust 1.99.1)",
+  "modes": {
+    "h3": "wtransport 0.7.2 (draft-02) on quinn 0.11.12 (rustls 0.23.46 + ring)"
+  },
+  "webtransport": "wtransport 0.7.2 (draft-02) on quinn 0.11.12 (rustls 0.23.46 + ring)",
+  "scenarios": [
+    "wt"
+  ],
+  "ready": "wt"
+}

@@ -68,8 +68,8 @@ func cpusetSize(set string) int {
 	return n
 }
 
-var allServers = "anole,fiber,gohttp,axum,express,fastify,fastapi,nginx"
-var allScenarios = []string{"raw", "conns", "latency", "twelve", "ws", "mem", "gc", "video"}
+var allServers = "anole,fiber,gohttp,axum,express,fastify,fastapi,nginx,gohttp-wt,axum-wt,fastify-wt,fastapi-wt"
+var allScenarios = []string{"raw", "conns", "latency", "twelve", "ws", "mem", "gc", "video", "wt"}
 
 func runSuite(args []string) {
 	fs := flag.NewFlagSet("suite", flag.ExitOnError)
@@ -98,7 +98,7 @@ func runSuite(args []string) {
 			log.Fatalf("unknown tier %s", t)
 		}
 	}
-	cfg := sut.Config{HostBenchDir: env("BENCH_HOST_DIR", ""), CgroupRoot: env("HOST_CGROUP", "/host/cgroup")}
+	cfg := sut.Config{HostBenchDir: env("BENCH_HOST_DIR", ""), CgroupRoot: env("HOST_CGROUP", "/host/cgroup"), BenchDir: "/bench"}
 	if cfg.HostBenchDir == "" {
 		log.Fatal("BENCH_HOST_DIR is not set (run through bench/suite.sh)")
 	}
@@ -111,9 +111,11 @@ func runSuite(args []string) {
 		s.LoadPrior(strings.Split(*prior, ","))
 	}
 	start := time.Now()
+	all := s.Servers
 	for _, sc := range strings.Split(*only, ",") {
 		t0 := time.Now()
 		log.Printf("== %s", sc)
+		s.Servers = s.ServersIn(all, sc)
 		switch sc {
 		case "raw":
 			s.Raw()
@@ -131,6 +133,8 @@ func runSuite(args []string) {
 			s.Video()
 		case "twelve":
 			s.Twelve(env("PG_CPUS_TWELVE", "16-27"), env("PG_CPUS", "16-19"))
+		case "wt":
+			s.WebTransport()
 		default:
 			log.Printf("unknown scenario %s (skipped)", sc)
 		}

@@ -123,6 +123,32 @@ SELECT (SELECT count(*) FROM p) AS found, (SELECT count(*) FROM ins) AS inserted
 
 `grpc.testing.TestService/UnaryCall` from `tests/grpc/proto/grpc/testing/test.proto`: answer with a payload of `response_size` zero bytes (the interop semantics). The language's standard gRPC library: grpc-go, tonic, @grpc/grpc-js, grpcio (`grpc.aio`). Anole uses its interop server.
 
+## WebTransport (`MODE=h3`)
+
+WebTransport over HTTP/3, **draft-02** (draft-ietf-webtrans-http3-02), the
+version Chrome, Edge and Firefox speak: extended CONNECT with `:protocol
+webtransport`, `SETTINGS_ENABLE_WEBTRANSPORT` (0x2b603742), HTTP datagrams
+(RFC 9297, quarter stream ID) and the `max_datagram_frame_size` transport
+parameter. A server that serves it does so in `MODE=h3`, on UDP
+`HTTPS_PORT`, at `/wt/echo`:
+
+- Each bidirectional stream the client opens gets every byte echoed back on
+  the same stream, and the server ends its send side (FIN) once the
+  client's send side has ended.
+- Each datagram is sent back unchanged on the same session.
+- The QUIC idle timeout is at least 75 s (`wtload -mode idle -d 80s` checks it).
+- A CONNECT to any other path gets 404. Unidirectional streams are not used.
+
+The load client is `bench/tools/wtload` (its own Go module: it pins the
+last draft-02 webtransport-go). Stacks without WebTransport in their own
+HTTP/3 have a `<name>-wt` server beside the main one: `gohttp-wt`
+(webtransport-go), `axum-wt` (wtransport), `fastify-wt`
+(@fails-components/webtransport) and `fastapi-wt` (aioquic). These serve
+`/wt/echo` and, where the library allows it, `GET /plaintext` over the same
+HTTP/3 endpoint; `axum-wt` and `fastify-wt` cannot (their libraries answer
+only WebTransport CONNECTs), so `wtload -mode sessions -n 1`, which exits
+non-zero when no session opens, is their readiness probe.
+
 ## Smoke check
 
 `bench/suite.sh --only smoke --servers <name>` checks each route, each declared mode and the $12 golden tests. A server is benchmarked only after it passes.

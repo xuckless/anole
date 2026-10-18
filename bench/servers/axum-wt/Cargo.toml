@@ -1,0 +1,10 @@
+[package]
+name = "axum-wt-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# WebTransport draft-02 (SETTINGS_ENABLE_WEBTRANSPORT 0x2b603742, :protocol webtransport) on quinn.
+wtransport = "0.7.2"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "io-util"] }

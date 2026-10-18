@@ -1,0 +1,11 @@
+{
+  "name": "gohttp-wt",
+  "label": "webtransport-go v0.10.0 (quic-go v0.59.0, go1.27.2)",
+  "modes": {
+    "h3": "webtransport-go v0.10.0 (draft-02) on quic-go v0.59.0"
+  },
+  "webtransport": "webtransport-go v0.10.0 (draft-02) on quic-go v0.59.0",
+  "scenarios": [
+    "wt"
+  ]
+}

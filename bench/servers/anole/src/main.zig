@@ -216,7 +216,8 @@ pub fn main(init: std.process.Init) !void {
             .tls, .h3 => .{ .address = "0.0.0.0", .port = https_port, .cert = cert },
             else => null,
         },
-        .http3 = if (mode == .h3) .{} else null,
+        // QUIC's idle timeout to the benchmark's 75 s keep-alive floor.
+        .http3 = if (mode == .h3) .{ .idle_timeout_ms = 120_000 } else null,
         .server = .{
             // Video streams and sockets outlive the 30 s default; the
             // challenge wants idle keep-alive kept 65 s or more; the
@@ -239,6 +240,7 @@ pub fn main(init: std.process.Init) !void {
     app.wsWith("/ws/echo", wsEcho, .{ .max_message_size = 1 << 20 });
     app.ws("/ws/feed", wsFeed);
     app.ws("/ws/trade", wsTrade);
+    if (mode == .h3) app.webtransport("/wt/echo", wtEcho);
 
     const database_url = env("DATABASE_URL", "");
     if (database_url.len > 0) {
@@ -251,4 +253,39 @@ pub fn main(init: std.process.Init) !void {
     defer if (tick) |*t| t.cancel(app.io());
 
     try app.run();
+}
+
+const wt = anole.webtransport;
+
+/// /wt/echo (SPEC.md): every bidirectional stream back on itself, every
+/// datagram back unchanged.
+fn wtEcho(session: *wt.Session, req: *anole.Request) !void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(req.io);
+    try group.concurrent(req.io, wtStreams, .{ session, req.io });
+    try group.concurrent(req.io, wtDatagrams, .{session});
+    group.await(req.io) catch {};
+}
+
+fn wtStreams(session: *wt.Session, io: std.Io) std.Io.Cancelable!void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    while (true) {
+        const stream = session.acceptStream() catch return;
+        group.concurrent(io, wtStream, .{stream}) catch stream.release();
+    }
+}
+
+fn wtStream(stream: *wt.Stream) std.Io.Cancelable!void {
+    defer stream.release();
+    _ = stream.reader().streamRemaining(stream.writer()) catch return;
+    stream.closeSend() catch {};
+}
+
+fn wtDatagrams(session: *wt.Session) std.Io.Cancelable!void {
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const d = session.receiveDatagram(&buf) catch return;
+        session.sendDatagram(d) catch return;
+    }
 }

@@ -1,0 +1,9 @@
+github.com/quic-go/webtransport-go v0.10.0 (tag v0.10.0, commit 9d448b125754f4c83064afb2c586221214e55eec),
+the last release that speaks WebTransport draft-02, with its tests and interop/ removed.
+
+One change, in client.go (Dialer.Dial): the client's SETTINGS carry
+SETTINGS_ENABLE_WEBTRANSPORT (0x2b603742) = 1. draft-02 section 3.1 has both
+endpoints send it, Chrome does, and Chromium's QUICHE server (which
+@fails-components/webtransport wraps) only treats an extended CONNECT as
+WebTransport when the client sent it; without it QUICHE answers 404.
+Upstream's client never sent it in any draft-02 release (v0.1.0-v0.10.0).

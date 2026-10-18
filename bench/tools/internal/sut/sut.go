@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,19 @@ type Manifest struct {
 	GRPC    string            `json:"grpc"`
 	Twelve  string            `json:"twelve"`
 	Static  string            `json:"static"`
+	// WebTransport (draft-02) at /wt/echo in MODE=h3, and with what.
+	WebTransport string `json:"webtransport"`
+	// Ready is how to tell the server is up when it is not by GET
+	// /plaintext: "wt" opens one WebTransport session.
+	Ready string `json:"ready"`
+	// Scenarios, when set, are the only scenarios the server takes part in
+	// (the <name>-wt servers serve WebTransport and nothing else).
+	Scenarios []string `json:"scenarios"`
+}
+
+// In reports whether the server takes part in scenario sc.
+func (m Manifest) In(sc string) bool {
+	return len(m.Scenarios) == 0 || slices.Contains(m.Scenarios, sc)
 }
 
 // Image is the Docker image for a server name: "anole" is anole-bench/anole,
@@ -74,12 +88,15 @@ type Config struct {
 	HostBenchDir string
 	// CgroupRoot is the host's /sys/fs/cgroup as mounted here.
 	CgroupRoot string
+	// BenchDir is bench/ here, for the servers' manifests.
+	BenchDir string
 }
 
 // Server is a running server container.
 type Server struct {
 	Name   string
 	Mode   string
+	ready  string
 	Tier   Tier
 	ID     string
 	cgroup string
@@ -110,7 +127,8 @@ func Start(cfg Config, name, mode string, tier Tier, env map[string]string, memM
 	if err != nil {
 		return nil, fmt.Errorf("docker run %s: %v: %s", name, err, out)
 	}
-	s := &Server{Name: name, Mode: mode, Tier: tier, ID: strings.TrimSpace(string(out))}
+	m, _ := LoadManifest(cfg.BenchDir, name)
+	s := &Server{Name: name, Mode: mode, ready: m.Ready, Tier: tier, ID: strings.TrimSpace(string(out))}
 	s.cgroup = filepath.Join(cfg.CgroupRoot, "system.slice", "docker-"+s.ID+".scope")
 	if err := s.waitReady(60 * time.Second); err != nil {
 		logs, _ := exec.Command("docker", "logs", "--tail", "30", containerName).CombinedOutput()
@@ -153,7 +171,7 @@ func (s *Server) waitReady(limit time.Duration) error {
 		if exited, why := s.Exited(); exited {
 			return fmt.Errorf("container %s", why)
 		}
-		last = probe(s.Mode)
+		last = probe(s.Mode, s.ready)
 		if last == nil {
 			return nil
 		}
@@ -172,7 +190,12 @@ func URL(mode string) string {
 	}
 }
 
-func probe(mode string) error {
+func probe(mode, ready string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if ready == "wt" {
+		return exec.CommandContext(ctx, "wtload", "-url", URL(mode)+"/wt/echo", "-mode", "sessions", "-n", "1", "-c", "1", "-timeout", "2s").Run()
+	}
 	var args []string
 	switch mode {
 	case "grpc":
@@ -188,8 +211,6 @@ func probe(mode string) error {
 	case "h3":
 		args = []string{"-k", "--http3-only"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 	args = append(args, "-sf", "-o", "/dev/null", URL(mode)+"/plaintext")
 	return exec.CommandContext(ctx, "curl", args...).Run()
 }

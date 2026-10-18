@@ -13,7 +13,7 @@ import (
 	"github.com/xuckless/anole/bench/tools/internal/suite"
 )
 
-var serverOrder = []string{"anole", "fiber", "gohttp", "axum", "express", "fastify", "fastapi", "nginx"}
+var serverOrder = []string{"anole", "fiber", "gohttp", "axum", "express", "fastify", "fastapi", "nginx", "gohttp-wt", "axum-wt", "fastify-wt", "fastapi-wt"}
 var protoOrder = []string{"h1", "h1-tls", "h2c", "h2-tls", "h3"}
 
 func rank(order []string, s string) int {
@@ -149,6 +149,8 @@ func Write(dir string) error {
 		"The 60 s 4K60 AV1 clip (about 21 Mbit/s, 160 MB) (bench/media/gen.sh). Unpaced: 64 concurrent whole-file downloads (HTTP/1.1, wrk) or 16 connections × 4 streams (HTTP/2, HTTP/3, h2load); throughput in the notes. Paced: viewers that play in real time, keep 30 s buffered and start after 2 s; progressive MP4 through 2 MB Range requests, or HLS 4 s segments. Stalls, startup time and memory per stream in the notes. Cleartext HTTP/1.1 can use sendfile; TLS, HTTP/2 and HTTP/3 encrypt in user space for every server.")
 	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "gc" }), "Garbage-collection pressure",
 		"1,000,000 retained objects (RETAIN) that a collector keeps tracing, and /gc/alloc building and serializing 2,000 objects per request. Closed loop for the maximum, then a fixed rate at half of it (oha, latency-corrected) for the tail.")
+	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "wt" }), "WebTransport (draft-02)",
+		"wtload (webtransport-go v0.10.0, the last draft-02 release) against /wt/echo. Sessions: QUIC handshake plus extended CONNECT, 64 at a time; the latency columns are the handshake. Streams: 16 sessions with 4 bidirectional streams each in flight, 16 KiB echoed per stream; rate is streams/s. Datagrams: 64 sessions each sending 1000 64-byte datagrams/s, echoed back; rate is received/s, loss in the notes. Anole serves it from its own HTTP/3; Go from webtransport-go, Rust from wtransport, Node from @fails-components/webtransport (Chromium's QUICHE), Python from aioquic.")
 	if len(d.notes) > 0 {
 		d.WriteString("## Notes\n\n")
 		for i, n := range d.notes {

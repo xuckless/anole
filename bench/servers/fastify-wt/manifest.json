@@ -1,0 +1,12 @@
+{
+  "name": "fastify-wt",
+  "label": "@fails-components/webtransport 1.6.8 (Chromium QUICHE, Node 24.22.0)",
+  "modes": {
+    "h3": "@fails-components/webtransport 1.6.8 Http3Server (draft-02) on Chromium's QUICHE (webtransport-transport-http3-quiche 1.6.8)"
+  },
+  "webtransport": "@fails-components/webtransport 1.6.8 Http3Server (draft-02) on Chromium's QUICHE (webtransport-transport-http3-quiche 1.6.8)",
+  "scenarios": [
+    "wt"
+  ],
+  "ready": "wt"
+}

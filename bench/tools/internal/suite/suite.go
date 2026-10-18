@@ -96,6 +96,17 @@ func New(cfg sut.Config, benchDir, out string, p Profile, servers []string, tier
 
 func (s *Suite) Close() { s.f.Close() }
 
+// ServersIn is the servers of all that take part in scenario sc.
+func (s *Suite) ServersIn(all []string, sc string) []string {
+	var in []string
+	for _, name := range all {
+		if s.manifests[name].In(sc) {
+			in = append(in, name)
+		}
+	}
+	return in
+}
+
 func (s *Suite) record(c Case) {
 	c.At = time.Now().UTC()
 	if c.Label == "" {

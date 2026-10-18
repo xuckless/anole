@@ -1,0 +1,11 @@
+{
+  "name": "fastapi-wt",
+  "label": "aioquic 1.7.0 WebTransport (uvloop 0.23.0, Python 3.13.16)",
+  "modes": {
+    "h3": "aioquic 1.7.0 H3Connection(enable_webtransport=True) (draft-02), uvloop 0.23.0"
+  },
+  "webtransport": "aioquic 1.7.0 H3Connection(enable_webtransport=True) (draft-02), uvloop 0.23.0",
+  "scenarios": [
+    "wt"
+  ]
+}
