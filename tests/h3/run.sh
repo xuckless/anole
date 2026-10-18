@@ -2,7 +2,7 @@
 # Anole's HTTP/3 server against aioquic's client (an independent QUIC and
 # HTTP/3 stack): downloads, uploads with checksums, echoes, many streams at
 # once, a drain that lets a download in flight finish, Retry, resumption and
-# 0-RTT. Then
+# 0-RTT, WebTransport and WebSocket over HTTP/3. Then
 # anole.h3's client against aioquic's server.
 #   tests/h3/run.sh [path-to-h3-test-server] [path-to-h3-test-client]
 # Needs python3; aioquic is installed into a throwaway venv.
@@ -100,6 +100,26 @@ kill -TERM $pid
 for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with 0-RTT"
 pid=""
+# WebTransport (draft-02) and WebSocket over HTTP/3 (RFC 9220) on aioquic's
+# client: streams both ways, datagrams, a close from either side, and the
+# drain (DRAIN_WEBTRANSPORT_SESSION then a close; WebSocket 1001).
+start
+xc="$work/venv/bin/python -I $here/extended_connect.py"
+for mode in wt wt-close ws; do
+  $xc $mode $port >"$work/xc" 2>&1 || { cat "$work/xc"; fail "extended CONNECT $mode"; }
+  sed 's/^/  /' "$work/xc"
+done
+$xc wt-hold $port >"$work/wt-hold" 2>&1 &
+$xc ws-hold $port >"$work/ws-hold" 2>&1 &
+sleep 1
+kill -TERM $pid
+for i in $(seq 1 100); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
+wait
+grep -qx "capsules 0x78ae 0x2843:00000000'server shutting down'" "$work/wt-hold" || fail "WebTransport drain: $(cat "$work/wt-hold")"
+grep -qx "close 1001 server shutting down" "$work/ws-hold" || fail "WebSocket drain: $(cat "$work/ws-hold")"
+grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with WebTransport"
+pid=""
+echo "PASS drain: WebTransport DRAIN and CLOSE capsules, WebSocket 1001"
 # Bound to every interface: replies must leave from the address each client
 # wrote to (PKTINFO). On Linux all of 127/8 is local, so 127.0.0.2 is a
 # second address to write to.
@@ -147,6 +167,17 @@ resumed 0 early none
 status 200 bytes 10000 sum $want
 resumed 1 early accepted" ] || pfail "client 0-RTT: $out"
 echo "PASS client resumption and 0-RTT"
+out=$("$client" wt $port "$ca" /wt) || pfail "client WebTransport: $out"
+[ "$out" = "session open
+bidirectional ok 300000
+unidirectional one way
+datagram d1
+datagram datagram two
+closed by peer 7 asked to
+second session closed" ] || pfail "client WebTransport: $out"
+sleep 0.2
+grep -qx "wt closed 4242 client done" "$work/peer.log" || pfail "client WebTransport close not seen by the server"
+echo "PASS client WebTransport: streams, datagrams, a close from either side"
 kill $peer
 peer=""
 

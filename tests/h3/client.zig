@@ -7,6 +7,10 @@
 //!   h3-test-client many PORT CA PATH N       N GETs at once, one connection
 //!   h3-test-client zerortt PORT CA PATH      a GET, then a GET in 0-RTT on a
 //!                                            second connection that resumes
+//!   h3-test-client wt PORT CA PATH           a WebTransport session at PATH
+//!                                            that echoes (peer_server.py's
+//!                                            /wt): a line per check, then a
+//!                                            second session the client closes
 //!
 //! A response prints as "status S bytes N sum X" (X: the byte sum, mod
 //! 2^32), then "trailer NAME VALUE" for each trailer; `zerortt` adds
@@ -80,8 +84,11 @@ pub fn main(init: std.process.Init) !void {
         .address = .{ .ip4 = .loopback(port) },
         .port = port,
         .tls = .{ .ca = .{ .pem = ca_pem } },
+        .webtransport = std.mem.eql(u8, cmd, "wt"),
     });
     defer conn.close();
+
+    if (std.mem.eql(u8, cmd, "wt")) return webTransport(gpa, conn, path, w);
 
     if (std.mem.eql(u8, cmd, "get")) {
         try fetch(gpa, io, conn, "GET", path, null, w);
@@ -138,4 +145,52 @@ fn fetch(gpa: std.mem.Allocator, io: std.Io, conn: *h3.ClientConnection, method:
 fn send(s: *h3.Stream, body: []const u8) anyerror!void {
     try s.writer().writeAll(body);
     try s.closeSend();
+}
+
+fn webTransport(gpa: std.mem.Allocator, conn: *h3.ClientConnection, path: []const u8, w: *std.Io.Writer) !void {
+    {
+        const session = try conn.openWebTransport(.{ .authority = "localhost", .path = path });
+        defer session.deinit();
+        try w.print("session open\n", .{});
+        // Bidirectional: what goes out comes back on the same stream.
+        const body = try gpa.alloc(u8, 300_000);
+        defer gpa.free(body);
+        for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
+        {
+            const s = try session.openStream();
+            defer s.release();
+            try s.writer().writeAll(body);
+            try s.closeSend();
+            const back = try s.reader().allocRemaining(gpa, .unlimited);
+            defer gpa.free(back);
+            try w.print("bidirectional {s} {d}\n", .{ if (std.mem.eql(u8, back, body)) "ok" else "MISMATCH", back.len });
+        }
+        // Unidirectional: back on one the server opens.
+        {
+            const s = try session.openUniStream();
+            try s.writer().writeAll("one way");
+            try s.closeSend();
+            s.release();
+            const in = try session.acceptUniStream();
+            defer in.release();
+            const back = try in.reader().allocRemaining(gpa, .unlimited);
+            defer gpa.free(back);
+            try w.print("unidirectional {s}\n", .{back});
+        }
+        var buf: [2048]u8 = undefined;
+        for ([_][]const u8{ "d1", "datagram two" }) |d| {
+            try session.sendDatagram(d);
+            try w.print("datagram {s}\n", .{try session.receiveDatagram(&buf)});
+        }
+        // The server closes on request: every wait ends, with its code.
+        try session.sendDatagram("close");
+        _ = session.acceptStream() catch {};
+        const info = session.closeInfo().?;
+        try w.print("closed by {t} {d} {s}\n", .{ info.by, info.code, info.reason });
+    }
+    // A second session on the same connection, which the client closes.
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = path });
+    defer session.deinit();
+    try session.close(4242, "client done");
+    try w.print("second session closed\n", .{});
 }

@@ -1,6 +1,7 @@
 //! A server for checking HTTP/3 with an independent client
 //! (tests/h3/client.py on aioquic): downloads, uploads and echoes of any
-//! size, beside HTTP/1.1 and HTTP/2 on the same routes.
+//! size, beside HTTP/1.1 and HTTP/2 on the same routes; WebSocket over
+//! HTTP/3 (RFC 9220) at /ws and WebTransport at /wt, echoing.
 //!
 //!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry] [early] [drain=MS] [ADDRESS]
 //!
@@ -76,6 +77,63 @@ fn echo(req: *http.Request, res: *http.Response) !void {
     try out.end();
 }
 
+/// WebSocket at /ws (RFC 9220 over HTTP/3): each message back.
+fn wsEcho(ws: *anole.websocket.Socket) !void {
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+}
+
+const wt = anole.webtransport;
+
+/// WebTransport at /wt: each bidirectional stream back on itself, each
+/// unidirectional stream back on one the server opens, each datagram back.
+/// A datagram "close" closes the session with code 7 and "asked to".
+fn wtEcho(session: *wt.Session, req: *http.Request) !void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(req.io);
+    try group.concurrent(req.io, wtBidi, .{ session, req.io });
+    try group.concurrent(req.io, wtUni, .{session});
+    try group.concurrent(req.io, wtDatagrams, .{session});
+    group.await(req.io) catch {};
+}
+
+fn wtBidi(session: *wt.Session, io: std.Io) std.Io.Cancelable!void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    while (true) {
+        const stream = session.acceptStream() catch return;
+        group.concurrent(io, wtStream, .{stream}) catch stream.release();
+    }
+}
+
+fn wtStream(stream: *wt.Stream) std.Io.Cancelable!void {
+    defer stream.release();
+    _ = stream.reader().streamRemaining(stream.writer()) catch return;
+    stream.closeSend() catch {};
+}
+
+fn wtUni(session: *wt.Session) std.Io.Cancelable!void {
+    while (true) {
+        const in = session.acceptUniStream() catch return;
+        defer in.release();
+        const out = session.openUniStream() catch return;
+        defer out.release();
+        _ = in.reader().streamRemaining(out.writer()) catch return;
+        out.closeSend() catch return;
+    }
+}
+
+fn wtDatagrams(session: *wt.Session) std.Io.Cancelable!void {
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        const d = session.receiveDatagram(&buf) catch return;
+        if (std.mem.eql(u8, d, "close")) {
+            session.close(7, "asked to") catch {};
+            return;
+        }
+        session.sendDatagram(d) catch return;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8443;
     var args = init.minimal.args.iterate();
@@ -107,6 +165,8 @@ pub fn main(init: std.process.Init) !void {
     app.post("/echo", echo);
     app.get("/early", early);
     app.post("/early", early);
+    app.ws("/ws", wsEcho);
+    app.webtransport("/wt", wtEcho);
     std.log.info("h3 test server on https://{s}:{d} (TCP and UDP)", .{ address, port });
     try app.run();
 }
