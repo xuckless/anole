@@ -295,6 +295,7 @@ With a zio runtime of your own, start a pool on it with
 | `use(middleware)` | Adds a global middleware (copied, owned by the server; a function works too), before any route. |
 | `get`, `head`, `post`, `put`, `patch`, `delete`, `options`, `query`, `any` | Register a route (`query` is the HTTP QUERY method). |
 | `ws(path, handler)` | A WebSocket endpoint; see [websocket.md](websocket.md#an-endpoint-in-one-line). |
+| `webtransport(path, handler)` | A WebTransport endpoint (HTTP/3); see [webtransport.md](webtransport.md#an-endpoint-in-one-line). |
 | `static(prefix, dir, options)`, `staticDir(prefix, path, options)`, `embedded(path, data, options)` | Serve a directory (one you opened, or one the server opens), or one file compiled in. |
 | `group(prefix, .{ middleware, ... })`, `with(.{ middleware, ... })` | A route group, or middleware for some routes; see [routing.md](routing.md#groups). |
 | `grpc(pb.Service, handlers)`, `grpcHealth()` | A gRPC service, and the health service; see [grpc.md](grpc.md#serve-a-service). |
@@ -338,7 +339,9 @@ SIGUSR2, or `stop()`, starts a graceful drain:
    when a SIGUSR2 restart hands the socket over: then they close at once,
    see [below](#zero-downtime-restart-and-socket-activation)).
 5. Open WebSockets get close 1001 (going away); each ends when its client
-   answers (see [Shutdown](websocket.md#shutdown)).
+   answers (see [Shutdown](websocket.md#shutdown)). Open WebTransport
+   sessions get DRAIN_WEBTRANSPORT_SESSION and a close (see
+   [Shutdown](webtransport.md#shutdown)).
 6. `run` returns once every connection is closed, or when
    `server.timeout.shutdown` (30 s) runs out.
 
@@ -399,8 +402,9 @@ address and port, and every response that did not come over HTTP/3 carries
 `http3` fields: `address` and `port` (`https`'s when null), `alt_svc`
 (true), `max_streams_bidi` (100 concurrent requests per connection),
 `idle_timeout_ms` (30 000), `validate_address` (false), `early_data`
-(false) and `sockets` (null: one per executor on Linux, see
-[Cores](#cores)). With `validate_address`, every new client must prove its address
+(false), `sockets` (null: one per executor on Linux, see
+[Cores](#cores)), `enable_connect_protocol` (true: extended CONNECT, for RFC 9220
+WebSockets) and `webtransport` (false; `app.webtransport` turns it on). With `validate_address`, every new client must prove its address
 with a Retry first, which costs a round trip and resists floods from
 spoofed sources. `hq_interop_root` is for the QUIC interop runner only.
 
@@ -409,8 +413,9 @@ Supported: QUIC v1 and v2, Retry, stateless reset, ECN, session resumption,
 GSO/GRO on Linux, a GOAWAY drain, mutual TLS (the `https` listener's
 `client_auth`, see [TLS](#tls)), certificate reloads (the same) and SIGUSR2
 restarts (see
-[below](#zero-downtime-restart-and-socket-activation)). Not yet:
-WebTransport, and gRPC over HTTP/3.
+[below](#zero-downtime-restart-and-socket-activation)), WebSockets (RFC 9220,
+see [websocket.md](websocket.md)) and WebTransport (draft-02, see
+[webtransport.md](webtransport.md)). Not yet: gRPC over HTTP/3.
 
 ### 0-RTT
 

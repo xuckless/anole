@@ -1,8 +1,8 @@
 # Anole
 
 Anole is a Zig library for building backends: one server core that serves
-REST, WebSockets and gRPC (over HTTP/1.1, HTTP/2 and HTTP/3), with TLS and auth
-built in. It is assembled from proven libraries rather than written from
+REST, WebSockets and gRPC (over HTTP/1.1, HTTP/2 and HTTP/3), and WebTransport,
+with TLS and auth built in. It is assembled from proven libraries rather than written from
 scratch: [zio](https://github.com/lalinsky/zio) for async I/O,
 [dusty](https://github.com/lalinsky/dusty) (through a fork) for HTTP, and nghttp2,
 BoringSSL, ngtcp2 and nghttp3 for HTTP/2, TLS and HTTP/3. Zig compiles every C
@@ -79,9 +79,9 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   the same router and handlers, with streaming bodies, flow control and
   trailers; h2spec 2.6.0 passes every case in strict mode, over h2c and TLS;
   a drain sends every connection a two-phase GOAWAY;
-- WebSockets over HTTP/1.1 and over HTTP/2 (RFC 8441 extended CONNECT), with
-  permessage-deflate and a rooms helper for broadcast; Autobahn passes all
-  517 cases;
+- WebSockets over HTTP/1.1, over HTTP/2 (RFC 8441 extended CONNECT) and over
+  HTTP/3 (RFC 9220), with permessage-deflate and a rooms helper for
+  broadcast; Autobahn passes all 517 cases;
 - gRPC server and client over HTTP/2 (all four call modes, deadlines,
   metadata, gzip), plus gRPC-Web, Buf's Connect protocol, REST routes from
   `google.api.http` annotations (JSON transcoding), and the
@@ -114,9 +114,14 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   ChaCha20, multiplexing, Retry, HTTP/3, amplification limit, blackhole, key
   update, handshake and transfer loss and corruption, ECN, port and address
   rebinding, v2, resumption, 0-RTT), and the 18 of them quic-go's client
-  runs.
+  runs;
+- WebTransport over HTTP/3 (draft-02, as Chrome, Edge and Firefox speak it):
+  sessions with streams both ways and datagrams on the same router
+  (`app.webtransport`), a close with a code, a drain, and a client; checked
+  against aioquic both ways and against flupke in the interop runner's
+  WebTransport mode (all seven cases). Browsers themselves have not been run
+  against it yet.
 
-WebTransport is still to come.
 Nothing is stable before 1.0.
 
 ## Requirements
@@ -183,7 +188,7 @@ the table shows the median run. Reproduce with `bench/run.sh`.
 | --- | --- | --- | --- | --- |
 | `-Dtls=boringssl\|none` | none | boringssl | boringssl | BoringSSL |
 | `-Dhttp2=bool` | false | true | true | nghttp2 |
-| `-Dhttp3=bool` | false | false | true | ngtcp2, nghttp3 |
+| `-Dhttp3=bool` | false | false | true | ngtcp2, nghttp3, WebTransport |
 | `-Dcompression=bool` | false | true | true | zlib-ng, zstd |
 | `-Dgrpc=bool` | false | false | true | gRPC, zig-protobuf (and protoc for codegen) |
 | `-Dwebsocket=bool` | false | true | true | WebSocket |
@@ -246,7 +251,8 @@ push.
   HTTP/3, draining, restarts, socket activation, proxies.
 - [docs/routing.md](docs/routing.md): routes, middleware, requests and
   responses, errors, static files, compression, timeouts and limits.
-- [docs/websocket.md](docs/websocket.md), [docs/grpc.md](docs/grpc.md),
+- [docs/websocket.md](docs/websocket.md),
+  [docs/webtransport.md](docs/webtransport.md), [docs/grpc.md](docs/grpc.md),
   [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
   [docs/observability.md](docs/observability.md).
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,

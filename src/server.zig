@@ -42,6 +42,9 @@ const observe = @import("observe/root.zig");
 const websocket = if (features.websocket) @import("websocket/root.zig") else struct {
     pub const UpgradeOptions = struct {};
 };
+const webtransport_mod = if (features.http3) @import("webtransport.zig") else struct {
+    pub const AcceptOptions = struct {};
+};
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
     pub const RegisterOptions = struct {};
@@ -162,6 +165,12 @@ pub const Options = struct {
         /// socket: null for one per executor, as the TCP accept loops. At
         /// most 255; macOS always uses one.
         sockets: ?u16 = null,
+        /// Extended CONNECT (RFC 9220): WebSockets over HTTP/3, as over
+        /// HTTP/2.
+        enable_connect_protocol: bool = true,
+        /// Speak WebTransport (draft-02, what Chrome and Firefox use), for
+        /// `anole.webtransport.accept`. `app.webtransport` turns it on.
+        webtransport: bool = false,
     };
 
     pub const Https = struct {
@@ -260,6 +269,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             grpc_health: ?*grpc_mod.Health = null,
             exporter: ?*observe.trace.Exporter = null,
             dirs: std.ArrayList(std.Io.Dir) = .empty,
+            /// A WebTransport route exists: the HTTP/3 listener speaks it.
+            webtransport: bool = false,
         };
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
@@ -547,6 +558,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         .idle_timeout_ms = q.idle_timeout_ms,
                         .hq_interop_root = q.hq_interop_root,
                         .early_data = q.early_data,
+                        .enable_connect_protocol = q.enable_connect_protocol,
+                        .webtransport = q.webtransport or self.extras.webtransport,
                         .client_auth = h3ClientAuth(https.client_auth, client_ca),
                         .fds = h3_fds,
                         .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
@@ -752,8 +765,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.router.any(path, route(handler));
         }
 
-        /// A WebSocket endpoint at `path`, over HTTP/1.1 and HTTP/2
-        /// (RFC 8441): `handler` gets the open socket, which is closed
+        /// A WebSocket endpoint at `path`, over HTTP/1.1, HTTP/2 (RFC
+        /// 8441) and HTTP/3 (RFC 9220): `handler` gets the open socket, which is closed
         /// when it returns, and with 1001 when the server drains. A plain
         /// HTTP request there gets 426 Upgrade Required. `handler` is
         /// `fn (ws: *anole.websocket.Socket, req: *anole.Request) !void`
@@ -773,6 +786,43 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn wsWith(self: *Self, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             self.router.get(path, websocket.route(Ctx, handler, upgrade));
+        }
+
+        /// A WebTransport endpoint at `path` (draft-02, what Chrome and
+        /// Firefox speak), on the HTTP/3 listener, which this turns
+        /// WebTransport on for: `handler` gets the open session, which is
+        /// closed when it returns, and on the server's drain. A request
+        /// there that is no WebTransport session gets 400. `handler` is
+        /// `fn (session: *anole.webtransport.Session, req: *anole.Request)
+        /// !void` (the request may be left out; the server's state may
+        /// come first):
+        ///
+        ///     fn echo(session: *anole.webtransport.Session) !void {
+        ///         while (true) {
+        ///             const stream = session.acceptStream() catch return;
+        ///             defer stream.release();
+        ///             ...
+        ///         }
+        ///     }
+        ///     app.webtransport("/echo", echo);
+        pub fn webtransport(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.webtransportWith(path, handler, .{});
+        }
+
+        /// `webtransport` with accept options (the drain's close, timeout).
+        pub fn webtransportWith(self: *Self, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+            if (comptime !features.http3) @compileError("app.webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+            self.enableWebTransport();
+            self.router.get(path, webtransport_mod.route(Ctx, handler, accept));
+        }
+
+        /// The HTTP/3 listener speaks WebTransport, now or once it is set
+        /// up.
+        fn enableWebTransport(self: *Self) void {
+            self.extras.webtransport = true;
+            // Every endpoint (one per core on Linux), or tickets from one
+            // would not resume in 0-RTT on another.
+            if (comptime features.http3) if (self.h3) |ep| ep.enableWebTransport();
         }
 
         /// Serves the files under `dir` below `prefix`: ranges, ETags and
@@ -891,6 +941,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
+            }
+            pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.webtransportWith(path, handler, .{});
+            }
+            pub fn webtransportWith(g: Group, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+                if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+                g.server.enableWebTransport();
+                g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
                 g.inner.static(prefix, dir, opts);
@@ -1733,6 +1791,36 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
     var client_future = try app.io().concurrent(Run.run, .{ &app, &pems, tmp.dir });
     try app.run();
     try client_future.await(app.io());
+}
+
+test "anole.Server: app.webtransport after init reaches every HTTP/3 endpoint, which share one 0-RTT context" {
+    if (comptime !features.http3) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pem = try tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var app = try Server(void).init(gpa, .{
+        .http = null,
+        .https = .{ .port = 0, .cert = .{ .pem = .{ .cert = pem.cert, .key = pem.key } } },
+        // One endpoint per executor on Linux; one elsewhere.
+        .http3 = .{ .port = 0, .alt_svc = false, .early_data = true },
+        .executors = .exact(4),
+    }, {});
+    defer app.deinit();
+    const S = struct {
+        fn session(_: *webtransport_mod.Session) !void {}
+    };
+    app.webtransport("/wt", S.session);
+    const endpoints = app.h3.?.endpoints();
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(@as(usize, 4), endpoints.len);
+    const h3_server = @import("h3/server.zig");
+    const early_context_max = h3_server.early_context_max;
+    var first_buf: [early_context_max]u8 = undefined;
+    const first = try h3_server.earlyDataContextOf(&endpoints[0].options, &first_buf);
+    for (endpoints) |e| {
+        try std.testing.expect(e.options.webtransport);
+        var buf: [early_context_max]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, first, try h3_server.earlyDataContextOf(&e.options, &buf));
+    }
 }
 
 test "anole.Server: a second server on the same thread is refused, and one after the first is freed is fine" {

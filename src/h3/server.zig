@@ -41,6 +41,7 @@ const quic_tls = @import("quic_tls.zig");
 const dusty_tls = @import("anole_dusty_tls");
 const net = @import("net.zig");
 const bridge = @import("bridge.zig");
+const webtransport = @import("webtransport.zig");
 const early_data = @import("../early_data.zig");
 const steer = @import("steer.zig");
 const builtin = @import("builtin");
@@ -123,6 +124,21 @@ pub const Options = struct {
     /// other method waits for the handshake, which a replay never
     /// completes (RFC 8470 §3).
     early_data: bool = false,
+    /// Advertise extended CONNECT (RFC 9220), so a client may open a
+    /// WebSocket, or another protocol, on a request stream. Such a request
+    /// reaches the router as a GET with `Request.protocol` set, as over
+    /// HTTP/2.
+    enable_connect_protocol: bool = true,
+    /// Speak WebTransport (draft-02, what Chrome and Firefox use): its
+    /// SETTINGS, HTTP datagrams, and its streams beside the requests.
+    /// Sessions reach the router as extended CONNECTs (`:protocol
+    /// webtransport`), for `anole.webtransport.accept`. Read when each
+    /// connection starts, so it may be turned on after `init`.
+    webtransport: bool = false,
+    /// WebTransport streams the peer may open beside requests: the
+    /// unidirectional ones (the bidirectional ones share
+    /// `max_streams_bidi`).
+    webtransport_max_streams_uni: u64 = 100,
 };
 
 /// The SETTINGS every connection of an endpoint sends.
@@ -132,14 +148,34 @@ fn http3Settings(options: *const Options) nghttp3.Settings {
     settings.qpack_max_dtable_capacity = 4096;
     settings.qpack_blocked_streams = 100;
     settings.max_field_section_size = options.max_field_section_size;
+    settings.enable_connect_protocol = @intFromBool(options.enable_connect_protocol or options.webtransport);
+    settings.h3_datagram = @intFromBool(options.webtransport);
     return settings;
 }
 
+/// The transport parameters `options` decide; a connection adds its
+/// connection IDs and tokens.
+fn transportParams(options: *const Options) ngtcp2.TransportParams {
+    var params: ngtcp2.TransportParams = undefined;
+    ngtcp2.transportParamsDefault(&params);
+    params.initial_max_stream_data_bidi_local = options.max_stream_data;
+    params.initial_max_stream_data_bidi_remote = options.max_stream_data;
+    params.initial_max_stream_data_uni = options.max_stream_data;
+    params.initial_max_data = options.max_data;
+    params.initial_max_streams_bidi = options.max_streams_bidi;
+    // The control and QPACK streams, and WebTransport's.
+    params.initial_max_streams_uni = 3 + if (options.webtransport) options.webtransport_max_streams_uni else 0;
+    // HTTP datagrams (RFC 9297), for WebTransport.
+    if (options.webtransport) params.max_datagram_frame_size = 65535;
+    params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+    return params;
+}
+
 /// Room for `earlyDataContext`'s output.
-const early_context_max = 1 + 256 + 5 * 8;
+pub const early_context_max = 1 + 256 + 6 * 8;
 /// Bumped whenever the layout below changes, so older tickets stop
 /// carrying 0-RTT rather than being misread.
-const early_context_version = 1;
+const early_context_version = 2;
 
 /// What 0-RTT tickets are tied to (`quic_tls.setEarlyDataContext`): a
 /// version byte, ngtcp2's encoding of the transport parameters a client
@@ -147,9 +183,9 @@ const early_context_version = 1;
 /// tokens), and the SETTINGS values a client may assume (RFC 9114 §7.2.4.2).
 /// Any change to either, such as a new `max_streams_bidi`, makes old
 /// tickets resume without 0-RTT.
-fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, buf: *[early_context_max]u8) ![]const u8 {
+fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, wt: bool, buf: *[early_context_max]u8) ![]const u8 {
     buf[0] = early_context_version;
-    const n = c.ngtcp2_conn_encode_0rtt_transport_params2(q, buf[1..].ptr, buf.len - 1 - 5 * 8);
+    const n = c.ngtcp2_conn_encode_0rtt_transport_params2(q, buf[1..].ptr, buf.len - 1 - 6 * 8);
     if (n < 0) return error.QuicSetupFailed;
     var len: usize = 1 + @as(usize, @intCast(n));
     for ([_]u64{
@@ -158,6 +194,8 @@ fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, buf: *[
         settings.qpack_blocked_streams,
         settings.enable_connect_protocol,
         settings.h3_datagram,
+        // SETTINGS_ENABLE_WEBTRANSPORT, sent beside nghttp3's.
+        @intFromBool(wt),
     }) |v| {
         std.mem.writeInt(u64, buf[len..][0..8], v, .little);
         len += 8;
@@ -208,6 +246,11 @@ pub fn Endpoint(comptime Ctx: type) type {
         gpa: std.mem.Allocator,
         io: std.Io,
         http: *HttpServer,
+        /// A copy per endpoint of the listener's options. They must stay
+        /// the same on every endpoint: a client resumes on whichever one
+        /// the kernel picks, and its 0-RTT is refused where the SETTINGS or
+        /// limits differ. Change them through the listener (as
+        /// `enableWebTransport` does), never on one endpoint.
         options: Options,
         udp: net.Udp,
         local: Addr,
@@ -439,6 +482,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// before still resume. Connections already open keep the context
         /// they started with (each `SSL` holds a reference to it). Safe from
         /// any task or thread.
+        /// Turns WebTransport on for every endpoint of the listener, for
+        /// connections that start from now on.
+        pub fn enableWebTransport(self: *Self) void {
+            for (self.shared.endpoints) |e| e.options.webtransport = true;
+        }
+
         pub fn useTls(self: *Self, tls: quic_tls.Context) void {
             const shared = self.shared;
             lockTls(shared);
@@ -865,6 +914,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             hq: bool = false,
             hq_streams: std.AutoArrayHashMapUnmanaged(i64, *HqStream) = .empty,
             drain_at: u64 = 0,
+            /// WebTransport's streams, sessions and datagrams, when the
+            /// endpoint speaks it.
+            wt: ?*webtransport.Core = null,
 
             const State = enum { open, closing, draining, closed };
 
@@ -908,15 +960,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 ep.io.random(&initial_pkt_num);
                 settings.initial_pkt_num = std.mem.readInt(u32, &initial_pkt_num, .little) & 0x7fffffff;
 
-                var params: ngtcp2.TransportParams = undefined;
-                ngtcp2.transportParamsDefault(&params);
-                params.initial_max_stream_data_bidi_local = ep.options.max_stream_data;
-                params.initial_max_stream_data_bidi_remote = ep.options.max_stream_data;
-                params.initial_max_stream_data_uni = ep.options.max_stream_data;
-                params.initial_max_data = ep.options.max_data;
-                params.initial_max_streams_bidi = ep.options.max_streams_bidi;
-                params.initial_max_streams_uni = 3;
-                params.max_idle_timeout = @as(u64, ep.options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+                var params = transportParams(&ep.options);
                 params.stateless_reset_token_present = 1;
                 params.active_connection_id_limit = 7;
                 params.grease_quic_bit = 1;
@@ -941,7 +985,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 errdefer c.SSL_free(conn.ssl);
                 if (ep.options.early_data) {
                     var buf: [early_context_max]u8 = undefined;
-                    try quic_tls.setEarlyDataContext(conn.ssl, try earlyDataContext(conn.q, http3Settings(&ep.options), &buf));
+                    try quic_tls.setEarlyDataContext(conn.ssl, try earlyDataContext(conn.q, http3Settings(&ep.options), ep.options.webtransport, &buf));
                 }
                 c.ngtcp2_conn_set_tls_native_handle(conn.q, conn.ssl);
                 return conn;
@@ -960,6 +1004,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 var it = conn.streams.valueIterator();
                 while (it.next()) |s| s.*.free();
                 conn.streams.deinit(gpa);
+                if (conn.wt) |w| w.destroy();
                 if (conn.h3) |hc| h.nghttp3_conn_del(hc);
                 c.ngtcp2_conn_del(conn.q);
                 c.SSL_free(conn.ssl);
@@ -987,6 +1032,26 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn kick(conn: *Conn) void {
                 _ = conn.gen.fetchAdd(1, .release);
                 conn.ep.io.futexWake(u32, &conn.gen.raw, std.math.maxInt(u32));
+            }
+
+            /// How WebTransport's sessions and streams reach the
+            /// connection.
+            fn wtHost(conn: *Conn) webtransport.Host {
+                const S = struct {
+                    fn of(ctx: *anyopaque) *Conn {
+                        return @ptrCast(@alignCast(ctx));
+                    }
+                    fn lock(ctx: *anyopaque) void {
+                        of(ctx).lock();
+                    }
+                    fn unlock(ctx: *anyopaque) void {
+                        of(ctx).unlock();
+                    }
+                    fn kick(ctx: *anyopaque) void {
+                        of(ctx).kick();
+                    }
+                };
+                return .{ .ctx = conn, .gen = &conn.gen, .lock_fn = S.lock, .unlock_fn = S.unlock, .kick_fn = S.kick };
             }
 
             fn path(conn: *Conn) c.ngtcp2_path {
@@ -1272,6 +1337,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn wakeStreams(conn: *Conn) void {
                 var it = conn.streams.valueIterator();
                 while (it.next()) |s| s.*.reset = true;
+                if (conn.wt) |w| w.connectionClosed();
             }
 
             /// The driver's end: requests finish, the IDs go, the driver's
@@ -1295,10 +1361,23 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn setupHttp3(conn: *Conn) !void {
                 if (conn.h3 != null) return;
                 if (c.ngtcp2_conn_get_streams_uni_left2(conn.q) < 3) return error.Http3SetupFailed;
-                const settings = http3Settings(&conn.ep.options);
+                const options = &conn.ep.options;
+                const settings = http3Settings(options);
                 var hc: ?*h.nghttp3_conn = null;
                 if (nghttp3.connServerNew(&hc, &h3_callbacks, &settings, h.nghttp3_mem_default(), conn) != 0) return error.Http3SetupFailed;
                 errdefer h.nghttp3_conn_del(hc);
+                if (options.webtransport) {
+                    // Chrome and Firefox (draft-02), and Safari (draft-07
+                    // on), through the nghttp3 fork's extra SETTINGS.
+                    if (h.nghttp3_conn_add_extra_setting(hc, webtransport.setting_enable_webtransport, 1) != 0 or
+                        h.nghttp3_conn_add_extra_setting(hc, webtransport.setting_max_sessions, 1) != 0)
+                        return error.Http3SetupFailed;
+                    conn.wt = webtransport.Core.create(conn.ep.gpa, conn.ep.io, conn.q, conn.wtHost(), true, .{}) catch return error.Http3SetupFailed;
+                }
+                errdefer if (conn.wt) |w| {
+                    w.destroy();
+                    conn.wt = null;
+                };
                 const params = c.ngtcp2_conn_get_local_transport_params2(conn.q);
                 h.nghttp3_conn_set_max_client_streams_bidi(hc, params.*.initial_max_streams_bidi);
                 var ctrl: i64 = 0;
@@ -1313,7 +1392,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             fn side(conn: *Conn) bridge.Side {
-                return .{ .q = conn.q, .h3 = conn.h3, .last_error = &conn.last_error };
+                return .{ .q = conn.q, .h3 = conn.h3, .last_error = &conn.last_error, .wt = conn.wt };
             }
 
             fn consume(conn: *Conn, stream_id: i64, n: u64) void {
@@ -1467,6 +1546,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The request's head came in 0-RTT, before the handshake
             /// completed.
             early: bool = false,
+            /// `:protocol`, on an extended CONNECT (RFC 9220).
+            protocol: []const u8 = "",
             /// Who still holds the stream.
             refs: struct { quic: bool = true, handler: bool = false } = .{},
 
@@ -1602,11 +1683,22 @@ pub fn Endpoint(comptime Ctx: type) type {
                     response.status = .not_implemented;
                     return response.write();
                 };
-                // CONNECT (and RFC 9220 extended CONNECT) is not served
-                // over HTTP/3 yet.
                 if (request.method == .connect) {
-                    response.status = .not_implemented;
-                    return response.write();
+                    // A plain CONNECT (a proxy's tunnel) is not served.
+                    if (s.protocol.len == 0) {
+                        response.status = .not_implemented;
+                        return response.write();
+                    }
+                    // An extended CONNECT (RFC 9220; nghttp3 has checked
+                    // its pseudo-headers) is routed as the GET that the
+                    // HTTP/1.1 upgrade it replaces would be, as over
+                    // HTTP/2.
+                    request.method = .get;
+                    request.protocol = s.protocol;
+                    // A WebTransport session: `anole.webtransport.accept`
+                    // finds the connection's WebTransport here.
+                    if (conn.wt) |w| if (isWebTransport(s.protocol))
+                        try request.setLocal(webtransport.local_key, webtransport.Connect{ .core = w, .session_id = s.id });
                 }
                 response.head = request.method == .head;
                 request.url = s.path;
@@ -1618,7 +1710,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 var early = s.early and !conn.handshakeDone();
                 conn.unlock();
-                if (early and !early_data.isSafe(request.method)) {
+                // A WebSocket or WebTransport session (an extended
+                // CONNECT, routed as a GET) waits too: what runs on it is
+                // anything but a safe request.
+                if (early and (!early_data.isSafe(request.method) or request.protocol != null)) {
                     _ = ep.early_held.fetchAdd(1, .monotonic);
                     try s.awaitHandshake();
                     early = false;
@@ -1712,6 +1807,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
         };
+
+        fn isWebTransport(protocol: []const u8) bool {
+            // "webtransport" in draft-02 (Chrome, Firefox) and up to
+            // draft-14, "webtransport-h3" since draft-15.
+            return std.mem.eql(u8, protocol, "webtransport") or std.mem.eql(u8, protocol, "webtransport-h3");
+        }
 
         fn parseMethod(name: []const u8) ?dusty.Method {
             var lower: [16]u8 = undefined;
@@ -2019,6 +2120,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
             cb.stream_close2 = onStreamClose;
             cb.path_validation = onPathValidation;
+            cb.recv_datagram = onRecvDatagram;
+            cb.extend_max_local_streams_bidi = onExtendMaxLocalStreams;
+            cb.extend_max_local_streams_uni = onExtendMaxLocalStreams;
             break :blk cb;
         };
 
@@ -2055,15 +2159,31 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
-        fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, offset: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const bytes: []const u8 = if (len == 0) &.{} else data[0..len];
             if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
-            return bridge.recvStreamData(conn.side(), flags, stream_id, bytes);
+            const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
+            // A bidirectional stream WebTransport took is no request.
+            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchRemove(stream_id)) |e| e.value.free();
+            return rv;
+        }
+
+        fn onRecvDatagram(_: ?*c.ngtcp2_conn, _: u32, data: [*c]const u8, len: usize, user_data: ?*anyopaque) callconv(.c) c_int {
+            const conn = connOf(user_data);
+            if (conn.wt) |w| w.onDatagram(if (len == 0) &.{} else data[0..len]);
+            return 0;
+        }
+
+        fn onExtendMaxLocalStreams(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
+            // A WebTransport handler waiting to open a stream may go on.
+            connOf(user_data).kick();
+            return 0;
         }
 
         fn onAckedStreamDataOffset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, len: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
+            if (conn.wt) |w| if (w.onAcked(stream_id, len)) return 0;
             const hc = conn.h3 orelse return 0;
             if (h.nghttp3_conn_add_ack_offset(hc, stream_id, len) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
@@ -2091,6 +2211,12 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onStreamClose(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, rx_code: u64, tx_code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
+            // WebTransport's: nghttp3 never knew it, and the core gives
+            // the peer its stream credit back.
+            if (conn.wt) |w| if (w.onClose(stream_id)) {
+                conn.kick();
+                return 0;
+            };
             const rv = bridge.closeStream(conn.side(), flags, stream_id, rx_code, tx_code);
             if (rv != 0) return rv;
             if (conn.hq_streams.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
@@ -2106,16 +2232,18 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
-        fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
+            if (conn.wt) |w| if (w.onReset(stream_id, code)) return 0;
             if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             if (conn.streamOf(stream_id)) |s| s.reset = true;
             conn.kick();
             return 0;
         }
 
-        fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
+            if (conn.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
             if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             // The peer wants no more of the response.
             if (conn.streamOf(stream_id)) |s| s.reset = true;
@@ -2155,6 +2283,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             // More credit: the driver writes again.
             if (conn.hq) conn.kick();
+            if (conn.wt) |w| if (w.onUnblocked(stream_id)) return 0;
             const hc = conn.h3 orelse return 0;
             if (h.nghttp3_conn_unblock_stream(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
@@ -2242,7 +2371,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 h.NGHTTP3_QPACK_TOKEN__PATH => s.path = val,
                 h.NGHTTP3_QPACK_TOKEN__METHOD => s.method = val,
                 h.NGHTTP3_QPACK_TOKEN__AUTHORITY => s.authority = val,
-                h.NGHTTP3_QPACK_TOKEN__SCHEME, h.NGHTTP3_QPACK_TOKEN__PROTOCOL => {},
+                h.NGHTTP3_QPACK_TOKEN__PROTOCOL => s.protocol = val,
+                h.NGHTTP3_QPACK_TOKEN__SCHEME => {},
                 else => {
                     const n = h.nghttp3_rcbuf_get_buf(name);
                     const key = arena.dupe(u8, n.base[0..n.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -2315,8 +2445,11 @@ pub fn Endpoint(comptime Ctx: type) type {
     };
 }
 
-test "0-RTT context: the same for the same settings, different when a limit or a SETTINGS value changes" {
-    const Ctx = struct {
+/// The 0-RTT context a connection of an endpoint with `options` gets, from
+/// a throwaway connection with fixed IDs: for tests that compare endpoints
+/// or settings.
+pub fn earlyDataContextOf(options: *const Options, buf: *[early_context_max]u8) ![]const u8 {
+    const S = struct {
         fn rand(dest: [*c]u8, len: usize, _: [*c]const c.ngtcp2_rand_ctx) callconv(.c) void {
             @memset(dest[0..len], 7);
         }
@@ -2326,42 +2459,42 @@ test "0-RTT context: the same for the same settings, different when a limit or a
             @memset(&token.*.data, 9);
             return 0;
         }
+    };
+    var settings: ngtcp2.Settings = undefined;
+    ngtcp2.settingsDefault(&settings);
+    settings.initial_ts = 1;
+    var params = transportParams(options);
+    var cid: c.ngtcp2_cid = undefined;
+    const bytes: [8]u8 = @splat(1);
+    c.ngtcp2_cid_init(&cid, &bytes, bytes.len);
+    params.original_dcid = cid;
+    params.original_dcid_present = 1;
+    var local: net.Addr = .from(.{ .ip4 = .loopback(4433) });
+    var remote: net.Addr = .from(.{ .ip4 = .loopback(50000) });
+    const p: c.ngtcp2_path = .{ .local = local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
+    var cb = std.mem.zeroes(c.ngtcp2_callbacks);
+    cb.recv_client_initial = c.ngtcp2_crypto_recv_client_initial_cb;
+    cb.recv_crypto_data = c.ngtcp2_crypto_recv_crypto_data_cb;
+    cb.encrypt = c.ngtcp2_crypto_encrypt_cb;
+    cb.decrypt = c.ngtcp2_crypto_decrypt_cb;
+    cb.hp_mask = c.ngtcp2_crypto_hp_mask_cb;
+    cb.update_key = c.ngtcp2_crypto_update_key_cb;
+    cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+    cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+    cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
+    cb.rand = S.rand;
+    cb.get_new_connection_id2 = S.newCid;
+    var q: ?*c.ngtcp2_conn = null;
+    if (ngtcp2.connServerNew(&q, &cid, &cid, &p, c.NGTCP2_PROTO_VER_V1, &cb, &settings, &params, null, null) != 0)
+        return error.QuicSetupFailed;
+    defer c.ngtcp2_conn_del(q);
+    return earlyDataContext(q.?, http3Settings(options), options.webtransport, buf);
+}
 
-        /// The context of a server connection with these limits.
+test "0-RTT context: the same for the same settings, different when a limit or a SETTINGS value changes" {
+    const Ctx = struct {
         fn of(options: Options, buf: *[early_context_max]u8) ![]const u8 {
-            var settings: ngtcp2.Settings = undefined;
-            ngtcp2.settingsDefault(&settings);
-            settings.initial_ts = 1;
-            var params: ngtcp2.TransportParams = undefined;
-            ngtcp2.transportParamsDefault(&params);
-            params.initial_max_streams_bidi = options.max_streams_bidi;
-            params.initial_max_data = options.max_data;
-            params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
-            var cid: c.ngtcp2_cid = undefined;
-            const bytes: [8]u8 = @splat(1);
-            c.ngtcp2_cid_init(&cid, &bytes, bytes.len);
-            params.original_dcid = cid;
-            params.original_dcid_present = 1;
-            var local: net.Addr = .from(.{ .ip4 = .loopback(4433) });
-            var remote: net.Addr = .from(.{ .ip4 = .loopback(50000) });
-            const p: c.ngtcp2_path = .{ .local = local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
-            var cb = std.mem.zeroes(c.ngtcp2_callbacks);
-            cb.recv_client_initial = c.ngtcp2_crypto_recv_client_initial_cb;
-            cb.recv_crypto_data = c.ngtcp2_crypto_recv_crypto_data_cb;
-            cb.encrypt = c.ngtcp2_crypto_encrypt_cb;
-            cb.decrypt = c.ngtcp2_crypto_decrypt_cb;
-            cb.hp_mask = c.ngtcp2_crypto_hp_mask_cb;
-            cb.update_key = c.ngtcp2_crypto_update_key_cb;
-            cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
-            cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
-            cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
-            cb.rand = rand;
-            cb.get_new_connection_id2 = newCid;
-            var q: ?*c.ngtcp2_conn = null;
-            if (ngtcp2.connServerNew(&q, &cid, &cid, &p, c.NGTCP2_PROTO_VER_V1, &cb, &settings, &params, null, null) != 0)
-                return error.QuicSetupFailed;
-            defer c.ngtcp2_conn_del(q);
-            return earlyDataContext(q.?, http3Settings(&options), buf);
+            return earlyDataContextOf(&options, buf);
         }
     };
     const base: Options = .{ .address = .{ .ip4 = .loopback(0) }, .cert_pem = "", .key_pem = "" };
@@ -2374,5 +2507,8 @@ test "0-RTT context: the same for the same settings, different when a limit or a
     var bigger_headers = base;
     bigger_headers.max_field_section_size *= 2;
     try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(bigger_headers, &b)));
+    var with_webtransport = base;
+    with_webtransport.webtransport = true;
+    try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(with_webtransport, &b)));
     try std.testing.expectEqual(@as(u8, early_context_version), (try Ctx.of(base, &a))[0]);
 }

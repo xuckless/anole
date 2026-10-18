@@ -14,7 +14,7 @@ that happens promptly.
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (tarball) |
-| nghttp3 | build.zig.zon | upstream release tarball |
+| nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
 | zlib-ng, zstd, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
 | zig-protobuf | build.zig.zon | upstream commit; it pins protoc per platform |
 | websocket-zig, zig-jwt | build.zig.zon | commits of the xuckless forks, branch `anole` |
@@ -63,13 +63,27 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      unit tests, commit the new `version.h`, merge into `anole`, and pin the
      merge commit. Then run Anole's migration test ("a client that moves to
      a new port"), `tests/h3/run.sh` and the interop runner.
+   - **nghttp3** comes from the fork as well: the tag, the release's
+     generated `lib/includes/nghttp3/version.h` and its bundled
+     `lib/sfparse` (a submodule in the repository, plain files in the fork,
+     so the GitHub archive is complete), and
+     `nghttp3_conn_add_extra_setting`, which lets Anole send SETTINGS
+     nghttp3 does not know (WebTransport's), with
+     `test_nghttp3_conn_add_extra_setting`. On a new tag: drop the patch if
+     upstream can send such settings itself (its WebTransport PR #442, or
+     issue #501), otherwise rebase it on a new branch, copy the new
+     tarball's `version.h` and `lib/sfparse`, run nghttp3's unit tests,
+     merge into `anole`, and pin the merge commit. Then run
+     `tests/h3/run.sh` (WebTransport and RFC 9220 included) and
+     `tests/interop/webtransport/run.sh`.
    - **nghttp2 and nghttp3 both ship sfparse** with the same exported
      symbols, and the linker keeps one copy. `build/nghttp3.zig`
      (`checkSharedSfparse`) stops the build when the two copies differ; then
      rename one copy's symbols with `-D` macros or build one shared sfparse.
 4. Run everything CI runs: `zig build test`, `zig build test-flags`,
    `zig build dusty-test`, the profile builds, h2spec, Autobahn, the gRPC
-   interop, `tests/h3/run.sh` and `tests/interop/run.sh`.
+   interop, `tests/h3/run.sh`, `tests/interop/run.sh` and
+   `tests/interop/webtransport/run.sh`.
 
 ## The forks
 
@@ -95,7 +109,7 @@ against lalinsky/dusty (#263-#270) are left as they are.
   accepting on a busy executor (`accept-now`: a direct accept with its own
   budget, and spawn backpressure every 64 spawns instead of on every one).
   `bench/` measures both (`conns`, `raw`).
-- **nghttp2**, **ngtcp2**: see above.
+- **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.
 

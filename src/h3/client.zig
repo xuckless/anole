@@ -36,6 +36,7 @@ const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
 const net = @import("net.zig");
 const bridge = @import("bridge.zig");
+const webtransport = @import("webtransport.zig");
 pub const SessionCache = @import("session_cache.zig").SessionCache;
 
 const c = ngtcp2.c;
@@ -83,6 +84,9 @@ pub const ConnectOptions = struct {
     /// Early data can be replayed by anyone who records it, so send in it
     /// only what is harmless to repeat.
     early_data: bool = false,
+    /// Speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
+    /// HTTP datagrams, and streams the server may open.
+    webtransport: bool = false,
 
     pub const Tls = struct {
         /// The certificate authorities the server's certificate must chain
@@ -210,6 +214,19 @@ pub const ClientConnection = struct {
     /// A socket for the driver to move to (`rebind`), and how.
     rebind_to: ?struct { socket: std.Io.net.Socket, how: Rebind } = null,
     rebind_error: ?anyerror = null,
+    /// WebTransport's streams, sessions and datagrams
+    /// (`ConnectOptions.webtransport`).
+    wt: ?*webtransport.Core = null,
+    /// The server's SETTINGS, once they arrived.
+    peer_settings: ?PeerSettings = null,
+
+    /// What the server's SETTINGS allow (`waitSettings`).
+    pub const PeerSettings = struct {
+        /// Extended CONNECT (RFC 9220): WebSocket, WebTransport.
+        connect_protocol: bool,
+        /// HTTP datagrams (RFC 9297).
+        h3_datagram: bool,
+    };
 
     /// Resolves `host` (unless `address` is set), handshakes with ALPN
     /// "h3", and returns once the connection is ready for requests.
@@ -283,9 +300,11 @@ pub const ClientConnection = struct {
         params.initial_max_stream_data_bidi_remote = options.stream_window;
         params.initial_max_stream_data_uni = options.stream_window;
         params.initial_max_data = options.max_data;
-        // HTTP/3 servers open no request streams.
-        params.initial_max_streams_bidi = 0;
-        params.initial_max_streams_uni = 3;
+        // HTTP/3 servers open no request streams, but a WebTransport
+        // session's may.
+        params.initial_max_streams_bidi = if (options.webtransport) 100 else 0;
+        params.initial_max_streams_uni = if (options.webtransport) 103 else 3;
+        if (options.webtransport) params.max_datagram_frame_size = 65535;
         params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
         params.active_connection_id_limit = 7;
         params.grease_quic_bit = 1;
@@ -296,6 +315,8 @@ pub const ClientConnection = struct {
             return error.QuicSetupFailed;
         self.q = q.?;
         errdefer c.ngtcp2_conn_del(self.q);
+        if (options.webtransport) self.wt = try webtransport.Core.create(gpa, io, self.q, self.wtHost(), false, .{});
+        errdefer if (self.wt) |w| w.destroy();
         // A ticket is used once, whatever happens to this connection.
         var ticket: ?SessionCache.Entry = if (self.cache) |cache| cache.take(self.cache_key) else null;
         defer if (ticket) |*t| t.deinit(gpa);
@@ -492,6 +513,7 @@ pub const ClientConnection = struct {
         if (self.rebind_to) |r| r.socket.close(io);
         if (self.cache != null) self.gpa.free(self.cache_key);
         if (self.h3) |hc| h.nghttp3_conn_del(hc);
+        if (self.wt) |w| w.destroy();
         // Streams released but not yet closed by QUIC.
         while (self.live.popFirst()) |node| {
             const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
@@ -523,6 +545,25 @@ pub const ClientConnection = struct {
         self.io.futexWake(u32, &self.gen.raw, std.math.maxInt(u32));
     }
 
+    /// How WebTransport's sessions and streams reach the connection.
+    fn wtHost(self: *ClientConnection) webtransport.Host {
+        const S = struct {
+            fn of(ctx: *anyopaque) *ClientConnection {
+                return @ptrCast(@alignCast(ctx));
+            }
+            fn lock(ctx: *anyopaque) void {
+                of(ctx).lock();
+            }
+            fn unlock(ctx: *anyopaque) void {
+                of(ctx).unlock();
+            }
+            fn kick(ctx: *anyopaque) void {
+                of(ctx).kick();
+            }
+        };
+        return .{ .ctx = self, .gen = &self.gen, .lock_fn = S.lock, .unlock_fn = S.unlock, .kick_fn = S.kick };
+    }
+
     fn wait(self: *ClientConnection, gen: u32) std.Io.Cancelable!void {
         try self.io.futexWait(u32, &self.gen.raw, gen);
     }
@@ -532,8 +573,87 @@ pub const ClientConnection = struct {
     }
 
     fn side(self: *ClientConnection) bridge.Side {
-        return .{ .q = self.q, .h3 = self.h3, .last_error = &self.last_error };
+        return .{ .q = self.q, .h3 = self.h3, .last_error = &self.last_error, .wt = self.wt };
     }
+
+    /// Waits for the server's SETTINGS (which follow the handshake).
+    pub fn waitSettings(self: *ClientConnection) !PeerSettings {
+        while (true) {
+            const gen = self.gen.load(.acquire);
+            self.lock();
+            const settings = self.peer_settings;
+            const closed = self.state == .closed;
+            self.unlock();
+            if (settings) |got| return got;
+            if (closed) return error.ConnectionClosed;
+            try self.wait(gen);
+        }
+    }
+
+    pub const WebTransportOptions = struct {
+        /// `:authority`, the server's name (and port, if not 443).
+        authority: []const u8,
+        path: []const u8 = "/",
+        /// The `Origin` a browser would send, if any.
+        origin: ?[]const u8 = null,
+        /// More request fields, names in lower case.
+        headers: []const Header = &.{},
+    };
+
+    /// Opens a WebTransport session (draft-02): an extended CONNECT that
+    /// the server answers with 200. Needs `ConnectOptions.webtransport`.
+    /// Close it with `Session.close`, and `deinit` it before `close`.
+    pub fn openWebTransport(self: *ClientConnection, options: WebTransportOptions) !*webtransport.Session {
+        const core = self.wt orelse return error.WebTransportNotEnabled;
+        const settings = try self.waitSettings();
+        if (!settings.connect_protocol) return error.ExtendedConnectRefused;
+        var fields: std.ArrayList(Header) = .empty;
+        defer fields.deinit(self.gpa);
+        try fields.appendSlice(self.gpa, &.{
+            .{ .name = ":method", .value = "CONNECT" },
+            .{ .name = ":protocol", .value = "webtransport" },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":authority", .value = options.authority },
+            .{ .name = ":path", .value = options.path },
+            // What Chrome sends for draft-02.
+            .{ .name = "sec-webtransport-http3-draft02", .value = "1" },
+        });
+        if (options.origin) |o| try fields.append(self.gpa, .{ .name = "origin", .value = o });
+        try fields.appendSlice(self.gpa, options.headers);
+        const stream = try self.request(fields.items, .{ .body = true, .timeout = .none });
+        errdefer stream.release();
+        try stream.waitHead();
+        if (stream.status != 200) return error.WebTransportRefused;
+        const holder = try self.gpa.create(ClientSession);
+        errdefer self.gpa.destroy(holder);
+        holder.* = .{ .session = undefined, .stream = stream, .gpa = self.gpa };
+        try holder.session.start(core, stream.id, .{
+            .reader = stream.reader(),
+            .writer = stream.writer(),
+            .ctx = holder,
+            .end_fn = ClientSession.end,
+            .release_fn = ClientSession.release,
+        }, .{});
+        return &holder.session;
+    }
+
+    /// A client's session and the CONNECT stream it runs on.
+    const ClientSession = struct {
+        session: webtransport.Session,
+        stream: *Stream,
+        gpa: std.mem.Allocator,
+
+        fn end(ctx: *anyopaque) void {
+            const self: *ClientSession = @ptrCast(@alignCast(ctx));
+            self.stream.closeSend() catch {};
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *ClientSession = @ptrCast(@alignCast(ctx));
+            self.stream.release();
+            self.gpa.destroy(self);
+        }
+    };
 
     pub const RequestOptions = struct {
         /// The request has a body, written through `Stream.writer` and
@@ -792,6 +912,7 @@ pub const ClientConnection = struct {
     fn closeLocked(self: *ClientConnection) void {
         self.state = .closed;
         self.closing = true;
+        if (self.wt) |w| w.connectionClosed();
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
             const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
@@ -809,9 +930,13 @@ pub const ClientConnection = struct {
         nghttp3.settingsDefault(&settings);
         settings.qpack_max_dtable_capacity = 4096;
         settings.qpack_blocked_streams = 100;
+        settings.h3_datagram = @intFromBool(self.wt != null);
         var hc: ?*h.nghttp3_conn = null;
         if (nghttp3.connClientNew(&hc, &h3_callbacks, &settings, h.nghttp3_mem_default(), self) != 0) return error.Http3SetupFailed;
         errdefer h.nghttp3_conn_del(hc);
+        // As Chrome does: SETTINGS_ENABLE_WEBTRANSPORT from the client too.
+        if (self.wt != null and h.nghttp3_conn_add_extra_setting(hc, webtransport.setting_enable_webtransport, 1) != 0)
+            return error.Http3SetupFailed;
         var ctrl: i64 = 0;
         var enc: i64 = 0;
         var dec: i64 = 0;
@@ -851,6 +976,8 @@ pub const ClientConnection = struct {
         cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
         cb.stream_close2 = onStreamClose;
         cb.tls_early_data_rejected = onEarlyDataRejected;
+        cb.recv_datagram = onRecvDatagram;
+        cb.extend_max_local_streams_uni = onExtendMaxLocalStreamsUni;
         break :blk cb;
     };
 
@@ -909,12 +1036,26 @@ pub const ClientConnection = struct {
         return 1;
     }
 
-    fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
-        return bridge.recvStreamData(connOf(user_data).side(), flags, stream_id, if (len == 0) &.{} else data[0..len]);
+    fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, offset: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        return bridge.recvStreamData(connOf(user_data).side(), flags, stream_id, offset, if (len == 0) &.{} else data[0..len]);
+    }
+
+    fn onRecvDatagram(_: ?*c.ngtcp2_conn, _: u32, data: [*c]const u8, len: usize, user_data: ?*anyopaque) callconv(.c) c_int {
+        const self = connOf(user_data);
+        if (self.wt) |w| w.onDatagram(if (len == 0) &.{} else data[0..len]);
+        return 0;
+    }
+
+    fn onExtendMaxLocalStreamsUni(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
+        // A WebTransport session waiting to open a stream may go on.
+        connOf(user_data).kick();
+        return 0;
     }
 
     fn onAckedStreamDataOffset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, len: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
-        const hc = connOf(user_data).h3 orelse return 0;
+        const self = connOf(user_data);
+        if (self.wt) |w| if (w.onAcked(stream_id, len)) return 0;
+        const hc = self.h3 orelse return 0;
         if (h.nghttp3_conn_add_ack_offset(hc, stream_id, len) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
         return 0;
     }
@@ -930,16 +1071,18 @@ pub const ClientConnection = struct {
         self.io.random(dest[0..len]);
     }
 
-    fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, _: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
+    fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
+        if (self.wt) |w| if (w.onReset(stream_id, code)) return 0;
         if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
         if (streamOfUser(sud)) |s| s.endEarly(error.StreamReset);
         self.kick();
         return 0;
     }
 
-    fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
+    fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
+        if (self.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
         if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
         // The server wants no more of the request body; its response may
         // still come.
@@ -949,7 +1092,9 @@ pub const ClientConnection = struct {
     }
 
     fn onExtendMaxStreamData(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
-        const hc = connOf(user_data).h3 orelse return 0;
+        const self = connOf(user_data);
+        if (self.wt) |w| if (w.onUnblocked(stream_id)) return 0;
+        const hc = self.h3 orelse return 0;
         if (h.nghttp3_conn_unblock_stream(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
         return 0;
     }
@@ -970,6 +1115,10 @@ pub const ClientConnection = struct {
 
     fn onStreamClose(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, rx_code: u64, tx_code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
+        if (self.wt) |w| if (w.onClose(stream_id)) {
+            self.kick();
+            return 0;
+        };
         const rv = bridge.closeStream(self.side(), flags, stream_id, rx_code, tx_code);
         if (rv != 0) return rv;
         if (streamOfUser(sud)) |s| {
@@ -999,6 +1148,7 @@ pub const ClientConnection = struct {
         cb.end_stream = onH3EndStream;
         cb.reset_stream = onH3ResetStream;
         cb.shutdown = onH3Shutdown;
+        cb.recv_settings2 = onH3RecvSettings;
         cb.rand = net.h3Rand;
         break :blk cb;
     };
@@ -1079,6 +1229,16 @@ pub const ClientConnection = struct {
 
     fn onH3ResetStream(_: ?*h.nghttp3_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
         if (c.ngtcp2_conn_shutdown_stream_write(connOf(user_data).q, 0, stream_id, code) != 0) return h.NGHTTP3_ERR_CALLBACK_FAILURE;
+        return 0;
+    }
+
+    fn onH3RecvSettings(_: ?*h.nghttp3_conn, settings: [*c]const h.nghttp3_proto_settings, user_data: ?*anyopaque) callconv(.c) c_int {
+        const self = connOf(user_data);
+        self.peer_settings = .{
+            .connect_protocol = settings.*.enable_connect_protocol != 0,
+            .h3_datagram = settings.*.h3_datagram != 0,
+        };
+        self.kick();
         return 0;
     }
 

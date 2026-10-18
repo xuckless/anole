@@ -6,6 +6,7 @@
 const std = @import("std");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
+const webtransport = @import("webtransport.zig");
 
 const c = ngtcp2.c;
 const h = nghttp3.c;
@@ -17,14 +18,36 @@ pub const Side = struct {
     q: *c.ngtcp2_conn,
     h3: ?*h.nghttp3_conn,
     last_error: *c.ngtcp2_ccerr,
+    /// WebTransport's streams and datagrams, when the connection speaks it.
+    wt: ?*webtransport.Core = null,
 };
 
 /// Feeds nghttp3 the stream data ngtcp2 delivered, and gives back the
 /// flow-control credit for nghttp3's own framing (a body's comes back as
-/// it is read). Returns an ngtcp2 callback result.
-pub fn recvStreamData(side: Side, flags: u32, stream_id: i64, data: []const u8) c_int {
+/// it is read). WebTransport's streams are taken out first, so nghttp3
+/// never sees them. Returns an ngtcp2 callback result.
+pub fn recvStreamData(side: Side, flags: u32, stream_id: i64, offset: u64, data: []const u8) c_int {
+    const fin = flags & c.NGTCP2_STREAM_DATA_FLAG_FIN != 0;
+    var replay: []const u8 = &.{};
+    var head: webtransport.Partial = .{};
+    if (side.wt) |w| {
+        const route = w.route(stream_id, offset, data, fin) catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
+        switch (route) {
+            .taken => return 0,
+            .http3 => |partial| {
+                head = partial;
+                replay = head.bytes[0..head.len];
+            },
+        }
+    }
     const hc = side.h3 orelse return 0;
-    const n = h.nghttp3_conn_read_stream2(hc, stream_id, data.ptr, data.len, @intFromBool(flags & c.NGTCP2_STREAM_DATA_FLAG_FIN != 0), c.ngtcp2_conn_get_timestamp(side.q));
+    // The first bytes of a stream WebTransport held back to look at.
+    if (replay.len > 0) if (readStream(side, hc, stream_id, replay, false) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+    return readStream(side, hc, stream_id, data, fin);
+}
+
+fn readStream(side: Side, hc: *h.nghttp3_conn, stream_id: i64, data: []const u8, fin: bool) c_int {
+    const n = h.nghttp3_conn_read_stream2(hc, stream_id, data.ptr, data.len, @intFromBool(fin), c.ngtcp2_conn_get_timestamp(side.q));
     if (n < 0) {
         log.debug("nghttp3_conn_read_stream2: {s}", .{h.nghttp3_strerror(@intCast(n))});
         c.ngtcp2_ccerr_set_application_error(side.last_error, h.nghttp3_err_infer_quic_app_error_code(@intCast(n)), null, 0);
@@ -46,7 +69,25 @@ pub fn consume(q: *c.ngtcp2_conn, stream_id: i64, n: u64) void {
 pub fn writePacket(side: Side, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, dest_len: usize, ts: u64) c.ngtcp2_ssize {
     const q = side.q;
     var vec: [16]h.nghttp3_vec = undefined;
+    // WebTransport: datagrams first (they are small and go stale), then
+    // its streams and nghttp3's take turns at leading a packet.
+    var datagrams = side.wt != null;
+    const wt_first = if (side.wt) |w| w.takeTurn() else false;
     while (true) {
+        if (side.wt) |w| {
+            if (datagrams) if (w.writeDatagram(p, pi, dest[0..dest_len], ts)) |wrote| switch (wrote) {
+                .more => continue,
+                .packet => |n| return n,
+                .skip => datagrams = false,
+                .failed => |rv| return fail(side, rv),
+            };
+            if (wt_first) if (w.writeStream(p, pi, dest[0..dest_len], ts)) |wrote| switch (wrote) {
+                .more => continue,
+                .skip => {},
+                .packet => |n| return n,
+                .failed => |rv| return fail(side, rv),
+            };
+        }
         var stream_id: i64 = -1;
         var fin: c_int = 0;
         var count: h.nghttp3_ssize = 0;
@@ -56,6 +97,14 @@ pub fn writePacket(side: Side, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, 
                 c.ngtcp2_ccerr_set_application_error(side.last_error, h.nghttp3_err_infer_quic_app_error_code(@intCast(count)), null, 0);
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
             }
+        };
+        // Nothing from nghttp3: WebTransport's streams, if they did not
+        // go first, before a packet of only acknowledgements and the like.
+        if (stream_id < 0 and !wt_first) if (side.wt) |w| if (w.writeStream(p, pi, dest[0..dest_len], ts)) |wrote| switch (wrote) {
+            .more => continue,
+            .skip => {},
+            .packet => |n| return n,
+            .failed => |rv| return fail(side, rv),
         };
         var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
         if (fin != 0) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
@@ -89,6 +138,12 @@ pub fn writePacket(side: Side, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, 
         }
         return n;
     }
+}
+
+/// A write that failed with ngtcp2 error `rv`: the connection ends with it.
+fn fail(side: Side, rv: c.ngtcp2_ssize) c.ngtcp2_ssize {
+    if (side.last_error.error_code == 0) c.ngtcp2_ccerr_set_liberr(side.last_error, @intCast(rv), null, 0);
+    return c.NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 /// Tells nghttp3 a QUIC stream closed. Returns an ngtcp2 callback result.
@@ -156,6 +211,23 @@ pub const Ring = struct {
             from += k;
         }
         r.sent = from;
+        return count;
+    }
+
+    /// What is written and not yet sent, in one or two runs (the ring may
+    /// wrap), leaving `sent` where it is: for a writer that learns only
+    /// afterwards how much went (`ngtcp2_conn_writev_stream`). Returns the
+    /// run count.
+    pub fn unsent(r: *const Ring, runs: *[2][]const u8) usize {
+        var count: usize = 0;
+        var from = r.sent;
+        while (from < r.written and count < runs.len) {
+            const pos: usize = @intCast(from % r.buf.len);
+            const k: usize = @min(@as(usize, @intCast(r.written - from)), r.buf.len - pos);
+            runs[count] = r.buf[pos..][0..k];
+            count += 1;
+            from += k;
+        }
         return count;
     }
 };

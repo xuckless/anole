@@ -1,6 +1,7 @@
 //! HTTP/3: ngtcp2 1.25.0 (QUIC transport, from Anole's xuckless/ngtcp2 fork)
-//! with its BoringSSL crypto helper, and nghttp3 1.18.0 (HTTP/3 + QPACK, the
-//! release tarball), all MIT.
+//! with its BoringSSL crypto helper, and nghttp3 1.18.0 (HTTP/3 + QPACK, from
+//! Anole's xuckless/nghttp3 fork), all MIT. WebTransport's streams and
+//! datagrams sit beside nghttp3 (`webtransport.zig`).
 //! `Endpoint` is the server: a QUIC endpoint whose requests reach the same
 //! router as HTTP/1.1 and HTTP/2. `ClientConnection` is the client, with the
 //! HTTP/2 client's API.

@@ -43,7 +43,8 @@ for macOS and Linux.
   RST_STREAM, or a lost connection, cancels the stream's handler. h2spec
   passes every case in strict mode, over h2c and TLS.
 - HTTP/3 on ngtcp2 1.25.0 (from Anole's fork xuckless/ngtcp2, see the
-  migration entry) and nghttp3 1.18.0: the same handlers over QUIC,
+  migration entry) and nghttp3 1.18.0 (from Anole's fork xuckless/nghttp3,
+  which can send the SETTINGS WebTransport needs): the same handlers over QUIC,
   `Alt-Svc`, Retry, stateless reset, QUIC v2, ECN, PKTINFO, GSO and GRO on
   Linux, per-request timeouts, a GOAWAY drain and mutual TLS. The QUIC interop runner
   passes every server case it was given against ngtcp2's and quic-go's
@@ -70,6 +71,14 @@ for macOS and Linux.
   any core), the token and stateless-reset key, and the drain. The UDP port
   is probed before the group binds, as TCP's is, and a SIGUSR2 restart hands
   every socket over in order.
+- WebTransport over HTTP/3, draft-02 (what Chrome, Edge and Firefox speak):
+  `app.webtransport(path, handler)` or `anole.webtransport.accept` give a
+  session with streams both ways in either direction, datagrams (RFC 9297),
+  `close(code, reason)` and a drain (DRAIN_WEBTRANSPORT_SESSION, then a
+  close). The HTTP/3 client opens sessions too (`openWebTransport`).
+  Checked against aioquic both ways, and in the interop runner's
+  WebTransport mode against flupke (all seven cases); the browser images
+  have not been run yet.
 - TLS through BoringSSL, built from source by Zig: TLS 1.3 and 1.2, ALPN,
   mutual TLS (with the acceptable CAs named in the request, and the client's
   certificate for handlers through `req.peerCertificate()` on HTTP/1.1,
@@ -171,19 +180,20 @@ for macOS and Linux.
 
 ### WebSockets
 
-- RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 behind one
-  `anole.websocket.upgrade`, permessage-deflate, and a rooms helper for
-  broadcast. Autobahn passes every case.
+- RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2 and RFC 9220 over HTTP/3
+  behind one `anole.websocket.upgrade`, permessage-deflate, and a rooms
+  helper for broadcast. Autobahn passes every case; RFC 9220 is checked
+  against aioquic's client.
 - A receive that fails on the client's account sends the matching close
-  code first (1009, 1007 or 1002) on both HTTP versions.
+  code first (1009, 1007 or 1002) on every HTTP version.
 - A drain closes open sockets with 1001 (going away) and ends them as soon
   as their clients answer, rather than at `timeout.shutdown`;
   `Socket.draining()` tells handlers why, `close_on_drain = false` leaves it
   to them, and `req.drain` lets any long-lived handler watch for the drain.
 - `Rooms.broadcast` sends outside the lock: a slow member holds up only the
   broadcasts that include it.
-- RFC 8441 sockets are logged, measured and traced as 101, like HTTP/1.1
-  upgrades.
+- RFC 8441 and RFC 9220 sockets are logged, measured and traced as 101,
+  like HTTP/1.1 upgrades.
 - `app.ws(path, handler)` with `Socket.next()` (text and binary messages,
   null on close): an echo endpoint is one loop; a plain request gets 426.
 - Breaking: `Rooms.init(allocator)` takes no `Io` (it comes from the first
@@ -293,8 +303,8 @@ for macOS and Linux.
   `addApp` and a `.proto`) and deploying (addresses, systemd, Docker).
 - docs/from-fiber.md: Go Fiber v3's API next to Anole's, and what differs
   in Zig (arenas, error unions, no `recover`).
-- Guides for the server, routing, WebSockets, gRPC, clients, auth and
-  observability, with every Zig snippet compiled against the API.
+- Guides for the server, routing, WebSockets, WebTransport, gRPC, clients,
+  auth and observability, with every Zig snippet compiled against the API.
 - Examples, each with `zig build run-<name>`: `hello` (the smallest
   server), `rest` (a JSON CRUD API behind an API-key middleware, checked
   by tests/rest_test.zig), `websocket`, `grpc`, `auth`, `clients`,
@@ -305,7 +315,8 @@ for macOS and Linux.
 
 - CI on Linux and macOS: unit tests for every flag combination, dusty's own
   test suite on Anole's TLS and C libraries, h2spec, Autobahn, gRPC interop,
-  HTTP/3 against aioquic, the QUIC interop runner, fuzzing of the parsers
+  HTTP/3 (WebTransport and RFC 9220 included) against aioquic, the QUIC
+  interop runner and its WebTransport mode, fuzzing of the parsers
   and shim boundaries (HTTP/1.1 requests whole and in pieces, a whole
   connection over HTTP/1.1 and HTTP/2, the PROXY protocol, WebSocket over
   HTTP/2 and permessage-deflate, gRPC frames, metadata and timeouts,
@@ -316,7 +327,9 @@ for macOS and Linux.
 
 ### Not yet
 
-- HTTP/3: WebTransport, and keeping ticket keys (so 0-RTT) across restarts.
+- HTTP/3: keeping ticket keys (so 0-RTT) across restarts.
+- WebTransport's later drafts (13 and on, which need QUIC's RESET_STREAM_AT
+  and per-session flow control), and checks against real browsers.
 - gRPC over HTTP/3; JSON transcoding of client and bidirectional streaming
   methods.
 - Benchmarks on a dedicated Linux machine (the first results, on a Mac, are

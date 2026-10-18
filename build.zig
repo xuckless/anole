@@ -604,6 +604,19 @@ pub fn build(b: *std.Build) void {
         });
         b.step("h3-interop-server", "Build the QUIC interop runner's server (tests/interop/build.sh)").dependOn(&b.addInstallArtifact(h3_interop, .{}).step);
         test_step.dependOn(&h3_interop.step);
+        // The interop runner's WebTransport server endpoint
+        // (tests/interop/webtransport).
+        const wt_interop = b.addExecutable(.{
+            .name = "wt-interop-server",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/h3/wt_interop.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        b.step("wt-interop-server", "Build the interop runner's WebTransport server (tests/interop/webtransport/run.sh)").dependOn(&b.addInstallArtifact(wt_interop, .{}).step);
+        test_step.dependOn(&wt_interop.step);
     }
 
     // examples/io: handlers that wait on timers, files and outbound requests

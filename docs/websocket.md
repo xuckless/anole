@@ -1,7 +1,7 @@
 # WebSocket
 
-Anole serves WebSockets over HTTP/1.1 and HTTP/2 with one `Socket` type for
-both. `app.ws` registers an endpoint in one line; `anole.websocket.upgrade`
+Anole serves WebSockets over HTTP/1.1, HTTP/2 and HTTP/3 with one `Socket`
+type for all three. `app.ws` registers an endpoint in one line; `anole.websocket.upgrade`
 does the same from an ordinary route handler, for full control. The
 runnable example is `examples/websocket/main.zig`:
 
@@ -19,20 +19,22 @@ page on `/` that you can open in two browser tabs.
   TLS listeners. The Autobahn test suite passes all 517 cases.
 - RFC 8441 over HTTP/2 (extended CONNECT), over h2c and over TLS. The HTTP/2
   engine advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` by default.
-- permessage-deflate (RFC 7692), on both HTTP versions, when the client
+- RFC 9220 over HTTP/3 (extended CONNECT again), on the HTTP/3 listener. It
+  too advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` by default. Checked
+  against aioquic's client (`tests/h3/run.sh`): text, binary, ping, close
+  and the drain's 1001.
+- permessage-deflate (RFC 7692), on every HTTP version, when the client
   offers it.
 - `anole.websocket.Rooms`, named groups of sockets for broadcast.
 - Text messages are checked for valid UTF-8, pings are answered and close
   frames are echoed for you.
 
-WebSocket over HTTP/3 (RFC 9220) is not supported. A request that arrives
-over HTTP/3 is not upgraded.
-
 ## Build flags
 
 WebSocket is on in the `web` and `full` profiles. `-Dwebsocket=false` removes
 it, and `anole.websocket` becomes an empty struct. permessage-deflate needs
-`-Dcompression` (zlib-ng). RFC 8441 needs `-Dhttp2`.
+`-Dcompression` (zlib-ng). RFC 8441 needs `-Dhttp2`, and RFC 9220
+`-Dhttp3`.
 
 ## An endpoint in one line
 
@@ -45,7 +47,7 @@ app.ws("/echo", echo);
 ```
 
 `app.ws(path, handler)` registers a `GET` route that accepts the WebSocket,
-on either HTTP version, and calls `handler` with the open socket. When the
+on any HTTP version, and calls `handler` with the open socket. When the
 handler returns, the socket is closed with 1000 (1011 if it returned an
 error, nothing if it is closed already). A plain HTTP request on that path
 gets 426 Upgrade Required. The server's drain closes the socket with 1001
@@ -77,15 +79,16 @@ fn echo(_: *App, req: *anole.Request, res: *anole.Response) !void {
 }
 ```
 
-The same route serves both versions. An RFC 8441 request reaches the router
-as a `GET` with `req.protocol` set to `"websocket"`. On the wire the server
-accepts it with a 200, as RFC 8441 requires, but the access log, metrics and
-spans record it as 101, like an HTTP/1.1 upgrade, so a WebSocket reads the
-same on both. `ws.conn` tells you which one you got (`.h1` or `.h2`).
+The same route serves every version. An RFC 8441 or RFC 9220 request
+reaches the router as a `GET` with `req.protocol` set to `"websocket"`. On
+the wire the server accepts it with a 200, as both RFCs require, but the
+access log, metrics and spans record it as 101, like an HTTP/1.1 upgrade, so
+a WebSocket reads the same on all of them. `ws.conn` tells you which kind
+you got: `.h1`, or `.h2` for a socket on a stream (HTTP/2 or HTTP/3).
 
 The socket lives as long as the handler. It is held in the request's arena,
 so do not keep a pointer to it after the handler returns. Always
-`defer ws.deinit()`; on HTTP/2 that also ends the stream.
+`defer ws.deinit()`; on HTTP/2 and HTTP/3 that also ends the stream.
 
 Over HTTP/2, call `anole.websocket.upgrade`, not dusty's
 `res.upgradeWebSocket`. The dusty call handles HTTP/1.1 only and returns null
@@ -95,6 +98,10 @@ in the server options (keep the stream limit, which this field replaces):
 ```zig
 .http2 = .{ .max_concurrent_streams = 250, .enable_connect_protocol = false },
 ```
+
+Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
+(the dusty call never handled HTTP/3 anyway). A plain CONNECT, without
+`:protocol`, gets 501 over HTTP/3: Anole is no proxy.
 
 ### Upgrade options
 
@@ -167,7 +174,7 @@ When a client sends something invalid (a message over `max_message_size`,
 invalid UTF-8, a bad frame), `receive` returns an error, and a close frame
 with the matching code goes out first: 1009 for a message too large, 1007
 for text that is not UTF-8, 1002 for any other protocol error. This holds
-on both HTTP versions. Return from the handler.
+on every HTTP version. Return from the handler.
 
 ## Timeouts
 
@@ -188,14 +195,14 @@ while (true) {
 }
 ```
 
-When a timeout runs out, the connection is cut (over HTTP/2, only the
-stream) and `receive` fails. No close frame is sent.
+When a timeout runs out, the connection is cut (over HTTP/2 and HTTP/3,
+only the stream) and `receive` fails. No close frame is sent.
 
 ### Shutdown
 
 On SIGINT or SIGTERM the server stops accepting and waits for requests in
 flight, and an open socket counts as one. When the drain starts, every open
-socket, on HTTP/1.1 or HTTP/2, is sent close 1001 (going away) with the
+socket, on HTTP/1.1, HTTP/2 or HTTP/3, is sent close 1001 (going away) with the
 reason `"server shutting down"`. A handler does not need to do anything:
 the client answers the close, `receive` returns that answer as a `.close`
 message, and the handler returns as it would for any close. Sending after
@@ -289,8 +296,8 @@ fn chat(app: *App, ws: *anole.websocket.Socket, req: *anole.Request) !void {
   `receive` will see the connection end.
 - `count(room)` returns the number of members.
 
-Rooms work across HTTP versions and threads: a socket on HTTP/1.1 and one on
-HTTP/2 can share a room. A broadcast takes a snapshot of the room's members
+Rooms work across HTTP versions and threads: sockets on HTTP/1.1, HTTP/2 and
+HTTP/3 can share a room. A broadcast takes a snapshot of the room's members
 under a short lock and sends outside it, to each member in turn. A slow
 client therefore slows only the broadcasts that include it, and the caller
 of such a broadcast waits for its send; broadcasts to other rooms, joins and
@@ -300,7 +307,7 @@ the room and returned. For large rooms or slow clients, queue messages per
 socket in your own code instead, so one client cannot hold up the rest of
 its room.
 
-## Browsers and HTTP/2
+## Browsers, HTTP/2 and HTTP/3
 
 Browsers use RFC 8441 only over TLS (h2), never over h2c. As of 2026-10:
 
@@ -310,7 +317,11 @@ Browsers use RFC 8441 only over TLS (h2), never over h2c. As of 2026-10:
   confirmed.
 - Safari shows no support and uses HTTP/1.1.
 
-Because `upgrade` handles both versions, you do not need to care which one a
+No browser opens WebSockets over HTTP/3 by default yet: Chrome has RFC 9220
+behind a flag (`kEnableWebsocketsOverHttp3`, off), and Firefox has no
+setting for it. RFC 9220 is there for clients that do, such as aioquic's.
+
+Because `upgrade` handles every version, you do not need to care which one a
 browser picks. Try it with the example on `https://127.0.0.1:8445/` (accept
 the self-signed certificate) in Firefox; the log reads
 `chat: WebSocket over HTTP/2 joined lobby`.
