@@ -99,6 +99,19 @@ these routes too.
 With application state, use `anole.Server(App)` and `register(App, ...)`, and
 reach the state from a handler with `call.state(App)`.
 
+`registerWith` takes options for one registration:
+
+```zig
+anole.grpc.registerWith(void, app.router, pb.Greeter(Call, anyerror), .{ .SayHello = sayHello }, .{
+    .max_message_size = 64 * 1024, // default anole.grpc.default_max_message_size, 4 MiB
+    .data = &greeter_state, // `call.data` in each handler of this registration
+});
+```
+
+`max_message_size` bounds each request message after decompression; a larger
+one fails the call with RESOURCE_EXHAUSTED. `data` is for handlers that serve
+more than one registration, such as the same service on two servers.
+
 ## Handler shapes
 
 The method's kind comes from the generated signature. Requests and responses
@@ -148,17 +161,19 @@ lives until the call ends.
 | `call.io` | The `std.Io` for async work (timers, outbound calls, files). |
 | `call.arena` | The call's arena; thread-safe. |
 | `call.metadata(name)` | A request metadata value by lower-case name, or null. |
-| `call.addHeader(name, value)` | Initial metadata. Only before the first response message. |
+| `call.addHeader(name, value)` | Initial metadata. `error.HeadersSent` once the first response message has gone out. |
 | `call.addTrailer(name, value)` | Trailing metadata, sent with the status. |
 | `call.fail(code, message)` | Sets the status; return what it returns. |
 | `call.deadline` | The client's deadline, if it sent one. |
 | `call.deadlineExceeded()` | True once the deadline has passed. |
 | `call.cancelled()` | The client went away, or the deadline passed. |
 | `call.state(T)` | The `Server(T)` application state. |
+| `call.data` | `RegisterOptions.data` of the registration, or null. |
 | `call.request_compression`, `call.protocol`, `call.codec` | How the request came in. |
 
 In a streaming handler, add headers before the first `putOne`: the writer
-task sends the response head with the first message.
+task sends the response head with the first message, and once it has,
+`addHeader` returns `error.HeadersSent`.
 
 ### Status codes
 
@@ -172,10 +187,14 @@ The codes are `anole.grpc.Code`: `.ok`, `.cancelled`, `.unknown`,
 Other errors map to a status too:
 
 - `error.Canceled` becomes DEADLINE_EXCEEDED past the deadline, else CANCELLED;
-- a request message over 4 MiB becomes RESOURCE_EXHAUSTED;
+- a request message over the registration's limit (4 MiB by default) becomes
+  RESOURCE_EXHAUSTED;
 - a message that does not decode becomes INTERNAL;
-- any other error becomes UNKNOWN, with the error's name as the message, so
-  the client sees it. Use `call.fail` for anything you want to word yourself.
+- any other error becomes UNKNOWN with the message "Application error
+  processing RPC" (grpc-java's wording). The error's name stays on the
+  server: it is logged at `warn` in scope `anole_grpc`, with the path and the
+  request ID when the RequestId middleware runs. Use `call.fail` for anything
+  the client should read.
 
 The response's HTTP status is 200 for gRPC and gRPC-Web, so an access log
 shows 200 for a failed call; the gRPC status travels in the trailers.
@@ -188,9 +207,20 @@ When it passes, Anole cancels the handler: any wait on `call.io` returns
 check the deadline yourself while you wait on `call.io`. A call without a
 deadline is not bound by the server's request timeout.
 
-When the client resets the stream, the handler is not canceled. A handler that
-waits a long time on something other than its queues checks
-`call.cancelled()` between waits.
+When the client resets the stream (RST_STREAM), or the connection is lost,
+the handler is canceled the same way: its next wait on `call.io` returns
+`error.Canceled`, so a call blocked in a sleep, a database query or an
+outbound request ends at once. The call ends as CANCELLED, which a client
+that reset its stream no longer reads. This holds for HTTP/2 under Anole's
+zio runtime, which is what `anole.Server` runs. A connection that ends
+cleanly may be only half-closed, so the server first checks with a PING
+(every 500 ms) whether the client is gone before canceling handlers whose
+request was complete.
+
+`call.cancelled()` still reports the client going away or the deadline
+passing: use it in work that does not wait on `call.io`, such as a long
+computation, and on HTTP/1.1 (gRPC-Web, Connect), where nothing cancels the
+handler.
 
 ### Compression
 
@@ -245,7 +275,31 @@ You need nothing extra on the server: the routes `register` adds serve them.
 - Connect streaming (`application/connect+proto` or `+json`) serves all four
   call modes, with the status in an end-of-stream message.
 
-Connect's GET form for idempotent methods is not supported yet.
+### Connect GET
+
+A unary method marked as free of side effects also answers Connect's GET
+form, which browsers, proxies and CDNs can cache:
+
+```proto
+rpc GetGreeting(GreetingRequest) returns (Greeting) {
+  option idempotency_level = NO_SIDE_EFFECTS;
+}
+```
+
+`register` adds a GET route beside the POST one for such methods (zig-protobuf
+keeps the option in the generated `_method_options`). The query carries the
+call: `encoding` (`proto` or `json`, else `415`), `message` (the request,
+percent-encoded, or with `base64=1` in URL-safe base64, padded or not; absent
+is an empty message), `compression` (`identity` or `gzip`, else
+UNIMPLEMENTED) and `connect=v1` (optional; another version is
+INVALID_ARGUMENT). Other parameters are ignored. The answer is a Connect unary
+response, compressed by the request's `Accept-Encoding`.
+
+```sh
+curl 'http://localhost:8083/greeter.Greeter/GetGreeting?connect=v1&encoding=json&message=%7B%22name%22%3A%22Ada%22%7D'
+```
+
+A GET on any other method is `405 Method Not Allowed`.
 
 ## The health service
 
@@ -261,8 +315,9 @@ try health.set("greeter.Greeter", .SERVING);
 The empty service name is the server as a whole, and starts SERVING. Change a
 status with `set(name, .NOT_SERVING)`, or mark everything NOT_SERVING with
 `shutdown()`. Watch streams each change. Check on an unknown name fails with
-NOT_FOUND. Keep one `Health` per process: the routes it registers read a
-process-wide instance.
+NOT_FOUND. Each `Health` is its own registry: two servers in one process can
+each register their own, or both register the same one. It must outlive the
+router.
 
 ```sh
 curl -H 'Content-Type: application/json' -d '{"service":"greeter.Greeter"}' \
@@ -326,10 +381,14 @@ deadline reports DEADLINE_EXCEEDED.
 ## Interop
 
 grpc-go v1.84.0's interop client passes all 14 cases it runs against Anole's
-server over h2c (`tests/grpc/interop/run.sh`), and Anole's client passes 11
-cases against grpc-go's server (`tests/grpc/interop/run-client.sh`). Both run
-in CI. The same cases over TLS, and grpc's `http2_interop` suite, are not run
-yet. For benchmark numbers against grpc-go, see the README.
+server (`tests/grpc/interop/run.sh`), and Anole's client passes 11 cases
+against grpc-go's server (`tests/grpc/interop/run-client.sh`), each over h2c
+and, with `--tls`, over TLS with a certificate made for the run. grpc's
+HTTP/2 server checks (`tools/http2_interop`, `tests/grpc/interop/run-http2.sh`)
+pass their framing cases over h2c and TLS and the TLS profile, except five
+results the tool itself causes (listed with reasons in
+`tests/grpc/interop/http2-known-failures.txt`). All of it runs in CI. For
+benchmark numbers against grpc-go, see the README.
 
 ## Not there yet
 
@@ -337,8 +396,5 @@ yet. For benchmark numbers against grpc-go, see the README.
   methods). Connect's JSON covers many of the same uses meanwhile.
 - gRPC over HTTP/3. Native gRPC runs over HTTP/2 only.
 - Server reflection.
-- Connect GET requests.
-- A configurable message size limit on the server: it is 4 MiB. The client's
-  is `Channel.max_message_size`, also 4 MiB by default.
-- Canceling a handler when the client resets its stream (use
-  `call.cancelled()`).
+- Canceling the handler of a gRPC-Web or Connect call over HTTP/1.1 when the
+  client goes away (check `call.cancelled()`).

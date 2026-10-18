@@ -39,7 +39,8 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
 - gRPC server and client over HTTP/2 (all four call modes, deadlines,
   metadata, gzip), plus gRPC-Web and Buf's Connect protocol, and the
   `grpc.health.v1` service; grpc-go's interop client passes 14/14 cases
-  against Anole and Anole's client passes 11/11 against grpc-go's server;
+  against Anole and Anole's client passes 11/11 against grpc-go's server,
+  over h2c and TLS;
   `zig build` runs protoc and the Zig code generator, so nothing extra to install;
 - an HTTP/2 client (nghttp2), used by the gRPC client;
 - JSON on yyjson, a Redis/Valkey client on hiredis, server-side sessions in

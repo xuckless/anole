@@ -22,8 +22,9 @@ for macOS and Linux.
   connection.
 - HTTP/2 on nghttp2 1.70.0 (with an RFC 9113 strictness patch), over TLS
   through ALPN and over cleartext with prior knowledge, on the same router;
-  streaming bodies, trailers, two-phase GOAWAY on drain. h2spec passes every
-  case in strict mode, over h2c and TLS.
+  streaming bodies, trailers, two-phase GOAWAY on drain. A client's
+  RST_STREAM, or a lost connection, cancels the stream's handler. h2spec
+  passes every case in strict mode, over h2c and TLS.
 - HTTP/3 on ngtcp2 1.25.0 and nghttp3 1.18.0: the same handlers over QUIC,
   `Alt-Svc`, Retry, stateless reset, QUIC v2, ECN, PKTINFO, GSO and GRO on
   Linux, per-request timeouts, a GOAWAY drain and mutual TLS. The QUIC interop runner
@@ -64,10 +65,18 @@ for macOS and Linux.
 ### gRPC
 
 - Server and client over HTTP/2: all four call modes, deadlines, metadata,
-  status in trailers, gzip. grpc-go's interop client passes 14/14 cases
-  against Anole and Anole's client 11/11 against grpc-go.
-- gRPC-Web and Buf's Connect protocol on the same routes, and the
-  `grpc.health.v1` service.
+  status in trailers, gzip, and handlers canceled when the client resets the
+  call. grpc-go's interop client passes 14/14 cases against Anole and Anole's
+  client 11/11 against grpc-go, each over h2c and TLS; grpc's
+  `tools/http2_interop` server checks run too.
+- `registerWith` options per registration: the request message limit
+  (`default_max_message_size`, 4 MiB, by default) and data for the handlers.
+  A handler's own error reaches the client as UNKNOWN "Application error
+  processing RPC" and is logged on the server, rather than sent by name.
+  `Call.addHeader` returns `error.HeadersSent` once the response has started.
+- gRPC-Web and Buf's Connect protocol on the same routes, including Connect's
+  GET form for methods marked `NO_SIDE_EFFECTS`, and the `grpc.health.v1`
+  service (`anole.grpc.Health`, one registry per instance).
 - `addProtoGen` for an application's build.zig: protoc and the Zig generator
   are pinned and built by `zig build`, nothing to install.
 
