@@ -83,3 +83,19 @@ jobs:
       # listed case that now passes, and if the server dies.
       - name: h2spec over h2c and over TLS
         run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/hello
+
+  autobahn:
+    name: Autobahn (WebSocket conformance, HTTP/1.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: autobahn
+      - name: Build the echo peer
+        run: zig build autobahn-echo -Doptimize=ReleaseSafe --summary all
+      # The fuzzing client in Docker (image pinned by digest); fails on any
+      # case that is not OK, NON-STRICT or INFORMATIONAL.
+      - name: Autobahn fuzzing client
+        run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo

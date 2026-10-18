@@ -213,6 +213,21 @@ pub fn build(b: *std.Build) void {
     const run_io = b.addRunArtifact(io_example);
     run_io.addPassthruArgs();
     b.step("run-io", "Run examples/io (pass a port after --, default 8081)").dependOn(&run_io.step);
+
+    // tests/autobahn: the WebSocket echo peer for the Autobahn suite.
+    if (features.websocket) {
+        const echo = b.addExecutable(.{
+            .name = "autobahn-echo",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/autobahn/echo.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        b.step("autobahn-echo", "Build the Autobahn echo peer (tests/autobahn/run.sh runs the suite)").dependOn(&b.addInstallArtifact(echo, .{}).step);
+        test_step.dependOn(&echo.step);
+    }
 }
 
 /// Reads -Dprofile and the per-feature overrides. A feature that depends on a
