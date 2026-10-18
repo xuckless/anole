@@ -1,5 +1,13 @@
 //! WebSocket for handlers, over HTTP/1.1 (RFC 6455 upgrade) and HTTP/2
-//! (RFC 8441 extended CONNECT), behind one `Socket`:
+//! (RFC 8441 extended CONNECT), behind one `Socket`. The short form is a
+//! route of its own (`Server.ws`, through `route`):
+//!
+//!     fn echo(ws: *anole.websocket.Socket, _: *anole.Request) !void {
+//!         while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+//!     }
+//!     app.ws("/echo", echo);
+//!
+//! and from any handler, `upgrade`:
 //!
 //!     fn chat(req: *anole.Request, res: *anole.Response) !void {
 //!         var ws = (try anole.websocket.upgrade(req, res, .{})) orelse {
