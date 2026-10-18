@@ -378,26 +378,34 @@ fn getMessage(call: *Call) ![]const u8 {
     if (query.get("connect")) |version| {
         if (!std.mem.eql(u8, version, "v1")) return call.fail(.invalid_argument, "unsupported connect protocol version");
     }
-    var message: []const u8 = query.get("message") orelse "";
-    if (query.get("base64")) |flag| if (std.mem.eql(u8, flag, "1")) {
-        // URL-safe base64, padded or not.
-        const trimmed = std.mem.trimEnd(u8, message, "=");
-        const decoder = std.base64.url_safe_no_pad.Decoder;
-        const len = decoder.calcSizeForSlice(trimmed) catch return call.fail(.invalid_argument, "message is not URL-safe base64");
-        const decoded = try call.arena.alloc(u8, len);
-        decoder.decode(decoded, trimmed) catch return call.fail(.invalid_argument, "message is not URL-safe base64");
-        message = decoded;
-    };
     const compression: Compression = if (query.get("compression")) |name|
         Compression.parse(name) orelse return call.fail(.unimplemented, "unsupported compression; supported: " ++ comptime acceptEncoding())
     else
         .identity;
-    // An empty message is never decompressed.
-    if (compression == .gzip and message.len > 0) {
-        if (comptime !features.compression) return call.fail(.unimplemented, "gzip is not built in");
-        message = try frame.decompressGzip(call.arena, message, call.max_message_size);
+    if (compression == .gzip and !features.compression) return call.fail(.unimplemented, "gzip is not built in");
+    const base64 = if (query.get("base64")) |flag| std.mem.eql(u8, flag, "1") else false;
+    return decodeGetMessage(call.arena, query.get("message") orelse "", base64, compression, call.max_message_size) catch |err| switch (err) {
+        error.InvalidBase64 => call.fail(.invalid_argument, "message is not URL-safe base64"),
+        else => |e| e,
+    };
+}
+
+/// The `message` query parameter of a Connect GET (already percent-decoded)
+/// back to the codec's bytes: URL-safe base64 (padded or not) undone when
+/// `base64`, then inflated for gzip; at most `max_message_size` bytes.
+fn decodeGetMessage(arena: std.mem.Allocator, text: []const u8, base64: bool, compression: Compression, max_message_size: usize) ![]const u8 {
+    var message = text;
+    if (base64) {
+        const trimmed = std.mem.trimEnd(u8, message, "=");
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const len = decoder.calcSizeForSlice(trimmed) catch return error.InvalidBase64;
+        const decoded = try arena.alloc(u8, len);
+        decoder.decode(decoded, trimmed) catch return error.InvalidBase64;
+        message = decoded;
     }
-    if (message.len > call.max_message_size) return error.MessageTooLarge;
+    // An empty message is never decompressed.
+    if (compression == .gzip and message.len > 0) message = try frame.decompressGzip(arena, message, max_message_size);
+    if (message.len > max_message_size) return error.MessageTooLarge;
     return message;
 }
 
@@ -770,6 +778,33 @@ fn runBidi(comptime M: type, comptime handler: anytype, call: *Call, body: *dust
     try group.await(call.io);
     try reader_result;
     return handler_result;
+}
+
+test "fuzz: Connect GET messages, base64 and gzip" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            if (input.len == 0) return;
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            // The first byte picks base64 and gzip, and a limit.
+            const base64 = input[0] & 1 != 0;
+            const compression: Compression = if (input[0] & 2 != 0 and features.compression) .gzip else .identity;
+            const max: usize = if (input[0] & 4 != 0) 64 else 1024;
+            // Refusing the input is fine; running out of memory is not.
+            const message = decodeGetMessage(arena.allocator(), input[1..], base64, compression, max) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return;
+            };
+            if (message.len > max) return error.OverLimit;
+        }
+    }.check, &.{
+        "\x01CgJoaQ",
+        "\x01CgJoaQ==",
+        "\x00{\"message\":\"hi\"}",
+        "\x03H4sIAAAAAAAAA-PiYGFgYGRgAAA",
+        "\x07H4sIAAAAAAAA",
+        "\x02\x1f\x8b\x08\x00",
+    });
 }
 
 test "percentEncode leaves printable ASCII and escapes the rest" {
