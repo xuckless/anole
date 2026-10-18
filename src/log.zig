@@ -1,11 +1,27 @@
-//! Anole's log output: std's default log with the scopes of the libraries
-//! underneath renamed to Anole's (`dusty` -> `anole`, `dusty_access` ->
-//! `access`, `dusty_h2` -> `anole_h2`), so a server's terminal reads as one
-//! program. An executable
-//! opts in from its root file:
+//! Anole's log setup. The libraries underneath log under Anole's own scopes
+//! (`anole`, `access`, `anole_h2`, `anole_h3`), so a server's terminal reads
+//! as one program with std's default log. An executable may also declare,
+//! in its root file:
 //!
-//!     pub const std_options: std.Options = .{ .logFn = anole.logFn };
+//!     pub const std_options = anole.std_options;
+//!
+//! which keeps the debug chatter of the runtime (a line per worker thread
+//! started and stopped) and of the connection loops out of Debug builds.
+//!
+//! `logFn` is kept for programs that set it: it renames the scopes older
+//! builds of the dusty fork used (`dusty` -> `anole`, `dusty_access` ->
+//! `access`, `dusty_h2` -> `anole_h2`) and passes everything else through.
 const std = @import("std");
+
+pub const std_options: std.Options = .{
+    .logFn = logFn,
+    .log_scope_levels = &.{
+        .{ .scope = .zio, .level = .info },
+        .{ .scope = .anole, .level = .info },
+        .{ .scope = .anole_h2, .level = .info },
+        .{ .scope = .anole_h3, .level = .info },
+    },
+};
 
 pub fn logFn(
     comptime level: std.log.Level,
@@ -25,9 +41,23 @@ fn rename(comptime scope: @EnumLiteral()) @EnumLiteral() {
     return scope;
 }
 
-test "dusty's scopes are renamed, others kept" {
+test "older scopes are renamed, others kept" {
     try std.testing.expect(comptime rename(.dusty) == .anole);
     try std.testing.expect(comptime rename(.dusty_access) == .access);
     try std.testing.expect(comptime rename(.dusty_h2) == .anole_h2);
+    try std.testing.expect(comptime rename(.anole) == .anole);
     try std.testing.expect(comptime rename(.zio) == .zio);
+}
+
+test "std_options: debug from the runtime and the loops quieted, the access log kept" {
+    comptime {
+        var zio_seen = false;
+        for (std_options.log_scope_levels) |l| {
+            std.debug.assert(l.level == .info);
+            // The access log is info already; nothing here may hide it.
+            std.debug.assert(l.scope != .access);
+            if (l.scope == .zio) zio_seen = true;
+        }
+        std.debug.assert(zio_seen);
+    }
 }
