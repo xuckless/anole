@@ -148,7 +148,7 @@ test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodie
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const addr = server.address.ip;
 
     var out: [64 * 1024]u8 = undefined;

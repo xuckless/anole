@@ -665,9 +665,11 @@ pub fn Server(comptime Ctx: type) type {
             return self.server.addresses;
         }
 
-        /// Waits until the listeners are bound.
+        /// Waits until the listeners are bound, or returns `run`'s error if
+        /// it stopped before they were (a certificate that will not load,
+        /// a port in use) rather than waiting for good.
         pub fn waitReady(self: *Self) !void {
-            try self.server.ready.wait(self.rt.io());
+            try self.server.waitReady(self.rt.io());
         }
 
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and
@@ -779,7 +781,9 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn notifyWhenReady(server: *http.Server(Ctx), rt_io: std.Io, process: std.process.Init.Minimal) void {
-            server.ready.wait(rt_io) catch return;
+            // Only a server that is listening tells the predecessor so;
+            // one that failed to start leaves it to time out and carry on.
+            server.waitReady(rt_io) catch return;
             // A successor names itself the main process before its
             // predecessor starts to exit.
             const successor = handoff.isSuccessor(process.environ);

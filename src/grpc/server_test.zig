@@ -248,7 +248,7 @@ test "gRPC: unary, server, client and bidi streaming; status and trailers; deadl
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const addr = server.address.ip;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -372,7 +372,7 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const port = server.address.ip.getPort();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -467,7 +467,7 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const h2 = @import("anole_h2_client");
     const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
@@ -552,7 +552,7 @@ fn startServer(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!
             try s.run();
         }
     }.run, .{server});
-    try server.ready.wait(io);
+    try server.waitReady(io);
     return future;
 }
 

@@ -48,7 +48,7 @@ test "CSRF: a token from the session, required on POST" {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const port = server.address.ip.getPort();
 
     var out: [4096]u8 = undefined;
@@ -108,7 +108,7 @@ test "API key: the owner reaches the handler but never a session cookie" {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const port = server.address.ip.getPort();
 
     var out: [4096]u8 = undefined;

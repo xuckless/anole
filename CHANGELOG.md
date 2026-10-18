@@ -55,6 +55,10 @@ for macOS and Linux.
   scheduling, so `zio_options` is optional, and declaring work stealing is a
   compile error. A second `Server` on a thread that has one fails with
   `error.ServerAlreadyOnThread` instead of an assertion in zio.
+  `Server.waitReady` returns `run`'s error when the server stops before it
+  is listening (a certificate that will not load, a port in use) instead of
+  waiting for good; a restarted process tells its predecessor it is serving
+  only once it really is.
 - A response can carry 64 headers (`response.max_header_count`), no longer
   capped by the request's `max_header_count` (32).
 - An opt-in blocking pool (`Options.blocking`, `anole.blocking.run`):
@@ -162,10 +166,11 @@ for macOS and Linux.
   HTTP/3 against aioquic, the QUIC interop runner, fuzzing of the parsers
   and shim boundaries (HTTP/1.1 requests whole and in pieces, a whole
   connection over HTTP/1.1 and HTTP/2, the PROXY protocol, WebSocket over
-  HTTP/2 and permessage-deflate, gRPC frames, metadata and timeouts, JSON,
-  session cookies, traceparent, JWS and JWK Sets, OIDC discovery, token
-  responses and ID token claims, `LISTEN_FDS`), a clean-consumer build, and a weekly check of the C libraries' pins
-  against known advisories.
+  HTTP/2 and permessage-deflate, gRPC frames, metadata and timeouts,
+  Connect GET messages, JSON, session cookies, traceparent, JWS and JWK
+  Sets, OIDC discovery, token responses and ID token claims,
+  `LISTEN_FDS`), a clean-consumer build, and a weekly check of the C
+  libraries' pins against known advisories.
 
 ### Not yet
 

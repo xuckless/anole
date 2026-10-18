@@ -82,7 +82,7 @@ fn startServer(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!
             try s.run();
         }
     }.run, .{server});
-    try server.ready.wait(io);
+    try server.waitReady(io);
     return future;
 }
 

@@ -54,7 +54,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
     otel.router.post("/v1/traces", collector);
     var otel_future = try io.concurrent(serve, .{&otel});
     defer otel_future.cancel(io) catch {};
-    try otel.ready.wait(io);
+    try otel.waitReady(io);
 
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
@@ -81,7 +81,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
     health.registerOn(void, &app.router, &app);
     var app_future = try io.concurrent(serve, .{&app});
     defer app_future.cancel(io) catch {};
-    try app.ready.wait(io);
+    try app.waitReady(io);
     const port = app.address.ip.getPort();
 
     var out: [8192]u8 = undefined;
@@ -161,7 +161,7 @@ test "observe: an unsampled caller's context is passed on; error statuses as sen
     registry.serveOn(void, &app.router, "/metrics");
     var app_future = try io.concurrent(serve, .{&app});
     defer app_future.cancel(io) catch {};
-    try app.ready.wait(io);
+    try app.waitReady(io);
     const port = app.address.ip.getPort();
 
     var out: [8192]u8 = undefined;
@@ -202,7 +202,7 @@ test "observe: two servers in one process each serve their own health and metric
         r.serveOn(void, &s.router, "/metrics");
         h.registerOn(void, &s.router, s);
         futures[i] = try io.concurrent(serve, .{s});
-        try s.ready.wait(io);
+        try s.waitReady(io);
     }
     defer for (&servers, &registries, &futures) |*s, *r, *f| {
         f.cancel(io) catch {};
@@ -260,7 +260,7 @@ test "observe: /readyz answers 503 to a request routed after the drain started" 
     health.registerOn(void, &app.router, &app);
     var app_future = try io.concurrent(serve, .{&app});
     defer app_future.cancel(io) catch {};
-    try app.ready.wait(io);
+    try app.waitReady(io);
     const port = app.address.ip.getPort();
 
     var out: [1024]u8 = undefined;
@@ -333,7 +333,7 @@ test "observe: exclude keeps probes out of metrics and traces" {
     health.registerOn(void, &app.router, &app);
     var app_future = try io.concurrent(serve, .{&app});
     defer app_future.cancel(io) catch {};
-    try app.ready.wait(io);
+    try app.waitReady(io);
     const port = app.address.ip.getPort();
 
     var out: [8192]u8 = undefined;

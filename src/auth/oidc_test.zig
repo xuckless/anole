@@ -83,7 +83,7 @@ test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     provider_port = server.address.ip.getPort();
 
     var client = dusty.Client.init(gpa, io, .{});

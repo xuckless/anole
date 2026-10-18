@@ -513,7 +513,7 @@ test "TLS hello: HTTPS GET through dusty's seam, certificate verified, ALPN http
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var client = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
             defer client.deinit();
 
@@ -557,7 +557,7 @@ test "TLS hello: a client that does not trust the certificate is refused" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io, dir: std.Io.Dir) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var client = dusty.Client.init(std.testing.allocator, _io, .{
                 .tls = .{ .ca = .{ .file = .{ .path = "other.pem", .dir = dir } } },
             });
@@ -593,7 +593,7 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa, dir: std.Io.Dir) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
             {
@@ -639,7 +639,7 @@ test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" 
     server.router.get("/", handleHello);
     var server_future = try io.concurrent(runServer, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     // Reads what the server asked for, in the cert callback: the requested
     // CAs are readable only during the handshake.
@@ -695,7 +695,7 @@ test "TLS hello: a connection the server closes ends with close_notify" {
     server.router.get("/", handleHello);
     var server_future = try io.concurrent(runServer, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const Peer = struct {
         fn run(port: u16) !void {
@@ -728,7 +728,7 @@ test "TLS hello: an RSA-4096 handshake fits the default coroutine stacks on both
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
             // Two clients, so two connections and two full handshakes.
@@ -755,7 +755,7 @@ test "TLS hello: a returning client resumes its session with a ticket" {
     server.router.get("/", handleHello);
     var server_future = try io.concurrent(runServer, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const Returning = struct {
         /// The latest session the server issued: in TLS 1.3 sessions come
@@ -814,7 +814,7 @@ test "TLS hello: a certificate reload serves the new certificate, and tickets fr
     server.router.get("/", handleHello);
     var server_future = try io.concurrent(runServer, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const Client = struct {
         var latest: ?*c.SSL_SESSION = null;

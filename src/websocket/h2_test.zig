@@ -238,7 +238,7 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var client: Client = undefined;
     try client.init(io, server.address.ip);
@@ -307,7 +307,7 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var client: Client = undefined;
     try client.init(io, server.address.ip);

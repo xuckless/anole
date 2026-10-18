@@ -83,7 +83,7 @@ const Running = struct {
             gpa.destroy(server);
         }
         const future = try io.concurrent(run, .{server});
-        try server.ready.wait(io);
+        try server.waitReady(io);
         return .{ .server = server, .future = future };
     }
 
@@ -125,7 +125,7 @@ test "h2 client: GET, a large streamed echo, trailers and 20 concurrent streams"
         }
     }.run, .{server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
     defer conn.close();
@@ -206,7 +206,7 @@ test "h2 client: over TLS with ALPN h2" {
         }
     }.run, .{server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const conn = try h2.ClientConnection.connect(gpa, io, .{
         .host = "localhost",
@@ -272,7 +272,7 @@ test "h2 engine: a client's RST_STREAM or a lost connection cancels the stream's
         }
     }.run, .{server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const sleep_request = [_]h2.Header{
         .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/sleep" },

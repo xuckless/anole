@@ -93,7 +93,7 @@ fn run(kind: Kind) !void {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const port = server.address.ip.getPort();
 
     var out: [4096]u8 = undefined;

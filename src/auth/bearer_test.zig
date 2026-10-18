@@ -98,7 +98,7 @@ test "RequireJwt: RFC 6750 answers, claims for the handler only, scopes" {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const port = server.address.ip.getPort();
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);

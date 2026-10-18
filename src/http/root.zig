@@ -66,7 +66,7 @@ test "HTTP/1.1 smoke: GET /users/:id over loopback on zio" {
     var response: [512]u8 = undefined;
     var client_future = try io.concurrent(struct {
         fn run(s: *Server(void), _io: std.Io, out: *[512]u8) ![]const u8 {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
 

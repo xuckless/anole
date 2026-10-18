@@ -43,7 +43,7 @@ test "Rooms: a message to the room reaches every member" {
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/chat", .{server.address.ip.getPort()});

@@ -144,7 +144,7 @@ test "Require: roles from the application's state, 403 without the permission" {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(server.address.ip.getPort()) };
 
     const Post = struct {

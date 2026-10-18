@@ -339,7 +339,7 @@ test "Middleware: 429 with Retry-After once the bucket is empty" {
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var statuses: [3]u16 = undefined;
     var last: [1024]u8 = undefined;

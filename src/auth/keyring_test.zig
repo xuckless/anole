@@ -71,7 +71,7 @@ test "Keyring: one fetch for concurrent verifiers, and known keys never wait on 
         }
     }.r, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
