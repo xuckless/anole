@@ -16,8 +16,8 @@
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#864bdfd2bad6e56e37f901a8152e85830843638a",
-            .hash = "dusty-0.4.0-Qdw7RuN1JQBmXMhwfP6FiBoa24rlwNL7SiNO_RZloXgb",
+            .url = "git+https://github.com/xuckless/dusty#62ad04f5cfed9e3c760225e21215ccc23f4bb337",
+            .hash = "dusty-0.4.0-Qdw7RpWwJQBKXJ29fsJeCfHTOdPc_lc8Q88cIHw8Ko2Z",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
