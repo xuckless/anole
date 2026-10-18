@@ -1,0 +1,28 @@
+name: Network
+
+# Checks that need the public internet, kept out of CI so an outage
+# elsewhere does not fail a push: weekly, and by hand.
+on:
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tls-public:
+    name: Outbound HTTPS with the system trust store (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: network
+      - name: zig build tls-public-check
+        run: zig build tls-public-check

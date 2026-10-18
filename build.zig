@@ -264,6 +264,23 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&bench.step);
     }
 
+    // tls-public-check: outbound HTTPS against public hosts (needs the network).
+    if (features.tls == .boringssl) {
+        const public_check = b.addExecutable(.{
+            .name = "tls-public-check",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/tls_public.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        const run_public_check = b.addRunArtifact(public_check);
+        run_public_check.has_side_effects = true;
+        b.step("tls-public-check", "Fetch public HTTPS hosts with the system trust store (needs the network)").dependOn(&run_public_check.step);
+        test_step.dependOn(&public_check.step);
+    }
+
     // tests/h3: a server for the independent HTTP/3 client (tests/h3/client.py).
     if (features.http3) {
         const h3_server = b.addExecutable(.{
