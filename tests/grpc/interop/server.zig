@@ -1,7 +1,9 @@
 //! grpc.testing.TestService for the gRPC interop suite
 //! (https://github.com/grpc/grpc/blob/master/doc/interop-test-descriptions.md),
-//! on cleartext HTTP/2. tests/grpc/interop/run.sh drives it with grpc-go's
-//! interop client.
+//! on cleartext HTTP/2, or on TLS with a certificate and key given as PEM
+//! files. tests/grpc/interop/run.sh drives it with grpc-go's interop client.
+//!
+//!     grpc-interop-server <port> [<cert.pem> <key.pem>]
 const std = @import("std");
 const anole = @import("anole");
 const pb = @import("anole_interop_pb");
@@ -109,7 +111,12 @@ pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
-    var app = try anole.Server(void).init(init.gpa, .{
+    const cert_path = args.next();
+    const key_path = args.next();
+    var app = try anole.Server(void).init(init.gpa, if (cert_path) |cert| .{
+        .http = null,
+        .https = .{ .address = "127.0.0.1", .port = port, .cert = .{ .files = .{ .cert_path = cert, .key_path = key_path orelse return error.MissingKey } } },
+    } else .{
         .http = .{ .address = "127.0.0.1", .port = port, .h2c = true },
     }, {});
     defer app.deinit();
@@ -123,6 +130,6 @@ pub fn main(init: std.process.Init) !void {
         .HalfDuplexCall = halfDuplexCall,
         .UnimplementedCall = unimplemented,
     });
-    std.log.info("interop server on 127.0.0.1:{d}", .{port});
+    std.log.info("interop server on 127.0.0.1:{d} ({s})", .{ port, if (cert_path != null) "TLS" else "h2c" });
     try app.run();
 }

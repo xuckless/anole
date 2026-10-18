@@ -1,0 +1,24 @@
+# Cases of grpc's tools/http2_interop that fail against Anole for a reason
+# in the tool, not the server: "<mode> <case>", mode h2c, tls-framing or
+# tls. run-http2.sh fails on any other failure, and on a listed case that
+# passes (so the list never outlives its reason).
+
+# The tool's frame parser has no GOAWAY (parseFrame falls through to
+# UnknownFrame), so it reads past the server's GOAWAY(PROTOCOL_ERROR) to
+# EOF and never sees "Got goaway frame". Every server fails it; h2spec's
+# 6.5.2 checks the same GOAWAY and passes.
+h2c TestSoonSmallMaxFrameSize
+tls-framing TestSoonSmallMaxFrameSize
+
+# On the shared HTTP/1.1 port a lone "X" may start an HTTP/1.1 request, so
+# the server waits for the rest (up to the request-head timeout) instead
+# of closing within the tool's 1 s. Over TLS (h2 by ALPN) it passes.
+h2c TestSoonShortPreface
+
+# Go (since 1.22) refuses a client config with MaxVersion TLS 1.1 before
+# it connects: "no supported versions satisfy MinVersion and MaxVersion".
+tls TestSoonTLSMaxVersion
+
+# Go's CipherSuites does not apply to TLS 1.3, so the "bad" suites are
+# never offered and the handshake succeeds on TLS 1.3 with an AEAD.
+tls TestSoonTLSBadCipherSuites

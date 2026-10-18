@@ -3,7 +3,9 @@
 //! on anole.grpc's client, against any interop server (grpc-go's, in
 //! tests/grpc/interop/run-client.sh).
 //!
-//!   grpc-interop-client <port> <test_case>
+//!   grpc-interop-client <port> <test_case> [<ca.pem>]
+//!
+//! With a CA certificate, over TLS to "localhost"; else cleartext HTTP/2.
 const std = @import("std");
 const anole = @import("anole");
 const pb = @import("anole_interop_pb");
@@ -146,13 +148,24 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     const port = try std.fmt.parseInt(u16, args.next() orelse "10000", 10);
     const case = args.next() orelse return error.MissingTestCase;
+    // TLS, trusting this CA certificate (PEM), for the server's name
+    // "localhost"; cleartext HTTP/2 without it.
+    const ca_path = args.next();
 
     const rt = try anole.zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    const conn = try anole.h2.ClientConnection.connect(init.gpa, io, .{ .host = "127.0.0.1", .port = port });
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(init.gpa);
+    if (ca_path) |path| try bundle.addCertsFromFilePath(init.gpa, io, std.Io.Clock.real.now(io), std.Io.Dir.cwd(), path);
+    const conn = try anole.h2.ClientConnection.connect(init.gpa, io, .{
+        .host = if (ca_path != null) "localhost" else "127.0.0.1",
+        .address = .{ .ip4 = .loopback(port) },
+        .port = port,
+        .tls = if (ca_path != null) .{ .root_ca = bundle } else null,
+    });
     defer conn.close();
-    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost", .scheme = if (ca_path != null) "https" else "http" };
     const client: Client = .{ .channel = &channel };
     var arena_state: std.heap.ArenaAllocator = .init(init.gpa);
     defer arena_state.deinit();

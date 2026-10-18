@@ -186,7 +186,7 @@ jobs:
         run: zig build test -Dllvm=true --fuzz=200K
 
   grpc-interop:
-    name: gRPC interop (both directions with grpc-go, cleartext HTTP/2)
+    name: gRPC interop (both directions with grpc-go, h2c and TLS; grpc's HTTP/2 checks)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -206,6 +206,16 @@ jobs:
         run: tests/grpc/interop/run.sh ./zig-out/bin/grpc-interop-server
       - name: Interop test cases (Anole client, grpc-go server)
         run: tests/grpc/interop/run-client.sh ./zig-out/bin/grpc-interop-client
+      # The same cases over TLS, with a certificate made for the run.
+      - name: Interop test cases over TLS (grpc-go client, Anole server)
+        run: tests/grpc/interop/run.sh --tls ./zig-out/bin/grpc-interop-server
+      - name: Interop test cases over TLS (Anole client, grpc-go server)
+        run: tests/grpc/interop/run-client.sh --tls ./zig-out/bin/grpc-interop-client
+      # grpc's tools/http2_interop (pinned): framing over h2c and TLS, and
+      # the TLS profile; tool-side failures are listed in
+      # tests/grpc/interop/http2-known-failures.txt.
+      - name: grpc HTTP/2 server checks
+        run: tests/grpc/interop/run-http2.sh ./zig-out/bin/grpc-interop-server
 
   redis:
     name: Redis and Valkey (live client and session store tests)
