@@ -126,7 +126,9 @@ comptime {
 pub const ProtoGenOptions = struct {
     /// The .proto files.
     source_files: []const std.Build.LazyPath,
-    /// Where protoc resolves imports from (its `-I`).
+    /// Where protoc resolves imports from (its `-I`). Anole adds its own
+    /// .proto directory after these, for `google/api/annotations.proto` and
+    /// `google/api/http.proto` (JSON transcoding).
     include_directories: []const std.Build.LazyPath = &.{},
     /// Where the .pb.zig files go: a directory in the project's source tree,
     /// committed like any other source.
@@ -152,9 +154,12 @@ pub fn addProtoGen(step: *std.Build.Step, anole_dep: *std.Build.Dependency, opti
     // and the build runner fetches them and configures again.
     const pb = anole_dep.builder.lazyImport(@This(), "protobuf") orelse return;
     const pb_dep = anole_dep.builder.lazyDependency("protobuf", .{ .target = b.graph.host }) orelse return;
+    const includes = b.allocator.alloc(std.Build.LazyPath, options.include_directories.len + 1) catch @panic("OOM");
+    @memcpy(includes[0..options.include_directories.len], options.include_directories);
+    includes[options.include_directories.len] = anole_dep.path("src/grpc/proto");
     const run = pb.RunProtocStep.createWithGenerator(b, pb_dep.artifact("protoc-gen-zig"), .{
         .source_files = options.source_files,
-        .include_directories = options.include_directories,
+        .include_directories = includes,
         .destination_directory = options.destination_directory,
     });
     step.dependOn(run.step);
@@ -287,7 +292,7 @@ pub fn build(b: *std.Build) void {
     const Example = struct { name: []const u8, needs: bool, about: []const u8 };
     const examples = [_]Example{
         .{ .name = "websocket", .needs = features.websocket, .about = "WebSocket echo and a broadcast room" },
-        .{ .name = "grpc", .needs = features.grpc, .about = "a gRPC Greeter, also over gRPC-Web and Connect" },
+        .{ .name = "grpc", .needs = features.grpc, .about = "a gRPC Greeter, also over gRPC-Web, Connect and REST (JSON transcoding)" },
         .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
         .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },
         .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
@@ -440,6 +445,14 @@ pub fn build(b: *std.Build) void {
                 .destination_directory = b.path("tests/grpc/gen"),
                 .generator = dep.artifact("protoc-gen-zig"),
             });
+            // google/api/annotations.proto and http.proto come from
+            // src/grpc/proto (vendored, Apache-2.0).
+            const gen_transcode = pb.RunProtocStep.create(b, target, .{
+                .source_files = &.{b.path("tests/grpc/proto/transcode.proto")},
+                .include_directories = &.{ b.path("tests/grpc/proto"), b.path("src/grpc/proto") },
+                .destination_directory = b.path("tests/grpc/gen"),
+                .generator = dep.artifact("protoc-gen-zig"),
+            });
             const gen_interop = pb.RunProtocStep.create(b, target, .{
                 .source_files = &.{b.path("tests/grpc/proto/grpc/testing/test.proto")},
                 .include_directories = &.{b.path("tests/grpc/proto")},
@@ -448,7 +461,7 @@ pub fn build(b: *std.Build) void {
             });
             const gen_example = pb.RunProtocStep.create(b, target, .{
                 .source_files = &.{b.path("examples/grpc/proto/greeter.proto")},
-                .include_directories = &.{b.path("examples/grpc/proto")},
+                .include_directories = &.{ b.path("examples/grpc/proto"), b.path("src/grpc/proto") },
                 .destination_directory = b.path("examples/grpc/gen"),
                 .generator = dep.artifact("protoc-gen-zig"),
             });
@@ -456,6 +469,7 @@ pub fn build(b: *std.Build) void {
             gen.dependOn(gen_example.step);
             gen.dependOn(gen_health.step);
             gen.dependOn(gen_test.step);
+            gen.dependOn(gen_transcode.step);
             gen.dependOn(gen_interop.step);
         };
     }
@@ -878,6 +892,13 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     // The generated test service (tests/grpc/gen), outside src/.
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
+        .target = o.target,
+        .optimize = o.optimize,
+        .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
+    }));
+    // The JSON transcoding test service (google.api.http annotations).
+    if (f.grpc and o.for_test) mod.addImport("anole_transcode_pb", b.createModule(.{
+        .root_source_file = b.path("tests/grpc/gen/transcode.pb.zig"),
         .target = o.target,
         .optimize = o.optimize,
         .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},

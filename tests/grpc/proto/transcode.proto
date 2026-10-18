@@ -1,0 +1,168 @@
+// Anole's JSON transcoding test service: one method per google.api.http
+// form (verbs, path templates, body and response_body selection).
+syntax = "proto3";
+
+package transcode;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+enum Shade {
+  SHADE_UNSPECIFIED = 0;
+  LIGHT = 1;
+  DARK = 2;
+}
+
+message Author {
+  string name = 1;
+  int32 born = 2;
+}
+
+message Book {
+  string name = 1;
+  string title = 2;
+  int64 pages = 3;
+  Shade shade = 4;
+  repeated string tags = 5;
+  Author author = 6;
+  bool available = 7;
+  google.protobuf.Timestamp published = 8;
+  double score = 9;
+  bytes token = 10;
+  oneof edition {
+    string isbn = 11;
+    int32 printing = 12;
+  }
+}
+
+message GetBookRequest {
+  string name = 1;
+  string view = 2;
+  Shade shade = 3;
+  repeated string tags = 4;
+  Author author = 5;
+  int64 revision = 6;
+  bool full = 7;
+  double score = 8;
+  google.protobuf.Timestamp since = 9;
+  bytes token = 10;
+  repeated int32 pages = 11;
+  uint64 big = 12;
+}
+
+message CreateBookRequest {
+  string parent = 1;
+  Book book = 2;
+  string book_id = 3;
+}
+
+message UpdateBookRequest {
+  Book book = 1;
+  string mask = 2;
+}
+
+message ListBooksRequest {
+  string parent = 1;
+  int32 page_size = 2;
+  string fail = 3;
+}
+
+message ListBooksResponse {
+  repeated Book books = 1;
+  string next_page_token = 2;
+}
+
+message Empty {}
+
+service Library {
+  // Two bindings: a resource name with literals, and a short form.
+  rpc GetBook(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      get: "/v1/{name=shelves/*/books/*}"
+      additional_bindings { get: "/v1/books/{name}" }
+      additional_bindings { get: "/v1/authors/{author.name}/books" }
+    };
+  }
+  // body: a named field; the rest from the query.
+  rpc CreateBook(CreateBookRequest) returns (Book) {
+    option (google.api.http) = {
+      post: "/v1/{parent=shelves/*}/books"
+      body: "book"
+    };
+  }
+  // A nested field in the path, inside the body field.
+  rpc UpdateBook(UpdateBookRequest) returns (Book) {
+    option (google.api.http) = {
+      patch: "/v1/{book.name=shelves/*/books/*}"
+      body: "book"
+      additional_bindings { put: "/v1/{book.name=shelves/*/books/*}" body: "*" }
+    };
+  }
+  // response_body: the repeated field alone, as a JSON array. The second
+  // binding has a variable where another route has one of another name.
+  rpc ListBooks(ListBooksRequest) returns (ListBooksResponse) {
+    option (google.api.http) = {
+      get: "/v1/{parent=shelves/*}/books"
+      response_body: "books"
+      additional_bindings { get: "/v1/authors/{parent}/shelf" }
+    };
+  }
+  rpc DeleteBook(GetBookRequest) returns (Empty) {
+    option (google.api.http) = {
+      delete: "/v1/{name=shelves/*/books/*}"
+    };
+  }
+  // A custom verb, after a variable; body "*".
+  rpc PublishBook(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      post: "/v1/{name=shelves/*/books/*}:publish"
+      body: "*"
+    };
+  }
+  // A custom verb after a variable, on the route of GetBook's /v1/books/{name}.
+  rpc StatBook(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      get: "/v1/books/{name}:stat"
+    };
+  }
+  // A custom verb after a literal.
+  rpc BatchGet(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      get: "/v1/books:batchGet"
+    };
+  }
+  // ** in a variable, and an anonymous *.
+  rpc GetFile(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      get: "/files/*/{name=**}"
+    };
+  }
+  // ** with a verb after it.
+  rpc GetFileInfo(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      get: "/info/{name=**}:stat"
+    };
+  }
+  // A custom HTTP method.
+  rpc SearchBooks(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      custom: { kind: "SEARCH" path: "/v1/books" }
+      body: "*"
+    };
+  }
+  // Server streaming: one JSON array.
+  rpc WatchBooks(ListBooksRequest) returns (stream Book) {
+    option (google.api.http) = {
+      get: "/v1/{parent=shelves/*}/books:watch"
+    };
+  }
+  // Client streaming is not transcoded: 501.
+  rpc UploadBooks(stream Book) returns (Book) {
+    option (google.api.http) = {
+      post: "/v1/books:upload"
+      body: "*"
+    };
+  }
+  // Not annotated: no REST route.
+  rpc Plain(GetBookRequest) returns (Book);
+}
