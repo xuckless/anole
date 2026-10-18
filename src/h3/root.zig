@@ -196,5 +196,6 @@ test {
     _ = @import("bridge.zig");
     _ = @import("net.zig");
     _ = @import("client_test.zig");
+    _ = @import("steer.zig");
     _ = @import("session_cache.zig");
 }

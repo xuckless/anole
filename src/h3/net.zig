@@ -65,6 +65,58 @@ pub fn wallClock(io: std.Io) u64 {
     return @intCast(std.Io.Clock.real.now(io).nanoseconds);
 }
 
+/// A UDP socket with SO_REUSEPORT, bound to `address`: one of a group that
+/// share it (`steer`). Blocking; whoever adopts it makes it otherwise.
+pub fn bindReusePort(address: std.Io.net.IpAddress) !std.posix.fd_t {
+    const posix = std.posix;
+    const family: c_int = switch (address) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const fd = std.c.socket(@intCast(family), posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = std.c.close(fd);
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+    const one: c_int = 1;
+    if (std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int)) != 0) return error.ReusePortFailed;
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const len = std.Io.Threaded.addressToPosix(&address, &storage);
+    if (std.c.bind(fd, &storage.any, len) != 0) return switch (std.posix.errno(@as(c_int, -1))) {
+        .ADDRINUSE => error.AddressInUse,
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .ACCES => error.AccessDenied,
+        else => error.BindFailed,
+    };
+    return fd;
+}
+
+/// Fails with `error.AddressInUse` when some other UDP socket is bound to
+/// `address`, which binding with SO_REUSEPORT (`bindReusePort`) would
+/// otherwise join without a word, sharing the port's datagrams with a
+/// second copy of the server. As dusty's `checkAddressFree` for TCP; the
+/// probe sets no option at all, since UDP has no TIME_WAIT to tolerate and
+/// a probe with SO_REUSEADDR would join sockets that set it too. Port zero
+/// is not checked, and nothing is when the probe cannot be had.
+pub fn checkUdpAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void {
+    if (address.getPort() == 0) return;
+    const posix = std.posix;
+    const family: c_int = switch (address) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const fd = std.c.socket(@intCast(family), posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const len = std.Io.Threaded.addressToPosix(&address, &storage);
+    if (std.c.bind(fd, &storage.any, len) != 0 and std.posix.errno(@as(c_int, -1)) == .ADDRINUSE) {
+        const fmt = "UDP {f} is already in use: another process is bound to it";
+        // Tests provoke it on purpose, and fail on any error logged.
+        if (@import("builtin").is_test) log.warn(fmt, .{address}) else log.err(fmt, .{address});
+        return error.AddressInUse;
+    }
+}
+
 /// A UDP socket set up for QUIC, after ngtcp2's examples/shared.cc and
 /// server.cc (MIT): ECN codepoints in and out, the local address of each
 /// datagram when bound to a wildcard address (PKTINFO, so replies leave
@@ -328,4 +380,27 @@ test "UDP: ECN codepoints and the local address of a wildcard socket come throug
             got += 1;
         }
     }
+}
+
+test "UDP: SO_REUSEPORT sockets share a port, and the probe sees any socket on it" {
+    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const first = try bindReusePort(lo);
+    var first_open = true;
+    defer if (first_open) {
+        _ = std.c.close(first);
+    };
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(first, &storage.any, &len));
+    const taken = std.Io.Threaded.addressFromPosix(&storage);
+    // The probe refuses the port, SO_REUSEPORT or not.
+    try std.testing.expectError(error.AddressInUse, checkUdpAddressFree(taken));
+    // A second member of the group binds all the same.
+    const second = try bindReusePort(taken);
+    _ = std.c.close(second);
+    // Free again once both are closed; port zero is never checked.
+    _ = std.c.close(first);
+    first_open = false;
+    try checkUdpAddressFree(taken);
+    try checkUdpAddressFree(lo);
 }
