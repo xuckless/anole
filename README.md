@@ -37,7 +37,8 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   permessage-deflate and a rooms helper for broadcast; Autobahn passes all
   517 cases;
 - gRPC server and client over HTTP/2 (all four call modes, deadlines,
-  metadata, gzip), plus gRPC-Web and Buf's Connect protocol, and the
+  metadata, gzip), plus gRPC-Web, Buf's Connect protocol, REST routes from
+  `google.api.http` annotations (JSON transcoding), and the
   `grpc.health.v1` service; grpc-go's interop client passes 14/14 cases
   against Anole and Anole's client passes 11/11 against grpc-go's server,
   over h2c and TLS;
@@ -66,8 +67,7 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   handshake and transfer loss and corruption, ECN, port and address
   rebinding, v2), and the 16 of them quic-go's client runs.
 
-0-RTT, connection migration and WebTransport are still to come, as is gRPC
-JSON transcoding.
+0-RTT, connection migration and WebTransport are still to come.
 Nothing is stable before 1.0.
 
 ## Requirements

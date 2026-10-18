@@ -11,6 +11,9 @@ apart by the request's content type:
 | Connect unary | `application/proto`, `application/json` | HTTP/1.1 or HTTP/2 |
 | Connect streaming | `application/connect+proto`, `application/connect+json` | HTTP/1.1 or HTTP/2 |
 
+Methods annotated with `google.api.http` also get REST routes of their own,
+JSON in and out ([JSON transcoding](#json-transcoding)).
+
 A gRPC request over HTTP/1.1 gets `505 HTTP Version Not Supported`, and an
 unknown content type gets `415`. gRPC needs `-Dgrpc` and `-Dhttp2`, both on in
 the default `full` profile.
@@ -56,7 +59,12 @@ pub fn build(b: *std.Build) void {
 ```
 
 Run `zig build gen-proto` after you change a `.proto` file, and commit the
-generated `.pb.zig` files like any other source. `tests/consumer` is a
+generated `.pb.zig` files like any other source. `addProtoGen` also puts
+Anole's copies of `google/api/annotations.proto` and `google/api/http.proto`
+on protoc's include path, so a file can import them for
+[JSON transcoding](#json-transcoding) without vendoring them; the code for
+their packages is generated beside yours (`google/api.pb.zig`, and
+`google/protobuf.pb.zig` for descriptor.proto). `tests/consumer` is a
 complete project set up this way.
 
 For each service, the generated file has a function that returns its method
@@ -257,7 +265,7 @@ file, since Anole has no server reflection yet. Use `-plaintext` for h2c and
 `-insecure` for the self-signed TLS listener:
 
 ```sh
-grpcurl -plaintext -import-path examples/grpc/proto -proto greeter.proto \
+grpcurl -plaintext -import-path examples/grpc/proto -import-path src/grpc/proto -proto greeter.proto \
   -d '{"name":"Ada"}' localhost:8083 greeter.Greeter/SayHello
 ```
 
@@ -300,6 +308,147 @@ curl 'http://localhost:8083/greeter.Greeter/GetGreeting?connect=v1&encoding=json
 ```
 
 A GET on any other method is `405 Method Not Allowed`.
+
+## JSON transcoding
+
+A method annotated with `google.api.http` (google/api/http.proto, as Envoy's
+gRPC-JSON transcoder and grpc-gateway read it) also answers plain REST
+requests, JSON in and out, on routes of its own:
+
+```proto
+import "google/api/annotations.proto";
+
+service Library {
+  rpc GetBook(GetBookRequest) returns (Book) {
+    option (google.api.http) = {
+      get: "/v1/{name=shelves/*/books/*}"
+      additional_bindings { get: "/v1/books/{name}" }
+    };
+  }
+  rpc CreateBook(CreateBookRequest) returns (Book) {
+    option (google.api.http) = { post: "/v1/{parent=shelves/*}/books" body: "book" };
+  }
+}
+```
+
+```sh
+curl 'http://localhost:8083/v1/shelves/s1/books/b1?view=FULL'
+curl -d '{"title":"Dune"}' 'http://localhost:8083/v1/shelves/s1/books?bookId=dune'
+```
+
+`register` adds these routes beside the gRPC one, for HTTP/1.1 and HTTP/2,
+from the annotations zig-protobuf keeps in the generated code: there is no
+protoc plugin to run. `registerWith(..., .{ .transcode = false })` leaves
+them out. The handlers are the same; `call.protocol` is `.http_json`.
+
+The rules are checked at compile time: the template's syntax, that each path
+variable names a single field of a primitive type (a string, number, bool,
+enum, or a Timestamp, Duration, FieldMask or wrapper), and that `body` and
+`response_body` name top-level fields.
+
+### Routes
+
+The verbs are `get`, `put`, `post`, `delete` and `patch`, plus `custom` with
+any HTTP method dusty knows (`custom: { kind: "SEARCH" path: "/v1/books" }`),
+and each of `additional_bindings` is a route too. Path templates take the
+whole syntax:
+
+| Template | Matches | Sets |
+| --- | --- | --- |
+| `/v1/books/{name}` | one segment | `name` |
+| `/v1/{name=shelves/*/books/*}` | the segments, literals included | `name` to `shelves/1/books/2` |
+| `/files/{path=**}` | the rest of the path | `path` to `a/b/c.txt` |
+| `/v1/*/x` | any one segment, bound to nothing | |
+| `/v1/{book.name}` | one segment | the nested field `book.name` |
+| `/v1/{name=books/*}:publish`, `/v1/books:batchGet` | a custom verb after the last segment | |
+
+A one-segment variable is percent-decoded in full; a longer one keeps `%2F`
+as it is, as http.proto asks.
+
+Each template becomes a router route: `*` a parameter, `**` a wildcard, a
+verb part of a last literal. What the router cannot say (literals inside a
+variable, a verb after a variable) the binding checks itself, so several
+bindings can share a route, `/v1/books/{name}` and `/v1/books/{name}:stat`
+for example; those with a verb are tried first. A path that the route
+matches and no binding does is a 404. Transcoding routes follow the router's
+rules:
+
+- A parameter at a position where another route has one takes that route's
+  name (the router keeps one name per position; the binding reads its
+  values from the path, not from `req.params`).
+- A binding whose route is already someone else's (yours, or another
+  method's gRPC route) panics at registration, as two bindings that match
+  the same paths do.
+- `**` needs at least one segment here (Envoy also matches none).
+- The router picks a route before the binding is asked: of `/v1/{name}:x`
+  and `/v1/{name=**}`, `/v1/abc` reaches the first's route and is a 404.
+
+### The request
+
+The request message is put together the way http.proto describes:
+
+- `body: "*"`: the JSON body is the message, with the path variables set over
+  it. Query parameters are ignored.
+- `body: "book"`: the JSON body is that field (any type, a repeated field
+  takes an array); the other fields come from the path and the query.
+- No `body`: everything from the path and the query; a body is ignored.
+
+A query parameter names a field by its proto or JSON name, nested with dots
+(`author.name=Ada`, `pageSize=10`), and repeats for a repeated field
+(`tags=a&tags=b`). Values read as the proto3 JSON mapping reads strings:
+enums by name or number, `true`/`false`, 64-bit integers, `NaN` and
+`Infinity` for floats, base64 for bytes, RFC 3339 for a Timestamp, `1.5s` for
+a Duration. Parameters for no field are ignored (cache-busters, tracking
+tags), and so are those for fields the path or the body set. A message or map
+field cannot be set from the query.
+
+A request that does not make a message (a value of the wrong type, a body
+that is not JSON) fails with INVALID_ARGUMENT before the handler runs. The
+body may nest 100 arrays or objects deep; it is limited to the
+registration's `max_message_size` (RESOURCE_EXHAUSTED past it), and may come
+compressed with `Content-Encoding`.
+
+### The response
+
+The response message as JSON (`application/json`), in the proto3 mapping of
+the generated `jsonEncode`: JSON field names, fields at their default left
+out, 64-bit integers as strings, oneof members as fields. With
+`response_body: "books"`, the body is that field alone: `[...]` for a
+repeated field, its default (`[]`, `""`, `0`) when unset. Responses are
+compressed by the request's `Accept-Encoding`.
+
+`call.addHeader` sets response headers, and `call.addTrailer` sends
+`grpc-trailer-<name>` headers, as grpc-gateway does. A client's
+`grpc-timeout` header sets the deadline; without one, the call is not bound
+by the server's request timeout, as with gRPC.
+
+A failed call answers the gRPC code's HTTP status (the same table as
+Connect: NOT_FOUND 404, INVALID_ARGUMENT 400, UNAUTHENTICATED 401,
+UNIMPLEMENTED 501, and so on) with a google.rpc.Status body:
+
+```json
+{"code":5,"message":"no such book","details":[]}
+```
+
+### Streaming
+
+A server-streaming method answers one JSON array, as Envoy's transcoder
+does, sent element by element as the handler queues messages: `[` with the
+first, `,` before each next one, `]` when the handler returns. No message is
+`[]`.
+
+A failure before the first message is an ordinary error response. After it
+the status line has gone out as 200, so the array is cut short instead: on
+HTTP/2 the stream is reset (CANCEL), on HTTP/1.1 the connection closes before
+the body's last chunk. A client never reads a complete array from a failed
+call; the server logs the status at `warn`. On HTTP/2, trailing metadata of a
+successful stream goes out as HTTP trailers (HTTP/1.1 has none to carry it).
+
+Client- and bidirectional-streaming methods are not transcoded: their routes
+answer 501 with UNIMPLEMENTED. Call them over gRPC, gRPC-Web or Connect.
+
+Not supported: rules from a service config (`selector`; annotations only),
+and map fields from query parameters.
 
 ## The health service
 
@@ -395,8 +544,6 @@ benchmark numbers against grpc-go, see the README.
 
 ## Not there yet
 
-- JSON transcoding from `google.api.http` annotations (REST routes for gRPC
-  methods). Connect's JSON covers many of the same uses meanwhile.
 - gRPC over HTTP/3. Native gRPC runs over HTTP/2 only.
 - Server reflection.
 - Canceling the handler of a gRPC-Web or Connect call over HTTP/1.1 when the

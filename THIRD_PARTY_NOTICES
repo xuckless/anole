@@ -196,6 +196,22 @@ tests/grpc/proto/grpc/testing/*.proto (and tests/grpc/gen/grpc/testing.pb.zig)
   Licence:  Apache License 2.0 (text in part E). Copyright The gRPC Authors
   Source:   https://github.com/grpc/grpc-proto, commit 8133308
 
+src/grpc/proto/google/api/annotations.proto, http.proto (and the Zig
+generated from them, tests/grpc/gen/google/api.pb.zig and
+examples/grpc/gen/google/api.pb.zig)
+  The google.api.http option, for JSON transcoding; protoc reads them
+  through `addProtoGen`'s include path.
+  Licence:  Apache License 2.0 (text in part E). Copyright 2025 Google LLC
+  Source:   https://github.com/googleapis/googleapis, commit 94bc991
+            (google/api)
+
+tests/grpc/gen/google/protobuf.pb.zig, examples/grpc/gen/google/protobuf.pb.zig
+  Generated from protobuf's google/protobuf/descriptor.proto (shipped with
+  the pinned protoc), whose comments it carries.
+  Licence:  BSD-3-Clause (the conditions in part F). Copyright 2008 Google
+            Inc.
+  Source:   https://github.com/protocolbuffers/protobuf
+
 src/auth/csrf.zig
   The synchronizer-token check follows jetzig's
   src/jetzig/middleware/AntiCsrfMiddleware.zig.
@@ -277,8 +293,8 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 
 
-E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, zig-jwt)
--------------------------------------------------------------------
+E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, googleapis, zig-jwt)
+-------------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of the pinned BoringSSL tree (commit
 22a0079b). That file also covers Go-licensed TLS test-suite code, which is
@@ -487,8 +503,8 @@ not compiled into BoringSSL and so is not reproduced here.
    limitations under the License.
 
 
-F. BSD-3-Clause licence text (zstd, hiredis)
---------------------------------------------
+F. BSD-3-Clause licence text (zstd, hiredis, protobuf's descriptor.proto)
+-------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of zstd 1.5.7.
 

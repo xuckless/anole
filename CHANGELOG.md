@@ -96,8 +96,18 @@ for macOS and Linux.
 - gRPC-Web and Buf's Connect protocol on the same routes, including Connect's
   GET form for methods marked `NO_SIDE_EFFECTS`, and the `grpc.health.v1`
   service (`anole.grpc.Health`, one registry per instance).
+- JSON transcoding from `google.api.http` annotations: the same
+  registration adds REST routes (`get`/`put`/`post`/`delete`/`patch`,
+  `custom`, `additional_bindings`), with the full path template syntax
+  (`{field=a/*/b}`, `**`, nested fields, `:verb`), `body` (`*` or a field)
+  with the rest from query parameters, `response_body`, errors as
+  google.rpc.Status JSON under the matching HTTP status, and a server
+  stream as one JSON array sent element by element. JSON through
+  zig-protobuf's generated proto3 mapping. `RegisterOptions.transcode =
+  false` leaves the routes out.
 - `addProtoGen` for an application's build.zig: protoc and the Zig generator
-  are pinned and built by `zig build`, nothing to install.
+  are pinned and built by `zig build`, nothing to install;
+  `google/api/annotations.proto` and `http.proto` come with Anole.
 
 ### Clients
 
@@ -175,6 +185,7 @@ for macOS and Linux.
 ### Not yet
 
 - HTTP/3: 0-RTT, connection migration and WebTransport.
-- gRPC: JSON transcoding (`google.api.http`) and gRPC over HTTP/3.
+- gRPC over HTTP/3; JSON transcoding of client and bidirectional streaming
+  methods.
 - Benchmarks on a dedicated Linux machine (the first results, on a Mac, are
   in the README).
