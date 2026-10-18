@@ -24,6 +24,7 @@ const features = @import("build_options");
 const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
+const handoff = @import("handoff.zig");
 
 /// The zio configuration Anole is built for. An executable declares it in
 /// its root file: `pub const zio_options = anole.zio_options;`. Pinned: a
@@ -46,6 +47,17 @@ pub const Options = struct {
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
+    /// The process's arguments and environment (`init.minimal`). With them
+    /// the server takes listening sockets handed over by systemd socket
+    /// activation or by the process it replaces (`LISTEN_FDS`), and
+    /// restarts without downtime on SIGUSR2: a new copy of the program
+    /// takes the sockets, and this one drains once it is serving. Without
+    /// them, neither. (With them, listeners are single sockets, not one
+    /// per core.)
+    process: ?std.process.Init.Minimal = null,
+    /// How long a restart waits for the new process to be serving before
+    /// giving up on it and carrying on.
+    restart_timeout_ms: u32 = 10_000,
     /// The rest of dusty's server configuration: timeouts, limits,
     /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
     /// replaced by the fields above.
@@ -95,6 +107,11 @@ pub fn Server(comptime Ctx: type) type {
         server: *http.Server(Ctx),
         router: *http.Router(Ctx),
         stopped: *std.Io.Event,
+        /// For hand-off: the process (args, environment), and the
+        /// listening sockets to pass on.
+        process: ?std.process.Init.Minimal = null,
+        held: []const handoff.Listener = &.{},
+        restart_timeout_ms: u32 = 10_000,
 
         pub fn init(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) !Self {
             const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -112,14 +129,25 @@ pub fn Server(comptime Ctx: type) type {
             // One accept loop per executor (dusty's default on zio); on
             // Linux each with its own SO_REUSEPORT socket, so the kernel
             // spreads connections over the executors.
-            const per_core_sockets = builtin.os.tag == .linux;
+            // Hand-off needs one socket per listener, which we open (or
+            // inherit) ourselves.
+            const handoff_mode = opts.process != null;
+            const per_core_sockets = builtin.os.tag == .linux and !handoff_mode;
+            const inherited = if (opts.process) |p| handoff.inherited(p.environ) else null;
+            var held: std.ArrayList(handoff.Listener) = .empty;
             var listeners: std.ArrayList(http.Listener) = .empty;
-            if (opts.http) |h| try listeners.append(a, .{
-                .address = .{ .ip = try std.Io.net.IpAddress.parse(h.address, h.port) },
-                .http2_prior_knowledge = h.h2c and features.http2,
-                .socket_per_acceptor = per_core_sockets,
-                .proxy_protocol = h.proxy_protocol,
-            });
+            if (opts.http) |h| {
+                const address = try std.Io.net.IpAddress.parse(h.address, h.port);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, "http", 0, address);
+                if (fd) |f| try held.append(a, .{ .fd = f, .name = "http" });
+                try listeners.append(a, .{
+                    .address = .{ .ip = address },
+                    .http2_prior_knowledge = h.h2c and features.http2,
+                    .socket_per_acceptor = per_core_sockets,
+                    .proxy_protocol = h.proxy_protocol,
+                    .fd = fd,
+                });
+            }
             if (opts.https) |h| {
                 if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
                 var config: http.ServerConfig.Tls = .{
@@ -139,11 +167,15 @@ pub fn Server(comptime Ctx: type) type {
                         config.pem = .{ .cert = try a.dupe(u8, pem.cert), .key = try a.dupe(u8, pem.key) };
                     },
                 }
+                const address = try std.Io.net.IpAddress.parse(h.address, h.port);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, "https", listeners.items.len, address);
+                if (fd) |f| try held.append(a, .{ .fd = f, .name = "https" });
                 try listeners.append(a, .{
-                    .address = .{ .ip = try std.Io.net.IpAddress.parse(h.address, h.port) },
+                    .address = .{ .ip = address },
                     .socket_per_acceptor = per_core_sockets,
                     .proxy_protocol = h.proxy_protocol,
                     .tls = config,
+                    .fd = fd,
                 });
             }
             if (listeners.items.len == 0) return error.NoListeners;
@@ -155,7 +187,27 @@ pub fn Server(comptime Ctx: type) type {
             server.* = .init(gpa, rt_io, server_config, ctx);
             const stopped = try a.create(std.Io.Event);
             stopped.* = .unset;
-            return .{ .gpa = gpa, .rt = rt, .arena = arena, .server = server, .router = &server.router, .stopped = stopped };
+            return .{
+                .gpa = gpa,
+                .rt = rt,
+                .arena = arena,
+                .server = server,
+                .router = &server.router,
+                .stopped = stopped,
+                .process = opts.process,
+                .held = held.items,
+                .restart_timeout_ms = opts.restart_timeout_ms,
+            };
+        }
+
+        /// The socket for one listener in hand-off mode: inherited if one
+        /// was passed in under `name` (or at `index`), else opened here.
+        /// Null outside hand-off mode (dusty binds).
+        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: std.Io.net.IpAddress) !?handoff.Fd {
+            if (!handoff_mode) return null;
+            if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
+            const s = try address.listen(io_, .{ .reuse_address = true });
+            return s.socket.handle;
         }
 
         pub fn deinit(self: *Self) void {
@@ -235,21 +287,61 @@ pub fn Server(comptime Ctx: type) type {
                 term: anyerror!void,
                 stop: anyerror!void,
                 served: anyerror!void,
+                restart: anyerror!void,
             };
-            var done_buf: [4]Done = undefined;
+            var done_buf: [8]Done = undefined;
             var sel = std.Io.Select(Done).init(rt_io, &done_buf);
             try sel.concurrent(.int, waitForSignal, .{.interrupt});
             try sel.concurrent(.term, waitForSignal, .{.terminate});
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             try sel.concurrent(.served, serve, .{self.server});
-            const first = try sel.await();
+            const restartable = self.process != null and self.held.len > 0;
+            if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
+            // A successor started by a predecessor tells it when it is
+            // serving.
+            var notify: ?std.Io.Future(void) = if (restartable)
+                try rt_io.concurrent(notifyWhenReady, .{ self.server, rt_io, self.process.? })
+            else
+                null;
+            defer if (notify) |*n| n.cancel(rt_io);
+            const log = std.log.scoped(.anole);
+            const first = while (true) {
+                const done = try sel.await();
+                if (done != .restart) break done;
+                // SIGUSR2: start the successor; drain once it serves.
+                if (self.restart()) break done;
+                try sel.concurrent(.restart, waitForSignal, .{.user2});
+            };
             // Cancels the server's run, which drains, then the watchers.
             sel.cancelDiscard();
             switch (first) {
                 .served => |r| return r,
-                .int, .term => std.log.scoped(.anole).info("signal received ({t}); drained and stopped", .{first}),
+                .int, .term => log.info("signal received ({t}); drained and stopped", .{first}),
+                .restart => log.info("handed over to the new process; drained and stopped", .{}),
                 .stop => {},
             }
+        }
+
+        /// Starts the successor and waits for it to serve. False when it
+        /// did not, and this process keeps serving.
+        fn restart(self: *Self) bool {
+            const log = std.log.scoped(.anole);
+            const successor = handoff.spawn(self.gpa, self.rt.io(), self.process.?, self.held) catch |err| {
+                log.err("restart: could not start the new process: {t}", .{err});
+                return false;
+            };
+            log.info("restart: started process {d}; waiting for it to serve", .{successor.pid});
+            if (!successor.waitReady(self.rt.io(), self.restart_timeout_ms)) {
+                log.err("restart: process {d} did not report serving; stopped it and carrying on", .{successor.pid});
+                successor.abandon();
+                return false;
+            }
+            return true;
+        }
+
+        fn notifyWhenReady(server: *http.Server(Ctx), rt_io: std.Io, process: std.process.Init.Minimal) void {
+            server.ready.wait(rt_io) catch return;
+            handoff.notifyReady(process.environ);
         }
 
         fn waitForSignal(kind: zio.SignalKind) anyerror!void {

@@ -126,6 +126,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const features = resolveFeatures(b);
 
+    // Declared before the lazy-dependency return below: an option first
+    // declared after it is "invalid" on a fresh cache's first pass.
+    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
+
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
     // then fetches everything requested and runs build() again.
@@ -136,8 +140,6 @@ pub fn build(b: *std.Build) void {
 
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
     const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .public = true });
-
-    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");

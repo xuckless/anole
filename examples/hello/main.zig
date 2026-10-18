@@ -19,7 +19,8 @@
 //! reports the same thread.
 //!
 //! SIGINT/SIGTERM end `anole.Server.run`, which stops the accept loops and
-//! drains in-flight requests before returning.
+//! drains in-flight requests before returning. SIGUSR2 starts a new copy of
+//! the binary on the same sockets and drains this one once it serves.
 const std = @import("std");
 const anole = @import("anole");
 const http = anole.http;
@@ -95,6 +96,9 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         .http = .{ .port = port },
         .https = if (anole.features.tls != .none) .{ .port = tls_port, .cert = .dev_self_signed } else null,
+        // Takes sockets from systemd (LISTEN_FDS), and restarts without
+        // downtime on SIGUSR2.
+        .process = init.minimal,
     }, {});
     defer app.deinit();
 
