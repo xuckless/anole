@@ -51,6 +51,15 @@ fn stall(req: *dusty.Request, res: *dusty.Response) !void {
     try out.end();
 }
 
+/// Part of a body, then `Response.abort`.
+fn aborted(_: *dusty.Request, res: *dusty.Response) !void {
+    var out_buf: [256]u8 = undefined;
+    var out = try res.stream(&out_buf);
+    try out.interface.writeAll("[1,");
+    try out.interface.flush();
+    return res.abort();
+}
+
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const s = try conn.request(&.{
         .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
@@ -103,6 +112,7 @@ const Fixture = struct {
         http.router.get("/slow", slow);
         http.router.get("/stall", stall);
         http.router.get("/peer", peer);
+        http.router.get("/abort", aborted);
         var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
         const ep = try Endpoint.init(gpa, io, http, .{
@@ -250,6 +260,34 @@ test "h3 client: certificate checks, and a server that goes away" {
         gpa.free(b);
         try io.sleep(.fromMilliseconds(20), .awake);
     } else return error.TestUnexpectedResult;
+}
+
+test "h3 server: Response.abort resets the stream, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/abort" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    // A reset, before or after the head: never a whole body.
+    if (s.waitHead()) |_| {
+        if (s.reader().allocRemaining(gpa, .unlimited)) |body| {
+            gpa.free(body);
+            return error.WholeBody;
+        } else |_| {}
+    } else |_| {}
+
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
 }
 
 test "h3 server: a request that outlives timeout.request is reset" {

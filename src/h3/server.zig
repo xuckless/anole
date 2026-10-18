@@ -1191,6 +1191,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                         s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
                         return error.Canceled;
                     }
+                    // `Response.abort`: the reset is the abort.
+                    if (err == error.ResponseAborted) {
+                        log.debug("HTTP/3 stream {d}: response aborted", .{s.id});
+                        s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
+                        return;
+                    }
                     conn.lock();
                     const gone = s.reset;
                     conn.unlock();

@@ -544,14 +544,11 @@ fn finish(call: *Call, result: anyerror!void) !void {
                 // now can only cut it short, which the client sees as a
                 // reset stream (HTTP/2) or a body without its last chunk
                 // (HTTP/1.1), never as a complete array. Envoy does the same.
-                // `error.Canceled` is what dusty aborts a response on without
-                // calling it a server fault: HTTP/2 resets the stream
-                // (CANCEL), HTTP/1.1 closes the connection.
                 if (call.status != .ok) {
                     if (call.res.peerGone()) return;
                     const path = call.req.url[0 .. std.mem.indexOfScalar(u8, call.req.url, '?') orelse call.req.url.len];
                     log.warn("{s}: JSON stream cut short by {t}: {s}", .{ path, call.status, call.status_message });
-                    return error.Canceled;
+                    return call.res.abort();
                 }
                 for (call.trailers.items) |t| try call.res.trailer(t.key, t.value);
                 try writeBytes(call, "]");
