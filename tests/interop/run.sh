@@ -15,7 +15,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 clients=${1:-ngtcp2,quic-go}
-tests=${2:-handshake,transfer,longrtt,chacha20,multiplexing,retry,http3,amplificationlimit,blackhole,keyupdate,handshakeloss,transferloss,handshakecorruption,transfercorruption,ecn,rebind-port,rebind-addr,v2}
+tests=${2:-handshake,transfer,longrtt,chacha20,multiplexing,retry,http3,amplificationlimit,blackhole,keyupdate,handshakeloss,transferloss,handshakecorruption,transfercorruption,ecn,rebind-port,rebind-addr,v2,resumption,zerortt}
 runner_commit=ab039a4a4b43ae2e21bb5704c9fad1f8fe6257d6
 work=${ANOLE_INTEROP_WORK:-$(mktemp -d)}
 mkdir -p "$work"
