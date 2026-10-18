@@ -36,6 +36,12 @@ turn on, for the ease-of-use comparison).
 | fastapi | uvicorn[standard] | uvicorn, http/1.1 only | Hypercorn | Hypercorn + aioquic | Starlette | grpcio (aio) | asyncpg + PyJWT |
 | nginx | nginx 1.30 | OpenSSL, h2 + http/1.1 | - | nginx QUIC | - | - | - |
 
+WebTransport has servers of its own (`gohttp-wt`, `axum-wt`, `fastify-wt`,
+`fastapi-wt`), in the `wt` scenario only: webtransport-go, wtransport,
+@fails-components/webtransport (Chromium's QUICHE) and aioquic, the
+draft-02 libraries people use in each language. Anole serves it from the
+same HTTP/3 listener as everything else. Fiber and Express have none.
+
 Where a framework has no protocol of its own, the row uses what developers
 in that language reach for: Go's own net/http and quic-go stand in for Fiber
 on HTTP/2, HTTP/3 and gRPC; Hypercorn serves the same FastAPI app for h2c
@@ -102,6 +108,7 @@ What to keep in mind when reading the numbers:
 | `ws` | Idle sockets and their memory, echo throughput, tick fan-out to 100-10 000 subscribers, the trading-bot simulation | benchctl (coder/websocket) |
 | `mem` | Memory per idle keep-alive connection, concurrent 1 MiB uploads, the same load under a 256 MB cap | benchctl, wrk |
 | `gc` | 1 000 000 retained objects plus an allocation-heavy route; max req/s, then the tail at a fixed rate and the memory sawtooth | wrk, oha |
+| `wt` | WebTransport (draft-02) at `/wt/echo`: session setup, 16 KiB stream echo, and 64-byte datagram echo at 64 000/s (round trips and loss) | wtload (webtransport-go v0.10.0, the last draft-02 release) |
 | `video` | The 4K clip: unpaced throughput, and paced viewers (progressive MP4 by Range, HLS segments) with stalls, startup time and memory per stream, over HTTP/1.1, TLS, h2 and HTTP/3 | wrk, h2load, benchctl's player |
 
 ### The $12 server challenge

@@ -19,6 +19,8 @@ P = only behind a proxy (nginx); - = nothing idiomatic.
 | HTTP/3 | N (one option) | P | L (quic-go) | L (h3 + h3-quinn, 71 lines of glue) | P | P | L (Hypercorn + aioquic; broken with `--workers`) |
 | WebSocket (h1) | N | L (gofiber/contrib) | L (coder/websocket) | N (feature `ws`) | L (ws, outside the router) | L (@fastify/websocket) | N |
 | WebSocket over h2 (RFC 8441) | N, no code | - | - | N (`any()` routes; one line for TLS) | - | - | L (Hypercorn) |
+| WebSocket over h3 (RFC 9220) | N, no code | - | - | - | - | - | - |
+| WebTransport (draft-02) | N (`app.webtransport`, one line) | - | L (webtransport-go v0.10, separate server; later releases dropped draft-02) | L (wtransport, its own endpoint: no axum routes beside it) | - | L (@fails-components/webtransport, no Fastify integration) | L (raw aioquic events; no ASGI server has it) |
 | gRPC | N (codegen in `zig build`) | - | L (grpc-go + protoc) | L (tonic + build.rs + protoc) | - | L (grpc-js, separate server) | L (grpcio, separate process) |
 | Static + Range | N (sendfile) | N (`ByteRange: true` opt-in) | N | L (tower-http) | N | L (@fastify/static) | N |
 | Postgres client | **none** | L (pgx) | L (pgx) | L (sqlx) | L (pg) | L (pg) | L (asyncpg) |
@@ -51,6 +53,21 @@ line count is dominated by the database client it had to bring itself.
   `.executors = .exact(n)`, `anole.http.Status` vs `std.http.Status`,
   `ContentType.unknown` for octet-stream.
 - Two root declarations (`std_options`, `zio_options`) in every program.
+
+**WebTransport, everyone**
+- Anole: `app.webtransport("/wt/echo", handler)` beside every other route,
+  on the same HTTP/3 listener; the handler is 30 lines with datagrams.
+- Go: webtransport-go's current releases speak only the newer drafts
+  browsers don't use yet, so it is pinned to v0.10.0 (quic-go v0.59.0,
+  three releases old); a separate server with its own Origin check.
+- Rust: wtransport owns the QUIC endpoint and rejects anything that is not
+  a WebTransport CONNECT, so no `/plaintext` (or axum Router) beside it;
+  paths are matched by hand.
+- Node: a native addon wrapping Chromium's QUICHE; it needs glibc 2.38,
+  ignores the client unless it sends `SETTINGS_ENABLE_WEBTRANSPORT`, and
+  its idle timeout can't be set from JS.
+- Python: no ASGI server serves it; aioquic gives connection events
+  (headers, stream data, datagrams) and the session bookkeeping is yours.
 
 **Fiber**
 - No HTTP/2, HTTP/3 or gRPC at all (fasthttp); Go's own net/http is the

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -247,5 +248,64 @@ func Oha(o OhaOpts) (Result, error) {
 	r.P90MS = s.LatencyPercentiles["p90"] * 1000
 	r.P99MS = s.LatencyPercentiles["p99"] * 1000
 	r.P999MS = s.LatencyPercentiles["p99.9"] * 1000
+	return r, nil
+}
+
+// GhzOpts: gRPC unary calls to grpc.testing.TestService/UnaryCall.
+type GhzOpts struct {
+	Target      string // host:port, plaintext (h2c)
+	ProtoDir    string // holds grpc/testing/test.proto
+	Conns       int
+	Concurrency int
+	RespSize    int // response_size: bytes of payload in each reply
+	Duration    time.Duration
+}
+
+// Ghz runs ghz for o.Duration. ghz reports latencies in nanoseconds and has
+// no p99.9.
+func Ghz(o GhzOpts) (Result, error) {
+	args := []string{"--insecure", "--import-paths", o.ProtoDir,
+		"--proto", filepath.Join(o.ProtoDir, "grpc", "testing", "test.proto"),
+		"--call", "grpc.testing.TestService/UnaryCall",
+		"-d", fmt.Sprintf(`{"response_size":%d}`, o.RespSize),
+		"--connections", strconv.Itoa(o.Conns), "-c", strconv.Itoa(o.Concurrency),
+		"-z", o.Duration.String(), "--format", "json", o.Target}
+	out, err := run(o.Duration+time.Minute, "ghz", args...)
+	if err != nil {
+		return Result{}, err
+	}
+	var g struct {
+		Count   int64   `json:"count"`
+		RPS     float64 `json:"rps"`
+		Average float64 `json:"average"`
+		Slowest float64 `json:"slowest"`
+		Dist    []struct {
+			Percentage int     `json:"percentage"`
+			Latency    float64 `json:"latency"`
+		} `json:"latencyDistribution"`
+		Status map[string]int64 `json:"statusCodeDistribution"`
+	}
+	if err := json.Unmarshal([]byte(out), &g); err != nil {
+		return Result{}, fmt.Errorf("ghz output: %v: %s", err, tail(out, 300))
+	}
+	r := Result{Tool: "ghz", Args: strings.Join(args, " "), Requests: g.Count, RPS: g.RPS,
+		MeanMS: g.Average / 1e6, MaxMS: g.Slowest / 1e6}
+	for code, n := range g.Status {
+		if code != "OK" {
+			r.Errors += n
+		}
+	}
+	for _, p := range g.Dist {
+		switch p.Percentage {
+		case 50:
+			r.P50MS = p.Latency / 1e6
+		case 90:
+			r.P90MS = p.Latency / 1e6
+		case 95:
+			r.P95MS = p.Latency / 1e6
+		case 99:
+			r.P99MS = p.Latency / 1e6
+		}
+	}
 	return r, nil
 }

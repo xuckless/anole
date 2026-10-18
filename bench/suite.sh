@@ -7,6 +7,7 @@
 #   bench/suite.sh -profile full                     # the overnight run
 #   bench/suite.sh -only raw -servers anole,fiber -tiers 1
 #   NO_BUILD=1 bench/suite.sh ...                    # reuse the images as built
+#   RESULTS=<id> bench/suite.sh -only grpc ...       # add cases to an earlier run
 #
 # Results go to bench/results/<UTC date>-<commit>[-<RUN_TAG>]/: cases.jsonl
 # (one line per case), env.json and report.md.
@@ -43,12 +44,12 @@ fi
 
 sha=$(git -C "$root" rev-parse --short HEAD)
 dirty=$(git -C "$root" status --porcelain -- src build.zig build.zig.zon bench/servers | head -1)
-id=$(date -u +%Y%m%d-%H%M)-$sha${dirty:+-dirty}${RUN_TAG:+-$RUN_TAG}
+id=${RESULTS:-$(date -u +%Y%m%d-%H%M)-$sha${dirty:+-dirty}${RUN_TAG:+-$RUN_TAG}}
 out=$bench/results/$id
 mkdir -p "$out"
 
-# The environment, for the report.
-{
+# The environment, for the report (an earlier run's, when adding to it).
+[ -f "$out/env.json" ] || {
   printf '{\n'
   printf '  "commit": "%s%s",\n' "$(git -C "$root" rev-parse HEAD)" "${dirty:+ (dirty)}"
   printf '  "date": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
