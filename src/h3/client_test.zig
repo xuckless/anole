@@ -787,6 +787,34 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     try std.testing.expectEqual(@as(u64, 2), f.ep.early_served.load(.monotonic));
 }
 
+test "h3: 0-RTT carries on across a certificate reload" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .early_data = true });
+    defer f.stop(gpa, io);
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, null);
+        defer conn.close();
+        const b = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+        gpa.free(b);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+    // A new TLS context (the same certificate, so the client still trusts
+    // it): the ticket keys carry over, and 0-RTT with them.
+    f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, null));
+    const conn = try f.connectResuming(gpa, io, &cache, true, null);
+    defer conn.close();
+    try std.testing.expectEqual(client.EarlyData.pending, conn.earlyData());
+    const b = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+    gpa.free(b);
+    try std.testing.expectEqual(client.EarlyData.accepted, conn.earlyData());
+    try std.testing.expect(conn.resumed());
+}
+
 test "h3: 0-RTT the server refuses goes again after the handshake" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
