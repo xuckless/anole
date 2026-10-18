@@ -8,8 +8,9 @@
 # CLIENTS and TESTS are comma-separated runner names (defaults below). Needs
 # Docker with compose v2, tshark, python3 and git; Linux, or anything that
 # can run the runner (see the CI job). ANOLE_INTEROP_BIN skips building
-# the server (a Linux binary of `zig build h3-interop-server`). Exits
-# non-zero when any test fails.
+# the server (a Linux binary of `zig build h3-interop-server`);
+# ANOLE_INTEROP_IMAGE names its image (default anole-interop:latest), so
+# two checkouts can keep their own. Exits non-zero when any test fails.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -18,6 +19,7 @@ clients=${1:-ngtcp2,quic-go}
 tests=${2:-handshake,transfer,longrtt,chacha20,multiplexing,retry,http3,amplificationlimit,blackhole,keyupdate,handshakeloss,transferloss,handshakecorruption,transfercorruption,ecn,rebind-port,rebind-addr,v2,resumption,zerortt}
 runner_commit=ab039a4a4b43ae2e21bb5704c9fad1f8fe6257d6
 work=${ANOLE_INTEROP_WORK:-$(mktemp -d)}
+image=${ANOLE_INTEROP_IMAGE:-anole-interop:latest}
 mkdir -p "$work"
 
 # The server, for the Docker host's architecture.
@@ -35,18 +37,18 @@ else
   cp "$work/out/bin/h3-interop-server" "$ctx/"
 fi
 cp "$here/Dockerfile" "$here/run_endpoint.sh" "$ctx/"
-docker build -q -t anole-interop:latest "$ctx" >/dev/null
+docker build -q -t "$image" "$ctx" >/dev/null
 
 # The runner, with Anole added as a server.
 if [ ! -d "$work/runner/.git" ]; then
   git clone -q https://github.com/quic-interop/quic-interop-runner "$work/runner"
 fi
 git -C "$work/runner" checkout -q "$runner_commit"
-python3 -I - "$work/runner/implementations_quic.json" <<'PY'
+python3 -I - "$work/runner/implementations_quic.json" "$image" <<'PY'
 import json, sys
 p = sys.argv[1]
 impls = json.load(open(p))
-impls["anole"] = {"image": "anole-interop:latest", "url": "https://github.com/xuckless/anole", "role": "server"}
+impls["anole"] = {"image": sys.argv[2], "url": "https://github.com/xuckless/anole", "role": "server"}
 json.dump(impls, open(p, "w"), indent=2)
 PY
 python3 -m venv "$work/venv"

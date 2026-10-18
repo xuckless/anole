@@ -60,6 +60,16 @@ for macOS and Linux.
   out a new token when the IP address changed, and reports the new address
   to handlers. The ngtcp2 fork fixes a migration right after a NAT
   rebinding, which stock 1.25.0 closed with CONNECTION_ID_LIMIT_ERROR.
+- HTTP/3 on every core on Linux: one SO_REUSEPORT UDP socket and endpoint
+  per executor (`http3.sockets`, one per executor by default; macOS keeps
+  one). The server's connection IDs name their endpoint in one byte, and a
+  classic BPF program on the socket group (Linux 4.5+) steers each datagram
+  to its connection's socket, across migrations too; a datagram that lands
+  on another endpoint's socket all the same is passed on to its owner and
+  handled there. Endpoints share one TLS context (tickets and 0-RTT work on
+  any core), the token and stateless-reset key, and the drain. The UDP port
+  is probed before the group binds, as TCP's is, and a SIGUSR2 restart hands
+  every socket over in order.
 - TLS through BoringSSL, built from source by Zig: TLS 1.3 and 1.2, ALPN,
   mutual TLS (with the acceptable CAs named in the request, and the client's
   certificate for handlers through `req.peerCertificate()` on HTTP/1.1,
@@ -74,7 +84,7 @@ for macOS and Linux.
   and compressed request bodies.
 - The PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies.
 - Zero-downtime restart on SIGUSR2 (the new process inherits the listening
-  sockets, HTTP/3's UDP socket included; HTTP/3 connections are closed and
+  sockets, HTTP/3's UDP sockets included; HTTP/3 connections are closed and
   reconnect), systemd socket activation, and systemd's readiness protocol
   (`READY=1`, `RELOADING=1`, `MAINPID=`, `STOPPING=1`) without libsystemd.
 - `anole.Server` conveniences: `static`, `embedded` and `query` routes;

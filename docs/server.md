@@ -320,7 +320,9 @@ the server there, send its requests, call `app.stop()`, and let `run` return.
 `init` creates the zio runtime, one pinned executor per CPU. On Linux each
 executor runs its own accept loop on its own `SO_REUSEPORT` socket, so the
 kernel spreads new connections over the cores and a connection never leaves
-the executor that accepted it. On macOS the accept loops share one socket.
+the executor that accepted it. HTTP/3 does the same with one UDP socket per
+executor (see [Cores](#cores)). On macOS the accept loops share one socket,
+and HTTP/3 has one.
 
 `run` handles SIGINT and SIGTERM (and SIGUSR2 when `process` is set), and
 SIGHUP when there is an `https` listener, which reloads its certificate
@@ -356,8 +358,9 @@ not `SO_REUSEPORT`. The probe conflicts with any socket already listening
 there, and the listener fails with `error.AddressInUse` and a log line
 naming the address. Connections a stopped server left in `TIME_WAIT` do not
 trip it, so a quick restart works. Port 0 is not checked, and neither are
-sockets inherited from systemd or a SIGUSR2 predecessor. On macOS, as on
-other BSDs, a listener on a specific address beside one on the wildcard
+sockets inherited from systemd or a SIGUSR2 predecessor. HTTP/3's UDP
+sockets get the same check, with a probe that sets no option at all (UDP has
+no `TIME_WAIT`), before the first of them binds. On macOS, as on other BSDs, a listener on a specific address beside one on the wildcard
 address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
 allowed: the kernel treats those as different addresses.
 
@@ -395,8 +398,9 @@ address and port, and every response that did not come over HTTP/3 carries
 
 `http3` fields: `address` and `port` (`https`'s when null), `alt_svc`
 (true), `max_streams_bidi` (100 concurrent requests per connection),
-`idle_timeout_ms` (30 000), `validate_address` (false) and `early_data`
-(false). With `validate_address`, every new client must prove its address
+`idle_timeout_ms` (30 000), `validate_address` (false), `early_data`
+(false) and `sockets` (null: one per executor on Linux, see
+[Cores](#cores)). With `validate_address`, every new client must prove its address
 with a Retry first, which costs a round trip and resists floods from
 spoofed sources. `hq_interop_root` is for the QUIC interop runner only.
 
@@ -459,7 +463,41 @@ because the runner wants a PATH_CHALLENGE as the first packet on the new path
 and ngtcp2 sends the PATH_RESPONSE first, as RFC 9000 allows
 (quic-interop-runner issues #424 and #500).
 
-The endpoint runs on one executor for now, so HTTP/3 uses one core.
+### Cores
+
+On Linux HTTP/3 runs on every executor, as TCP does: one UDP socket per
+executor (`sockets`, at most 255), all bound to the HTTP/3 port with
+`SO_REUSEPORT`, each read by an endpoint of its own on its own executor. A
+connection lives on the endpoint that accepted it, with all its tasks, and
+never touches another executor. The kernel's 4-tuple hash, which spreads
+TCP connections, would not keep it there: a client that moves to a new port or address would land on another socket.
+So each of the server's connection IDs carries its endpoint's number in its
+second byte, and a classic BPF program on the socket group
+(`SO_ATTACH_REUSEPORT_CBPF`, Linux 4.5 or later) reads that byte from every
+datagram's destination connection ID and picks the socket by it. A client's
+first Initial carries a connection ID of its own choosing, so the kernel's
+hash places it, and the endpoint that takes it hands out IDs with its own
+number from then on.
+
+What lands on another endpoint's socket all the same is passed on to the
+owner's queue and handled there, never where it landed: another
+connection's datagrams in a GRO batch (the kernel delivers a batch whole, to
+the socket of its first), a socket group without the program (a kernel older
+than 4.5: logged as a warning, and everything still works, one hop slower),
+and sockets inherited in another order than they were bound in. Each
+endpoint counts what it handled, passed on and accepted
+(`anole.h3.EndpointStats`).
+
+The endpoints share one TLS context, so a session ticket from one resumes,
+with 0-RTT, on any other, and a certificate reload switches them all; one
+key for address-validation tokens and stateless resets; and the drain,
+which waits for every endpoint's connections. The endpoint number is one
+plain byte of an ID that is otherwise random, so an observer who sees a
+connection's IDs before and after a migration learns that both belong to
+the same core, one of a few; QUIC-LB's plaintext mode makes the same trade.
+
+On macOS `SO_REUSEPORT` does not spread datagrams over a group's sockets,
+so HTTP/3 keeps one socket and one endpoint there, whatever `sockets` says.
 
 ## TLS
 
@@ -541,14 +579,20 @@ Pass the process to enable all of this: `.process = init.minimal`.
 
 **Socket activation.** When `LISTEN_PID` is this process, Anole serves the
 `LISTEN_FDS` sockets from fd 3 on, as systemd passes them. It matches them by
-`LISTEN_FDNAMES` (`http`, `https`, and `h3` for HTTP/3's UDP socket), or by
-position (`http`, `https`, `h3`) when they have no names. A listener with no
-inherited socket opens its own, and one named `h3` must be a datagram socket.
+`LISTEN_FDNAMES` (`http`, `https`, and `h3` for HTTP/3's UDP sockets), or by
+position (`http`, `https`, then every one left for HTTP/3) when they have no
+names. A listener with no inherited socket opens its own, and one named `h3`
+must be a datagram socket. Several `h3` sockets are one `SO_REUSEPORT` group,
+one endpoint each, in the order they were bound in: the steering program
+picks a socket by its place in the group, which is the order of the `bind`
+calls and changes when one of them closes. In another order they still work,
+through the endpoints passing datagrams on to each other.
 
 **Restart on SIGUSR2.** `kill -USR2 <pid>` starts the binary at the same
 path with the same arguments and environment. The new process inherits the
-listening sockets, HTTP/3's included (in the `LISTEN_FDS` format), binds
-nothing of its own, and reports through a pipe once it serves; only then does
+listening sockets, HTTP/3's included (in the `LISTEN_FDS` format; every
+per-core UDP socket, in the group's order, so the steering stays right),
+binds nothing of its own, and reports through a pipe once it serves; only then does
 the old one stop accepting and drain. TCP clients never see a closed port. If
 the new process does not report within `restart_timeout_ms`, the old one kills
 it and keeps serving. To deploy, replace the binary on disk and send SIGUSR2.
@@ -631,7 +675,10 @@ Service=anole.service
 ```
 
 Without the socket units, drop `Requires=` and `Sockets=`: Anole binds the
-ports itself and still hands them over on a reload. On systemd 253 or later,
+ports itself and still hands them over on a reload. `anole-h3.socket` gives
+HTTP/3 one socket, so one core; on Linux, leave it out (and out of
+`Requires=` and `Sockets=`) and Anole binds a UDP socket per executor itself,
+and hands them all over on a reload. On systemd 253 or later,
 `Type=notify-reload` with `ReloadSignal=SIGUSR2` can replace `Type=notify` and
 `ExecReload=`: systemd then sends the signal itself and waits for
 `RELOADING=1` and `READY=1`. Both setups were checked on systemd 257: two
@@ -640,8 +687,8 @@ drains.
 
 Limits:
 
-- Each listener is one socket in this mode, so Linux loses the per-core
-  `SO_REUSEPORT` sockets.
+- Each TCP listener is one socket in this mode, so Linux loses the per-core
+  `SO_REUSEPORT` accept sockets. HTTP/3 keeps its per-core UDP sockets.
 - HTTP/3 requests in flight at a restart are cut (see above).
 - `systemctl restart` stops and starts the service: with socket units the
   sockets stay open and TCP connections queue meanwhile, but in-flight work

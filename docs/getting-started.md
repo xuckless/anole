@@ -394,7 +394,8 @@ WantedBy=multi-user.target
 With `.process = init.minimal` in the options, Anole also takes sockets
 from systemd's socket activation, reports readiness (`Type=notify`) and
 restarts with no downtime on SIGUSR2 (`systemctl reload`), at the cost of
-one listening socket per port rather than one per core;
+one TCP listening socket per port rather than one per core (HTTP/3 keeps
+one per core);
 [server.md](server.md#zero-downtime-restart-and-socket-activation) has the
 units.
 
