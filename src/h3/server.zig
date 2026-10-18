@@ -29,6 +29,7 @@
 //! response plumbing follows dusty's HTTP/2 engine (src/server/h2.zig in
 //! the xuckless/dusty fork).
 const std = @import("std");
+const zio = @import("zio");
 const dusty = @import("dusty");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
@@ -1069,6 +1070,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
             }
 
+            fn setTimeout(context: *anyopaque, _: std.Io, timeout: std.Io.Timeout) void {
+                const timer: *zio.AutoCancel = @ptrCast(@alignCast(context));
+                timer.setClock(.fromStd(timeout), .fromStdTimeout(timeout));
+            }
+
             fn resetStream(s: *Stream, code: u64) void {
                 const conn = s.conn;
                 conn.lock();
@@ -1086,6 +1092,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const arena = s.arena.allocator();
                 const io = ep.io;
 
+                // `timeout.request` bounds the whole exchange, as on HTTP/1.1
+                // and HTTP/2; a handler may move it (`Request.setTimeout`).
+                // Running out cancels the task, which resets the stream.
+                var timer: zio.AutoCancel = .init;
+                defer timer.clear();
+                if (server.config.timeout.request) |d| setTimeout(&timer, io, .{ .duration = .{ .raw = d, .clock = .awake } });
+
                 var request: dusty.Request = .{
                     .arena = arena,
                     .io = io,
@@ -1096,6 +1109,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .secure = true,
                     .version_major = 3,
                     .version_minor = 0,
+                    ._timeout_context = &timer,
+                    ._set_timeout = setTimeout,
                 };
                 var body_reader: BodyReader = .init(s);
                 request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };

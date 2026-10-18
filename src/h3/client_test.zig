@@ -30,6 +30,11 @@ fn withTrailers(_: *dusty.Request, res: *dusty.Response) !void {
     try res.trailer("x-checksum", "abc");
 }
 
+fn slow(req: *dusty.Request, res: *dusty.Response) !void {
+    try req.io.sleep(.fromSeconds(5), .awake);
+    res.body = "too late";
+}
+
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const s = try conn.request(&.{
         .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
@@ -49,15 +54,20 @@ const Fixture = struct {
     bundle: std.crypto.Certificate.Bundle,
 
     fn start(gpa: std.mem.Allocator, io: std.Io) !Fixture {
+        return startWith(gpa, io, .{ .listeners = &.{} });
+    }
+
+    fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig) !Fixture {
         var pem = try anole_tls.selfSigned(gpa, .{});
         errdefer pem.deinit(gpa);
         const http = try gpa.create(dusty.Server(void));
         errdefer gpa.destroy(http);
-        http.* = .init(gpa, io, .{ .listeners = &.{} }, {});
+        http.* = .init(gpa, io, config, {});
         errdefer http.deinit();
         http.router.get("/hello", hello);
         http.router.post("/echo", echo);
         http.router.get("/trailers", withTrailers);
+        http.router.get("/slow", slow);
         const ep = try Endpoint.init(gpa, io, http, .{
             .address = .{ .ip4 = .loopback(0) },
             .cert_pem = pem.cert,
@@ -202,4 +212,30 @@ test "h3 client: certificate checks, and a server that goes away" {
         gpa.free(b);
         try io.sleep(.fromMilliseconds(20), .awake);
     } else return error.TestUnexpectedResult;
+}
+
+test "h3 server: a request that outlives timeout.request is reset" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(300) } });
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const started = std.Io.Clock.awake.now(io);
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/slow" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    if (s.waitHead()) |_| return error.ServedPastTheTimeout else |_| {}
+    const took = started.durationTo(std.Io.Clock.awake.now(io));
+    try std.testing.expect(took.toMilliseconds() < 3000);
+
+    // The connection carries on.
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
 }
