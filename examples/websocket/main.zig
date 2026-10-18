@@ -16,11 +16,9 @@ const std = @import("std");
 const anole = @import("anole");
 const websocket = anole.websocket;
 
-/// Log lines read `anole` and `access`, not the libraries underneath.
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 const log = std.log.scoped(.websocket_example);
 
@@ -127,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
     app.wsWith("/echo", echo, .{ .max_message_size = 1024 * 1024 });
     app.ws("/chat/:room", chat);
 
-    log.info("listening on http://127.0.0.1:{d}", .{port});
-    if (anole.features.tls != .none) log.info("listening on https://127.0.0.1:{d} (self-signed)", .{tls_port});
+    // The server logs a "listening on" line per listener as it starts.
+    if (anole.features.tls != .none) log.info("the HTTPS certificate is a self-signed development one (curl -k)", .{});
     try app.run();
 }

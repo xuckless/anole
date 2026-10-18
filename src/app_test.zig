@@ -50,11 +50,7 @@ const AppRoutes = struct {
     }
 
     fn requireKey(req: *Request, res: *Response, next: handlers.Next) !void {
-        if (req.headers.get("X-Api-Key") == null) {
-            res.status = .unauthorized;
-            res.body = "no key\n";
-            return;
-        }
+        if (req.headers.get("X-Api-Key") == null) return res.fail(.unauthorized, "no key");
         return next.call();
     }
 

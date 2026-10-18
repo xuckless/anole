@@ -23,12 +23,9 @@ const anole = @import("anole");
 const http = anole.http;
 const auth = anole.auth;
 
-pub const zio_options = anole.zio_options;
-
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 const issuer = "anole-auth-example";
 const demo_password = "demo-password";
@@ -91,10 +88,7 @@ fn login(app: *App, req: *http.Request, res: *http.Response) !void {
     const user = app.find(form.get("user") orelse "");
     const stored = if (user) |u| u.hash else app.dummy_hash;
     const ok = auth.password.verify(app.gpa, req.io, stored, form.get("password") orelse "");
-    if (!ok or user == null) {
-        res.status = .unauthorized;
-        return res.print(.text, "wrong user or password\n", .{});
-    }
+    if (!ok or user == null) return res.fail(.unauthorized, "wrong user or password");
     try req.session.set("user", user.?.name);
     try req.session.set("role", user.?.role);
     // A new session at sign-in (against session fixation: with a store, a
@@ -106,10 +100,7 @@ fn login(app: *App, req: *http.Request, res: *http.Response) !void {
 }
 
 fn me(_: *App, req: *http.Request, res: *http.Response) !void {
-    const user = req.session.get("user") orelse {
-        res.status = .unauthorized;
-        return res.print(.text, "not signed in\n", .{});
-    };
+    const user = req.session.get("user") orelse return res.fail(.unauthorized, "not signed in");
     try res.print(.text, "user: {s}\nrole: {s}\ncsrf: {s}\n", .{ user, req.session.get("role").?, try auth.csrf.token(req) });
 }
 
@@ -212,7 +203,6 @@ pub fn main(init: std.process.Init) !void {
     server.group("/api", &jwt_only).get("/me", apiMe);
     server.group("/service", &key_only).get("/stats", serviceStats);
 
-    std.log.info("listening on http://localhost:{d}", .{port});
     std.log.info("users alice (editor) and bob (reader), password \"{s}\"", .{demo_password});
     std.log.info("demo JWT for alice, valid 1 h:\n{s}", .{token});
     std.log.info("demo API key:\n{s}", .{api_key.key});

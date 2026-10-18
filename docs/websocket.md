@@ -71,11 +71,7 @@ plain HTTP:
 fn echo(_: *App, req: *anole.Request, res: *anole.Response) !void {
     var ws = (try anole.websocket.upgrade(req, res, .{
         .max_message_size = 1024 * 1024,
-    })) orelse {
-        res.status = .bad_request;
-        try res.print(.text, "this endpoint speaks WebSocket\n", .{});
-        return;
-    };
+    })) orelse return res.fail(.bad_request, "this endpoint speaks WebSocket");
     defer ws.deinit();
     // ...
 }

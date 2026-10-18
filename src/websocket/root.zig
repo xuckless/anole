@@ -10,10 +10,8 @@
 //! and from any handler, `upgrade`:
 //!
 //!     fn chat(req: *anole.Request, res: *anole.Response) !void {
-//!         var ws = (try anole.websocket.upgrade(req, res, .{})) orelse {
-//!             res.status = .bad_request;
-//!             return;
-//!         };
+//!         var ws = (try anole.websocket.upgrade(req, res, .{})) orelse
+//!             return res.fail(.bad_request, "");
 //!         defer ws.deinit();
 //!         while (true) {
 //!             const msg = try ws.receive();
@@ -297,11 +295,8 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
     const S = struct {
         fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
             var ws = (try upgrade(req, res, options)) orelse {
-                res.status = .upgrade_required;
-                try res.header("Upgrade", "websocket");
-                res.content_type = .text;
-                res.body = "426 Upgrade Required: this endpoint speaks WebSocket\n";
-                return;
+                res.fail(.upgrade_required, "this endpoint speaks WebSocket");
+                return res.header("Upgrade", "websocket");
             };
             defer ws.deinit();
             const result = switch (params.len) {

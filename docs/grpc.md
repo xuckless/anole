@@ -105,8 +105,7 @@ const std = @import("std");
 const anole = @import("anole");
 const pb = @import("greeter_pb");
 
-pub const zio_options = anole.zio_options;
-pub const std_options: std.Options = .{ .logFn = anole.logFn };
+pub const std_options = anole.std_options; // optional: quieter Debug builds
 
 const Call = anole.grpc.Call;
 

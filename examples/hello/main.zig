@@ -25,16 +25,9 @@ const std = @import("std");
 const anole = @import("anole");
 const http = anole.http;
 
-/// Compile-time zio configuration, read by zio from the root module
-/// (zio src/options.zig). `.pinned`: many executors, a task never migrates.
-pub const zio_options = anole.zio_options;
-
-/// Log lines read `anole` and `access`, not the libraries underneath.
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    // zio's per-thread startup lines are debug noise here.
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 // No `std_options_debug_io = zio.debug_io` (zio's examples set it so logging
 // yields): std.debug uses that Io for stack unwinding too, and Debug builds
@@ -116,9 +109,9 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("anole features: tls={t} http2={} http3={} websocket={}", .{
         anole.features.tls, anole.features.http2, anole.features.http3, anole.features.websocket,
     });
-    std.log.info("listening on http://127.0.0.1:{d}", .{port});
-    if (anole.features.tls != .none) std.log.info("listening on https://127.0.0.1:{d} (self-signed, BoringSSL)", .{tls_port});
-    if (app.http3Address()) |q| std.log.info("listening on HTTP/3 udp://127.0.0.1:{d}", .{q.getPort()});
+    // The server logs one "listening on" line per listener as it starts,
+    // HTTP/3 named on the HTTPS one.
+    if (anole.features.tls != .none) std.log.info("the HTTPS certificate is a self-signed development one (curl -k)", .{});
     // Until SIGINT or SIGTERM; then the accept loops stop and in-flight
     // requests drain (bounded by timeout.shutdown).
     try app.run();

@@ -29,13 +29,9 @@ const h2 = anole.h2;
 const h3 = anole.h3;
 const grpc = anole.grpc;
 
-/// Log lines read `anole` and `access`, not the libraries underneath.
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    .log_level = .info,
-    // zio's per-thread startup lines are debug noise here.
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 const App = struct {
     /// Thread-safe: the clients' tasks may run on any executor.

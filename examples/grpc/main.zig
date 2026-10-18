@@ -34,11 +34,9 @@ const std = @import("std");
 const anole = @import("anole");
 const pb = @import("greeter_pb");
 
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    // zio's per-thread startup lines are debug noise here.
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 const Call = anole.grpc.Call;
 

@@ -367,8 +367,8 @@ status codes.
 ## Outside a server
 
 In a program with no `anole.Server`, such as a CLI tool or a test, start a
-runtime yourself and use its `Io`. Declare `pub const zio_options =
-anole.zio_options;` in the root file, as for a server.
+runtime yourself and use its `Io`. Anole's build already gives zio pinned
+scheduling, so the root file needs no `zio_options`, as for a server.
 
 ```zig
 const rt = try anole.zio.Runtime.init(gpa, .{});

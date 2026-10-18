@@ -21,17 +21,9 @@ const http = anole.http;
 const observe = anole.observe;
 const metrics = observe.metrics;
 
-/// Log lines read `anole` and `access`, not the libraries underneath.
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    // zio's per-thread startup lines and the server's per-request debug
-    // lines are noise here. Levels are set by the original scope name
-    // (`dusty`), not the renamed one (`anole`).
-    .log_scope_levels = &.{
-        .{ .scope = .zio, .level = .info },
-        .{ .scope = .dusty, .level = .info },
-    },
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 /// What every handler shares, passed as the handler's first argument.
 const App = struct {

@@ -23,14 +23,9 @@ const std = @import("std");
 const anole = @import("anole");
 const http = anole.http;
 
-pub const zio_options = anole.zio_options;
-
-/// Log lines read `anole` and `access`, not the libraries underneath.
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    // zio's per-thread startup lines are debug noise here.
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
-};
+/// Keeps the runtime's per-thread lines and the connection loops' debug
+/// lines out of a Debug build; info (startup lines, access log) stays.
+pub const std_options = anole.std_options;
 
 const App = struct {
     client: http.Client,
@@ -112,6 +107,5 @@ pub fn main(init: std.process.Init) !void {
     server.get("/files/:name", handleFile);
     server.get("/fanout", handleFanout);
 
-    std.log.info("listening on http://127.0.0.1:{d}", .{port});
-    try server.run();
+    try server.run(); // logs a "listening on" line as it starts
 }

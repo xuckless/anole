@@ -114,11 +114,7 @@ the `*App` first.
 
 ```zig
 fn requireKey(req: *anole.Request, res: *anole.Response, next: anole.Next) !void {
-    if (req.headers.get("X-Api-Key") == null) {
-        res.status = .unauthorized;
-        res.body = "missing API key\n";
-        return;
-    }
+    if (req.headers.get("X-Api-Key") == null) return res.fail(.unauthorized, "missing API key");
     return next.call();
 }
 
@@ -134,11 +130,8 @@ const RequireToken = struct {
     token: []const u8,
 
     pub fn execute(self: *const RequireToken, req: *anole.Request, res: *anole.Response, executor: anytype) !void {
-        if (!std.mem.eql(u8, req.headers.get("Authorization") orelse "", self.token)) {
-            res.status = .unauthorized;
-            res.body = "401 Unauthorized\n";
-            return;
-        }
+        if (!std.mem.eql(u8, req.headers.get("Authorization") orelse "", self.token))
+            return res.fail(.unauthorized, "");
         return executor.next();
     }
 };
