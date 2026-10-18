@@ -1,10 +1,14 @@
-//! ngtcp2 (QUIC transport, MIT) built from the official v1.25.0 release tarball,
-//! plus ngtcp2's BoringSSL crypto helper (crypto/shared.c + crypto/boringssl/boringssl.c)
+//! ngtcp2 1.25.0 (QUIC transport, MIT) built from Anole's fork (xuckless/ngtcp2,
+//! branch `anole`: the v1.25.0 tag, the release's generated
+//! lib/includes/ngtcp2/version.h, and a patch that keeps a server's fallback
+//! connection ID across a migration right after a NAT rebinding), fetched as a
+//! GitHub archive of the pinned commit (a lazy dependency), plus ngtcp2's
+//! BoringSSL crypto helper (crypto/shared.c + crypto/boringssl/boringssl.c)
 //! as its own static library.
 //!
 //! The source list and macro set are adapted from kingwill101/server_native (MIT),
 //! zig/protocol_sources.zig and zig/protocol_dependencies.zig. Differences from
-//! server_native: the release tarball already ships lib/includes/ngtcp2/version.h, so no
+//! server_native: the fork (like the release tarball) has lib/includes/ngtcp2/version.h, so no
 //! config header is generated; HAVE_CONFIG_H is never defined, so every config.h macro
 //! that the sources test is set here per OS; and the crypto helper is a separate library
 //! instead of being compiled into the consumer module.
@@ -71,7 +75,7 @@ pub const crypto_boringssl_sources = [_][]const u8{
 
 const c_flags = [_][]const u8{"-std=c11"};
 
-/// Builds libngtcp2.a. `upstream` is the lazy `ngtcp2` dependency (release tarball root).
+/// Builds libngtcp2.a. `upstream` is the lazy `ngtcp2` dependency (the fork's tree).
 /// Public headers (ngtcp2/ngtcp2.h, ngtcp2/version.h) are installed so `linkLibrary`
 /// exposes them to dependents.
 pub fn library(

@@ -872,12 +872,11 @@ test "h3: a client that moves to a new port keeps its connection, and the server
     const conn = try f.connect(gpa, io);
     defer conn.close();
 
-    // Not a NAT rebinding followed at once by a migration: ngtcp2 1.25.0's
-    // server then retires the connection ID its path validation still
-    // keeps as the fallback, counts it anyway when the client replaces
-    // it, and closes with CONNECTION_ID_LIMIT_ERROR. A few seconds apart,
-    // once that validation has ended, the two are fine.
-    for ([_]client.Rebind{ .migrate, .migrate, .nat, .nat }) |how| {
+    // Every pair of moves, back to back: a migration right after a NAT
+    // rebinding needs the xuckless/ngtcp2 fix, without which the server
+    // retired the connection ID it kept as the fallback and closed with
+    // CONNECTION_ID_LIMIT_ERROR.
+    for ([_]client.Rebind{ .migrate, .nat, .migrate, .migrate, .nat, .nat }) |how| {
         const before = conn.udp.socket.address.getPort();
         // A download in flight across the move.
         const d = try request(conn, "GET", "/download?n=2000000", .{});

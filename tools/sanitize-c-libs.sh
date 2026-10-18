@@ -9,8 +9,10 @@
 #
 #   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd]
 #
-# Needs clang, make, cmake, curl and tar (the ngtcp2 and nghttp3 release
-# tarballs ship their configure scripts). DETECT_LEAKS=1 turns on
+# Needs clang, make, cmake, curl, tar and git (the nghttp3 release tarball
+# ships its configure script; ngtcp2 comes from the xuckless/ngtcp2 fork,
+# whose archive lacks the tests' munit submodule, so it is cloned at the
+# pinned commit with its submodules and built with CMake). DETECT_LEAKS=1 turns on
 # LeakSanitizer where it exists (Linux).
 set -euo pipefail
 
@@ -44,10 +46,19 @@ fetch() {
 for lib in "${libs[@]}"; do
   case $lib in
     ngtcp2)
-      fetch ngtcp2 "ngtcp2/releases"
-      ./configure --enable-lib-only --disable-dependency-tracking CFLAGS="$san" LDFLAGS="-fsanitize=address,undefined" >/dev/null
-      make -j"$jobs" check >/dev/null || { cat tests/test-suite.log; exit 1; }
-      grep -E "^# (PASS|FAIL|ERROR)" tests/test-suite.log
+      url=$(url_of "xuckless/ngtcp2/archive")
+      [ -n "$url" ] || { echo "no pinned URL matching xuckless/ngtcp2/archive" >&2; exit 1; }
+      commit=${url##*/}
+      commit=${commit%.tar.gz}
+      echo "== ngtcp2: xuckless/ngtcp2 at $commit"
+      rm -rf "$work/ngtcp2" && git init -q "$work/ngtcp2" && cd "$work/ngtcp2"
+      git fetch -q --depth 1 https://github.com/xuckless/ngtcp2 "$commit"
+      git -c advice.detachedHead=false checkout -q FETCH_HEAD
+      git submodule update -q --init --depth 1
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=ON \
+        -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" >/dev/null
+      cmake --build build -j"$jobs" --target main >/dev/null
+      build/tests/main | tail -1
       ;;
     nghttp3)
       fetch nghttp3 "nghttp3/releases"

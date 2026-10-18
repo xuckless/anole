@@ -65,8 +65,11 @@ BoringSSL (TLS and cryptography)
 
 ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
   Licence:  MIT. Copyright (c) 2016 ngtcp2 contributors
-  Source:   https://github.com/ngtcp2/ngtcp2
-            (release tarball ngtcp2-1.25.0.tar.xz)
+  Source:   https://github.com/ngtcp2/ngtcp2, used through Anole's fork
+            https://github.com/xuckless/ngtcp2 (branch anole: tag v1.25.0,
+            its generated version.h, and Anole's patch keeping a server's
+            fallback connection ID across a migration after a NAT rebinding)
+  Pinned:   commit 591e959bc67820226651ee8f009a265899bfc71c of the fork
   Includes: lib/ngtcp2_pcg.c (PCG random number generator,
             Copyright 2014-2019 Melissa O'Neill and the PCG Project
             contributors, Apache-2.0 OR MIT, used under MIT), compiled in

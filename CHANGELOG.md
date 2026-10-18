@@ -42,7 +42,8 @@ for macOS and Linux.
   streaming bodies, trailers, two-phase GOAWAY on drain. A client's
   RST_STREAM, or a lost connection, cancels the stream's handler. h2spec
   passes every case in strict mode, over h2c and TLS.
-- HTTP/3 on ngtcp2 1.25.0 and nghttp3 1.18.0: the same handlers over QUIC,
+- HTTP/3 on ngtcp2 1.25.0 (from Anole's fork xuckless/ngtcp2, see the
+  migration entry) and nghttp3 1.18.0: the same handlers over QUIC,
   `Alt-Svc`, Retry, stateless reset, QUIC v2, ECN, PKTINFO, GSO and GRO on
   Linux, per-request timeouts, a GOAWAY drain and mutual TLS. The QUIC interop runner
   passes every server case it was given against ngtcp2's and quic-go's
@@ -51,13 +52,14 @@ for macOS and Linux.
   OPTIONS from early data run at once, marked `Early-Data: 1`; other methods
   wait for the handshake, which a replay never completes.
   `anole.early_data.TooEarly` answers 425 on routes that want no early data
-  at all, and every route answers 425 to unsafe requests a proxy marked
-  `Early-Data` (`anole.early_data.Guard`). Session resumption works without
+  at all, and with HTTP/3 on every route answers 425 to unsafe requests a
+  proxy marked `Early-Data` (`anole.early_data.Guard`). Session resumption works without
   it. The interop runner's `resumption` and `zerortt` cases pass.
 - HTTP/3 connection migration: clients may move to a new address or port;
   the server validates the path, answers on it (closing included), hands
   out a new token when the IP address changed, and reports the new address
-  to handlers.
+  to handlers. The ngtcp2 fork fixes a migration right after a NAT
+  rebinding, which stock 1.25.0 closed with CONNECTION_ID_LIMIT_ERROR.
 - TLS through BoringSSL, built from source by Zig: TLS 1.3 and 1.2, ALPN,
   mutual TLS (with the acceptable CAs named in the request, and the client's
   certificate for handlers through `req.peerCertificate()` on HTTP/1.1,

@@ -459,12 +459,6 @@ because the runner wants a PATH_CHALLENGE as the first packet on the new path
 and ngtcp2 sends the PATH_RESPONSE first, as RFC 9000 allows
 (quic-interop-runner issues #424 and #500).
 
-One known gap, in ngtcp2 1.25.0: a client that migrates moments after a NAT
-rebinding, while the server still validates a path from it, can be closed
-with CONNECTION_ID_LIMIT_ERROR. The server retires the connection ID it
-keeps to fall back to, then still counts it when the client sends a
-replacement. Seconds apart, the two are fine.
-
 The endpoint runs on one executor for now, so HTTP/3 uses one core.
 
 ## TLS

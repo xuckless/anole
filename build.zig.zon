@@ -42,10 +42,15 @@
             .hash = "N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq",
             .lazy = true,
         },
-        // -Dhttp3: ngtcp2 1.25.0 and nghttp3 1.18.0 release tarballs.
+        // -Dhttp3: ngtcp2 1.25.0 from Anole's fork xuckless/ngtcp2, branch
+        // `anole`: the v1.25.0 tag plus its generated version.h and a patch
+        // that keeps the connection ID a server falls back to when a client
+        // migrates right after a NAT rebinding (stock 1.25.0 retires it and
+        // then closes with CONNECTION_ID_LIMIT_ERROR). nghttp3 1.18.0: the
+        // release tarball.
         .ngtcp2 = .{
-            .url = "https://github.com/ngtcp2/ngtcp2/releases/download/v1.25.0/ngtcp2-1.25.0.tar.xz",
-            .hash = "N-V-__8AADwxaQCTJkOX_hQ27ZB-ox3TiXC3K25GoJCazPOJ",
+            .url = "https://github.com/xuckless/ngtcp2/archive/591e959bc67820226651ee8f009a265899bfc71c.tar.gz",
+            .hash = "N-V-__8AABJoQwBrzAagy2GLO39dOB29jJX9PivETrPyVl0y",
             .lazy = true,
         },
         // -Dcompression: zlib-ng 2.3.3 (zlib-compat, runtime SIMD dispatch) and

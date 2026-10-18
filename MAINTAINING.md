@@ -13,7 +13,8 @@ that happens promptly.
 | dusty | build.zig.zon | commit of the xuckless/dusty fork, branch `anole` |
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
-| ngtcp2, nghttp3 | build.zig.zon | upstream release tarballs |
+| ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (tarball) |
+| nghttp3 | build.zig.zon | upstream release tarball |
 | zlib-ng, zstd, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
 | zig-protobuf | build.zig.zon | upstream commit; it pins protoc per platform |
 | websocket-zig, zig-jwt | build.zig.zon | commits of the xuckless forks, branch `anole` |
@@ -53,6 +54,15 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      patch. Rebase the patch onto the new tag on a new branch, run nghttp2's
      unit tests and h2spec in strict mode (147/147 over h2c and TLS), merge
      into `anole`, and pin the merge commit.
+   - **ngtcp2** comes from the fork too: the tag, the release's generated
+     `lib/includes/ngtcp2/version.h`, and a patch that keeps a server's
+     fallback connection ID across a migration right after a NAT rebinding
+     (`conn_stop_pv_keep`, with `test_ngtcp2_conn_server_migration_after_nat_rebinding`).
+     On a new tag: drop the patch if upstream fixed the bug (run that test
+     against the new tag), otherwise rebase it on a new branch, run ngtcp2's
+     unit tests, commit the new `version.h`, merge into `anole`, and pin the
+     merge commit. Then run Anole's migration test ("a client that moves to
+     a new port"), `tests/h3/run.sh` and the interop runner.
    - **nghttp2 and nghttp3 both ship sfparse** with the same exported
      symbols, and the linker keeps one copy. `build/nghttp3.zig`
      (`checkSharedSfparse`) stops the build when the two copies differ; then
@@ -79,7 +89,7 @@ against lalinsky/dusty (#263-#270) are left as they are.
   test runner has no fuzzer; CI's `fuzz` job runs them from the pinned
   package. C compiled into the dusty module breaks Zig 0.17's fuzzer, so
   C goes in a static library the module links (as llhttp and nghttp2 do).
-- **nghttp2**: see above.
+- **nghttp2**, **ngtcp2**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.
 
