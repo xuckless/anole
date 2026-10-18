@@ -168,7 +168,7 @@ pub const Udp = struct {
                     d.ecn = m.data[0] & 0x3;
                 } else if (kind == posix.IP.PKTINFO and m.data.len >= @sizeOf(std.c.in_pktinfo)) {
                     const pi = std.mem.bytesToValue(std.c.in_pktinfo, m.data[0..@sizeOf(std.c.in_pktinfo)]);
-                    d.local = .{ .ip4 = .{ .bytes = @bitCast(pi.addr), .port = self.socket.address.getPort() } };
+                    d.local = .{ .ip4 = .{ .bytes = std.mem.toBytes(pi.addr), .port = self.socket.address.getPort() } };
                 }
             } else if (level == posix.IPPROTO.IPV6) {
                 if (kind == posix.IPV6.TCLASS and m.data.len >= @sizeOf(c_int)) {
@@ -206,7 +206,7 @@ pub const Udp = struct {
         if (self.wildcard) if (local) |l| switch (l) {
             .ip4 => |a| {
                 var pi = std.mem.zeroes(std.c.in_pktinfo);
-                pi.spec_dst = @bitCast(a.bytes);
+                pi.spec_dst = std.mem.bytesToValue(u32, &a.bytes);
                 w += put(control[w..], posix.IPPROTO.IP, posix.IP.PKTINFO, std.mem.asBytes(&pi));
             },
             .ip6 => |a| {
