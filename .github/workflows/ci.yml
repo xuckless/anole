@@ -62,3 +62,24 @@ jobs:
           cache-key: cross-aarch64-linux-gnu
       - name: Build every test binary and the hello example
         run: zig build test-flags hello -Dtarget=aarch64-linux-gnu --summary all
+
+  h2spec:
+    name: h2spec (HTTP/2 conformance, h2c and TLS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: h2spec
+      - name: Build examples/hello
+        run: zig build hello -Doptimize=ReleaseSafe --summary all
+      - name: Fetch h2spec 2.6.0, pinned by SHA-256
+        run: |
+          curl -fsSL -o h2spec.tar.gz https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          echo "157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318  h2spec.tar.gz" | sha256sum -c -
+          tar xzf h2spec.tar.gz h2spec
+      # Fails on any failure not in tests/h2spec/known-failures.txt, on a
+      # listed case that now passes, and if the server dies.
+      - name: h2spec over h2c and over TLS
+        run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/hello

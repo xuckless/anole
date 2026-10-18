@@ -1,11 +1,14 @@
-//! nghttp2 1.70.0 built from the official release tarball (a lazy dependency).
+//! nghttp2 1.70.0 built from Anole's fork (xuckless/nghttp2, branch `anole`:
+//! the v1.70.0 tag plus an RFC 9113 strictness patch), fetched as a GitHub
+//! archive of the pinned commit (a lazy dependency).
 //!
 //! Provenance (all MIT):
 //! - Per-OS defines: lalinsky/dusty build.zig @ d3cb485a644a18bee7e03b4a51577990455b23b3
 //!   (the `use_http2` block). Windows branch dropped: Anole has no Windows support.
 //! - Source list: mattrobenolt/etcd-zig build.zig @ 4becbeeaa7a17f727d4f26b2a34ac906a299c660,
 //!   cross-checked against the 26 `lib/*.c` files in nghttp2-1.70.0.tar.xz.
-//! - The tarball ships the generated lib/includes/nghttp2/nghttp2ver.h, so no configure step.
+//! - The fork commits the release's generated lib/includes/nghttp2/nghttp2ver.h,
+//!   so, as with the release tarball, there is no configure step.
 const std = @import("std");
 
 pub const sources: []const []const u8 = &.{

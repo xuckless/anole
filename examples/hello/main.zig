@@ -10,6 +10,7 @@
 //!
 //!   GET /          -> "hello"
 //!   GET /users/:id -> "user <id>"
+//!   POST /echo     -> the request body, streamed back
 //!
 //! Every response carries `X-Thread: <os thread id>` so a test can see which
 //! executor served it: under `.pinned` a connection's task stays on the
@@ -48,6 +49,20 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
     try res.print(.text, "user {s}", .{id});
 }
 
+/// Streams the request body back as it arrives: a body larger than the
+/// flow-control windows exercises backpressure in both directions.
+fn handleEcho(req: *http.Request, res: *http.Response) !void {
+    var in_buf: [16 * 1024]u8 = undefined;
+    var body = try req.reader(&in_buf);
+    var out_buf: [16 * 1024]u8 = undefined;
+    var out = try res.stream(&out_buf);
+    _ = body.interface.streamRemaining(&out.interface) catch |err| switch (err) {
+        error.ReadFailed => return body.err orelse error.Unexpected,
+        error.WriteFailed => return out.err orelse error.Unexpected,
+    };
+    try out.end();
+}
+
 fn waitForSignal(kind: zio.SignalKind) !void {
     var sig = try zio.Signal.init(kind);
     defer sig.deinit();
@@ -75,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
-    var listeners: [2]http.Listener = .{ .{ .address = addr }, undefined };
+    var listeners: [2]http.Listener = .{ .{ .address = addr, .http2_prior_knowledge = anole.features.http2 }, undefined };
     var listener_count: usize = 1;
 
     var dev_cert = if (has_tls) try anole.tls.selfSigned(init.gpa, .{}) else {};
@@ -85,7 +100,7 @@ pub fn main(init: std.process.Init) !void {
             .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", tls_port) },
             .tls = .{
                 .pem = .{ .cert = dev_cert.cert, .key = dev_cert.key },
-                .alpn_protocols = &.{"http/1.1"},
+                .alpn_protocols = if (anole.features.http2) &.{ "h2", "http/1.1" } else &.{"http/1.1"},
             },
         };
         listener_count = 2;
@@ -93,11 +108,13 @@ pub fn main(init: std.process.Init) !void {
 
     var server = http.Server(void).init(init.gpa, io, .{
         .listeners = listeners[0..listener_count],
+        .http2 = .{ .max_concurrent_streams = 250 },
     }, {});
     defer server.deinit();
 
     server.router.get("/", handleRoot);
     server.router.get("/users/:id", handleUser);
+    server.router.post("/echo", handleEcho);
 
     // SIGINT, SIGTERM and the server run as three tasks of one std.Io.Select;
     // whichever finishes first decides. The buffer holds all three results

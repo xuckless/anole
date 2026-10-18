@@ -1,0 +1,4 @@
+# h2spec 2.6.0 cases expected to fail, one per line: "<package> | <test case>".
+# The CI job fails on any failure not listed here, and on a listed case that
+# passes. Empty: with Anole's nghttp2 patch (xuckless/nghttp2, branch anole)
+# every case passes over h2c and over TLS.

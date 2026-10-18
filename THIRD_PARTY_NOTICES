@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit 8bb3200e614a75a94e83530a23b2cc569da1a66e of the fork
+  Pinned:   commit 4730ff3e279b2d851a33a6794cab8cfde86ecd14 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -40,8 +40,10 @@ llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
 nghttp2 1.70.0 (HTTP/2)
   Licence:  MIT. Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa;
             Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors
-  Source:   https://github.com/nghttp2/nghttp2
-            (release tarball nghttp2-1.70.0.tar.xz)
+  Source:   https://github.com/nghttp2/nghttp2, used through Anole's fork
+            https://github.com/xuckless/nghttp2 (branch anole: tag v1.70.0,
+            its generated nghttp2ver.h, and Anole's RFC 9113 strictness patch)
+  Pinned:   commit 0f8bc1c4271f4380409071eade31830e6e436bd6 of the fork
   Linked:   -Dhttp2=true
 
 sfparse (Structured Field Values parser, shipped inside nghttp2 and nghttp3)

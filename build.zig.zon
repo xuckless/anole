@@ -6,17 +6,18 @@
     .dependencies = .{
         // Core, always used, pinned by commit. zio: main HEAD on 2026-10-17
         // (its v0.19.x tags are the Zig 0.16 line). dusty: Anole's fork
-        // xuckless/dusty, branch `anole`, which is lalinsky/dusty d3cb485 plus
-        // the patches Anole needs (TLS state teardown, server ALPN, in-memory
-        // PEM, handshake log level, nghttp2 injection, HTTP/1.0 keep-alive),
-        // each open upstream as lalinsky/dusty PRs #263-#268.
+        // xuckless/dusty, branch `anole`: lalinsky/dusty d3cb485 plus the
+        // patches Anole needs, each open upstream (lalinsky/dusty #263-#270):
+        // TLS teardown, server ALPN, in-memory PEM, handshake log level,
+        // nghttp2 injection, HTTP/1.0 keep-alive, the Sink seam and the
+        // HTTP/2 server engine.
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#4e4e1ed10da974f15b119207d346a78cc6c363e4",
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#8bb3200e614a75a94e83530a23b2cc569da1a66e",
-            .hash = "dusty-0.4.0-Qdw7RjwBJADorKlLVXZFliL4yxMta0zRsBnVUSEsNS9z",
+            .url = "git+https://github.com/xuckless/dusty#4730ff3e279b2d851a33a6794cab8cfde86ecd14",
+            .hash = "dusty-0.4.0-Qdw7RpNnJQD-2yO06L5CaNLcW0KyHisbhErKhzl6ph4V",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -24,10 +25,13 @@
             .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
             .lazy = true,
         },
-        // -Dhttp2: nghttp2 1.70.0 release tarball.
+        // -Dhttp2: nghttp2 1.70.0 from Anole's fork xuckless/nghttp2, branch
+        // `anole`: the v1.70.0 tag plus its generated nghttp2ver.h and a patch
+        // that answers frames on closed streams, PRIORITY errors and stream
+        // window overflow as RFC 9113 says (h2spec 146/146).
         .nghttp2 = .{
-            .url = "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
-            .hash = "N-V-__8AACay2gDbHrByjNGWvyH8G9Gp30uRgZqobYOF1nhb",
+            .url = "https://github.com/xuckless/nghttp2/archive/0f8bc1c4271f4380409071eade31830e6e436bd6.tar.gz",
+            .hash = "N-V-__8AAP98WQBOcqCV-jYjCmw19Aw3aCtmPAMilcMGfLOK",
             .lazy = true,
         },
         // -Dtls=boringssl: google/boringssl at 22a0079b, the commit ngtcp2 1.25.0

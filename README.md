@@ -17,9 +17,12 @@ and Linux (x86_64), and cross-compiles for aarch64 Linux:
 - an HTTP/1.1 server and router (dusty on zio), with a runnable hello world;
 - HTTPS through BoringSSL: TLS 1.3 and 1.2, ALPN, certificate verification,
   mutual TLS, for both the server and dusty's HTTP client;
-- nghttp2, ngtcp2 and nghttp3 bindings, each with a smoke test.
+- HTTP/2 on nghttp2, over TLS (ALPN "h2") and cleartext (prior knowledge), on
+  the same router and handlers, with streaming bodies, flow control and
+  trailers; h2spec 2.6.0 passes every case in strict mode, over h2c and TLS;
+- ngtcp2 and nghttp3 bindings, with a smoke test.
 
-There is no HTTP/2 server, HTTP/3 endpoint, gRPC or auth code yet. Nothing is
+There is no HTTP/3 endpoint, gRPC or auth code yet. Nothing is
 stable before 1.0.
 
 ## Requirements
@@ -35,6 +38,9 @@ zig build test          # unit tests plus smoke tests for the enabled features
 zig build test-flags    # the tests for every preset and edge flag combination
 zig build run-hello     # hello world on http://127.0.0.1:8080 and https://127.0.0.1:8443
 ```
+
+Both ports speak HTTP/1.1 and HTTP/2 (`curl --http2-prior-knowledge` on 8080,
+`curl -k --http2` on 8443). `POST /echo` streams the request body back.
 
 With the hello world running, `curl localhost:8080/` returns `hello` and
 `curl localhost:8080/users/42` returns `user 42`. The HTTPS listener uses a
