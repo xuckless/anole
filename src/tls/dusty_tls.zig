@@ -182,7 +182,12 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     c.SSL_set_accept_state(ssl);
 
     if (opt.client_auth) |ca| {
-        try setVerifyStore(ssl, ca.root_ca);
+        // The CertificateRequest also names the acceptable CAs, so a client
+        // holding several certificates can pick the right one.
+        const trust = try trustStore(ca.root_ca, true);
+        defer c.X509_STORE_free(trust.store);
+        if (c.SSL_set1_verify_cert_store(ssl, trust.store) != 1) return error.OutOfMemory;
+        c.SSL_set0_client_CAs(ssl, trust.names);
         const mode: c_int = switch (ca.auth_type) {
             .request => c.SSL_VERIFY_PEER,
             .require => c.SSL_VERIFY_PEER | c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
@@ -593,31 +598,44 @@ fn clientCtx() HandshakeError!*c.SSL_CTX {
 /// because a freed bundle's memory can be reused for a different one.
 /// Planned dusty fork patch P4 (load the trust store once through this
 /// module) removes the conversion.
-const StoreEntry = struct { hash: u64, len: usize, store: *c.X509_STORE };
+const StoreEntry = struct {
+    hash: u64,
+    len: usize,
+    store: *c.X509_STORE,
+    /// The certificates' subject names (DER), for a server's client CA list.
+    names: *c.struct_stack_st_CRYPTO_BUFFER,
+};
+
+const Trust = struct {
+    store: *c.X509_STORE,
+    /// A new stack sharing the cached name buffers, or null when not asked
+    /// for; ownership passes to `SSL_set0_client_CAs`.
+    names: ?*c.struct_stack_st_CRYPTO_BUFFER,
+};
 var store_cache: [8]?StoreEntry = @splat(null);
 var store_cache_next: usize = 0;
 
 fn setVerifyStore(ssl: *c.SSL, bundle: std.crypto.Certificate.Bundle) HandshakeError!void {
-    const store = try trustStore(bundle);
-    defer c.X509_STORE_free(store);
-    if (c.SSL_set1_verify_cert_store(ssl, store) != 1) return error.OutOfMemory;
+    const trust = try trustStore(bundle, false);
+    defer c.X509_STORE_free(trust.store);
+    if (c.SSL_set1_verify_cert_store(ssl, trust.store) != 1) return error.OutOfMemory;
 }
 
-/// Returns a new reference; the caller frees it.
-fn trustStore(bundle: std.crypto.Certificate.Bundle) HandshakeError!*c.X509_STORE {
+/// Returns a new reference to the store; the caller frees it.
+fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) HandshakeError!Trust {
     const der = bundle.bytes.items;
     const hash = std.hash.Wyhash.hash(0, der);
     lockGlobal();
     defer global_lock.unlock();
     for (store_cache) |entry| {
         const e = entry orelse continue;
-        if (e.hash == hash and e.len == der.len) {
-            _ = c.X509_STORE_up_ref(e.store);
-            return e.store;
-        }
+        if (e.hash == hash and e.len == der.len) return trustFrom(e, want_names);
     }
 
     const store = c.X509_STORE_new() orelse return error.OutOfMemory;
+    errdefer c.X509_STORE_free(store);
+    const names = c.sk_CRYPTO_BUFFER_new_null() orelse return error.OutOfMemory;
+    errdefer c.sk_CRYPTO_BUFFER_pop_free(names, c.CRYPTO_BUFFER_free);
     // The bundle is DER certificates back to back.
     var p: [*c]const u8 = der.ptr;
     const end = der.ptr + der.len;
@@ -625,15 +643,46 @@ fn trustStore(bundle: std.crypto.Certificate.Bundle) HandshakeError!*c.X509_STOR
         const x = c.d2i_X509(null, &p, @intCast(end - p)) orelse break;
         defer c.X509_free(x);
         _ = c.X509_STORE_add_cert(store, x);
+        var name_der: [*c]const u8 = undefined;
+        var name_len: usize = 0;
+        if (c.X509_NAME_get0_der(c.X509_get_subject_name(x), &name_der, &name_len) != 1) continue;
+        const buf = c.CRYPTO_BUFFER_new(name_der, name_len, null) orelse return error.OutOfMemory;
+        if (c.sk_CRYPTO_BUFFER_push(names, buf) == 0) {
+            c.CRYPTO_BUFFER_free(buf);
+            return error.OutOfMemory;
+        }
     }
     c.ERR_clear_error();
 
     const slot = &store_cache[store_cache_next];
     store_cache_next = (store_cache_next + 1) % store_cache.len;
-    if (slot.*) |old| c.X509_STORE_free(old.store);
-    slot.* = .{ .hash = hash, .len = der.len, .store = store };
-    _ = c.X509_STORE_up_ref(store);
-    return store;
+    if (slot.*) |old| {
+        c.X509_STORE_free(old.store);
+        c.sk_CRYPTO_BUFFER_pop_free(old.names, c.CRYPTO_BUFFER_free);
+    }
+    slot.* = .{ .hash = hash, .len = der.len, .store = store, .names = names };
+    return trustFrom(slot.*.?, want_names);
+}
+
+/// New references to a cached entry's store and, if asked, its names.
+/// Under the global lock.
+fn trustFrom(e: StoreEntry, want_names: bool) HandshakeError!Trust {
+    var names: ?*c.struct_stack_st_CRYPTO_BUFFER = null;
+    if (want_names) {
+        const copy = c.sk_CRYPTO_BUFFER_new_null() orelse return error.OutOfMemory;
+        for (0..c.sk_CRYPTO_BUFFER_num(e.names)) |i| {
+            const buf = c.sk_CRYPTO_BUFFER_value(e.names, i);
+            _ = c.CRYPTO_BUFFER_up_ref(buf);
+            if (c.sk_CRYPTO_BUFFER_push(copy, buf) == 0) {
+                c.CRYPTO_BUFFER_free(buf);
+                c.sk_CRYPTO_BUFFER_pop_free(copy, c.CRYPTO_BUFFER_free);
+                return error.OutOfMemory;
+            }
+        }
+        names = copy;
+    }
+    _ = c.X509_STORE_up_ref(e.store);
+    return .{ .store = e.store, .names = names };
 }
 
 // ---------------------------------------------------------------------------

@@ -538,3 +538,86 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
     }.run, .{ &server, io, h.caFile(), h.tmp.dir });
     try client_future.await(io);
 }
+
+test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{
+            .pem = .{ .cert = h.pem.cert, .key = h.pem.key },
+            .client_auth = .{ .ca = h.caFile(), .mode = .request },
+        } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    // A plain BoringSSL client on its own thread (blocking socket I/O must
+    // not hold up the runtime), which only reads what the server asked for.
+    const Probe = struct {
+        port: u16,
+        names: usize = 0,
+        matches: bool = false,
+        failed: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        expected: []const u8 = &.{},
+
+        fn run(p: *@This()) void {
+            defer p.done.store(true, .release);
+            p.probe() catch |err| {
+                p.failed = err;
+            };
+        }
+
+        /// The requested CAs are readable only during the handshake.
+        fn certCb(ssl: ?*c.SSL, arg: ?*anyopaque) callconv(.c) c_int {
+            const p: *@This() = @ptrCast(@alignCast(arg.?));
+            const names = c.SSL_get0_server_requested_CAs(ssl) orelse return 1;
+            p.names = c.sk_CRYPTO_BUFFER_num(names);
+            for (0..p.names) |i| {
+                const buf = c.sk_CRYPTO_BUFFER_value(names, i);
+                const der = c.CRYPTO_BUFFER_data(buf)[0..c.CRYPTO_BUFFER_len(buf)];
+                if (std.mem.eql(u8, der, p.expected)) p.matches = true;
+            }
+            return 1;
+        }
+
+        fn probe(p: *@This()) !void {
+            const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+            if (fd < 0) return error.Socket;
+            defer _ = std.c.close(fd);
+            var addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, p.port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+            if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
+            const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+            defer c.SSL_CTX_free(ctx);
+            c.SSL_CTX_set_cert_cb(ctx, certCb, p);
+            const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
+            defer c.SSL_free(ssl);
+            _ = c.SSL_set_fd(ssl, fd);
+            // Unverified: this client only looks at the request.
+            if (c.SSL_connect(ssl) != 1) return error.Handshake;
+            _ = c.SSL_shutdown(ssl);
+        }
+    };
+
+    // The expected name: the certificate's own subject (it is its own CA).
+    const bio_mem = c.BIO_new_mem_buf(h.pem.cert.ptr, @intCast(h.pem.cert.len)) orelse return error.OutOfMemory;
+    defer _ = c.BIO_free(bio_mem);
+    const x = c.PEM_read_bio_X509(bio_mem, null, null, null) orelse return error.BadCertificate;
+    defer c.X509_free(x);
+    var subject_der: [*c]const u8 = undefined;
+    var subject_len: usize = 0;
+    try std.testing.expectEqual(1, c.X509_NAME_get0_der(c.X509_get_subject_name(x), &subject_der, &subject_len));
+
+    var probe: Probe = .{ .port = server.address.ip.getPort(), .expected = subject_der[0..subject_len] };
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    while (!probe.done.load(.acquire)) try io.sleep(.fromMilliseconds(2), .awake);
+    thread.join();
+    if (probe.failed) |err| return err;
+    try std.testing.expectEqual(1, probe.names);
+    try std.testing.expect(probe.matches);
+}
