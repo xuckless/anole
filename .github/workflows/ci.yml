@@ -122,6 +122,10 @@ jobs:
         run: zig build h3-test-server h3-test-client --summary all
       - name: Server and client against aioquic
         run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
+      - name: Build examples/hello
+        run: zig build hello --summary all
+      - name: SIGUSR2 restarts with HTTP/3, under a stand-in for systemd's notify socket
+        run: tests/restart/run.sh ./zig-out/bin/hello
 
   quic-interop:
     name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
