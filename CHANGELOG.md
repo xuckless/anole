@@ -260,6 +260,21 @@ for macOS and Linux.
 - Release binaries of examples/full on x86_64 Linux: 5.0 MB with
   everything, 1.1 MB minimal.
 
+### Docs and examples
+
+- docs/getting-started.md: from `zig init` and `zig fetch --save` to a
+  running JSON API, then a WebSocket, static files, TLS, gRPC (with
+  `addApp` and a `.proto`) and deploying (addresses, systemd, Docker).
+- docs/from-fiber.md: Go Fiber v3's API next to Anole's, and what differs
+  in Zig (arenas, error unions, no `recover`).
+- Guides for the server, routing, WebSockets, gRPC, clients, auth and
+  observability, with every Zig snippet compiled against the API.
+- Examples, each with `zig build run-<name>`: `hello` (the smallest
+  server), `rest` (a JSON CRUD API behind an API-key middleware, checked
+  by tests/rest_test.zig), `websocket`, `grpc`, `auth`, `clients`,
+  `observe`, `io`, and `full` (every listener and option spelled out; the
+  server that h2spec and the restart test drive).
+
 ### Quality
 
 - CI on Linux and macOS: unit tests for every flag combination, dusty's own
