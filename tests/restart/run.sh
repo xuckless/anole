@@ -17,7 +17,7 @@ hello=${1:-zig-out/bin/hello}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 pids=""
-trap 'for p in $pids; do kill -9 $p 2>/dev/null; done; rm -rf "$work"' EXIT
+trap 'for p in $pids; do kill -9 $p 2>/dev/null || true; done; rm -rf "$work"' EXIT
 python3 -m venv "$work/venv"
 "$work/venv/bin/pip" install -q aioquic==1.7.0
 py="$work/venv/bin/python -I"
@@ -96,3 +96,4 @@ kill -0 $third 2>/dev/null && fail "still running after SIGTERM"
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic in the server log"
 echo "PASS STOPPING=1 and a clean exit on SIGTERM"
 echo "all restart checks passed"
+exit 0
