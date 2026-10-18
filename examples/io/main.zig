@@ -33,14 +33,14 @@ const App = struct {
     port: u16,
 };
 
-fn handleSlow(_: *App, req: *http.Request, res: *http.Response) !void {
+fn handleSlow(_: *App, req: *anole.Request, res: *anole.Response) !void {
     const ms = req.query.getInt(u32, "ms") orelse 200;
     // Suspends this request only; the executor serves others.
     try req.io.sleep(.fromMilliseconds(@min(ms, 10_000)), .awake);
     try res.print(.text, "slept {d} ms", .{ms});
 }
 
-fn handleFile(app: *App, req: *http.Request, res: *http.Response) !void {
+fn handleFile(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const name = req.params.get("name").?;
     // One plain name: no way out of the directory.
     if (std.mem.indexOfAny(u8, name, "/\\") != null or name[0] == '.') return error.NotFound;
@@ -66,7 +66,7 @@ fn fetchBody(app: *App, path: []const u8, out: *[256]u8) ![]const u8 {
     return out[0..n];
 }
 
-fn handleFanout(app: *App, req: *http.Request, res: *http.Response) !void {
+fn handleFanout(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const io = req.io;
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     // Both requests are in flight at once. Each future is either awaited

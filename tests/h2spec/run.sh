@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Runs h2spec (strict mode, all cases) against examples/hello over cleartext HTTP/2 (prior knowledge)
+# Runs h2spec (strict mode, all cases) against examples/full over cleartext HTTP/2 (prior knowledge)
 # and over TLS (BoringSSL, ALPN h2), then checks the results against
-# known-failures.txt. Usage: tests/h2spec/run.sh <h2spec binary> <hello binary>
+# known-failures.txt. Usage: tests/h2spec/run.sh <h2spec binary> <examples/full binary>
 set -euo pipefail
 h2spec=$1
-hello=$2
+server_bin=$2
 here=$(cd "$(dirname "$0")" && pwd)
 out=$(mktemp -d)
 
-"$hello" 18080 18443 >"$out/server.log" 2>&1 &
+"$server_bin" 18080 18443 >"$out/server.log" 2>&1 &
 server=$!
 trap 'kill -INT "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 50); do

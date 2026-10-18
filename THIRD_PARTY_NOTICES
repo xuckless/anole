@@ -244,7 +244,7 @@ src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
             https://github.com/lalinsky/tls.zig, commit 60d0ced)
 
 src/http/root.zig, src/tls/root.zig (loopback test harnesses),
-examples/hello/main.zig (wiring)
+examples/full/main.zig (wiring)
   Follow the shape of dusty's src/server_test.zig, src/client_test.zig and
   its README examples.
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors

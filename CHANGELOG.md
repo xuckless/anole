@@ -257,7 +257,7 @@ for macOS and Linux.
   `-Dhttp3`, `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dcompression`, `-Djson`,
   `-Dredis`) and presets (`-Dprofile=minimal|web|full`); what is off is
   neither downloaded nor compiled.
-- Release binaries of examples/hello on x86_64 Linux: 5.0 MB with
+- Release binaries of examples/full on x86_64 Linux: 5.0 MB with
   everything, 1.1 MB minimal.
 
 ### Quality

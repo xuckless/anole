@@ -17,7 +17,6 @@
 //!   GET /readyz           200, or 503 in maintenance or while draining
 const std = @import("std");
 const anole = @import("anole");
-const http = anole.http;
 const observe = anole.observe;
 const metrics = observe.metrics;
 
@@ -34,7 +33,7 @@ const App = struct {
     maintenance_gauge: *metrics.Family(metrics.Gauge),
 };
 
-fn handleUser(app: *App, req: *http.Request, res: *http.Response) !void {
+fn handleUser(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const id = req.params.get("id").?;
     // Labelled by how the lookup arrived; keep label values to a small set.
     const via = if (req.headers.get("traceparent") != null) "traced" else "direct";
@@ -44,7 +43,7 @@ fn handleUser(app: *App, req: *http.Request, res: *http.Response) !void {
 
 /// An outgoing call inside this request's span: the callee continues the
 /// same trace, with this span as its parent.
-fn handleChain(app: *App, req: *http.Request, res: *http.Response) !void {
+fn handleChain(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const id = std.fmt.parseInt(u32, req.params.get("id").?, 10) catch return error.NotFound;
     const url = try std.fmt.allocPrint(req.arena, "http://127.0.0.1:{d}/users/{d}", .{ app.port, id });
     var tp_buf: [55]u8 = undefined;
@@ -58,13 +57,13 @@ fn handleChain(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.print(.text, "downstream said: {s}", .{body});
 }
 
-fn handleMaintenanceOn(app: *App, _: *http.Request, res: *http.Response) !void {
+fn handleMaintenanceOn(app: *App, _: *anole.Request, res: *anole.Response) !void {
     app.maintenance.store(true, .release);
     app.maintenance_gauge.with(&.{}).set(1);
     try res.print(.text, "maintenance on\n", .{});
 }
 
-fn handleMaintenanceOff(app: *App, _: *http.Request, res: *http.Response) !void {
+fn handleMaintenanceOff(app: *App, _: *anole.Request, res: *anole.Response) !void {
     app.maintenance.store(false, .release);
     app.maintenance_gauge.with(&.{}).set(0);
     try res.print(.text, "maintenance off\n", .{});

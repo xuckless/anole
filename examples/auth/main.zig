@@ -20,7 +20,6 @@
 //! the routes with curl.
 const std = @import("std");
 const anole = @import("anole");
-const http = anole.http;
 const auth = anole.auth;
 
 /// Keeps the runtime's per-thread lines and the connection loops' debug
@@ -61,7 +60,7 @@ const policy: auth.rbac.Policy = .{ .roles = &.{
 
 /// The request's roles: the session's one role. (`Roles.ptr` could carry
 /// the app, to look roles up in its state instead.)
-fn rolesOf(_: ?*anyopaque, req: *http.Request) anyerror![]const []const u8 {
+fn rolesOf(_: ?*anyopaque, req: *anole.Request) anyerror![]const []const u8 {
     const role = req.session.get("role") orelse return &.{};
     const roles = try req.arena.alloc([]const u8, 1);
     roles[0] = role;
@@ -76,13 +75,13 @@ const form_html =
     \\<button>Sign in</button></form>
 ;
 
-fn loginForm(_: *App, req: *http.Request, res: *http.Response) !void {
+fn loginForm(_: *App, req: *anole.Request, res: *anole.Response) !void {
     const token = try auth.csrf.token(req);
     try res.header(auth.csrf.header_name, token);
     try res.print(.html, form_html, .{token});
 }
 
-fn login(app: *App, req: *http.Request, res: *http.Response) !void {
+fn login(app: *App, req: *anole.Request, res: *anole.Response) !void {
     // The CSRF middleware has parsed the form already; this is its copy.
     const form = try req.formData();
     const user = app.find(form.get("user") orelse "");
@@ -99,30 +98,30 @@ fn login(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.print(.text, "signed in as {s}\n", .{user.?.name});
 }
 
-fn me(_: *App, req: *http.Request, res: *http.Response) !void {
+fn me(_: *App, req: *anole.Request, res: *anole.Response) !void {
     const user = req.session.get("user") orelse return res.fail(.unauthorized, "not signed in");
     try res.print(.text, "user: {s}\nrole: {s}\ncsrf: {s}\n", .{ user, req.session.get("role").?, try auth.csrf.token(req) });
 }
 
-fn addNote(_: *App, req: *http.Request, res: *http.Response) !void {
+fn addNote(_: *App, req: *anole.Request, res: *anole.Response) !void {
     // Only a signed-in editor gets here: RBAC ran first, and without a
     // session there is no role.
     res.status = .created;
     try res.print(.text, "note saved by {s}\n", .{req.session.get("user").?});
 }
 
-fn logout(_: *App, req: *http.Request, res: *http.Response) !void {
+fn logout(_: *App, req: *anole.Request, res: *anole.Response) !void {
     req.session.clear(); // the middleware expires the cookie
     try res.print(.text, "signed out\n", .{});
 }
 
-fn apiMe(_: *App, req: *http.Request, res: *http.Response) !void {
+fn apiMe(_: *App, req: *anole.Request, res: *anole.Response) !void {
     // The token RequireJwt verified, from the request's locals.
     const token = auth.claims(req) orelse return error.Unauthorized;
     try res.print(.text, "token subject: {s}, role: {s}\n", .{ auth.subject(req) orelse "-", token.string("role") orelse "-" });
 }
 
-fn serviceStats(_: *App, req: *http.Request, res: *http.Response) !void {
+fn serviceStats(_: *App, req: *anole.Request, res: *anole.Response) !void {
     const owner = auth.apikey.owner(req) orelse return error.Unauthorized;
     try res.print(.text, "stats for {s}: 42 requests\n", .{owner});
 }
@@ -186,15 +185,15 @@ pub fn main(init: std.process.Init) !void {
     var bearer = auth.RequireJwt.init(.{ .static = &jwt_keys }, .{ .issuer = issuer, .audience = "api" }, .{});
     var api_keys = auth.apikey.Middleware.init(.{ .ptr = &app, .lookup = lookupKey });
 
-    const M = http.Middleware(App);
+    const M = anole.Middleware(App);
     const web = [_]M{ .init(&sessions), .init(&csrf) };
     const limited = [_]M{ .init(&login_limit), .init(&sessions), .init(&csrf) };
     const writers = [_]M{ .init(&sessions), .init(&csrf), .init(&can_write) };
     const jwt_only = [_]M{.init(&bearer)};
     const key_only = [_]M{.init(&api_keys)};
 
-    server.use(http.middleware.RequestId.init(.{}));
-    server.use(http.middleware.Logger.init());
+    server.use(anole.middleware.RequestId.init(.{}));
+    server.use(anole.middleware.Logger.init());
     server.group("", &web).get("/login", loginForm);
     server.group("", &limited).post("/login", login);
     server.group("", &web).get("/me", me);

@@ -2,8 +2,8 @@
 """Loaded size of an x86_64/aarch64 ELF binary, and how much of it is libc++,
 libc++abi and libunwind (pulled in by BoringSSL), from the symbol table.
 
-    zig build hello -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast [-Dprofile=...]
-    tools/binary_size.py zig-out/bin/hello
+    zig build full -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast [-Dprofile=...]
+    tools/binary_size.py zig-out/bin/full
 """
 import struct, sys, re
 def analyze(path):

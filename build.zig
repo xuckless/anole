@@ -13,8 +13,11 @@
 //!   test        unit tests + smoke tests of the enabled features
 //!   test-flags  the test binary for every preset and edge combination, sharing
 //!               one build of each C library (run when the target is native)
-//!   hello       install examples/hello (also part of the default install step)
-//!   run-hello   run examples/hello (`zig build run-hello -- 8080`)
+//!   <example>   install examples/<example> (hello, rest, websocket, grpc, auth,
+//!               clients, observe, full)
+//!   run-<example>  run it (`zig build run-rest -- 127.0.0.1:4000`)
+//!   full        examples/full, every listener spelled out (also part of the
+//!               default install step; the h2spec and restart scripts drive it)
 //!   bench-server  the Anole side of bench/run.sh (with -Doptimize=ReleaseFast)
 //!   io          install examples/io (handlers waiting on I/O through std.Io)
 //!   run-io      run examples/io (`zig build run-io -- 8081`)
@@ -465,6 +468,8 @@ pub fn build(b: *std.Build) void {
     // `zig build run-<name>`.
     const Example = struct { name: []const u8, needs: bool, about: []const u8 };
     const examples = [_]Example{
+        .{ .name = "hello", .needs = true, .about = "the smallest server, on port 3000" },
+        .{ .name = "rest", .needs = true, .about = "a JSON REST API: CRUD in memory, behind an API key, on port 3000" },
         .{ .name = "websocket", .needs = features.websocket, .about = "WebSocket echo and a broadcast room" },
         .{ .name = "grpc", .needs = features.grpc, .about = "a gRPC Greeter, also over gRPC-Web, Connect and REST (JSON transcoding)" },
         .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
@@ -487,30 +492,48 @@ pub fn build(b: *std.Build) void {
         }));
         const ex_exe = b.addExecutable(.{ .name = ex.name, .root_module = ex_mod });
         test_step.dependOn(&ex_exe.step);
+        b.step(ex.name, b.fmt("Build and install examples/{s}", .{ex.name})).dependOn(&b.addInstallArtifact(ex_exe, .{}).step);
+        if (std.mem.eql(u8, ex.name, "rest")) {
+            // tests/rest_test.zig serves the example's routes and calls
+            // each one.
+            const rest_test = b.addTest(.{
+                .name = "rest-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/rest_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "rest", .module = ex_mod } },
+                }),
+            });
+            const run_rest_test = b.addRunArtifact(rest_test);
+            run_rest_test.skip_foreign_checks = true;
+            test_step.dependOn(&run_rest_test.step);
+        }
         const run_ex = b.addRunArtifact(ex_exe);
         run_ex.addPassthruArgs();
         b.step(b.fmt("run-{s}", .{ex.name}), b.fmt("Run examples/{s}: {s}", .{ ex.name, ex.about })).dependOn(&run_ex.step);
     }
 
-    // examples/hello: dusty on zio, HTTP/1.1.
-    const hello = b.addExecutable(.{
-        .name = "hello",
+    // examples/full: every listener and option spelled out; the server
+    // tests/h2spec and tests/restart drive.
+    const full = b.addExecutable(.{
+        .name = "full",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/hello/main.zig"),
+            .root_source_file = b.path("examples/full/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "anole", .module = anole_mod }},
         }),
     });
-    const install_hello = b.addInstallArtifact(hello, .{});
-    b.getInstallStep().dependOn(&install_hello.step);
-    b.step("hello", "Build and install examples/hello").dependOn(&install_hello.step);
+    const install_full = b.addInstallArtifact(full, .{});
+    b.getInstallStep().dependOn(&install_full.step);
+    b.step("full", "Build and install examples/full").dependOn(&install_full.step);
     // `zig build test` also proves the example still compiles.
-    test_step.dependOn(&hello.step);
+    test_step.dependOn(&full.step);
 
-    const run_hello = b.addRunArtifact(hello);
-    run_hello.addPassthruArgs();
-    b.step("run-hello", "Run examples/hello (pass a port after --, default 8080)").dependOn(&run_hello.step);
+    const run_full = b.addRunArtifact(full);
+    run_full.addPassthruArgs();
+    b.step("run-full", "Run examples/full (pass the ports after --, default 8080 and 8443)").dependOn(&run_full.step);
 
     // bench/anole: the Anole side of the Fiber benchmark (bench/run.sh).
     if (features.json) {

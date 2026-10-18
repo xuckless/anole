@@ -40,7 +40,7 @@ const App = struct {
     http_port: u16 = 0,
 };
 
-fn hello(_: *App, req: *http.Request, res: *http.Response) !void {
+fn hello(_: *App, req: *anole.Request, res: *anole.Response) !void {
     const version = switch (req.version_major) {
         2 => "HTTP/2",
         3 => "HTTP/3",
@@ -51,7 +51,7 @@ fn hello(_: *App, req: *http.Request, res: *http.Response) !void {
 
 /// Streams the request body back and sends its length as a trailer. Only
 /// HTTP/2 and HTTP/3 carry trailers; HTTP/1.1 drops them.
-fn echo(_: *App, req: *http.Request, res: *http.Response) !void {
+fn echo(_: *App, req: *anole.Request, res: *anole.Response) !void {
     var in_buf: [4096]u8 = undefined;
     var body = try req.reader(&in_buf);
     var out_buf: [4096]u8 = undefined;
@@ -67,7 +67,7 @@ fn echo(_: *App, req: *http.Request, res: *http.Response) !void {
 /// An HTTP/2 call made by a handler. `req.io` is the server's runtime, so
 /// the wait suspends this request only. A real application keeps one
 /// connection in its context and shares it between requests.
-fn relay(app: *App, req: *http.Request, res: *http.Response) !void {
+fn relay(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const conn = try h2.ClientConnection.connect(app.gpa, req.io, .{ .host = "127.0.0.1", .port = app.http_port });
     defer conn.close();
     var buf: [256]u8 = undefined;

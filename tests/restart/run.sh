@@ -1,5 +1,5 @@
 #!/bin/sh
-# A zero-downtime restart (SIGUSR2) of examples/hello with HTTP/1.1, HTTPS
+# A zero-downtime restart (SIGUSR2) of examples/full with HTTP/1.1, HTTPS
 # and HTTP/3 on, under a stand-in for systemd's notification socket:
 #   - READY=1 once serving; RELOADING=1, then MAINPID=<new> READY=1 from the
 #     successor on SIGUSR2; no STOPPING=1 from the process handing over;
@@ -10,10 +10,10 @@
 #   - TCP and HTTP/3 serve throughout, and a second restart works too;
 #   - SIGHUP reloads the certificate (RELOADING=1, then READY=1) and the
 #     process goes on serving.
-#   tests/restart/run.sh [path-to-hello]
+#   tests/restart/run.sh [path-to-full]
 # Needs python3 and curl; aioquic is installed into a throwaway venv.
 set -eu
-hello=${1:-zig-out/bin/hello}
+server_bin=${1:-zig-out/bin/full}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 pids=""
@@ -24,7 +24,7 @@ py="$work/venv/bin/python -I"
 port=18580
 tls_port=18581
 
-fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[h]ello $port" || true; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
+fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[f]ull $port" || true; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
 # Waits up to 10 s for a line matching $1 in the notification log, after
 # its first $2 lines.
 await_notify() {
@@ -44,7 +44,7 @@ check_all() {
 $py "$here/notify.py" "$work/notify" "$work/notify.log" &
 pids="$!"
 sleep 0.5
-NOTIFY_SOCKET="$work/notify" "$hello" $port $tls_port >"$work/server.log" 2>&1 &
+NOTIFY_SOCKET="$work/notify" "$server_bin" $port $tls_port >"$work/server.log" 2>&1 &
 first=$!
 pids="$pids $first"
 await_notify "^READY=1$"

@@ -64,8 +64,8 @@ jobs:
         with:
           version: 0.17.0
           cache-key: cross-aarch64-linux-gnu
-      - name: Build every test binary and the hello example
-        run: zig build test-flags hello -Dtarget=aarch64-linux-gnu --summary all
+      - name: Build every test binary and the full example
+        run: zig build test-flags full -Dtarget=aarch64-linux-gnu --summary all
 
   h2spec:
     name: h2spec (HTTP/2 conformance, h2c and TLS)
@@ -76,8 +76,8 @@ jobs:
         with:
           version: 0.17.0
           cache-key: h2spec
-      - name: Build examples/hello
-        run: zig build hello -Doptimize=ReleaseSafe --summary all
+      - name: Build examples/full
+        run: zig build full -Doptimize=ReleaseSafe --summary all
       - name: Fetch h2spec 2.6.0, pinned by SHA-256
         run: |
           curl -fsSL -o h2spec.tar.gz https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
@@ -86,7 +86,7 @@ jobs:
       # Fails on any failure not in tests/h2spec/known-failures.txt, on a
       # listed case that now passes, and if the server dies.
       - name: h2spec over h2c and over TLS
-        run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/hello
+        run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/full
 
   autobahn:
     name: Autobahn (WebSocket conformance, HTTP/1.1)
@@ -122,10 +122,10 @@ jobs:
         run: zig build h3-test-server h3-test-client --summary all
       - name: Server and client against aioquic
         run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
-      - name: Build examples/hello
-        run: zig build hello --summary all
+      - name: Build examples/full
+        run: zig build full --summary all
       - name: SIGUSR2 restarts with HTTP/3, under a stand-in for systemd's notify socket
-        run: tests/restart/run.sh ./zig-out/bin/hello
+        run: tests/restart/run.sh ./zig-out/bin/full
 
   quic-interop:
     name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
