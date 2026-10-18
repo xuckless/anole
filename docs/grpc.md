@@ -438,9 +438,9 @@ first, `,` before each next one, `]` when the handler returns. No message is
 `[]`.
 
 A failure before the first message is an ordinary error response. After it
-the status line has gone out as 200, so the array is cut short instead: on
-HTTP/2 the stream is reset (CANCEL), on HTTP/1.1 the connection closes before
-the body's last chunk. A client never reads a complete array from a failed
+the status line has gone out as 200, so the array is cut short instead
+(`Response.abort`): on HTTP/2 and HTTP/3 the stream is reset, on HTTP/1.1 the
+connection closes before the body's last chunk. A client never reads a complete array from a failed
 call; the server logs the status at `warn`. On HTTP/2, trailing metadata of a
 successful stream goes out as HTTP trailers (HTTP/1.1 has none to carry it).
 

@@ -105,6 +105,9 @@ for macOS and Linux.
   stream as one JSON array sent element by element. JSON through
   zig-protobuf's generated proto3 mapping. `RegisterOptions.transcode =
   false` leaves the routes out.
+- Connect's JSON writes a oneof's member as a field of the message, as
+  protojson does; it was nested under the oneof's name.
+- The tasks of a streaming call run on the stream's own executor.
 - `addProtoGen` for an application's build.zig: protoc and the Zig generator
   are pinned and built by `zig build`, nothing to install;
   `google/api/annotations.proto` and `http.proto` come with Anole.
