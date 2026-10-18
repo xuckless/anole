@@ -32,3 +32,6 @@ test/certs/
 AGENTS.md
 TODO.md
 research/
+
+# Zig 0.17 unpacks fetched packages into the project
+zig-pkg/

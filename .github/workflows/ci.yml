@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple silicon (arm64).
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+      - name: Unit and smoke tests (default profile, every feature on)
+        run: zig build test --summary all
+      - name: Every preset and edge flag combination
+        run: zig build test-flags --summary all
+      # test-flags shares one full-profile configure, so it cannot catch a
+      # feature that reads a C module its own flags never requested. These
+      # configure each profile on its own, as a user would.
+      - name: Profile minimal (no C library besides llhttp)
+        run: zig build test -Dprofile=minimal --summary all
+      - name: Profile web (BoringSSL + nghttp2, no HTTP/3)
+        run: zig build test -Dprofile=web --summary all
+      - name: Full profile without TLS (turns HTTP/3 off)
+        run: zig build test -Dtls=none --summary all
+      - name: HTTP/3 without HTTP/2 (nghttp3 without nghttp2)
+        run: zig build test -Dhttp2=false -Dhttp3=true --summary all
+      - name: Invalid flag combination is rejected
+        shell: bash
+        run: |
+          if out=$(zig build -Dtls=none -Dhttp3=true 2>&1); then
+            echo "expected -Dtls=none -Dhttp3=true to fail, but the build succeeded"
+            exit 1
+          fi
+          echo "$out"
+          grep -F "invalid Anole feature flags" <<<"$out"
+
+  cross:
+    name: cross (aarch64-linux-gnu, compile and link only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: cross-aarch64-linux-gnu
+      - name: Build every test binary and the hello example
+        run: zig build test-flags hello -Dtarget=aarch64-linux-gnu --summary all
