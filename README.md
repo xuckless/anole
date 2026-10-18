@@ -83,20 +83,31 @@ const std = @import("std");
 const anole = @import("anole");
 
 fn getUser(req: *anole.Request, res: *anole.Response) !void {
-    try res.print(.text, "user {s}", .{req.params.get("id").?});
+    try res.print(.text, "user {s}", .{req.params.get("id") orelse "?"});
+}
+
+fn echo(ws: *anole.websocket.Socket, _: *anole.Request) !void {
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
 }
 
 pub fn main(init: std.process.Init) !void {
-    var app = try anole.Server(void).init(init.gpa, .{
-        .http = .{ .port = 8080 }, // HTTP/1.1, plus HTTP/2 for clients that start with it
-        .https = .{ .port = 8443, .cert = .dev_self_signed }, // or .pem / .files
-    }, {});
+    var app = try anole.App.init(init.gpa, .{});
     defer app.deinit();
     app.use(anole.middleware.RequestId.init(.{}));
     app.get("/users/:id", getUser);
-    try app.run(); // until SIGINT/SIGTERM, then drains
+    app.ws("/echo", echo); // WebSocket over HTTP/1.1 and HTTP/2
+    try app.listen(":8080"); // HTTP/1.1 and h2c until SIGINT/SIGTERM, then drains
+    // HTTPS, HTTP/2 and HTTP/3: try app.listenTls(":8443", .fromFiles("cert.pem", "key.pem"));
 }
 ```
+
+One line each adds the rest: `app.grpc(pb.Greeter, .{ .SayHello = sayHello })`,
+`app.grpcHealth()`, `app.metrics(.{})`, `app.health(.{})`,
+`app.tracing(.{})`, `app.staticDir("/", "public", .{})`, and
+`anole.client(req).fetch(url, .{})` for outbound calls from a handler.
+Full control stays: `anole.Server(App).init(gpa, options, &state)` with
+every listener in `options`, and `app.router` and `anole.http` for dusty
+itself ([docs/server.md](docs/server.md)).
 
 Handlers make async calls (outbound HTTP, files, timers, anything on `std.Io`)
 through `req.io`; a call that waits suspends that request only.
@@ -182,16 +193,35 @@ In code, the chosen flags are available as `anole.features`.
 zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>
 ```
 
+The whole build.zig of an application, with gRPC code generated from a
+`.proto` as part of `zig build` (no separate step, nothing to commit):
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    _ = @import("anole").addApp(b, .{
+        .name = "api",
+        .root_source_file = b.path("src/main.zig"),
+        .protos = &.{.{ .name = "greeter_pb", .file = b.path("proto/greeter.proto") }}, // optional
+    });
+}
+```
+
+`zig build run` runs it. `addApp` also takes `target`, `optimize` and
+`.profile = .web`. By hand:
+
 ```zig
 const anole = b.dependency("anole", .{ .target = target, .optimize = optimize, .profile = .web });
 exe.root_module.addImport("anole", anole.module("anole"));
 ```
 
 Use the `git+https` form: Zig 0.17.0's `zig fetch` mishandles tarball URLs.
-For gRPC, generate code from your `.proto` files in your own build.zig with
-`@import("anole").addProtoGen(...)`; see [docs/grpc.md](docs/grpc.md).
-`tests/consumer` is a complete small project set up this way, and CI builds
-it from a fresh cache on every push.
+`addProtoModule` generates one `.proto`'s module for an executable of your
+own, and `addProtoGen` writes the code into your source tree for those who
+commit it; see [docs/grpc.md](docs/grpc.md). `tests/consumer` is a complete
+small project set up this way, and CI builds it from a fresh cache on every
+push.
 
 ## Documentation
 

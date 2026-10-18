@@ -28,9 +28,36 @@ zig build run-grpc -- 9000 9443 # other ports
 ## Generate code
 
 You install nothing. Anole pins protoc and zig-protobuf's `protoc-gen-zig`,
-and `zig build` downloads and builds them. In your `build.zig`, give a step
-the `.proto` files with `addProtoGen`, and give the generated files the
-`protobuf` module that Anole exports:
+and `zig build` downloads and builds them. The short way is `addApp`, which
+makes the executable and generates the code for each `.proto` as part of
+`zig build`, into the cache, whenever the file changes:
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    _ = @import("anole").addApp(b, .{
+        .name = "greeter",
+        .root_source_file = b.path("src/main.zig"),
+        .protos = &.{.{ .name = "greeter_pb", .file = b.path("proto/greeter.proto") }},
+    });
+}
+```
+
+The program imports each proto by its `name` (`@import("greeter_pb")`).
+protoc looks for imports in the file's directory, `include_directories` and
+Anole's google/api protos. The generated module is the file for the proto's
+`package` (read from the file; set `.package` for a file outside the
+project). `addApp` also installs the executable, adds `zig build run`, takes
+`target`, `optimize` and Anole's `profile`, and returns the executable and
+the Anole dependency (`.exe`, `.anole`). For an executable of your own,
+`addProtoModule(b, anole_dep, proto)` returns the module alone. Reuse
+`addApp`'s `.anole` rather than calling `b.dependency("anole", ...)` again
+with other arguments: two instances of Anole in one build collide.
+
+To commit the generated code instead, give a step the `.proto` files with
+`addProtoGen`, and give the generated files the `protobuf` module that
+Anole exports:
 
 ```zig
 const anole_build = @import("anole");
@@ -65,7 +92,7 @@ on protoc's include path, so a file can import them for
 [JSON transcoding](#json-transcoding) without vendoring them; the code for
 their packages is generated beside yours (`google/api.pb.zig`, and
 `google/protobuf.pb.zig` for descriptor.proto). `tests/consumer` is a
-complete project set up this way.
+complete project with both.
 
 For each service, the generated file has a function that returns its method
 table, for example `pb.Greeter(UserData, ErrorSet)`. Anole instantiates it with
@@ -89,32 +116,43 @@ fn sayHello(call: *Call, req: pb.HelloRequest) anyerror!pb.HelloReply {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var app = try anole.Server(void).init(init.gpa, .{
-        .http = .{ .port = 8083 }, // HTTP/1.1, plus h2c for clients that open with HTTP/2
-        .https = .{ .port = 8483, .cert = .dev_self_signed }, // ALPN h2 and http/1.1
-    }, {});
+    var app = try anole.App.init(init.gpa, .{});
     defer app.deinit();
-    anole.grpc.register(void, app.router, pb.Greeter(Call, anyerror), .{ .SayHello = sayHello });
-    try app.run();
+    app.grpc(pb.Greeter, .{ .SayHello = sayHello });
+    // HTTP/1.1 and h2c; listenTls(":8483", .dev_self_signed) for ALPN h2.
+    try app.listen(":8083");
 }
 ```
 
-`register` adds one POST route per method, `/<package>.<Service>/<Method>`,
-here `/greeter.Greeter/SayHello`. Every method of the service needs a handler;
-a missing one is a compile error. Middleware added with `app.use` runs for
-these routes too.
+`app.grpc` adds one POST route per method, `/<package>.<Service>/<Method>`,
+here `/greeter.Greeter/SayHello`, plus Connect GET for methods marked
+`NO_SIDE_EFFECTS` and the REST routes of [JSON transcoding](#json-transcoding).
+Every method of the service needs a handler; a missing one is a compile
+error. Middleware added with `app.use` runs for these routes too.
 
-With application state, use `anole.Server(App)` and `register(App, ...)`, and
-reach the state from a handler with `call.state(App)`.
+The handlers can come three ways:
 
-`registerWith` takes options for one registration:
+- a struct literal, as above;
+- a type that declares them by method name: `app.grpc(pb.Greeter, Greeter)`;
+- a pointer to a value whose methods take it first,
+  `fn SayHello(self: *Greeter, call: *Call, req: pb.HelloRequest) !pb.HelloReply`:
+  `app.grpc(pb.Greeter, &greeter)`. The value must outlive the server.
+
+With application state, use `anole.Server(App)` and reach the state from a
+handler with `call.state(App)`.
+
+`app.grpcWith(Service, impl, options)` takes options for one registration:
 
 ```zig
-anole.grpc.registerWith(void, app.router, pb.Greeter(Call, anyerror), .{ .SayHello = sayHello }, .{
+app.grpcWith(pb.Greeter, .{ .SayHello = sayHello }, .{
     .max_message_size = 64 * 1024, // default anole.grpc.default_max_message_size, 4 MiB
     .data = &greeter_state, // `call.data` in each handler of this registration
+    .transcode = false, // gRPC routes only
 });
 ```
+
+`app.grpc` is `anole.grpc.register(Ctx, app.router, pb.Greeter(Call,
+anyerror), impl)` (and `registerWith`), which work on any dusty router.
 
 `max_message_size` bounds each request message after decompression; a larger
 one fails the call with RESOURCE_EXHAUSTED. `data` is for handlers that serve
@@ -452,7 +490,15 @@ and map fields from query parameters.
 
 ## The health service
 
-`anole.grpc.Health` serves `grpc.health.v1.Health` (Check, List and Watch):
+`anole.grpc.Health` serves `grpc.health.v1.Health` (Check, List and Watch).
+`app.grpcHealth()` registers one that the server owns, and marks every
+service NOT_SERVING when the server starts to drain:
+
+```zig
+try app.grpcHealth().set("greeter.Greeter", .SERVING);
+```
+
+On a router of your own:
 
 ```zig
 var health: anole.grpc.Health = .init(init.gpa, app.io());

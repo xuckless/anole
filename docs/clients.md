@@ -6,6 +6,7 @@ a thread, and all of them use the same BoringSSL as the server.
 
 | Client | Protocol | Use it for |
 | --- | --- | --- |
+| `anole.client(req)` | as `anole.http.Client` | The server's own pooled client, from any handler: nothing to set up. |
 | `anole.http.Client` | HTTP/1.1, HTTPS, optionally HTTP/2 | Ordinary REST calls: one request at a time per connection, pooled keep-alive connections, redirects, decompression. |
 | `anole.h2.ClientConnection` | HTTP/2 (TLS or h2c) | Many concurrent requests over one connection, full-duplex streaming, trailers. |
 | `anole.h3.ClientConnection` | HTTP/3 over QUIC | The same as HTTP/2, over UDP. Same API. |
@@ -17,11 +18,47 @@ a thread, and all of them use the same BoringSSL as the server.
 zig build run-clients
 ```
 
-When in doubt, use `anole.http.Client`. Use the HTTP/2 client when you make
+When in doubt, use `anole.client(req)` in a handler, or `anole.http.Client`
+elsewhere. Use the HTTP/2 client when you make
 many calls to one host at once, need to stream a body both ways, or need
 trailers. Use the HTTP/3 client when the peer serves HTTP/3 and you want QUIC's
 behaviour on lossy networks. The HTTP/2 and HTTP/3 clients need `-Dhttp2` and
 `-Dhttp3`; TLS on any client needs `-Dtls=boringssl`. All are on by default.
+
+## The server's client
+
+Every `anole.Server` makes one HTTP client with its runtime, and frees it
+with itself. A handler reaches it with `anole.client(req)` (or
+`anole.client(io)` from any task of the server), on any server, with or
+without state; `app.client()` returns the same one:
+
+```zig
+const Repo = struct { full_name: []const u8, stargazers_count: u64 };
+
+fn stars(req: *anole.Request, res: *anole.Response) !void {
+    var upstream = try anole.client(req).fetch("https://api.github.com/repos/ziglang/zig", .{
+        .headers = &.{ .{ "User-Agent", "anole" }, .{ "Accept", "application/json" } },
+    });
+    defer upstream.deinit();
+    if (upstream.status() != .ok) return error.BadGateway;
+    const repo = try upstream.json(Repo, req.arena);
+    try res.print(.text, "{s}: {d} stars\n", .{ repo.full_name, repo.stargazers_count });
+}
+```
+
+- `fetch(url, options)` takes `method`, `headers` (inline pairs, up to 32),
+  `body`, `timeout`, `max_redirects` and `decompress`.
+- The response has `status()`, `header(name)`, `body()` (the whole body,
+  `""` when there is none) and `json(T, allocator)`, which parses the body
+  into `T`, skipping fields `T` does not have, with memory from `allocator`
+  that outlives the response. It does not check the status.
+- `deinit` hands the connection back to the pool. `.inner` is dusty's
+  response, `.http` (on the client) dusty's client, for the rest of what
+  `anole.http.Client` below offers.
+
+It trusts the system's CA store and has the defaults below. A client with
+other settings (CAs, a client certificate, HTTP/2) is an
+`anole.http.Client` of your own.
 
 ## HTTP/1.1 and HTTPS
 
@@ -299,9 +336,9 @@ other tasks still use the connection.
 Handlers get the server's `std.Io` as `req.io`. A client call through it
 suspends that request only; the executor serves others meanwhile.
 
-- Keep one `anole.http.Client` in your context, created with `server.io()`, as
-  `examples/io` does. Its `/fanout` route makes two calls at once with
-  `io.concurrent`.
+- Use `anole.client(req)`, or keep an `anole.http.Client` of your own in
+  your context, created with `server.io()`, as `examples/io` does. Its
+  `/fanout` route makes two calls at once with `io.concurrent`.
 - Keep HTTP/2 and HTTP/3 connections in your context too, rather than one per
   request: connecting costs a handshake. `examples/clients` opens one per
   request in `GET /relay` only to stay short.

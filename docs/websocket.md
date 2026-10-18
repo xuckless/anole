@@ -1,9 +1,9 @@
 # WebSocket
 
-Anole serves WebSockets from ordinary route handlers. One call,
-`anole.websocket.upgrade`, accepts the connection whether it arrived over
-HTTP/1.1 or HTTP/2, and gives you one `Socket` type for both. The runnable
-example is `examples/websocket/main.zig`:
+Anole serves WebSockets over HTTP/1.1 and HTTP/2 with one `Socket` type for
+both. `app.ws` registers an endpoint in one line; `anole.websocket.upgrade`
+does the same from an ordinary route handler, for full control. The
+runnable example is `examples/websocket/main.zig`:
 
 ```sh
 zig build run-websocket              # http://127.0.0.1:8082 and https://127.0.0.1:8445
@@ -33,6 +33,33 @@ over HTTP/3 is not upgraded.
 WebSocket is on in the `web` and `full` profiles. `-Dwebsocket=false` removes
 it, and `anole.websocket` becomes an empty struct. permessage-deflate needs
 `-Dcompression` (zlib-ng). RFC 8441 needs `-Dhttp2`.
+
+## An endpoint in one line
+
+```zig
+fn echo(ws: *anole.websocket.Socket, _: *anole.Request) !void {
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+}
+
+app.ws("/echo", echo);
+```
+
+`app.ws(path, handler)` registers a `GET` route that accepts the WebSocket,
+on either HTTP version, and calls `handler` with the open socket. When the
+handler returns, the socket is closed with 1000 (1011 if it returned an
+error, nothing if it is closed already). A plain HTTP request on that path
+gets 426 Upgrade Required. The server's drain closes the socket with 1001
+(see [Shutdown](#shutdown)).
+
+`ws.next()` returns the next text or binary message, or null once the
+socket is done: the client closed it (the close is answered for you) or the
+connection ended (`ws.end_error` says how). It fails only for a cancel or no
+memory, which the handler should pass on.
+
+The handler takes `(ws, req)`, `(ws)` alone, or on a `Server(App)`
+`(app, ws, req)`. `app.wsWith(path, handler, options)` takes the
+[upgrade options](#upgrade-options) (at compile time); groups have `ws` and
+`wsWith` too.
 
 ## Accepting a connection
 
@@ -88,7 +115,8 @@ in the server options (keep the stream limit, which this field replaces):
 
 ## Receiving and sending
 
-`receive` waits for the next text, binary or close message:
+`next` (above) is the short form. `receive` waits for the next text, binary
+or close message:
 
 ```zig
 while (true) {
@@ -228,43 +256,32 @@ compressor. The server declines an 8-bit server window.
 ## Rooms
 
 `anole.websocket.Rooms` keeps named groups of sockets. Create one per server
-and reach it from your handlers through the server's context type:
+and reach it from your handlers through the server's context type.
+`Rooms.init` takes only an allocator (the rooms take the runtime's `std.Io`
+from the first socket that joins), so it can be made before the server:
 
 ```zig
 const App = struct {
     rooms: anole.websocket.Rooms,
 };
 
-var state: App = undefined;
-var app = try anole.Server(App).init(init.gpa, .{ .http = .{ .port = port } }, &state);
-defer app.deinit();
-state = .{ .rooms = .init(init.gpa, app.io()) };
+var state: App = .{ .rooms = .init(init.gpa) };
 defer state.rooms.deinit();
-app.get("/chat/:room", chat);
+var app = try anole.Server(App).init(init.gpa, .{}, &state);
+defer app.deinit();
+app.ws("/chat/:room", chat);
+try app.listen(":8082");
 ```
 
 In the handler, join after the upgrade and leave before the socket goes
 away. Defers run in reverse order, so this order is correct:
 
 ```zig
-fn chat(app: *App, req: *anole.Request, res: *anole.Response) !void {
+fn chat(app: *App, ws: *anole.websocket.Socket, req: *anole.Request) !void {
     const room = req.params.get("room") orelse "lobby";
-    var ws = (try anole.websocket.upgrade(req, res, .{})) orelse {
-        res.status = .bad_request;
-        return;
-    };
-    defer ws.deinit();
-    try app.rooms.join(room, &ws);
-    defer app.rooms.leave(room, &ws);
-
-    while (true) {
-        const msg = ws.receive() catch return;
-        switch (msg.type) {
-            .text, .binary => _ = app.rooms.broadcast(room, msg.type, msg.data, null),
-            .close => return,
-            else => {},
-        }
-    }
+    try app.rooms.join(room, ws);
+    defer app.rooms.leave(room, ws);
+    while (try ws.next()) |msg| _ = app.rooms.broadcast(room, msg.type, msg.data, null);
 }
 ```
 

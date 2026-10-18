@@ -1,10 +1,11 @@
 # The server
 
-`anole.Server(Ctx)` is the entry point. One `init` call creates the async
-runtime, the listeners (HTTP/1.1 with cleartext HTTP/2, HTTPS with HTTP/2,
-optionally HTTP/3) and the router. `run()` serves until the process is told
-to stop, then drains. Routes, middleware, requests and responses are in
-[routing.md](routing.md).
+`anole.Server(Ctx)` is the entry point, and `anole.App` the same server
+without state. `init` creates the async runtime and the router; `listen` or
+`listenTls` (or the `http`/`https` options and `run`) set up the listeners
+(HTTP/1.1 with cleartext HTTP/2, HTTPS with HTTP/2, HTTP/3) and serve until
+the process is told to stop, then drain. Routes, middleware, requests and
+responses are in [routing.md](routing.md).
 
 ## A complete program
 
@@ -17,28 +18,42 @@ fn hello(_: *anole.Request, res: *anole.Response) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var app = try anole.Server(void).init(init.gpa, .{
-        .http = .{ .port = 8080 },
-        .https = .{ .port = 8443, .cert = .dev_self_signed },
-    }, {});
+    var app = try anole.App.init(init.gpa, .{});
     defer app.deinit();
 
     app.use(anole.middleware.RequestId.init(.{}));
     app.get("/", hello);
-    try app.run();
+    try app.listen(":8080"); // every interface; "127.0.0.1:8080" for this machine only
 }
 ```
 
 It logs one line per listener as it starts, with what each one speaks:
 
 ```
-info(anole): listening on http://127.0.0.1:8080 (HTTP/1.1, HTTP/2 cleartext)
-info(anole): listening on https://127.0.0.1:8443 (HTTP/2, HTTP/1.1)
+info(anole): listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)
 ```
 
 A port that another process already listens on is an error,
 `error.AddressInUse`, logged with the address, rather than a second server
 quietly taking a share of the connections (see [Ports in use](#ports-in-use)).
+
+The same with every listener spelled out in the options, which is how to
+serve cleartext and TLS from one process:
+
+```zig
+var app = try anole.Server(void).init(init.gpa, .{
+    .http = .{ .port = 8080 },
+    .https = .{ .port = 8443, .cert = .dev_self_signed },
+}, {});
+defer app.deinit();
+app.get("/", hello);
+try app.run();
+```
+
+```
+info(anole): listening on http://127.0.0.1:8080 (HTTP/1.1, HTTP/2 cleartext)
+info(anole): listening on https://127.0.0.1:8443 (HTTP/2, HTTP/1.1)
+```
 
 Add middleware with `use` before any route: the router panics on a `use`
 after a route. Call `run` from the thread that called `init`. One `Server`
@@ -96,9 +111,42 @@ std.debug unwinds stack traces through that `Io`, and Debug builds capture
 traces inside allocator and task-pool locks, so a coroutine can be suspended
 while holding one: a livelock or a recursive-lock abort.
 
+## listen and listenTls
+
+`listen(address)` serves HTTP/1.1, and HTTP/2 for clients that open with its
+preface (h2c), on `address` in Go's notation, until SIGINT, SIGTERM or
+`stop`, as `run` does:
+
+| Address | Binds |
+| --- | --- |
+| `":3000"` | every IPv4 interface (`0.0.0.0`), as a container or a server needs |
+| `"127.0.0.1:3000"`, `"localhost:3000"` | this machine only |
+| `"[::]:3000"` | every IPv6 interface (and IPv4 too where the system maps it) |
+| `"[::1]:3000"` | IPv6 loopback |
+
+`listenTls(address, cert)` serves HTTPS instead: HTTP/2 and HTTP/1.1 by
+ALPN, and, when Anole is built with HTTP/3 (the default `full` profile),
+HTTP/3 on the same port number over UDP, advertised to browsers with
+`Alt-Svc`. A browser that cannot reach the UDP port stays on HTTP/2.
+`listen_tls_http3 = false` in the options leaves HTTP/3 out, and `http3`
+in the options tunes it.
+
+```zig
+try app.listenTls(":443", .fromFiles("fullchain.pem", "privkey.pem"));
+try app.listenTls("localhost:8443", .dev_self_signed);
+```
+
+Both are for a server whose `init` options name no listener (neither `http`
+nor `https`); otherwise they fail with `error.ListenersAlreadySet` and the
+listeners from the options are served with `run`. To serve both cleartext
+and TLS, name both in the options. A port in use, a certificate that does
+not load or an address that does not parse is returned by `listen`, and by
+`waitReady` to any task waiting for the server.
+
 ## Options
 
-`init(gpa, options, ctx)` takes an `anole.ServerOptions`:
+`init(gpa, options, ctx)` (`App.init(gpa, options)`) takes an
+`anole.ServerOptions`:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -109,16 +157,18 @@ while holding one: a livelock or a recursive-lock abort.
 | `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
 | `process` | `null` | `init.minimal` enables socket activation, SIGUSR2 restarts and `sd_notify`. |
 | `restart_timeout_ms` | 10 000 | How long a restart waits for the new process. |
+| `listen_tls_http3` | true | Whether `listenTls` adds HTTP/3 (when built in). |
 | `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
 | `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
 | `server` | `.{}` | The rest of dusty's `ServerConfig`: timeouts, limits, proxies. |
 
-You get the listeners you name. `.{}` alone serves cleartext HTTP on
-127.0.0.1:8080, `.{ .https = ... }` serves HTTPS only, and a server that
-wants both names both. Both listeners bind to `127.0.0.1` unless given an
+You get the listeners you name. `.{}` alone leaves them to `listen` or
+`listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
+`.{ .https = ... }` serves HTTPS only, and a server that wants both names
+both. Listeners named in the options bind to `127.0.0.1` unless given an
 `address`; use `"0.0.0.0"` or `"::"` to accept connections from other
-machines.
+machines (`listen(":3000")` does the first).
 
 ```zig
 var app = try anole.Server(void).init(init.gpa, .{
@@ -153,6 +203,9 @@ var app = try anole.Server(void).init(init.gpa, .{
   `127.0.0.1` and `::1`, held only in memory. For development; clients need
   `curl -k`.
 
+`anole.Cert.fromFiles(cert_path, key_path)` and `.fromPem(cert, key)` build
+the first two: `.cert = .fromFiles("cert.pem", "key.pem")`.
+
 `server` goes to dusty as is, except that `listeners` and `http2` are
 replaced by the fields above. Its timeouts and limits are covered in
 [routing.md](routing.md#timeouts-and-limits); `trusted_proxy_hops` below;
@@ -183,6 +236,9 @@ pub fn main(init: std.process.Init) !void {
     try app.run();
 }
 ```
+
+A handler that does not need the state can leave it out: `(req, res)`
+handlers work on a `Server(App)` too.
 
 Handlers run at the same time on every executor, so shared state needs
 atomics or a lock. Prefer `std.Io.Mutex` or `std.Io.RwLock` to
@@ -235,10 +291,15 @@ With a zio runtime of your own, start a pool on it with
 
 | Member | What it does |
 | --- | --- |
-| `use(middleware)` | Adds a global middleware (copied, owned by the server), before any route. |
+| `listen(address)`, `listenTls(address, cert)` | Set up the listener and serve; see [above](#listen-and-listentls). |
+| `use(middleware)` | Adds a global middleware (copied, owned by the server; a function works too), before any route. |
 | `get`, `head`, `post`, `put`, `patch`, `delete`, `options`, `query`, `any` | Register a route (`query` is the HTTP QUERY method). |
-| `static(prefix, dir, options)`, `embedded(path, data, options)` | Serve a directory, or one file compiled in. |
-| `group(prefix, .{ middleware, ... })` | A route group; see [routing.md](routing.md#groups). |
+| `ws(path, handler)` | A WebSocket endpoint; see [websocket.md](websocket.md#an-endpoint-in-one-line). |
+| `static(prefix, dir, options)`, `staticDir(prefix, path, options)`, `embedded(path, data, options)` | Serve a directory (one you opened, or one the server opens), or one file compiled in. |
+| `group(prefix, .{ middleware, ... })`, `with(.{ middleware, ... })` | A route group, or middleware for some routes; see [routing.md](routing.md#groups). |
+| `grpc(pb.Service, handlers)`, `grpcHealth()` | A gRPC service, and the health service; see [grpc.md](grpc.md#serve-a-service). |
+| `metrics(.{})`, `health(.{})`, `tracing(.{})` | `/metrics`, `/healthz` and `/readyz`, OpenTelemetry traces; see [observability.md](observability.md#wiring). |
+| `client()` | The server's outbound HTTP client (also `anole.client(req)`); see [clients.md](clients.md#the-servers-client). |
 | `middleware(value)` | A server-owned copy of a middleware, as a handle to share between groups. |
 | `reloadCertificates()`, `setCertificate(cert)` | Swap the TLS certificate while serving; see [TLS](#tls). |
 | `router`, `server` | dusty's router and server. |

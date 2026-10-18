@@ -18,8 +18,20 @@ app.any("/legacy/*path", legacy); // every method
 ```
 
 The server has `get`, `head`, `post`, `put`, `patch`, `delete`, `options`,
-`query` (the HTTP QUERY method: a GET with a body) and `any`, plus `static`
-and `embedded` ([below](#static-files)).
+`query` (the HTTP QUERY method: a GET with a body) and `any`, plus `static`,
+`staticDir` and `embedded` ([below](#static-files)) and `ws` for WebSockets
+([websocket.md](websocket.md)).
+
+A handler takes the request and the response. On a `Server(App)` it may take
+a `*App` first as well; one that does not need the state leaves it out:
+
+```zig
+fn health(_: *anole.Request, res: *anole.Response) !void { res.body = "ok"; }
+fn count(app: *App, _: *anole.Request, res: *anole.Response) !void { ... }
+
+app.get("/health", health); // (req, res) on a Server(App) too
+app.get("/count", count);
+```
 
 - A literal segment matches itself, `:name` one segment, and `*name` the
   rest of the path (one or more segments).
@@ -76,6 +88,14 @@ A handle you make yourself, `anole.Middleware(Ctx).init(&value)`, points at a
 value you keep alive and free; a slice of such handles works in place of the
 tuple. With a context, use `anole.Middleware(App)`.
 
+`with` is a group without a prefix: middleware for the routes registered
+through it, and no others.
+
+```zig
+app.with(.{requireAdmin}).delete("/users/:id", deleteUser);
+app.get("/users/:id", getUser); // not behind requireAdmin
+```
+
 ## Middleware
 
 The chain runs global middleware (`use`, in the order added), then each
@@ -84,11 +104,30 @@ enclosing group's, then the handler. Global middleware also runs for 404s and
 preflight) runs the middleware of the route it asks about, group middleware
 included, so a group's `Cors` can answer it.
 
-A middleware is a struct with an `execute` method of exactly this shape.
-`executor.next()` runs the rest of the chain, and an error from the handler
-comes back out of it; return that error so the server can answer it. Code
-after `next()` runs once the handler is done. Return without calling it to
-answer the request yourself.
+The short form is a function that takes the request, the response and an
+`anole.Next`. `next.call()` runs the rest of the chain, and an error from
+the handler comes back out of it; return that error so the server can answer
+it. Code after it runs once the handler is done. Return without calling it to
+answer the request yourself. `use`, `group` and `with` take the function as
+it is (or wrapped, `anole.func(requireKey)`); on a `Server(App)` it may take
+the `*App` first.
+
+```zig
+fn requireKey(req: *anole.Request, res: *anole.Response, next: anole.Next) !void {
+    if (req.headers.get("X-Api-Key") == null) {
+        res.status = .unauthorized;
+        res.body = "missing API key\n";
+        return;
+    }
+    return next.call();
+}
+
+app.use(requireKey);
+```
+
+A middleware with settings of its own is a struct with an `execute` method
+of exactly this shape, where `executor.next()` plays the part of
+`next.call()`:
 
 ```zig
 const RequireToken = struct {
@@ -302,7 +341,15 @@ WebSockets are in [websocket.md](websocket.md).
 
 ## Static files
 
-`static` serves a directory, which must stay open while the server runs:
+`staticDir` serves the directory at a path (relative to the working
+directory), which the server opens at once and closes with itself:
+
+```zig
+try app.staticDir("/", "public", .{});
+```
+
+`static` takes a directory you opened, which must stay open while the server
+runs:
 
 ```zig
 var public = try std.Io.Dir.cwd().openDir(io, "public", .{});
@@ -312,6 +359,8 @@ app.static("/assets", public, .{
     .cache_control = "public, max-age=3600",
 });
 ```
+
+Both take the same options:
 
 - `ETag` and `Last-Modified`, with 304 for `If-None-Match` and
   `If-Modified-Since`; `Range` and `If-Range`, with 206 or 416.

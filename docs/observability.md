@@ -15,6 +15,36 @@ zig build run-observe -- 9000 text     # another port, text access log
 
 ## Wiring
 
+The server sets each one up in a line, and owns what it makes:
+
+```zig
+app.use(anole.middleware.RequestId.init(.{}));
+_ = try app.tracing(.{ .service_name = "api" }); // OTLP to OTEL_EXPORTER_OTLP_ENDPOINT or localhost:4318
+app.use(anole.observe.AccessLog.init(.{ .format = .json, .exclude = &anole.observe.probe_paths }));
+const registry = app.metrics(.{}); // /metrics, and the HTTP metrics middleware
+const health = app.health(.{}); // /healthz and /readyz
+try health.addCheck("db", dbReady, &pool);
+// ... routes ...
+```
+
+- `metrics(.{ .path, .http, .exclude })` returns the registry for metrics of
+  your own; `.http = false` leaves out the request metrics.
+- `health(.{ .healthz_path, .readyz_path })` returns the `Health` for
+  `addCheck`; readiness fails once the server drains.
+- `tracing(.{ .endpoint, .service_name, .sample_all, .exclude, ... })`
+  exports through the server's own client. The endpoint and the service
+  name default to `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
+  when the server has `process` (`init.minimal`), else
+  `http://localhost:4318` and `"anole"`. The server sends the spans still
+  queued when it is freed.
+- `metrics` and `tracing` add a middleware, so they go before the routes,
+  with the `use` calls. The `/metrics`, `/healthz` and `/readyz` routes are
+  added when serving starts, so the order of `health` does not matter.
+- `exclude` defaults to `anole.observe.probe_paths` for the request metrics
+  and the traces.
+
+The same by hand, for a router or a registry of your own:
+
 ```zig
 var registry = anole.observe.metrics.Registry.init(gpa, app.io());
 defer registry.deinit();

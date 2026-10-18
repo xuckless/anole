@@ -11,6 +11,23 @@ for macOS and Linux.
 
 ### Server
 
+- `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
+  / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
+  notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with
+  `Alt-Svc` when it is built in (`Options.listen_tls_http3`). Without
+  `http`/`https` in the options, the listeners are set up by `listen`,
+  `listenTls` or `run`, hand-off, `sd_notify` and `waitReady` included.
+  `anole.Cert.fromFiles` / `fromPem`.
+- One line per subsystem, owned by the server: `app.grpc(pb.Service,
+  handlers)` (a struct literal, a namespace, or methods on a value; gRPC,
+  gRPC-Web, Connect and transcoded routes), `grpcHealth()` (NOT_SERVING on
+  drain), `metrics(.{})`, `health(.{})`, `tracing(.{})`,
+  `staticDir(prefix, path, .{})` and `ws(path, handler)`.
+- Plain `(req, res)` handlers on a `Server(App)`; function middleware
+  (`fn (req, res, next: anole.Next) !void`, or `anole.func(f)`) in `use`,
+  `group` and the new `with` (middleware for some routes, no prefix).
+- `anole.client(req)` / `app.client()`: the server's pooled outbound HTTP
+  client, with inline headers and `response.json(T, allocator)`.
 - `anole.Server(Ctx)`: one call sets up the zio runtime (one pinned executor
   per core, connections never leave the core that accepted them), the
   listeners, SIGINT/SIGTERM handling and a graceful drain with a hard
@@ -144,6 +161,10 @@ for macOS and Linux.
   broadcasts that include it.
 - RFC 8441 sockets are logged, measured and traced as 101, like HTTP/1.1
   upgrades.
+- `app.ws(path, handler)` with `Socket.next()` (text and binary messages,
+  null on close): an echo endpoint is one loop; a plain request gets 426.
+- Breaking: `Rooms.init(allocator)` takes no `Io` (it comes from the first
+  socket to join), so the rooms can be made before the server.
 
 ### gRPC
 
@@ -175,6 +196,9 @@ for macOS and Linux.
 - `addProtoGen` for an application's build.zig: protoc and the Zig generator
   are pinned and built by `zig build`, nothing to install;
   `google/api/annotations.proto` and `http.proto` come with Anole.
+- `addApp(b, .{ .name, .root_source_file, .protos })` makes an application's
+  build.zig one call, and `addProtoModule` generates a `.proto`'s module in
+  the cache as part of `zig build` (no separate step, nothing committed).
 
 ### Clients
 
