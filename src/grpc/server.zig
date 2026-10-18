@@ -131,17 +131,20 @@ fn QueueElem(comptime P: type) type {
     return @typeInfo(@typeInfo(@TypeOf(Q.init)).@"fn".param_types[0].?).pointer.child;
 }
 
+/// The kind and message types of a generated method's function pointer type.
+pub const MethodOf = Method;
+
 fn Method(comptime F: type) type {
     const info = @typeInfo(@typeInfo(F).pointer.child).@"fn";
     const params = info.param_types;
     const ret = @typeInfo(info.return_type.?).error_union.payload;
     const second_is_queue = @typeInfo(params[1].?) == .pointer;
     return struct {
-        const kind: MethodKind = if (params.len == 2)
+        pub const kind: MethodKind = if (params.len == 2)
             (if (second_is_queue) .client_streaming else .unary)
         else if (second_is_queue) .bidi_streaming else .server_streaming;
-        const Request = if (second_is_queue) QueueElem(params[1].?) else params[1].?;
-        const Response = if (params.len == 3) QueueElem(params[2].?) else ret;
+        pub const Request = if (second_is_queue) QueueElem(params[1].?) else params[1].?;
+        pub const Response = if (params.len == 3) QueueElem(params[2].?) else ret;
     };
 }
 

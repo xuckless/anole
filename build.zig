@@ -267,6 +267,20 @@ pub fn build(b: *std.Build) void {
         });
         b.step("grpc-interop-server", "Build the gRPC interop server (tests/grpc/interop/run.sh runs grpc-go's client)").dependOn(&b.addInstallArtifact(interop, .{}).step);
         test_step.dependOn(&interop.step);
+        const interop_client = b.addExecutable(.{
+            .name = "grpc-interop-client",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/grpc/interop/client.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "anole", .module = anole_mod },
+                    .{ .name = "anole_interop_pb", .module = interop.root_module.import_table.get("anole_interop_pb").? },
+                },
+            }),
+        });
+        b.step("grpc-interop-client", "Build the gRPC interop client (tests/grpc/interop/run-client.sh runs it against grpc-go's server)").dependOn(&b.addInstallArtifact(interop_client, .{}).step);
+        test_step.dependOn(&interop_client.step);
     }
 
     // tests/autobahn: the WebSocket echo peer for the Autobahn suite.

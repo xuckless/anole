@@ -101,7 +101,7 @@ jobs:
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
 
   grpc-interop:
-    name: gRPC interop (grpc-go client, cleartext HTTP/2)
+    name: gRPC interop (both directions with grpc-go, cleartext HTTP/2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -115,5 +115,9 @@ jobs:
       - name: Build the interop server
         run: zig build grpc-interop-server -Doptimize=ReleaseSafe --summary all
       # grpc-go's interop client (v1.84.0), one test case at a time.
-      - name: Interop test cases
+      - name: Build the interop client
+        run: zig build grpc-interop-client -Doptimize=ReleaseSafe --summary all
+      - name: Interop test cases (grpc-go client, Anole server)
         run: tests/grpc/interop/run.sh ./zig-out/bin/grpc-interop-server
+      - name: Interop test cases (Anole client, grpc-go server)
+        run: tests/grpc/interop/run-client.sh ./zig-out/bin/grpc-interop-client

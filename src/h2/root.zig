@@ -1,6 +1,13 @@
-//! HTTP/2: nghttp2 1.70.0 (MIT) bindings from the official translate-c package.
-//! Only the bindings exist so far; the server engine is Milestone 2.
+//! HTTP/2: nghttp2 1.70.0 (MIT) bindings from the official translate-c
+//! package, and the client connection. The server engine lives in the dusty
+//! fork.
 const std = @import("std");
+
+/// An HTTP/2 client connection (cleartext or TLS), many streams at once.
+pub const ClientConnection = @import("client.zig").ClientConnection;
+pub const Stream = @import("client.zig").Stream;
+pub const Header = @import("client.zig").Header;
+pub const ConnectOptions = @import("client.zig").ConnectOptions;
 
 /// The translated nghttp2.h.
 pub const c = @import("anole_nghttp2_c");
@@ -23,6 +30,10 @@ fn onFrameRecv(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, u
     ctx.frames_recv += 1;
     if (frame.*.hd.type == c.NGHTTP2_SETTINGS) ctx.settings_recv = true;
     return 0;
+}
+
+test {
+    _ = @import("client_test.zig");
 }
 
 test "nghttp2 version" {

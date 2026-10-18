@@ -18,6 +18,15 @@ pub const Call = server.Call;
 pub const register = server.register;
 pub const MethodKind = server.MethodKind;
 
+/// The client: `Channel` over an `anole.h2.ClientConnection`, and
+/// `Client(Service)` for typed calls.
+const client = @import("client.zig");
+pub const Channel = client.Channel;
+pub const Client = client.Client;
+pub const ClientStream = client.Stream;
+pub const CallOptions = client.CallOptions;
+pub const openCall = client.open;
+
 /// grpc.health.v1.Health.
 pub const health = @import("health.zig");
 pub const Health = health.Health;
@@ -34,5 +43,6 @@ test {
     _ = @import("compression.zig");
     _ = server;
     _ = health;
+    _ = client;
     if (features.http2) _ = @import("server_test.zig");
 }

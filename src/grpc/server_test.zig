@@ -406,3 +406,87 @@ fn decodeChunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     }
     return out.items;
 }
+
+test "gRPC client: every call mode, an error status, a client deadline and metadata" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const h2 = @import("../h2/client.zig");
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const r = try client.unary("Unary", arena, .{ .message = "via client" }, .{});
+    try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+    try std.testing.expectEqualStrings("via client", r.message.?.message);
+    var echoed = false;
+    for (r.trailers) |t| if (std.mem.eql(u8, t.name, "x-echoed")) {
+        echoed = true;
+    };
+    try std.testing.expect(echoed);
+
+    const failed = try client.unary("Unary", arena, .{ .message = "fail" }, .{});
+    try std.testing.expectEqual(grpc.Code.not_found, failed.status.code);
+    try std.testing.expectEqualStrings("no such thing: fail", failed.status.message);
+
+    const late = try client.unary("Unary", arena, .{ .message = "slow" }, .{ .timeout = .fromMilliseconds(100) });
+    try std.testing.expectEqual(grpc.Code.deadline_exceeded, late.status.code);
+
+    {
+        var s = try client.stream("ServerStream", arena, .{});
+        defer s.deinit();
+        try s.send(.{ .message = "n", .repeat = 4 });
+        try s.closeSend();
+        var n: usize = 0;
+        while (try s.receive()) |m| : (n += 1) try std.testing.expectEqual(@as(i32, @intCast(n)), m.index);
+        try std.testing.expectEqual(@as(usize, 4), n);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+    {
+        var s = try client.stream("ClientStream", arena, .{ .compression = if (features.compression) .gzip else .identity });
+        defer s.deinit();
+        for ([_][]const u8{ "x", "y", "z" }) |m| try s.send(.{ .message = m });
+        try s.closeSend();
+        const reply = (try s.receive()).?;
+        try std.testing.expectEqualStrings("xyz", reply.message);
+        try std.testing.expect(try s.receive() == null);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+    {
+        // Bidi in lock step: each reply before the next request.
+        var s = try client.stream("Bidi", arena, .{ .metadata = &.{.{ .name = "x-trace", .value = "1" }} });
+        defer s.deinit();
+        for ([_][]const u8{ "ping", "pong", "again" }, 0..) |m, i| {
+            try s.send(.{ .message = m });
+            const reply = (try s.receive()).?;
+            try std.testing.expectEqualStrings(m, reply.message);
+            try std.testing.expectEqual(@as(i32, @intCast(i)), reply.index);
+        }
+        try s.closeSend();
+        try std.testing.expect(try s.receive() == null);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+}
