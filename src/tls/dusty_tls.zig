@@ -158,6 +158,9 @@ pub const config = struct {
         root_ca: std.crypto.Certificate.Bundle,
         /// `root_ca` loaded once, as in `ClientAuth.trust`.
         trust: ?*const TrustStore = null,
+        /// A store from `clientStore`, for clients outside dusty; taken over
+        /// `trust` and `root_ca`.
+        store: ?*c.X509_STORE = null,
         insecure_skip_verify: bool = false,
         auth: ?*CertKeyPair = null,
         now: std.Io.Timestamp,
@@ -349,8 +352,8 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
     if (opt.insecure_skip_verify) {
         c.SSL_set_verify(ssl, c.SSL_VERIFY_NONE, null);
     } else {
-        if (opt.trust) |t| {
-            if (c.SSL_set1_verify_cert_store(ssl, t.store) != 1) return error.OutOfMemory;
+        if (opt.store orelse if (opt.trust) |t| t.store else null) |store| {
+            if (c.SSL_set1_verify_cert_store(ssl, store) != 1) return error.OutOfMemory;
         } else try setVerifyStore(ssl, opt.root_ca);
         c.SSL_set_verify(ssl, c.SSL_VERIFY_PEER, null);
         const ok = if (host_is_ip)
@@ -1011,6 +1014,61 @@ pub const TrustStore = struct {
         return trustFrom(.{ .hash = 0, .len = 0, .store = self.store, .names = self.names }, want_names);
     }
 };
+
+/// The trust store for a client connection made outside dusty (Anole's
+/// HTTP/2 and HTTP/3 clients), from `ca`, a `dusty.TlsCa`. `.system` is
+/// loaded on first use and kept for the process; a file, directory or PEM is
+/// read on every call and its store cached by content, as dusty's bundles
+/// are. Null for `.none`. A new reference: `X509_STORE_free` it.
+pub fn clientStore(gpa: Allocator, io: std.Io, ca: anytype) !?*c.X509_STORE {
+    switch (ca) {
+        .none => return null,
+        .system => return try systemStore(io),
+        else => {
+            var bundle = try ca.load(gpa, io);
+            defer bundle.deinit(gpa);
+            return (try trustStore(bundle, false)).store;
+        },
+    }
+}
+
+/// Drops a reference `clientStore` returned.
+pub fn releaseStore(store: *c.X509_STORE) void {
+    c.X509_STORE_free(store);
+}
+
+var system_store: ?*c.X509_STORE = null;
+var system_store_mutex: std.Io.Mutex = .init;
+
+/// The platform's trust store (`std.crypto.Certificate.Bundle.rescan`, what
+/// dusty's `.system` reads), loaded once. A new reference.
+fn systemStore(io: std.Io) !*c.X509_STORE {
+    system_store_mutex.lockUncancelable(io);
+    defer system_store_mutex.unlock(io);
+    if (system_store == null) {
+        const gpa = std.heap.c_allocator;
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(gpa);
+        try bundle.rescan(gpa, io, std.Io.Clock.real.now(io));
+        const built = try TrustStore.fromDer(bundle.bytes.items);
+        // Only a server's client CA list needs the names.
+        c.sk_CRYPTO_BUFFER_pop_free(built.names, c.CRYPTO_BUFFER_free);
+        system_store = built.store;
+    }
+    _ = c.X509_STORE_up_ref(system_store.?);
+    return system_store.?;
+}
+
+/// How many certificates `store` holds (for tests).
+pub fn storeCertCount(store: *c.X509_STORE) usize {
+    const objects = c.X509_STORE_get1_objects(store) orelse return 0;
+    defer c.sk_X509_OBJECT_pop_free(objects, c.X509_OBJECT_free);
+    var n: usize = 0;
+    for (0..c.sk_X509_OBJECT_num(objects)) |i| {
+        if (c.X509_OBJECT_get0_X509(c.sk_X509_OBJECT_value(objects, i)) != null) n += 1;
+    }
+    return n;
+}
 
 /// New references to an entry's store and, if asked, its names. Under the
 /// global lock for a cached entry.
