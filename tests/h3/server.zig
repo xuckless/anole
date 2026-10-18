@@ -2,11 +2,11 @@
 //! (tests/h3/client.py on aioquic): downloads, uploads and echoes of any
 //! size, beside HTTP/1.1 and HTTP/2 on the same routes.
 //!
-//!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry] [ADDRESS]
+//!   zig build h3-test-server && zig-out/bin/h3-test-server 8443 [retry] [drain=MS] [ADDRESS]
 //!
 //! With `retry`, every new client proves its address with a Retry first.
-//! ADDRESS (default 127.0.0.1) is where it listens, 0.0.0.0 for every
-//! interface.
+//! `drain=MS` bounds the shutdown drain (default 30 s). ADDRESS (default
+//! 127.0.0.1) is where it listens, 0.0.0.0 for every interface.
 const std = @import("std");
 const anole = @import("anole");
 const http = anole.http;
@@ -17,6 +17,13 @@ pub const std_options: std.Options = .{
     .log_level = .info,
     .log_scope_levels = &.{.{ .scope = .zio, .level = .warn }},
 };
+
+/// GET /slow?ms=N: answers after N milliseconds.
+fn slow(req: *http.Request, res: *http.Response) !void {
+    const ms = std.fmt.parseInt(i64, req.query.get("ms") orelse "0", 10) catch 0;
+    try req.io.sleep(.fromMilliseconds(ms), .awake);
+    res.body = "slow\n";
+}
 
 /// GET /download?n=BYTES: that many bytes, streamed.
 fn download(req: *http.Request, res: *http.Response) !void {
@@ -68,17 +75,24 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     var retry = false;
+    var drain: ?std.Io.Duration = .fromSeconds(30);
     var address: []const u8 = "127.0.0.1";
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "retry")) retry = true else address = a;
+        if (std.mem.eql(u8, a, "retry")) {
+            retry = true;
+        } else if (std.mem.startsWith(u8, a, "drain=")) {
+            drain = .fromMilliseconds(try std.fmt.parseInt(i64, a["drain=".len..], 10));
+        } else address = a;
     }
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
         .https = .{ .address = address, .port = port, .cert = .dev_self_signed },
         .http3 = .{ .validate_address = retry },
+        .server = .{ .timeout = .{ .shutdown = drain } },
     }, {});
     defer app.deinit();
     app.get("/download", download);
+    app.get("/slow", slow);
     app.post("/upload", upload);
     app.post("/echo", echo);
     std.log.info("h3 test server on https://{s}:{d} (TCP and UDP)", .{ address, port });

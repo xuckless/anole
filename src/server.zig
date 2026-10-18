@@ -244,6 +244,11 @@ pub fn Server(comptime Ctx: type) type {
                         .max_streams_bidi = q.max_streams_bidi,
                         .validate_address = q.validate_address,
                         .idle_timeout_ms = q.idle_timeout_ms,
+                        // The same drain deadline as HTTP/1.1 and HTTP/2.
+                        .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
+                            @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
+                        else
+                            std.math.maxInt(u32),
                     });
                     errdefer ep.deinit();
                     endpoint = ep;

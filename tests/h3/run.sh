@@ -58,6 +58,18 @@ kill -0 $pid 2>/dev/null && fail "server still running after the drain"
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic in the server log"
 pid=""
 echo "PASS drain"
+# The drain's hard deadline: a request that never finishes is cut off.
+start drain=1000
+$py "$url/slow?ms=60000" --quiet >"$work/slow" 2>&1 &
+slowpid=$!
+sleep 0.5
+kill -TERM $pid
+for i in $(seq 1 60); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done
+kill -0 $pid 2>/dev/null && fail "server still running 6 s after a 1 s drain"
+kill -9 $slowpid 2>/dev/null || true
+grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic after the drain deadline"
+pid=""
+echo "PASS drain deadline"
 # Address validation: a Retry round trip, then the request.
 start retry
 out=$($py "$url/download?n=70000" --quiet | head -1)
