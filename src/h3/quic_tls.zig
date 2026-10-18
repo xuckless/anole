@@ -32,6 +32,9 @@ pub const ServerOptions = struct {
     /// Also accept ALPN "hq-interop" (after "h3").
     hq_interop: bool = false,
     client_auth: ?ClientAuth = null,
+    /// Accept 0-RTT (early data) from clients resuming a session. Each
+    /// connection must then also get `setEarlyDataContext`.
+    early_data: bool = false,
 };
 
 pub const Context = struct {
@@ -52,6 +55,11 @@ pub const Context = struct {
         try useIdentity(.ctx, ctx, options.cert_pem, options.key_pem);
         if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsKeyMismatch;
         if (options.client_auth) |ca| try requestClientCertificates(ctx, ca);
+        // 0-RTT is set here, so a context rebuilt for a certificate reload
+        // takes it too. Its tickets are sealed with the endpoint's keys
+        // (`dusty_tls.installTicketKeys`), which a reload carries over, and
+        // every connection of a listener, on any executor, shares them.
+        if (options.early_data) c.SSL_CTX_set_early_data_enabled(ctx, 1);
         return .{ .ctx = ctx };
     }
 
@@ -71,6 +79,22 @@ pub const Context = struct {
         return ssl;
     }
 };
+
+/// What a 0-RTT ticket is tied to, for BoringSSL to compare byte for byte
+/// when the client comes back (RFC 9001 §4.6.1 and RFC 9114 §7.2.4.2: the
+/// server must not take early data under settings it cannot honour):
+/// ngtcp2's encoding of the transport parameters a client remembers, and
+/// the HTTP/3 SETTINGS. A mismatch still resumes, without 0-RTT. Before
+/// the handshake starts.
+pub fn setEarlyDataContext(ssl: *c.SSL, context: []const u8) !void {
+    if (c.SSL_set_quic_early_data_context(ssl, context.ptr, context.len) != 1) return error.OutOfMemory;
+}
+
+/// Why the server took or refused this connection's early data, for logs.
+pub fn earlyDataReason(ssl: *const c.SSL) []const u8 {
+    const text: ?[*:0]const u8 = c.SSL_early_data_reason_string(c.SSL_get_early_data_reason(ssl));
+    return if (text) |t| std.mem.span(t) else "unknown";
+}
 
 /// What a listener accepts, in its order of preference.
 const Accept = struct { protocols: []const []const u8 };

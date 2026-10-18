@@ -37,6 +37,7 @@ const quic_tls = @import("quic_tls.zig");
 const dusty_tls = @import("anole_dusty_tls");
 const net = @import("net.zig");
 const bridge = @import("bridge.zig");
+const early_data = @import("../early_data.zig");
 const Addr = net.Addr;
 const CidKey = net.CidKey;
 const now = net.now;
@@ -98,7 +99,54 @@ pub const Options = struct {
     /// predecessor's, so the predecessor's clients accept the stateless
     /// resets it sends them.
     secret: ?[32]u8 = null,
+    /// Take 0-RTT from clients that resume a session: their first requests
+    /// arrive with the handshake, one round trip sooner. Such a request may
+    /// be a replay until the handshake completes, so GET, HEAD and OPTIONS
+    /// run at once (with `Early-Data: 1` among their headers) and every
+    /// other method waits for the handshake, which a replay never
+    /// completes (RFC 8470 §3).
+    early_data: bool = false,
 };
+
+/// The SETTINGS every connection of an endpoint sends.
+fn http3Settings(options: *const Options) nghttp3.Settings {
+    var settings: nghttp3.Settings = undefined;
+    nghttp3.settingsDefault(&settings);
+    settings.qpack_max_dtable_capacity = 4096;
+    settings.qpack_blocked_streams = 100;
+    settings.max_field_section_size = options.max_field_section_size;
+    return settings;
+}
+
+/// Room for `earlyDataContext`'s output.
+const early_context_max = 1 + 256 + 5 * 8;
+/// Bumped whenever the layout below changes, so older tickets stop
+/// carrying 0-RTT rather than being misread.
+const early_context_version = 1;
+
+/// What 0-RTT tickets are tied to (`quic_tls.setEarlyDataContext`): a
+/// version byte, ngtcp2's encoding of the transport parameters a client
+/// remembers (limits, idle timeout and so on, not the per-connection IDs and
+/// tokens), and the SETTINGS values a client may assume (RFC 9114 §7.2.4.2).
+/// Any change to either, such as a new `max_streams_bidi`, makes old
+/// tickets resume without 0-RTT.
+fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, buf: *[early_context_max]u8) ![]const u8 {
+    buf[0] = early_context_version;
+    const n = c.ngtcp2_conn_encode_0rtt_transport_params2(q, buf[1..].ptr, buf.len - 1 - 5 * 8);
+    if (n < 0) return error.QuicSetupFailed;
+    var len: usize = 1 + @as(usize, @intCast(n));
+    for ([_]u64{
+        settings.max_field_section_size,
+        settings.qpack_max_dtable_capacity,
+        settings.qpack_blocked_streams,
+        settings.enable_connect_protocol,
+        settings.h3_datagram,
+    }) |v| {
+        std.mem.writeInt(u64, buf[len..][0..8], v, .little);
+        len += 8;
+    }
+    return buf[0..len];
+}
 
 /// One HTTP/3 listener, serving `server`'s router.
 pub fn Endpoint(comptime Ctx: type) type {
@@ -135,6 +183,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         reset_window: u64 = 0,
         /// The listener requests report (address, `secure`).
         listener: dusty.Listener,
+        /// Requests that came in 0-RTT: run before the handshake completed
+        /// (GET, HEAD, OPTIONS), and held until it had (the rest).
+        early_served: std.atomic.Value(u64) = .init(0),
+        early_held: std.atomic.Value(u64) = .init(0),
 
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
             const self = try gpa.create(Self);
@@ -208,6 +260,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .key_pem = options.key_pem,
                 .hq_interop = options.hq_interop_root != null,
                 .client_auth = options.client_auth,
+                .early_data = options.early_data,
             });
             errdefer tls.deinit();
             try dusty_tls.installTicketKeys(tls.ctx);
@@ -633,6 +686,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.q = q.?;
                 errdefer c.ngtcp2_conn_del(conn.q);
                 conn.ssl = try ep.newTlsSession(&conn.conn_ref);
+                errdefer c.SSL_free(conn.ssl);
+                if (ep.options.early_data) {
+                    var buf: [early_context_max]u8 = undefined;
+                    try quic_tls.setEarlyDataContext(conn.ssl, try earlyDataContext(conn.q, http3Settings(&ep.options), &buf));
+                }
                 c.ngtcp2_conn_set_tls_native_handle(conn.q, conn.ssl);
                 return conn;
             }
@@ -968,11 +1026,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn setupHttp3(conn: *Conn) !void {
                 if (conn.h3 != null) return;
                 if (c.ngtcp2_conn_get_streams_uni_left2(conn.q) < 3) return error.Http3SetupFailed;
-                var settings: nghttp3.Settings = undefined;
-                nghttp3.settingsDefault(&settings);
-                settings.qpack_max_dtable_capacity = 4096;
-                settings.qpack_blocked_streams = 100;
-                settings.max_field_section_size = conn.ep.options.max_field_section_size;
+                const settings = http3Settings(&conn.ep.options);
                 var hc: ?*h.nghttp3_conn = null;
                 if (nghttp3.connServerNew(&hc, &h3_callbacks, &settings, h.nghttp3_mem_default(), conn) != 0) return error.Http3SetupFailed;
                 errdefer h.nghttp3_conn_del(hc);
@@ -995,6 +1049,12 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn consume(conn: *Conn, stream_id: i64, n: u64) void {
                 bridge.consume(conn.q, stream_id, n);
+            }
+
+            /// The client's Finished has arrived: what it sent can no longer
+            /// be a replay. Locked.
+            fn handshakeDone(conn: *Conn) bool {
+                return c.ngtcp2_conn_get_handshake_completed2(conn.q) != 0;
             }
 
             // -- hq-interop (HTTP/0.9), for the QUIC interop runner -------
@@ -1135,6 +1195,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
             started: bool = false,
+            /// The request's head came in 0-RTT, before the handshake
+            /// completed.
+            early: bool = false,
             /// Who still holds the stream.
             refs: struct { quic: bool = true, handler: bool = false } = .{},
 
@@ -1279,6 +1342,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 response.head = request.method == .head;
                 request.url = s.path;
 
+                // 0-RTT (RFC 8470 §3): what came in early data may be a
+                // replay until the handshake completes, which a replay
+                // never does. Safe methods run now and say so with
+                // `Early-Data: 1`, as a proxy would; the rest wait.
+                conn.lock();
+                var early = s.early and !conn.handshakeDone();
+                conn.unlock();
+                if (early and !early_data.isSafe(request.method)) {
+                    _ = ep.early_held.fetchAdd(1, .monotonic);
+                    try s.awaitHandshake();
+                    early = false;
+                }
+
                 request.headers = dusty.Headers.init(arena, server.config.request.max_header_count) catch return error.OutOfMemory;
                 var too_many = false;
                 for (s.headers.items) |f| request.headers.put(f.name, f.value) catch {
@@ -1287,6 +1363,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
                 if (!too_many and request.headers.get("Host") == null and s.authority.len > 0) {
                     request.headers.put("Host", s.authority) catch {
+                        too_many = true;
+                    };
+                }
+                if (!too_many and early) {
+                    _ = ep.early_served.fetchAdd(1, .monotonic);
+                    if (request.headers.get(early_data.header) == null) request.headers.put(early_data.header, "1") catch {
                         too_many = true;
                     };
                 }
@@ -1340,6 +1422,23 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Waits for the connection to change. Unlocked.
             fn wait(s: *Stream, gen: u32) std.Io.Cancelable!void {
                 try s.conn.ep.io.futexWait(u32, &s.conn.gen.raw, gen);
+            }
+
+            /// Waits until the handshake completes; fails if the stream or
+            /// the connection goes first (a replayed 0-RTT flight: its
+            /// connection never completes). Unlocked.
+            fn awaitHandshake(s: *Stream) !void {
+                const conn = s.conn;
+                while (true) {
+                    const gen = conn.gen.load(.acquire);
+                    conn.lock();
+                    const done = conn.handshakeDone();
+                    const gone = s.reset;
+                    conn.unlock();
+                    if (done) return;
+                    if (gone) return error.ConnectionResetByPeer;
+                    try s.wait(gen);
+                }
             }
         };
 
@@ -1663,6 +1762,24 @@ pub fn Endpoint(comptime Ctx: type) type {
             const p = c.ngtcp2_conn_get_path2(conn.q);
             const n = c.ngtcp2_crypto_generate_regular_token(&token, &conn.ep.secret, conn.ep.secret.len, p.*.remote.addr, p.*.remote.addrlen, wallClock(conn.ep.io));
             if (n > 0) _ = c.ngtcp2_conn_submit_new_token(conn.q, &token, @intCast(n));
+            if (conn.ep.options.early_data and c.SSL_session_reused(conn.ssl) != 0)
+                log.debug("resumed; 0-RTT: {s}", .{quic_tls.earlyDataReason(conn.ssl)});
+            // Requests held for the handshake may go on.
+            conn.kick();
+            return 0;
+        }
+
+        /// The client moved (a NAT rebinding, or a migration of its own) and
+        /// the new path checked out. If its address changed, not just the
+        /// port, a token for that address lets its next connection skip
+        /// the Retry round trip, as at the handshake.
+        fn onPathValidation(_: ?*c.ngtcp2_conn, flags: u32, p: [*c]const c.ngtcp2_path, _: [*c]const c.ngtcp2_path, res: c.ngtcp2_path_validation_result, user_data: ?*anyopaque) callconv(.c) c_int {
+            if (res != c.NGTCP2_PATH_VALIDATION_RESULT_SUCCESS or flags & c.NGTCP2_PATH_VALIDATION_FLAG_NEW_TOKEN == 0) return 0;
+            const conn = connOf(user_data);
+            var token: [c.NGTCP2_CRYPTO_MAX_REGULAR_TOKENLEN]u8 = undefined;
+            const n = c.ngtcp2_crypto_generate_regular_token(&token, &conn.ep.secret, conn.ep.secret.len, p.*.remote.addr, p.*.remote.addrlen, wallClock(conn.ep.io));
+            if (n <= 0) return 0;
+            if (c.ngtcp2_conn_submit_new_token(conn.q, &token, @intCast(n)) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             return 0;
         }
 
@@ -1868,6 +1985,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             const s = streamOfUser(sud) orelse return 0;
             if (s.started) return 0;
             if (fin != 0) s.body_done = true;
+            // On a server, 1-RTT data is only read once the handshake has
+            // completed, so a head that ends before came in 0-RTT.
+            s.early = !conn.handshakeDone();
             conn.startStream(s);
             return 0;
         }
@@ -1921,4 +2041,67 @@ pub fn Endpoint(comptime Ctx: type) type {
             return @intCast(count);
         }
     };
+}
+
+
+test "0-RTT context: the same for the same settings, different when a limit or a SETTINGS value changes" {
+    const Ctx = struct {
+        fn rand(dest: [*c]u8, len: usize, _: [*c]const c.ngtcp2_rand_ctx) callconv(.c) void {
+            @memset(dest[0..len], 7);
+        }
+        fn newCid(_: ?*c.ngtcp2_conn, cid: [*c]c.ngtcp2_cid, token: [*c]c.ngtcp2_stateless_reset_token, len: usize, _: ?*anyopaque) callconv(.c) c_int {
+            @memset(cid.*.data[0..len], 9);
+            cid.*.datalen = len;
+            @memset(&token.*.data, 9);
+            return 0;
+        }
+
+        /// The context of a server connection with these limits.
+        fn of(options: Options, buf: *[early_context_max]u8) ![]const u8 {
+            var settings: ngtcp2.Settings = undefined;
+            ngtcp2.settingsDefault(&settings);
+            settings.initial_ts = 1;
+            var params: ngtcp2.TransportParams = undefined;
+            ngtcp2.transportParamsDefault(&params);
+            params.initial_max_streams_bidi = options.max_streams_bidi;
+            params.initial_max_data = options.max_data;
+            params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+            var cid: c.ngtcp2_cid = undefined;
+            const bytes: [8]u8 = @splat(1);
+            c.ngtcp2_cid_init(&cid, &bytes, bytes.len);
+            params.original_dcid = cid;
+            params.original_dcid_present = 1;
+            var local: net.Addr = .from(.{ .ip4 = .loopback(4433) });
+            var remote: net.Addr = .from(.{ .ip4 = .loopback(50000) });
+            const p: c.ngtcp2_path = .{ .local = local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
+            var cb = std.mem.zeroes(c.ngtcp2_callbacks);
+            cb.recv_client_initial = c.ngtcp2_crypto_recv_client_initial_cb;
+            cb.recv_crypto_data = c.ngtcp2_crypto_recv_crypto_data_cb;
+            cb.encrypt = c.ngtcp2_crypto_encrypt_cb;
+            cb.decrypt = c.ngtcp2_crypto_decrypt_cb;
+            cb.hp_mask = c.ngtcp2_crypto_hp_mask_cb;
+            cb.update_key = c.ngtcp2_crypto_update_key_cb;
+            cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+            cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+            cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
+            cb.rand = rand;
+            cb.get_new_connection_id2 = newCid;
+            var q: ?*c.ngtcp2_conn = null;
+            if (ngtcp2.connServerNew(&q, &cid, &cid, &p, c.NGTCP2_PROTO_VER_V1, &cb, &settings, &params, null, null) != 0)
+                return error.QuicSetupFailed;
+            defer c.ngtcp2_conn_del(q);
+            return earlyDataContext(q.?, http3Settings(&options), buf);
+        }
+    };
+    const base: Options = .{ .address = .{ .ip4 = .loopback(0) }, .cert_pem = "", .key_pem = "" };
+    var a: [early_context_max]u8 = undefined;
+    var b: [early_context_max]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, try Ctx.of(base, &a), try Ctx.of(base, &b));
+    var more_streams = base;
+    more_streams.max_streams_bidi += 1;
+    try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(more_streams, &b)));
+    var bigger_headers = base;
+    bigger_headers.max_field_section_size *= 2;
+    try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(bigger_headers, &b)));
+    try std.testing.expectEqual(@as(u8, early_context_version), (try Ctx.of(base, &a))[0]);
 }

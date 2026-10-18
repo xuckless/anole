@@ -33,6 +33,7 @@ const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct 
 const handoff = @import("handoff.zig");
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
+const early_data = @import("early_data.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
@@ -147,6 +148,12 @@ pub const Options = struct {
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
         idle_timeout_ms: u32 = 30_000,
+        /// Take 0-RTT (early data) from clients resuming a session, which
+        /// saves them a round trip. GET, HEAD and OPTIONS that come in
+        /// 0-RTT run at once, with `Early-Data: 1` among their headers
+        /// (`anole.early_data.isEarly`); other methods wait until the
+        /// handshake completes, which a replayed flight never does.
+        early_data: bool = false,
         /// QUIC interop runner tests only: also speak "hq-interop"
         /// (HTTP/0.9), serving the files under this directory.
         hq_interop_root: ?[]const u8 = null,
@@ -417,6 +424,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .blocking_pool = pool,
                 .extras = extras,
             };
+            // RFC 8470 §5.1: unsafe requests taken in early data (marked
+            // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
+            // get 425 Too Early, on every route. Now, before any route, and
+            // for `listenTls` too, which turns HTTP/3 on later.
+            if (features.http3 and (opts.http3 != null or opts.listen_tls_http3)) {
+                const guard = try a.create(early_data.Guard);
+                guard.* = .{};
+                self.router.use(http.Middleware(Ctx).init(guard));
+            }
             if (opts.http == null and opts.https == null) {
                 self.pending = opts;
                 // `listenTls` turns HTTP/3 on once routes exist, when no
@@ -523,6 +539,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         .validate_address = q.validate_address,
                         .idle_timeout_ms = q.idle_timeout_ms,
                         .hq_interop_root = q.hq_interop_root,
+                        .early_data = q.early_data,
                         .client_auth = h3ClientAuth(https.client_auth, client_ca),
                         .fd = h3_fd,
                         .secret = secret,

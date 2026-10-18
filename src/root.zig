@@ -97,6 +97,10 @@ pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 /// Sessions: server-side stores (memory, Redis) or an encrypted cookie.
 pub const session = @import("session/root.zig");
 
+/// Early data (0-RTT) and replays (RFC 8470): `isEarly`, and the 425 Too
+/// Early middleware.
+pub const early_data = @import("early_data.zig");
+
 /// Rate limiting: token buckets in memory or Redis, and a 429 middleware.
 pub const ratelimit = @import("ratelimit/root.zig");
 
@@ -134,6 +138,7 @@ test {
     _ = json;
     _ = redis;
     _ = session;
+    _ = early_data;
     _ = ratelimit;
     _ = auth;
     _ = observe;
