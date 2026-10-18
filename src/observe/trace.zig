@@ -13,6 +13,7 @@
 //! makes the `traceparent` to pass downstream.
 const std = @import("std");
 const dusty = @import("dusty");
+const common = @import("common.zig");
 
 /// A parsed `traceparent` (version 00).
 pub const Context = struct {
@@ -102,6 +103,10 @@ pub const Options = struct {
     /// Record only requests whose caller asked for it (sampled flag), or
     /// every request.
     sample_all: bool = true,
+    /// Paths the middleware does not trace: exact, or a prefix when the
+    /// entry ends in `*`. `&anole.observe.probe_paths` leaves out health
+    /// checks and scrapes.
+    exclude: []const []const u8 = &.{},
 };
 
 pub const Exporter = struct {
@@ -112,6 +117,8 @@ pub const Exporter = struct {
     queue: std.Io.Queue(Span),
     buffer: []Span,
     task: ?std.Io.Future(void) = null,
+    /// Set by `deinit`: wakes the task from its pause between batches.
+    closing: std.Io.Event = .unset,
     dropped: std.atomic.Value(u64) = .init(0),
     exported: std.atomic.Value(u64) = .init(0),
 
@@ -127,6 +134,7 @@ pub const Exporter = struct {
 
     /// Sends what is queued and stops the task.
     pub fn deinit(self: *Exporter) void {
+        self.closing.set(self.io);
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
         self.gpa.free(self.buffer);
@@ -149,7 +157,14 @@ pub const Exporter = struct {
                 return;
             };
             self.send(batch[0..n]);
-            if (n < batch.len) self.io.sleep(.fromMilliseconds(self.options.interval_ms), .awake) catch return;
+            // A pause before the next batch, cut short by `deinit`.
+            if (n < batch.len) self.closing.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromMilliseconds(self.options.interval_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return,
+            };
         }
     }
 
@@ -202,6 +217,7 @@ pub const Middleware = struct {
     }
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+        if (common.excluded(req, self.exporter.options.exclude)) return executor.next();
         const parent = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;
         if (!self.exporter.options.sample_all) if (parent == null or !parent.?.sampled) {
             // Not recorded here, but the caller's context still goes on to
@@ -233,7 +249,7 @@ pub const Middleware = struct {
         @memcpy(span.route[0..span.route_len], route[0..span.route_len]);
         const name = std.fmt.bufPrint(&span.name, "{s} {s}", .{ method, route[0..span.route_len] }) catch span.name[0..0];
         span.name_len = @intCast(name.len);
-        span.status_code = @import("access_log.zig").statusOf(res, result);
+        span.status_code = common.statusOf(req, res, result);
         self.exporter.submit(span);
         return result;
     }

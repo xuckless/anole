@@ -6,6 +6,7 @@
 //!     app.use(anole.observe.AccessLog.init(.{ .format = .json }));
 const std = @import("std");
 const dusty = @import("dusty");
+const common = @import("common.zig");
 
 pub const Format = enum { text, json };
 
@@ -13,6 +14,9 @@ pub const Options = struct {
     format: Format = .text,
     /// Where lines go; stderr by default.
     file: ?std.Io.File = null,
+    /// Paths not logged: exact, or a prefix when the entry ends in `*`.
+    /// `&anole.observe.probe_paths` leaves out health checks and scrapes.
+    exclude: []const []const u8 = &.{},
 };
 
 pub const AccessLog = struct {
@@ -23,10 +27,11 @@ pub const AccessLog = struct {
     }
 
     pub fn execute(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+        if (common.excluded(req, self.options.exclude)) return executor.next();
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
         const result = executor.next();
         const micros = start.durationTo(.now(req.io, .awake)).raw.toMicroseconds();
-        const status = statusOf(res, result);
+        const status = statusOf(req, res, result);
         const line = format(req.arena, self.options.format, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
         const file = self.options.file orelse std.Io.File.stderr();
         file.writeStreamingAll(req.io, line) catch {};
@@ -34,15 +39,7 @@ pub const AccessLog = struct {
     }
 };
 
-/// The status the client gets for this response: the handler's, or for an
-/// error the one dusty answers it with (its 4xx for request faults, else
-/// 500). An app's own `uncaughtError` may still choose another.
-pub fn statusOf(res: *const dusty.Response, result: anytype) u16 {
-    if (result) |_| return @intCast(@backingInt(res.status)) else |err| {
-        const answer = dusty.clientError(err) orelse return 500;
-        return @intCast(@backingInt(answer.status));
-    }
-}
+pub const statusOf = common.statusOf;
 
 pub fn format(arena: std.mem.Allocator, fmt: Format, req: *const dusty.Request, status: u16, micros: i64, now_ms: i64, err: ?anyerror) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);

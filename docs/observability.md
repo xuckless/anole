@@ -18,7 +18,9 @@ zig build run-observe -- 9000 text     # another port, text access log
 ```zig
 var registry = anole.observe.metrics.Registry.init(gpa, app.io());
 defer registry.deinit();
-const http_metrics = try anole.observe.metrics.HttpMetrics.init(&registry);
+const http_metrics = try anole.observe.metrics.HttpMetrics.init(&registry, .{
+    .exclude = &anole.observe.probe_paths,
+});
 
 var exporter = try anole.observe.trace.Exporter.init(gpa, app.io(), &client, .{
     .endpoint = "http://127.0.0.1:4318",
@@ -28,7 +30,7 @@ try exporter.start();
 
 app.use(anole.middleware.RequestId.init(.{}));
 app.use(anole.observe.trace.Middleware.init(&exporter));
-app.use(anole.observe.AccessLog.init(.{ .format = .json }));
+app.use(anole.observe.AccessLog.init(.{ .format = .json, .exclude = &anole.observe.probe_paths }));
 app.use(http_metrics);
 
 // ... routes ...
@@ -44,10 +46,12 @@ that move: keep the exporter, registry and health values alive for as long
 as the server runs. Add middleware before any route, as the router requires.
 
 Global middleware runs for every route, `/metrics`, `/healthz` and `/readyz`
-included, and for requests that match no route. Every probe and scrape
-therefore gets a log line, a span and a metric series. To keep them out,
-attach the middleware to a route group with `app.group(prefix, ...)` instead
-of `app.use`.
+included, and for requests that match no route. To keep probes and scrapes
+out of the log, the metrics and the traces, give each its `exclude` list:
+`AccessLog`'s and `HttpMetrics`' options, and the exporter's options for
+tracing. An entry matches a path exactly, query aside, or as a prefix when
+it ends in `*` (`"/internal/*"`). `anole.observe.probe_paths` holds
+`/healthz`, `/readyz` and `/metrics`.
 
 ## Request IDs
 
@@ -65,6 +69,7 @@ returns. Options:
 
 - `.format`: `.text` (default) or `.json`, one object per line.
 - `.file`: a `std.Io.File` to write to; stderr when null.
+- `.exclude`: paths not logged (see [Wiring](#wiring)).
 
 Each line is a single write, so lines from concurrent requests do not
 interleave. The line is written straight to the file, not through
@@ -89,8 +94,11 @@ middleware are installed. A handler that returns `error.NotFound` is logged
 as the 404 it becomes. Any other error adds `error` and reports the status
 the server answers it with: the 4xx for a request fault, such as 413 for a
 body over `max_body_size`, and 500 for anything else. Metrics and spans
-record the same status. An app's own `uncaughtError` can choose a different
-status, which these records do not see.
+record the same status. An error raised after the response head went out
+(a stream cut short, say) is recorded with the status that was sent. A
+WebSocket over HTTP/2 is recorded as 101, like one over HTTP/1.1, though the
+stream was accepted with a 200 (RFC 8441). An app's own `uncaughtError` can
+choose a different status, which these records do not see.
 
 The middleware reads the IDs after the handler returns, so its position
 among the other middleware does not change what it logs. Its
@@ -129,7 +137,8 @@ hide the per-request debug lines of a Debug build.
 
 `Registry` holds counters, gauges and histograms, each with labels.
 `serveOn` serves the registry at a path in the Prometheus text format
-(version 0.0.4). One registry per process can be served.
+(version 0.0.4). A registry belongs to whoever creates it, and serves only
+its own metrics, so two servers in one process can each serve their own.
 
 `HttpMetrics` is a middleware that keeps three series:
 
@@ -143,7 +152,7 @@ hide the per-request debug lines of a Debug build.
 number of series stays bounded. Requests that match no route get
 `route="unmatched"`. The histogram uses Prometheus' default buckets, 5 ms to
 10 s. It times the middleware after it and the handler, so add it first to
-include the time of the other middleware.
+include the time of the other middleware. Its only option is `.exclude`.
 
 Your own metrics come from the same registry:
 
@@ -160,7 +169,15 @@ work.with(&.{}).observe(0.042);
 
 `with` takes one value per label and makes the series on first use. Keep
 label values to a small, fixed set. Updates are atomic and safe from any
-executor. Output from the example, histogram buckets trimmed:
+executor.
+
+A histogram's buckets must be finite and strictly increasing, or
+`histogram` returns `error.InvalidBuckets`; `+Inf` is always added after
+them. A value equal to a bound counts in that bucket (`le` is "less than or
+equal"). The sum is kept as a float, added to atomically, so it is exact to
+the float in the values' own unit: seconds for the duration histograms,
+where `observeDuration` takes a `std.Io.Duration` and keeps its
+nanoseconds. Output from the example, histogram buckets trimmed:
 
 ```
 # HELP anole_http_requests_total HTTP requests answered.
@@ -202,10 +219,12 @@ collector as JSON, with `POST {endpoint}/v1/traces`. It sends through the
   not recorded, but a caller's unsampled context is still passed on: the
   request gets the caller's trace and span IDs, and `trace.outgoing` sends
   them on with the flag still unset (`-00`).
+- `.exclude`: paths the middleware does not trace (see [Wiring](#wiring)).
 
 Call `start` once the runtime exists. `deinit` sends what is still queued
 and stops the batching task; call it after `app.run` returns and before the
-client is freed. It can take up to `interval_ms` to return. The atomics
+client is freed. It wakes the task from its pause between batches, so it
+returns as soon as the last POST is done. The atomics
 `exporter.exported` and `exporter.dropped` count spans sent and spans lost
 (queue full, collector unreachable or answering anything but 200). With no
 collector listening the server runs normally, and every span is dropped.
@@ -250,11 +269,15 @@ do not add it on their own.
   `not ready: <name>` naming the first failing check; 503 `draining` once
   the server has started to drain.
 
+`Health.init(.{ .healthz_path = ..., .readyz_path = ... })` serves them
+elsewhere. A `Health` belongs to whoever creates it and serves the server it
+is registered on, so two servers in one process can each have their own;
+it must outlive the server.
+
 A check is a `fn (ctx: ?*anyopaque) bool` plus a context pointer, added with
 `addCheck(name, fn, ctx)`; up to 16 per server. Checks run on every
 `/readyz` request, so keep them cheap: read a flag that a background task
-keeps current rather than querying a database. One `Health` per process
-serves the routes.
+keeps current rather than querying a database.
 
 From the example, after `POST /maintenance`:
 
@@ -270,13 +293,15 @@ not ready: maintenance
 
 On SIGINT or SIGTERM, `app.run` stops accepting connections and drains the
 requests in flight. From that moment the server answers any new request on
-an open connection with 503 before routing, and closes keep-alive
-connections after their current response. A load balancer polling `/readyz`
-therefore sees 503 or a refused connection as soon as the drain starts.
-There is no period in which readiness fails while the server still serves.
-To take a node out of rotation first, fail a readiness check (as the
-example's `POST /maintenance` does), wait for the balancer to notice, then
-send SIGTERM.
+an open HTTP/1.1 connection with 503 before routing, and closes keep-alive
+connections after their current response. Some requests still reach the
+router: an HTTP/2 stream opened before the final GOAWAY, or a request that
+was already past that check. `/readyz` answers those 503 `draining` too, so
+a load balancer polling it sees 503 or a refused connection as soon as the
+drain starts. There is no period in which readiness fails while the server
+still takes new work. To take a node out of rotation first, fail a
+readiness check (as the example's `POST /maintenance` does), wait for the
+balancer to notice, then send SIGTERM.
 
 ## gRPC health
 

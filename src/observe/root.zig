@@ -7,11 +7,14 @@ pub const trace = @import("trace.zig");
 pub const AccessLog = @import("access_log.zig").AccessLog;
 pub const access_log = @import("access_log.zig");
 pub const Health = @import("health.zig").Health;
+/// `/healthz`, `/readyz` and `/metrics`, for the middleware's `exclude`.
+pub const probe_paths = @import("common.zig").probe_paths;
 
 test {
     _ = metrics;
     _ = trace;
     _ = access_log;
     _ = @import("health.zig");
+    _ = @import("common.zig");
     _ = @import("observe_test.zig");
 }

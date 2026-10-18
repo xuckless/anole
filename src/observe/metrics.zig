@@ -3,8 +3,8 @@
 //! `/metrics` route.
 //!
 //!     var registry = anole.observe.metrics.Registry.init(gpa, io);
-//!     var http = try anole.observe.metrics.HttpMetrics.init(&registry);
-//!     app.use(&http);
+//!     defer registry.deinit();
+//!     app.use(try anole.observe.metrics.HttpMetrics.init(&registry, .{}));
 //!     registry.serveOn(void, app.router, "/metrics");
 //!     const jobs = try registry.counter("jobs_total", "Jobs run.", &.{"queue"});
 //!     jobs.with(&.{"email"}).inc();
@@ -13,6 +13,7 @@
 //! raw path, so their number stays bounded.
 const std = @import("std");
 const dusty = @import("dusty");
+const common = @import("common.zig");
 
 pub const Counter = struct {
     value: std.atomic.Value(u64) = .init(0),
@@ -40,20 +41,50 @@ pub const Gauge = struct {
 pub const default_buckets = [_]f64{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 };
 
 pub const Histogram = struct {
+    /// Upper bounds (`le`), strictly increasing and finite.
     bounds: []const f64,
-    /// One more than `bounds`: the last counts everything (+Inf).
+    /// One more than `bounds`, cumulative: `counts[i]` counts the values
+    /// at most `bounds[i]`, and the last counts everything (+Inf).
     counts: []std.atomic.Value(u64),
-    /// The sum, in millionths, so it stays atomic.
-    sum_micro: std.atomic.Value(u64) = .init(0),
+    /// The sum of the values as an `f64`'s bits, added to by compare and
+    /// swap (as Prometheus' own clients do): exact to the float, in the
+    /// values' own unit, with no truncation or overflow.
+    sum_bits: std.atomic.Value(u64) = .init(@bitCast(@as(f64, 0))),
 
     pub fn observe(self: *Histogram, v: f64) void {
-        for (self.bounds, 0..) |b, i| {
-            if (v <= b) _ = self.counts[i].fetchAdd(1, .monotonic);
+        // From +Inf down, each release: a scrape reads upward with acquire,
+        // so a bucket it sees counted has every larger one counted too, and
+        // the buckets it renders never decrease.
+        _ = self.counts[self.bounds.len].fetchAdd(1, .release);
+        var i = self.bounds.len;
+        while (i > 0) {
+            i -= 1;
+            if (!(v <= self.bounds[i])) break;
+            _ = self.counts[i].fetchAdd(1, .release);
         }
-        _ = self.counts[self.bounds.len].fetchAdd(1, .monotonic);
-        _ = self.sum_micro.fetchAdd(@intFromFloat(@max(0, v) * 1e6), .monotonic);
+        var old = self.sum_bits.load(.monotonic);
+        while (self.sum_bits.cmpxchgWeak(old, @bitCast(@as(f64, @bitCast(old)) + v), .monotonic, .monotonic)) |seen| old = seen;
+    }
+
+    pub fn sum(self: *const Histogram) f64 {
+        return @bitCast(self.sum_bits.load(.monotonic));
+    }
+
+    /// Observes a duration in seconds, from its nanoseconds.
+    pub fn observeDuration(self: *Histogram, d: std.Io.Duration) void {
+        self.observe(@as(f64, @floatFromInt(d.nanoseconds)) / std.time.ns_per_s);
     }
 };
+
+/// Whether `buckets` can be a histogram's bounds: finite and strictly
+/// increasing (+Inf is always there, after them).
+pub fn validBuckets(buckets: []const f64) bool {
+    for (buckets, 0..) |b, i| {
+        if (!std.math.isFinite(b)) return false;
+        if (i > 0 and !(buckets[i - 1] < b)) return false;
+    }
+    return true;
+}
 
 const Kind = enum { counter, gauge, histogram };
 
@@ -119,17 +150,20 @@ pub fn Family(comptime T: type) type {
                     for (s.bounds, 0..) |b, i| {
                         try w.print("{s}_bucket", .{self.name});
                         try writeLabels(w, self.labels, key, "le", b);
-                        try w.print(" {d}\n", .{s.counts[i].load(.monotonic)});
+                        try w.print(" {d}\n", .{s.counts[i].load(.acquire)});
                     }
+                    const total = s.counts[s.bounds.len].load(.acquire);
                     try w.print("{s}_bucket", .{self.name});
                     try writeLabels(w, self.labels, key, "le", null);
-                    try w.print(" {d}\n", .{s.counts[s.bounds.len].load(.monotonic)});
+                    try w.print(" {d}\n", .{total});
                     try w.print("{s}_sum", .{self.name});
                     try writeLabels(w, self.labels, key, null, null);
-                    try w.print(" {d}\n", .{@as(f64, @floatFromInt(s.sum_micro.load(.monotonic))) / 1e6});
+                    try w.writeByte(' ');
+                    try writeFloat(w, s.sum());
+                    try w.writeByte('\n');
                     try w.print("{s}_count", .{self.name});
                     try writeLabels(w, self.labels, key, null, null);
-                    try w.print(" {d}\n", .{s.counts[s.bounds.len].load(.monotonic)});
+                    try w.print(" {d}\n", .{total});
                 } else {
                     try w.writeAll(self.name);
                     try writeLabels(w, self.labels, key, null, null);
@@ -138,6 +172,14 @@ pub fn Family(comptime T: type) type {
             }
         }
     };
+}
+
+/// A sample value as the exposition format spells floats: the shortest
+/// decimal that reads back as the same `f64`, or `+Inf`, `-Inf`, `NaN`.
+fn writeFloat(w: *std.Io.Writer, v: f64) !void {
+    if (std.math.isNan(v)) return w.writeAll("NaN");
+    if (std.math.isInf(v)) return w.writeAll(if (v > 0) "+Inf" else "-Inf");
+    try w.print("{d}", .{v});
 }
 
 /// `{a="x",b="y"}` from the NUL-separated values in `key`, plus `le`.
@@ -175,8 +217,6 @@ pub const Registry = struct {
     gauges: std.ArrayList(*Family(Gauge)) = .empty,
     histograms: std.ArrayList(*Family(Histogram)) = .empty,
 
-    var served: ?*Registry = null;
-
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Registry {
         return .{ .gpa = gpa, .io = io };
     }
@@ -189,7 +229,6 @@ pub const Registry = struct {
             }
             list.deinit(self.gpa);
         }
-        if (served == self) served = null;
     }
 
     pub fn counter(self: *Registry, name: []const u8, help: []const u8, labels: []const []const u8) !*Family(Counter) {
@@ -198,7 +237,10 @@ pub const Registry = struct {
     pub fn gauge(self: *Registry, name: []const u8, help: []const u8, labels: []const []const u8) !*Family(Gauge) {
         return self.add(Gauge, &self.gauges, name, help, labels, &.{});
     }
+    /// `buckets` must be finite and strictly increasing (`error.InvalidBuckets`
+    /// otherwise), and outlive the registry.
     pub fn histogram(self: *Registry, name: []const u8, help: []const u8, labels: []const []const u8, buckets: []const f64) !*Family(Histogram) {
+        if (!validBuckets(buckets)) return error.InvalidBuckets;
         return self.add(Histogram, &self.histograms, name, help, labels, buckets);
     }
 
@@ -221,18 +263,14 @@ pub const Registry = struct {
         for (self.histograms.items) |f| try f.render(w);
     }
 
-    /// Serves `render` at `path` (one registry per process serves).
+    /// Serves `render` at `path` ("/metrics" by convention) on `router`.
+    /// Each registry serves its own metrics, so two servers in one process
+    /// can each have one. The registry must outlive the router.
     pub fn serveOn(self: *Registry, comptime Ctx: type, router: *dusty.Router(Ctx), path: []const u8) void {
-        served = self;
-        if (Ctx == void) router.get(path, handle) else router.get(path, struct {
-            fn h(_: *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-                return handle(req, res);
-            }
-        }.h);
+        common.serve(Ctx, router, path, Registry, self, handle);
     }
 
-    fn handle(_: *dusty.Request, res: *dusty.Response) anyerror!void {
-        const self = served orelse return error.NotFound;
+    fn handle(self: *Registry, _: *dusty.Request, res: *dusty.Response) anyerror!void {
         var out: std.Io.Writer.Allocating = .init(res.arena);
         try self.render(&out.writer);
         try res.header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
@@ -248,9 +286,18 @@ pub const HttpMetrics = struct {
     requests: *Family(Counter),
     duration: *Family(Histogram),
     in_flight: *Family(Gauge),
+    options: Options = .{},
 
-    pub fn init(registry: *Registry) !HttpMetrics {
+    pub const Options = struct {
+        /// Paths not measured: exact, or a prefix when the entry ends in
+        /// `*`. `&anole.observe.probe_paths` leaves out health checks and
+        /// scrapes.
+        exclude: []const []const u8 = &.{},
+    };
+
+    pub fn init(registry: *Registry, options: Options) !HttpMetrics {
         return .{
+            .options = options,
             .requests = try registry.counter("anole_http_requests_total", "HTTP requests answered.", &.{ "method", "route", "status" }),
             .duration = try registry.histogram("anole_http_request_duration_seconds", "Time to answer an HTTP request.", &.{ "method", "route" }, &default_buckets),
             .in_flight = try registry.gauge("anole_http_requests_in_flight", "HTTP requests being answered.", &.{}),
@@ -258,19 +305,20 @@ pub const HttpMetrics = struct {
     }
 
     pub fn execute(self: *const HttpMetrics, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+        if (common.excluded(req, self.options.exclude)) return executor.next();
         const gauge = self.in_flight.with(&.{});
         gauge.add(1);
         defer gauge.add(-1);
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
         const result = executor.next();
-        const seconds = @as(f64, @floatFromInt(start.durationTo(.now(req.io, .awake)).raw.nanoseconds)) / 1e9;
+        const elapsed = start.durationTo(.now(req.io, .awake)).raw;
         var method_buf: [16]u8 = undefined;
         const method = std.fmt.bufPrint(&method_buf, "{f}", .{req.method}) catch "?";
-        const route = if (req.route) |r| r.path else "unmatched";
+        const route_path = if (req.route) |r| r.path else "unmatched";
         var status_buf: [4]u8 = undefined;
-        const status = std.fmt.bufPrint(&status_buf, "{d}", .{@import("access_log.zig").statusOf(res, result)}) catch "?";
-        self.requests.with(&.{ method, route, status }).inc();
-        self.duration.with(&.{ method, route }).observe(seconds);
+        const status = std.fmt.bufPrint(&status_buf, "{d}", .{common.statusOf(req, res, result)}) catch "?";
+        self.requests.with(&.{ method, route_path, status }).inc();
+        self.duration.with(&.{ method, route_path }).observeDuration(elapsed);
         return result;
     }
 };
@@ -303,4 +351,38 @@ test "registry renders counters, gauges and histograms" {
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_bucket{le=\"+Inf\"} 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_count 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_sum 5.55\n") != null);
+}
+
+test "histograms: sums kept to the float, buckets checked and cumulative" {
+    const gpa = std.testing.allocator;
+    var r = Registry.init(gpa, std.testing.io);
+    defer r.deinit();
+    try std.testing.expectError(error.InvalidBuckets, r.histogram("a", "A.", &.{}, &.{ 1, 0.5 }));
+    try std.testing.expectError(error.InvalidBuckets, r.histogram("b", "B.", &.{}, &.{ 1, 1 }));
+    try std.testing.expectError(error.InvalidBuckets, r.histogram("c", "C.", &.{}, &.{ 1, std.math.inf(f64) }));
+    try std.testing.expectError(error.InvalidBuckets, r.histogram("d", "D.", &.{}, &.{std.math.nan(f64)}));
+
+    const lat = try r.histogram("latency_seconds", "Latency.", &.{}, &default_buckets);
+    const h = lat.with(&.{});
+    // 1.5 microseconds: whole microseconds kept 1 of it.
+    h.observeDuration(.fromNanoseconds(1500));
+    try std.testing.expectEqual(@as(f64, 1.5e-6), h.sum());
+    // On a bound counts in that bucket (le is "at most").
+    h.observe(0.005);
+    h.observe(0.0051);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try r.render(&out.writer);
+    const text = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_bucket{le=\"0.005\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_bucket{le=\"0.01\"} 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_bucket{le=\"10\"} 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_bucket{le=\"+Inf\"} 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_count 3\n") != null);
+    // The sum reads back as the same float.
+    const at = std.mem.indexOf(u8, text, "latency_seconds_sum ").? + "latency_seconds_sum ".len;
+    const line = text[at .. at + std.mem.indexOfScalar(u8, text[at..], '\n').?];
+    try std.testing.expectEqual(h.sum(), try std.fmt.parseFloat(f64, line));
+    try std.testing.expectEqual(@as(f64, 1.5e-6 + 0.005 + 0.0051), h.sum());
 }

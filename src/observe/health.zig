@@ -6,8 +6,12 @@
 //!     var health = anole.observe.Health.init(.{});
 //!     try health.addCheck("db", dbReady, &pool);
 //!     health.registerOn(void, app.router, app.server);
+//!
+//! Each `Health` serves its own server, so two servers in one process can
+//! each have one.
 const std = @import("std");
 const dusty = @import("dusty");
+const common = @import("common.zig");
 
 pub const Check = struct {
     name: []const u8,
@@ -16,18 +20,21 @@ pub const Check = struct {
 };
 
 pub const Health = struct {
+    options: Options,
     checks: [16]Check = undefined,
     len: usize = 0,
     /// Set by `registerOn`: reports the server's drain.
     draining: ?*const fn (server: *anyopaque) bool = null,
     server: ?*anyopaque = null,
 
-    var instance: ?*Health = null;
+    pub const Options = struct {
+        /// Where `registerOn` serves the two routes.
+        healthz_path: []const u8 = "/healthz",
+        readyz_path: []const u8 = "/readyz",
+    };
 
-    pub const Options = struct {};
-
-    pub fn init(_: Options) Health {
-        return .{};
+    pub fn init(options: Options) Health {
+        return .{ .options = options };
     }
 
     pub fn addCheck(self: *Health, name: []const u8, ready: *const fn (ctx: ?*anyopaque) bool, ctx: ?*anyopaque) !void {
@@ -36,9 +43,10 @@ pub const Health = struct {
         self.len += 1;
     }
 
-    /// Serves `/healthz` and `/readyz` (one `Health` per process).
+    /// Serves `/healthz` and `/readyz` (or `Options`' paths) on `router`,
+    /// with `server`'s drain failing readiness. The `Health` must outlive
+    /// the router.
     pub fn registerOn(self: *Health, comptime Ctx: type, router: *dusty.Router(Ctx), server: *dusty.Server(Ctx)) void {
-        instance = self;
         self.server = server;
         self.draining = struct {
             fn f(p: *anyopaque) bool {
@@ -46,39 +54,31 @@ pub const Health = struct {
                 return s.busy.load(.acquire).draining;
             }
         }.f;
-        if (Ctx == void) {
-            router.get("/healthz", healthz);
-            router.get("/readyz", readyz);
-        } else {
-            router.get("/healthz", struct {
-                fn h(_: *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-                    return healthz(req, res);
-                }
-            }.h);
-            router.get("/readyz", struct {
-                fn h(_: *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-                    return readyz(req, res);
-                }
-            }.h);
-        }
+        common.serve(Ctx, router, self.options.healthz_path, Health, self, healthz);
+        common.serve(Ctx, router, self.options.readyz_path, Health, self, readyz);
     }
 
-    fn healthz(_: *dusty.Request, res: *dusty.Response) anyerror!void {
+    /// Whether the server `registerOn` was given has started to drain.
+    pub fn isDraining(self: *const Health) bool {
+        const d = self.draining orelse return false;
+        return d(self.server.?);
+    }
+
+    fn healthz(_: *Health, _: *dusty.Request, res: *dusty.Response) anyerror!void {
         res.content_type = .text;
         res.body = "ok\n";
     }
 
-    fn readyz(_: *dusty.Request, res: *dusty.Response) anyerror!void {
+    fn readyz(self: *Health, _: *dusty.Request, res: *dusty.Response) anyerror!void {
         res.content_type = .text;
-        const self = instance orelse {
-            res.body = "ok\n";
-            return;
-        };
-        if (self.draining) |d| if (d(self.server.?)) {
+        // Requests still reach the router during a drain: one pipelined
+        // behind another on a keep-alive connection, or an HTTP/2 stream
+        // opened before the final GOAWAY.
+        if (self.isDraining()) {
             res.status = .service_unavailable;
             res.body = "draining\n";
             return;
-        };
+        }
         for (self.checks[0..self.len]) |c| {
             if (!c.ready(c.ctx)) {
                 res.status = .service_unavailable;

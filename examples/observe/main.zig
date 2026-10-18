@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
     // application.
     var registry = metrics.Registry.init(init.gpa, io);
     defer registry.deinit();
-    const http_metrics = try metrics.HttpMetrics.init(&registry);
+    const http_metrics = try metrics.HttpMetrics.init(&registry, .{});
     app.lookups = try registry.counter("example_user_lookups_total", "User lookups, by how they arrived.", &.{"via"});
     app.maintenance_gauge = try registry.gauge("example_maintenance", "1 while in maintenance mode.", &.{});
     app.maintenance_gauge.with(&.{}).set(0);
@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
     // handler runs, and the access log writes its line after it.
     server.use(anole.middleware.RequestId.init(.{}));
     server.use(observe.trace.Middleware.init(&exporter));
-    server.use(observe.AccessLog.init(.{ .format = log_format }));
+    server.use(observe.AccessLog.init(.{ .format = log_format, .exclude = &observe.probe_paths }));
     server.use(http_metrics);
 
     server.get("/users/:id", handleUser);
