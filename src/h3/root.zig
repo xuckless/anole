@@ -125,9 +125,9 @@ fn smoke() !void {
     h.nghttp3_conn_del(h3conn);
 }
 
-/// <openssl/rand.h> is not pulled in by ngtcp2_crypto_boringssl.h. TODO: take it from the
-/// tls namespace's bindings once the h3 code depends on it. BoringSSL: int RAND_bytes(uint8_t *buf, size_t len).
-extern fn RAND_bytes(buf: [*c]u8, len: usize) c_int;
+/// From the TLS bindings (src/tls/bssl.h): ngtcp2_crypto_boringssl.h does not
+/// pull in <openssl/rand.h>. HTTP/3 always builds with BoringSSL.
+const RAND_bytes = @import("anole_boringssl_c").RAND_bytes;
 
 fn randCb(dest: [*c]u8, destlen: usize, _: [*c]const ngtcp2.c.ngtcp2_rand_ctx) callconv(.c) void {
     _ = RAND_bytes(dest, destlen);
