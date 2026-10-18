@@ -176,7 +176,15 @@ pub fn build(b: *std.Build) void {
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
     // then fetches everything requested and runs build() again.
-    const c_mods = CModules.init(b, features, target, optimize) orelse return;
+    const c_mods = CModules.init(b, features, target, optimize) orelse {
+        // A project depending on Anole asks for its modules in this same
+        // pass, and `Dependency.module` panics on a missing one, so they
+        // exist here as stand-ins. The pass is thrown away once the lazy
+        // dependencies are fetched; nothing compiles these.
+        _ = b.addModule("anole", .{ .root_source_file = b.path("src/root.zig") });
+        if (features.grpc) _ = b.addModule("protobuf", .{});
+        return;
+    };
 
     // Core: zio (runtime) and dusty (HTTP/1.1), always on.
     const core = Core.init(b, c_mods, target, optimize);

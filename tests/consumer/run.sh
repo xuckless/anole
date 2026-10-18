@@ -31,7 +31,7 @@ import re, sys
 p = sys.argv[1]
 s = open(p).read()
 s = re.sub(r'\n\s*//[^\n]*\n\s*//[^\n]*\n\s*\.anole = \.\{ \.path = "\.\./\.\." \},', '', s)
-assert '.path' not in s, s
+assert '.path =' not in s, s
 open(p, 'w').write(s)
 PY
 "$zig" fetch --save=anole "$url"
