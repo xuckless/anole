@@ -5,15 +5,16 @@
 //!
 //! The program starts an `anole.Server` on free local ports: HTTP/1.1 and
 //! h2c on one, HTTPS (HTTP/1.1 and HTTP/2) on another, and HTTP/3 over UDP,
-//! with a development certificate made in memory. It writes that
-//! certificate (not the key) to a temporary file as a CA file, then calls
-//! the server with each client and prints what came back:
+//! with a development certificate made in memory, which every client
+//! trusts as a CA given as PEM in memory. It calls the server with each
+//! client and prints what came back:
 //!
-//!   anole.http.Client          an HTTPS GET over HTTP/1.1
+//!   anole.http.Client          an HTTPS GET over HTTP/1.1, and one over
+//!                              HTTP/2 (`.http2 = true`)
 //!   anole.h2.ClientConnection  a GET, a streamed POST with a trailer, and
 //!                              8 requests at once on one TLS connection
 //!   anole.grpc.Client          grpc.health.v1 Check, on that connection
-//!   anole.h3.ClientConnection  a GET over QUIC, under a timeout
+//!   anole.h3.ClientConnection  a GET over QUIC, with a 5 s timeout
 //!   GET /relay                 a handler that makes an HTTP/2 call itself,
 //!                              through `req.io`
 //!
@@ -94,11 +95,6 @@ fn get(conn: anytype, scheme: []const u8, path: []const u8, out: []u8) !Got {
     return .{ .status = s.status, .body = w.buffered() };
 }
 
-/// `get` with a concrete type, for `zio.withTimeout`.
-fn getH3(conn: *h3.ClientConnection, path: []const u8, out: []u8) !Got {
-    return get(conn, "https", path, out);
-}
-
 /// One of several GETs sharing a connection.
 fn getCounted(conn: *h2.ClientConnection, ok: *std.atomic.Value(usize)) std.Io.Cancelable!void {
     var buf: [64]u8 = undefined;
@@ -145,7 +141,7 @@ fn postEcho(io: std.Io, conn: *h2.ClientConnection, len: usize, trailer_buf: []u
     return .{ n, kept };
 }
 
-fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8, tmp_path: []const u8) !void {
+fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8) !void {
     defer server.stop();
     const io = server.io();
     const gpa = app.gpa;
@@ -160,26 +156,16 @@ fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8, tmp_path: 
     const out = &stdout.interface;
     defer out.flush() catch {};
 
-    // The dev certificate is its own CA. dusty's client reads CAs from the
-    // system store, a PEM file or a directory, so it goes into a file.
-    var tmp = try std.Io.Dir.cwd().openDir(io, tmp_path, .{});
-    defer tmp.close(io);
-    var name_buf: [64]u8 = undefined;
-    var suffix: [4]u8 = undefined;
-    io.random(&suffix);
-    const ca_name = try std.fmt.bufPrint(&name_buf, "anole-clients-{x}.pem", .{&suffix});
-    try tmp.writeFile(io, .{ .sub_path = ca_name, .data = ca_pem });
-    defer tmp.deleteFile(io, ca_name) catch {};
-    // The HTTP/2 and HTTP/3 clients take a bundle.
-    var bundle: std.crypto.Certificate.Bundle = .empty;
-    defer bundle.deinit(gpa);
-    try bundle.addCertsFromFilePath(gpa, io, std.Io.Clock.real.now(io), tmp, ca_name);
+    // The dev certificate is its own CA. Every client takes it as PEM in
+    // memory (`.ca = .{ .pem = ... }`); by default they trust the system
+    // store.
+    const ca: http.TlsCa = .{ .pem = ca_pem };
 
     var url_buf: [128]u8 = undefined;
 
-    // dusty's client: HTTP/1.1, pooled keep-alive connections.
+    // dusty's client: pooled keep-alive connections, HTTP/1.1.
     var client = http.Client.init(gpa, io, .{
-        .tls = .{ .ca = .{ .file = .{ .path = ca_name, .dir = tmp } } },
+        .tls = .{ .ca = ca },
         .timeout = .fromSeconds(5),
     });
     defer client.deinit();
@@ -189,13 +175,23 @@ fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8, tmp_path: 
         defer response.deinit();
         try out.print("anole.http.Client  GET  {s}  {d} \"{s}\"\n", .{ url, @backingInt(response.status()), (try response.body()) orelse "" });
     }
+    // The same client offering HTTP/2 through ALPN: a server that picks it
+    // gets the request over HTTP/2, one at a time per pooled connection.
+    {
+        var client2 = http.Client.init(gpa, io, .{ .tls = .{ .ca = ca }, .timeout = .fromSeconds(5), .http2 = true });
+        defer client2.deinit();
+        const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/hello", .{https_addr.getPort()});
+        var response = try client2.fetch(url, .{});
+        defer response.deinit();
+        try out.print("anole.http.Client  GET  {s}  {d} \"{s}\" (.http2 = true)\n", .{ url, @backingInt(response.status()), (try response.body()) orelse "" });
+    }
 
     // HTTP/2 over TLS: one connection, many streams.
     const conn = try h2.ClientConnection.connect(gpa, io, .{
         .host = "localhost",
         .address = https_addr,
         .port = https_addr.getPort(),
-        .tls = .{ .root_ca = bundle },
+        .tls = .{ .ca = ca },
     });
     defer conn.close();
     {
@@ -231,12 +227,14 @@ fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8, tmp_path: 
             .host = "localhost",
             .address = h3_addr,
             .port = h3_addr.getPort(),
-            .tls = .{ .root_ca = bundle },
+            .tls = .{ .ca = ca },
+            // Each request's budget, through the end of its body (30 s by
+            // default). Past it the stream is reset: error.Timeout.
+            .timeout = .fromSeconds(5),
         });
         defer q.close();
         var buf: [256]u8 = undefined;
-        // Past the timeout the call is canceled and fails with error.Timeout.
-        const r = try anole.zio.withTimeout(.fromSeconds(5), getH3, .{ q, "/hello", &buf });
+        const r = try get(q, "https", "/hello", &buf);
         try out.print("anole.h3           GET  /hello  {d} \"{s}\"\n", .{ r.status, r.body });
     }
 
@@ -254,7 +252,6 @@ pub fn main(init: std.process.Init) !void {
     // The certificate the server presents, which the clients then trust.
     var pem = try anole.tls.selfSigned(gpa, .{});
     defer pem.deinit(gpa);
-    const tmp_path = init.environ_map.get("TMPDIR") orelse "/tmp";
 
     var app: App = .{ .gpa = gpa };
     var server = try anole.Server(App).init(gpa, .{
@@ -272,7 +269,7 @@ pub fn main(init: std.process.Init) !void {
     server.post("/echo", echo);
     server.get("/relay", relay);
 
-    var calls = try server.io().concurrent(callAll, .{ &server, &app, pem.cert, tmp_path });
+    var calls = try server.io().concurrent(callAll, .{ &server, &app, pem.cert });
     server.run() catch |err| {
         calls.cancel(server.io()) catch {};
         return err;

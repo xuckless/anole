@@ -353,12 +353,15 @@ if (r.status.code == .ok) std.log.info("{s}", .{r.message.?.message});
 and received messages live in `arena`. `r.headers` and `r.trailers` hold the
 response metadata.
 
-`CallOptions` takes a `timeout` (sent as `grpc-timeout`), extra `metadata`
-with lower-case names, and `compression = .gzip`.
+`CallOptions` takes a `timeout` (sent as `grpc-timeout`, and the client
+resets the stream past it too), extra `metadata` with lower-case names, and
+`compression = .gzip`. A call without a `timeout` has no time limit on the
+client side, whatever the connection's default request `timeout`.
 
-For TLS, connect with `.tls = .{ .root_ca = bundle }` (or
-`.insecure_skip_verify = true` against a development certificate) and set
-`.scheme = "https"` on the channel. The connection negotiates `h2` by ALPN.
+For TLS, connect with `.tls = .{}` (the system trust store), or name a CA
+(`.tls = .{ .ca = .{ .pem = ca_pem } }`, see
+[TLS options](clients.md#tls-options)), and set `.scheme = "https"` on the
+channel. The connection negotiates `h2` by ALPN.
 
 Every call mode goes through `stream`:
 

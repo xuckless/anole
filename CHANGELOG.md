@@ -97,9 +97,24 @@ for macOS and Linux.
 
 ### Clients
 
-- Outbound HTTP/1.1 and HTTPS (dusty's client on BoringSSL, the system trust
-  store or your own CAs), an HTTP/2 client and an HTTP/3 client, usable from
-  handlers through `req.io`; each can present a client certificate.
+- Outbound HTTP/1.1 and HTTPS (dusty's client on BoringSSL), an HTTP/2 client
+  and an HTTP/3 client, usable from handlers through `req.io`. dusty's client
+  speaks HTTP/2 too when a server picks it (`ClientConfig.http2 = true`).
+- One set of TLS options for all three: the system trust store by default
+  (loaded once), a CA file, directory or PEM in memory, client certificates
+  for mutual TLS from files or memory, and
+  `insecure_skip_verify` for tests.
+- The HTTP/2 and HTTP/3 clients share their names (`ClientConnection`,
+  `Stream`, `Header`, `ConnectOptions`, `RequestOptions`, `StreamError`), a
+  `connect_timeout` and a per-request `timeout` that ends in
+  `error.Timeout`; `Stream.readError()` and `writeError()` say what a
+  `ReadFailed` or `WriteFailed` was.
+- Breaking: their `tls.root_ca` bundle is now `tls.ca` (an
+  `anole.http.TlsCa`, the system store by default, where it trusted nothing
+  before); `tls.certificate = .{ .cert_pem, .key_pem }` is
+  `tls.client_certificate`, dusty's shape (`.pem = .{ .cert, .key }` or
+  `cert_path`/`key_path`); the HTTP/3 client's `handshake_timeout_ms` is
+  `connect_timeout`.
 
 ### Auth, state and limits
 
