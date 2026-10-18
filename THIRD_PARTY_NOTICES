@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit eaf1e603f3c04314345c1639d0b0e6381e692d47 of the fork
+  Pinned:   commit 3990b5d602628a583881b7beec82afd477f1ae37 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -68,6 +68,10 @@ ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
   Includes: lib/ngtcp2_pcg.c (PCG random number generator,
             Copyright 2014-2019 Melissa O'Neill and the PCG Project
             contributors, Apache-2.0 OR MIT, used under MIT), compiled in
+  Ported:   src/h3/server.zig and src/h3/quic_tls.zig are a Zig port of
+            examples/server.cc, examples/http3_server_proto_codec.cc and
+            examples/tls_server_{context,session}_boringssl.cc (same
+            licence and copyright)
   Linked:   -Dhttp3=true
 
 nghttp3 1.18.0 (HTTP/3 and QPACK)

@@ -25,6 +25,7 @@ const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const handoff = @import("handoff.zig");
+const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 
 /// The zio configuration Anole is built for. An executable declares it in
 /// its root file: `pub const zio_options = anole.zio_options;`. Pinned: a
@@ -41,6 +42,9 @@ pub const Options = struct {
     http: ?Http = .{},
     /// The TLS listener, or null for none. Needs `-Dtls=boringssl`.
     https: ?Https = null,
+    /// HTTP/3 over QUIC, beside `https` and with its certificate, or null
+    /// for none. Needs `-Dhttp3` (on by default) and `https`.
+    http3: ?Http3 = null,
     /// HTTP/2 settings, for h2c and h2 over TLS. 250 concurrent streams per
     /// connection by default.
     http2: http.ServerConfig.Http2 = .{ .max_concurrent_streams = 250 },
@@ -70,6 +74,22 @@ pub const Options = struct {
         /// HTTP/1.1 on the same port.
         h2c: bool = features.http2,
         proxy_protocol: bool = false,
+    };
+
+    pub const Http3 = struct {
+        /// The UDP address and port; `https`'s when null (the usual setup:
+        /// one port number, over TCP and UDP).
+        address: ?[]const u8 = null,
+        port: ?u16 = null,
+        /// Advertise HTTP/3 to HTTP/1.1 and HTTP/2 clients (`Alt-Svc`), so
+        /// browsers switch to it.
+        alt_svc: bool = true,
+        /// Concurrent requests per connection.
+        max_streams_bidi: u64 = 100,
+        /// Make every new client prove its address with a Retry first (one
+        /// more round trip; resists spoofed-source floods).
+        validate_address: bool = false,
+        idle_timeout_ms: u32 = 30_000,
     };
 
     pub const Https = struct {
@@ -112,6 +132,20 @@ pub fn Server(comptime Ctx: type) type {
         process: ?std.process.Init.Minimal = null,
         held: []const handoff.Listener = &.{},
         restart_timeout_ms: u32 = 10_000,
+        /// The HTTP/3 endpoint, when `Options.http3` asked for one.
+        h3: H3Endpoint,
+
+        const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
+
+        /// `Alt-Svc` on responses that did not come over HTTP/3.
+        const AltSvc = struct {
+            value: []const u8,
+
+            pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
+                if (req.version_major != 3) try res.header("Alt-Svc", self.value);
+                return executor.next();
+            }
+        };
 
         pub fn init(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) !Self {
             const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -187,6 +221,39 @@ pub fn Server(comptime Ctx: type) type {
             server.* = .init(gpa, rt_io, server_config, ctx);
             const stopped = try a.create(std.Io.Event);
             stopped.* = .unset;
+
+            var endpoint: H3Endpoint = if (features.http3) null else {};
+            if (opts.http3) |q| {
+                if (comptime !features.http3) return error.Http3NotBuilt;
+                if (comptime features.http3) {
+                    const https = opts.https orelse return error.Http3NeedsHttps;
+                    const tls_config = listeners.items[listeners.items.len - 1].tls.?;
+                    var cert_pem: []const u8 = undefined;
+                    var key_pem: []const u8 = undefined;
+                    if (tls_config.pem) |p| {
+                        cert_pem = p.cert;
+                        key_pem = p.key;
+                    } else {
+                        cert_pem = try std.Io.Dir.cwd().readFileAlloc(rt_io, tls_config.cert_path, a, .limited(1 << 20));
+                        key_pem = try std.Io.Dir.cwd().readFileAlloc(rt_io, tls_config.key_path, a, .limited(1 << 20));
+                    }
+                    const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
+                        .address = try std.Io.net.IpAddress.parse(q.address orelse https.address, q.port orelse https.port),
+                        .cert_pem = cert_pem,
+                        .key_pem = key_pem,
+                        .max_streams_bidi = q.max_streams_bidi,
+                        .validate_address = q.validate_address,
+                        .idle_timeout_ms = q.idle_timeout_ms,
+                    });
+                    errdefer ep.deinit();
+                    endpoint = ep;
+                    if (q.alt_svc) {
+                        const alt = try a.create(AltSvc);
+                        alt.* = .{ .value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{ep.address().getPort()}) };
+                        server.router.use(http.Middleware(Ctx).init(alt));
+                    }
+                }
+            }
             return .{
                 .gpa = gpa,
                 .rt = rt,
@@ -197,6 +264,7 @@ pub fn Server(comptime Ctx: type) type {
                 .process = opts.process,
                 .held = held.items,
                 .restart_timeout_ms = opts.restart_timeout_ms,
+                .h3 = endpoint,
             };
         }
 
@@ -211,6 +279,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
             self.rt.deinit();
             self.arena.deinit();
@@ -288,6 +357,7 @@ pub fn Server(comptime Ctx: type) type {
                 stop: anyerror!void,
                 served: anyerror!void,
                 restart: anyerror!void,
+                h3: anyerror!void,
             };
             var done_buf: [8]Done = undefined;
             var sel = std.Io.Select(Done).init(rt_io, &done_buf);
@@ -295,6 +365,7 @@ pub fn Server(comptime Ctx: type) type {
             try sel.concurrent(.term, waitForSignal, .{.terminate});
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             try sel.concurrent(.served, serve, .{self.server});
+            if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
             const restartable = self.process != null and self.held.len > 0;
             if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
             // A successor started by a predecessor tells it when it is
@@ -315,7 +386,7 @@ pub fn Server(comptime Ctx: type) type {
             // Cancels the server's run, which drains, then the watchers.
             sel.cancelDiscard();
             switch (first) {
-                .served => |r| return r,
+                .served, .h3 => |r| return r,
                 .int, .term => log.info("signal received ({t}); drained and stopped", .{first}),
                 .restart => log.info("handed over to the new process; drained and stopped", .{}),
                 .stop => {},
@@ -356,6 +427,18 @@ pub fn Server(comptime Ctx: type) type {
 
         fn serve(server: *http.Server(Ctx)) anyerror!void {
             return server.run();
+        }
+
+        fn serveH3(ep: if (features.http3) *h3.Endpoint(Ctx) else void) anyerror!void {
+            if (comptime features.http3) return ep.run();
+        }
+
+        /// The HTTP/3 endpoint's address (its real port when 0 was asked
+        /// for), or null without one.
+        pub fn http3Address(self: *const Self) ?std.Io.net.IpAddress {
+            if (comptime !features.http3) return null;
+            const ep = self.h3 orelse return null;
+            return ep.address();
         }
     };
 }

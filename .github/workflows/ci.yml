@@ -100,6 +100,25 @@ jobs:
       - name: Autobahn fuzzing client
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
 
+  h3:
+    name: HTTP/3 against aioquic (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: h3
+      # Debug, so the debug allocator reports any leak at exit.
+      - name: Build the HTTP/3 test server
+        run: zig build h3-test-server --summary all
+      - name: Downloads, uploads, echoes, 100 streams, drain
+        run: tests/h3/run.sh ./zig-out/bin/h3-test-server
+
   grpc-interop:
     name: gRPC interop (both directions with grpc-go, cleartext HTTP/2)
     runs-on: ubuntu-latest

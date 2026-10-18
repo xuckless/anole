@@ -96,6 +96,8 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         .http = .{ .port = port },
         .https = if (anole.features.tls != .none) .{ .port = tls_port, .cert = .dev_self_signed } else null,
+        // HTTP/3 on the same port number over UDP, advertised by Alt-Svc.
+        .http3 = if (anole.features.http3) .{} else null,
         // Takes sockets from systemd (LISTEN_FDS), and restarts without
         // downtime on SIGUSR2.
         .process = init.minimal,
@@ -116,6 +118,7 @@ pub fn main(init: std.process.Init) !void {
     });
     std.log.info("listening on http://127.0.0.1:{d}", .{port});
     if (anole.features.tls != .none) std.log.info("listening on https://127.0.0.1:{d} (self-signed, BoringSSL)", .{tls_port});
+    if (app.http3Address()) |q| std.log.info("listening on HTTP/3 udp://127.0.0.1:{d}", .{q.getPort()});
     // Until SIGINT or SIGTERM; then the accept loops stop and in-flight
     // requests drain (bounded by timeout.shutdown).
     try app.run();

@@ -170,6 +170,7 @@ pub fn module(
         \\#include <ngtcp2/ngtcp2.h>
         \\#include <ngtcp2/ngtcp2_crypto.h>
         \\#include <ngtcp2/ngtcp2_crypto_boringssl.h>
+        \\#include <openssl/pem.h>
         \\
     );
     const t: Translator = .init(translate_c, .{

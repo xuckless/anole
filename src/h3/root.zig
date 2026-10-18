@@ -1,13 +1,16 @@
 //! HTTP/3: ngtcp2 1.25.0 (QUIC transport) with its BoringSSL crypto helper, and
 //! nghttp3 1.18.0 (HTTP/3 + QPACK), all MIT, built from the release tarballs.
-//! Only the bindings exist so far; the UDP endpoint and the ngtcp2/nghttp3
-//! bridge are later work.
+//! `Endpoint` is the server: a QUIC endpoint whose requests reach the same
+//! router as HTTP/1.1 and HTTP/2.
 const std = @import("std");
 
 /// ngtcp2 bindings (`ngtcp2.c`) plus typed wrappers for its `*_versioned` macros.
 pub const ngtcp2 = @import("ngtcp2.zig");
 /// nghttp3 bindings (`nghttp3.c`) plus typed wrappers for its `*_versioned` macros.
 pub const nghttp3 = @import("nghttp3.zig");
+/// The HTTP/3 server endpoint for a dusty server's router.
+pub const Endpoint = @import("server.zig").Endpoint;
+pub const EndpointOptions = @import("server.zig").Options;
 
 /// Runtime version strings of the linked libraries.
 pub fn ngtcp2Version() []const u8 {

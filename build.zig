@@ -224,6 +224,21 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&bench.step);
     }
 
+    // tests/h3: a server for the independent HTTP/3 client (tests/h3/client.py).
+    if (features.http3) {
+        const h3_server = b.addExecutable(.{
+            .name = "h3-test-server",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/h3/server.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        b.step("h3-test-server", "Build the HTTP/3 test server (tests/h3/run.sh drives it with aioquic)").dependOn(&b.addInstallArtifact(h3_server, .{}).step);
+        test_step.dependOn(&h3_server.step);
+    }
+
     // examples/io: handlers that wait on timers, files and outbound requests
     // through std.Io.
     const io_example = b.addExecutable(.{
