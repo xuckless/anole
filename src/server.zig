@@ -765,8 +765,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.router.any(path, route(handler));
         }
 
-        /// A WebSocket endpoint at `path`, over HTTP/1.1 and HTTP/2
-        /// (RFC 8441): `handler` gets the open socket, which is closed
+        /// A WebSocket endpoint at `path`, over HTTP/1.1, HTTP/2 (RFC
+        /// 8441) and HTTP/3 (RFC 9220): `handler` gets the open socket, which is closed
         /// when it returns, and with 1001 when the server drains. A plain
         /// HTTP request there gets 426 Upgrade Required. `handler` is
         /// `fn (ws: *anole.websocket.Socket, req: *anole.Request) !void`

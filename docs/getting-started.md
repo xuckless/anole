@@ -426,7 +426,7 @@ package) cannot make outbound HTTPS calls.
   errors, limits.
 - [server.md](server.md): listeners, TLS, HTTP/2 and HTTP/3, draining,
   restarts.
-- [websocket.md](websocket.md), [grpc.md](grpc.md),
+- [websocket.md](websocket.md), [webtransport.md](webtransport.md), [grpc.md](grpc.md),
   [clients.md](clients.md) (outbound HTTP from a handler with
   `anole.client(req)`), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,
   rate limits), [observability.md](observability.md) (metrics, tracing,
