@@ -14,7 +14,8 @@
 //! `google.api.http` gets REST routes that speak JSON (transcode.zig).
 //!
 //! Unary methods run on the stream's task. A streaming method's handler, its
-//! request reader and its response writer run as tasks of one group, joined
+//! request reader and its response writer run as tasks of one group, on the
+//! stream's own executor (`placement .local`), joined
 //! through `std.Io.Queue`s (zig-protobuf's streaming signatures); a failure
 //! or the deadline in any of them cancels the others.
 const std = @import("std");
@@ -841,7 +842,7 @@ fn runServerStreaming(comptime M: type, comptime handler: anytype, call: *Call, 
     var group: std.Io.Group = .init;
     defer group.cancel(call.io);
     var handler_result: anyerror!void = {};
-    try group.concurrent(call.io, Tasks(M, handler).serverStreaming, .{ call, request, &responses, &handler_result });
+    try placement.concurrent(&group, call.io, .local, Tasks(M, handler).serverStreaming, .{ call, request, &responses, &handler_result });
     try pumpResponses(M.Response, call, &responses);
     try group.await(call.io);
     return handler_result;
@@ -902,7 +903,7 @@ fn runClientStreaming(comptime M: type, comptime handler: anytype, call: *Call, 
     var group: std.Io.Group = .init;
     defer group.cancel(call.io);
     var reader_result: anyerror!void = {};
-    try group.concurrent(call.io, Tasks(M, handler).readRequests, .{ call, body, &requests, &reader_result });
+    try placement.concurrent(&group, call.io, .local, Tasks(M, handler).readRequests, .{ call, body, &requests, &reader_result });
     const response = handler(call, &requests) catch |err| {
         // The reader's failure, if it failed first, says more.
         reader_result catch |rerr| return rerr;
@@ -923,8 +924,8 @@ fn runBidi(comptime M: type, comptime handler: anytype, call: *Call, body: *dust
     defer group.cancel(call.io);
     var reader_result: anyerror!void = {};
     var handler_result: anyerror!void = {};
-    try group.concurrent(call.io, Tasks(M, handler).readRequests, .{ call, body, &requests, &reader_result });
-    try group.concurrent(call.io, Tasks(M, handler).bidi, .{ call, &requests, &responses, &handler_result });
+    try placement.concurrent(&group, call.io, .local, Tasks(M, handler).readRequests, .{ call, body, &requests, &reader_result });
+    try placement.concurrent(&group, call.io, .local, Tasks(M, handler).bidi, .{ call, &requests, &responses, &handler_result });
     try pumpResponses(M.Response, call, &responses);
     try group.await(call.io);
     try reader_result;
