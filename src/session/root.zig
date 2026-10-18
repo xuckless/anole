@@ -10,6 +10,7 @@
 //!     var sessions = anole.session.Middleware.init(.{ .key = key, .store = mem.store() });
 //!     app.use(sessions);
 //!     // in a handler: try req.session.set("user", "42"); req.session.get("user")
+//!     // at sign-in:   try anole.session.regenerate(req);  (a new session id)
 //!
 //! The cookie encryption follows jetzig's src/jetzig/http/Session.zig (MIT,
 //! Copyright 2023-2024 Robert Farrell; nonce, ciphertext and tag in that
@@ -183,6 +184,23 @@ pub const Config = struct {
     cookie_opts: dusty.CookieOpts = .{ .path = "/", .http_only = true, .secure = true, .same_site = .lax },
 };
 
+/// The session entry `regenerate` leaves for the middleware. Never stored:
+/// the save path takes it out first.
+pub const regenerate_key = "_anole_regenerate";
+
+/// Asks the session middleware to issue a new session id when it saves
+/// this response: call it when someone signs in (or their privileges
+/// change), against session fixation. With a store, the old id is
+/// destroyed there and the data saved under a fresh one, with a new
+/// cookie. A sealed cookie has no id, and is re-sealed (a new nonce) as on
+/// every save; an earlier copy of it stays valid until it expires, but
+/// holds only what the session held before.
+///
+/// It takes one of the session's 16 entries until the response is saved.
+pub fn regenerate(req: *dusty.Request) error{ SessionFull, InvalidSessionData }!void {
+    try req.session.set(regenerate_key, "1");
+}
+
 /// The session middleware: `app.use(anole.session.Middleware.init(config))`.
 pub const Middleware = struct {
     config: Config,
@@ -204,7 +222,9 @@ pub const Middleware = struct {
         try executor.next();
 
         if (!req.session.modified and req.session.len == 0) return;
-        self.save(req, res, id) catch |err| switch (err) {
+        const fresh = req.session.get(regenerate_key) != null;
+        if (fresh) req.session.remove(regenerate_key);
+        self.save(req, res, id, fresh) catch |err| switch (err) {
             // The handler streamed its response: the cookie cannot go out.
             error.HeadersAlreadySent => log.debug("session cookie not set: response already started", .{}),
             else => |e| return e,
@@ -228,7 +248,9 @@ pub const Middleware = struct {
         req.session.modified = false;
     }
 
-    fn save(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, id: ?[]const u8) !void {
+    /// `fresh`: `regenerate` was called, so a stored session moves to a
+    /// new id (the old one destroyed first, so it is never left valid).
+    fn save(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, id: ?[]const u8, fresh: bool) !void {
         if (req.session.len == 0) {
             // Cleared: forget it, here and in the browser.
             if (self.config.store) |store| if (id) |i| try store.destroy(i);
@@ -240,7 +262,8 @@ pub const Middleware = struct {
         var opts = self.config.cookie_opts;
         opts.max_age = .fromSeconds(self.config.ttl_seconds);
         if (self.config.store) |store| {
-            const session_id = id orelse try newId(req.arena, req.io);
+            if (fresh) if (id) |old| try store.destroy(old);
+            const session_id = if (fresh) try newId(req.arena, req.io) else id orelse try newId(req.arena, req.io);
             try store.save(session_id, data, self.config.ttl_seconds);
             return res.setCookie(self.config.cookie_name, session_id, opts);
         }

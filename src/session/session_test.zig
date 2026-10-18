@@ -3,6 +3,9 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const session = @import("root.zig");
+const features = @import("build_options");
+const redis = if (features.redis) @import("../redis/root.zig") else struct {};
+const RedisStore = if (features.redis) session.RedisStore else void;
 
 fn setUser(req: *dusty.Request, res: *dusty.Response) !void {
     try req.session.set("user", "42");
@@ -11,6 +14,16 @@ fn setUser(req: *dusty.Request, res: *dusty.Response) !void {
 
 fn getUser(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = req.session.get("user") orelse "none";
+}
+
+fn entries(req: *dusty.Request, res: *dusty.Response) !void {
+    res.body = try std.fmt.allocPrint(req.arena, "entries={d}", .{req.session.len});
+}
+
+fn signIn(req: *dusty.Request, res: *dusty.Response) !void {
+    try req.session.set("user", "alice");
+    try session.regenerate(req);
+    res.body = "signed in";
 }
 
 fn logout(req: *dusty.Request, res: *dusty.Response) !void {
@@ -44,11 +57,27 @@ fn cookieOf(resp: []const u8, buf: []u8) ?[]const u8 {
     return buf[0..v.len];
 }
 
-fn run(store: ?session.Store) !void {
+const Kind = enum { cookie, memory, redis };
+
+fn run(kind: Kind) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
+    var mem = session.MemoryStore.init(gpa, io);
+    defer mem.deinit();
+    var redis_store: RedisStore = undefined;
+    var store: ?session.Store = null;
+    switch (kind) {
+        .cookie => {},
+        .memory => store = mem.store(),
+        .redis => if (comptime features.redis) {
+            const port = features.redis_test_port orelse return error.SkipZigTest;
+            redis_store = .{ .client = try redis.Client.connect(gpa, io, .{ .port = port }), .gpa = gpa };
+            store = redis_store.store();
+        } else return error.SkipZigTest,
+    }
+    defer if (comptime features.redis) if (kind == .redis) redis_store.client.close();
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
     defer server.deinit();
     var mw = session.Middleware.init(.{ .store = store, .key = @splat(3) });
@@ -56,6 +85,8 @@ fn run(store: ?session.Store) !void {
     server.router.get("/set", setUser);
     server.router.get("/get", getUser);
     server.router.get("/logout", logout);
+    server.router.get("/signin", signIn);
+    server.router.get("/entries", entries);
     var future = try io.concurrent(struct {
         fn r(s: *dusty.Server(void)) !void {
             try s.run();
@@ -85,6 +116,29 @@ fn run(store: ?session.Store) !void {
     var out3: [4096]u8 = undefined;
     try std.testing.expect(std.mem.endsWith(u8, try exchange(io, port, bad_req, &out3), "none"));
 
+    // Signing in issues a new cookie; with a store, the old id is gone.
+    var si_buf: [1024]u8 = undefined;
+    const si_req = try std.fmt.bufPrint(&si_buf, "GET /signin HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{cookie});
+    var out_si: [4096]u8 = undefined;
+    var fresh_buf: [512]u8 = undefined;
+    const fresh = cookieOf(try exchange(io, port, si_req, &out_si), &fresh_buf).?;
+    try std.testing.expect(!std.mem.eql(u8, fresh, cookie));
+    var fresh_req_buf: [1024]u8 = undefined;
+    const fresh_req = try std.fmt.bufPrint(&fresh_req_buf, "GET /get HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{fresh});
+    var out_fresh: [4096]u8 = undefined;
+    const fresh_resp = try exchange(io, port, fresh_req, &out_fresh);
+    try std.testing.expect(std.mem.endsWith(u8, fresh_resp, "alice"));
+    // The marker is never saved, only "user".
+    var entries_buf: [1024]u8 = undefined;
+    const entries_req = try std.fmt.bufPrint(&entries_buf, "GET /entries HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{fresh});
+    var out_entries: [4096]u8 = undefined;
+    try std.testing.expect(std.mem.endsWith(u8, try exchange(io, port, entries_req, &out_entries), "entries=1"));
+    var out_old: [4096]u8 = undefined;
+    const old_resp = try exchange(io, port, get_req, &out_old);
+    // A sealed cookie has no id to destroy: the old copy still opens, with
+    // the data from before the sign-in.
+    try std.testing.expect(std.mem.endsWith(u8, old_resp, if (store != null) "none" else "42"));
+
     // Logging out clears the cookie (and the stored session).
     var lo_buf: [1024]u8 = undefined;
     const lo_req = try std.fmt.bufPrint(&lo_buf, "GET /logout HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{cookie});
@@ -97,11 +151,13 @@ fn run(store: ?session.Store) !void {
 }
 
 test "session: encrypted cookie" {
-    try run(null);
+    try run(.cookie);
 }
 
 test "session: memory store" {
-    var mem = session.MemoryStore.init(std.testing.allocator, std.testing.io);
-    defer mem.deinit();
-    try run(mem.store());
+    try run(.memory);
+}
+
+test "session: Redis store against a live server (-Dredis-test-port)" {
+    try run(.redis);
 }
