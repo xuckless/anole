@@ -553,6 +553,7 @@ pub const H2Socket = struct {
 test {
     _ = @import("rooms_test.zig");
     _ = @import("h1_test.zig");
+    _ = @import("h2_fuzz_test.zig");
     if (features.http2) _ = @import("h2_test.zig");
     if (features.compression) _ = @import("deflate.zig");
 }
