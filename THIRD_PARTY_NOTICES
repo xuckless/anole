@@ -88,6 +88,15 @@ zstd 1.5.7 (Zstandard)
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
 
+zig-jwt (JWT building and signing)
+  Licence:  Apache License 2.0 (text in part E). Copyright deatil
+  Source:   https://github.com/deatil/zig-jwt, used through Anole's fork
+            https://github.com/xuckless/zig-jwt (branch anole: security
+            fixes, pkg/ shipped, weak algorithms dropped)
+  Pinned:   commit 243c12861835f546043dd7db0fb33b77b1a16a50
+  Includes: zig-rsa (https://github.com/deatil/zig-rsa, Apache-2.0)
+  Linked:   -Dauth=true
+
 yyjson (JSON reader and writer)
   Licence:  MIT. Copyright (c) 2020 YaoYuan
   Source:   https://github.com/ibireme/yyjson (tag archive 0.13.0)
@@ -192,6 +201,12 @@ src/ratelimit/root.zig (token bucket)
   Licence:  MIT. Copyright (c) muhammad-fiaz
   Source:   https://github.com/muhammad-fiaz/httpx.zig, commit 8743d21
 
+src/auth/oidc.zig
+  The relying-party checks follow liboauth2's OIDC client code, rewritten
+  in Zig (no code copied).
+  Licence:  Apache License 2.0. Copyright ZmartZone Holding BV and OpenIDC
+  Source:   https://github.com/OpenIDC/liboauth2
+
 src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
   The Connection.Reader/Writer vtables follow tls.zig's src/connection.zig,
   and the declarations mirror the tls.zig API that dusty compiles against.
@@ -249,8 +264,8 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 
 
-E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto's health.proto)
--------------------------------------------------------------------------
+E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, zig-jwt)
+-------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of the pinned BoringSSL tree (commit
 22a0079b). That file also covers Go-licensed TLS test-suite code, which is

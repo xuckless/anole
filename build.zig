@@ -88,7 +88,7 @@ pub const Features = struct {
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
             (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
-            (!f.json or have.json) and (!f.redis or have.redis);
+            (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth);
     }
 };
 
@@ -463,6 +463,8 @@ const CModules = struct {
     yyjson: ?*std.Build.Module = null,
     /// hiredis.h (redis)
     hiredis: ?*std.Build.Module = null,
+    /// xuckless/zig-jwt (auth).
+    jwt: ?*std.Build.Module = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -482,6 +484,7 @@ const CModules = struct {
         const protobuf_dep = if (f.grpc) b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) else null;
         const yyjson_dep = if (f.json) b.lazyDependency("yyjson", .{}) else null;
         const hiredis_dep = if (f.redis) b.lazyDependency("hiredis", .{}) else null;
+        const jwt_dep = if (f.auth) b.lazyDependency("zig_jwt", .{ .target = target, .optimize = optimize }) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
@@ -492,6 +495,7 @@ const CModules = struct {
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
         if (f.redis and hiredis_dep == null) return null;
+        if (f.auth and jwt_dep == null) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
@@ -499,6 +503,7 @@ const CModules = struct {
         var m: CModules = .{};
         if (websocket_dep) |dep| m.websocket = dep.module("websocket");
         if (protobuf_dep) |dep| m.protobuf = dep.module("protobuf");
+        if (jwt_dep) |dep| m.jwt = dep.module("zig-jwt");
         if (!f.needsTranslateC()) return m;
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
@@ -615,6 +620,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
+    if (f.auth) mod.addImport("anole_jwt", o.c.jwt.?);
     // The generated test service (tests/grpc/gen), outside src/.
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),

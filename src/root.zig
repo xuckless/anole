@@ -69,8 +69,9 @@ pub const ratelimit = @import("ratelimit/root.zig");
 /// zig-protobuf served through the router.
 pub const grpc = if (features.grpc) @import("grpc/root.zig") else struct {};
 
-// -Dauth is accepted and validated, but no auth code exists yet, so there is
-// no namespace for it.
+/// Auth (-Dauth): JWT/JWKS verification and signing, OIDC, CSRF,
+/// passwords, API keys, roles.
+pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 
 test {
     _ = @import("server.zig");
@@ -86,6 +87,7 @@ test {
     _ = redis;
     _ = session;
     _ = ratelimit;
+    _ = auth;
 }
 
 test "feature constraints hold" {

@@ -91,6 +91,11 @@
             .hash = "N-V-__8AAPwwCwC-qD60sHS0_NF1XJZ_qtzgIE_XlRCts2kn",
             .lazy = true,
         },
+        .zig_jwt = .{
+            .url = "git+https://github.com/xuckless/zig-jwt#243c12861835f546043dd7db0fb33b77b1a16a50",
+            .hash = "zig_jwt-1.7.6-w3q9SD1JHwCv7Y7wd9cdliyEaGpggJhl1M9QbZm2oNP6",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
