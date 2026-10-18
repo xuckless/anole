@@ -28,6 +28,13 @@ const http = anole.http;
 /// (zio src/options.zig). `.pinned`: many executors, a task never migrates.
 pub const zio_options = anole.zio_options;
 
+/// Log lines read `anole` and `access`, not the libraries underneath.
+pub const std_options: std.Options = .{
+    .logFn = anole.logFn,
+    // zio's per-thread startup lines are debug noise here.
+    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
+};
+
 // No `std_options_debug_io = zio.debug_io` (zio's examples set it so logging
 // yields): std.debug uses that Io for stack unwinding too, and Debug builds
 // capture a stack trace inside allocator and zio task-pool locks, so a

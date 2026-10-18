@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit e5cbe543ab2bf8c93c90e5e245be94d2f70e3b64 of the fork
+  Pinned:   commit 31ff22b2b7e4ec24394119ab9151aaf17a85437e of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -87,6 +87,14 @@ zstd 1.5.7 (Zstandard)
             affiliates.
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
+
+websocket-zig (sans-IO WebSocket frame codec, for WebSocket over HTTP/2)
+  Licence:  MIT. Copyright (c) 2026 Matt Robenolt
+  Source:   https://github.com/mattrobenolt/websocket-zig
+  Fork:     https://github.com/xuckless/websocket-zig, branch anole (ported to
+            Zig 0.17; the libxev example dropped)
+  Pinned:   commit 4bd0e5c4f46466ded5478afb0db3a2f72a264ae8
+  Linked:   -Dwebsocket=true
 
 zlib.zig (std.Io wrapper over the zlib API; its src/root.zig only)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky

@@ -80,7 +80,7 @@ pub const Features = struct {
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
-            (!f.compression or have.compression);
+            (!f.compression or have.compression) and (!f.websocket or have.websocket);
     }
 };
 
@@ -356,6 +356,9 @@ const CModules = struct {
     zlib_c: ?*std.Build.Module = null,
     /// zstd.h (compression)
     zstd: ?*std.Build.Module = null,
+    /// xuckless/websocket-zig, the sans-IO frame codec for WebSocket over
+    /// HTTP/2 (websocket). Pure Zig, but fetched lazily like the C libraries.
+    websocket: ?*std.Build.Module = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -371,17 +374,20 @@ const CModules = struct {
         // Only its src/root.zig is used (its module would compile a second,
         // vendored zlib).
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
+        const websocket_dep = if (f.websocket) b.lazyDependency("websocket_zig", .{ .target = target, .optimize = optimize }) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
         if (f.needsTls() and boringssl_dep == null) return null;
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
+        if (f.websocket and websocket_dep == null) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
 
         var m: CModules = .{};
+        if (websocket_dep) |dep| m.websocket = dep.module("websocket");
         if (!f.needsTranslateC()) return m;
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
@@ -480,6 +486,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
     if (f.http2) mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
+    if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
     if (f.compression) {
         mod.addImport("anole_zlib", o.c.zlib.?);
         mod.addImport("anole_zlib_c", o.c.zlib_c.?);

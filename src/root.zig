@@ -23,6 +23,9 @@ pub const ServerOptions = @import("server.zig").Options;
 /// Declare in the executable's root file: `pub const zio_options =
 /// anole.zio_options;` (pinned scheduling).
 pub const zio_options = @import("server.zig").zio_options;
+/// Log output with the underlying libraries' scopes renamed to Anole's:
+/// `pub const std_options: std.Options = .{ .logFn = anole.logFn };`.
+pub const logFn = @import("log.zig").logFn;
 
 /// HTTP/1.1 and HTTP/2 server, router and client (the xuckless/dusty fork of
 /// lalinsky/dusty, on zio), for everything `Server` does not wrap.
@@ -55,6 +58,7 @@ pub const websocket = if (features.websocket) @import("websocket/root.zig") else
 
 test {
     _ = @import("server.zig");
+    _ = @import("log.zig");
     _ = http;
     _ = tls;
     _ = h2;

@@ -25,6 +25,13 @@ const http = anole.http;
 
 pub const zio_options = anole.zio_options;
 
+/// Log lines read `anole` and `access`, not the libraries underneath.
+pub const std_options: std.Options = .{
+    .logFn = anole.logFn,
+    // zio's per-thread startup lines are debug noise here.
+    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }},
+};
+
 const App = struct {
     client: http.Client,
     files: std.Io.Dir,
