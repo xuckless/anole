@@ -213,7 +213,9 @@ pub fn readMessage(
     return .{ .payload = payload, .consumed_bytes = header_size + length, .compressed = compressed };
 }
 
-fn decompressGzip(
+/// Inflates one gzip message, refusing it once it passes
+/// `max_message_size`. The result is allocated with `allocator`.
+pub fn decompressGzip(
     allocator: std.mem.Allocator,
     payload: []const u8,
     max_message_size: usize,

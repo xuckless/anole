@@ -9,16 +9,51 @@ const grpc = @import("root.zig");
 const features = @import("build_options");
 
 const Echo = pb.Echo(grpc.Call, anyerror);
+const Lookup = pb.Lookup(grpc.Call, anyerror);
+
+/// The "sleep" call: whether its handler started, was canceled, ended.
+const Sleeper = struct {
+    var started: std.atomic.Value(bool) = .init(false);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+};
 
 fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
     if (std.mem.eql(u8, req.message, "fail")) return call.fail(.not_found, "no such thing: fail");
     if (std.mem.eql(u8, req.message, "slow")) try call.io.sleep(.fromMilliseconds(2000), .awake);
+    if (std.mem.eql(u8, req.message, "boom")) return error.SecretInternalName;
+    if (std.mem.eql(u8, req.message, "sleep")) {
+        defer Sleeper.done.store(true, .release);
+        Sleeper.started.store(true, .release);
+        call.io.sleep(.fromSeconds(10), .awake) catch |err| {
+            Sleeper.canceled.store(true, .release);
+            return err;
+        };
+    }
     try call.addTrailer("x-echoed", "yes");
     return .{ .message = req.message, .index = 0 };
 }
 
 fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
+    if (std.mem.eql(u8, req.message, "headers")) {
+        // Initial metadata before the first message goes out with it;
+        // once the writer has started the response, it is refused.
+        try call.addHeader("x-early", "yes");
+        try out.putOne(call.io, .{ .message = "first", .index = 0 });
+        try call.io.sleep(.fromMilliseconds(200), .awake);
+        const late: []const u8 = if (call.addHeader("x-late", "yes")) |_| "added" else |err| @errorName(err);
+        try out.putOne(call.io, .{ .message = late, .index = 1 });
+        return;
+    }
     for (0..@intCast(req.repeat)) |i| try out.putOne(call.io, .{ .message = req.message, .index = @intCast(i) });
+}
+
+fn find(_: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+    return .{ .message = req.message, .index = 7 };
+}
+
+fn store(_: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+    return .{ .message = req.message, .index = 8 };
 }
 
 fn clientStream(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest)) anyerror!pb.EchoResponse {
@@ -65,6 +100,8 @@ const Client = struct {
     grpc_message: [128]u8 = undefined,
     grpc_message_len: usize = 0,
     echoed_trailer: bool = false,
+    early_header: bool = false,
+    late_header: bool = false,
     closed: bool = false,
 
     fn call(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const c.nghttp2_nv) !*Client {
@@ -157,6 +194,8 @@ const Client = struct {
             @memcpy(self.grpc_message[0..self.grpc_message_len], v[0..self.grpc_message_len]);
         }
         if (std.mem.eql(u8, n, "x-echoed")) self.echoed_trailer = true;
+        if (std.mem.eql(u8, n, "x-early")) self.early_header = true;
+        if (std.mem.eql(u8, n, "x-late")) self.late_header = true;
         return 0;
     }
 
@@ -489,4 +528,245 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         try std.testing.expect(try s.receive() == null);
         try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
     }
+}
+
+fn http1Get(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, port: u16, target: []const u8) !Http1 {
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var url_buf: [512]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, target });
+    var resp = try client.fetch(url, .{ .method = .get });
+    defer resp.deinit();
+    const h = resp.headers();
+    return .{
+        .status = @intCast(@backingInt(resp.status())),
+        .body = try arena.dupe(u8, (try resp.body()) orelse ""),
+        .content_type = try arena.dupe(u8, h.get("Content-Type") orelse ""),
+        .trailer_echoed = null,
+    };
+}
+
+fn startServer(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!void) {
+    const future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{server});
+    try server.ready.wait(io);
+    return future;
+}
+
+/// A message over the 64-byte limit of the Lookup registration.
+const x100: [100]u8 = @splat('x');
+
+test "gRPC: generic UNKNOWN, initial metadata after the head, per-registration limits, Connect GET" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    grpc.registerWith(void, &server.router, Lookup, .{ .Find = find, .Store = store }, .{ .max_message_size = 64 });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+    const addr = server.address.ip;
+    const port = addr.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        // A handler's own error: UNKNOWN, with nothing of its name. (The
+        // server's warning about it is expected; kept out of the output.)
+        const level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = level;
+        const cl = try Client.call(gpa, io, addr, "/anole.test.Echo/Unary", &.{.{ .message = "boom" }}, &.{});
+        defer cl.deinit();
+        try std.testing.expectEqual(@as(?u32, 2), cl.grpc_status);
+        try std.testing.expectEqualStrings("Application error processing RPC", cl.message());
+    }
+    {
+        // Initial metadata: in before the first message, refused after.
+        const cl = try Client.call(gpa, io, addr, "/anole.test.Echo/ServerStream", &.{.{ .message = "headers" }}, &.{});
+        defer cl.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+        try std.testing.expect(cl.early_header);
+        try std.testing.expect(!cl.late_header);
+        const rs = try cl.responses(arena);
+        try std.testing.expectEqual(@as(usize, 2), rs.len);
+        try std.testing.expectEqualStrings("HeadersSent", rs[1].message);
+    }
+    {
+        // Lookup's registration takes messages of up to 64 bytes.
+        const small = try Client.call(gpa, io, addr, "/anole.test.Lookup/Store", &.{.{ .message = "fits" }}, &.{});
+        defer small.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), small.grpc_status);
+        const big = try Client.call(gpa, io, addr, "/anole.test.Lookup/Store", &.{.{ .message = &x100 }}, &.{});
+        defer big.deinit();
+        try std.testing.expectEqual(@as(?u32, 8), big.grpc_status);
+        // Echo's keeps the default.
+        const echo = try Client.call(gpa, io, addr, "/anole.test.Echo/Unary", &.{.{ .message = &x100 }}, &.{});
+        defer echo.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), echo.grpc_status);
+    }
+
+    // Connect GET, for Find only (NO_SIDE_EFFECTS).
+    {
+        // JSON, percent-encoded.
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Find?encoding=json&message=%7B%22message%22%3A%22got%20it%22%7D&connect=v1");
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("application/json", r.content_type);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"message\":\"got it\"") != null);
+    }
+    {
+        // Protobuf, URL-safe base64 (unpadded), parameters in any order.
+        var enc: std.Io.Writer.Allocating = .init(arena);
+        try (pb.EchoRequest{ .message = "binary?>" }).encode(&enc.writer, arena);
+        const b64 = try arena.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(enc.written().len));
+        _ = std.base64.url_safe_no_pad.Encoder.encode(b64, enc.written());
+        const r = try http1Get(gpa, arena, io, port, try std.fmt.allocPrint(arena, "/anole.test.Lookup/Find?message={s}&base64=1&encoding=proto&utm=x", .{b64}));
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("application/proto", r.content_type);
+        var reader: std.Io.Reader = .fixed(r.body);
+        const reply = try pb.EchoResponse.decode(&reader, arena);
+        try std.testing.expectEqualStrings("binary?>", reply.message);
+        try std.testing.expectEqual(@as(i32, 7), reply.index);
+    }
+    if (features.compression) {
+        // gzip, then base64.
+        var enc: std.Io.Writer.Allocating = .init(arena);
+        try (pb.EchoRequest{ .message = "squeezed" }).encode(&enc.writer, arena);
+        const framed = try grpc.frame.encodeWithCompression(arena, enc.written(), .gzip);
+        const gz = framed[grpc.frame.header_size..];
+        const b64 = try arena.alloc(u8, std.base64.url_safe.Encoder.calcSize(gz.len));
+        _ = std.base64.url_safe.Encoder.encode(b64, gz);
+        // Padding, if any, percent-encoded.
+        var padded: std.ArrayList(u8) = .empty;
+        for (b64) |ch| if (ch == '=') try padded.appendSlice(arena, "%3D") else try padded.append(arena, ch);
+        const r = try http1Get(gpa, arena, io, port, try std.fmt.allocPrint(arena, "/anole.test.Lookup/Find?encoding=proto&base64=1&compression=gzip&message={s}", .{padded.items}));
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        var reader: std.Io.Reader = .fixed(r.body);
+        try std.testing.expectEqualStrings("squeezed", (try pb.EchoResponse.decode(&reader, arena)).message);
+    }
+    {
+        // No message at all is the empty message (in protobuf's encoding).
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Find?encoding=proto");
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        var reader: std.Io.Reader = .fixed(r.body);
+        try std.testing.expectEqual(@as(i32, 7), (try pb.EchoResponse.decode(&reader, arena)).index);
+    }
+    {
+        // Store has side effects: no GET route.
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Store?encoding=json&message=%7B%7D");
+        try std.testing.expectEqual(@as(u16, 405), r.status);
+    }
+    {
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Find?encoding=xml&message=x");
+        try std.testing.expectEqual(@as(u16, 415), r.status);
+    }
+    {
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Find?encoding=json&connect=v2&message=%7B%7D");
+        try std.testing.expectEqual(@as(u16, 400), r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"code\":\"invalid_argument\"") != null);
+    }
+    {
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Find?encoding=json&compression=br&message=%7B%7D");
+        try std.testing.expectEqual(@as(u16, 501), r.status);
+    }
+    {
+        // The registration's limit holds for GET too.
+        const r = try http1Get(gpa, arena, io, port, "/anole.test.Lookup/Find?encoding=json&message=%7B%22message%22%3A%22" ++ x100 ++ "%22%7D");
+        try std.testing.expectEqual(@as(u16, 429), r.status);
+    }
+}
+
+test "gRPC: two health registries in one process" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const listeners: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }};
+    var a = dusty.Server(void).init(gpa, io, .{ .listeners = listeners }, {});
+    defer a.deinit();
+    var b = dusty.Server(void).init(gpa, io, .{ .listeners = listeners }, {});
+    defer b.deinit();
+    var health_a: grpc.Health = .init(gpa, io);
+    defer health_a.deinit();
+    var health_b: grpc.Health = .init(gpa, io);
+    defer health_b.deinit();
+    health_a.registerOn(void, &a.router);
+    health_b.registerOn(void, &b.router);
+    try health_a.set("only.on.A", .SERVING);
+    var future_a = try startServer(&a, io);
+    defer future_a.cancel(io) catch {};
+    var future_b = try startServer(&b, io);
+    defer future_b.cancel(io) catch {};
+
+    // HealthCheckRequest{service = "only.on.A"} has the wire form of an
+    // EchoRequest with that message.
+    const on_a = try Client.call(gpa, io, a.address.ip, "/grpc.health.v1.Health/Check", &.{.{ .message = "only.on.A" }}, &.{});
+    defer on_a.deinit();
+    try std.testing.expectEqual(@as(?u32, 0), on_a.grpc_status);
+    const on_b = try Client.call(gpa, io, b.address.ip, "/grpc.health.v1.Health/Check", &.{.{ .message = "only.on.A" }}, &.{});
+    defer on_b.deinit();
+    try std.testing.expectEqual(@as(?u32, 5), on_b.grpc_status);
+}
+
+test "gRPC: the client's RST_STREAM cancels the handler" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+
+    const h2 = @import("../h2/client.zig");
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    Sleeper.started.store(false, .release);
+    Sleeper.canceled.store(false, .release);
+    Sleeper.done.store(false, .release);
+    {
+        var s = try client.stream("Unary", arena, .{});
+        defer s.deinit();
+        try s.send(.{ .message = "sleep" });
+        try s.closeSend();
+        while (!Sleeper.started.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+        const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
+        s.cancel();
+        // A 10 s sleep, over well inside a second.
+        while (!Sleeper.done.load(.acquire)) {
+            try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
+        try std.testing.expect(Sleeper.canceled.load(.acquire));
+    }
+    // The connection serves on.
+    const r = try client.unary("Unary", arena, .{ .message = "after" }, .{});
+    try std.testing.expectEqual(grpc.Code.ok, r.status.code);
 }

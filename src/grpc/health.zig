@@ -7,7 +7,8 @@
 //!     health.registerOn(void, app.router);
 //!     try health.set("my.package.MyService", .SERVING);
 //!
-//! One `Health` per process serves the routes (they are static).
+//! Each `Health` is its own registry: two servers in one process can each
+//! register their own (or share one, registered on both routers).
 const std = @import("std");
 const dusty = @import("dusty");
 const server = @import("server.zig");
@@ -24,28 +25,30 @@ pub const Health = struct {
     /// Bumped on every change; Watch waits on it.
     generation: std.atomic.Value(u32) = .init(0),
 
-    var instance: ?*Health = null;
-
     /// The overall status starts as SERVING.
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Health {
         return .{ .allocator = allocator, .io = io };
     }
 
     pub fn deinit(self: *Health) void {
-        if (instance == self) instance = null;
         for (self.statuses.keys()) |k| self.allocator.free(k);
         self.statuses.deinit(self.allocator);
     }
 
-    /// Serves the health service on `router`, from this registry.
+    /// Serves the health service on `router`, from this registry, which
+    /// must outlive the router.
     pub fn registerOn(self: *Health, comptime Ctx: type, router: *dusty.Router(Ctx)) void {
-        instance = self;
         self.set("", .SERVING) catch @panic("OOM");
-        server.register(Ctx, router, pb.Health(Call, anyerror), .{
+        server.registerWith(Ctx, router, pb.Health(Call, anyerror), .{
             .Check = check,
             .List = list,
             .Watch = watch,
-        });
+        }, .{ .data = self });
+    }
+
+    /// The registry the call's route was registered from.
+    fn of(call: *Call) *Health {
+        return @ptrCast(@alignCast(call.data.?));
     }
 
     pub fn set(self: *Health, service: []const u8, status: ServingStatus) !void {
@@ -77,13 +80,13 @@ pub const Health = struct {
     }
 
     fn check(call: *Call, req: pb.HealthCheckRequest) anyerror!pb.HealthCheckResponse {
-        const self = instance orelse return call.fail(.unavailable, "health service not set up");
+        const self = of(call);
         const status = self.get(req.service) orelse return call.fail(.not_found, "unknown service");
         return .{ .status = status };
     }
 
     fn list(call: *Call, _: pb.HealthListRequest) anyerror!pb.HealthListResponse {
-        const self = instance orelse return call.fail(.unavailable, "health service not set up");
+        const self = of(call);
         var out: pb.HealthListResponse = .{};
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -95,7 +98,7 @@ pub const Health = struct {
 
     /// The status now, then each change, until the client goes away.
     fn watch(call: *Call, req: pb.HealthCheckRequest, out: *std.Io.Queue(pb.HealthCheckResponse)) anyerror!void {
-        const self = instance orelse return call.fail(.unavailable, "health service not set up");
+        const self = of(call);
         var last: ?ServingStatus = null;
         while (true) {
             const gen = self.generation.load(.acquire);

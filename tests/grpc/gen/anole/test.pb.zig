@@ -161,3 +161,21 @@ pub fn Echo(comptime UserDataType: type, comptime ErrorSet: type) type {
         Bidi: *const fn (userdata: *UserDataType, reader_queue: *std.Io.Queue(EchoRequest), writer_queue: *std.Io.Queue(EchoResponse)) ErrorSet!void,
     };
 }
+
+/// Connect GET: Find has no side effects, Store has.
+pub fn Lookup(comptime UserDataType: type, comptime ErrorSet: type) type {
+    return struct {
+        pub const package = "anole.test";
+        pub const service_name = "Lookup";
+
+        /// Options of the methods that have some (`google.protobuf.MethodOptions`).
+        pub const _method_options = .{
+            .Find = .{
+                .@"#raw" = "\x90\x02\x01",
+                .idempotency_level = .NO_SIDE_EFFECTS,
+            },
+        };
+        Find: *const fn (userdata: *UserDataType, request: EchoRequest) ErrorSet!EchoResponse,
+        Store: *const fn (userdata: *UserDataType, request: EchoRequest) ErrorSet!EchoResponse,
+    };
+}

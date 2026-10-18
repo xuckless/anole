@@ -19,3 +19,11 @@ service Echo {
   rpc ClientStream(stream EchoRequest) returns (EchoResponse);
   rpc Bidi(stream EchoRequest) returns (stream EchoResponse);
 }
+
+// Connect GET: Find has no side effects, Store has.
+service Lookup {
+  rpc Find(EchoRequest) returns (EchoResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc Store(EchoRequest) returns (EchoResponse);
+}

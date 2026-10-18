@@ -16,6 +16,10 @@ pub const Compression = @import("compression.zig").Compression;
 const server = @import("server.zig");
 pub const Call = server.Call;
 pub const register = server.register;
+pub const registerWith = server.registerWith;
+pub const RegisterOptions = server.RegisterOptions;
+/// The request message limit of a registration without its own (4 MiB).
+pub const default_max_message_size = server.default_max_message_size;
 pub const MethodKind = server.MethodKind;
 
 /// The client: `Channel` over an `anole.h2.ClientConnection`, and

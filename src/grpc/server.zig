@@ -8,7 +8,9 @@
 //!
 //! into one POST route per method (`/package.Service/Method`), and runs
 //! each call: request frames decoded into messages, the handler, response
-//! messages framed back, and the status in the trailers.
+//! messages framed back, and the status in the trailers. A unary method
+//! marked `option idempotency_level = NO_SIDE_EFFECTS` also gets a GET
+//! route, for Connect's GET form.
 //!
 //! Unary methods run on the stream's task. A streaming method's handler, its
 //! request reader and its response writer run as tasks of one group, joined
@@ -24,8 +26,29 @@ const Compression = @import("compression.zig").Compression;
 const features = @import("build_options");
 
 const Code = status_mod.Code;
+const log = std.log.scoped(.anole_grpc);
 
+/// The largest request message a registration takes unless its options say
+/// otherwise; a larger one fails the call with RESOURCE_EXHAUSTED.
 pub const default_max_message_size = 4 * 1024 * 1024;
+
+/// Per registration (`registerWith`): the same service can be registered
+/// twice, on two routers, with different options.
+pub const RegisterOptions = struct {
+    /// The largest request message, after decompression.
+    max_message_size: usize = default_max_message_size,
+    /// Handed to every call of this registration as `Call.data`: state for
+    /// handlers that serve more than one registration (`Health` keeps its
+    /// registry here).
+    data: ?*anyopaque = null,
+};
+
+const default_options: RegisterOptions = .{};
+
+/// What a client is told when a handler fails with an error that is not a
+/// gRPC status, as grpc-java words it. The error itself is logged: its name
+/// is the server's business.
+pub const unknown_error_message = "Application error processing RPC";
 
 /// One call, as its handler sees it: the request's metadata, its deadline,
 /// an arena for the call, and the status and trailing metadata to send.
@@ -38,6 +61,8 @@ pub const Call = struct {
     io: std.Io,
     /// The application state of a `Server(Ctx)`, or null.
     ctx: ?*anyopaque,
+    /// `RegisterOptions.data` of the registration that routed the call.
+    data: ?*anyopaque = null,
     /// When the client's grpc-timeout runs out, if it sent one.
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Set by `fail`, or left at OK.
@@ -62,6 +87,8 @@ pub const Call = struct {
     unary_response: ?[]const u8 = null,
     /// gRPC-Web text: the request body, base64-decoded.
     text_input: ?std.Io.Reader = null,
+    /// Connect GET: the request message, from the query.
+    get_message: ?[]const u8 = null,
 
     pub const Error = error{GrpcStatus};
 
@@ -82,9 +109,16 @@ pub const Call = struct {
         return error.GrpcStatus;
     }
 
-    /// Adds initial metadata (a response header). Only before the first
-    /// response message is sent.
+    /// Adds initial metadata (a response header). The response head goes
+    /// out with the first response message: once it has started this
+    /// returns `error.HeadersSent`. In a streaming handler, where the
+    /// response writer runs as its own task, add headers before the first
+    /// `putOne`.
     pub fn addHeader(self: *Call, name: []const u8, value: []const u8) !void {
+        // The writer starts the head under the same lock (`writeBytes`).
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.out != null) return error.HeadersSent;
         try self.res.header(name, value);
     }
 
@@ -94,9 +128,9 @@ pub const Call = struct {
     }
 
     /// The client went away (reset the stream or closed the connection),
-    /// or the deadline passed. A handler that waits a long time on
-    /// something other than its queues (a timer, a condition) checks this
-    /// between waits: the engine does not cancel it on the client's reset.
+    /// or the deadline passed. On HTTP/2 under zio the handler is canceled
+    /// then anyway (its next wait returns `error.Canceled`); this is for
+    /// work that does not wait, and for other runtimes and protocols.
     pub fn cancelled(self: *Call) bool {
         return self.res.peerGone() or self.deadlineExceeded();
     }
@@ -151,8 +185,17 @@ fn Method(comptime F: type) type {
 /// Registers every method of `Service` (a zig-protobuf service type,
 /// `Svc(anole.grpc.Call, ErrorSet)`) on `router` with the handlers in
 /// `impl`. For a `Server(Ctx)`, `Ctx` is its state type and `Call.ctx`
-/// points at it.
+/// points at it. `registerWith` takes options.
 pub fn register(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service: type, comptime impl: Service) void {
+    registerWith(Ctx, router, Service, impl, .{});
+}
+
+/// `register`, with options for this registration (a message size limit,
+/// data for the handlers).
+pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service: type, comptime impl: Service, options: RegisterOptions) void {
+    // The routes hand it to each call; it lives as long as the router.
+    const registration = router.arena.allocator().create(RegisterOptions) catch @panic("OOM");
+    registration.* = options;
     const info = @typeInfo(Service).@"struct";
     inline for (info.field_names, info.field_types) |name, F| {
         const path = "/" ++ Service.package ++ "." ++ Service.service_name ++ "/" ++ name;
@@ -163,25 +206,42 @@ pub fn register(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service
                 try serve(M, handler, ctx, req, res);
             }
         };
-        if (Ctx == void) {
-            router.post(path, struct {
-                fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
-                    return Adapter.run(null, req, res);
-                }
-            }.h);
-        } else {
-            router.post(path, struct {
-                fn h(ctx: *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-                    return Adapter.run(ctx, req, res);
-                }
-            }.h);
-        }
+        const route = if (Ctx == void) struct {
+            fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+                return Adapter.run(null, req, res);
+            }
+        }.h else struct {
+            fn h(ctx: *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
+                return Adapter.run(ctx, req, res);
+            }
+        }.h;
+        router.addRoute(.post, path, route, registration);
+        if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) router.addRoute(.get, path, route, registration);
     }
 }
 
+/// Whether the method is marked `option idempotency_level =
+/// NO_SIDE_EFFECTS`, which zig-protobuf's codegen keeps in the service's
+/// `_method_options`.
+fn hasNoSideEffects(comptime Service: type, comptime method: []const u8) bool {
+    if (!@hasDecl(Service, "_method_options")) return false;
+    const all = Service._method_options;
+    if (!@hasField(@TypeOf(all), method)) return false;
+    const options = @field(all, method);
+    if (!@hasField(@TypeOf(options), "idempotency_level")) return false;
+    return std.mem.eql(u8, @tagName(options.idempotency_level), "NO_SIDE_EFFECTS");
+}
+
 fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *dusty.Request, res: *dusty.Response) !void {
+    const options: *const RegisterOptions = if (req.route) |route|
+        (if (route.data) |d| @ptrCast(@alignCast(d)) else &default_options)
+    else
+        &default_options;
+    // Connect GET (only routed for unary methods without side effects):
+    // the codec comes from the query, not a content type.
+    const is_get = req.method == .get or req.method == .head;
     const content_type = req.headers.get("content-type") orelse "";
-    const kind = classify(content_type) orelse {
+    const kind = (if (is_get) classifyGet(req.query.get("encoding") orelse "") else classify(content_type)) orelse {
         res.status = .unsupported_media_type;
         return;
     };
@@ -202,7 +262,8 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         .arena = req.arena,
         .io = req.io,
         .ctx = ctx,
-        .max_message_size = default_max_message_size,
+        .data = options.data,
+        .max_message_size = options.max_message_size,
         .protocol = kind.protocol,
         .codec = kind.codec,
     };
@@ -253,6 +314,8 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         req.setTimeout(.none);
     }
 
+    if (is_get) call.get_message = getMessage(&call) catch |err| return finish(&call, err);
+
     var in_buf: [16 * 1024]u8 = undefined;
     var body = try req.reader(&in_buf);
 
@@ -298,6 +361,46 @@ fn classify(content_type: []const u8) ?Kind {
     return null;
 }
 
+/// Connect GET's `encoding` query parameter, as `classify` answers.
+fn classifyGet(encoding: []const u8) ?Kind {
+    if (std.mem.eql(u8, encoding, "proto"))
+        return .{ .protocol = .connect, .codec = .proto, .response_type = "application/proto" };
+    if (std.mem.eql(u8, encoding, "json"))
+        return .{ .protocol = .connect, .codec = .json, .response_type = "application/json" };
+    return null;
+}
+
+/// Connect GET: the request message from the query (`message`, `base64`,
+/// `compression`), back to the codec's bytes. Unknown parameters are
+/// ignored, as the protocol asks.
+fn getMessage(call: *Call) ![]const u8 {
+    const query = &call.req.query;
+    if (query.get("connect")) |version| {
+        if (!std.mem.eql(u8, version, "v1")) return call.fail(.invalid_argument, "unsupported connect protocol version");
+    }
+    var message: []const u8 = query.get("message") orelse "";
+    if (query.get("base64")) |flag| if (std.mem.eql(u8, flag, "1")) {
+        // URL-safe base64, padded or not.
+        const trimmed = std.mem.trimEnd(u8, message, "=");
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const len = decoder.calcSizeForSlice(trimmed) catch return call.fail(.invalid_argument, "message is not URL-safe base64");
+        const decoded = try call.arena.alloc(u8, len);
+        decoder.decode(decoded, trimmed) catch return call.fail(.invalid_argument, "message is not URL-safe base64");
+        message = decoded;
+    };
+    const compression: Compression = if (query.get("compression")) |name|
+        Compression.parse(name) orelse return call.fail(.unimplemented, "unsupported compression; supported: " ++ comptime acceptEncoding())
+    else
+        .identity;
+    // An empty message is never decompressed.
+    if (compression == .gzip and message.len > 0) {
+        if (comptime !features.compression) return call.fail(.unimplemented, "gzip is not built in");
+        message = try frame.decompressGzip(call.arena, message, call.max_message_size);
+    }
+    if (message.len > call.max_message_size) return error.MessageTooLarge;
+    return message;
+}
+
 fn acceptEncoding() []const u8 {
     return if (features.compression) "identity,gzip" else "identity";
 }
@@ -325,7 +428,13 @@ fn finish(call: *Call, result: anyerror!void) !void {
         },
         error.DecodeFailed, error.TruncatedFrame, error.InvalidCompressedFlag, error.CompressionMismatch, error.MalformedCompressedMessage => {
             call.status = .internal;
-            call.status_message = @errorName(err);
+            call.status_message = switch (err) {
+                error.DecodeFailed => "request message does not decode",
+                error.TruncatedFrame => "request message frame cut short",
+                error.InvalidCompressedFlag => "invalid compressed flag in a message frame",
+                error.CompressionMismatch => "compressed message without a message encoding",
+                else => "malformed compressed message",
+            };
         },
         error.ExpectedUnaryMessage => {
             call.status = .unimplemented;
@@ -334,8 +443,20 @@ fn finish(call: *Call, result: anyerror!void) !void {
         // The peer is gone: nothing can be told.
         error.ConnectionResetByPeer, error.BrokenPipe => return,
         else => {
+            const path = call.req.url[0 .. std.mem.indexOfScalar(u8, call.req.url, '?') orelse call.req.url.len];
+            if (call.res.peerGone()) {
+                log.debug("{s}: {t} after the client went away", .{ path, err });
+                return;
+            }
+            // The error's name stays here; the client gets a generic
+            // message (grpc-java's), not an internal identifier.
+            if (call.req.id.len > 0) {
+                log.warn("{s} failed with error.{t} (request {s}); the client gets UNKNOWN", .{ path, err, call.req.id });
+            } else {
+                log.warn("{s} failed with error.{t}; the client gets UNKNOWN", .{ path, err });
+            }
             call.status = .unknown;
-            call.status_message = @errorName(err);
+            call.status_message = unknown_error_message;
         },
     }
     switch (call.protocol) {
@@ -436,9 +557,10 @@ fn percentEncode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader) !?Req {
     const payload = switch (call.protocol) {
         .connect => blk: {
-            // The whole body is the one message.
+            // The whole body is the one message (Connect GET: the query's).
             if (call.unary_read) return null;
             call.unary_read = true;
+            if (call.get_message) |message| break :blk message;
             break :blk body.interface.allocRemaining(call.arena, .limited(call.max_message_size + 1)) catch |err| switch (err) {
                 error.StreamTooLong => return error.MessageTooLarge,
                 else => |e| return e,
