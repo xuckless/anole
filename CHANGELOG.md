@@ -26,18 +26,21 @@ for macOS and Linux.
   case in strict mode, over h2c and TLS.
 - HTTP/3 on ngtcp2 1.25.0 and nghttp3 1.18.0: the same handlers over QUIC,
   `Alt-Svc`, Retry, stateless reset, QUIC v2, ECN, PKTINFO, GSO and GRO on
-  Linux, per-request timeouts and a GOAWAY drain. The QUIC interop runner
+  Linux, per-request timeouts, a GOAWAY drain and mutual TLS. The QUIC interop runner
   passes every server case it was given against ngtcp2's and quic-go's
   clients.
 - TLS through BoringSSL, built from source by Zig: TLS 1.3 and 1.2, ALPN,
-  mutual TLS (with the acceptable CAs named in the request), stateless
-  session tickets, close_notify on graceful closes, and a development
+  mutual TLS (with the acceptable CAs named in the request, and the client's
+  certificate for handlers through `req.peerCertificate()` on HTTP/1.1,
+  HTTP/2 and HTTP/3), stateless session tickets, close_notify on graceful closes, and a development
   certificate generated in memory (`.dev_self_signed`).
 - Response compression with zstd or gzip (zlib-ng) by the client's q-values,
   and compressed request bodies.
 - The PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies.
 - Zero-downtime restart on SIGUSR2 (the new process inherits the listening
-  sockets) and systemd socket activation.
+  sockets, HTTP/3's UDP socket included; HTTP/3 connections are closed and
+  reconnect), systemd socket activation, and systemd's readiness protocol
+  (`READY=1`, `RELOADING=1`, `MAINPID=`, `STOPPING=1`) without libsystemd.
 - An opt-in blocking pool (`Options.blocking`, `anole.blocking.run`):
   CPU-heavy or blocking calls run on zio's thread pool, capped at a set
   number at once, while the request's executor goes on serving.
@@ -72,7 +75,7 @@ for macOS and Linux.
 
 - Outbound HTTP/1.1 and HTTPS (dusty's client on BoringSSL, the system trust
   store or your own CAs), an HTTP/2 client and an HTTP/3 client, usable from
-  handlers through `req.io`.
+  handlers through `req.io`; each can present a client certificate.
 
 ### Auth, state and limits
 

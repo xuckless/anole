@@ -365,6 +365,15 @@ fn lookup(ptr: ?*anyopaque, arena: std.mem.Allocator, digest: anole.auth.apikey.
 var api_keys = anole.auth.apikey.Middleware.init(.{ .ptr = &db, .lookup = lookup });
 ```
 
+## Client certificates
+
+Mutual TLS is a listener setting (`https.client_auth`, in
+[docs/server.md](server.md#tls)), and it covers HTTP/3 as well. A handler or
+middleware reads the verified certificate with `req.peerCertificate()`, the
+leaf as DER or `null`, the same way over HTTP/1.1, HTTP/2 and HTTP/3. Map it
+to an owner as you would an API key, for example by the SHA-256 of the DER or
+by a subject name from `std.crypto.Certificate`.
+
 ## Roles (RBAC)
 
 A `Policy` lists roles. Each role grants permissions, which are exact names,

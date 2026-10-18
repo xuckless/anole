@@ -616,6 +616,9 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
                 var resp = try authed.fetch(url, .{});
                 defer resp.deinit();
                 try std.testing.expectEqualSlices(u8, der, (try resp.body()).?);
+                // What docs/server.md shows a handler doing with it.
+                const cert: std.crypto.Certificate = .{ .buffer = (try resp.body()).?, .index = 0 };
+                try std.testing.expectEqualStrings("localhost", (try cert.parse()).commonName());
             }
 
             // HTTP/2.

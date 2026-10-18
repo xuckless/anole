@@ -26,7 +26,8 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   q-values, and decoding of compressed request bodies;
 - the PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies;
 - HTTPS through BoringSSL: TLS 1.3 and 1.2, ALPN, certificate verification,
-  mutual TLS, session tickets and close_notify, for both the server and
+  mutual TLS (also over HTTP/3, with the client certificate for handlers),
+  session tickets and close_notify, for both the server and
   dusty's HTTP client, whose own test suite (515 tests) passes on it;
 - HTTP/2 on nghttp2, over TLS (ALPN "h2") and cleartext (prior knowledge), on
   the same router and handlers, with streaming bodies, flow control and
@@ -51,7 +52,8 @@ on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
   `traceparent`, OTLP/HTTP export), JSON or text access logs with request and
   trace IDs, `/healthz` and `/readyz`;
 - operations: zero-downtime restart on SIGUSR2 (the new process inherits the
-  listening sockets), and systemd socket activation;
+  listening sockets, HTTP/3's too), systemd socket activation and readiness
+  notification (`Type=notify`);
 - HTTP/3 on ngtcp2 and nghttp3: the same handlers over QUIC, advertised with
   `Alt-Svc`, with Retry, stateless reset, QUIC v2, ECN and a GOAWAY drain,
   and an HTTP/3 client with the HTTP/2 client's API; both checked against

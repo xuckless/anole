@@ -83,7 +83,7 @@ while holding one: a livelock or a recursive-lock abort.
 | `http3` | `null` | HTTP/3 over QUIC. Needs `-Dhttp3` and `https`. |
 | `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
 | `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
-| `process` | `null` | `init.minimal` enables socket activation and SIGUSR2 restarts. |
+| `process` | `null` | `init.minimal` enables socket activation, SIGUSR2 restarts and `sd_notify`. |
 | `restart_timeout_ms` | 10 000 | How long a restart waits for the new process. |
 | `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
 | `server` | `.{}` | The rest of dusty's `ServerConfig`: timeouts, limits, proxies. |
@@ -236,7 +236,9 @@ first of these, or `stop()`, starts a graceful drain:
 3. Every HTTP/2 connection gets a two-phase GOAWAY: a notice with a PING,
    then the final GOAWAY on the PING's answer or after one second. Open
    streams finish.
-4. HTTP/3 connections get a GOAWAY and finish their open requests.
+4. HTTP/3 connections get a GOAWAY and finish their open requests (except
+   when a SIGUSR2 restart hands the socket over: then they close at once,
+   see [below](#zero-downtime-restart-and-socket-activation)).
 5. Open WebSockets get close 1001 (going away); each ends when its client
    answers (see [Shutdown](websocket.md#shutdown)).
 6. `run` returns once every connection is closed, or when
@@ -280,17 +282,14 @@ first, which costs a round trip and resists floods from spoofed sources.
 `hq_interop_root` is for the QUIC interop runner only.
 
 Supported: QUIC v1 and v2, Retry, stateless reset, ECN, NAT rebinding, key
-update, GSO/GRO on Linux and a GOAWAY drain. Not yet:
+update, GSO/GRO on Linux, a GOAWAY drain, mutual TLS (the `https` listener's
+`client_auth`, see [TLS](#tls)) and SIGUSR2 restarts (see
+[below](#zero-downtime-restart-and-socket-activation)). Not yet:
 
 - 0-RTT (early data);
 - connection migration to an address the client chooses (no preferred
   address is advertised);
-- WebTransport, and gRPC over HTTP/3;
-- mutual TLS: the QUIC endpoint does not ask for client certificates yet,
-  so `init` refuses `https.client_auth` together with `http3`
-  (`error.Http3WithClientAuth`) rather than let HTTP/3 bypass it;
-- SIGUSR2 restarts: the UDP socket is not handed over, the new process fails
-  to bind it, and the old one carries on.
+- WebTransport, and gRPC over HTTP/3.
 
 The endpoint runs on one executor for now, so HTTP/3 uses one core.
 
@@ -323,45 +322,141 @@ Mutual TLS verifies client certificates against the CAs you give:
 },
 ```
 
-A client without a valid certificate fails the handshake. Handlers cannot
-read the client certificate yet, so mTLS only gates access.
+The same CAs and mode apply to HTTP/3 when it is on. A client without a
+valid certificate fails the handshake, on TCP and on QUIC alike; in
+`.request` mode a client that sends none is served, but one that sends a
+certificate that does not verify is still refused.
+
+Handlers read the client's certificate with `req.peerCertificate()`: the
+leaf certificate, DER-encoded and already verified, or `null` when the
+connection is not this server's TLS, `client_auth` is off, or the client
+sent none. It reads the same over HTTP/1.1, HTTP/2 and HTTP/3, and the slice
+is valid for the request. Parse it with `std.crypto.Certificate` to get the
+subject or a SAN:
+
+```zig
+fn whoami(req: *anole.http.Request, res: *anole.http.Response) !void {
+    const der = req.peerCertificate() orelse return res.print(.text, "anonymous", .{});
+    const cert: std.crypto.Certificate = .{ .buffer = der, .index = 0 };
+    const parsed = try cert.parse();
+    try res.print(.text, "CN={s}", .{parsed.commonName()});
+}
+```
+
+Behind a TLS-terminating proxy there is no certificate here: the proxy saw
+it, not Anole.
 
 ## Zero-downtime restart and socket activation
 
-Pass the process to enable both: `.process = init.minimal`.
+Pass the process to enable all of this: `.process = init.minimal`.
 
 **Socket activation.** When `LISTEN_PID` is this process, Anole serves the
 `LISTEN_FDS` sockets from fd 3 on, as systemd passes them. It matches them by
-`LISTEN_FDNAMES` (`http`, `https`), or by position (`http` first) when they
-have no names. A listener with no inherited socket opens its own.
-
-```ini
-# anole.socket
-[Socket]
-ListenStream=0.0.0.0:80
-FileDescriptorName=http
-
-[Install]
-WantedBy=sockets.target
-```
+`LISTEN_FDNAMES` (`http`, `https`, and `h3` for HTTP/3's UDP socket), or by
+position (`http`, `https`, `h3`) when they have no names. A listener with no
+inherited socket opens its own, and one named `h3` must be a datagram socket.
 
 **Restart on SIGUSR2.** `kill -USR2 <pid>` starts the binary at the same
 path with the same arguments and environment. The new process inherits the
-listening sockets (in the `LISTEN_FDS` format) and reports through a pipe once
-it serves; only then does the old one stop accepting and drain. Clients never
-see a closed port. If the new process does not report within
-`restart_timeout_ms`, the old one kills it and keeps serving. To deploy,
-replace the binary on disk and send SIGUSR2.
+listening sockets, HTTP/3's included (in the `LISTEN_FDS` format), binds
+nothing of its own, and reports through a pipe once it serves; only then does
+the old one stop accepting and drain. TCP clients never see a closed port. If
+the new process does not report within `restart_timeout_ms`, the old one kills
+it and keeps serving. To deploy, replace the binary on disk and send SIGUSR2.
+
+**HTTP/3 across a restart.** A UDP socket has no queue of new connections to
+share: both processes would read the same socket, and each datagram reaches
+only one of them. So once the new process serves, the old one sends every
+QUIC connection a final GOAWAY and a CONNECTION_CLOSE (`H3_NO_ERROR`) and
+stops reading, and every datagram from then on goes to the new process.
+HTTP/3 requests in flight are cut, and their clients reconnect: browsers
+retry idempotent requests, or fall back to TCP, which drains as usual.
+
+The new process also gets the old one's key for stateless resets and address
+validation tokens, through a pipe of its own. A packet for an old connection
+that reaches the new process (in the moment both are reading, or from a client
+that missed the CONNECTION_CLOSE) is answered with a stateless reset that the
+client accepts, so it reconnects at once rather than at its idle timeout.
+
+**systemd.** When `NOTIFY_SOCKET` is set, Anole speaks systemd's notification
+protocol itself (no libsystemd): `READY=1` once the listeners are bound,
+`RELOADING=1` when SIGUSR2 starts a new process, `MAINPID=<pid>` and
+`READY=1` from the new process once it serves, so systemd follows the main
+process to it, `READY=1` from the old one if the new one fails, and
+`STOPPING=1` when a drain to exit starts. The process that hands over never
+sends `STOPPING=1`, which would stop the service. A path starting with `@` is
+in Linux's abstract namespace.
+
+A service with every listener passed in, restarted with `systemctl reload`:
+
+```ini
+# anole.service
+[Unit]
+Description=My Anole service
+Requires=anole-http.socket anole-https.socket anole-h3.socket
+After=network.target
+
+[Service]
+# READY=1 says when it serves; a reload is RELOADING=1 ... READY=1.
+Type=notify
+# The new process sends MAINPID= and READY=1 before it is the main process.
+NotifyAccess=all
+ExecStart=/usr/local/bin/myapp
+ExecReload=/bin/kill -USR2 $MAINPID
+# Stop by SIGTERM and wait out the drain. After a reload the main process is
+# not systemd's child, and systemd would follow its own SIGTERM with SIGKILL
+# at once instead of waiting.
+ExecStop=/bin/sh -c 'kill -TERM $MAINPID; while kill -0 $MAINPID 2>/dev/null; do sleep 0.1; done'
+# The default: a stop signals every process of the service, an old one
+# still draining after a restart too.
+KillMode=control-group
+# Longer than the drain (timeout.shutdown, 30 s).
+TimeoutStopSec=40
+Sockets=anole-http.socket anole-https.socket anole-h3.socket
+
+[Install]
+WantedBy=multi-user.target
+```
+
+One socket unit per name, since `FileDescriptorName` names every socket of
+its unit:
+
+```ini
+# anole-http.socket
+[Socket]
+ListenStream=0.0.0.0:80
+FileDescriptorName=http
+Service=anole.service
+
+# anole-https.socket
+[Socket]
+ListenStream=0.0.0.0:443
+FileDescriptorName=https
+Service=anole.service
+
+# anole-h3.socket
+[Socket]
+ListenDatagram=0.0.0.0:443
+FileDescriptorName=h3
+Service=anole.service
+```
+
+Without the socket units, drop `Requires=` and `Sockets=`: Anole binds the
+ports itself and still hands them over on a reload. On systemd 253 or later,
+`Type=notify-reload` with `ReloadSignal=SIGUSR2` can replace `Type=notify` and
+`ExecReload=`: systemd then sends the signal itself and waits for
+`RELOADING=1` and `READY=1`. Both setups were checked on systemd 257: two
+reloads in a row move `MainPID` to each new process, and a stop after them
+drains.
 
 Limits:
 
 - Each listener is one socket in this mode, so Linux loses the per-core
   `SO_REUSEPORT` sockets.
-- HTTP/3 breaks the restart (see above).
-- The restart changes the main PID without telling systemd, so with the
-  default `KillMode` systemd stops the new process when the old one exits.
-  Under systemd, use `systemctl restart` with a socket unit: the socket stays
-  open and connections queue while the service restarts.
+- HTTP/3 requests in flight at a restart are cut (see above).
+- `systemctl restart` stops and starts the service: with socket units the
+  sockets stay open and TCP connections queue meanwhile, but in-flight work
+  is drained, not handed over. Use `reload` for zero downtime.
 
 ## Behind a proxy
 

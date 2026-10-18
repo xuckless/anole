@@ -130,7 +130,7 @@ The client does not discover HTTP/3 from `Alt-Svc`, retry over TCP, or send
 | System trust store | `.ca = .system` (the default) | load a bundle with `bundle.rescan(gpa, io, now)` |
 | A CA file or directory | `.ca = .{ .file = .{ .path = "ca.pem" } }`, or `.dir` | `bundle.addCertsFromFilePath(gpa, io, now, dir, "ca.pem")` |
 | Skip verification (tests only) | `.insecure_skip_verify = true`, optionally `.ca = .none` | `.insecure_skip_verify = true` |
-| Client certificate (mutual TLS) | `.client_certificate = .{ .cert_path = ..., .key_path = ... }` | not supported |
+| Client certificate (mutual TLS) | `.client_certificate = .{ .cert_path = ..., .key_path = ... }` | `.certificate = .{ .cert_pem = ..., .key_pem = ... }` (PEM in memory) |
 | ALPN | none offered; HTTP/1.1 | "h2" or "h3", fixed |
 
 `bundle` is a `std.crypto.Certificate.Bundle` and `now` is
