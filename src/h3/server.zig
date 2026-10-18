@@ -34,6 +34,7 @@ const dusty = @import("dusty");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
+const dusty_tls = @import("anole_dusty_tls");
 const net = @import("net.zig");
 const bridge = @import("bridge.zig");
 const Addr = net.Addr;
@@ -64,7 +65,8 @@ const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 
 
 pub const Options = struct {
     address: std.Io.net.IpAddress,
-    /// PEM: the certificate chain (leaf first) and its key.
+    /// PEM: the certificate chain (leaf first) and its key. Read by
+    /// `init` only; a reload passes its own (`Endpoint.loadTls`).
     cert_pem: []const u8,
     key_pem: []const u8,
     /// Requests a client may have open at once on a connection.
@@ -113,7 +115,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// (wildcard binds only), for its stateless replies.
         reply_from: ?std.Io.net.IpAddress = null,
         local: Addr,
+        /// What new connections handshake with; `useTls` replaces it, so
+        /// it is read under `tls_lock` (`newTlsSession`).
         tls: quic_tls.Context,
+        tls_lock: std.atomic.Mutex = .unlocked,
         /// Keys stateless reset tokens and address validation tokens.
         secret: [32]u8,
         /// The connection IDs in use, ours and the clients' first ones.
@@ -134,12 +139,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tls = try quic_tls.Context.init(.{
-                .cert_pem = options.cert_pem,
-                .key_pem = options.key_pem,
-                .hq_interop = options.hq_interop_root != null,
-                .client_auth = options.client_auth,
-            });
+            var tls = try newTlsContext(options);
             errdefer tls.deinit();
             const socket = if (options.fd) |fd|
                 try adoptSocket(io, fd, options.address)
@@ -198,6 +198,61 @@ pub fn Endpoint(comptime Ctx: type) type {
             self.conns.deinit(self.gpa);
             self.tls.deinit();
             self.gpa.destroy(self);
+        }
+
+        /// The TLS context for `options`, with session ticket keys of its
+        /// own (see `useTls`).
+        fn newTlsContext(options: Options) !quic_tls.Context {
+            var tls = try quic_tls.Context.init(.{
+                .cert_pem = options.cert_pem,
+                .key_pem = options.key_pem,
+                .hq_interop = options.hq_interop_root != null,
+                .client_auth = options.client_auth,
+            });
+            errdefer tls.deinit();
+            try dusty_tls.installTicketKeys(tls.ctx);
+            return tls;
+        }
+
+        /// A certificate reload, first step: the TLS context for a new
+        /// certificate and key (PEM) and client CAs, the rest as before.
+        /// Nothing changes until `useTls`; `deinit` it to drop it.
+        pub fn loadTls(self: *const Self, cert_pem: []const u8, key_pem: []const u8, client_auth: ?quic_tls.ClientAuth) !quic_tls.Context {
+            var options = self.options;
+            options.cert_pem = cert_pem;
+            options.key_pem = key_pem;
+            options.client_auth = client_auth;
+            return newTlsContext(options);
+        }
+
+        /// A certificate reload, second step: connections that start from
+        /// now on handshake with `tls`, which takes over the session ticket
+        /// keys, so tickets issued before still resume. Connections already
+        /// open keep the context they started with (each `SSL` holds a
+        /// reference to it). Safe from any task or thread.
+        pub fn useTls(self: *Self, tls: quic_tls.Context) void {
+            self.lockTls();
+            dusty_tls.carryTicketKeys(tls.ctx, self.tls.ctx);
+            var old = self.tls;
+            self.tls = tls;
+            self.tls_lock.unlock();
+            old.deinit();
+        }
+
+        fn lockTls(self: *Self) void {
+            while (!self.tls_lock.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        /// A server `SSL` for a new connection, from the context in place.
+        fn newTlsSession(self: *Self, conn_ref: *c.ngtcp2_crypto_conn_ref) !*c.SSL {
+            self.lockTls();
+            var tls = self.tls;
+            // A reference of our own, so a reload cannot free it between
+            // here and `SSL_new`, which takes the `SSL`'s.
+            _ = c.SSL_CTX_up_ref(tls.ctx);
+            self.tls_lock.unlock();
+            defer tls.deinit();
+            return tls.newSession(conn_ref);
         }
 
         /// The bound address (the real port when 0 was asked for).
@@ -577,7 +632,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     return error.QuicSetupFailed;
                 conn.q = q.?;
                 errdefer c.ngtcp2_conn_del(conn.q);
-                conn.ssl = try ep.tls.newSession(&conn.conn_ref);
+                conn.ssl = try ep.newTlsSession(&conn.conn_ref);
                 c.ngtcp2_conn_set_tls_native_handle(conn.q, conn.ssl);
                 return conn;
             }
@@ -1195,7 +1250,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
                 var sink_state: StreamSink = .{ .stream = s };
-                var response = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.request.max_header_count);
+                var response = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
                 server.configureResponse(&response);
                 defer response.deinit();
                 response.request = &request;
