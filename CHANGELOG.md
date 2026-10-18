@@ -47,6 +47,16 @@ for macOS and Linux.
 - RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 behind one
   `anole.websocket.upgrade`, permessage-deflate, and a rooms helper for
   broadcast. Autobahn passes every case.
+- A receive that fails on the client's account sends the matching close
+  code first (1009, 1007 or 1002) on both HTTP versions.
+- A drain closes open sockets with 1001 (going away) and ends them as soon
+  as their clients answer, rather than at `timeout.shutdown`;
+  `Socket.draining()` tells handlers why, `close_on_drain = false` leaves it
+  to them, and `req.drain` lets any long-lived handler watch for the drain.
+- `Rooms.broadcast` sends outside the lock: a slow member holds up only the
+  broadcasts that include it.
+- RFC 8441 sockets are logged, measured and traced as 101, like HTTP/1.1
+  upgrades.
 
 ### gRPC
 
@@ -83,6 +93,16 @@ for macOS and Linux.
 - Prometheus `/metrics`, OpenTelemetry traces (W3C `traceparent`, OTLP/HTTP
   export), JSON or text access logs with request and trace IDs, `/healthz`
   and `/readyz`, and `anole.logFn` for one consistent log output.
+- `Registry` and `Health` are values the application owns, each serving its
+  own server, so one process can run several servers.
+- An `exclude` list on the access log, HTTP metrics and tracing middleware
+  keeps paths such as `anole.observe.probe_paths` (`/healthz`, `/readyz`,
+  `/metrics`) out.
+- Histogram sums are exact floats (seconds for durations, from
+  nanoseconds), and bucket bounds are checked. `/readyz` answers 503 to
+  anything still routed during a drain. `Exporter.deinit` returns without
+  waiting out `interval_ms`.
+- Breaking: `HttpMetrics.init` takes options, and `statusOf` the request.
 
 ### Build
 

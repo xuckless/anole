@@ -9,6 +9,9 @@ const dusty = @import("dusty");
 const c = @import("anole_nghttp2_c");
 const wsc = @import("anole_websocket_codec").client;
 const websocket = @import("root.zig");
+const observe = @import("../observe/root.zig");
+
+var saw_draining: std.atomic.Value(bool) = .init(false);
 
 fn echo(req: *dusty.Request, res: *dusty.Response) !void {
     var ws = (try websocket.upgrade(req, res, .{})) orelse {
@@ -24,7 +27,10 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
         };
         switch (msg.type) {
             .text, .binary => try ws.send(msg.type, msg.data),
-            .close => return,
+            .close => {
+                saw_draining.store(ws.draining(), .release);
+                return;
+            },
             else => {},
         }
     }
@@ -217,10 +223,14 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
     defer rt.deinit();
     const io = rt.io();
 
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var http = try observe.metrics.HttpMetrics.init(&registry, .{});
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
     }, {});
     defer server.deinit();
+    server.router.use(dusty.Middleware(void).init(&http));
     server.router.get("/chat", echo);
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
@@ -264,4 +274,70 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
             return cl.closed;
         }
     }.f);
+
+    // Recorded as the 101 an HTTP/1.1 upgrade gets, though the stream's
+    // answer was a 200 (RFC 8441 §5). The handler's task ends just after the
+    // stream does.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for (0..1000) |_| {
+        out.clearRetainingCapacity();
+        try registry.render(&out.writer);
+        if (std.mem.indexOf(u8, out.written(), "route=\"/chat\",status=\"101\"} 1") != null) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    } else return error.TestUnexpectedResult;
+}
+
+test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does not wait out timeout.shutdown" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    saw_draining.store(false, .release);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .timeout = .{ .shutdown = .fromSeconds(20) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", echo);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try client.sendFrame(.text, "before");
+    try std.testing.expectEqualStrings("before", try client.nextFrame(&op, &buf));
+
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    var drain = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(io_));
+        }
+    }.run, .{ &server_future, io });
+    const closing = try client.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
+    try std.testing.expectEqualStrings("server shutting down", closing[2..]);
+    // Answer the close and end the stream; the server ends its side.
+    try client.sendFrame(.close, &.{ 0x03, 0xe9 });
+    client.finished = true;
+    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
+    try drain.await(io);
+    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    try std.testing.expect(saw_draining.load(.acquire));
 }

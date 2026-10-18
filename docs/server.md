@@ -237,12 +237,15 @@ first of these, or `stop()`, starts a graceful drain:
    then the final GOAWAY on the PING's answer or after one second. Open
    streams finish.
 4. HTTP/3 connections get a GOAWAY and finish their open requests.
-5. `run` returns once every connection is closed, or when
+5. Open WebSockets get close 1001 (going away); each ends when its client
+   answers (see [Shutdown](websocket.md#shutdown)).
+6. `run` returns once every connection is closed, or when
    `server.timeout.shutdown` (30 s) runs out.
 
-With `timeout.shutdown = null` the drain waits however long it takes. A
-WebSocket or event stream never closes on its own, so it then holds the
-drain open forever.
+Handlers that run for long can learn of the drain: `req.drain` is an
+`std.Io.Event` set when it starts, to wait on or test with `isSet()`. An
+event stream that does neither never closes on its own, so with
+`timeout.shutdown = null` it holds the drain open forever.
 
 ## HTTP/2
 

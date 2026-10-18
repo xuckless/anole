@@ -55,9 +55,10 @@ fn echo(_: *App, req: *anole.Request, res: *anole.Response) !void {
 ```
 
 The same route serves both versions. An RFC 8441 request reaches the router
-as a `GET` with `req.protocol` set to `"websocket"`, and the access log shows
-it with status 200 rather than 101. `ws.conn` tells you which one you got
-(`.h1` or `.h2`).
+as a `GET` with `req.protocol` set to `"websocket"`. On the wire the server
+accepts it with a 200, as RFC 8441 requires, but the access log, metrics and
+spans record it as 101, like an HTTP/1.1 upgrade, so a WebSocket reads the
+same on both. `ws.conn` tells you which one you got (`.h1` or `.h2`).
 
 The socket lives as long as the handler. It is held in the request's arena,
 so do not keep a pointer to it after the handler returns. Always
@@ -82,6 +83,8 @@ in the server options (keep the stream limit, which this field replaces):
 | `timeout` | `.none` | Replaces the request timeout once the socket is open. |
 | `compression` | on with `-Dcompression` | Accept permessage-deflate when the client offers it. |
 | `deflate` | see below | Compressor settings. |
+| `close_on_drain` | true | Send close 1001 when the server starts to drain (see [Shutdown](#shutdown)). |
+| `drain_reason` | `"server shutting down"` | The reason in that close frame. |
 
 ## Receiving and sending
 
@@ -137,10 +140,10 @@ Codes are `anole.websocket.CloseCode`: `.normal` (1000), `.going_away`
 (1001), `.policy_violation` (1008), `.too_large` (1009) and so on.
 
 When a client sends something invalid (a message over `max_message_size`,
-invalid UTF-8, a bad frame), `receive` returns an error. Over HTTP/2 a close
-frame with the matching code (1002, 1007 or 1009) goes out first. Over
-HTTP/1.1 the connection ends without a close frame, unless the message was
-compressed. Either way, return from the handler.
+invalid UTF-8, a bad frame), `receive` returns an error, and a close frame
+with the matching code goes out first: 1009 for a message too large, 1007
+for text that is not UTF-8, 1002 for any other protocol error. This holds
+on both HTTP versions. Return from the handler.
 
 ## Timeouts
 
@@ -167,15 +170,41 @@ stream) and `receive` fails. No close frame is sent.
 ### Shutdown
 
 On SIGINT or SIGTERM the server stops accepting and waits for requests in
-flight, and an open socket counts as one. HTTP/2 connections get a GOAWAY,
-but streams already open, WebSockets included, keep running. After
-`timeout.shutdown` (30 s by default) the remaining sockets are cut without a
-close frame. A handler is not told that a shutdown has started. A server
-with long-lived sockets usually wants a shorter wait:
+flight, and an open socket counts as one. When the drain starts, every open
+socket, on HTTP/1.1 or HTTP/2, is sent close 1001 (going away) with the
+reason `"server shutting down"`. A handler does not need to do anything:
+the client answers the close, `receive` returns that answer as a `.close`
+message, and the handler returns as it would for any close. Sending after
+that fails. `ws.draining()` tells a handler that the close came from the
+drain rather than from the client:
+
+```zig
+const msg = ws.receive() catch return;
+if (msg.type == .close) {
+    if (ws.draining()) std.log.info("closed for shutdown", .{});
+    return;
+}
+```
+
+To say something else first, such as where to reconnect, turn the automatic
+close off with `.close_on_drain = false` and watch for the drain yourself.
+`ws.draining()` turns true when it starts, and `req.drain` is the event
+behind it, which a task of your own can wait on. Then close the socket
+yourself with `ws.close(.going_away, ...)` and keep calling `receive` until
+the answer arrives.
+
+A client that never answers the close holds its socket open until
+`timeout.shutdown` (30 s by default) runs out; the remaining sockets are then
+cut without a further frame. A server with long-lived sockets may want a
+shorter wait:
 
 ```zig
 .server = .{ .timeout = .{ .shutdown = .fromSeconds(5) } },
 ```
+
+The close is sent by a small task beside each socket's handler, on the same
+executor. It ends with `ws.deinit()`, which is one more reason to always
+`defer` it.
 
 ## Compression
 
@@ -248,10 +277,15 @@ fn chat(app: *App, req: *anole.Request, res: *anole.Response) !void {
 - `count(room)` returns the number of members.
 
 Rooms work across HTTP versions and threads: a socket on HTTP/1.1 and one on
-HTTP/2 can share a room. One lock covers every room, and a broadcast holds it
-while it sends to each member in turn. A slow client therefore slows every
-broadcast. For large rooms or slow clients, queue messages per socket in your
-own code instead.
+HTTP/2 can share a room. A broadcast takes a snapshot of the room's members
+under a short lock and sends outside it, to each member in turn. A slow
+client therefore slows only the broadcasts that include it, and the caller
+of such a broadcast waits for its send; broadcasts to other rooms, joins and
+leaves go on meanwhile. `leave` waits for any send to the leaving socket
+that is under way, so a socket is never sent to after its handler has left
+the room and returned. For large rooms or slow clients, queue messages per
+socket in your own code instead, so one client cannot hold up the rest of
+its room.
 
 ## Browsers and HTTP/2
 

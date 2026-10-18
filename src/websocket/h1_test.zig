@@ -1,0 +1,150 @@
+//! WebSocket over HTTP/1.1, end to end with a raw client: the close codes a
+//! failed receive sends, and the close 1001 a drain sends.
+const std = @import("std");
+const zio = @import("zio");
+const dusty = @import("dusty");
+const websocket = @import("root.zig");
+
+var saw_draining: std.atomic.Value(bool) = .init(false);
+
+fn echo(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{ .max_message_size = 8 })) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    while (true) {
+        const msg = ws.receive() catch return;
+        switch (msg.type) {
+            .text, .binary => try ws.send(msg.type, msg.data),
+            .close => {
+                saw_draining.store(ws.draining(), .release);
+                return;
+            },
+            else => {},
+        }
+    }
+}
+
+const Raw = struct {
+    stream: std.Io.net.Stream,
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
+    rbuf: [1024]u8 = undefined,
+    wbuf: [1024]u8 = undefined,
+
+    fn open(self: *Raw, io: std.Io, addr: std.Io.net.IpAddress) !void {
+        self.stream = try addr.connect(io, .{ .mode = .stream });
+        self.reader = self.stream.reader(io, &self.rbuf);
+        self.writer = self.stream.writer(io, &self.wbuf);
+        try self.writer.interface.writeAll("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        try self.writer.interface.flush();
+        const head = try self.reader.interface.takeDelimiterInclusive('\n');
+        if (!std.mem.startsWith(u8, head, "HTTP/1.1 101")) return error.NotUpgraded;
+        while (true) {
+            const line = try self.reader.interface.takeDelimiterInclusive('\n');
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+    }
+
+    /// One masked frame (zero key, so the payload goes as it is).
+    fn send(self: *Raw, opcode: u8, payload: []const u8) !void {
+        std.debug.assert(payload.len < 126);
+        try self.writer.interface.writeAll(&.{ 0x80 | opcode, 0x80 | @as(u8, @intCast(payload.len)), 0, 0, 0, 0 });
+        try self.writer.interface.writeAll(payload);
+        try self.writer.interface.flush();
+    }
+
+    /// The next frame's opcode and payload (unmasked, short).
+    fn next(self: *Raw, out: []u8) !struct { opcode: u8, payload: []u8 } {
+        const head = try self.reader.interface.takeArray(2);
+        const len = head[1] & 0x7f;
+        std.debug.assert(len < 126);
+        try self.reader.interface.readSliceAll(out[0..len]);
+        return .{ .opcode = head[0] & 0x0f, .payload = out[0..len] };
+    }
+
+    /// The close frame's reason, in `buf`.
+    fn expectClose(self: *Raw, code: u16, buf: []u8) ![]u8 {
+        const f = try self.next(buf);
+        try std.testing.expectEqual(@as(u8, 0x8), f.opcode);
+        try std.testing.expect(f.payload.len >= 2);
+        try std.testing.expectEqual(code, std.mem.readInt(u16, f.payload[0..2], .big));
+        return f.payload[2..];
+    }
+};
+
+fn startServer(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!void) {
+    server.router.get("/ws", echo);
+    const future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{server});
+    try server.ready.wait(io);
+    return future;
+}
+
+test "WebSocket over HTTP/1.1: a message too large gets close 1009, bad UTF-8 1007" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    var a: Raw = undefined;
+    try a.open(io, server.address.ip);
+    defer a.stream.close(io);
+    try a.send(0x1, "fits");
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("fits", (try a.next(&buf)).payload);
+    try a.send(0x2, "nine bytes");
+    _ = try a.expectClose(1009, &buf);
+
+    var b: Raw = undefined;
+    try b.open(io, server.address.ip);
+    defer b.stream.close(io);
+    try b.send(0x1, "\xff");
+    _ = try b.expectClose(1007, &buf);
+}
+
+test "WebSocket over HTTP/1.1: the drain closes an open socket with 1001 and does not wait out timeout.shutdown" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    saw_draining.store(false, .release);
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+        .timeout = .{ .shutdown = .fromSeconds(20) },
+    }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    var c: Raw = undefined;
+    try c.open(io, server.address.ip);
+    defer c.stream.close(io);
+    try c.send(0x1, "hi");
+    var buf: [125]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", (try c.next(&buf)).payload);
+
+    // The drain blocks until the socket is done, so it runs beside the test.
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    var drain = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), io_: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(io_));
+        }
+    }.run, .{ &future, io });
+    try std.testing.expectEqualStrings("server shutting down", try c.expectClose(1001, &buf));
+    // The closing handshake: answer, and the server ends the connection.
+    try c.send(0x8, &.{ 0x03, 0xe9 });
+    try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
+    try drain.await(io);
+    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    try std.testing.expect(saw_draining.load(.acquire));
+}

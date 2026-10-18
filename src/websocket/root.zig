@@ -31,8 +31,14 @@
 //!
 //! permessage-deflate (RFC 7692) is accepted when offered and
 //! `-Dcompression` is on (`UpgradeOptions.compression`), on either version.
+//!
+//! When the server starts to drain, every open socket is closed with 1001
+//! (going away) unless `UpgradeOptions.close_on_drain` is off: the peer's
+//! answer arrives through `receive` as a `.close` message, and
+//! `Socket.draining` says why.
 const std = @import("std");
 const dusty = @import("dusty");
+const placement = dusty.placement;
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec").server;
 
@@ -46,8 +52,8 @@ pub const Client = dusty.WebSocketClient;
 
 pub const UpgradeOptions = struct {
     /// The largest message `receive` assembles (after inflating). A bigger
-    /// one fails `receive` with `error.MessageTooLarge`; over HTTP/2 the
-    /// peer also gets close 1009, over HTTP/1.1 the connection just ends.
+    /// one fails `receive` with `error.MessageTooLarge`, and the peer gets
+    /// close 1009 first.
     max_message_size: usize = WebSocket.default_max_message_size,
     /// Replaces the request's timeout once the socket is open: a socket
     /// outlives `timeout.request`. Set a deadline here, or call
@@ -57,6 +63,12 @@ pub const UpgradeOptions = struct {
     /// Needs `-Dcompression`.
     compression: bool = features.compression,
     deflate: DeflateOptions = .{},
+    /// When the server starts to drain, send close 1001 (going away) with
+    /// `drain_reason`, so the peer answers and `receive` returns its
+    /// `.close`. Off: the socket stays open until the handler ends it
+    /// (`Socket.draining` tells it to) or `timeout.shutdown` cuts it.
+    close_on_drain: bool = true,
+    drain_reason: []const u8 = "server shutting down",
 };
 
 pub const DeflateOptions = if (features.compression) deflate_impl.Options else struct {};
@@ -66,10 +78,7 @@ const deflate_impl = if (features.compression) @import("deflate.zig") else struc
 
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
 pub const Socket = struct {
-    conn: union(enum) {
-        h1: WebSocket,
-        h2: *H2Socket,
-    },
+    conn: Conn,
     /// permessage-deflate, when negotiated.
     deflate: if (features.compression) ?*deflate_impl.Deflate else void =
         if (features.compression) null else {},
@@ -80,13 +89,33 @@ pub const Socket = struct {
     /// one socket (a `Rooms.broadcast` beside the socket's own handler) do
     /// not interleave on the compressor.
     send_mutex: std.Io.Mutex = .init,
+    /// The server's drain signal (`Request.drain`); null in a request the
+    /// server did not build.
+    drain: ?*std.Io.Event = null,
+    /// The task that sends 1001 when the drain starts
+    /// (`UpgradeOptions.close_on_drain`).
+    drain_watch: ?*std.Io.Group = null,
+
+    /// Both live in the request's arena, so a task beside the handler (the
+    /// drain watch, a `Rooms.broadcast`) acts on the same one.
+    pub const Conn = union(enum) {
+        h1: *WebSocket,
+        h2: *H2Socket,
+    };
+
+    /// Whether the server has started to drain. With `close_on_drain` the
+    /// close is already on its way; without, the handler should end the
+    /// socket (close 1001, then `receive` until the answer) soon.
+    pub fn draining(self: *const Socket) bool {
+        const d = self.drain orelse return false;
+        return d.isSet();
+    }
 
     /// The next text, binary or close message. Pings are answered and
     /// pongs dropped on the way; a compressed message is inflated.
     pub fn receive(self: *Socket) !Message {
         var msg = switch (self.conn) {
-            .h1 => |*ws| try ws.receive(),
-            .h2 => |ws| try ws.receive(),
+            inline else => |ws| try ws.receive(),
         };
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
@@ -110,21 +139,19 @@ pub const Socket = struct {
             if (self.deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
                 const packed_data = try d.compress(self.allocator, data);
                 return switch (self.conn) {
-                    .h1 => |*ws| ws.sendCompressed(msg_type, packed_data),
+                    .h1 => |ws| ws.sendCompressed(msg_type, packed_data),
                     .h2 => |ws| ws.sendMessage(msg_type, packed_data, true),
                 };
             };
         }
         return switch (self.conn) {
-            .h1 => |*ws| ws.send(msg_type, data),
-            .h2 => |ws| ws.send(msg_type, data),
+            inline else => |ws| ws.send(msg_type, data),
         };
     }
 
     pub fn ping(self: *Socket, data: []const u8) !void {
         return switch (self.conn) {
-            .h1 => |*ws| ws.ping(data),
-            .h2 => |ws| ws.ping(data),
+            inline else => |ws| ws.ping(data),
         };
     }
 
@@ -132,16 +159,25 @@ pub const Socket = struct {
     /// `receive`.
     pub fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
         return switch (self.conn) {
-            .h1 => |*ws| ws.close(code, reason),
-            .h2 => |ws| ws.close(code, reason),
+            inline else => |ws| ws.close(code, reason),
         };
     }
 
     pub fn deinit(self: *Socket) void {
+        // First, so nothing sends on the socket once it is gone.
+        if (self.drain_watch) |g| g.cancel(self.io);
         if (comptime features.compression) if (self.deflate) |d| d.deinit(self.allocator);
         switch (self.conn) {
-            .h1 => |*ws| ws.deinit(),
-            .h2 => |ws| ws.deinit(),
+            inline else => |ws| ws.deinit(),
+        }
+    }
+
+    /// Sends close 1001 once the drain starts. Runs beside the handler, on
+    /// its executor, until `deinit` cancels it.
+    fn closeOnDrain(drain: *std.Io.Event, io: std.Io, conn: Conn, reason: []const u8) std.Io.Cancelable!void {
+        try drain.wait(io);
+        switch (conn) {
+            inline else => |ws| ws.close(.going_away, reason) catch {},
         }
     }
 };
@@ -180,16 +216,28 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
         .allocator = req.arena,
         .io = req.io,
         .max_message_size = options.max_message_size,
+        .drain = req.drain,
     };
     if (h2) {
         socket.conn = .{ .h2 = try H2Socket.accept(req, res, options, negotiated) };
     } else {
-        var ws = (try res.upgradeWebSocket(req)) orelse return null;
+        const ws = try req.arena.create(WebSocket);
+        ws.* = (try res.upgradeWebSocket(req)) orelse return null;
         ws.max_message_size = options.max_message_size;
         ws.rsv1_allowed = negotiated;
         socket.conn = .{ .h1 = ws };
     }
     req.setTimeout(options.timeout);
+    if (options.close_on_drain) if (req.drain) |drain| {
+        const group = try req.arena.create(std.Io.Group);
+        group.* = .init;
+        const reason = try req.arena.dupe(u8, options.drain_reason);
+        // Without a task to spare, the socket lives on until the handler
+        // ends it or the drain's deadline does.
+        if (placement.concurrent(group, req.io, .local, Socket.closeOnDrain, .{ drain, req.io, socket.conn, reason })) |_| {
+            socket.drain_watch = group;
+        } else |_| {}
+    };
     return socket;
 }
 
@@ -197,15 +245,33 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
 /// socket to rooms, and anything may broadcast to a room. Safe from any task
 /// or thread of the runtime.
 ///
-/// A broadcast sends to every member in turn while holding the rooms' lock,
-/// so a member that has left (and whose handler has returned) is never sent
-/// to; a slow member slows the broadcast down. A member's send failing is
-/// that member's affair: its own `receive` sees the connection end.
+/// A broadcast takes a snapshot of the room's members under the lock and
+/// sends outside it, so a slow member holds up only the broadcasts that
+/// reach it, never another room's or a join or leave elsewhere. A member
+/// that leaves waits for the sends to it that are under way, so a socket is
+/// never sent to after its handler has left and returned. A member's send
+/// failing is that member's affair: its own `receive` sees the connection
+/// end.
 pub const Rooms = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    /// Over `rooms` and every member's `sends`; never held across I/O.
     mutex: std.Io.Mutex = .init,
-    rooms: std.StringHashMapUnmanaged(std.ArrayList(*Socket)) = .empty,
+    /// Signalled when a member that left has no sends left.
+    idle: std.Io.Condition = .init,
+    rooms: std.StringHashMapUnmanaged(std.ArrayList(*Member)) = .empty,
+
+    const Member = struct {
+        socket: *Socket,
+        /// Broadcasts sending to this member right now.
+        sends: u32 = 0,
+        /// Out of its room, waiting for `sends` to reach zero.
+        left: bool = false,
+    };
+
+    /// Members a broadcast snapshots on the stack; a bigger room borrows
+    /// from the allocator.
+    const stack_snapshot = 64;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Rooms {
         return .{ .allocator = allocator, .io = io };
@@ -215,6 +281,7 @@ pub const Rooms = struct {
         var it = self.rooms.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |m| self.allocator.destroy(m);
             entry.value_ptr.deinit(self.allocator);
         }
         self.rooms.deinit(self.allocator);
@@ -223,6 +290,9 @@ pub const Rooms = struct {
     /// Adds `socket` to `room`. Leave before the socket goes away:
     /// `defer rooms.leave(room, &ws)`.
     pub fn join(self: *Rooms, room: []const u8, socket: *Socket) !void {
+        const member = try self.allocator.create(Member);
+        errdefer self.allocator.destroy(member);
+        member.* = .{ .socket = socket };
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const entry = try self.rooms.getOrPut(self.allocator, room);
@@ -233,35 +303,73 @@ pub const Rooms = struct {
             };
             entry.value_ptr.* = .empty;
         }
-        try entry.value_ptr.append(self.allocator, socket);
+        try entry.value_ptr.append(self.allocator, member);
     }
 
+    /// Takes `socket` out of `room`, once any broadcast sending to it has
+    /// finished with it.
     pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const members = self.rooms.getPtr(room) orelse return;
-        for (members.items, 0..) |m, i| if (m == socket) {
-            _ = members.swapRemove(i);
-            break;
-        };
+        const member = for (members.items, 0..) |m, i| {
+            if (m.socket == socket) break members.swapRemove(i);
+        } else return;
         if (members.items.len == 0) {
             const key = self.rooms.getKey(room).?;
             members.deinit(self.allocator);
             _ = self.rooms.remove(room);
             self.allocator.free(key);
         }
+        member.left = true;
+        while (member.sends > 0) self.idle.waitUncancelable(self.io, &self.mutex);
+        self.allocator.destroy(member);
     }
 
     /// Sends one message to every member of `room` but `except`. Returns
-    /// how many it reached.
+    /// how many it reached. Members joining meanwhile are not sent to.
     pub fn broadcast(self: *Rooms, room: []const u8, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const members = self.rooms.get(room) orelse return 0;
+        var stack: [stack_snapshot]*Member = undefined;
+        var heap: []*Member = &.{};
+        defer self.allocator.free(heap);
+        const snapshot = snap: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const members = (self.rooms.get(room) orelse return 0).items;
+            const buf: []*Member = if (members.len <= stack.len) &stack else big: {
+                heap = self.allocator.alloc(*Member, members.len) catch {
+                    // No memory for a snapshot: send under the lock
+                    // instead, which only makes this broadcast hold up the
+                    // others.
+                    return sendAll(members, msg_type, data, except);
+                };
+                break :big heap;
+            };
+            var n: usize = 0;
+            for (members) |m| {
+                if (m.socket == except) continue;
+                m.sends += 1;
+                buf[n] = m;
+                n += 1;
+            }
+            break :snap buf[0..n];
+        };
         var reached: usize = 0;
-        for (members.items) |m| {
-            if (m == except) continue;
-            m.send(msg_type, data) catch continue;
+        for (snapshot) |m| {
+            if (m.socket.send(msg_type, data)) |_| reached += 1 else |_| {}
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            m.sends -= 1;
+            if (m.sends == 0 and m.left) self.idle.broadcast(self.io);
+        }
+        return reached;
+    }
+
+    fn sendAll(members: []const *Member, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
+        var reached: usize = 0;
+        for (members) |m| {
+            if (m.socket == except) continue;
+            m.socket.send(msg_type, data) catch continue;
             reached += 1;
         }
         return reached;
@@ -444,6 +552,7 @@ pub const H2Socket = struct {
 
 test {
     _ = @import("rooms_test.zig");
+    _ = @import("h1_test.zig");
     if (features.http2) _ = @import("h2_test.zig");
     if (features.compression) _ = @import("deflate.zig");
 }

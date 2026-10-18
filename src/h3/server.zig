@@ -1109,6 +1109,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .secure = true,
                     .version_major = 3,
                     .version_minor = 0,
+                    .drain = &server.draining,
                     ._timeout_context = &timer,
                     ._set_timeout = setTimeout,
                 };
