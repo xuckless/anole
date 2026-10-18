@@ -1,0 +1,36 @@
+name: Sanitizers
+
+# The bundled C libraries' own test suites, from the exact tarballs
+# build.zig.zon pins, under AddressSanitizer and UndefinedBehaviorSanitizer
+# (tools/sanitize-c-libs.sh). The pinned code changes only with a pin, so
+# this runs then, weekly (a newer compiler can find more), and on demand.
+# nghttp2 runs under the same sanitizers in the xuckless/nghttp2 fork's CI.
+on:
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [build.zig.zon, tools/sanitize-c-libs.sh, .github/workflows/sanitize.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  c-libs:
+    name: ASan and UBSan (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+      - name: tools/sanitize-c-libs.sh
+        run: tools/sanitize-c-libs.sh
+        env:
+          # LeakSanitizer runs on Linux only.
+          DETECT_LEAKS: ${{ runner.os == 'Linux' && '1' || '0' }}

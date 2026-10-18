@@ -11,8 +11,9 @@ build flag, so whatever you turn off is neither downloaded nor compiled.
 
 ## Status
 
-Pre-alpha. The dependency layer builds and passes its tests on macOS (arm64)
-and Linux (x86_64), and cross-compiles for aarch64 Linux:
+Pre-alpha, heading for a first 0.1.0 release (see
+[CHANGELOG.md](CHANGELOG.md)). Everything below builds and passes its tests
+on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
 
 - `anole.Server`: one call sets up the runtime (one pinned executor per core),
   the listeners, SIGINT/SIGTERM and a graceful drain;
@@ -25,7 +26,8 @@ and Linux (x86_64), and cross-compiles for aarch64 Linux:
   q-values, and decoding of compressed request bodies;
 - the PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies;
 - HTTPS through BoringSSL: TLS 1.3 and 1.2, ALPN, certificate verification,
-  mutual TLS, for both the server and dusty's HTTP client;
+  mutual TLS, session tickets and close_notify, for both the server and
+  dusty's HTTP client, whose own test suite (515 tests) passes on it;
 - HTTP/2 on nghttp2, over TLS (ALPN "h2") and cleartext (prior knowledge), on
   the same router and handlers, with streaming bodies, flow control and
   trailers; h2spec 2.6.0 passes every case in strict mode, over h2c and TLS;
@@ -59,8 +61,8 @@ and Linux (x86_64), and cross-compiles for aarch64 Linux:
   handshake and transfer loss and corruption, ECN, port and address
   rebinding, v2), and the 16 of them quic-go's client runs.
 
-0-RTT, connection migration and WebTransport are still to come, as is gRPC
-JSON transcoding.
+0-RTT, connection migration and WebTransport are still to come, as are gRPC
+JSON transcoding and hot certificate reload.
 Nothing is stable before 1.0.
 
 ## Requirements
@@ -156,9 +158,11 @@ the table shows the median run. Reproduce with `bench/run.sh`.
 | `-Dhttp2=bool` | false | true | true | nghttp2 |
 | `-Dhttp3=bool` | false | false | true | ngtcp2, nghttp3 |
 | `-Dcompression=bool` | false | true | true | zlib-ng, zstd |
-| `-Dgrpc=bool` | false | false | true | gRPC (not implemented yet) |
+| `-Dgrpc=bool` | false | false | true | gRPC, zig-protobuf (and protoc for codegen) |
 | `-Dwebsocket=bool` | false | true | true | WebSocket |
-| `-Dauth=bool` | false | true | true | auth (not implemented yet) |
+| `-Dauth=bool` | false | true | true | JWT, OIDC, CSRF, passwords, API keys, RBAC |
+| `-Djson=bool` | false | true | true | yyjson |
+| `-Dredis=bool` | false | false | true | hiredis (Redis/Valkey client, stores) |
 
 Constraints:
 
@@ -172,13 +176,33 @@ In code, the chosen flags are available as `anole.features`.
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#<commit>
+zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>
 ```
 
 ```zig
 const anole = b.dependency("anole", .{ .target = target, .optimize = optimize, .profile = .web });
 exe.root_module.addImport("anole", anole.module("anole"));
 ```
+
+Use the `git+https` form: Zig 0.17.0's `zig fetch` mishandles tarball URLs.
+For gRPC, generate code from your `.proto` files in your own build.zig with
+`@import("anole").addProtoGen(...)`; see [docs/grpc.md](docs/grpc.md).
+`tests/consumer` is a complete small project set up this way, and CI builds
+it from a fresh cache on every push.
+
+## Documentation
+
+- [docs/server.md](docs/server.md): `anole.Server`, listeners, TLS, HTTP/2,
+  HTTP/3, draining, restarts, socket activation, proxies.
+- [docs/routing.md](docs/routing.md): routes, middleware, requests and
+  responses, static files, compression, timeouts and limits.
+- [docs/websocket.md](docs/websocket.md), [docs/grpc.md](docs/grpc.md),
+  [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
+  [docs/observability.md](docs/observability.md).
+- Examples, each runnable with `zig build run-<name>`: `hello`, `io`,
+  `websocket`, `grpc`, `auth`, `clients`, `observe`.
+- [CHANGELOG.md](CHANGELOG.md) and [MAINTAINING.md](MAINTAINING.md) (pins,
+  forks, the Zig version, releases).
 
 ## Licence
 

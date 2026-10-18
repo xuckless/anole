@@ -151,6 +151,22 @@ jobs:
           path: ${{ runner.temp }}/interop/logs
           retention-days: 7
 
+  consumer:
+    name: A project that adds Anole with zig fetch (fresh cache)
+    # The commit must be fetchable from this repository, so pushes only.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          use-cache: false
+      - name: tests/consumer/run.sh
+        run: tests/consumer/run.sh "git+https://github.com/${{ github.repository }}#${{ github.sha }}"
+        env:
+          ANOLE_CONSUMER_FRESH_CACHE: "1"
+
   fuzz:
     name: Fuzz the parsers (200K runs per target)
     runs-on: ubuntu-latest

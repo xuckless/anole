@@ -278,6 +278,38 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_duplex.step);
     }
 
+    // examples/<name>: one per protocol or area, each built by `zig build
+    // test` when the flags include what it needs, and run with
+    // `zig build run-<name>`.
+    const Example = struct { name: []const u8, needs: bool, about: []const u8 };
+    const examples = [_]Example{
+        .{ .name = "websocket", .needs = features.websocket, .about = "WebSocket echo and a broadcast room" },
+        .{ .name = "grpc", .needs = features.grpc, .about = "a gRPC Greeter, also over gRPC-Web and Connect" },
+        .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
+        .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },
+        .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
+    };
+    for (examples) |ex| {
+        if (!ex.needs) continue;
+        const ex_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{ex.name})),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+        });
+        if (std.mem.eql(u8, ex.name, "grpc")) ex_mod.addImport("greeter_pb", b.createModule(.{
+            .root_source_file = b.path("examples/grpc/gen/greeter.pb.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "protobuf", .module = c_mods.protobuf.? }},
+        }));
+        const ex_exe = b.addExecutable(.{ .name = ex.name, .root_module = ex_mod });
+        test_step.dependOn(&ex_exe.step);
+        const run_ex = b.addRunArtifact(ex_exe);
+        run_ex.addPassthruArgs();
+        b.step(b.fmt("run-{s}", .{ex.name}), b.fmt("Run examples/{s}: {s}", .{ ex.name, ex.about })).dependOn(&run_ex.step);
+    }
+
     // examples/hello: dusty on zio, HTTP/1.1.
     const hello = b.addExecutable(.{
         .name = "hello",
@@ -411,7 +443,14 @@ pub fn build(b: *std.Build) void {
                 .destination_directory = b.path("tests/grpc/gen"),
                 .generator = dep.artifact("protoc-gen-zig"),
             });
+            const gen_example = pb.RunProtocStep.create(b, target, .{
+                .source_files = &.{b.path("examples/grpc/proto/greeter.proto")},
+                .include_directories = &.{b.path("examples/grpc/proto")},
+                .destination_directory = b.path("examples/grpc/gen"),
+                .generator = dep.artifact("protoc-gen-zig"),
+            });
             const gen = b.step("gen-proto", "Regenerate the Zig for Anole's .proto files (committed)");
+            gen.dependOn(gen_example.step);
             gen.dependOn(gen_health.step);
             gen.dependOn(gen_test.step);
             gen.dependOn(gen_interop.step);
