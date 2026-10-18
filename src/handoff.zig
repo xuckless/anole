@@ -34,18 +34,29 @@ pub const Inherited = struct {
 /// The sockets passed in by systemd or a predecessor: `LISTEN_PID` must
 /// be this process, `LISTEN_FDS` how many, starting at fd 3.
 pub fn inherited(environ: std.process.Environ) ?Inherited {
-    const pid_text = environ.getPosix("LISTEN_PID") orelse return null;
-    const pid = std.fmt.parseInt(c.pid_t, pid_text, 10) catch return null;
-    if (pid != c.getpid()) return null;
-    const count = std.fmt.parseInt(usize, environ.getPosix("LISTEN_FDS") orelse return null, 10) catch return null;
+    const out = parseListenEnv(
+        environ.getPosix("LISTEN_PID"),
+        environ.getPosix("LISTEN_FDS"),
+        environ.getPosix("LISTEN_FDNAMES"),
+        c.getpid(),
+    ) orelse return null;
+    // Ours now: not passed on to anything this process starts.
+    for (out.fds[0..out.count]) |fd| _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+    return out;
+}
+
+/// What `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` say to the process
+/// `self_pid`; the names are slices of `names_text`.
+fn parseListenEnv(pid_text: ?[]const u8, fds_text: ?[]const u8, names_text: ?[]const u8, self_pid: c.pid_t) ?Inherited {
+    const pid = std.fmt.parseInt(c.pid_t, pid_text orelse return null, 10) catch return null;
+    if (pid != self_pid) return null;
+    const count = std.fmt.parseInt(usize, fds_text orelse return null, 10) catch return null;
     if (count == 0 or count > max_listeners) return null;
     var out: Inherited = .{ .count = count };
-    var names = std.mem.splitScalar(u8, environ.getPosix("LISTEN_FDNAMES") orelse "", ':');
+    var names = std.mem.splitScalar(u8, names_text orelse "", ':');
     for (0..count) |i| {
         out.fds[i] = @intCast(3 + i);
         out.names[i] = names.next() orelse "";
-        // Ours now: not passed on to anything this process starts.
-        _ = c.fcntl(out.fds[i], c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
     }
     return out;
 }
@@ -256,4 +267,42 @@ test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
     const none: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{"PATH=/bin"} } };
     try std.testing.expect(inheritedSecret(none) == null);
     try std.testing.expect(!isSuccessor(none));
+}
+
+test "fuzz: LISTEN_PID, LISTEN_FDS and LISTEN_FDNAMES" {
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            // The three values, newline-separated; a missing one is unset.
+            var parts = std.mem.splitScalar(u8, input, '\n');
+            const pid = parts.next();
+            const fds = parts.next();
+            const names = parts.next();
+            const got = parseListenEnv(pid, fds, names, 4242) orelse return;
+            try std.testing.expectEqual(@as(c.pid_t, 4242), std.fmt.parseInt(c.pid_t, pid.?, 10) catch unreachable);
+            try std.testing.expect(got.count >= 1 and got.count <= max_listeners);
+            try std.testing.expectEqual(got.count, std.fmt.parseInt(usize, fds.?, 10) catch unreachable);
+            for (got.fds[0..got.count], got.names[0..got.count], 0..) |fd, name, i| {
+                try std.testing.expectEqual(@as(Fd, @intCast(3 + i)), fd);
+                try std.testing.expect(std.mem.indexOfScalar(u8, name, ':') == null);
+                // A name given twice finds the first.
+                const first = for (got.names[0..got.count], 0..) |n, j| {
+                    if (std.mem.eql(u8, n, name)) break j;
+                } else unreachable;
+                if (name.len > 0) try std.testing.expectEqual(@as(?Fd, got.fds[first]), got.find(name, 0));
+                if (first == i) try std.testing.expectEqual(@as(?Fd, fd), got.find(name, i));
+            }
+            // By position only when nothing is named.
+            const named = for (got.names[0..got.count]) |n| {
+                if (n.len > 0) break true;
+            } else false;
+            try std.testing.expectEqual(if (named) null else @as(?Fd, 3), got.find("\x00none", 0));
+        }
+    }.check, &.{
+        "4242\n2\nhttps:http",
+        "4242\n1",
+        "4242\n3\nhttp::",
+        "4243\n1\nhttp",
+        "4242\n9\n",
+        "+4242\n0x2\nhttp",
+    });
 }
