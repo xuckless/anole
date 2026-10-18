@@ -126,3 +126,54 @@ test "access log: text and JSON lines" {
     const text = try observe.access_log.format(arena_state.allocator(), .text, &req, 404, 7, 0, null);
     try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
 }
+
+fn relay(req: *dusty.Request, res: *dusty.Response) !void {
+    var buf: [55]u8 = undefined;
+    res.body = try res.arena.dupe(u8, observe.trace.outgoing(req, &buf) orelse "none");
+}
+
+fn tooBig(_: *dusty.Request, _: *dusty.Response) !void {
+    return error.BodyTooBig;
+}
+
+test "observe: an unsampled caller's context is passed on; error statuses as sent" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    // Never started: nothing here is recorded, or sent anywhere.
+    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .sample_all = false });
+    defer exporter.deinit();
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var http = try observe.metrics.HttpMetrics.init(&registry);
+    var tracing = observe.trace.Middleware.init(&exporter);
+
+    var app = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer app.deinit();
+    app.router.use(dusty.Middleware(void).init(&tracing));
+    app.router.use(dusty.Middleware(void).init(&http));
+    app.router.get("/relay", relay);
+    app.router.get("/big", tooBig);
+    registry.serveOn(void, &app.router, "/metrics");
+    var app_future = try io.concurrent(serve, .{&app});
+    defer app_future.cancel(io) catch {};
+    try app.ready.wait(io);
+    const port = app.address.ip.getPort();
+
+    var out: [8192]u8 = undefined;
+    // Not sampled by the caller, so not recorded, but passed on as it came.
+    const unsampled = try get(io, port, "GET /relay HTTP/1.1\r\nHost: x\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, unsampled, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"));
+    const sampled = try get(io, port, "GET /relay HTTP/1.1\r\nHost: x\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, sampled, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7") == null);
+    try std.testing.expect(std.mem.endsWith(u8, sampled, "-01"));
+    try std.testing.expect(std.mem.endsWith(u8, try get(io, port, "GET /relay HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out), "none"));
+
+    try std.testing.expect(std.mem.startsWith(u8, try get(io, port, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out), "HTTP/1.1 413"));
+    const metrics = try get(io, port, "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "route=\"/big\",status=\"413\"} 1") != null);
+}

@@ -63,10 +63,14 @@ fn randomHex(io: std.Io, out: []u8) void {
     }
 }
 
-/// The `traceparent` for a call made from within `req`'s span.
+/// The `traceparent` for a call made from within `req`'s span. Sampled,
+/// unless the request was not recorded and passes its caller's unsampled
+/// context on as it came.
 pub fn outgoing(req: *const dusty.Request, buf: *[55]u8) ?[]const u8 {
     if (req.trace_id.len != 32 or req.span_id.len != 16) return null;
-    return std.fmt.bufPrint(buf, "00-{s}-{s}-01", .{ req.trace_id, req.span_id }) catch null;
+    const passed_on = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;
+    const sampled = if (passed_on) |p| p.sampled or !std.mem.eql(u8, &p.span_id, req.span_id) else true;
+    return std.fmt.bufPrint(buf, "00-{s}-{s}-{s}", .{ req.trace_id, req.span_id, if (sampled) "01" else "00" }) catch null;
 }
 
 /// A finished span, as the exporter queues it.
@@ -199,7 +203,16 @@ pub const Middleware = struct {
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         const parent = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;
-        if (!self.exporter.options.sample_all) if (parent == null or !parent.?.sampled) return executor.next();
+        if (!self.exporter.options.sample_all) if (parent == null or !parent.?.sampled) {
+            // Not recorded here, but the caller's context still goes on to
+            // the calls this request makes, unchanged (W3C Trace Context:
+            // `outgoing` keeps its sampled flag).
+            if (parent) |p| {
+                req.trace_id = try req.arena.dupe(u8, &p.trace_id);
+                req.span_id = try req.arena.dupe(u8, &p.span_id);
+            }
+            return executor.next();
+        };
         var span: Span = undefined;
         if (parent) |p| span.trace_id = p.trace_id else randomHex(req.io, &span.trace_id);
         randomHex(req.io, &span.span_id);
@@ -220,7 +233,7 @@ pub const Middleware = struct {
         @memcpy(span.route[0..span.route_len], route[0..span.route_len]);
         const name = std.fmt.bufPrint(&span.name, "{s} {s}", .{ method, route[0..span.route_len] }) catch span.name[0..0];
         span.name_len = @intCast(name.len);
-        span.status_code = if (result) |_| @intCast(@backingInt(res.status)) else |_| 500;
+        span.status_code = @import("access_log.zig").statusOf(res, result);
         self.exporter.submit(span);
         return result;
     }

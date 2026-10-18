@@ -43,7 +43,9 @@ pub fn fromRequest(req: *dusty.Request) ?[]const u8 {
 }
 
 /// Requires a valid key: 401 without one. The owner is put in the
-/// request's session data as "api_key_owner" for handlers to read.
+/// request's session data as "api_key_owner" for handlers to read, for
+/// this request only: it is taken out again before a session middleware
+/// in front could save it into a cookie.
 pub const Middleware = struct {
     lookup: Lookup,
 
@@ -54,9 +56,14 @@ pub const Middleware = struct {
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         const key = fromRequest(req) orelse return unauthorized(res);
         const owner = (try self.lookup.lookup(self.lookup.ptr, req.arena, digest(key))) orelse return unauthorized(res);
+        const was_modified = req.session.modified;
         try req.session.set("api_key_owner", owner);
-        // Nothing to persist: an API-key request has no session cookie.
-        req.session.modified = false;
+        req.session.modified = was_modified;
+        defer {
+            const handler_modified = req.session.modified;
+            req.session.remove("api_key_owner");
+            req.session.modified = handler_modified;
+        }
         return executor.next();
     }
 

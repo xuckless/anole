@@ -21,6 +21,7 @@ const std = @import("std");
 const c = @import("anole_nghttp2_c");
 const features = @import("build_options");
 const tls = if (features.tls == .boringssl) @import("anole_dusty_tls") else struct {};
+const placement = @import("dusty").placement;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -106,8 +107,9 @@ pub const ClientConnection = struct {
             self.w = &self.tls_writer.interface;
         }
         try self.initSession();
-        try self.group.concurrent(io, readerLoop, .{self});
-        try self.group.concurrent(io, writerLoop, .{self});
+        // On the caller's executor, as every task of a connection is.
+        try placement.concurrent(&self.group, io, .local, readerLoop, .{self});
+        try placement.concurrent(&self.group, io, .local, writerLoop, .{self});
         return self;
     }
 

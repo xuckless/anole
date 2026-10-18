@@ -45,8 +45,9 @@ pub const CloseCode = WebSocket.CloseCode;
 pub const Client = dusty.WebSocketClient;
 
 pub const UpgradeOptions = struct {
-    /// The largest message `receive` assembles (after inflating); a bigger
-    /// one is answered with close 1009.
+    /// The largest message `receive` assembles (after inflating). A bigger
+    /// one fails `receive` with `error.MessageTooLarge`; over HTTP/2 the
+    /// peer also gets close 1009, over HTTP/1.1 the connection just ends.
     max_message_size: usize = WebSocket.default_max_message_size,
     /// Replaces the request's timeout once the socket is open: a socket
     /// outlives `timeout.request`. Set a deadline here, or call
@@ -403,6 +404,8 @@ pub const H2Socket = struct {
     }
 
     pub fn ping(self: *H2Socket, data: []const u8) !void {
+        // As over HTTP/1.1; the codec asserts it rather than failing.
+        if (data.len > codec.max_control_payload_len) return error.LargeControlFrame;
         try self.writeFrame(.ping, data);
     }
 

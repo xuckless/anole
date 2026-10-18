@@ -50,7 +50,8 @@ pub const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 /// side for response compression and request decoding.
 pub const compression = if (features.compression) @import("compression/root.zig") else struct {};
 
-/// dusty's RFC 6455 WebSocket over HTTP/1.1 (-Dwebsocket).
+/// WebSockets (-Dwebsocket): RFC 6455 over HTTP/1.1 (dusty's) and RFC 8441
+/// over HTTP/2 behind one `upgrade`, permessage-deflate, and `Rooms`.
 pub const websocket = if (features.websocket) @import("websocket/root.zig") else struct {};
 
 /// JSON on yyjson (-Djson): parse into and stringify Zig types.

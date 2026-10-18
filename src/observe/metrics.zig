@@ -4,7 +4,7 @@
 //!
 //!     var registry = anole.observe.metrics.Registry.init(gpa, io);
 //!     var http = try anole.observe.metrics.HttpMetrics.init(&registry);
-//!     app.use(http.middleware());
+//!     app.use(&http);
 //!     registry.serveOn(void, app.router, "/metrics");
 //!     const jobs = try registry.counter("jobs_total", "Jobs run.", &.{"queue"});
 //!     jobs.with(&.{"email"}).inc();
@@ -268,8 +268,8 @@ pub const HttpMetrics = struct {
         const method = std.fmt.bufPrint(&method_buf, "{f}", .{req.method}) catch "?";
         const route = if (req.route) |r| r.path else "unmatched";
         var status_buf: [4]u8 = undefined;
-        const status = std.fmt.bufPrint(&status_buf, "{d}", .{@backingInt(res.status)}) catch "?";
-        self.requests.with(&.{ method, route, if (result) |_| status else |_| "500" }).inc();
+        const status = std.fmt.bufPrint(&status_buf, "{d}", .{@import("access_log.zig").statusOf(res, result)}) catch "?";
+        self.requests.with(&.{ method, route, status }).inc();
         self.duration.with(&.{ method, route }).observe(seconds);
         return result;
     }
