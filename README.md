@@ -12,8 +12,7 @@ build flag, so whatever you turn off is neither downloaded nor compiled.
 ## Status
 
 Pre-alpha, Milestone 1. The dependency layer builds and passes its smoke tests
-on macOS (arm64), and cross-compiles and links for Linux (x86_64 and aarch64);
-the Linux test runs are pending CI:
+on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
 
 - an HTTP/1.1 server and router (dusty on zio), with a runnable hello world;
 - BoringSSL, with an in-memory TLS 1.3/1.2 handshake that negotiates ALPN;
