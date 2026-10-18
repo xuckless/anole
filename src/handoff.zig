@@ -15,7 +15,8 @@ const builtin = @import("builtin");
 const c = std.c;
 
 pub const Fd = std.posix.fd_t;
-pub const max_listeners = 8;
+/// Room for a few TCP listeners and an HTTP/3 socket per core.
+pub const max_listeners = 8 + 255;
 
 /// The listening sockets handed to this process, with their names.
 pub const Inherited = struct {
@@ -28,6 +29,27 @@ pub const Inherited = struct {
         for (self.names[0..self.count], 0..) |n, i| if (std.mem.eql(u8, n, name)) return self.fds[i];
         for (self.names[0..self.count]) |n| if (n.len > 0) return null;
         return if (index < self.count) self.fds[index] else null;
+    }
+
+    /// Every socket named `name`, in order, into `buf`; when none is
+    /// named, the ones from the `index`-th on. Several sockets of one
+    /// SO_REUSEPORT group (HTTP/3's, `h3`) come in the order their first
+    /// owner bound them in, which the predecessor keeps.
+    pub fn findAll(self: *const Inherited, name: []const u8, index: usize, buf: []Fd) []Fd {
+        var n: usize = 0;
+        for (self.names[0..self.count], self.fds[0..self.count]) |nm, fd| {
+            if (!std.mem.eql(u8, nm, name) or n == buf.len) continue;
+            buf[n] = fd;
+            n += 1;
+        }
+        if (n > 0) return buf[0..n];
+        for (self.names[0..self.count]) |nm| if (nm.len > 0) return buf[0..0];
+        for (self.fds[@min(index, self.count)..self.count]) |fd| {
+            if (n == buf.len) break;
+            buf[n] = fd;
+            n += 1;
+        }
+        return buf[0..n];
     }
 };
 
@@ -245,6 +267,28 @@ test "Inherited.find: by name, else by position" {
     plain.names[0] = "";
     plain.names[1] = "";
     try std.testing.expectEqual(@as(?Fd, 4), plain.find("https", 1));
+}
+
+test "Inherited.findAll: every socket of a name in order, else the rest by position" {
+    var named: Inherited = .{ .count = 5 };
+    const names = [_][]const u8{ "http", "h3", "https", "h3", "h3" };
+    for (0..5) |i| {
+        named.fds[i] = @intCast(3 + i);
+        named.names[i] = names[i];
+    }
+    var buf: [8]Fd = undefined;
+    try std.testing.expectEqualSlices(Fd, &.{ 4, 6, 7 }, named.findAll("h3", 2, &buf));
+    try std.testing.expectEqualSlices(Fd, &.{5}, named.findAll("https", 1, &buf));
+    try std.testing.expectEqualSlices(Fd, &.{}, named.findAll("grpc", 0, &buf));
+    var small: [2]Fd = undefined;
+    try std.testing.expectEqualSlices(Fd, &.{ 4, 6 }, named.findAll("h3", 2, &small));
+    var plain: Inherited = .{ .count = 4 };
+    for (0..4) |i| {
+        plain.fds[i] = @intCast(3 + i);
+        plain.names[i] = "";
+    }
+    try std.testing.expectEqualSlices(Fd, &.{ 5, 6 }, plain.findAll("h3", 2, &buf));
+    try std.testing.expectEqualSlices(Fd, &.{}, plain.findAll("h3", 4, &buf));
 }
 
 test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {

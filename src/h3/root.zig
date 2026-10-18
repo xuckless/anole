@@ -13,6 +13,9 @@ pub const nghttp3 = @import("nghttp3.zig");
 /// The HTTP/3 server endpoint for a dusty server's router.
 pub const Endpoint = @import("server.zig").Endpoint;
 pub const EndpointOptions = @import("server.zig").Options;
+/// An endpoint's counters (`Endpoint.stats`): packets handled, passed on
+/// between endpoints, connections accepted.
+pub const EndpointStats = @import("server.zig").Stats;
 /// Mutual TLS for an endpoint (`EndpointOptions.client_auth`).
 pub const ClientAuth = @import("quic_tls.zig").ClientAuth;
 /// A listener's TLS context; see `Endpoint.loadTls` and `Endpoint.useTls`.
@@ -197,5 +200,6 @@ test {
     _ = @import("net.zig");
     _ = @import("client_test.zig");
     _ = @import("steer.zig");
+    _ = @import("percore_test.zig");
     _ = @import("session_cache.zig");
 }

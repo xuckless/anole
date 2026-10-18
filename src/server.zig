@@ -157,6 +157,11 @@ pub const Options = struct {
         /// QUIC interop runner tests only: also speak "hq-interop"
         /// (HTTP/0.9), serving the files under this directory.
         hq_interop_root: ?[]const u8 = null,
+        /// UDP sockets on Linux, each served on an executor of its own,
+        /// with the kernel steering each connection's datagrams to its
+        /// socket: null for one per executor, as the TCP accept loops. At
+        /// most 255; macOS always uses one.
+        sockets: ?u16 = null,
     };
 
     pub const Https = struct {
@@ -527,10 +532,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     var client_ca: ?std.crypto.Certificate.Bundle = null;
                     defer if (client_ca) |*b| b.deinit(gpa);
                     if (https.client_auth) |ca| client_ca = try ca.ca.load(gpa, rt_io);
-                    // The UDP socket: inherited (`h3`, or by position after
-                    // the TCP listeners), with the predecessor's secret.
-                    const h3_fd: ?handoff.Fd = if (inherited) |inh| inh.find("h3", listeners.items.len) else null;
-                    const secret: ?[32]u8 = if (h3_fd != null) handoff.inheritedSecret(opts.process.?.environ) else null;
+                    // The UDP sockets: inherited (`h3`, in the order the
+                    // predecessor bound them, or by position after the TCP
+                    // listeners), with the predecessor's secret.
+                    var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
+                    const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.items.len, &h3_buf) else &.{};
+                    const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
                     const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
                         .address = try std.Io.net.IpAddress.parse(q.address orelse https.address, q.port orelse https.port),
                         .cert_pem = cert_state.?.pem.cert,
@@ -541,7 +548,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         .hq_interop_root = q.hq_interop_root,
                         .early_data = q.early_data,
                         .client_auth = h3ClientAuth(https.client_auth, client_ca),
-                        .fd = h3_fd,
+                        .fds = h3_fds,
+                        .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
                         .secret = secret,
                         // The same drain deadline as HTTP/1.1 and HTTP/2.
                         .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
@@ -558,7 +566,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         &.{"HTTP/3"}
                     else
                         try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
-                    if (handoff_mode) try held.append(a, .{ .fd = ep.udp.socket.handle, .name = "h3" });
+                    // Every socket, in the group's order.
+                    if (handoff_mode) for (ep.endpoints()) |e| try held.append(a, .{ .fd = e.udp.socket.handle, .name = "h3" });
                     if (q.alt_svc) {
                         const alt = self.alt_svc orelse self.addAltSvc();
                         self.alt_svc = alt;

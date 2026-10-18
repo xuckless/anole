@@ -1,14 +1,18 @@
 //! The HTTP/3 server: a QUIC endpoint on one UDP socket (ngtcp2), HTTP/3
 //! on each connection (nghttp3), and every request handed to the same
 //! router, middleware and `(req, res)` handlers as HTTP/1.1 and HTTP/2,
-//! through dusty's `Server.dispatch` with a sink-backed `Response`.
+//! through dusty's `Server.dispatch` with a sink-backed `Response`. On
+//! Linux a listener has one endpoint per executor, each on a socket of one
+//! SO_REUSEPORT group (`Endpoint`, `steer`).
 //!
 //! Tasks, all placed on the endpoint's executor (`placement .local`):
 //!
 //!   * the endpoint task: the only reader of the socket. It routes each
 //!     packet to its connection by destination connection ID, accepts new
 //!     connections (optionally after a Retry), and answers what belongs to
-//!     no connection (version negotiation, stateless reset);
+//!     no connection (version negotiation, stateless reset); it passes a
+//!     packet for another endpoint's connection on to that endpoint;
+//!   * the inbox task: handles what other endpoints pass on;
 //!   * one driver task per connection: writes the connection's packets,
 //!     runs its timers, and its closing and draining periods;
 //!   * one task per request: builds the `Request` and the `Response` and
@@ -38,6 +42,8 @@ const dusty_tls = @import("anole_dusty_tls");
 const net = @import("net.zig");
 const bridge = @import("bridge.zig");
 const early_data = @import("../early_data.zig");
+const steer = @import("steer.zig");
+const builtin = @import("builtin");
 const Addr = net.Addr;
 const CidKey = net.CidKey;
 const now = net.now;
@@ -53,8 +59,9 @@ const log = std.log.scoped(.anole_h3);
 const ReadError = @typeInfo(@typeInfo(@typeInfo(@FieldType(dusty.BodySource, "err")).pointer.child).@"fn".return_type.?).optional.child;
 const SendError = dusty.Response.SendError;
 
-/// Our connection IDs' length, as ngtcp2's examples use.
-const scid_len = 18;
+/// Our connection IDs' length, as ngtcp2's examples use; one byte of them
+/// names the endpoint (`steer`).
+const scid_len = steer.cid_len;
 /// Packets written per driver round (one send each).
 const burst = 10;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
@@ -91,9 +98,19 @@ pub const Options = struct {
     /// listener does. Handlers read the certificate with
     /// `Request.peerCertificate`.
     client_auth: ?quic_tls.ClientAuth = null,
+    /// UDP sockets, each served by an endpoint on an executor of its own:
+    /// on Linux several share `address` through SO_REUSEPORT, and the
+    /// kernel steers datagrams among them by connection ID (`Endpoint`).
+    /// Elsewhere always one. At most 255.
+    sockets: u16 = 1,
     /// Serve this UDP socket, opened elsewhere (systemd, or the process
     /// this one replaces), instead of binding `address`.
     fd: ?std.posix.fd_t = null,
+    /// Or these: one SO_REUSEPORT group's sockets, in the order they were
+    /// bound in (a predecessor passes them so). `sockets` is then their
+    /// count. Sockets in another order still work, through the endpoints
+    /// passing packets on to each other, only slower.
+    fds: []const std.posix.fd_t = &.{},
     /// The key for stateless reset and address validation tokens; random
     /// when null. A process that takes over the socket gets its
     /// predecessor's, so the predecessor's clients accept the stateless
@@ -148,7 +165,41 @@ fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, buf: *[
     return buf[0..len];
 }
 
-/// One HTTP/3 listener, serving `server`'s router.
+/// Packets waiting in an endpoint's inbox at most (`Endpoint.forward`);
+/// more are dropped, which QUIC takes as loss.
+const inbox_len = 256;
+
+/// One endpoint's counters. Several endpoints serve one listener on Linux
+/// (`Options.sockets`); these show how the kernel's steering does.
+pub const Stats = struct {
+    /// Packets this endpoint handled: from its own socket, and passed on to
+    /// it by another endpoint (`forwarded_in`).
+    packets: std.atomic.Value(u64) = .init(0),
+    /// Of those, the ones another endpoint's socket received.
+    forwarded_in: std.atomic.Value(u64) = .init(0),
+    /// Packets this endpoint's socket received for another endpoint's
+    /// connection, and passed on to it.
+    forwarded_out: std.atomic.Value(u64) = .init(0),
+    /// Packets for another endpoint dropped: its inbox was full, or it had
+    /// stopped.
+    dropped: std.atomic.Value(u64) = .init(0),
+    /// Connections accepted.
+    accepted: std.atomic.Value(u64) = .init(0),
+    /// Packets handled on another thread than the endpoint's own: always
+    /// zero; counted in test builds only.
+    foreign: std.atomic.Value(u64) = .init(0),
+};
+
+/// One HTTP/3 listener, serving `server`'s router: one endpoint per UDP
+/// socket. On Linux a listener may have several (`Options.sockets`), each
+/// bound to the same address with SO_REUSEPORT and served by an endpoint on
+/// an executor of its own, so HTTP/3 uses every core as TCP does. The
+/// kernel steers each datagram to the socket whose endpoint owns its
+/// connection, by a byte of the connection ID (`steer`); a datagram that
+/// lands on another endpoint's socket all the same is passed on to the
+/// owner's inbox and handled there, never where it landed. `init` returns
+/// the first endpoint, which owns the others: `run`, `deinit`, `handOver`,
+/// `loadTls`, `useTls` and `address` act on the whole listener through it.
 pub fn Endpoint(comptime Ctx: type) type {
     return struct {
         const Self = @This();
@@ -159,25 +210,24 @@ pub fn Endpoint(comptime Ctx: type) type {
         http: *HttpServer,
         options: Options,
         udp: net.Udp,
-        /// The local address of the datagram the endpoint task is handling
-        /// (wildcard binds only), for its stateless replies.
-        reply_from: ?std.Io.net.IpAddress = null,
         local: Addr,
-        /// What new connections handshake with; `useTls` replaces it, so
-        /// it is read under `tls_lock` (`newTlsSession`).
-        tls: quic_tls.Context,
-        tls_lock: std.atomic.Mutex = .unlocked,
-        /// Keys stateless reset tokens and address validation tokens.
+        /// This endpoint's place among the listener's: its socket's index in
+        /// the reuseport group (the order they were bound in), the executor
+        /// it runs on (modulo their count), and the byte its connection IDs
+        /// carry when there are several.
+        index: u8,
+        /// What the listener's endpoints share.
+        shared: *Shared,
+        /// Keys stateless reset tokens and address validation tokens: the
+        /// same in every endpoint of the listener.
         secret: [32]u8,
-        /// The connection IDs in use, ours and the clients' first ones.
+        /// The connection IDs in use, ours and the clients' first ones: this
+        /// endpoint's connections only.
         map_mutex: std.Io.Mutex = .init,
         conns: std.AutoHashMapUnmanaged(CidKey, *Conn) = .empty,
         /// The connections' driver tasks.
         group: std.Io.Group = .init,
         draining: bool = false,
-        /// The socket goes to another process: close every connection at
-        /// once and stop reading (see `handOver`).
-        hand_over: std.atomic.Value(bool) = .init(false),
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
@@ -187,16 +237,100 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// (GET, HEAD, OPTIONS), and held until it had (the rest).
         early_served: std.atomic.Value(u64) = .init(0),
         early_held: std.atomic.Value(u64) = .init(0),
+        /// Packets other endpoints' sockets received for this one's
+        /// connections, handled by a task of this endpoint's.
+        inbox: std.Io.Queue(*Forwarded),
+        inbox_buf: [inbox_len]*Forwarded = undefined,
+        /// What the socket is read into.
+        rx: []u8,
+        stats: Stats = .{},
+        /// The thread serving the endpoint, in test builds (`Stats.foreign`).
+        thread: ?std.Thread.Id = null,
 
+        /// What a listener's endpoints share; the first endpoint owns it.
+        const Shared = struct {
+            /// In socket order: `endpoints[i].index == i`.
+            endpoints: []*Self,
+            /// What new connections handshake with, on every endpoint, so a
+            /// session ticket from one resumes (with 0-RTT) on any other;
+            /// `useTls` replaces it, so it is read under `tls_lock`
+            /// (`newTlsSession`).
+            tls: quic_tls.Context,
+            tls_lock: std.atomic.Mutex = .unlocked,
+            /// The sockets go to another process: close every connection at
+            /// once and stop reading (see `handOver`).
+            hand_over: std.atomic.Value(bool) = .init(false),
+        };
+
+        /// A datagram passed from the endpoint whose socket received it to
+        /// the one that owns its connection.
+        const Forwarded = struct {
+            from: std.Io.net.IpAddress,
+            local: ?std.Io.net.IpAddress,
+            ecn: u8,
+            data: []u8,
+        };
+
+        /// The listener: its endpoints, their sockets bound (or adopted) in
+        /// order, and the steering program on them. Returns the first.
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
+            const inherited: []const std.posix.fd_t = if (options.fd) |*fd| fd[0..1] else options.fds;
+            const count: usize = if (inherited.len > 0)
+                inherited.len
+            else if (builtin.os.tag == .linux) options.sockets else 1;
+            if (count == 0 or count > steer.max_sockets) return error.InvalidSocketCount;
+
+            const shared = try gpa.create(Shared);
+            errdefer gpa.destroy(shared);
+            shared.* = .{ .endpoints = try gpa.alloc(*Self, count), .tls = undefined };
+            errdefer gpa.free(shared.endpoints);
+            shared.tls = try newTlsContext(options);
+            errdefer shared.tls.deinit();
+            var secret: [32]u8 = undefined;
+            if (options.secret) |s| secret = s else io.random(&secret);
+
+            // Several sockets share the port: none but ours may be on it
+            // already. An inherited group is ours.
+            if (inherited.len == 0 and count > 1) try net.checkUdpAddressFree(options.address);
+            var made: usize = 0;
+            errdefer for (shared.endpoints[0..made]) |ep| ep.deinitOne();
+            var bind_to = options.address;
+            for (0..count) |i| {
+                const socket = if (inherited.len > 0)
+                    try adoptSocket(io, inherited[i], options.address)
+                else if (count == 1)
+                    try bind_to.bind(io, .{ .mode = .dgram, .protocol = .udp })
+                else
+                    try bindMember(io, bind_to);
+                shared.endpoints[i] = initOne(gpa, io, http, options, socket, @intCast(i), shared, secret) catch |err| {
+                    socket.close(io);
+                    return err;
+                };
+                made += 1;
+                // The port the first got, when 0 was asked for.
+                bind_to = socket.address;
+            }
+            // The group numbers its sockets in bind order, as we did, so
+            // the program's index is the endpoint's. Inherited sockets keep
+            // the order their first owner bound them in.
+            if (count > 1) steer.attach(shared.endpoints[0].udp.socket.handle, @intCast(count)) catch
+                log.warn("HTTP/3: no connection-ID steering (classic BPF on SO_REUSEPORT needs Linux 4.5+); the {d} endpoints pass packets on to each other instead", .{count});
+            net.rand_io = io;
+            return shared.endpoints[0];
+        }
+
+        /// One more socket of the group, SO_REUSEPORT, as zio wants it.
+        fn bindMember(io: std.Io, at: std.Io.net.IpAddress) !std.Io.net.Socket {
+            const fd = try net.bindReusePort(at);
+            return adoptSocket(io, fd, at) catch |err| {
+                _ = std.c.close(fd);
+                return err;
+            };
+        }
+
+        fn initOne(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options, socket: std.Io.net.Socket, index: u8, shared: *Shared, secret: [32]u8) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tls = try newTlsContext(options);
-            errdefer tls.deinit();
-            const socket = if (options.fd) |fd|
-                try adoptSocket(io, fd, options.address)
-            else
-                try options.address.bind(io, .{ .mode = .dgram, .protocol = .udp });
             self.* = .{
                 .gpa = gpa,
                 .io = io,
@@ -204,12 +338,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .options = options,
                 .udp = .init(socket),
                 .local = .from(socket.address),
-                .tls = tls,
-                .secret = undefined,
+                .index = index,
+                .shared = shared,
+                .secret = secret,
                 .listener = .{ .address = .{ .ip = socket.address } },
+                .inbox = undefined,
+                .rx = try gpa.alloc(u8, max_datagram),
             };
-            if (options.secret) |secret| self.secret = secret else io.random(&self.secret);
-            net.rand_io = io;
+            self.inbox = .init(&self.inbox_buf);
             return self;
         }
 
@@ -236,20 +372,39 @@ pub fn Endpoint(comptime Ctx: type) type {
             return .{ .handle = fd, .address = bound };
         }
 
-        /// For a restart that passes the socket to a new process: when
+        /// For a restart that passes the sockets to a new process: when
         /// `run` is canceled next, every connection gets a final GOAWAY and
-        /// a CONNECTION_CLOSE at once, and the endpoint stops reading, so
+        /// a CONNECTION_CLOSE at once, and the endpoints stop reading, so
         /// every datagram goes to the new process. Requests in flight are
         /// cut. Safe from any task or thread.
         pub fn handOver(self: *Self) void {
-            self.hand_over.store(true, .release);
+            self.shared.hand_over.store(true, .release);
         }
 
+        /// The whole listener; on the first endpoint, once `run` is over.
         pub fn deinit(self: *Self) void {
+            const shared = self.shared;
+            const gpa = self.gpa;
+            for (shared.endpoints) |ep| ep.deinitOne();
+            shared.tls.deinit();
+            gpa.free(shared.endpoints);
+            gpa.destroy(shared);
+        }
+
+        fn deinitOne(self: *Self) void {
             self.udp.socket.close(self.io);
             self.conns.deinit(self.gpa);
-            self.tls.deinit();
+            // What other endpoints passed on after this one stopped.
+            var left: [1]*Forwarded = undefined;
+            while ((self.inbox.getUncancelable(self.io, &left, 0) catch 0) == 1) self.freeForwarded(left[0]);
+            self.gpa.free(self.rx);
             self.gpa.destroy(self);
+        }
+
+        /// The listener's endpoints, in socket order (`sockets` of them):
+        /// their sockets, to hand to a successor, and their `stats`.
+        pub fn endpoints(self: *const Self) []const *Self {
+            return self.shared.endpoints;
         }
 
         /// The TLS context for `options`, with session ticket keys of its
@@ -279,49 +434,77 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         /// A certificate reload, second step: connections that start from
-        /// now on handshake with `tls`, which takes over the session ticket
-        /// keys, so tickets issued before still resume. Connections already
-        /// open keep the context they started with (each `SSL` holds a
-        /// reference to it). Safe from any task or thread.
+        /// now on, on every endpoint of the listener, handshake with `tls`,
+        /// which takes over the session ticket keys, so tickets issued
+        /// before still resume. Connections already open keep the context
+        /// they started with (each `SSL` holds a reference to it). Safe from
+        /// any task or thread.
         pub fn useTls(self: *Self, tls: quic_tls.Context) void {
-            self.lockTls();
-            dusty_tls.carryTicketKeys(tls.ctx, self.tls.ctx);
-            var old = self.tls;
-            self.tls = tls;
-            self.tls_lock.unlock();
+            const shared = self.shared;
+            lockTls(shared);
+            dusty_tls.carryTicketKeys(tls.ctx, shared.tls.ctx);
+            var old = shared.tls;
+            shared.tls = tls;
+            shared.tls_lock.unlock();
             old.deinit();
         }
 
-        fn lockTls(self: *Self) void {
-            while (!self.tls_lock.tryLock()) std.atomic.spinLoopHint();
+        fn lockTls(shared: *Shared) void {
+            while (!shared.tls_lock.tryLock()) std.atomic.spinLoopHint();
         }
 
         /// A server `SSL` for a new connection, from the context in place.
         fn newTlsSession(self: *Self, conn_ref: *c.ngtcp2_crypto_conn_ref) !*c.SSL {
-            self.lockTls();
-            var tls = self.tls;
+            const shared = self.shared;
+            lockTls(shared);
+            var tls = shared.tls;
             // A reference of our own, so a reload cannot free it between
             // here and `SSL_new`, which takes the `SSL`'s.
             _ = c.SSL_CTX_up_ref(tls.ctx);
-            self.tls_lock.unlock();
+            shared.tls_lock.unlock();
             defer tls.deinit();
             return tls.newSession(conn_ref);
         }
 
-        /// The bound address (the real port when 0 was asked for).
+        /// A connection ID of ours, new: random, and with several endpoints
+        /// this one's index in the byte the kernel steers by (`steer`).
+        fn newCid(self: *const Self, bytes: []u8) void {
+            self.io.random(bytes);
+            if (self.shared.endpoints.len > 1 and bytes.len > steer.index_byte) bytes[steer.index_byte] = self.index;
+        }
+
+        /// The bound address (the real port when 0 was asked for); the
+        /// same for every endpoint of the listener.
         pub fn address(self: *const Self) std.Io.net.IpAddress {
             return self.udp.socket.address;
         }
 
         /// Serves until canceled, then drains: every connection gets a
         /// GOAWAY, requests in flight finish (within `drain_timeout_ms`),
-        /// and the connections close.
+        /// and the connections close. Every endpoint of the listener, each
+        /// on its executor; call it on the first.
         pub fn run(self: *Self) !void {
-            const buf = try self.gpa.alloc(u8, max_datagram);
-            defer self.gpa.free(buf);
+            const io = self.io;
+            var group: std.Io.Group = .init;
+            for (self.shared.endpoints) |ep| placement.concurrent(&group, io, .{ .executor = ep.index }, serve, .{ep}) catch |err| {
+                group.cancel(io);
+                return err;
+            };
+            // Canceled: the endpoints have drained by the time it returns.
+            group.await(io) catch io.recancel();
+        }
+
+        /// One endpoint, on its executor: reads its socket, and its inbox
+        /// in a task beside it.
+        fn serve(self: *Self) std.Io.Cancelable!void {
+            const io = self.io;
+            if (builtin.is_test) self.thread = std.Thread.getCurrentId();
+            var reader: std.Io.Group = .init;
+            // Without the task, packets passed on to it are dropped.
+            placement.concurrent(&reader, io, .local, readInbox, .{self}) catch self.inbox.close(io);
             var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
             while (true) {
-                var dg = self.udp.receive(self.io, buf, &control, .none) catch |err| switch (err) {
+                var dg = self.udp.receive(io, self.rx, &control, .none) catch |err| switch (err) {
                     error.Canceled => break,
                     else => {
                         log.debug("receive: {t}", .{err});
@@ -330,20 +513,69 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
                 self.onDatagram(&dg);
             }
-            self.shutdown(buf, &control);
+            self.shutdown(&control);
+            self.inbox.close(io);
+            reader.cancel(io);
+        }
+
+        /// Handles what other endpoints pass on, until the inbox closes.
+        fn readInbox(self: *Self) std.Io.Cancelable!void {
+            while (true) {
+                const f = self.inbox.getOne(self.io) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.Closed => return,
+                };
+                defer self.freeForwarded(f);
+                _ = self.stats.forwarded_in.fetchAdd(1, .monotonic);
+                self.onPacket(f.from, f.local, f.ecn, f.data);
+            }
+        }
+
+        fn freeForwarded(self: *Self, f: *Forwarded) void {
+            self.gpa.free(f.data);
+            self.gpa.destroy(f);
+        }
+
+        /// The endpoint that owns the connection `packet`'s destination
+        /// connection ID names, when that is another one: the steering
+        /// program's rule, so user space and the kernel agree.
+        fn owner(self: *const Self, packet: []const u8) ?*Self {
+            const eps = self.shared.endpoints;
+            if (eps.len < 2) return null;
+            const i = steer.indexOf(packet, eps.len) orelse return null;
+            return if (i == self.index) null else eps[i];
+        }
+
+        /// Passes a packet to the endpoint that owns its connection: it
+        /// landed here because the kernel had no program to steer by, or a
+        /// GRO batch began with another connection's packet, or a client
+        /// moved before the program could see its new ID.
+        fn forward(self: *Self, to: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []const u8) void {
+            const f = self.gpa.create(Forwarded) catch return self.dropForwarded(null);
+            f.* = .{ .from = from, .local = local, .ecn = ecn, .data = self.gpa.dupe(u8, data) catch {
+                self.gpa.destroy(f);
+                return self.dropForwarded(null);
+            } };
+            // Never waits: a full inbox drops it, as a full socket would.
+            const n = to.inbox.putUncancelable(self.io, &.{f}, 0) catch 0;
+            if (n == 0) return self.dropForwarded(f);
+            _ = self.stats.forwarded_out.fetchAdd(1, .monotonic);
+        }
+
+        fn dropForwarded(self: *Self, f: ?*Forwarded) void {
+            if (f) |p| self.freeForwarded(p);
+            _ = self.stats.dropped.fetchAdd(1, .monotonic);
         }
 
         fn onDatagram(self: *Self, dg: *net.Udp.Datagram) void {
-            self.reply_from = dg.local;
-            defer self.reply_from = null;
             while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data);
         }
 
-        fn shutdown(self: *Self, buf: []u8, control: *align(std.Io.net.cmsg_align) net.Udp.Control) void {
+        fn shutdown(self: *Self, control: *align(std.Io.net.cmsg_align) net.Udp.Control) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
             self.draining = true;
-            if (self.hand_over.load(.acquire)) {
+            if (self.shared.hand_over.load(.acquire)) {
                 // Not another read: what arrives now is the new process's.
                 const conns = self.liveConns();
                 for (conns) |conn| {
@@ -361,14 +593,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
             self.gpa.free(live);
             // Keep reading: the connections need the peers' ACKs and
-            // requests to finish.
+            // requests to finish. Until every endpoint's are done, since
+            // packets for another's may land on this socket.
             const deadline = now(self.io) + @as(u64, self.options.drain_timeout_ms) * std.time.ns_per_ms;
             while (now(self.io) < deadline) {
-                self.map_mutex.lockUncancelable(self.io);
-                const remaining = self.conns.count();
-                self.map_mutex.unlock(self.io);
-                if (remaining == 0) break;
-                var dg = self.udp.receive(self.io, buf, control, .{ .duration = .{
+                if (self.listenerIdle()) break;
+                var dg = self.udp.receive(self.io, self.rx, control, .{ .duration = .{
                     .raw = .fromMilliseconds(50),
                     .clock = .awake,
                 } }) catch continue;
@@ -382,6 +612,17 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
             self.gpa.free(left);
             self.group.cancel(self.io);
+        }
+
+        /// No endpoint of the listener has a connection left.
+        fn listenerIdle(self: *Self) bool {
+            for (self.shared.endpoints) |ep| {
+                ep.map_mutex.lockUncancelable(self.io);
+                const remaining = ep.conns.count();
+                ep.map_mutex.unlock(self.io);
+                if (remaining > 0) return false;
+            }
+            return true;
         }
 
         /// Each live connection once, with a reference each.
@@ -418,23 +659,32 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = self.conns.remove(key);
         }
 
-        /// A stateless reply from the endpoint task.
-        fn send(self: *Self, to: std.Io.net.IpAddress, data: []const u8) void {
-            self.udp.send(self.io, to, self.reply_from, 0, data, data.len);
+        /// A stateless reply, from `from` (a wildcard socket's address the
+        /// packet answered was sent to).
+        fn send(self: *Self, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, data: []const u8) void {
+            self.udp.send(self.io, to, from, 0, data, data.len);
         }
 
         // -- Packets in ------------------------------------------------------
 
+        /// One packet, from this endpoint's socket or passed on to it. The
+        /// endpoint task and its inbox task both call it, on one executor,
+        /// so it keeps nothing in the endpoint across a yield.
         fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
             var vc: c.ngtcp2_version_cid = undefined;
             switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, scid_len)) {
                 0 => {},
                 c.NGTCP2_ERR_VERSION_NEGOTIATION => {
-                    self.sendVersionNegotiation(from, &vc);
+                    self.sendVersionNegotiation(from, local, &vc);
                     return;
                 },
                 else => return,
             }
+            if (self.owner(data)) |ep| return self.forward(ep, from, local, ecn, data);
+            _ = self.stats.packets.fetchAdd(1, .monotonic);
+            if (builtin.is_test) if (self.thread) |t| if (t != std.Thread.getCurrentId()) {
+                _ = self.stats.foreign.fetchAdd(1, .monotonic);
+            };
             const remote: Addr = .from(from);
             if (self.lookup(.of(vc.dcid[0..vc.dcidlen]))) |conn| {
                 defer conn.unref();
@@ -452,7 +702,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // A short-header packet for a connection we do not know:
                 // tell the peer it is gone, if it is long enough to be one.
                 if (data[0] & 0x80 == 0 and data.len >= scid_len + 21)
-                    self.sendStatelessReset(remote.ip(), data.len, vc.dcid[0..vc.dcidlen]);
+                    self.sendStatelessReset(remote.ip(), local, data.len, vc.dcid[0..vc.dcidlen]);
                 return;
             }
 
@@ -460,9 +710,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             var pocid: ?*c.ngtcp2_cid = null;
             var token_type: c.ngtcp2_token_type = c.NGTCP2_TOKEN_TYPE_UNKNOWN;
             if (self.options.validate_address or hd.tokenlen > 0) {
-                if (hd.tokenlen == 0) return self.sendRetry(&hd, remote, data.len * 3);
+                if (hd.tokenlen == 0) return self.sendRetry(&hd, remote, local, data.len * 3);
                 if (hd.token[0] != c.NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2 and hd.dcid.datalen < c.NGTCP2_MIN_INITIAL_DCIDLEN)
-                    return self.sendStatelessClose(&hd, remote);
+                    return self.sendStatelessClose(&hd, remote, local);
                 switch (hd.token[0]) {
                     c.NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2 => {
                         const rv = c.ngtcp2_crypto_verify_retry_token2(&ocid, hd.token, hd.tokenlen, &self.secret, self.secret.len, hd.version, @ptrCast(&remote.storage), remote.len, &hd.dcid, 10 * c.NGTCP2_SECONDS, wallClock(self.io));
@@ -470,7 +720,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             pocid = &ocid;
                             token_type = c.NGTCP2_TOKEN_TYPE_RETRY;
                         } else if (rv == c.NGTCP2_CRYPTO_ERR_VERIFY_TOKEN or self.options.validate_address) {
-                            return self.sendStatelessClose(&hd, remote);
+                            return self.sendStatelessClose(&hd, remote, local);
                         } else {
                             hd.token = null;
                             hd.tokenlen = 0;
@@ -480,14 +730,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                         if (c.ngtcp2_crypto_verify_regular_token(hd.token, hd.tokenlen, &self.secret, self.secret.len, @ptrCast(&remote.storage), remote.len, 3600 * c.NGTCP2_SECONDS, wallClock(self.io)) == 0) {
                             token_type = c.NGTCP2_TOKEN_TYPE_NEW_TOKEN;
                         } else if (self.options.validate_address) {
-                            return self.sendRetry(&hd, remote, data.len * 3);
+                            return self.sendRetry(&hd, remote, local, data.len * 3);
                         } else {
                             hd.token = null;
                             hd.tokenlen = 0;
                         }
                     },
                     else => {
-                        if (self.options.validate_address) return self.sendRetry(&hd, remote, data.len * 3);
+                        if (self.options.validate_address) return self.sendRetry(&hd, remote, local, data.len * 3);
                         hd.token = null;
                         hd.tokenlen = 0;
                     },
@@ -505,7 +755,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), &pi, data, now(self.io));
             if (rv != 0) {
                 conn.unlock();
-                if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, data.len * 3);
+                if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, local, data.len * 3);
                 conn.destroy();
                 return;
             }
@@ -525,40 +775,42 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.destroy();
                 return;
             };
+            _ = self.stats.accepted.fetchAdd(1, .monotonic);
         }
 
-        fn sendVersionNegotiation(self: *Self, to: std.Io.net.IpAddress, vc: *const c.ngtcp2_version_cid) void {
+        fn sendVersionNegotiation(self: *Self, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, vc: *const c.ngtcp2_version_cid) void {
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             var unused: [1]u8 = undefined;
             self.io.random(&unused);
             // A reserved version (RFC 9000 §15) first, as greasing.
             const versions = [_]u32{ (vc.version & 0xf0f0f0f0) | 0x0a0a0a0a, c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
             const n = c.ngtcp2_pkt_write_version_negotiation(&buf, buf.len, unused[0], vc.scid, vc.scidlen, vc.dcid, vc.dcidlen, &versions, versions.len);
-            if (n > 0) self.send(to, buf[0..@intCast(n)]);
+            if (n > 0) self.send(to, from, buf[0..@intCast(n)]);
         }
 
-        fn sendRetry(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote_in: Addr, max_len: usize) void {
+        fn sendRetry(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote_in: Addr, from: ?std.Io.net.IpAddress, max_len: usize) void {
             var remote = remote_in;
             var scid: c.ngtcp2_cid = undefined;
             scid.datalen = scid_len;
-            self.io.random(scid.data[0..scid_len]);
+            // Ours, so the Initial that answers it comes back here.
+            self.newCid(scid.data[0..scid_len]);
             var token: [c.NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2]u8 = undefined;
             const token_len = c.ngtcp2_crypto_generate_retry_token2(&token, &self.secret, self.secret.len, chd.version, @ptrCast(&remote.storage), remote.len, &scid, &chd.dcid, wallClock(self.io));
             if (token_len < 0) return;
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             const n = c.ngtcp2_crypto_write_retry(&buf, @min(buf.len, max_len), chd.version, &chd.scid, &scid, &chd.dcid, &token, @intCast(token_len));
-            if (n > 0) self.send(remote.ip(), buf[0..@intCast(n)]);
+            if (n > 0) self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
-        fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr) void {
+        fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr, from: ?std.Io.net.IpAddress) void {
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             const n = c.ngtcp2_crypto_write_connection_close(&buf, buf.len, chd.version, &chd.scid, &chd.dcid, c.NGTCP2_INVALID_TOKEN, null, 0);
-            if (n > 0) self.send(remote.ip(), buf[0..@intCast(n)]);
+            if (n > 0) self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
         /// At most `NGTCP2_STATELESS_RESET_BURST` a second, so the endpoint
         /// cannot be made to amplify a flood of garbage.
-        fn sendStatelessReset(self: *Self, to: std.Io.net.IpAddress, pkt_len: usize, dcid: []const u8) void {
+        fn sendStatelessReset(self: *Self, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, pkt_len: usize, dcid: []const u8) void {
             const t = now(self.io);
             if (t -% self.reset_window >= std.time.ns_per_s) {
                 self.reset_window = t;
@@ -578,7 +830,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             self.io.random(rand[0..rand_len]);
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             const n = c.ngtcp2_pkt_write_stateless_reset2(&buf, buf.len, &token, &rand, rand_len);
-            if (n > 0) self.send(to, buf[0..@intCast(n)]);
+            if (n > 0) self.send(to, from, buf[0..@intCast(n)]);
         }
 
         // -- A connection ----------------------------------------------------
@@ -634,7 +886,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
                 c.ngtcp2_ccerr_default(&conn.last_error);
                 conn.scid.datalen = scid_len;
-                ep.io.random(conn.scid.data[0..scid_len]);
+                ep.newCid(conn.scid.data[0..scid_len]);
 
                 var settings: ngtcp2.Settings = undefined;
                 ngtcp2.settingsDefault(&settings);
@@ -1879,7 +2131,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onGetNewConnectionId(_: ?*c.ngtcp2_conn, cid: [*c]c.ngtcp2_cid, token: [*c]c.ngtcp2_stateless_reset_token, len: usize, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const ep = conn.ep;
-            ep.io.random(cid.*.data[0..len]);
+            ep.newCid(cid.*.data[0..len]);
             cid.*.datalen = len;
             if (c.ngtcp2_crypto_generate_stateless_reset_token(&token.*.data, &ep.secret, ep.secret.len, cid) != 0)
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
@@ -2062,7 +2314,6 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
     };
 }
-
 
 test "0-RTT context: the same for the same settings, different when a limit or a SETTINGS value changes" {
     const Ctx = struct {
