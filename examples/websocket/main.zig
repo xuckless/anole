@@ -150,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
     }, &state);
     defer app.deinit();
     // The rooms take the runtime's Io, which exists once the server does.
-    state = .{ .rooms = .init(init.gpa, app.io()) };
+    state = .{ .rooms = .init(init.gpa) };
     defer state.rooms.deinit();
 
     app.use(anole.middleware.Logger.init());

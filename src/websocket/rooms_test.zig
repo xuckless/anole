@@ -31,7 +31,7 @@ test "Rooms: a message to the room reaches every member" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    rooms = .init(gpa, io);
+    rooms = .init(gpa);
     defer rooms.deinit();
 
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
@@ -102,7 +102,7 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa, io);
+    var r: websocket.Rooms = .init(gpa);
     defer r.deinit();
 
     var stalled: Stalled = undefined;
@@ -112,6 +112,10 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
     other.init(gpa, io);
     defer other.ws.deinit();
     other.release.set(io); // never stalls
+
+    // Made without an Io: before the first join, every room is empty.
+    try std.testing.expectEqual(@as(usize, 0), r.broadcast("slow", .text, "nobody here", null));
+    try std.testing.expectEqual(@as(usize, 0), r.count("slow"));
 
     try r.join("slow", &stalled.socket);
     try r.join("fast", &other.socket);

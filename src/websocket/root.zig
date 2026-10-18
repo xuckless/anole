@@ -95,6 +95,12 @@ pub const Socket = struct {
     /// The task that sends 1001 when the drain starts
     /// (`UpgradeOptions.close_on_drain`).
     drain_watch: ?*std.Io.Group = null,
+    /// A close went out through `close`, or came in through `receive` (and
+    /// was answered), or `next` saw the connection end.
+    closed: std.atomic.Value(bool) = .init(false),
+    /// Why `next` returned null when it was not the peer's close: the
+    /// error `receive` failed with.
+    end_error: ?anyerror = null,
 
     /// Both live in the request's arena, so a task beside the handler (the
     /// drain watch, a `Rooms.broadcast`) acts on the same one.
@@ -117,6 +123,7 @@ pub const Socket = struct {
         var msg = switch (self.conn) {
             inline else => |ws| try ws.receive(),
         };
+        if (msg.type == .close) self.closed.store(true, .release);
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
         const d = self.deflate orelse unreachable; // RSV1 is refused unless negotiated
@@ -155,9 +162,34 @@ pub const Socket = struct {
         };
     }
 
+    /// The next text or binary message, or null once the socket is done:
+    /// the peer closed it (the close is answered) or the connection ended
+    /// (`end_error` says how). Pings, pongs and inflating are handled on the
+    /// way, as in `receive`. Fails only for what is not the peer's doing: a
+    /// cancel (the server stopping) or no memory.
+    ///
+    ///     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+    pub fn next(self: *Socket) anyerror!?Message {
+        while (true) {
+            const msg = self.receive() catch |err| {
+                const e: anyerror = err;
+                if (e == error.Canceled or e == error.OutOfMemory) return e;
+                self.end_error = e;
+                self.closed.store(true, .release);
+                return null;
+            };
+            switch (msg.type) {
+                .text, .binary => return msg,
+                .close => return null,
+                else => {},
+            }
+        }
+    }
+
     /// Sends a close frame. The peer's answer still arrives through
     /// `receive`.
     pub fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
+        self.closed.store(true, .release);
         return switch (self.conn) {
             inline else => |ws| ws.close(code, reason),
         };
@@ -241,6 +273,54 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
     return socket;
 }
 
+/// A route handler for `Server.ws`: upgrades, runs `handler` with the open
+/// socket, and closes it when `handler` returns (1000, or 1011 when it
+/// failed; nothing when the socket is already closed). A request that is
+/// not a WebSocket handshake gets 426 Upgrade Required. `handler` is
+/// `fn (*Socket) !void`, `fn (*Socket, *Request) !void`, or with the
+/// server's state first, `fn (*Ctx, *Socket, *Request) !void`.
+pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: UpgradeOptions) dusty.Router(Ctx).Handler {
+    const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
+    switch (params.len) {
+        1, 2 => {},
+        3 => if (Ctx == void) @compileError("a WebSocket handler with three parameters takes the server's state first, but this server has none"),
+        else => @compileError("a WebSocket handler takes (*anole.websocket.Socket) or (*anole.websocket.Socket, *anole.Request), got " ++ @typeName(@TypeOf(handler))),
+    }
+    const S = struct {
+        fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            var ws = (try upgrade(req, res, options)) orelse {
+                res.status = .upgrade_required;
+                try res.header("Upgrade", "websocket");
+                res.content_type = .text;
+                res.body = "426 Upgrade Required: this endpoint speaks WebSocket\n";
+                return;
+            };
+            defer ws.deinit();
+            const result = switch (params.len) {
+                1 => handler(&ws),
+                2 => handler(&ws, req),
+                3 => handler(ctx, &ws, req),
+                else => unreachable,
+            };
+            result catch |err| {
+                const e: anyerror = err;
+                if (e == error.Canceled) return e;
+                // The peer went away mid-send: not the handler's fault.
+                if (res.peerGone()) return;
+                std.log.scoped(.anole).warn("WebSocket handler for {s} failed: {t}", .{ req.url, e });
+                if (!ws.closed.load(.acquire)) ws.close(.internal_error, "") catch {};
+                return;
+            };
+            if (!ws.closed.load(.acquire)) ws.close(.normal, "") catch {};
+        }
+    };
+    return if (Ctx == void) struct {
+        fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            return S.serve({}, req, res);
+        }
+    }.h else S.serve;
+}
+
 /// Named groups of sockets for publish/subscribe: a handler joins its
 /// socket to rooms, and anything may broadcast to a room. Safe from any task
 /// or thread of the runtime.
@@ -254,7 +334,11 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
 /// end.
 pub const Rooms = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
+    /// The runtime's `std.Io`, taken from the first socket to join, so
+    /// `init` needs none (the rooms can be made before the server).
+    io: std.Io = undefined,
+    io_set: std.atomic.Value(bool) = .init(false),
+    io_lock: std.atomic.Mutex = .unlocked,
     /// Over `rooms` and every member's `sends`; never held across I/O.
     mutex: std.Io.Mutex = .init,
     /// Signalled when a member that left has no sends left.
@@ -273,8 +357,27 @@ pub const Rooms = struct {
     /// from the allocator.
     const stack_snapshot = 64;
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) Rooms {
-        return .{ .allocator = allocator, .io = io };
+    pub fn init(allocator: std.mem.Allocator) Rooms {
+        return .{ .allocator = allocator };
+    }
+
+    /// The `std.Io` to lock with: `io` (a joining or leaving socket's)
+    /// unless an earlier one was taken.
+    fn bind(self: *Rooms, io: std.Io) std.Io {
+        if (!self.io_set.load(.acquire)) {
+            while (!self.io_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.io_lock.unlock();
+            if (!self.io_set.load(.monotonic)) {
+                self.io = io;
+                self.io_set.store(true, .release);
+            }
+        }
+        return self.io;
+    }
+
+    /// Null until a socket has joined: until then every room is empty.
+    fn bound(self: *Rooms) ?std.Io {
+        return if (self.io_set.load(.acquire)) self.io else null;
     }
 
     pub fn deinit(self: *Rooms) void {
@@ -293,8 +396,9 @@ pub const Rooms = struct {
         const member = try self.allocator.create(Member);
         errdefer self.allocator.destroy(member);
         member.* = .{ .socket = socket };
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        const io = self.bind(socket.io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         const entry = try self.rooms.getOrPut(self.allocator, room);
         if (!entry.found_existing) {
             entry.key_ptr.* = self.allocator.dupe(u8, room) catch |err| {
@@ -309,8 +413,9 @@ pub const Rooms = struct {
     /// Takes `socket` out of `room`, once any broadcast sending to it has
     /// finished with it.
     pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        const io = self.bind(socket.io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         const members = self.rooms.getPtr(room) orelse return;
         const member = for (members.items, 0..) |m, i| {
             if (m.socket == socket) break members.swapRemove(i);
@@ -322,19 +427,20 @@ pub const Rooms = struct {
             self.allocator.free(key);
         }
         member.left = true;
-        while (member.sends > 0) self.idle.waitUncancelable(self.io, &self.mutex);
+        while (member.sends > 0) self.idle.waitUncancelable(io, &self.mutex);
         self.allocator.destroy(member);
     }
 
     /// Sends one message to every member of `room` but `except`. Returns
     /// how many it reached. Members joining meanwhile are not sent to.
     pub fn broadcast(self: *Rooms, room: []const u8, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
+        const io = self.bound() orelse return 0;
         var stack: [stack_snapshot]*Member = undefined;
         var heap: []*Member = &.{};
         defer self.allocator.free(heap);
         const snapshot = snap: {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             const members = (self.rooms.get(room) orelse return 0).items;
             const buf: []*Member = if (members.len <= stack.len) &stack else big: {
                 heap = self.allocator.alloc(*Member, members.len) catch {
@@ -357,10 +463,10 @@ pub const Rooms = struct {
         var reached: usize = 0;
         for (snapshot) |m| {
             if (m.socket.send(msg_type, data)) |_| reached += 1 else |_| {}
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             m.sends -= 1;
-            if (m.sends == 0 and m.left) self.idle.broadcast(self.io);
+            if (m.sends == 0 and m.left) self.idle.broadcast(io);
         }
         return reached;
     }
@@ -377,8 +483,9 @@ pub const Rooms = struct {
 
     /// How many sockets are in `room`.
     pub fn count(self: *Rooms, room: []const u8) usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        const io = self.bound() orelse return 0;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         return if (self.rooms.get(room)) |m| m.items.len else 0;
     }
 };
