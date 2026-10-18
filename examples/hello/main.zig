@@ -28,9 +28,12 @@ const http = anole.http;
 /// (zio src/options.zig). `.pinned`: many executors, a task never migrates.
 pub const zio_options: zio.Options = .{ .scheduling = .pinned };
 
-/// Route std.log / std.debug.print through zio so logging from a task yields
-/// instead of blocking the executor thread (zio examples/*.zig).
-pub const std_options_debug_io = zio.debug_io;
+// No `std_options_debug_io = zio.debug_io` (zio's examples set it so logging
+// yields): std.debug uses that Io for stack unwinding too, and Debug builds
+// capture a stack trace inside allocator and zio task-pool locks, so a
+// coroutine could be suspended while holding them. Seen as a livelock with
+// every executor spinning in SafeAllocator, and as a recursive-lock abort in
+// zio's TaskPool. Debug output stays on std's blocking Io.
 
 fn setThreadHeader(res: *http.Response) !void {
     const tid = std.Thread.getCurrentId();
