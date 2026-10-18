@@ -25,6 +25,7 @@ const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const handoff = @import("handoff.zig");
+const blocking = @import("blocking.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 
 /// The zio configuration Anole is built for. An executable declares it in
@@ -62,6 +63,10 @@ pub const Options = struct {
     /// How long a restart waits for the new process to be serving before
     /// giving up on it and carrying on.
     restart_timeout_ms: u32 = 10_000,
+    /// A blocking pool (`anole.blocking`): jobs that run on threads beside
+    /// the executors, at most this many at once. Password hashing uses it.
+    /// Null: none, and such work runs on the request's executor.
+    blocking: ?blocking.Options = null,
     /// The rest of dusty's server configuration: timeouts, limits,
     /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
     /// replaced by the fields above.
@@ -137,6 +142,8 @@ pub fn Server(comptime Ctx: type) type {
         restart_timeout_ms: u32 = 10_000,
         /// The HTTP/3 endpoint, when `Options.http3` asked for one.
         h3: H3Endpoint,
+        /// The blocking pool, when `Options.blocking` asked for one.
+        blocking_pool: ?*blocking.Pool = null,
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
 
@@ -266,6 +273,12 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
             }
+            var pool: ?*blocking.Pool = null;
+            if (opts.blocking) |b| {
+                const p = try a.create(blocking.Pool);
+                try p.init(rt, b);
+                pool = p;
+            }
             return .{
                 .gpa = gpa,
                 .rt = rt,
@@ -277,6 +290,7 @@ pub fn Server(comptime Ctx: type) type {
                 .held = held.items,
                 .restart_timeout_ms = opts.restart_timeout_ms,
                 .h3 = endpoint,
+                .blocking_pool = pool,
             };
         }
 
@@ -293,6 +307,7 @@ pub fn Server(comptime Ctx: type) type {
         pub fn deinit(self: *Self) void {
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
+            if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
             self.arena.deinit();
             self.gpa.destroy(self.arena);
@@ -506,4 +521,63 @@ test "anole.Server: HTTP/3 is refused beside mutual TLS, which QUIC does not che
         .http3 = .{ .port = 0 },
         .executors = .exact(1),
     }, {}));
+}
+
+test "anole.Server: with a blocking pool, one executor serves other requests while a job runs" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{
+        .http = .{ .port = 0, .h2c = false },
+        .executors = .exact(1),
+        .blocking = .{ .threads = 2 },
+    }, {});
+    defer app.deinit();
+    const Routes = struct {
+        /// 600 ms of CPU, as a slow password hash would take.
+        fn spin(io_: std.Io) u32 {
+            const start = std.Io.Clock.awake.now(io_);
+            var n: u32 = 0;
+            while (start.durationTo(std.Io.Clock.awake.now(io_)).toMilliseconds() < 600) n +%= 1;
+            return n;
+        }
+        fn slow(req: *http.Request, res: *http.Response) !void {
+            _ = try blocking.run(req.io, spin, .{req.io});
+            res.body = "slow";
+        }
+        fn fast(_: *http.Request, res: *http.Response) !void {
+            res.body = "fast";
+        }
+        fn get(io_: std.Io, addr: std.Io.net.IpAddress, path: []const u8) !i64 {
+            const start = std.Io.Clock.awake.now(io_);
+            const stream = try addr.connect(io_, .{ .mode = .stream });
+            defer stream.close(io_);
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(io_, &wbuf);
+            try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+            try w.interface.flush();
+            var rbuf: [1024]u8 = undefined;
+            var r = stream.reader(io_, &rbuf);
+            var out: [1024]u8 = undefined;
+            var fw: std.Io.Writer = .fixed(&out);
+            _ = r.interface.streamRemaining(&fw) catch {};
+            try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), path[1..]));
+            return start.durationTo(std.Io.Clock.awake.now(io_)).toMilliseconds();
+        }
+        fn client(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const addr = a.addresses()[0].ip;
+            var slow_req = try io_.concurrent(get, .{ io_, addr, "/slow" });
+            defer _ = slow_req.cancel(io_) catch {};
+            try io_.sleep(.fromMilliseconds(100), .awake);
+            // The slow job is running; the only executor still answers.
+            try std.testing.expect(try get(io_, addr, "/fast") < 300);
+            try std.testing.expect(try slow_req.await(io_) >= 500);
+        }
+    };
+    app.get("/slow", Routes.slow);
+    app.get("/fast", Routes.fast);
+    var client_future = try app.io().concurrent(Routes.client, .{&app});
+    try app.run();
+    try client_future.await(app.io());
 }

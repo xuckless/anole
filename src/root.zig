@@ -23,6 +23,9 @@ pub const ServerOptions = @import("server.zig").Options;
 /// Declare in the executable's root file: `pub const zio_options =
 /// anole.zio_options;` (pinned scheduling).
 pub const zio_options = @import("server.zig").zio_options;
+/// Blocking or CPU-heavy work on a pool thread while the request's
+/// coroutine waits (`Options.blocking`); password hashing uses it.
+pub const blocking = @import("blocking.zig");
 /// Log output with the underlying libraries' scopes renamed to Anole's:
 /// `pub const std_options: std.Options = .{ .logFn = anole.logFn };`.
 pub const logFn = @import("log.zig").logFn;
@@ -82,6 +85,7 @@ pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 test {
     _ = @import("server.zig");
     _ = @import("handoff.zig");
+    _ = blocking;
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = http;
