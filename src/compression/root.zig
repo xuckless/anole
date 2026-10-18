@@ -95,3 +95,84 @@ test "zstd: streaming round trip with an 8 MiB window cap" {
     try std.testing.expectEqual(input.len, out_buf.pos);
     try std.testing.expectEqualSlices(u8, input, out);
 }
+
+// zstd and gzip through dusty, over loopback: a response marked compress is
+// sent zstd when the client accepts it (preferred over gzip), and a zstd
+// request body is decoded before the handler sees it.
+
+const dusty = @import("dusty");
+const zio = @import("zio");
+
+fn bigHandler(_: *dusty.Request, res: *dusty.Response) !void {
+    res.compress = true;
+    var w = res.writer();
+    for (0..300) |i| try w.interface.print("row {d}: compressible compressible compressible\n", .{i});
+    try w.end();
+}
+
+fn echoHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    res.body = (try req.body()) orelse "";
+}
+
+fn exchange(io: std.Io, addr: std.Io.net.IpAddress, request: []const u8, out: []u8) ![]const u8 {
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    _ = r.interface.streamRemaining(&fw) catch |err| switch (err) {
+        error.WriteFailed => return error.ResponseTooLarge,
+        else => |e| return e,
+    };
+    return fw.buffered();
+}
+
+test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodies" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = loopback }} }, {});
+    defer server.deinit();
+    server.router.get("/big", bigHandler);
+    server.router.post("/echo", echoHandler);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+    const addr = server.address.ip;
+
+    var out: [64 * 1024]u8 = undefined;
+    const resp = try exchange(io, addr, "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, zstd\r\nConnection: close\r\n\r\n", &out);
+    const split = std.mem.indexOf(u8, resp, "\r\n\r\n").?;
+    const head = resp[0..split];
+    try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: zstd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Vary: Accept-Encoding") != null);
+    const body = resp[split + 4 ..];
+    var plain: [32 * 1024]u8 = undefined;
+    const n = zstd.ZSTD_decompress(&plain, plain.len, body.ptr, body.len);
+    try std.testing.expectEqual(@as(c_uint, 0), zstd.ZSTD_isError(n));
+    try std.testing.expect(std.mem.startsWith(u8, plain[0..n], "row 0: compressible"));
+    try std.testing.expect(body.len < n / 5);
+
+    // A zstd request body, decoded for the handler.
+    const text = "a zstd request body for the echo handler";
+    var frame: [256]u8 = undefined;
+    const fn_len = zstd.ZSTD_compress(&frame, frame.len, text.ptr, text.len, 3);
+    try std.testing.expectEqual(@as(c_uint, 0), zstd.ZSTD_isError(fn_len));
+    var req_buf: [512]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&req_buf);
+    try rw.print("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Encoding: zstd\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{fn_len});
+    try rw.writeAll(frame[0..fn_len]);
+    const echoed = try exchange(io, addr, rw.buffered(), &out);
+    try std.testing.expect(std.mem.endsWith(u8, echoed, text));
+}

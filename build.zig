@@ -261,6 +261,7 @@ const Core = struct {
                         if (tls) seam else null,
                         if (http2) c_mods.nghttp2 else null,
                         if (compression) c_mods.zlib else null,
+                        if (compression) c_mods.zstd else null,
                         target,
                         optimize,
                     );
@@ -280,6 +281,7 @@ const Core = struct {
         tls: ?*std.Build.Module,
         nghttp2: ?*std.Build.Module,
         zlib: ?*std.Build.Module,
+        zstd: ?*std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -301,12 +303,15 @@ const Core = struct {
             // vendored C zlib) is never fetched.
             .use_zlib = zlib != null,
             .use_bundled_zlib = false,
+            // zstd for responses and request bodies, on Anole's zstd.
+            .use_zstd = zstd != null,
         }).module("dusty");
         // Replace dusty's zio stub so its timeouts use zio.AutoCancel.
         mod.addImport("zio", zio_mod);
         if (tls) |m| mod.addImport("tls", m);
         if (nghttp2) |m| mod.addImport("nghttp2", m);
         if (zlib) |m| mod.addImport("zlib", m);
+        if (zstd) |m| mod.addImport("zstd", m);
         return mod;
     }
 };

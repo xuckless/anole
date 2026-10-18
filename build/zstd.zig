@@ -64,6 +64,9 @@ pub fn module(
     const t: Translator = .init(translate_c, .{
         .name = "zstd",
         .c_source_file = b.addWriteFiles().add("zstd_wrapper.h",
+            \\// The advanced API (custom allocators, streaming parameters) that
+            \\// dusty's zstd_io uses.
+            \\#define ZSTD_STATIC_LINKING_ONLY 1
             \\#include <zstd.h>
             \\
         ),

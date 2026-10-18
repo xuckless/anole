@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit 347faf545018498c00fbfee2867c0362b417e9a2 of the fork
+  Pinned:   commit ab646962dbe8cc09820052e1e35b903e8aaeb7ad of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -174,7 +174,7 @@ SOFTWARE.
 
 
 D. Zlib licence text (allyourcodebase/boringssl build script, zlib-ng)
--------------------------------------------------------------
+----------------------------------------------------------------------
 
 This software is provided 'as-is', without any express or implied warranty.
 In no event will the authors be held liable for any damages arising from the
