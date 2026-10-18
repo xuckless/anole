@@ -189,6 +189,12 @@ tests/grpc/proto/grpc/testing/*.proto (and tests/grpc/gen/grpc/testing.pb.zig)
   Licence:  Apache License 2.0 (text in part E). Copyright The gRPC Authors
   Source:   https://github.com/grpc/grpc-proto, commit 8133308
 
+src/auth/csrf.zig
+  The synchronizer-token check follows jetzig's
+  src/jetzig/middleware/AntiCsrfMiddleware.zig.
+  Licence:  MIT. Copyright 2023-2024 Robert Farrell
+  Source:   https://github.com/jetzig-framework/jetzig, commit f114b07
+
 src/session/root.zig (cookie encryption)
   The sealed-cookie layout (nonce, ciphertext, tag; XChaCha20-Poly1305)
   follows jetzig's src/jetzig/http/Session.zig.

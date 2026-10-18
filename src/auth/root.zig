@@ -22,8 +22,22 @@ pub const Keyring = @import("keyring.zig").Keyring;
 /// Google and Apple presets.
 pub const oidc = @import("oidc.zig");
 
+/// CSRF tokens in the session, checked on unsafe methods.
+pub const csrf = @import("csrf.zig");
+/// Argon2id password hashes (bcrypt accepted on verify).
+pub const password = @import("password.zig");
+/// Prefixed random API keys stored as SHA-256, and a middleware.
+pub const apikey = @import("apikey.zig");
+/// Roles, permissions and a middleware that requires one.
+pub const rbac = @import("rbac.zig");
+
 test {
     _ = jws;
+    _ = csrf;
+    _ = password;
+    _ = apikey;
+    _ = rbac;
+    _ = @import("csrf_test.zig");
     _ = oidc;
     _ = @import("oidc_test.zig");
 }
