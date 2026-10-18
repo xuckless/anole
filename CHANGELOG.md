@@ -65,6 +65,70 @@ for macOS and Linux.
   CPU-heavy or blocking calls run on zio's thread pool, capped at a set
   number at once, while the request's executor goes on serving.
 
+### Handlers, errors, JSON and CORS
+
+- Errors that carry a status: a handler or middleware returns
+  `error.Unauthorized` for a 401, `error.TooManyRequests` for a 429,
+  `error.ServiceUnavailable` for a 503; any standard 4xx or 5xx counts, by
+  its `std.http.Status` tag in PascalCase or its RFC 9110 phrase.
+  `anole.errorStatus(err)` says which.
+- `res.fail(status, message)`: the status and a body in place of anything
+  written before, `{"error":"..."}` for a request that takes JSON and text
+  otherwise. `Options.errors` (`.auto`, `.json`, `.text`) sets that for the
+  whole server, the server's own 404, 405 and error answers included.
+- `Options.error_handler`, a plain function that answers handler errors
+  without a `Ctx`, and `anole.defaultError(req, res, err)`, the default
+  answer, for it or an `uncaughtError` to fall back on.
+- `req.bind(T)`: the JSON body as a `T` in the request's arena, unknown
+  fields ignored, 400 when it is missing (`error.MissingBody`) or does not
+  fit (`error.InvalidJsonBody`); `req.bindWith(T, options)` takes
+  `std.json`'s options. `res.json(value)`; `res.jsonWith(value, options)`.
+  `anole.json.readBody` keeps the same contract on yyjson.
+- Request locals: `req.setLocal(key, value)` and `req.local(T, key)`, typed
+  values a middleware hands to the handler. `anole.auth.claims(req)`,
+  `anole.auth.subject(req)` and `anole.auth.apikey.owner(req)` read what
+  `RequireJwt` and the API key middleware verified.
+- `anole.middleware.Cors.init(.{})` works out of the box: any origin, the
+  common methods, the request headers the browser asks for, a 600 s max
+  age. Origin lists (echoed with `Vary: Origin`), `credentials` (refused
+  with every origin allowed), `expose`. A `Cors` inside a group answers the
+  preflights for the group's routes: an `OPTIONS` to a path whose routes are
+  for other methods runs the middleware of the route it asks about.
+- A port another process already listens on is `error.AddressInUse`, logged
+  with the address, rather than shared through `SO_REUSEPORT`; connections
+  in `TIME_WAIT` do not count, and inherited sockets are not checked.
+- Startup and logs: one line per listener as it starts, with its scheme and
+  protocols (`listening on https://127.0.0.1:8443 (HTTP/2, HTTP/1.1,
+  HTTP/3)`); the HTTP core logs under `anole`, `access` and `anole_h2`
+  itself, so `anole.logFn` is no longer needed; no per-request debug line;
+  `anole.std_options` quiets zio's thread lines and Anole's debug lines; a
+  TLS file that cannot be read is logged with its path. `zio_options` is
+  gone from the quick start (it was already optional).
+- Breaking:
+  - `std.json`'s error names (`SyntaxError`, `UnknownField`, `MissingField`
+    and the rest) are no longer answered 400: JSON that fails to parse
+    anywhere but the request body is a 500. The body helpers (`bind`,
+    `json`, `jsonValue`, `anole.json.readBody`) fail with
+    `error.InvalidJsonBody` instead, and `bind` and `readBody` with
+    `error.MissingBody` for no body. An `uncaughtError` that matched the old
+    names should match these.
+  - `req.json(T)` ignores unknown fields, as `bind` does.
+  - `res.json(value, options)` is `res.jsonWith(value, options)`;
+    `res.json(value)` takes no options.
+  - `Cors.init` no longer returns an error union (drop the `try`), `origin`
+    is optional, and `max_age` is a number of seconds (`?u32`, 600 by
+    default) instead of a string.
+  - An `OPTIONS` request to a path with routes for other methods runs that
+    route's group middleware before the 405.
+  - The HTTP core's log scopes are `anole` (was `dusty`), `access` (was
+    `dusty_access`) and `anole_h2` (was `dusty_h2`); a `log_scope_levels`
+    entry naming `.dusty` should name `.anole`.
+- Deprecated, removed after 0.1: reading `RequireJwt`'s claims from
+  `req.session` (`"jwt_sub"` and the `.claims` mapping's keys) and the API
+  key owner from `req.session.get("api_key_owner")`. Both are still set,
+  for the request only; use `anole.auth.claims`/`subject` and
+  `anole.auth.apikey.owner`.
+
 ### WebSockets
 
 - RFC 6455 over HTTP/1.1 and RFC 8441 over HTTP/2 behind one
@@ -151,7 +215,7 @@ for macOS and Linux.
 
 - Prometheus `/metrics`, OpenTelemetry traces (W3C `traceparent`, OTLP/HTTP
   export), JSON or text access logs with request and trace IDs, `/healthz`
-  and `/readyz`, and `anole.logFn` for one consistent log output.
+  and `/readyz`, and one consistent log output under Anole's own scopes.
 - `Registry` and `Health` are values the application owns, each serving its
   own server, so one process can run several servers.
 - An `exclude` list on the access log, HTTP metrics and tracing middleware

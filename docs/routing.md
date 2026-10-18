@@ -80,7 +80,9 @@ tuple. With a context, use `anole.Middleware(App)`.
 
 The chain runs global middleware (`use`, in the order added), then each
 enclosing group's, then the handler. Global middleware also runs for 404s and
-405s.
+405s. An `OPTIONS` to a path whose routes are for other methods (a CORS
+preflight) runs the middleware of the route it asks about, group middleware
+included, so a group's `Cors` can answer it.
 
 A middleware is a struct with an `execute` method of exactly this shape.
 `executor.next()` runs the rest of the chain, and an error from the handler
@@ -126,22 +128,51 @@ app.use(Timing{});
 | Middleware | What it does |
 | --- | --- |
 | `RequestId.init(.{})` | Sets `req.id` (128 random bits, hex) and sends it as `X-Request-Id`. `.header` renames it; `.trust_incoming = true` keeps a valid incoming one (only behind a proxy that sets or strips it). |
-| `Logger.init()` | One access-log line per request at `info`, scope `access` under `anole.logFn`: method, path, status or error, time, client, request ID. |
+| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path, status or error, time, client, request ID. |
 | `Compress.init()` | Sets `res.compress` on every response; see [Compression](#compression). |
-| `Cors.init(.{ .origin = ... })` | `Access-Control-Allow-Origin` on every response; answers preflights with 204. Returns an error union. |
+| `Cors.init(.{})` | CORS for browsers: any origin by default, preflights answered with 204; see [CORS](#cors). |
 | `Session.init(.{ .secret_key = ... })` | `req.session` in a signed, not encrypted, cookie. Returns an error union. |
 
 ```zig
 app.use(anole.middleware.RequestId.init(.{})); // first, so the rest see req.id
 app.use(anole.middleware.Logger.init());
 app.use(anole.middleware.Compress.init());
-app.use(try anole.middleware.Cors.init(.{
-    .origin = "https://app.example.com",
-    .methods = "GET, POST, PUT, DELETE",
-    .headers = "Content-Type, Authorization",
-    .max_age = "600",
+app.use(anole.middleware.Cors.init(.{}));
+```
+
+### CORS
+
+`Cors.init(.{})` lets a page on any origin call the API without
+credentials, as Fiber's `cors.New()` does: `Access-Control-Allow-Origin: *`
+on every response, and a preflight (an `OPTIONS` with `Origin` and
+`Access-Control-Request-Method`) answered 204 with
+`Access-Control-Allow-Methods` (GET, HEAD, POST, PUT, PATCH, DELETE), the
+`Access-Control-Allow-Headers` the browser asked for, and
+`Access-Control-Max-Age: 600`. A preflight never reaches a route.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `origins` | any | Allowed origins as the browser sends them (`"https://app.example"`). A listed origin is echoed back with `Vary: Origin`; any other gets no CORS headers, and a preflight from it a bare 204. |
+| `origin` | none | One origin, or `"*"`: the older single-origin form, still accepted. |
+| `methods` | `GET, HEAD, POST, PUT, PATCH, DELETE` | `Access-Control-Allow-Methods`. |
+| `headers` | what the preflight asks for | `Access-Control-Allow-Headers`. |
+| `expose` | none | `Access-Control-Expose-Headers`, response headers a page's script may read. |
+| `credentials` | false | Cookies and HTTP authentication across origins (`Access-Control-Allow-Credentials`). Needs `origins`: with any origin, `init` panics. |
+| `max_age` | 600 | Seconds a browser may reuse a preflight answer; null sends none. |
+
+```zig
+app.use(anole.middleware.Cors.init(.{
+    .origins = &.{ "https://app.example.com", "https://admin.example.com" },
+    .credentials = true,
+    .expose = "X-Request-Id",
 }));
 ```
+
+`Cors` works in a group too: for an `OPTIONS` to a path whose routes are all
+for other methods, the router runs the middleware of the route the preflight
+asks about, so the group's `Cors` answers it. Put `Cors` ahead of
+middleware that refuses requests (authentication): a preflight carries no
+credentials.
 
 Elsewhere in Anole: encrypted-cookie and server-side sessions, CSRF, API
 keys, roles and rate limiting ([auth.md](auth.md)); a JSON or text access
@@ -160,6 +191,7 @@ log, metrics and tracing ([observability.md](observability.md)).
 | `cookies().get(name)` | A cookie. |
 | `content_type`, `content_length`, `content_encoding` | The body's metadata as it arrived. |
 | `id`, `trace_id`, `span_id` | Set by the request ID and tracing middleware. |
+| `setLocal(key, value)`, `local(T, key)` | Values a middleware hands to the handler for this request; see [Request locals](#request-locals). |
 | `route` | The matched route; `route.?.path` is its pattern. |
 | `arena` | An allocator freed after the response. |
 | `io` | The server's `std.Io`; see [Async work](#async-work-in-handlers). |
@@ -169,10 +201,16 @@ The body is read once, whole or as a stream:
 - `body()` returns `?[]const u8` (null when empty), read into the arena up to
   `request.max_body_size` (1 MiB). Beyond that it fails with `BodyTooBig`,
   answered 413.
-- `json(T)`, `jsonValue()` and `jsonObject()` parse with `std.json`; a body
-  that does not parse or fit `T` is answered 400. `anole.json.readBody(T, req)`
-  and `anole.json.respond(res, value)` do the same on the faster yyjson
-  (`-Djson`), with the same 400s.
+- `bind(T)` parses the body as JSON into a `T` (`std.json`, in the
+  request's arena). Fields `T` does not have are ignored; a missing body
+  fails with `error.MissingBody` and one that does not parse or fit `T` with
+  `error.InvalidJsonBody`, both answered 400. `bindWith(T, options)` takes
+  `std.json`'s parse options as they are (their default refuses unknown
+  fields). `json(T)` is `bind` with null for an empty body;
+  `jsonValue()` and `jsonObject()` parse into `std.json.Value`.
+  `anole.json.readBody(T, req)` and `anole.json.respond(res, value)` keep
+  the same contract on yyjson (`-Djson`), which pays off for large
+  documents.
 - `formData()` parses `application/x-www-form-urlencoded` and
   `multiFormData()` `multipart/form-data` (entries have `value` and
   `filename`); both return a map with `get`.
@@ -183,10 +221,9 @@ The body is read once, whole or as a stream:
 const NewUser = struct { name: []const u8, email: []const u8 };
 
 fn createUser(req: *anole.Request, res: *anole.Response) !void {
-    // An empty body: the std.json name for it, answered 400 like the rest.
-    const user = try req.json(NewUser) orelse return error.UnexpectedEndOfInput;
+    const user = try req.bind(NewUser); // 400 when missing or malformed
     res.status = .created;
-    try res.json(.{ .name = user.name }, .{});
+    try res.json(.{ .name = user.name });
 }
 
 fn echo(req: *anole.Request, res: *anole.Response) !void {
@@ -222,7 +259,8 @@ res.body = "{\"id\":42}"; // must outlive the handler: a literal or res.arena
 | Method | Use |
 | --- | --- |
 | `print(content_type, fmt, args)` | A formatted body. |
-| `json(value, options)` | A `std.json` body with its content type. |
+| `json(value)` | A `std.json` body with its content type; `jsonWith(value, options)` takes `std.json`'s options. |
+| `fail(status, message)` | An error answer: the status, and `message` as text or `{"error":"..."}`; see [Error handling](#error-handling). |
 | `encode(content_type, encodeFn, value)` | A body from a serializer's write-to-writer function. |
 | `render(content_type, template, args)` | A body from a template function or type. |
 | `writer()` | A buffered body writer; `end()` it before returning. |
@@ -338,7 +376,7 @@ req.setTimeout(.none); // a WebSocket or event stream
 
 | `request` field | Default | Over the limit |
 | --- | --- | --- |
-| `max_body_size` | 1 MiB | `body()`, `json()` and forms fail: 413. Counted after decoding. |
+| `max_body_size` | 1 MiB | `body()`, `bind()`, `json()` and forms fail: 413. Counted after decoding. |
 | `max_content_length` | none | A larger declared `Content-Length` is a 413 before the handler runs. Bounds streams too. |
 | `buffer_size` | 16 KiB | The request line and headers must fit: 431. |
 | `max_header_count` | 32 | Request headers: 431. |
@@ -352,45 +390,108 @@ those the server adds included; past it `res.header` fails with
 
 ## Error handling
 
-A handler returns an error to give up:
+A handler or middleware returns an error to give up, and the error says what
+the client gets:
 
-- `error.NotFound` answers as if no route matched: 404.
-- Request faults get a 4xx: `BodyTooBig` 413, `UnsupportedContentEncoding`
-  415, a body that is not valid gzip, zstd or `std.json` 400.
+- An error named after a status answers with it: `error.Unauthorized` is a
+  401, `error.Forbidden` 403, `error.NotFound` 404, `error.Conflict` 409,
+  `error.UnprocessableEntity` (or `UnprocessableContent`) 422,
+  `error.TooManyRequests` 429, `error.ServiceUnavailable` 503. Any standard
+  4xx or 5xx counts, by its `std.http.Status` tag in PascalCase or its RFC
+  9110 reason phrase. `anole.errorStatus(err)` says which status an error
+  stands for.
+- Request-body faults get a 4xx: `BodyTooBig` 413,
+  `UnsupportedContentEncoding` 415, and 400 for `InvalidJsonBody` and
+  `MissingBody` (from `bind` and `json`) and a body that is not valid gzip or
+  zstd.
 - Anything else is logged at `err` and answered 500, and what the handler
-  wrote is discarded.
-- If the handler had started streaming, no 500 can be sent, so the
+  wrote is discarded. That includes `std.json`'s `SyntaxError` when the JSON
+  was not the request's own (a config file, an upstream response).
+- If the handler had started streaming, no error answer can be sent, so the
   connection is closed instead. If the client went away, nothing is logged.
 
-Zig panics cannot be recovered: a panic in a handler (an unwrapped null, an
-index out of bounds) ends the process. Return errors instead.
+To answer with a message of your own, `res.fail(status, message)` sets the
+status and replaces whatever was written:
 
-To answer errors, 404s and 405s yourself, declare any of these on `Ctx`:
+```zig
+fn requireKey(req: *anole.Request, res: *anole.Response, executor: anytype) !void {
+    if (req.headers.get("X-Api-Key") == null) return res.fail(.unauthorized, "missing API key");
+    return executor.next();
+}
+```
+
+The body of `fail`, and of the server's own error answers, is
+`{"error":"..."}` for a request that takes JSON (its `Accept` names JSON, or
+it sent a JSON body) and text otherwise. `ServerOptions.errors` settles it
+for every request: `.json` for an API, `.text` for neither. An empty message
+stands for the status line (`"404 Not Found\n"`, `{"error":"Not Found"}`).
+
+Zig panics cannot be recovered: a panic in a handler (an unwrapped null, an
+index out of bounds) ends the process, and in `ReleaseFast` an unwrapped
+null is undefined behaviour. Prefer `orelse return error.NotFound` to `.?`,
+and build servers `ReleaseSafe`.
+
+To answer errors yourself, set `ServerOptions.error_handler`, a plain
+function, and fall back on the default mapping for the rest:
+
+```zig
+fn onError(req: *anole.Request, res: *anole.Response, err: anyerror) void {
+    switch (err) {
+        error.OutOfStock => res.fail(.conflict, "out of stock"),
+        else => anole.defaultError(req, res, err),
+    }
+}
+
+var app = try anole.Server(void).init(gpa, .{ .error_handler = onError }, {});
+```
+
+With a context, these declarations on `Ctx` answer errors, 404s and 405s:
 
 ```zig
 const App = struct {
     pub fn notFound(_: *App, req: *anole.Request, res: *anole.Response) !void {
         res.status = .not_found;
-        try res.json(.{ .@"error" = "not found", .path = req.url }, .{});
+        try res.json(.{ .@"error" = "not found", .path = req.url });
     }
 
     pub fn uncaughtError(_: *App, req: *anole.Request, res: *anole.Response, err: anyerror) void {
         std.log.err("{s} {s}: {t}", .{ req.id, req.url, err });
-        res.status = switch (err) {
-            error.SyntaxError, error.UnexpectedEndOfInput => .bad_request,
-            error.BodyTooBig => .payload_too_large,
-            else => .internal_server_error,
-        };
-        res.content_type = .json;
-        res.body = "{\"error\":\"request failed\"}";
+        anole.defaultError(req, res, err);
     }
 };
 ```
 
 `methodNotAllowed` has the same signature as `notFound`, and finds `Allow`
-already set. `uncaughtError` replaces the built-in mapping, 4xx answers
-included. A `Ctx` can also declare `dispatch(self, action, req, res)` to wrap
-every handler call.
+already set. `uncaughtError` comes before `error_handler`; either replaces
+the built-in mapping unless it calls `anole.defaultError`. An error answered
+with a 4xx is logged at `debug`, one answered with a 5xx at `err`. A `Ctx`
+can also declare `dispatch(self, action, req, res)` to wrap every handler
+call.
+
+## Request locals
+
+A middleware hands what it found to the handler through the request's
+locals: typed values by name, for this request only, in its arena.
+
+```zig
+const Tenant = struct {
+    pub fn execute(_: *const Tenant, req: *anole.Request, _: *anole.Response, executor: anytype) !void {
+        const id = req.headers.get("X-Tenant") orelse return error.BadRequest;
+        try req.setLocal("tenant", id);
+        return executor.next();
+    }
+};
+
+fn handler(req: *anole.Request, res: *anole.Response) !void {
+    const tenant = req.local([]const u8, "tenant") orelse return error.Unauthorized;
+    try res.print(.text, "tenant {s}", .{tenant});
+}
+```
+
+`local` returns null when nothing is stored under the key or it was stored
+as another type. Keys are not copied (use literals). Anole's auth
+middleware keep what they verified here: `anole.auth.claims(req)` and
+`anole.auth.apikey.owner(req)` ([auth.md](auth.md)).
 
 ## Async work in handlers
 

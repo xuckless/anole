@@ -82,8 +82,6 @@ Nothing is stable before 1.0.
 const std = @import("std");
 const anole = @import("anole");
 
-pub const zio_options = anole.zio_options;
-
 fn getUser(req: *anole.Request, res: *anole.Response) !void {
     try res.print(.text, "user {s}", .{req.params.get("id").?});
 }

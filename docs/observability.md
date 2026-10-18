@@ -92,13 +92,15 @@ included. `route` appears only when a route matched. `request_id`,
 `trace_id` and `span_id` appear only when the RequestId and tracing
 middleware are installed. A handler that returns `error.NotFound` is logged
 as the 404 it becomes. Any other error adds `error` and reports the status
-the server answers it with: the 4xx for a request fault, such as 413 for a
-body over `max_body_size`, and 500 for anything else. Metrics and spans
-record the same status. An error raised after the response head went out
+the server answers it with (`anole.errorStatus`): a status-named error's own,
+such as 401 for `error.Unauthorized`, the 4xx for a request-body fault, such
+as 413 for a body over `max_body_size`, and 500 for anything else. Metrics
+and spans record the same status. An error raised after the response head went out
 (a stream cut short, say) is recorded with the status that was sent. A
 WebSocket over HTTP/2 is recorded as 101, like one over HTTP/1.1, though the
-stream was accepted with a 200 (RFC 8441). An app's own `uncaughtError` can
-choose a different status, which these records do not see.
+stream was accepted with a 200 (RFC 8441). An app's own `uncaughtError` or
+`error_handler` can choose a different status, which these records do not
+see.
 
 The middleware reads the IDs after the handler returns, so its position
 among the other middleware does not change what it logs. Its
@@ -113,25 +115,29 @@ info(access): GET /echo 200 3458us 127.0.0.1:64583 id=-
 
 ## Log scope names
 
-The libraries under Anole log under their own scopes. `anole.logFn` renames
-them so a server's output reads as one program: `dusty` becomes `anole`,
-`dusty_access` becomes `access`, `dusty_client` becomes `anole_client` and
-`dusty_h2` becomes `anole_h2`. Other scopes pass through. Opt in from your
-root file:
+Anole logs under its own scopes, so a server's output reads as one program
+with std's default log function: `anole` for the server (the startup lines,
+errors), `access` for `anole.middleware.Logger`, and `anole_h2`,
+`anole_h3`, `anole_auth` and the like for the protocol engines and
+subsystems. Each listener logs one line at info as it starts:
 
-```zig
-pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    .log_scope_levels = &.{
-        .{ .scope = .zio, .level = .info },
-        .{ .scope = .dusty, .level = .info },
-    },
-};
+```
+info(anole): listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)
+info(anole): listening on https://0.0.0.0:8443 (HTTP/2, HTTP/1.1, HTTP/3)
 ```
 
-`log_scope_levels` is applied before `logFn`, so it takes the original
-scope name: `.dusty`, not `.anole`. The example sets `.dusty` to info to
-hide the per-request debug lines of a Debug build.
+Nothing is logged per request at `debug`. A Debug build still logs zio's
+worker threads starting and stopping and a few connection events at `debug`;
+`anole.std_options` sets those scopes (`zio`, `anole`, `anole_h2`,
+`anole_h3`) to info:
+
+```zig
+pub const std_options = anole.std_options;
+```
+
+`anole.logFn` is kept for programs that set it. It renames the scopes older
+builds of the HTTP core used (`dusty` and the like) and is otherwise std's
+default.
 
 ## Metrics
 

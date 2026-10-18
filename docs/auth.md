@@ -71,24 +71,34 @@ go there), and refuses the request as RFC 6750 says:
 | The keyring could not fetch the keys | 503, so the client keeps its token |
 
 ```zig
-var bearer = anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
-    .claims = &.{ .{ .claim = "sub", .key = "user", .required = true }, .{ .claim = "role", .key = "role" } },
-    .scopes = &.{"notes:read"},   // all of these in the `scope` claim
+const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
+    .scopes = &.{"notes:read"}, // all of these in the `scope` claim
     .realm = "api",
-});
-const api = [_]M{.init(&bearer)};
-app.group("/api", &api).get("/me", me);
+})});
+api.get("/me", me);
+
+fn me(req: *anole.Request, res: *anole.Response) !void {
+    const token = anole.auth.claims(req) orelse return error.Unauthorized;
+    try res.print(.text, "{s} ({s})", .{ anole.auth.subject(req) orelse "-", token.string("role") orelse "-" });
+}
 ```
 
 Keys are `.{ .static = &keys }` or `.{ .keyring = &keyring }`. The handler
-reads the claims you list from `req.session` (string claims only; by
-default `sub` as `"jwt_sub"`, required). They are there for this request
-only: when the handler returns, the middleware takes them out again and
-puts back whatever the session held under those keys, so a session
-middleware in front never saves them into a cookie. For claims that are
-arrays or objects, set `.hook = .{ .ptr = ..., .func = ... }`: it gets the
-whole `Verified` before the handler, and an error from it refuses the
-token.
+gets the verified token from the request's locals
+([routing.md](routing.md#request-locals)): `anole.auth.claims(req)` is the
+`Verified` (claims and header as JSON objects, `string` and `integer` to
+read one), `anole.auth.subject(req)` its `sub`. Both are null on a route
+without `RequireJwt`. For claims that are arrays or objects, or checks of
+your own, set `.hook = .{ .ptr = ..., .func = ... }`: it gets the whole
+`Verified` before the handler, and an error from it refuses the token.
+
+`.claims` lists string claims that must be present (`.required = true`
+refuses a token without one; by default `sub` is required). Each is also
+copied into `req.session` under its `key` (by default `sub` as `"jwt_sub"`)
+for this request only, and taken out again when the handler returns, so a
+session middleware in front never saves it into a cookie. Reading claims
+from the session is deprecated: use `claims` and `subject`. The copy into
+the session goes after 0.1.
 
 ### Signing
 
@@ -353,9 +363,11 @@ slow hash adds nothing.
 `apikey.Middleware` takes the key from `Authorization: Bearer ak_...` or
 `X-API-Key`, hashes it, and asks your lookup function for the owner. It
 answers 401 with `WWW-Authenticate: Bearer` when there is no owner. The
-owner goes into `req.session` as `"api_key_owner"` for that request only:
-the middleware takes it out again when the handler returns, so a session
-middleware in front never saves it into a cookie.
+handler reads the owner with `anole.auth.apikey.owner(req)` (from the
+request's locals). It is also in `req.session` as `"api_key_owner"` for that
+request only (taken out again when the handler returns, so a session
+middleware in front never saves it); that copy is deprecated and goes after
+0.1.
 
 ```zig
 fn lookup(ptr: ?*anyopaque, arena: std.mem.Allocator, digest: anole.auth.apikey.Digest) anyerror!?[]const u8 {

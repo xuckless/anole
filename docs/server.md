@@ -12,9 +12,6 @@ to stop, then drains. Routes, middleware, requests and responses are in
 const std = @import("std");
 const anole = @import("anole");
 
-pub const zio_options = anole.zio_options;
-pub const std_options: std.Options = .{ .logFn = anole.logFn };
-
 fn hello(_: *anole.Request, res: *anole.Response) !void {
     try res.print(.text, "hello", .{});
 }
@@ -32,6 +29,17 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+It logs one line per listener as it starts, with what each one speaks:
+
+```
+info(anole): listening on http://127.0.0.1:8080 (HTTP/1.1, HTTP/2 cleartext)
+info(anole): listening on https://127.0.0.1:8443 (HTTP/2, HTTP/1.1)
+```
+
+A port that another process already listens on is an error,
+`error.AddressInUse`, logged with the address, rather than a second server
+quietly taking a share of the connections (see [Ports in use](#ports-in-use)).
+
 Add middleware with `use` before any route: the router panics on a `use`
 after a route. Call `run` from the thread that called `init`. One `Server`
 can be alive on a thread at a time: its runtime makes the thread one of its
@@ -41,7 +49,8 @@ or after the first's `deinit`.
 
 ## Root declarations
 
-`zio_options` in your executable's root file sets zio's configuration:
+Both are optional. `zio_options` in your executable's root file sets zio's
+configuration:
 
 ```zig
 pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned }
@@ -60,15 +69,27 @@ to write instead. To set other zio options, keep `.pinned`:
 pub const zio_options: anole.zio.Options = .{ .scheduling = .pinned, .debug_cancel = true };
 ```
 
-`std_options` is optional. `anole.logFn` renames the scopes of the libraries
-underneath (`dusty` becomes `anole`, `dusty_access` becomes `access`):
+Anole logs under its own scopes, `anole`, `access`, `anole_h2` and
+`anole_h3`, through std's default log. A Debug build logs at `debug` too,
+which includes a line from zio per worker thread started and stopped;
+`anole.std_options` keeps those and Anole's own debug lines out, and leaves
+info (the startup lines, the access log), warnings and errors:
+
+```zig
+pub const std_options = anole.std_options;
+```
+
+To set more, write your own and list the same scopes:
 
 ```zig
 pub const std_options: std.Options = .{
-    .logFn = anole.logFn,
-    .log_scope_levels = &.{.{ .scope = .zio, .level = .info }}, // hide zio's startup lines
+    .log_level = .info,
+    .log_scope_levels = &.{.{ .scope = .zio, .level = .warn }},
 };
 ```
+
+`anole.logFn` is still there for programs that set it; it only renames the
+scopes older builds used.
 
 Do not set `std_options_debug_io = zio.debug_io`, as zio's own examples do.
 std.debug unwinds stack traces through that `Io`, and Debug builds capture
@@ -89,6 +110,8 @@ while holding one: a livelock or a recursive-lock abort.
 | `process` | `null` | `init.minimal` enables socket activation, SIGUSR2 restarts and `sd_notify`. |
 | `restart_timeout_ms` | 10 000 | How long a restart waits for the new process. |
 | `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
+| `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
+| `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
 | `server` | `.{}` | The rest of dusty's `ServerConfig`: timeouts, limits, proxies. |
 
 You get the listeners you name. `.{}` alone serves cleartext HTTP on
@@ -124,7 +147,8 @@ var app = try anole.Server(void).init(init.gpa, .{
   `init`, for keys from a secret store or the environment.
 - `.{ .files = .{ .cert_path = ..., .key_path = ... } }`: PEM files (chain
   leaf first), read by `init` and by every reload, relative to the working
-  directory.
+  directory. One that cannot be read is logged with its path
+  (`cannot read the TLS certificate "cert.pem": FileNotFound`).
 - `.dev_self_signed`: a fresh P-256 key and certificate for `localhost`,
   `127.0.0.1` and `::1`, held only in memory. For development; clients need
   `curl -k`.
@@ -259,6 +283,22 @@ Handlers that run for long can learn of the drain: `req.drain` is an
 `std.Io.Event` set when it starts, to wait on or test with `isSet()`. An
 event stream that does neither never closes on its own, so with
 `timeout.shutdown = null` it holds the drain open forever.
+
+### Ports in use
+
+`SO_REUSEPORT` lets several sockets listen on one port, which is how the
+per-core accept loops and a restart's hand-over work. It would also let a
+second copy of the server, or a stale one, join the same port without an
+error and take a share of the connections. So before binding a listener,
+Anole checks the address with a probe socket that sets `SO_REUSEADDR` but
+not `SO_REUSEPORT`. The probe conflicts with any socket already listening
+there, and the listener fails with `error.AddressInUse` and a log line
+naming the address. Connections a stopped server left in `TIME_WAIT` do not
+trip it, so a quick restart works. Port 0 is not checked, and neither are
+sockets inherited from systemd or a SIGUSR2 predecessor. On macOS, as on
+other BSDs, a listener on a specific address beside one on the wildcard
+address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
+allowed: the kernel treats those as different addresses.
 
 ## HTTP/2
 
