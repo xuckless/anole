@@ -22,6 +22,12 @@
 //! `closeSend()`; its response body is read through `reader()`, and the
 //! trailers are in `trailers` once that reports the end. Release every
 //! stream before `close`.
+//!
+//! With a `SessionCache`, a connection resumes the session of an earlier
+//! one to the same server, and with `early_data` it sends its first
+//! requests in 0-RTT, before the handshake completes: `connect` returns at
+//! once. A server that refuses the early data gets the same requests again
+//! once the handshake is done.
 const std = @import("std");
 const dusty = @import("dusty");
 const tls = @import("anole_dusty_tls");
@@ -30,6 +36,7 @@ const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
 const net = @import("net.zig");
 const bridge = @import("bridge.zig");
+pub const SessionCache = @import("session_cache.zig").SessionCache;
 
 const c = ngtcp2.c;
 const h = nghttp3.c;
@@ -66,6 +73,16 @@ pub const ConnectOptions = struct {
     /// body, unless its `RequestOptions.timeout` says otherwise. Null for
     /// no limit, which a long-lived stream wants.
     timeout: ?std.Io.Duration = .fromSeconds(30),
+    /// Where tickets are kept, to resume sessions (one round trip less, no
+    /// certificate) and for `early_data`. Shared by any connections.
+    session_cache: ?*SessionCache = null,
+    /// With a ticket for this server that allows it: send requests in
+    /// 0-RTT, before the handshake completes. `connect` then returns at
+    /// once, and `request` sends GET, HEAD and OPTIONS (or any request, with
+    /// `RequestOptions.early`) right away; others wait for the handshake.
+    /// Early data can be replayed by anyone who records it, so send in it
+    /// only what is harmless to repeat.
+    early_data: bool = false,
 
     pub const Tls = struct {
         /// The certificate authorities the server's certificate must chain
@@ -130,6 +147,28 @@ fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     return .{ .duration = .{ .raw = d, .clock = .awake } };
 }
 
+/// What became of 0-RTT on a connection.
+pub const EarlyData = enum {
+    /// Not tried: no ticket that allows it, or `early_data` is off.
+    none,
+    /// Sent; the handshake has not said yet.
+    pending,
+    accepted,
+    /// The server refused it; what was sent early went again after the
+    /// handshake.
+    rejected,
+};
+
+/// How `ClientConnection.rebind` moves the connection.
+pub const Rebind = enum {
+    /// A migration (RFC 9000 §9): the client tells QUIC, which switches to
+    /// a fresh connection ID and validates the new path. What a client
+    /// does when its network changes.
+    migrate,
+    /// The new port without telling QUIC, as a NAT rebinding looks to both
+    /// ends: the server notices the new address and validates it.
+    nat,
+};
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -161,6 +200,16 @@ pub const ClientConnection = struct {
     group: std.Io.Group = .init,
     /// Streams the caller still holds or QUIC still knows.
     live: std.DoublyLinkedList = .{},
+    /// The task reading the socket (apart from `group`, so a rebind can
+    /// replace it).
+    readers: std.Io.Group = .init,
+    /// Tickets go here, filed under `cache_key`.
+    cache: ?*SessionCache = null,
+    cache_key: []u8 = &.{},
+    early: EarlyData = .none,
+    /// A socket for the driver to move to (`rebind`), and how.
+    rebind_to: ?struct { socket: std.Io.net.Socket, how: Rebind } = null,
+    rebind_error: ?anyerror = null,
 
     /// Resolves `host` (unless `address` is set), handshakes with ALPN
     /// "h3", and returns once the connection is ready for requests.
@@ -201,6 +250,11 @@ pub const ClientConnection = struct {
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
         net.rand_io = io;
+        if (options.session_cache) |cache| {
+            self.cache = cache;
+            self.cache_key = try cacheKey(gpa, options, identity);
+        }
+        errdefer if (self.cache != null) gpa.free(self.cache_key);
 
         var scid: c.ngtcp2_cid = undefined;
         scid.datalen = 17;
@@ -242,22 +296,150 @@ pub const ClientConnection = struct {
             return error.QuicSetupFailed;
         self.q = q.?;
         errdefer c.ngtcp2_conn_del(self.q);
+        // A ticket is used once, whatever happens to this connection.
+        var ticket: ?SessionCache.Entry = if (self.cache) |cache| cache.take(self.cache_key) else null;
+        defer if (ticket) |*t| t.deinit(gpa);
         self.ssl = try quic_tls.clientSession(&self.conn_ref, .{
             .host = options.host,
             .store = if (store) |st| @ptrCast(st) else null,
             .insecure_skip_verify = options.tls.insecure_skip_verify,
             .certificate = if (identity) |id| id.pem else null,
+            .session = if (ticket) |t| t.session else null,
+            .early_data = options.early_data,
+            .on_new_session = if (self.cache != null) onNewSession else null,
         });
         errdefer c.SSL_free(self.ssl);
         c.ngtcp2_conn_set_tls_native_handle(self.q, self.ssl);
         errdefer if (self.h3) |hc| h.nghttp3_conn_del(hc);
+        // 0-RTT: under the limits the server had, as the ticket recorded
+        // them, with HTTP/3 set up now so requests can go at once.
+        if (ticket) |t| if (options.early_data and c.SSL_SESSION_early_data_capable(t.session) != 0) {
+            const ready = c.ngtcp2_conn_decode_and_set_0rtt_transport_params(self.q, t.params.ptr, t.params.len) == 0 and
+                if (self.setupHttp3()) |_| true else |_| false;
+            if (ready) self.early = .pending else c.SSL_set_early_data_enabled(self.ssl, 0);
+        };
 
         errdefer self.group.cancel(io);
-        try placement.concurrent(&self.group, io, .local, readerLoop, .{self});
+        errdefer self.readers.cancel(io);
+        try placement.concurrent(&self.readers, io, .local, readerLoop, .{ self, self.udp });
         try placement.concurrent(&self.group, io, .local, drive, .{self});
+        if (self.early == .pending) return self;
         try self.waitHandshake();
         if (!std.mem.eql(u8, quic_tls.negotiated(self.ssl), "h3")) return error.NoH3;
         return self;
+    }
+
+    /// Where this connection's tickets are filed: the server, and every
+    /// TLS setting that decides whether a session may be trusted.
+    fn cacheKey(gpa: std.mem.Allocator, options: ConnectOptions, identity: ?Identity) ![]u8 {
+        var hash: std.hash.Wyhash = .init(0);
+        const ca = options.tls.ca;
+        hash.update(@tagName(ca));
+        switch (ca) {
+            .file, .dir => |src| hash.update(src.path),
+            .pem => |text| hash.update(text),
+            .system, .none => {},
+        }
+        hash.update(&.{@intFromBool(options.tls.insecure_skip_verify)});
+        if (identity) |id| hash.update(id.pem.cert_pem);
+        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, hash.final() });
+    }
+
+    /// What became of 0-RTT on this connection.
+    pub fn earlyData(self: *ClientConnection) EarlyData {
+        self.lock();
+        defer self.unlock();
+        return self.early;
+    }
+
+    /// The handshake resumed an earlier session (from `session_cache`).
+    pub fn resumed(self: *ClientConnection) bool {
+        self.lock();
+        defer self.unlock();
+        return c.SSL_session_reused(self.ssl) != 0;
+    }
+
+    /// Waits until the handshake has completed (after an early `connect`).
+    pub fn waitConnected(self: *ClientConnection) !void {
+        return self.waitHandshake();
+    }
+
+    /// Moves the connection to a new UDP socket, on a new local port, and
+    /// carries on: requests in flight continue on the new path. See
+    /// `Rebind` for the two ways. A migration needs the handshake done and
+    /// a spare connection ID from the server.
+    pub fn rebind(self: *ClientConnection, how: Rebind) !void {
+        const any: std.Io.net.IpAddress = switch (self.remote.ip()) {
+            .ip4 => .{ .ip4 = .unspecified(0) },
+            .ip6 => .{ .ip6 = .unspecified(0) },
+        };
+        const socket = try any.bind(self.io, .{ .mode = .dgram, .protocol = .udp });
+        self.lock();
+        if (self.state == .closed or self.rebind_to != null) {
+            self.unlock();
+            socket.close(self.io);
+            return error.ConnectionClosed;
+        }
+        self.rebind_to = .{ .socket = socket, .how = how };
+        self.rebind_error = null;
+        self.unlock();
+        self.kick();
+        // The driver moves it, as the only task that sends.
+        while (true) {
+            const gen = self.gen.load(.acquire);
+            self.lock();
+            const pending = self.rebind_to != null;
+            const err = self.rebind_error;
+            const closed = self.state == .closed;
+            self.unlock();
+            if (!pending) return if (err) |e| e else {};
+            if (closed) return error.ConnectionClosed;
+            try self.wait(gen);
+        }
+    }
+
+    /// The driver's half of `rebind`: QUIC told (for a migration), the
+    /// socket swapped, a reader on the new one, the old one closed.
+    fn switchSocket(self: *ClientConnection) void {
+        const io = self.io;
+        self.lock();
+        const next = self.rebind_to orelse {
+            self.unlock();
+            return;
+        };
+        if (next.how == .migrate) {
+            var local: Addr = .from(next.socket.address);
+            var p: c.ngtcp2_path = .{ .local = local.ngtcp2Addr(), .remote = self.remote.ngtcp2Addr(), .user_data = null };
+            const rv = c.ngtcp2_conn_initiate_immediate_migration(self.q, &p, now(io));
+            if (rv != 0) {
+                log.debug("HTTP/3 client migration: {s}", .{c.ngtcp2_strerror(rv)});
+                self.rebind_to = null;
+                self.rebind_error = error.MigrationRefused;
+                self.unlock();
+                next.socket.close(io);
+                self.kick();
+                return;
+            }
+            self.local = local;
+        }
+        const old = self.udp.socket;
+        self.udp = .init(next.socket);
+        const udp = self.udp;
+        self.unlock();
+        // What arrives on the old socket from here on is lost, as it would
+        // be on a network the client left.
+        self.readers.cancel(io);
+        old.close(io);
+        placement.concurrent(&self.readers, io, .local, readerLoop, .{ self, udp }) catch {
+            self.lock();
+            self.rebind_error = error.ConcurrencyUnavailable;
+            self.closeLocked();
+            self.unlock();
+        };
+        self.lock();
+        self.rebind_to = null;
+        self.unlock();
+        self.kick();
     }
 
     fn resolve(io: std.Io, host: []const u8, port: u16) !std.Io.net.IpAddress {
@@ -304,7 +486,11 @@ pub const ClientConnection = struct {
             self.fail();
         }
         self.unlock();
+        // The driver first: it may be starting a reader (`rebind`).
         self.group.cancel(io);
+        self.readers.cancel(io);
+        if (self.rebind_to) |r| r.socket.close(io);
+        if (self.cache != null) self.gpa.free(self.cache_key);
         if (self.h3) |hc| h.nghttp3_conn_del(hc);
         // Streams released but not yet closed by QUIC.
         while (self.live.popFirst()) |node| {
@@ -357,6 +543,11 @@ pub const ClientConnection = struct {
         /// `anole.h2`: null inherits it, `.none` lifts it, and past it the
         /// stream is reset and its waits fail with `error.Timeout`.
         timeout: ?std.Io.Timeout = null,
+        /// While a 0-RTT handshake is going (`ConnectOptions.early_data`):
+        /// true sends this request in early data, false waits for the
+        /// handshake, null decides by method (GET, HEAD and OPTIONS go).
+        /// Only what is harmless to repeat belongs in early data.
+        early: ?bool = null,
     };
 
     /// Opens a request stream, waiting while the server's stream limit is
@@ -377,10 +568,21 @@ pub const ClientConnection = struct {
         while (true) {
             const gen = self.gen.load(.acquire);
             self.lock();
-            if (self.closing or self.state != .open) {
+            if (self.closing or self.state == .closed) {
                 self.unlock();
                 return error.ConnectionClosed;
             }
+            const early = self.state == .handshaking;
+            if (early and !(self.early == .pending and (options.early orelse safeMethod(headers)))) {
+                self.unlock();
+                try stream.deadline.run(wait, .{ self, gen });
+                continue;
+            }
+            // Kept, to send again should the server refuse the early data.
+            if (early and stream.early_headers == null) stream.early_headers = stream.copyHeaders(headers) catch {
+                self.unlock();
+                return error.OutOfMemory;
+            };
             const hc = self.h3 orelse {
                 self.unlock();
                 return error.ConnectionClosed;
@@ -405,6 +607,7 @@ pub const ClientConnection = struct {
             }
             stream.id = id;
             stream.submitted = true;
+            if (!early) stream.early_headers = null;
             self.unlock();
             break;
         }
@@ -412,12 +615,56 @@ pub const ClientConnection = struct {
         return stream;
     }
 
+    fn safeMethod(headers: []const Header) bool {
+        for (headers) |f| if (std.mem.eql(u8, f.name, ":method")) {
+            for ([_][]const u8{ "GET", "HEAD", "OPTIONS" }) |m| if (std.mem.eql(u8, f.value, m)) return true;
+            return false;
+        };
+        return false;
+    }
+
+    /// Sends the requests that went in refused early data again, on new
+    /// streams (QUIC forgot the old ones). Locked, once the handshake is
+    /// done.
+    fn resendEarly(self: *ClientConnection) void {
+        const hc = self.h3 orelse return;
+        var it = self.live.first;
+        while (it) |node| {
+            it = node.next;
+            const s: *Stream = @alignCast(@fieldParentPtr("node", node));
+            const headers = s.early_headers orelse continue;
+            s.early_headers = null;
+            // Released or canceled meanwhile: nothing to send again.
+            if (s.user_done or s.cause != null) {
+                s.endEarly(error.Canceled);
+                s.protocol_done = true;
+                s.maybeFree();
+                continue;
+            }
+            var id: i64 = -1;
+            const reader: h.nghttp3_data_reader = .{ .read_data = readData };
+            if (c.ngtcp2_conn_open_bidi_stream(self.q, &id, s) != 0 or
+                h.nghttp3_conn_submit_request(hc, id, headers.ptr, headers.len, if (s.has_body) &reader else null, s) != 0)
+            {
+                if (id >= 0) _ = c.ngtcp2_conn_shutdown_stream(self.q, 0, id, h.NGHTTP3_H3_INTERNAL_ERROR);
+                s.endEarly(error.StreamReset);
+                s.protocol_done = id < 0;
+                continue;
+            }
+            s.id = id;
+            // The body from its start: none of it was acknowledged.
+            s.out.sent = s.out.acked;
+            s.deferred = false;
+        }
+        self.kick();
+    }
+
     // -- In: the reader task -------------------------------------------------
 
-    fn readerLoop(self: *ClientConnection) std.Io.Cancelable!void {
+    fn readerLoop(self: *ClientConnection, udp: net.Udp) std.Io.Cancelable!void {
         var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
         while (true) {
-            var dg = self.udp.receive(self.io, self.rx, &control, .none) catch |err| switch (err) {
+            var dg = udp.receive(self.io, self.rx, &control, .none) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => {
                     log.debug("HTTP/3 client receive: {t}", .{err});
@@ -465,6 +712,7 @@ pub const ClientConnection = struct {
         const io = self.io;
         while (true) {
             const gen = self.gen.load(.acquire);
+            self.switchSocket();
             self.flush();
             self.lock();
             if (self.state == .closed) {
@@ -602,6 +850,7 @@ pub const ClientConnection = struct {
         cb.get_new_connection_id2 = onGetNewConnectionId;
         cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
         cb.stream_close2 = onStreamClose;
+        cb.tls_early_data_rejected = onEarlyDataRejected;
         break :blk cb;
     };
 
@@ -616,8 +865,48 @@ pub const ClientConnection = struct {
     fn onHandshakeCompleted(_: ?*c.ngtcp2_conn, user_data: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         if (self.state == .handshaking) self.state = .open;
+        // BoringSSL says so as soon as the server's answer arrives (and
+        // `onEarlyDataRejected` has run); this is for any other way.
+        if (self.early == .pending and c.SSL_early_data_accepted(self.ssl) == 0) {
+            if (c.ngtcp2_conn_tls_early_data_rejected(self.q) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            self.early = .rejected;
+        }
+        switch (self.early) {
+            .pending => self.early = .accepted,
+            .rejected => {
+                // HTTP/3 again (if the 1-RTT keys did not already), then
+                // what was refused.
+                self.setupHttp3() catch return c.NGTCP2_ERR_CALLBACK_FAILURE;
+                self.resendEarly();
+            },
+            else => {},
+        }
         self.kick();
         return 0;
+    }
+
+    /// The server refused the 0-RTT data: QUIC has dropped the streams sent
+    /// in it, and HTTP/3 starts over once the handshake is done.
+    fn onEarlyDataRejected(_: ?*c.ngtcp2_conn, user_data: ?*anyopaque) callconv(.c) c_int {
+        const self = connOf(user_data);
+        log.debug("HTTP/3 client: 0-RTT refused, requests go again after the handshake", .{});
+        self.early = .rejected;
+        if (self.h3) |hc| h.nghttp3_conn_del(hc);
+        self.h3 = null;
+        return 0;
+    }
+
+    /// A session ticket from the server: kept with the transport parameters
+    /// that 0-RTT on it would need.
+    fn onNewSession(ssl: ?*c.SSL, session: ?*c.SSL_SESSION) callconv(.c) c_int {
+        const conn_ref: *c.ngtcp2_crypto_conn_ref = @ptrCast(@alignCast(c.SSL_get_ex_data(ssl, 0) orelse return 0));
+        const self: *ClientConnection = @ptrCast(@alignCast(conn_ref.user_data));
+        const cache = self.cache orelse return 0;
+        var params: [256]u8 = undefined;
+        const n = c.ngtcp2_conn_encode_0rtt_transport_params2(self.q, &params, params.len);
+        if (n < 0) return 0;
+        cache.put(self.cache_key, session.?, params[0..@intCast(n)]) catch return 0;
+        return 1;
     }
 
     fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
@@ -861,6 +1150,9 @@ pub const Stream = struct {
     /// Both the caller (`release`) and QUIC (stream close) are done.
     user_done: bool = false,
     protocol_done: bool = false,
+    /// The request's head, while it went in 0-RTT that the server may
+    /// still refuse.
+    early_headers: ?[]h.nghttp3_nv = null,
 
     fn create(conn: *ClientConnection, has_body: bool, deadline: Deadline) !*Stream {
         const self = try conn.gpa.create(Stream);
@@ -912,6 +1204,17 @@ pub const Stream = struct {
     /// already has a cause. Locked.
     fn endEarly(self: *Stream, cause: StreamError) void {
         if (self.cause == null and !self.body_done) self.cause = cause;
+    }
+
+    fn copyHeaders(self: *Stream, headers: []const Header) ![]h.nghttp3_nv {
+        const a = self.arena.allocator();
+        const nva = try a.alloc(h.nghttp3_nv, headers.len);
+        for (headers, nva) |f, *nv| {
+            const name = try a.dupe(u8, f.name);
+            const value = try a.dupe(u8, f.value);
+            nv.* = .{ .name = name.ptr, .namelen = name.len, .value = value.ptr, .valuelen = value.len, .flags = h.NGHTTP3_NV_FLAG_NONE };
+        }
+        return nva;
     }
 
     fn addField(self: *Stream, list: *std.ArrayList(Header), name: []const u8, value: []const u8) !void {

@@ -28,6 +28,12 @@ pub const ConnectOptions = @import("client.zig").ConnectOptions;
 pub const RequestOptions = @import("client.zig").ClientConnection.RequestOptions;
 /// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
 pub const StreamError = @import("client.zig").StreamError;
+/// Session tickets for resumption and 0-RTT (`ConnectOptions.session_cache`).
+pub const SessionCache = @import("client.zig").SessionCache;
+/// What became of a client connection's 0-RTT (`ClientConnection.earlyData`).
+pub const EarlyData = @import("client.zig").EarlyData;
+/// How `ClientConnection.rebind` moves a connection to a new socket.
+pub const Rebind = @import("client.zig").Rebind;
 
 /// Runtime version strings of the linked libraries.
 pub fn ngtcp2Version() []const u8 {
@@ -189,4 +195,5 @@ test {
     _ = @import("bridge.zig");
     _ = @import("net.zig");
     _ = @import("client_test.zig");
+    _ = @import("session_cache.zig");
 }

@@ -1,7 +1,8 @@
 //! The HTTP/3 client against Anole's HTTP/3 server engine: plain requests,
 //! a streamed body both ways larger than the windows and the ring,
 //! trailers, many concurrent streams on one connection, certificate checks,
-//! and a server that closes.
+//! a server that closes, resumption and 0-RTT (and a replay of it), and a
+//! client that moves to a new port.
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
@@ -9,6 +10,8 @@ const anole_tls = @import("../tls/root.zig");
 const client = @import("client.zig");
 const Endpoint = @import("server.zig").Endpoint(void);
 const quic_tls = @import("quic_tls.zig");
+const net = @import("net.zig");
+const early_data = @import("../early_data.zig");
 
 fn hello(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "hello over h3";
@@ -34,6 +37,40 @@ fn withTrailers(_: *dusty.Request, res: *dusty.Response) !void {
 /// The client's certificate as the handler sees it: the DER, or "none".
 fn peer(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = req.peerCertificate() orelse "none";
+}
+
+/// GET /early: whether the request may be a replay of 0-RTT data.
+fn early(req: *dusty.Request, res: *dusty.Response) !void {
+    res.body = if (early_data.isEarly(req)) "early" else "late";
+}
+
+/// How often POST /early-post ran.
+var early_posts: std.atomic.Value(u32) = .init(0);
+
+/// POST /early-post: counts, and says whether it may be a replay.
+fn earlyPost(req: *dusty.Request, res: *dusty.Response) !void {
+    _ = early_posts.fetchAdd(1, .monotonic);
+    res.body = if (early_data.isEarly(req)) "early" else "late";
+}
+
+/// GET /port: the client's port, as the request reports it.
+fn port(req: *dusty.Request, res: *dusty.Response) !void {
+    try res.print(.text, "{d}", .{req.remote_address.getPort()});
+}
+
+/// GET /download?n=BYTES: that many bytes, streamed.
+fn download(req: *dusty.Request, res: *dusty.Response) !void {
+    const n = std.fmt.parseInt(usize, req.query.get("n") orelse "0", 10) catch 0;
+    var w = res.writer();
+    var chunk: [16 * 1024]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @truncate(i);
+    var left = n;
+    while (left > 0) {
+        const k = @min(left, chunk.len);
+        try w.interface.writeAll(chunk[0..k]);
+        left -= k;
+    }
+    try w.end();
 }
 
 fn slow(req: *dusty.Request, res: *dusty.Response) !void {
@@ -90,6 +127,7 @@ const Fixture = struct {
         secret: ?[32]u8 = null,
         /// GET /hello says it comes from the successor.
         successor: bool = false,
+        early_data: bool = false,
     };
 
     fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig, extra: Extra) !Fixture {
@@ -113,6 +151,10 @@ const Fixture = struct {
         http.router.get("/stall", stall);
         http.router.get("/peer", peer);
         http.router.get("/abort", aborted);
+        http.router.get("/early", early);
+        http.router.post("/early-post", earlyPost);
+        http.router.get("/port", port);
+        http.router.get("/download", download);
         var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
         const ep = try Endpoint.init(gpa, io, http, .{
@@ -123,6 +165,7 @@ const Fixture = struct {
             .client_auth = if (extra.client_auth) |mode| .{ .ca_der = bundle.bytes.items, .mode = mode } else null,
             .fd = extra.fd,
             .secret = extra.secret,
+            .early_data = extra.early_data,
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -148,6 +191,18 @@ const Fixture = struct {
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
             .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        });
+    }
+
+    /// Through `via` (a relay) if given, with tickets in `cache`.
+    fn connectResuming(f: *Fixture, gpa: std.mem.Allocator, io: std.Io, cache: *client.SessionCache, early_ok: bool, via: ?*Relay) !*client.ClientConnection {
+        return client.ClientConnection.connect(gpa, io, .{
+            .host = "localhost",
+            .address = if (via) |r| r.front.socket.address else f.ep.address(),
+            .port = f.ep.address().getPort(),
+            .tls = .{ .ca = .{ .pem = f.pem.cert } },
+            .session_cache = cache,
+            .early_data = early_ok,
         });
     }
 };
@@ -505,4 +560,311 @@ test "h3 client: connect_timeout bounds a handshake nobody answers" {
         .connect_timeout = .fromMilliseconds(300),
     }));
     try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+}
+
+/// A UDP relay between a client and a server, which can hold the client's
+/// packets back once the server has answered (so 0-RTT requests are sure to
+/// be handled before the handshake completes) and record what the client
+/// sent (to replay it).
+const Relay = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Where the client sends.
+    front: net.Udp,
+    /// Toward the server.
+    back: net.Udp,
+    server: std.Io.net.IpAddress,
+    mutex: std.Io.Mutex = .init,
+    client: ?std.Io.net.IpAddress = null,
+    /// Once the server has answered, the client's next datagram (and so all
+    /// after it) waits this long, once.
+    hold_ms: u32 = 0,
+    answered: bool = false,
+    recording: bool = false,
+    recorded: std.ArrayList([]u8) = .empty,
+    group: std.Io.Group = .init,
+
+    fn start(gpa: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress) !*Relay {
+        const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const r = try gpa.create(Relay);
+        errdefer gpa.destroy(r);
+        r.* = .{
+            .gpa = gpa,
+            .io = io,
+            .front = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
+            .back = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
+            .server = server,
+        };
+        try r.group.concurrent(io, up, .{r});
+        try r.group.concurrent(io, down, .{r});
+        return r;
+    }
+
+    fn stop(r: *Relay) void {
+        r.group.cancel(r.io);
+        r.front.socket.close(r.io);
+        r.back.socket.close(r.io);
+        r.forget();
+        r.recorded.deinit(r.gpa);
+        r.gpa.destroy(r);
+    }
+
+    fn forget(r: *Relay) void {
+        for (r.recorded.items) |d| r.gpa.free(d);
+        r.recorded.clearRetainingCapacity();
+    }
+
+    /// Records from now on, holding the client back `hold_ms` once the
+    /// server answers: for the next connection.
+    fn arm(r: *Relay, hold_ms: u32) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.forget();
+        r.recording = true;
+        r.answered = false;
+        r.hold_ms = hold_ms;
+    }
+
+    fn disarm(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.recording = false;
+        r.hold_ms = 0;
+    }
+
+    fn up(r: *Relay) std.Io.Cancelable!void {
+        const buf = r.gpa.alloc(u8, 65536) catch return;
+        defer r.gpa.free(buf);
+        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+        while (true) {
+            var dg = r.front.receive(r.io, buf, &control, .none) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => continue,
+            };
+            r.mutex.lockUncancelable(r.io);
+            r.client = dg.from;
+            const hold = if (r.answered) r.hold_ms else 0;
+            if (hold > 0) r.hold_ms = 0;
+            if (r.recording) {
+                const copy = r.gpa.dupe(u8, dg.data) catch null;
+                if (copy) |d| r.recorded.append(r.gpa, d) catch r.gpa.free(d);
+            }
+            r.mutex.unlock(r.io);
+            if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
+            while (dg.next()) |d| r.back.send(r.io, r.server, null, 0, d, d.len);
+        }
+    }
+
+    fn down(r: *Relay) std.Io.Cancelable!void {
+        const buf = r.gpa.alloc(u8, 65536) catch return;
+        defer r.gpa.free(buf);
+        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+        while (true) {
+            var dg = r.back.receive(r.io, buf, &control, .none) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => continue,
+            };
+            r.mutex.lockUncancelable(r.io);
+            r.answered = true;
+            const to = r.client;
+            r.mutex.unlock(r.io);
+            if (to) |a| while (dg.next()) |d| r.front.send(r.io, a, null, 0, d, d.len);
+        }
+    }
+
+    /// What the client sent while recording, again, from a new address: an
+    /// attacker who captured the flight.
+    fn replay(r: *Relay) !void {
+        const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var attacker: net.Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }));
+        defer attacker.socket.close(r.io);
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        for (r.recorded.items) |d| attacker.send(r.io, r.server, null, 0, d, d.len);
+    }
+};
+
+fn request(conn: *client.ClientConnection, method: []const u8, path: []const u8, options: client.ClientConnection.RequestOptions) !*client.Stream {
+    return conn.request(&.{
+        .{ .name = ":method", .value = method }, .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, options);
+}
+
+/// The response body, which must come with a 200.
+fn finish(s: *client.Stream, gpa: std.mem.Allocator) ![]u8 {
+    defer s.release();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    return s.reader().allocRemaining(gpa, .unlimited);
+}
+
+/// Waits until `cond(arg)` holds, for `seconds` at most.
+fn eventually(io: std.Io, seconds: u32, cond: anytype, arg: anytype) !void {
+    for (0..seconds * 100) |_| {
+        if (cond(arg)) return;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.TimedOut;
+}
+
+fn hasTicket(cache: *client.SessionCache) bool {
+    return cache.count() > 0;
+}
+
+fn noConnections(ep: *Endpoint) bool {
+    ep.map_mutex.lockUncancelable(ep.io);
+    defer ep.map_mutex.unlock(ep.io);
+    return ep.conns.count() == 0;
+}
+
+test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a replayed POST never runs" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .early_data = true });
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+
+    // A first connection: a full handshake, and a ticket.
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        try std.testing.expect(!conn.resumed());
+        try std.testing.expectEqual(client.EarlyData.none, conn.earlyData());
+        const b = try finish(try request(conn, "GET", "/early", .{}), gpa);
+        defer gpa.free(b);
+        try std.testing.expectEqualStrings("late", b);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+
+    // The second: resumed, its requests in 0-RTT. The relay holds the
+    // client's Finished back, so the server handles both before the
+    // handshake completes.
+    const posts = early_posts.load(.monotonic);
+    relay.arm(300);
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        try std.testing.expectEqual(client.EarlyData.pending, conn.earlyData());
+        const get_early = try request(conn, "GET", "/early", .{});
+        const post_early = try request(conn, "POST", "/early-post", .{ .early = true });
+        const g = try finish(get_early, gpa);
+        defer gpa.free(g);
+        const p = try finish(post_early, gpa);
+        defer gpa.free(p);
+        // The GET ran from early data, and says so; the POST waited for
+        // the handshake, after which it is no replay.
+        try std.testing.expectEqualStrings("early", g);
+        try std.testing.expectEqualStrings("late", p);
+        try std.testing.expectEqual(client.EarlyData.accepted, conn.earlyData());
+        try std.testing.expect(conn.resumed());
+        try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), f.ep.early_served.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), f.ep.early_held.load(.monotonic));
+        relay.disarm();
+    }
+
+    // An attacker replays that flight once the connection is gone: the
+    // server takes the 0-RTT again (nothing in TLS stops it), runs the GET
+    // and holds the POST for a handshake that never completes.
+    // Its draining period is three PTOs, long after a handshake that took
+    // the relay's 300 ms.
+    try eventually(io, 10, noConnections, f.ep);
+    try relay.replay();
+    const Held = struct {
+        fn two(ep: *Endpoint) bool {
+            return ep.early_held.load(.monotonic) == 2;
+        }
+    };
+    try eventually(io, 2, Held.two, f.ep);
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), f.ep.early_served.load(.monotonic));
+}
+
+test "h3: 0-RTT the server refuses goes again after the handshake" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var old = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .early_data = true });
+    var old_stopped = false;
+    defer if (!old_stopped) old.stop(gpa, io);
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    {
+        const conn = try old.connectResuming(gpa, io, &cache, true, null);
+        defer conn.close();
+        const b = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+        gpa.free(b);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+
+    // The same address and certificate, but a new process's ticket keys:
+    // the ticket does not open, so no resumption and no 0-RTT.
+    const fd = std.c.dup(old.ep.udp.socket.handle);
+    try std.testing.expect(fd >= 0);
+    const pem_copy: anole_tls.Pem = .{ .cert = try gpa.dupe(u8, old.pem.cert), .key = try gpa.dupe(u8, old.pem.key) };
+    old.stop(gpa, io);
+    old_stopped = true;
+    var new = try Fixture.startWithPem(gpa, io, .{ .listeners = &.{} }, .{ .fd = fd, .early_data = true }, pem_copy);
+    defer new.stop(gpa, io);
+
+    const conn = try new.connectResuming(gpa, io, &cache, true, null);
+    defer conn.close();
+    try std.testing.expectEqual(client.EarlyData.pending, conn.earlyData());
+    const g = try request(conn, "GET", "/early", .{});
+    // A body too, which must go again from its start.
+    const e = try request(conn, "POST", "/echo", .{ .body = true, .early = true });
+    try e.writer().writeAll("sent early, and again");
+    try e.closeSend();
+    const gb = try finish(g, gpa);
+    defer gpa.free(gb);
+    const eb = try finish(e, gpa);
+    defer gpa.free(eb);
+    try std.testing.expectEqualStrings("late", gb);
+    try std.testing.expectEqualStrings("sent early, and again", eb);
+    try std.testing.expectEqual(client.EarlyData.rejected, conn.earlyData());
+    try std.testing.expect(!conn.resumed());
+    try std.testing.expectEqual(@as(u64, 0), new.ep.early_served.load(.monotonic));
+}
+
+test "h3: a client that moves to a new port keeps its connection, and the server follows" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // Not a NAT rebinding followed at once by a migration: ngtcp2 1.25.0's
+    // server then retires the connection ID its path validation still
+    // keeps as the fallback, counts it anyway when the client replaces
+    // it, and closes with CONNECTION_ID_LIMIT_ERROR. A few seconds apart,
+    // once that validation has ended, the two are fine.
+    for ([_]client.Rebind{ .migrate, .migrate, .nat, .nat }) |how| {
+        const before = conn.udp.socket.address.getPort();
+        // A download in flight across the move.
+        const d = try request(conn, "GET", "/download?n=2000000", .{});
+        try d.waitHead();
+        var some: [1000]u8 = undefined;
+        try d.reader().readSliceAll(&some);
+        try conn.rebind(how);
+        const after = conn.udp.socket.address.getPort();
+        try std.testing.expect(after != before);
+        const rest = try finish(d, gpa);
+        defer gpa.free(rest);
+        try std.testing.expectEqual(@as(usize, 2000000 - some.len), rest.len);
+        // Requests see where the client is now.
+        const p = try finish(try request(conn, "GET", "/port", .{}), gpa);
+        defer gpa.free(p);
+        try std.testing.expectEqual(after, try std.fmt.parseInt(u16, p, 10));
+    }
 }

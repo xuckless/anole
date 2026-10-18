@@ -212,6 +212,13 @@ pub const ClientOptions = struct {
     insecure_skip_verify: bool = false,
     /// A certificate to present when the server asks (mutual TLS).
     certificate: ?Identity = null,
+    /// A session from an earlier connection to resume (not consumed).
+    session: ?*c.SSL_SESSION = null,
+    /// Send early data (0-RTT) when `session` allows it.
+    early_data: bool = false,
+    /// Called with each session ticket the server sends; returns 1 when it
+    /// keeps the session (its reference), 0 when not.
+    on_new_session: ?*const fn (?*c.SSL, ?*c.SSL_SESSION) callconv(.c) c_int = null,
 };
 
 /// A certificate chain (leaf first) and its private key, in PEM.
@@ -225,6 +232,12 @@ pub fn clientSession(conn_ref: *c.ngtcp2_crypto_conn_ref, options: ClientOptions
     // The SSL holds its own reference.
     defer c.SSL_CTX_free(ctx);
     if (c.ngtcp2_crypto_boringssl_configure_client_context(ctx) != 0) return error.TlsSetupFailed;
+    if (options.on_new_session) |cb| {
+        // On a client this only turns the callback on: BoringSSL keeps no
+        // client cache of its own.
+        _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
+        c.SSL_CTX_sess_set_new_cb(ctx, cb);
+    }
     const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
     errdefer c.SSL_free(ssl);
     _ = c.SSL_set_ex_data(ssl, 0, conn_ref);
@@ -253,6 +266,10 @@ pub fn clientSession(conn_ref: *c.ngtcp2_crypto_conn_ref, options: ClientOptions
     if (options.certificate) |id| {
         try useIdentity(.ssl, ssl, id.cert_pem, id.key_pem);
         if (c.SSL_check_private_key(ssl) != 1) return error.TlsKeyMismatch;
+    }
+    if (options.session) |session| {
+        if (c.SSL_set_session(ssl, session) != 1) return error.OutOfMemory;
+        if (options.early_data and c.SSL_SESSION_early_data_capable(session) != 0) c.SSL_set_early_data_enabled(ssl, 1);
     }
     return ssl;
 }
