@@ -514,15 +514,15 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
                 var anon = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
                 defer anon.deinit();
                 // TLS 1.3: the client's flight is done before the server
-                // refuses it, so the refusal is the alert on the first read,
-                // or a reset when the server closed with the client's request
-                // still unread (it does not linger), whichever arrives first.
+                // refuses it, so the refusal is the alert on the first read.
+                // The server lingers after refusing, so no reset (from
+                // closing with the client's request unread) overtakes it.
                 if (anon.fetch(url, .{})) |r| {
                     var resp = r;
                     resp.deinit();
                     return error.ServedWithoutClientCertificate;
                 } else |err| switch (err) {
-                    error.TlsAlert, error.ConnectionResetByPeer => {},
+                    error.TlsAlert => {},
                     else => return err,
                 }
             }
@@ -620,4 +620,70 @@ test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" 
     if (probe.failed) |err| return err;
     try std.testing.expectEqual(1, probe.names);
     try std.testing.expect(probe.matches);
+}
+
+test "TLS hello: a connection the server closes ends with close_notify" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    // A plain BoringSSL client on its own thread: one request with
+    // `Connection: close`, then reads to the end and notes how it ended.
+    const Peer = struct {
+        port: u16,
+        clean_close: bool = false,
+        got_response: bool = false,
+        failed: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(p: *@This()) void {
+            defer p.done.store(true, .release);
+            p.talk() catch |err| {
+                p.failed = err;
+            };
+        }
+
+        fn talk(p: *@This()) !void {
+            const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+            if (fd < 0) return error.Socket;
+            defer _ = std.c.close(fd);
+            var addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, p.port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+            if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
+            const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+            defer c.SSL_CTX_free(ctx);
+            const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
+            defer c.SSL_free(ssl);
+            _ = c.SSL_set_fd(ssl, fd);
+            if (c.SSL_connect(ssl) != 1) return error.Handshake;
+            const req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            if (c.SSL_write(ssl, req, req.len) != req.len) return error.Write;
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = c.SSL_read(ssl, &buf, buf.len);
+                if (n > 0) {
+                    if (std.mem.indexOf(u8, buf[0..@intCast(n)], "hello over tls") != null) p.got_response = true;
+                    continue;
+                }
+                // ZERO_RETURN: close_notify; SYSCALL with no error: a bare EOF.
+                p.clean_close = c.SSL_get_error(ssl, n) == c.SSL_ERROR_ZERO_RETURN;
+                return;
+            }
+        }
+    };
+
+    var peer: Peer = .{ .port = server.address.ip.getPort() };
+    const thread = try std.Thread.spawn(.{}, Peer.run, .{&peer});
+    while (!peer.done.load(.acquire)) try io.sleep(.fromMilliseconds(2), .awake);
+    thread.join();
+    if (peer.failed) |err| return err;
+    try std.testing.expect(peer.got_response);
+    try std.testing.expect(peer.clean_close);
 }

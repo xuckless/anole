@@ -7,17 +7,18 @@
         // Core, always used, pinned by commit. zio: main HEAD on 2026-10-17
         // (its v0.19.x tags are the Zig 0.16 line). dusty: Anole's fork
         // xuckless/dusty, branch `anole`: lalinsky/dusty d3cb485 plus the
-        // patches Anole needs, each open upstream (lalinsky/dusty #263-#270):
-        // TLS teardown, server ALPN, in-memory PEM, handshake log level,
-        // nghttp2 injection, HTTP/1.0 keep-alive, the Sink seam and the
-        // HTTP/2 server engine.
+        // patches Anole needs. Open upstream (lalinsky/dusty #263-#270): TLS
+        // teardown, server ALPN, in-memory PEM, handshake log level, nghttp2
+        // injection, HTTP/1.0 keep-alive, the Sink seam and the HTTP/2
+        // server engine. Fork-only since: h2c, PROXY protocol, inherited
+        // listeners, HTTP/3 seams, TLS close_notify and the rest.
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#4e4e1ed10da974f15b119207d346a78cc6c363e4",
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#3990b5d602628a583881b7beec82afd477f1ae37",
-            .hash = "dusty-0.4.0-Qdw7RoaAJwCFDCVcl-ZiKmY2EznDMo1g2LSm1IfjxEyV",
+            .url = "git+https://github.com/xuckless/dusty#64895efcd3da6a50ca6c1b6af2fee6ab439437da",
+            .hash = "dusty-0.4.0-Qdw7RnKLJwCakG5iANFWhjQPcbnQF9K96lkoPzAXC7U2",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

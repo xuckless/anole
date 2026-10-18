@@ -28,8 +28,9 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
-            d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit 3990b5d602628a583881b7beec82afd477f1ae37 of the fork
+            d3cb485 plus Anole's patches; the first ones are open
+            upstream as lalinsky/dusty #263-#270, the rest are fork-only)
+  Pinned:   commit 64895efcd3da6a50ca6c1b6af2fee6ab439437da of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
