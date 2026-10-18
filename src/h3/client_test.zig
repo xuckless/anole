@@ -41,6 +41,16 @@ fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "too late";
 }
 
+/// The head and some of the body, then nothing for a while.
+fn stall(req: *dusty.Request, res: *dusty.Response) !void {
+    var out_buf: [256]u8 = undefined;
+    var out = try res.stream(&out_buf);
+    try out.interface.writeAll("part of it");
+    try out.interface.flush();
+    try req.io.sleep(.fromSeconds(5), .awake);
+    try out.end();
+}
+
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const s = try conn.request(&.{
         .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
@@ -91,6 +101,7 @@ const Fixture = struct {
         http.router.post("/echo", echo);
         http.router.get("/trailers", withTrailers);
         http.router.get("/slow", slow);
+        http.router.get("/stall", stall);
         http.router.get("/peer", peer);
         var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
@@ -126,7 +137,7 @@ const Fixture = struct {
             .host = "localhost",
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
-            .tls = .{ .root_ca = f.bundle },
+            .tls = .{ .ca = .{ .pem = f.pem.cert } },
         });
     }
 };
@@ -212,14 +223,14 @@ test "h3 client: certificate checks, and a server that goes away" {
         .host = "localhost",
         .address = f.ep.address(),
         .port = f.ep.address().getPort(),
-        .handshake_timeout_ms = 2000,
+        .connect_timeout = .fromSeconds(2),
     }));
     try std.testing.expectError(error.HandshakeFailed, client.ClientConnection.connect(gpa, io, .{
         .host = "example.com",
         .address = f.ep.address(),
         .port = f.ep.address().getPort(),
-        .tls = .{ .root_ca = f.bundle },
-        .handshake_timeout_ms = 2000,
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .connect_timeout = .fromSeconds(2),
     }));
 
     const conn = try f.connect(gpa, io);
@@ -289,7 +300,7 @@ test "h3 server: mutual TLS in request mode, and the client certificate in handl
             .host = "localhost",
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
-            .tls = .{ .root_ca = f.bundle, .certificate = .{ .cert_pem = f.pem.cert, .key_pem = f.pem.key } },
+            .tls = .{ .ca = .{ .pem = f.pem.cert }, .client_certificate = .{ .pem = .{ .cert = f.pem.cert, .key = f.pem.key } } },
         });
         defer conn.close();
         const body = try get(conn, "/peer", gpa);
@@ -305,8 +316,8 @@ test "h3 server: mutual TLS in request mode, and the client certificate in handl
             .host = "localhost",
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
-            .tls = .{ .root_ca = f.bundle, .certificate = .{ .cert_pem = other.cert, .key_pem = other.key } },
-            .handshake_timeout_ms = 3000,
+            .tls = .{ .ca = .{ .pem = f.pem.cert }, .client_certificate = .{ .pem = .{ .cert = other.cert, .key = other.key } } },
+            .connect_timeout = .fromSeconds(3),
         })) |conn| {
             defer conn.close();
             if (get(conn, "/peer", gpa)) |body| {
@@ -369,4 +380,71 @@ test "h3 server: a hand-over closes the connections at once and leaves the socke
         defer gpa.free(b);
         try std.testing.expectEqualStrings("hello from the successor", b);
     }
+}
+
+test "h3 client: request timeouts, for the head and for the body, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .timeout = .fromMilliseconds(300),
+    });
+    defer conn.close();
+    const headers: []const client.Header = &.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/slow" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    };
+
+    const started = std.Io.Clock.awake.now(io);
+    {
+        const s = try conn.request(headers, .{});
+        defer s.release();
+        try std.testing.expectError(error.Timeout, s.waitHead());
+    }
+    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    {
+        const s = try conn.request(&.{
+            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/stall" },
+            .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+        }, .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } } });
+        defer s.release();
+        try s.waitHead();
+        try std.testing.expectError(error.ReadFailed, s.reader().allocRemaining(gpa, .unlimited));
+        try std.testing.expectEqual(@as(?client.StreamError, error.Timeout), s.readError());
+    }
+    {
+        const s = try conn.request(headers, .{});
+        defer s.release();
+        s.cancel();
+        try std.testing.expectError(error.Canceled, s.waitHead());
+    }
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+test "h3 client: connect_timeout bounds a handshake nobody answers" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    // Bound, never read: the packets go nowhere, and nothing says so.
+    const hole = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer hole.close(io);
+    const started = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = hole.address,
+        .port = hole.address.getPort(),
+        .tls = .{ .insecure_skip_verify = true },
+        .connect_timeout = .fromMilliseconds(300),
+    }));
+    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 }

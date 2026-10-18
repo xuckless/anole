@@ -46,15 +46,13 @@ pub fn main(init: std.process.Init) !void {
     const port = try std.fmt.parseInt(u16, args.next() orelse return error.Usage, 10);
     const ca_pem = try std.Io.Dir.cwd().readFileAlloc(io, args.next() orelse return error.Usage, gpa, .limited(1 << 20));
     defer gpa.free(ca_pem);
-    var bundle = try anole.tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), ca_pem);
-    defer bundle.deinit(gpa);
     const path = args.next() orelse return error.Usage;
 
     const conn = try h3.ClientConnection.connect(gpa, io, .{
         .host = "localhost",
         .address = .{ .ip4 = .loopback(port) },
         .port = port,
-        .tls = .{ .root_ca = bundle },
+        .tls = .{ .ca = .{ .pem = ca_pem } },
     });
     defer conn.close();
 
@@ -110,7 +108,7 @@ fn fetch(gpa: std.mem.Allocator, io: std.Io, conn: *h3.ClientConnection, method:
     _ = gpa;
 }
 
-fn send(s: *h3.ClientStream, body: []const u8) anyerror!void {
+fn send(s: *h3.Stream, body: []const u8) anyerror!void {
     try s.writer().writeAll(body);
     try s.closeSend();
 }

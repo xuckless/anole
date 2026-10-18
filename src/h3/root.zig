@@ -19,10 +19,17 @@ pub const TlsContext = @import("quic_tls.zig").Context;
 /// A client certificate and key for `ConnectOptions.tls.certificate`.
 pub const Identity = @import("quic_tls.zig").Identity;
 /// An HTTP/3 client connection: many concurrent requests over one QUIC
-/// connection.
+/// connection. The same names as `anole.h2`'s.
 pub const ClientConnection = @import("client.zig").ClientConnection;
+/// One request and its response.
+pub const Stream = @import("client.zig").Stream;
+/// `Stream`, by its earlier name.
 pub const ClientStream = @import("client.zig").Stream;
+pub const Header = @import("client.zig").Header;
 pub const ConnectOptions = @import("client.zig").ConnectOptions;
+pub const RequestOptions = @import("client.zig").ClientConnection.RequestOptions;
+/// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
+pub const StreamError = @import("client.zig").StreamError;
 
 /// Runtime version strings of the linked libraries.
 pub fn ngtcp2Version() []const u8 {

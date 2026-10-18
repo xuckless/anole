@@ -7,7 +7,7 @@
 //! http3_client_proto_codec.cc (MIT).
 //!
 //!     var conn = try anole.h3.ClientConnection.connect(gpa, io, .{
-//!         .host = "localhost", .port = 8443, .tls = .{ .root_ca = bundle },
+//!         .host = "localhost", .port = 8443, .tls = .{ .ca = .{ .pem = ca_pem } },
 //!     });
 //!     defer conn.close();
 //!     const s = try conn.request(&.{
@@ -24,6 +24,7 @@
 //! stream before `close`.
 const std = @import("std");
 const dusty = @import("dusty");
+const tls = @import("anole_dusty_tls");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
@@ -35,6 +36,7 @@ const h = nghttp3.c;
 const Addr = net.Addr;
 const now = net.now;
 const placement = dusty.placement;
+const Deadline = dusty.Deadline;
 
 const log = std.log.scoped(.anole_h3);
 
@@ -57,19 +59,76 @@ pub const ConnectOptions = struct {
     /// The same for the whole connection.
     max_data: u32 = 16 * 1024 * 1024,
     idle_timeout_ms: u32 = 30_000,
-    /// How long `connect` waits for the handshake.
-    handshake_timeout_ms: u32 = 10_000,
+    /// For `connect`: resolving `host` and the QUIC handshake. Null for no
+    /// limit. Past it, `connect` fails with `error.Timeout`.
+    connect_timeout: ?std.Io.Duration = .fromSeconds(10),
+    /// Each request's budget, from `request` to the end of the response
+    /// body, unless its `RequestOptions.timeout` says otherwise. Null for
+    /// no limit, which a long-lived stream wants.
+    timeout: ?std.Io.Duration = .fromSeconds(30),
 
     pub const Tls = struct {
-        root_ca: std.crypto.Certificate.Bundle = .empty,
+        /// The certificate authorities the server's certificate must chain
+        /// to, as for `anole.h2`: the system store by default, loaded on the
+        /// first `connect` and kept for the process. `.none` only with
+        /// `insecure_skip_verify`.
+        ca: Ca = .system,
+        /// Accept any certificate, for any name. For tests only.
         insecure_skip_verify: bool = false,
-        /// A certificate (and key, PEM) to present when the server asks
-        /// for one: mutual TLS.
-        certificate: ?quic_tls.Identity = null,
+        /// A certificate to present when the server asks for one (mutual
+        /// TLS): files or PEM in memory, read on every `connect`.
+        client_certificate: ?ClientCertificate = null,
+
+        pub const Ca = dusty.TlsCa;
+        pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
 pub const Error = error{ ConnectionClosed, StreamReset, OutOfMemory, Unexpected };
+
+/// `Tls.client_certificate` as PEM for `quic_tls`: read from its files, or
+/// borrowed.
+const Identity = struct {
+    pem: quic_tls.Identity,
+    /// Read from files, so freed by `deinit`.
+    owned: bool,
+
+    fn load(gpa: std.mem.Allocator, io: std.Io, cc: ConnectOptions.Tls.ClientCertificate) !Identity {
+        if (cc.pem) |p| return .{ .pem = .{ .cert_pem = p.cert, .key_pem = p.key }, .owned = false };
+        const dir = cc.dir orelse std.Io.Dir.cwd();
+        const cert = try dir.readFileAlloc(io, cc.cert_path, gpa, .limited(1 << 20));
+        errdefer gpa.free(cert);
+        const key = try dir.readFileAlloc(io, cc.key_path, gpa, .limited(1 << 20));
+        return .{ .pem = .{ .cert_pem = cert, .key_pem = key }, .owned = true };
+    }
+
+    fn deinit(self: *Identity, gpa: std.mem.Allocator) void {
+        if (!self.owned) return;
+        gpa.free(self.pem.cert_pem);
+        const key = @constCast(self.pem.key_pem);
+        std.crypto.secureZero(u8, key);
+        gpa.free(key);
+    }
+};
+
+/// Why a stream ended early: what `waitHead` returns, and what `readError`
+/// and `writeError` say behind a `ReadFailed` or `WriteFailed`. The same as
+/// `anole.h2.StreamError`.
+pub const StreamError = error{
+    /// The server reset the stream.
+    StreamReset,
+    /// The connection failed or was closed.
+    ConnectionClosed,
+    /// The request's `timeout` passed; the stream was reset.
+    Timeout,
+    /// The stream was canceled (`cancel`, or the task waiting on it).
+    Canceled,
+};
+
+fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
+    const d = duration orelse return .none;
+    return .{ .duration = .{ .raw = d, .clock = .awake } };
+}
 
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
@@ -91,6 +150,10 @@ pub const ClientConnection = struct {
     /// Bumped on every change; the driver and waiting callers wait on it.
     gen: std.atomic.Value(u32) = .init(0),
     state: enum { handshaking, open, closed } = .handshaking,
+    /// ngtcp2 ended the handshake for taking too long.
+    handshake_timed_out: bool = false,
+    /// The default for `RequestOptions.timeout`.
+    timeout: std.Io.Timeout,
     /// The server sent GOAWAY, or `close` began: no new requests.
     closing: bool = false,
     last_error: c.ngtcp2_ccerr = undefined,
@@ -102,7 +165,17 @@ pub const ClientConnection = struct {
     /// Resolves `host` (unless `address` is set), handshakes with ALPN
     /// "h3", and returns once the connection is ready for requests.
     pub fn connect(gpa: std.mem.Allocator, io: std.Io, options: ConnectOptions) !*ClientConnection {
-        const remote_ip = options.address orelse try resolve(io, options.host, options.port);
+        const deadline: Deadline = .init(io, timeoutFrom(options.connect_timeout));
+        const remote_ip = options.address orelse try deadline.run(resolve, .{ io, options.host, options.port });
+        // Before anything that needs undoing: the first `.system` loads the
+        // platform's store.
+        const store = if (options.tls.insecure_skip_verify)
+            null
+        else
+            try tls.clientStore(gpa, io, options.tls.ca) orelse return error.NoCertificateAuthority;
+        defer if (store) |st| tls.releaseStore(st);
+        var identity: ?Identity = if (options.tls.client_certificate) |cc| try .load(gpa, io, cc) else null;
+        defer if (identity) |*id| id.deinit(gpa);
         const any: std.Io.net.IpAddress = switch (remote_ip) {
             .ip4 => .{ .ip4 = .unspecified(0) },
             .ip6 => .{ .ip6 = .unspecified(0) },
@@ -123,6 +196,7 @@ pub const ClientConnection = struct {
             .remote = .from(remote_ip),
             .tx = tx,
             .rx = rx,
+            .timeout = timeoutFrom(options.timeout),
         };
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
@@ -141,7 +215,7 @@ pub const ClientConnection = struct {
         settings.rand_ctx = .{ .native_handle = self };
         settings.max_window = 6 * @as(u64, options.max_data);
         settings.max_stream_window = 6 * @as(u64, options.stream_window);
-        settings.handshake_timeout = @as(u64, options.handshake_timeout_ms) * c.NGTCP2_MILLISECONDS;
+        settings.handshake_timeout = if (options.connect_timeout) |t| @intCast(@max(1, t.nanoseconds)) else std.math.maxInt(u64);
         // qlog stays off: both of ngtcp2's high-severity advisories were in
         // its qlog code.
         settings.qlog_write = null;
@@ -170,9 +244,9 @@ pub const ClientConnection = struct {
         errdefer c.ngtcp2_conn_del(self.q);
         self.ssl = try quic_tls.clientSession(&self.conn_ref, .{
             .host = options.host,
-            .root_ca = options.tls.root_ca,
+            .store = if (store) |st| @ptrCast(st) else null,
             .insecure_skip_verify = options.tls.insecure_skip_verify,
-            .certificate = options.tls.certificate,
+            .certificate = if (identity) |id| id.pem else null,
         });
         errdefer c.SSL_free(self.ssl);
         c.ngtcp2_conn_set_tls_native_handle(self.q, self.ssl);
@@ -209,6 +283,7 @@ pub const ClientConnection = struct {
             switch (state) {
                 .open => return,
                 .closed => {
+                    if (self.handshake_timed_out) return error.Timeout;
                     log.debug("HTTP/3 handshake failed: {s}", .{c.ngtcp2_strerror(@intCast(self.last_error.error_code))});
                     return error.HandshakeFailed;
                 },
@@ -233,7 +308,7 @@ pub const ClientConnection = struct {
         if (self.h3) |hc| h.nghttp3_conn_del(hc);
         // Streams released but not yet closed by QUIC.
         while (self.live.popFirst()) |node| {
-            const stream: *Stream = @fieldParentPtr("node", node);
+            const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
             stream.free();
         }
         c.ngtcp2_conn_del(self.q);
@@ -278,13 +353,17 @@ pub const ClientConnection = struct {
         /// The request has a body, written through `Stream.writer` and
         /// ended with `Stream.closeSend`.
         body: bool = false,
+        /// Replaces `ConnectOptions.timeout` for this request, as in
+        /// `anole.h2`: null inherits it, `.none` lifts it, and past it the
+        /// stream is reset and its waits fail with `error.Timeout`.
+        timeout: ?std.Io.Timeout = null,
     };
 
     /// Opens a request stream, waiting while the server's stream limit is
     /// reached. `headers` holds the pseudo-headers first, names in lower
     /// case; they are copied.
     pub fn request(self: *ClientConnection, headers: []const Header, options: RequestOptions) !*Stream {
-        const stream = try Stream.create(self, options.body);
+        const stream = try Stream.create(self, options.body, .init(self.io, options.timeout orelse self.timeout));
         errdefer stream.destroy();
         const nva = try self.gpa.alloc(h.nghttp3_nv, headers.len);
         defer self.gpa.free(nva);
@@ -310,7 +389,7 @@ pub const ClientConnection = struct {
             const rv = c.ngtcp2_conn_open_bidi_stream(self.q, &id, stream);
             if (rv == c.NGTCP2_ERR_STREAM_ID_BLOCKED) {
                 self.unlock();
-                try self.wait(gen);
+                try stream.deadline.run(wait, .{ self, gen });
                 continue;
             }
             if (rv != 0) {
@@ -397,6 +476,7 @@ pub const ClientConnection = struct {
             if (deadline <= t) {
                 const rv = c.ngtcp2_conn_handle_expiry(self.q, t);
                 if (rv != 0) {
+                    if (rv == c.NGTCP2_ERR_HANDSHAKE_TIMEOUT) self.handshake_timed_out = true;
                     c.ngtcp2_ccerr_set_liberr(&self.last_error, rv, null, 0);
                     self.fail();
                 }
@@ -466,8 +546,8 @@ pub const ClientConnection = struct {
         self.closing = true;
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
-            const stream: *Stream = @fieldParentPtr("node", node);
-            stream.reset = true;
+            const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+            stream.endEarly(error.ConnectionClosed);
         }
         self.kick();
     }
@@ -564,9 +644,7 @@ pub const ClientConnection = struct {
     fn onStreamReset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, _: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
-        if (streamOfUser(sud)) |s| if (!s.body_done) {
-            s.reset = true;
-        };
+        if (streamOfUser(sud)) |s| s.endEarly(error.StreamReset);
         self.kick();
         return 0;
     }
@@ -606,7 +684,7 @@ pub const ClientConnection = struct {
         const rv = bridge.closeStream(self.side(), flags, stream_id, rx_code, tx_code);
         if (rv != 0) return rv;
         if (streamOfUser(sud)) |s| {
-            if (!s.body_done) s.reset = true;
+            s.endEarly(error.StreamReset);
             s.protocol_done = true;
             s.maybeFree();
         }
@@ -749,13 +827,20 @@ pub const Stream = struct {
     node: std.DoublyLinkedList.Node = .{},
     arena: std.heap.ArenaAllocator,
     submitted: bool = false,
+    /// The request's budget, shared by every wait on the stream.
+    deadline: Deadline,
 
     status: u16 = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
     head_ready: bool = false,
-    /// The stream ended badly (reset, or the connection went).
-    reset: bool = false,
+    /// Why the stream ended early (reset, the connection went, the time
+    /// ran out).
+    cause: ?StreamError = null,
+    /// Behind the last `ReadFailed` (the reading task's) and `WriteFailed`
+    /// (the writing task's).
+    read_err: ?StreamError = null,
+    write_err: ?StreamError = null,
 
     /// Response body bytes not yet read.
     body: std.ArrayList(u8) = .empty,
@@ -777,12 +862,13 @@ pub const Stream = struct {
     user_done: bool = false,
     protocol_done: bool = false,
 
-    fn create(conn: *ClientConnection, has_body: bool) !*Stream {
+    fn create(conn: *ClientConnection, has_body: bool, deadline: Deadline) !*Stream {
         const self = try conn.gpa.create(Stream);
         errdefer conn.gpa.destroy(self);
         self.* = .{
             .conn = conn,
             .arena = .init(conn.gpa),
+            .deadline = deadline,
             .body_reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = readBody } },
             .out_writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drainOut, .flush = flushOut } },
             .has_body = has_body,
@@ -822,25 +908,44 @@ pub const Stream = struct {
         self.free();
     }
 
+    /// The stream ended early, unless its response was complete or it
+    /// already has a cause. Locked.
+    fn endEarly(self: *Stream, cause: StreamError) void {
+        if (self.cause == null and !self.body_done) self.cause = cause;
+    }
+
     fn addField(self: *Stream, list: *std.ArrayList(Header), name: []const u8, value: []const u8) !void {
         const a = self.arena.allocator();
         try list.append(a, .{ .name = try a.dupe(u8, name), .value = try a.dupe(u8, value) });
     }
 
     /// Waits for the response head (`status`, `headers`).
-    pub fn waitHead(self: *Stream) !void {
+    pub fn waitHead(self: *Stream) StreamError!void {
         const conn = self.conn;
         while (true) {
             const gen = conn.gen.load(.acquire);
             conn.lock();
             const ready = self.head_ready;
-            const reset = self.reset;
-            const gone = conn.state == .closed;
+            const cause = self.cause;
             conn.unlock();
             if (ready) return;
-            if (reset) return if (gone) error.ConnectionClosed else error.StreamReset;
-            try conn.wait(gen);
+            if (cause) |e| return e;
+            try self.waitFor(gen);
         }
+    }
+
+    /// One wait for news on the connection, within the request's budget.
+    /// Past it the stream is reset.
+    fn waitFor(self: *Stream, gen: u32) error{ Timeout, Canceled }!void {
+        self.deadline.run(ClientConnection.wait, .{ self.conn, gen }) catch |err| switch (err) {
+            error.Timeout => {
+                self.conn.lock();
+                defer self.conn.unlock();
+                self.cancelLocked(error.Timeout);
+                return error.Timeout;
+            },
+            else => return error.Canceled,
+        };
     }
 
     pub fn header(self: *const Stream, name: []const u8) ?[]const u8 {
@@ -854,15 +959,28 @@ pub const Stream = struct {
     }
 
     /// The response body. `error.EndOfStream` at its end; then `trailers`
-    /// are in. A reset stream fails the read.
+    /// are in. A stream that ended early fails the read with `ReadFailed`,
+    /// and `readError` says why.
     pub fn reader(self: *Stream) *std.Io.Reader {
         return &self.body_reader;
     }
 
     /// The request body (for a request opened with `.body = true`).
-    /// `flush` sends what is written; `closeSend` ends it.
+    /// `flush` sends what is written; `closeSend` ends it. A stream that
+    /// ended early fails the write with `WriteFailed`, and `writeError`
+    /// says why.
     pub fn writer(self: *Stream) *std.Io.Writer {
         return &self.out_writer;
+    }
+
+    /// What the last `ReadFailed` from `reader` was.
+    pub fn readError(self: *const Stream) ?StreamError {
+        return self.read_err;
+    }
+
+    /// What the last `WriteFailed` from `writer` was.
+    pub fn writeError(self: *const Stream) ?StreamError {
+        return self.write_err;
     }
 
     /// Ends the request body.
@@ -881,14 +999,14 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         defer conn.unlock();
-        self.cancelLocked();
+        self.cancelLocked(error.Canceled);
     }
 
-    fn cancelLocked(self: *Stream) void {
+    fn cancelLocked(self: *Stream, cause: StreamError) void {
         const conn = self.conn;
         if (self.submitted and !self.protocol_done and conn.state != .closed)
             _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, self.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
-        self.reset = true;
+        self.endEarly(cause);
         conn.kick();
     }
 
@@ -898,7 +1016,7 @@ pub const Stream = struct {
         conn.lock();
         defer conn.unlock();
         const sent = !self.has_body or self.send_stopped or (self.send_closed and self.out.allSent());
-        if (!(self.body_done and sent)) self.cancelLocked();
+        if (!(self.body_done and sent)) self.cancelLocked(error.Canceled);
         self.user_done = true;
         // A stream QUIC never got, or one the connection's end left
         // behind, has no close to wait for.
@@ -942,11 +1060,17 @@ pub const Stream = struct {
                 return n;
             }
             const done = self.body_done;
-            const reset = self.reset;
+            const cause = self.cause;
             conn.unlock();
             if (done) return error.EndOfStream;
-            if (reset) return error.ReadFailed;
-            conn.wait(gen) catch return error.ReadFailed;
+            if (cause) |e| {
+                self.read_err = e;
+                return error.ReadFailed;
+            }
+            self.waitFor(gen) catch |e| {
+                self.read_err = e;
+                return error.ReadFailed;
+            };
         }
     }
 
@@ -959,7 +1083,8 @@ pub const Stream = struct {
         while (rest.len > 0) {
             const gen = conn.gen.load(.acquire);
             conn.lock();
-            if (self.reset or self.send_stopped or conn.state == .closed) {
+            if (self.cause != null or self.send_stopped or conn.state == .closed) {
+                self.write_err = self.cause orelse if (self.send_stopped) error.StreamReset else error.ConnectionClosed;
                 conn.unlock();
                 return error.WriteFailed;
             }
@@ -973,7 +1098,10 @@ pub const Stream = struct {
             }
             conn.unlock();
             // Kick only for new bytes; see the server's StreamSink.put.
-            if (n > 0) conn.kick() else conn.wait(gen) catch return error.WriteFailed;
+            if (n > 0) conn.kick() else self.waitFor(gen) catch |e| {
+                self.write_err = e;
+                return error.WriteFailed;
+            };
         }
     }
 

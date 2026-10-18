@@ -108,3 +108,19 @@ test "feature constraints hold" {
     if (features.grpc) try std.testing.expect(features.http2);
     if (features.http3) try std.testing.expect(features.tls != .none);
 }
+
+test "anole.h2 and anole.h3 export the same client names" {
+    if (!features.http2 or !features.http3) return error.SkipZigTest;
+    inline for (.{ "ClientConnection", "Stream", "ClientStream", "Header", "ConnectOptions", "RequestOptions", "StreamError" }) |name| {
+        try std.testing.expect(@hasDecl(h2, name) and @hasDecl(h3, name));
+    }
+    // One error set for both, so code over either handles the same causes.
+    try std.testing.expect(h2.StreamError == h3.StreamError);
+    inline for (.{ "ca", "insecure_skip_verify" }) |field| {
+        try std.testing.expect(@FieldType(h2.ConnectOptions.Tls, field) == @FieldType(h3.ConnectOptions.Tls, field));
+    }
+    inline for (.{ "connect_timeout", "timeout", "address", "host", "port" }) |field| {
+        try std.testing.expect(@FieldType(h2.ConnectOptions, field) == @FieldType(h3.ConnectOptions, field));
+    }
+    try std.testing.expect(@FieldType(h2.RequestOptions, "timeout") == @FieldType(h3.RequestOptions, "timeout"));
+}

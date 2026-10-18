@@ -181,7 +181,10 @@ pub const ClientOptions = struct {
     /// The server's name: SNI (unless an IP literal) and the certificate
     /// check.
     host: []const u8,
-    root_ca: std.crypto.Certificate.Bundle = .empty,
+    /// The trust store, from `dusty_tls.clientStore` (cached there); the
+    /// `SSL` takes its own reference. Required unless
+    /// `insecure_skip_verify`.
+    store: ?*c.X509_STORE = null,
     insecure_skip_verify: bool = false,
     /// A certificate to present when the server asks (mutual TLS).
     certificate: ?Identity = null,
@@ -212,18 +215,7 @@ pub fn clientSession(conn_ref: *c.ngtcp2_crypto_conn_ref, options: ClientOptions
     if (options.insecure_skip_verify) {
         c.SSL_set_verify(ssl, c.SSL_VERIFY_NONE, null);
     } else {
-        const store = c.X509_STORE_new() orelse return error.OutOfMemory;
-        defer c.X509_STORE_free(store);
-        // The bundle is DER certificates back to back.
-        const der = options.root_ca.bytes.items;
-        var p: [*c]const u8 = der.ptr;
-        const end = der.ptr + der.len;
-        while (p != end) {
-            const x = c.d2i_X509(null, &p, @intCast(end - p)) orelse break;
-            defer c.X509_free(x);
-            _ = c.X509_STORE_add_cert(store, x);
-        }
-        c.ERR_clear_error();
+        const store = options.store orelse return error.NoCertificateAuthority;
         if (c.SSL_set1_verify_cert_store(ssl, store) != 1) return error.OutOfMemory;
         c.SSL_set_verify(ssl, c.SSL_VERIFY_PEER, null);
         const ok = if (host_is_ip)
