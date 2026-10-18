@@ -283,3 +283,29 @@ test "stringify round-trips through parse" {
     try std.testing.expectEqualStrings("a\"b", back[0].name);
     try std.testing.expectEqualStrings("n", back[1].note.?);
 }
+
+test "fuzz: JSON into a struct" {
+    try @import("../fuzz.zig").bytes(struct {
+        const T = struct {
+            name: []const u8 = "",
+            age: ?i64 = null,
+            tags: []const []const u8 = &.{},
+            scores: []const i32 = &.{},
+            inner: ?struct { ok: bool = false, ratio: f64 = 0 } = null,
+            kind: enum { a, b } = .a,
+        };
+        fn check(input: []const u8) !void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            _ = parse(T, arena_state.allocator(), input, .{}) catch return;
+        }
+    }.check, &.{
+        \\{"name":"anole","age":3,"tags":["a","b"],"scores":[1,-2,3],"inner":{"ok":true,"ratio":0.5},"kind":"b"}
+        ,
+        \\{"name":"\u00e9\ud83d\ude00","age":9223372036854775807,"scores":[2147483648]}
+        ,
+        \\{"inner":null,"extra":{"deep":[[[[[]]]]]}}
+        ,
+        "[1,2,3]",
+    });
+}

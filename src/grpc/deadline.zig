@@ -112,3 +112,15 @@ test "deadline uses an injectable monotonic clock" {
     try std.testing.expect(value.isExceeded());
     try std.testing.expectEqual(@as(u64, 0), value.remainingNs());
 }
+
+test "fuzz: grpc-timeout values" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            const ns = parseTimeout(input) catch return;
+            // Whatever parses formats back to a value no shorter.
+            var buf: [16]u8 = undefined;
+            const text = formatTimeout(&buf, ns);
+            try std.testing.expect(try parseTimeout(text) >= ns);
+        }
+    }.check, &.{ "1S", "100m", "5H", "99999999n", "250u", "0M", "99999999H" });
+}

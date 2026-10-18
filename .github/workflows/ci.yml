@@ -119,6 +119,20 @@ jobs:
       - name: Server and client against aioquic
         run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
 
+  fuzz:
+    name: Fuzz the parsers (200K runs per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: fuzz
+      # The fuzz targets are the "fuzz:" tests (src/fuzz.zig); a plain
+      # `zig build test` runs them on their seeds and fixed mutations only.
+      - name: zig build test --fuzz=200K
+        run: zig build test --fuzz=200K
+
   grpc-interop:
     name: gRPC interop (both directions with grpc-go, cleartext HTTP/2)
     runs-on: ubuntu-latest

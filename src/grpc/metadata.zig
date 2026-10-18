@@ -290,3 +290,14 @@ test "invalid incoming ASCII metadata is discarded" {
     try std.testing.expectEqual(IncomingResult.appended, try metadata.appendDecoded("x-visible", " ~"));
     try std.testing.expectEqual(@as(usize, 1), metadata.items().len);
 }
+
+test "fuzz: incoming metadata, text and -bin" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            const colon = std.mem.indexOfScalar(u8, input, ':') orelse return;
+            var md = Metadata.init(std.testing.allocator);
+            defer md.deinit();
+            _ = md.appendDecoded(input[0..colon], input[colon + 1 ..]) catch return;
+        }
+    }.check, &.{ "trace-bin:qw==", "x-user:alice", "a-bin:AAEC,AwQF", "b-bin:AAE", "grpc-status:0", "x-n:\x7f" });
+}

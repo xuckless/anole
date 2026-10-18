@@ -80,6 +80,7 @@ pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 test {
     _ = @import("server.zig");
     _ = @import("handoff.zig");
+    _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = http;
     _ = tls;

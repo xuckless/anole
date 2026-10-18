@@ -371,3 +371,31 @@ test "verify: ES256 and EdDSA signed here, keys from a JWKS" {
         try std.testing.expectEqualStrings(case[1], v.kid.?);
     }
 }
+
+test "fuzz: JWS verification and JWK Sets" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const secret = try decode(arena, rfc_hs256_key);
+            const keys = [_]Key{
+                .{ .alg = .HS256, .material = .{ .hmac = secret } },
+                .{ .alg = .HS512, .kid = "k2", .material = .{ .hmac = "another secret" } },
+            };
+            if (verify(arena, input, &keys, .{}, 1300819000)) |v| {
+                // Only a signature over exactly this input verifies.
+                try std.testing.expect(v.alg == .HS256 or v.alg == .HS512);
+            } else |_| {}
+            _ = parseJwks(arena, input) catch {};
+        }
+    }.check, &.{
+        rfc_hs256_token,
+        "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.",
+        "eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiYiJdfQ.e30.AAAA",
+        \\{"keys":[{"kty":"oct","alg":"HS256","k":"AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow"}]}
+        ,
+        \\{"keys":[{"kty":"EC","crv":"P-256","kid":"ec1","x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4","y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"},{"kty":"RSA","n":"0vx7","e":"AQAB","alg":"RS256"},{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}
+        ,
+    });
+}

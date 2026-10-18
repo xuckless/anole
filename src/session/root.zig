@@ -324,3 +324,16 @@ test "seal/open: round trip, wrong key, and a cookie name it was not sealed for"
 test {
     _ = @import("session_test.zig");
 }
+
+test "fuzz: forged session cookies never open" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const key: [key_length]u8 = @splat(7);
+            const raw = decodeBase64(arena, input) catch input;
+            if (open(arena, key, "sid", raw)) |_| return error.ForgedCookieOpened else |_| {}
+        }
+    }.check, &.{ "", "AAAA", &@as([80]u8, @splat('A')), &@as([40]u8, @splat(0)) });
+}

@@ -239,3 +239,20 @@ test "traceparent: parse, round trip, and what is refused" {
     try std.testing.expect(Context.parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra") == null);
     try std.testing.expect(Context.parse("garbage") == null);
 }
+
+test "fuzz: traceparent parsing round-trips" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            const ctx = Context.parse(input) orelse return;
+            var buf: [64]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            try ctx.format(&w);
+            const again = Context.parse(w.buffered()) orelse return error.RoundTrip;
+            try std.testing.expectEqual(ctx, again);
+        }
+    }.check, &.{
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        " 00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-00\t",
+        "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-future",
+    });
+}

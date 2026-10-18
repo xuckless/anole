@@ -219,6 +219,9 @@ fn decompressGzip(
     max_message_size: usize,
 ) ![]u8 {
     if (comptime !features.compression) return error.CompressionUnsupported;
+    // No gzip stream is empty, and the inflater asserts it has input: a
+    // peer could crash a safe build with an empty compressed message.
+    if (payload.len == 0) return error.MalformedCompressedMessage;
     var input: std.Io.Reader = .fixed(payload);
     var decompressor = try zlib.Decompress.init(allocator, &input, &.{}, .gzip, .{});
     defer decompressor.deinit();
@@ -478,4 +481,45 @@ test "readMessage: messages off a reader, null at a clean end" {
 
     var cut: std.Io.Reader = .fixed(a[0 .. a.len - 1]);
     try std.testing.expectError(error.TruncatedFrame, readMessage(&cut, gpa, 1024, .identity));
+}
+
+test "fuzz: gRPC message frames, plain and gzip, fed in pieces" {
+    try @import("../fuzz.zig").bytes(struct {
+        const max = 1024;
+        fn check(input: []const u8) !void {
+            if (input.len == 0) return;
+            // The first byte picks the compression and the piece size.
+            const compression: Compression = if (input[0] & 1 == 1) .gzip else .identity;
+            const step: usize = (input[0] >> 1) + 1;
+            const wire = input[1..];
+            const gpa = std.testing.allocator;
+
+            var decoder = Decoder.initWithCompression(gpa, max, compression);
+            defer decoder.deinit();
+            var i: usize = 0;
+            feeding: while (i < wire.len) : (i += step) {
+                decoder.feed(wire[i..@min(i + step, wire.len)]) catch break;
+                while (true) {
+                    const m = decoder.nextMessage() catch break :feeding orelse break;
+                    defer gpa.free(m.payload);
+                    try std.testing.expect(m.payload.len <= max);
+                }
+            }
+
+            var reader: std.Io.Reader = .fixed(wire);
+            while (true) {
+                const m = readMessage(&reader, gpa, max, compression) catch break orelse break;
+                defer gpa.free(m.payload);
+                try std.testing.expect(m.payload.len <= max);
+            }
+        }
+    }.check, &.{
+        "\x00\x00\x00\x00\x05hello\x00\x00\x00\x00\x00",
+        "\x01\x01\x00\x00\x00\x1c\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\xc8\x40\x27\x01\xe3\x51\x3d\x8d\x17\x00\x00\x00",
+        // 5000 bytes once inflated: over the limit.
+        "\x03\x01\x00\x00\x00\x29\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x31\x01\x00\x00\x00\xc2\xa0\xac\xeb\x5f\xc2\x14\x7e\x40\x01\x00\x00\x00\x00\x6f\x03\x76\x59\xf4\x4c\x88\x13\x00\x00",
+        "\x00\x00\xff\xff\xff\xff",
+        // Found by this target: an empty compressed message.
+        "\x01\x01\x00\x00\x00\x00",
+    });
 }

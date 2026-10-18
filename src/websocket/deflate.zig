@@ -286,3 +286,39 @@ test "Deflate: messages round-trip, with and without context takeover" {
     try std.testing.expectEqualStrings("Hello", try rx.decompress(gpa, &.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 100));
     try std.testing.expectError(error.MessageTooLarge, rx.decompress(gpa, &.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 3));
 }
+
+test "fuzz: permessage-deflate offers" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var out: [256]u8 = undefined;
+            const r = negotiate(input, .{}, &out) orelse return;
+            try std.testing.expect(r.config.server_window_bits >= 8);
+            try std.testing.expect(std.mem.startsWith(u8, r.response, "permessage-deflate"));
+        }
+    }.check, &.{
+        "permessage-deflate",
+        "permessage-deflate; client_max_window_bits",
+        "x-webkit-deflate-frame, permessage-deflate; server_no_context_takeover; client_max_window_bits=10; server_max_window_bits=9",
+        "permessage-deflate; server_max_window_bits=\"8\", permessage-deflate",
+    });
+}
+
+test "fuzz: inflating messages stays within the limit" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            const gpa = std.testing.allocator;
+            var d: Deflate = .init(.{}, .{});
+            defer d.deinit(gpa);
+            // Two messages through the same context.
+            const half = input.len / 2;
+            for ([_][]const u8{ input[0..half], input[half..] }) |part| {
+                const m = d.decompress(gpa, part, 4096) catch return;
+                try std.testing.expect(m.len <= 4096);
+            }
+        }
+    }.check, &.{
+        "\xf2\x48\xcd\xc9\xc9\xd7\x51\x28\x48\x2d\xca\x4d\x2d\x2e\x4e\x4c\x4f\xd5\x4d\x49\x4d\xcb\x49\x2c\x49\x55\x54\xf0\xa0\xb6\x14\x00",
+        "\x00\x00\xff\xff",
+        "\x03\x00",
+    });
+}
