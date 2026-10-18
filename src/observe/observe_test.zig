@@ -1,0 +1,128 @@
+//! Metrics, traces, readiness and access-log lines, end to end.
+const std = @import("std");
+const zio = @import("zio");
+const dusty = @import("dusty");
+const observe = @import("root.zig");
+
+var collected: [16 * 1024]u8 = undefined;
+var collected_len: usize = 0;
+
+fn collector(req: *dusty.Request, res: *dusty.Response) !void {
+    const body = (try req.body()) orelse "";
+    const n = @min(body.len, collected.len - collected_len);
+    @memcpy(collected[collected_len..][0..n], body[0..n]);
+    collected_len += n;
+    res.body = "{}";
+}
+
+fn user(req: *dusty.Request, res: *dusty.Response) !void {
+    res.body = try std.fmt.allocPrint(res.arena, "user {s} trace {s}", .{ req.params.get("id").?, req.trace_id });
+}
+
+var db_ready = true;
+fn dbCheck(_: ?*anyopaque) bool {
+    return db_ready;
+}
+
+fn get(io: std.Io, port: u16, request: []const u8, out: []u8) ![]const u8 {
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [1024]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    _ = r.interface.streamRemaining(&fw) catch {};
+    return fw.buffered();
+}
+
+fn serve(s: *dusty.Server(void)) !void {
+    try s.run();
+}
+
+test "observe: traces reach the collector, metrics by route, readiness" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var otel = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer otel.deinit();
+    otel.router.post("/v1/traces", collector);
+    var otel_future = try io.concurrent(serve, .{&otel});
+    defer otel_future.cancel(io) catch {};
+    try otel.ready.wait(io);
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
+    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = endpoint, .service_name = "test-api", .interval_ms = 50 });
+    var exporter_live = true;
+    defer if (exporter_live) exporter.deinit();
+    try exporter.start();
+
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var http = try observe.metrics.HttpMetrics.init(&registry);
+    var tracing = observe.trace.Middleware.init(&exporter);
+    var health = observe.Health.init(.{});
+    try health.addCheck("db", dbCheck, null);
+
+    var app = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer app.deinit();
+    app.router.use(dusty.Middleware(void).init(&tracing));
+    app.router.use(dusty.Middleware(void).init(&http));
+    app.router.get("/users/:id", user);
+    registry.serveOn(void, &app.router, "/metrics");
+    health.registerOn(void, &app.router, &app);
+    var app_future = try io.concurrent(serve, .{&app});
+    defer app_future.cancel(io) catch {};
+    try app.ready.wait(io);
+    const port = app.address.ip.getPort();
+
+    var out: [8192]u8 = undefined;
+    const resp = try get(io, port, "GET /users/7 HTTP/1.1\r\nHost: x\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "user 7 trace 4bf92f3577b34da6a3ce929d0e0e4736"));
+
+    const metrics = try get(io, port, "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_http_requests_total{method=\"GET\",route=\"/users/:id\",status=\"200\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_http_request_duration_seconds_count{method=\"GET\",route=\"/users/:id\"} 1") != null);
+
+    var out2: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try get(io, port, "GET /readyz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out2), "HTTP/1.1 200"));
+    db_ready = false;
+    const not_ready = try get(io, port, "GET /readyz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out2);
+    try std.testing.expect(std.mem.startsWith(u8, not_ready, "HTTP/1.1 503"));
+    try std.testing.expect(std.mem.endsWith(u8, not_ready, "not ready: db\n"));
+    try std.testing.expect(std.mem.startsWith(u8, try get(io, port, "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out2), "HTTP/1.1 200"));
+
+    // Flushes the queue: the request's span reaches the collector under the
+    // caller's trace, as a child of its span.
+    exporter.deinit();
+    exporter_live = false;
+    const sent = collected[0..collected_len];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"traceId\":\"4bf92f3577b34da6a3ce929d0e0e4736\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"parentSpanId\":\"00f067aa0ba902b7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"name\":\"GET /users/:id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"stringValue\":\"test-api\"") != null);
+}
+
+test "access log: text and JSON lines" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/a\"b";
+    req.id = "rid";
+    req.trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    req.span_id = "00f067aa0ba902b7";
+    const json = try observe.access_log.format(arena_state.allocator(), .json, &req, 200, 42, 1700000000000, null);
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"ts\":1700000000000,\"method\":\"GET\",\"path\":\"/a\\\"b\",\"status\":200,\"duration_us\":42,"));
+    try std.testing.expect(std.mem.endsWith(u8, json, "\"request_id\":\"rid\",\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"span_id\":\"00f067aa0ba902b7\"}\n"));
+    const text = try observe.access_log.format(arena_state.allocator(), .text, &req, 404, 7, 0, null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
+}
