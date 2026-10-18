@@ -41,6 +41,13 @@ pub const Provider = struct {
         defer response.deinit();
         if (response.status() != .ok) return error.DiscoveryFailed;
         const body = try a.dupe(u8, (try response.body()) orelse return error.DiscoveryFailed);
+        var provider = try parseDiscovery(a, body, issuer);
+        provider.arena = arena;
+        return provider;
+    }
+
+    /// A discovery document's endpoints, its strings in `a`.
+    fn parseDiscovery(a: std.mem.Allocator, body: []const u8, issuer: []const u8) !Provider {
         const doc = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return error.DiscoveryFailed;
         if (doc != .object) return error.DiscoveryFailed;
         const o = doc.object;
@@ -52,7 +59,6 @@ pub const Provider = struct {
             .token_endpoint = str(o, "token_endpoint") orelse return error.DiscoveryFailed,
             .jwks_uri = str(o, "jwks_uri") orelse return error.DiscoveryFailed,
             .userinfo_endpoint = str(o, "userinfo_endpoint"),
-            .arena = arena,
         };
     }
 
@@ -217,16 +223,32 @@ pub const RelyingParty = struct {
             std.log.scoped(.anole_oidc).info("token endpoint said {d}: {s}", .{ @backingInt(response.status()), body[0..@min(body.len, 200)] });
             return error.TokenRequestFailed;
         }
+        const tokens = try parseTokens(arena, body);
+        // OIDC Core 3.1.3.7: signature, iss, aud, exp, iat; then azp and nonce.
+        const v = try self.keyring.verify(arena, tokens.object.get("id_token").?.string, self.idTokenPolicy());
+        return self.identify(v, tokens.object, saved);
+    }
+
+    /// The token endpoint's answer: a JSON object with a string `id_token`.
+    fn parseTokens(arena: std.mem.Allocator, body: []const u8) !std.json.Value {
         const tokens = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return error.TokenRequestFailed;
         if (tokens != .object) return error.TokenRequestFailed;
-        const id_token = str(tokens.object, "id_token") orelse return error.NoIdToken;
+        _ = str(tokens.object, "id_token") orelse return error.NoIdToken;
+        return tokens;
+    }
 
-        // OIDC Core 3.1.3.7: signature, iss, aud, exp, iat; then azp and nonce.
-        const v = try self.keyring.verify(arena, id_token, .{
+    /// What the ID token's signature and standard claims are checked against.
+    fn idTokenPolicy(self: *const RelyingParty) jws.Policy {
+        return .{
             .issuer = self.provider.issuer,
             .audience = self.client_id,
             .leeway_seconds = self.leeway_seconds,
-        });
+        };
+    }
+
+    /// The rest of OIDC Core 3.1.3.7 on a verified ID token (azp, nonce),
+    /// and who signed in.
+    fn identify(self: *const RelyingParty, v: jws.Verified, tokens: std.json.ObjectMap, saved: Start) !Identity {
         if (v.claims.get("aud")) |aud| if (aud == .array and aud.array.items.len > 1) {
             const azp = v.string("azp") orelse return error.AzpMismatch;
             if (!std.mem.eql(u8, azp, self.client_id)) return error.AzpMismatch;
@@ -246,8 +268,8 @@ pub const RelyingParty = struct {
             .email_verified = verified_email,
             .name = v.string("name"),
             .claims = v,
-            .access_token = str(tokens.object, "access_token"),
-            .refresh_token = str(tokens.object, "refresh_token"),
+            .access_token = str(tokens, "access_token"),
+            .refresh_token = str(tokens, "refresh_token"),
         };
     }
 };
@@ -276,4 +298,92 @@ fn param(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
             try w.print("%{X:0>2}", .{ch});
         }
     }
+}
+
+test "fuzz: OIDC discovery documents, token responses and ID token claims" {
+    try @import("../fuzz.zig").bytes(struct {
+        const issuer = "https://issuer.example";
+        const secret = "fuzz-secret";
+        const now = 1700000000;
+
+        fn encode(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+            return b64.Encoder.encode(try arena.alloc(u8, b64.Encoder.calcSize(bytes.len)), bytes);
+        }
+
+        fn check(input: []const u8) !void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            // The input as the provider's discovery document, and as its
+            // token endpoint's answer.
+            if (Provider.parseDiscovery(arena, input, issuer)) |p| {
+                try std.testing.expectEqualStrings(issuer, p.issuer);
+            } else |_| {}
+            if (RelyingParty.parseTokens(arena, input)) |t| {
+                try std.testing.expect(t.object.get("id_token").? == .string);
+            } else |_| {}
+
+            // The input as the claims of an ID token the provider signed:
+            // whatever they say, an identity comes out only if they pass
+            // every check.
+            const provider: Provider = .{ .issuer = issuer, .authorization_endpoint = "", .token_endpoint = "", .jwks_uri = "" };
+            const rp: RelyingParty = .{ .provider = &provider, .client_id = "client-1", .redirect_uri = "", .keyring = undefined };
+            const saved: Start = .{ .url = "", .state = "state-1", .nonce = "nonce-1", .code_verifier = "" };
+            const header = "{\"alg\":\"HS256\"}";
+            const signing_input = try std.fmt.allocPrint(arena, "{s}.{s}", .{ try encode(arena, header), try encode(arena, input) });
+            var mac: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signing_input, secret);
+            const body = try std.fmt.allocPrint(arena, "{{\"id_token\":\"{s}.{s}\",\"access_token\":\"at\"}}", .{ signing_input, try encode(arena, &mac) });
+            const tokens = try RelyingParty.parseTokens(arena, body);
+            const key: jws.Key = .{ .alg = .HS256, .material = .{ .hmac = secret } };
+            // With a maximum age too, which OIDC leaves to the application.
+            var aged = rp.idTokenPolicy();
+            aged.max_age_seconds = 600;
+            _ = jws.verify(arena, tokens.object.get("id_token").?.string, &.{key}, aged, now) catch {};
+            const v = jws.verify(arena, tokens.object.get("id_token").?.string, &.{key}, rp.idTokenPolicy(), now) catch return;
+            const id = rp.identify(v, tokens.object, saved) catch return;
+
+            const claims = (try std.json.parseFromSliceLeaky(std.json.Value, arena, input, .{})).object;
+            try std.testing.expectEqualStrings(issuer, claims.get("iss").?.string);
+            try std.testing.expectEqualStrings("nonce-1", claims.get("nonce").?.string);
+            try std.testing.expectEqualStrings(claims.get("sub").?.string, id.subject);
+            const exp: f64 = switch (claims.get("exp").?) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expect(exp > now - rp.leeway_seconds);
+            switch (claims.get("aud").?) {
+                .string => |s| try std.testing.expectEqualStrings("client-1", s),
+                .array => |a| {
+                    var found = false;
+                    for (a.items) |item| found = found or (item == .string and std.mem.eql(u8, item.string, "client-1"));
+                    try std.testing.expect(found);
+                    if (a.items.len > 1) try std.testing.expectEqualStrings("client-1", claims.get("azp").?.string);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expectEqual(id.email_verified, if (claims.get("email_verified")) |e|
+                (e == .bool and e.bool) or (e == .string and std.mem.eql(u8, e.string, "true"))
+            else
+                false);
+        }
+    }.check, &.{
+        \\{"iss":"https://issuer.example","aud":"client-1","sub":"u1","nonce":"nonce-1","exp":1700000600,"iat":1700000000}
+        ,
+        \\{"iss":"https://issuer.example","aud":["client-1","other"],"azp":"client-1","sub":"u2","nonce":"nonce-1","exp":1700000600,"email":"a@b.example","email_verified":"true"}
+        ,
+        \\{"iss":"https://issuer.example","aud":["other","client-1"],"sub":"u3","nonce":"nonce-1","exp":1700000600.5,"nbf":1699999990}
+        ,
+        // Times far past what fits in an i64.
+        \\{"iss":"https://issuer.example","aud":"client-1","sub":"u4","nonce":"nonce-1","exp":1e300,"iat":-1e300,"nbf":-9.3e18}
+        ,
+        \\{"iss":"https://issuer.example","aud":"client-1","sub":"u5","nonce":"nonce-1","exp":9223372036854775807,"iat":-9223372036854775808,"nbf":-9223372036854775808}
+        ,
+        \\{"issuer":"https://issuer.example","authorization_endpoint":"https://issuer.example/a","token_endpoint":"https://issuer.example/t","jwks_uri":"https://issuer.example/k"}
+        ,
+        \\{"id_token":"eyJhbGciOiJIUzI1NiJ9.e30.AAAA","access_token":"at","refresh_token":"rt"}
+        ,
+    });
 }
