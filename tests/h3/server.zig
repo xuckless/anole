@@ -77,7 +77,8 @@ fn echo(req: *http.Request, res: *http.Response) !void {
     try out.end();
 }
 
-/// WebSocket at /ws (RFC 9220 over HTTP/3): each message back.
+/// WebSocket at /ws (RFC 9220 over HTTP/3): each message back. Only with
+/// `-Dwebsocket`.
 fn wsEcho(ws: *anole.websocket.Socket) !void {
     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
 }
@@ -165,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
     app.post("/echo", echo);
     app.get("/early", early);
     app.post("/early", early);
-    app.ws("/ws", wsEcho);
+    if (anole.features.websocket) app.ws("/ws", wsEcho);
     app.webtransport("/wt", wtEcho);
     std.log.info("h3 test server on https://{s}:{d} (TCP and UDP)", .{ address, port });
     try app.run();
