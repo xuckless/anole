@@ -10,7 +10,8 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const anole_tls = @import("../tls/root.zig");
 const client = @import("client.zig");
-const Endpoint = @import("server.zig").Endpoint(void);
+const server = @import("server.zig");
+const Endpoint = server.Endpoint(void);
 const steer = @import("steer.zig");
 
 const executors = 4;
@@ -28,6 +29,10 @@ const Fixture = struct {
     future: std.Io.Future(anyerror!void),
 
     fn start(gpa: std.mem.Allocator, io: std.Io, fds: []const std.posix.fd_t, secret: ?[32]u8, pem_in: ?anole_tls.Pem) !Fixture {
+        return startWith(gpa, io, fds, secret, pem_in, false);
+    }
+
+    fn startWith(gpa: std.mem.Allocator, io: std.Io, fds: []const std.posix.fd_t, secret: ?[32]u8, pem_in: ?anole_tls.Pem, early_data: bool) !Fixture {
         var pem = pem_in orelse try anole_tls.selfSigned(gpa, .{});
         errdefer pem.deinit(gpa);
         const http = try gpa.create(dusty.Server(void));
@@ -42,6 +47,7 @@ const Fixture = struct {
             .sockets = executors,
             .fds = fds,
             .secret = secret,
+            .early_data = early_data,
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -66,6 +72,17 @@ const Fixture = struct {
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
             .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        });
+    }
+
+    fn connectResuming(f: *Fixture, gpa: std.mem.Allocator, io: std.Io, cache: *client.SessionCache) !*client.ClientConnection {
+        return client.ClientConnection.connect(gpa, io, .{
+            .host = "localhost",
+            .address = f.ep.address(),
+            .port = f.ep.address().getPort(),
+            .tls = .{ .ca = .{ .pem = f.pem.cert } },
+            .session_cache = cache,
+            .early_data = true,
         });
     }
 
@@ -150,6 +167,62 @@ test "h3 per-core: connections spread over the endpoints and stay on their execu
     }
     try std.testing.expectEqual(@as(u64, 0), f.sum("forwarded_out"));
     try f.expectNoForeign();
+}
+
+test "h3 per-core: WebTransport turned on after init reaches every endpoint; one 0-RTT context; 0-RTT on any endpoint" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(executors) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, &.{}, null, null, true);
+    defer f.stop(gpa, io);
+    // As `app.webtransport` does, after the listener is set up.
+    f.ep.enableWebTransport();
+    // Every endpoint speaks it, and ties tickets to the same context: a
+    // client resumes on whichever endpoint the kernel picks.
+    var first_buf: [server.early_context_max]u8 = undefined;
+    const first = try server.earlyDataContextOf(&f.ep.endpoints()[0].options, &first_buf);
+    for (f.ep.endpoints()) |e| {
+        try std.testing.expect(e.options.webtransport);
+        var buf: [server.early_context_max]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, first, try server.earlyDataContextOf(&e.options, &buf));
+    }
+
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    // A full handshake and a ticket from one endpoint...
+    const issuer = blk: {
+        const conn = try f.connectResuming(gpa, io, &cache);
+        defer conn.close();
+        const e = try f.served(conn, gpa);
+        try waitTicket(io, &cache);
+        break :blk e;
+    };
+    // ...and 0-RTT, each time with the newest ticket, on new client ports
+    // until one lands on another endpoint.
+    var elsewhere = false;
+    for (0..32) |_| {
+        const conn = try f.connectResuming(gpa, io, &cache);
+        defer conn.close();
+        const e = try f.served(conn, gpa);
+        try std.testing.expect(conn.resumed());
+        try std.testing.expectEqual(client.EarlyData.accepted, conn.earlyData());
+        try waitTicket(io, &cache);
+        if (e != issuer) {
+            elsewhere = true;
+            break;
+        }
+    }
+    try std.testing.expect(elsewhere);
+}
+
+fn waitTicket(io: std.Io, cache: *client.SessionCache) !void {
+    for (0..200) |_| {
+        if (cache.count() > 0) return;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.NoTicket;
 }
 
 test "h3 per-core: without the program, packets that land on another endpoint's socket are passed on to it" {

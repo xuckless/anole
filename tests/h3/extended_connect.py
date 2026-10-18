@@ -19,7 +19,7 @@ import sys
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.buffer import Buffer
-from aioquic.h3.connection import H3_ALPN, FrameType, H3Connection, H3Stream
+from aioquic.h3.connection import H3_ALPN, FrameType, FrameUnexpected, H3Connection, H3Stream
 from aioquic.h3.events import DataReceived, DatagramReceived, HeadersReceived, WebTransportStreamDataReceived
 from aioquic.quic.configuration import QuicConfiguration
 
@@ -243,8 +243,14 @@ async def ws(c, mode):
     c.transmit()
     f = await frames.next()
     check(f is not None and f[0] == 8 and f[1][:2] == struct.pack("!H", 1000), f"WebSocket close echoed ({f})")
-    c.h3.send_data(sid, b"", end_stream=True)
-    c.transmit()
+    # The client's end of the stream, unless the server has already
+    # stopped reading it (its close is done): aioquic then forgets the
+    # stream and refuses to send on it.
+    try:
+        c.h3.send_data(sid, b"", end_stream=True)
+        c.transmit()
+    except FrameUnexpected:
+        pass
 
 
 async def main():

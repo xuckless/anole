@@ -153,8 +153,26 @@ fn http3Settings(options: *const Options) nghttp3.Settings {
     return settings;
 }
 
+/// The transport parameters `options` decide; a connection adds its
+/// connection IDs and tokens.
+fn transportParams(options: *const Options) ngtcp2.TransportParams {
+    var params: ngtcp2.TransportParams = undefined;
+    ngtcp2.transportParamsDefault(&params);
+    params.initial_max_stream_data_bidi_local = options.max_stream_data;
+    params.initial_max_stream_data_bidi_remote = options.max_stream_data;
+    params.initial_max_stream_data_uni = options.max_stream_data;
+    params.initial_max_data = options.max_data;
+    params.initial_max_streams_bidi = options.max_streams_bidi;
+    // The control and QPACK streams, and WebTransport's.
+    params.initial_max_streams_uni = 3 + if (options.webtransport) options.webtransport_max_streams_uni else 0;
+    // HTTP datagrams (RFC 9297), for WebTransport.
+    if (options.webtransport) params.max_datagram_frame_size = 65535;
+    params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+    return params;
+}
+
 /// Room for `earlyDataContext`'s output.
-const early_context_max = 1 + 256 + 6 * 8;
+pub const early_context_max = 1 + 256 + 6 * 8;
 /// Bumped whenever the layout below changes, so older tickets stop
 /// carrying 0-RTT rather than being misread.
 const early_context_version = 2;
@@ -228,6 +246,11 @@ pub fn Endpoint(comptime Ctx: type) type {
         gpa: std.mem.Allocator,
         io: std.Io,
         http: *HttpServer,
+        /// A copy per endpoint of the listener's options. They must stay
+        /// the same on every endpoint: a client resumes on whichever one
+        /// the kernel picks, and its 0-RTT is refused where the SETTINGS or
+        /// limits differ. Change them through the listener (as
+        /// `enableWebTransport` does), never on one endpoint.
         options: Options,
         udp: net.Udp,
         local: Addr,
@@ -459,6 +482,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// before still resume. Connections already open keep the context
         /// they started with (each `SSL` holds a reference to it). Safe from
         /// any task or thread.
+        /// Turns WebTransport on for every endpoint of the listener, for
+        /// connections that start from now on.
+        pub fn enableWebTransport(self: *Self) void {
+            for (self.shared.endpoints) |e| e.options.webtransport = true;
+        }
+
         pub fn useTls(self: *Self, tls: quic_tls.Context) void {
             const shared = self.shared;
             lockTls(shared);
@@ -931,18 +960,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 ep.io.random(&initial_pkt_num);
                 settings.initial_pkt_num = std.mem.readInt(u32, &initial_pkt_num, .little) & 0x7fffffff;
 
-                var params: ngtcp2.TransportParams = undefined;
-                ngtcp2.transportParamsDefault(&params);
-                params.initial_max_stream_data_bidi_local = ep.options.max_stream_data;
-                params.initial_max_stream_data_bidi_remote = ep.options.max_stream_data;
-                params.initial_max_stream_data_uni = ep.options.max_stream_data;
-                params.initial_max_data = ep.options.max_data;
-                params.initial_max_streams_bidi = ep.options.max_streams_bidi;
-                // The control and QPACK streams, and WebTransport's.
-                params.initial_max_streams_uni = 3 + if (ep.options.webtransport) ep.options.webtransport_max_streams_uni else 0;
-                // HTTP datagrams (RFC 9297), for WebTransport.
-                if (ep.options.webtransport) params.max_datagram_frame_size = 65535;
-                params.max_idle_timeout = @as(u64, ep.options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+                var params = transportParams(&ep.options);
                 params.stateless_reset_token_present = 1;
                 params.active_connection_id_limit = 7;
                 params.grease_quic_bit = 1;
@@ -2427,8 +2445,11 @@ pub fn Endpoint(comptime Ctx: type) type {
     };
 }
 
-test "0-RTT context: the same for the same settings, different when a limit or a SETTINGS value changes" {
-    const Ctx = struct {
+/// The 0-RTT context a connection of an endpoint with `options` gets, from
+/// a throwaway connection with fixed IDs: for tests that compare endpoints
+/// or settings.
+pub fn earlyDataContextOf(options: *const Options, buf: *[early_context_max]u8) ![]const u8 {
+    const S = struct {
         fn rand(dest: [*c]u8, len: usize, _: [*c]const c.ngtcp2_rand_ctx) callconv(.c) void {
             @memset(dest[0..len], 7);
         }
@@ -2438,42 +2459,42 @@ test "0-RTT context: the same for the same settings, different when a limit or a
             @memset(&token.*.data, 9);
             return 0;
         }
+    };
+    var settings: ngtcp2.Settings = undefined;
+    ngtcp2.settingsDefault(&settings);
+    settings.initial_ts = 1;
+    var params = transportParams(options);
+    var cid: c.ngtcp2_cid = undefined;
+    const bytes: [8]u8 = @splat(1);
+    c.ngtcp2_cid_init(&cid, &bytes, bytes.len);
+    params.original_dcid = cid;
+    params.original_dcid_present = 1;
+    var local: net.Addr = .from(.{ .ip4 = .loopback(4433) });
+    var remote: net.Addr = .from(.{ .ip4 = .loopback(50000) });
+    const p: c.ngtcp2_path = .{ .local = local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
+    var cb = std.mem.zeroes(c.ngtcp2_callbacks);
+    cb.recv_client_initial = c.ngtcp2_crypto_recv_client_initial_cb;
+    cb.recv_crypto_data = c.ngtcp2_crypto_recv_crypto_data_cb;
+    cb.encrypt = c.ngtcp2_crypto_encrypt_cb;
+    cb.decrypt = c.ngtcp2_crypto_decrypt_cb;
+    cb.hp_mask = c.ngtcp2_crypto_hp_mask_cb;
+    cb.update_key = c.ngtcp2_crypto_update_key_cb;
+    cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+    cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+    cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
+    cb.rand = S.rand;
+    cb.get_new_connection_id2 = S.newCid;
+    var q: ?*c.ngtcp2_conn = null;
+    if (ngtcp2.connServerNew(&q, &cid, &cid, &p, c.NGTCP2_PROTO_VER_V1, &cb, &settings, &params, null, null) != 0)
+        return error.QuicSetupFailed;
+    defer c.ngtcp2_conn_del(q);
+    return earlyDataContext(q.?, http3Settings(options), options.webtransport, buf);
+}
 
-        /// The context of a server connection with these limits.
+test "0-RTT context: the same for the same settings, different when a limit or a SETTINGS value changes" {
+    const Ctx = struct {
         fn of(options: Options, buf: *[early_context_max]u8) ![]const u8 {
-            var settings: ngtcp2.Settings = undefined;
-            ngtcp2.settingsDefault(&settings);
-            settings.initial_ts = 1;
-            var params: ngtcp2.TransportParams = undefined;
-            ngtcp2.transportParamsDefault(&params);
-            params.initial_max_streams_bidi = options.max_streams_bidi;
-            params.initial_max_data = options.max_data;
-            params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
-            var cid: c.ngtcp2_cid = undefined;
-            const bytes: [8]u8 = @splat(1);
-            c.ngtcp2_cid_init(&cid, &bytes, bytes.len);
-            params.original_dcid = cid;
-            params.original_dcid_present = 1;
-            var local: net.Addr = .from(.{ .ip4 = .loopback(4433) });
-            var remote: net.Addr = .from(.{ .ip4 = .loopback(50000) });
-            const p: c.ngtcp2_path = .{ .local = local.ngtcp2Addr(), .remote = remote.ngtcp2Addr(), .user_data = null };
-            var cb = std.mem.zeroes(c.ngtcp2_callbacks);
-            cb.recv_client_initial = c.ngtcp2_crypto_recv_client_initial_cb;
-            cb.recv_crypto_data = c.ngtcp2_crypto_recv_crypto_data_cb;
-            cb.encrypt = c.ngtcp2_crypto_encrypt_cb;
-            cb.decrypt = c.ngtcp2_crypto_decrypt_cb;
-            cb.hp_mask = c.ngtcp2_crypto_hp_mask_cb;
-            cb.update_key = c.ngtcp2_crypto_update_key_cb;
-            cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
-            cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
-            cb.get_path_challenge_data2 = c.ngtcp2_crypto_get_path_challenge_data2_cb;
-            cb.rand = rand;
-            cb.get_new_connection_id2 = newCid;
-            var q: ?*c.ngtcp2_conn = null;
-            if (ngtcp2.connServerNew(&q, &cid, &cid, &p, c.NGTCP2_PROTO_VER_V1, &cb, &settings, &params, null, null) != 0)
-                return error.QuicSetupFailed;
-            defer c.ngtcp2_conn_del(q);
-            return earlyDataContext(q.?, http3Settings(&options), options.webtransport, buf);
+            return earlyDataContextOf(&options, buf);
         }
     };
     const base: Options = .{ .address = .{ .ip4 = .loopback(0) }, .cert_pem = "", .key_pem = "" };

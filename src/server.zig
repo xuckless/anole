@@ -820,9 +820,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// up.
         fn enableWebTransport(self: *Self) void {
             self.extras.webtransport = true;
-            if (comptime features.http3) if (self.h3) |ep| {
-                ep.options.webtransport = true;
-            };
+            // Every endpoint (one per core on Linux), or tickets from one
+            // would not resume in 0-RTT on another.
+            if (comptime features.http3) if (self.h3) |ep| ep.enableWebTransport();
         }
 
         /// Serves the files under `dir` below `prefix`: ranges, ETags and
@@ -1791,6 +1791,36 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
     var client_future = try app.io().concurrent(Run.run, .{ &app, &pems, tmp.dir });
     try app.run();
     try client_future.await(app.io());
+}
+
+test "anole.Server: app.webtransport after init reaches every HTTP/3 endpoint, which share one 0-RTT context" {
+    if (comptime !features.http3) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pem = try tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var app = try Server(void).init(gpa, .{
+        .http = null,
+        .https = .{ .port = 0, .cert = .{ .pem = .{ .cert = pem.cert, .key = pem.key } } },
+        // One endpoint per executor on Linux; one elsewhere.
+        .http3 = .{ .port = 0, .alt_svc = false, .early_data = true },
+        .executors = .exact(4),
+    }, {});
+    defer app.deinit();
+    const S = struct {
+        fn session(_: *webtransport_mod.Session) !void {}
+    };
+    app.webtransport("/wt", S.session);
+    const endpoints = app.h3.?.endpoints();
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(@as(usize, 4), endpoints.len);
+    const h3_server = @import("h3/server.zig");
+    const early_context_max = h3_server.early_context_max;
+    var first_buf: [early_context_max]u8 = undefined;
+    const first = try h3_server.earlyDataContextOf(&endpoints[0].options, &first_buf);
+    for (endpoints) |e| {
+        try std.testing.expect(e.options.webtransport);
+        var buf: [early_context_max]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, first, try h3_server.earlyDataContextOf(&e.options, &buf));
+    }
 }
 
 test "anole.Server: a second server on the same thread is refused, and one after the first is freed is fine" {
