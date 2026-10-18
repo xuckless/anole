@@ -227,6 +227,10 @@ pub const Udp = struct {
         var msg: std.Io.net.OutgoingMessage = .{ .address = &to, .data_ptr = data.ptr, .data_len = data.len, .control = control[0..w] };
         const err, _ = self.socket.sendManyTimeout(io, (&msg)[0..1], .{}, .none);
         if (err) |e| {
+            // A datagram may be lost, the cancelation may not: callers go
+            // on to a cancelation point (the endpoint's next receive) that
+            // must see it, or a canceled task never ends.
+            if (e == error.Canceled) return io.recancel();
             if (data.len > seg) {
                 // The kernel or the NIC refused GSO: per datagram from now on.
                 log.debug("UDP GSO off: {t}", .{e});
@@ -254,6 +258,32 @@ pub const Udp = struct {
 const cmsg_align = std.Io.net.cmsg_align;
 const native_endian = @import("builtin").cpu.arch.endian();
 const log = std.log.scoped(.anole_h3);
+
+test "UDP: a send that a cancelation interrupts leaves it for the next cancelation point" {
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var sink: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    defer sink.socket.close(io);
+    var udp: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    defer udp.socket.close(io);
+    const Task = struct {
+        fn run(u: *Udp, to: std.Io.net.IpAddress, tio: std.Io) std.Io.Cancelable!void {
+            // Protected until the cancelation has surely been asked for,
+            // so that the send is the first point to see it.
+            const protection = tio.swapCancelProtection(.blocked);
+            tio.sleep(.fromMilliseconds(200), .awake) catch {};
+            _ = tio.swapCancelProtection(protection);
+            u.send(tio, to, null, 0, "ping", 4);
+            // As the endpoint's receive loop: it must still see it.
+            return tio.checkCancel();
+        }
+    };
+    var future = try io.concurrent(Task.run, .{ &udp, sink.socket.address, io });
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+}
 
 test "UDP: ECN codepoints and the local address of a wildcard socket come through" {
     const zio = @import("zio");
