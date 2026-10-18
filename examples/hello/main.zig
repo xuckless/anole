@@ -135,6 +135,12 @@ pub fn main(init: std.process.Init) !void {
     }, {});
     defer server.deinit();
 
+    // Every response gets an X-Request-Id and an access-log line.
+    var request_id = http.middleware.RequestId.init(.{});
+    var access_log = http.middleware.Logger.init();
+    server.router.use(http.Middleware(void).init(&request_id));
+    server.router.use(http.Middleware(void).init(&access_log));
+
     server.router.get("/", handleRoot);
     server.router.get("/users/:id", handleUser);
     server.router.post("/echo", handleEcho);
