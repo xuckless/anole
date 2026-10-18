@@ -22,6 +22,8 @@ const nghttp2_build = @import("build/nghttp2.zig");
 const boringssl_build = @import("build/boringssl.zig");
 const ngtcp2_build = @import("build/ngtcp2.zig");
 const nghttp3_build = @import("build/nghttp3.zig");
+const zlib_ng_build = @import("build/zlib_ng.zig");
+const zstd_build = @import("build/zstd.zig");
 
 /// This file's struct, for `b.lazyImport` (which must name the build.zig that declares the dependency).
 const build_zig = @This();
@@ -47,13 +49,16 @@ pub const Features = struct {
     grpc: bool,
     websocket: bool,
     auth: bool,
+    /// gzip/deflate (zlib-ng) and zstd: response compression and request
+    /// decompression.
+    compression: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true },
         };
     }
 
@@ -68,11 +73,12 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3;
+        return f.tls != .none or f.http2 or f.http3 or f.compression;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
-        return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3);
+        return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
+            (!f.compression or have.compression);
     }
 };
 
@@ -85,6 +91,11 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
         var f = Features.preset(.full);
         f.tls = .none;
         f.http3 = false;
+        break :blk f;
+    } },
+    .{ .name = "full-no-compression", .features = blk: {
+        var f = Features.preset(.full);
+        f.compression = false;
         break :blk f;
     } },
     .{ .name = "http2-no-grpc", .features = blk: {
@@ -196,6 +207,7 @@ fn resolveFeatures(b: *std.Build) Features {
     const grpc = b.option(bool, "grpc", "gRPC; needs -Dhttp2=true (overrides the profile)");
     const websocket = b.option(bool, "websocket", "WebSocket (overrides the profile)");
     const auth = b.option(bool, "auth", "Auth: JWT, OIDC, sessions, API keys (overrides the profile)");
+    const compression = b.option(bool, "compression", "gzip/deflate (zlib-ng) and zstd (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -204,6 +216,7 @@ fn resolveFeatures(b: *std.Build) Features {
     if (grpc) |v| f.grpc = v;
     if (websocket) |v| f.websocket = v;
     if (auth) |v| f.auth = v;
+    if (compression) |v| f.compression = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
@@ -217,11 +230,12 @@ fn resolveFeatures(b: *std.Build) Features {
 
 const Core = struct {
     zio: *std.Build.Module,
-    /// dusty instances by [tls][http2]. One exists for each combination this
-    /// build can satisfy: TLS needs BoringSSL in the build, HTTP/2 needs
-    /// nghttp2. Different arguments give separate dusty instances, so
-    /// test-flags can build every combination side by side.
-    dusty_by: [2][2]?*std.Build.Module,
+    /// dusty instances by [tls][http2][compression]. One exists for each
+    /// combination this build can satisfy: TLS needs BoringSSL in the build,
+    /// HTTP/2 nghttp2, compression zlib-ng. Different arguments give separate
+    /// dusty instances, so test-flags can build every combination side by
+    /// side.
+    dusty_by: [2][2][2]?*std.Build.Module,
     /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
 
@@ -234,20 +248,30 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .dusty_by = .{ .{ null, null }, .{ null, null } }, .tls_seam = seam };
+        var core: Core = .{ .zio = zio_mod, .dusty_by = @splat(@splat(@splat(null))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
                 if (http2 and c_mods.nghttp2 == null) continue;
-                core.dusty_by[@intFromBool(tls)][@intFromBool(http2)] =
-                    dustyModule(b, zio_mod, if (tls) seam else null, if (http2) c_mods.nghttp2 else null, target, optimize);
+                for ([_]bool{ false, true }) |compression| {
+                    if (compression and c_mods.zlib == null) continue;
+                    core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)] = dustyModule(
+                        b,
+                        zio_mod,
+                        if (tls) seam else null,
+                        if (http2) c_mods.nghttp2 else null,
+                        if (compression) c_mods.zlib else null,
+                        target,
+                        optimize,
+                    );
+                }
             }
         }
         return core;
     }
 
     fn dusty(core: Core, f: Features) *std.Build.Module {
-        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)].?;
+        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
     }
 
     fn dustyModule(
@@ -255,6 +279,7 @@ const Core = struct {
         zio_mod: *std.Build.Module,
         tls: ?*std.Build.Module,
         nghttp2: ?*std.Build.Module,
+        zlib: ?*std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -271,13 +296,17 @@ const Core = struct {
             // 1.69.0, so only one copy is linked.
             .use_http2 = nghttp2 != null,
             .use_bundled_nghttp2 = false,
-            // Anole standardises on zlib-ng for deflate, so don't fetch dusty's zlib.zig.
-            .use_zlib = false,
+            // gzip/deflate on zlib-ng: the `zlib` import is zlib.zig's wrapper
+            // over Anole's zlib-ng, so dusty's pinned zlib.zig (and its
+            // vendored C zlib) is never fetched.
+            .use_zlib = zlib != null,
+            .use_bundled_zlib = false,
         }).module("dusty");
         // Replace dusty's zio stub so its timeouts use zio.AutoCancel.
         mod.addImport("zio", zio_mod);
         if (tls) |m| mod.addImport("tls", m);
         if (nghttp2) |m| mod.addImport("nghttp2", m);
+        if (zlib) |m| mod.addImport("zlib", m);
         return mod;
     }
 };
@@ -295,6 +324,13 @@ const CModules = struct {
     nghttp3: ?*std.Build.Module = null,
     /// C-side struct layouts for the h3 binding tests (http3, tests only)
     h3_layout: ?*std.Build.Module = null,
+    /// lalinsky/zlib.zig's std.Io wrapper over zlib-ng (compression); the
+    /// `zlib` module dusty imports.
+    zlib: ?*std.Build.Module = null,
+    /// zlib.h of zlib-ng (compression)
+    zlib_c: ?*std.Build.Module = null,
+    /// zstd.h (compression)
+    zstd: ?*std.Build.Module = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -305,11 +341,17 @@ const CModules = struct {
         const boringssl_dep = if (f.needsTls()) b.lazyDependency("boringssl", .{}) else null;
         const ngtcp2_dep = if (f.http3) b.lazyDependency("ngtcp2", .{}) else null;
         const nghttp3_dep = if (f.http3) b.lazyDependency("nghttp3", .{}) else null;
+        const zlib_ng_dep = if (f.compression) b.lazyDependency("zlib_ng", .{}) else null;
+        const zstd_dep = if (f.compression) b.lazyDependency("zstd", .{}) else null;
+        // Only its src/root.zig is used (its module would compile a second,
+        // vendored zlib).
+        const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
         if (f.needsTls() and boringssl_dep == null) return null;
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
+        if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
@@ -319,6 +361,24 @@ const CModules = struct {
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
         const Translator = tc_build.Translator;
+
+        if (zlib_ng_dep) |up| {
+            const lib = zlib_ng_build.library(b, up, target, optimize);
+            const c_mod = zlib_ng_build.module(b, Translator, tc_dep.?, lib, target, optimize);
+            const zlib_mod = b.createModule(.{
+                .root_source_file = zlib_zig_dep.?.path("src/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "c", .module = c_mod }},
+            });
+            m.zlib = zlib_mod;
+            m.zlib_c = c_mod;
+        }
+        if (zstd_dep) |up| {
+            const lib = zstd_build.library(b, up, target, optimize);
+            m.zstd = zstd_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
 
         if (nghttp2_dep) |up| {
             const lib = nghttp2_build.library(b, up, target, optimize);
@@ -382,6 +442,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "grpc", f.grpc);
     options.addOption(bool, "websocket", f.websocket);
     options.addOption(bool, "auth", f.auth);
+    options.addOption(bool, "compression", f.compression);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
@@ -394,6 +455,11 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
     if (f.http2) mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
+    if (f.compression) {
+        mod.addImport("anole_zlib", o.c.zlib.?);
+        mod.addImport("anole_zlib_c", o.c.zlib_c.?);
+        mod.addImport("anole_zstd_c", o.c.zstd.?);
+    }
     if (f.needsTls()) {
         mod.addImport("anole_boringssl_c", o.c.boringssl.?);
         mod.addImport("anole_dusty_tls", o.core.tls_seam.?);

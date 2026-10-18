@@ -28,6 +28,10 @@ pub const h2 = if (features.http2) @import("h2/root.zig") else struct {};
 /// ngtcp2 + nghttp3 bindings (-Dhttp3). The QUIC endpoint is later work.
 pub const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 
+/// gzip/deflate on zlib-ng and zstd (-Dcompression). dusty uses the zlib
+/// side for response compression and request decoding.
+pub const compression = if (features.compression) @import("compression/root.zig") else struct {};
+
 /// dusty's RFC 6455 WebSocket over HTTP/1.1 (-Dwebsocket).
 pub const websocket = if (features.websocket) @import("websocket/root.zig") else struct {};
 
@@ -40,6 +44,7 @@ test {
     _ = h2;
     _ = h3;
     _ = websocket;
+    _ = compression;
 }
 
 test "feature constraints hold" {

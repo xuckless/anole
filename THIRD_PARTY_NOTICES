@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit 9c9e7ad5e566ff1a2d22d5a5435826cf01845de8 of the fork
+  Pinned:   commit 347faf545018498c00fbfee2867c0362b417e9a2 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -76,6 +76,24 @@ nghttp3 1.18.0 (HTTP/3 and QPACK)
             (release tarball nghttp3-1.18.0.tar.xz)
   Linked:   -Dhttp3=true
 
+zlib-ng 2.3.3 (gzip/deflate, zlib-compat mode)
+  Licence:  Zlib (text in part D). (C) 1995-2024 Jean-loup Gailly and Mark Adler
+  Source:   https://github.com/zlib-ng/zlib-ng (tag archive 2.3.3)
+  Linked:   -Dcompression=true
+
+zstd 1.5.7 (Zstandard)
+  Licence:  BSD-3-Clause, text in part F (zstd is BSD-3-Clause OR GPL-2.0;
+            used under BSD-3-Clause). Copyright (c) Meta Platforms, Inc. and
+            affiliates.
+  Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
+  Linked:   -Dcompression=true
+
+zlib.zig (std.Io wrapper over the zlib API; its src/root.zig only)
+  Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky
+  Source:   https://github.com/lalinsky/zlib.zig
+  Pinned:   commit 537dbce25b1b29a0361845b019711dad35699aa6
+  Linked:   -Dcompression=true
+
 translate-c (build-time C header translator; not linked)
   Licence:  MIT (Expat). Copyright (c) Zig contributors
   Source:   https://codeberg.org/ziglang/translate-c
@@ -105,6 +123,18 @@ build/ngtcp2.zig, build/nghttp3.zig
   zig/protocol_sources.zig and zig/protocol_dependencies.zig.
   Licence:  MIT. Copyright (c) 2025 Glenford Williams
   Source:   https://github.com/kingwill101/server_native
+
+build/zlib_ng.zig
+  Source lists, per-file SIMD features and defines transcribed from zlib-ng
+  2.3.3's CMakeLists.txt and cmake/detect-intrinsics.cmake.
+  Licence:  Zlib (text in part D). (C) 1995-2024 Jean-loup Gailly and Mark Adler
+  Source:   https://github.com/zlib-ng/zlib-ng
+
+build/zstd.zig
+  Source lists and the x86_64 assembly rule from allyourcodebase/zstd's
+  build.zig (commit 4ccb01e, release 1.5.7-2).
+  Licence:  MIT (Expat). Copyright (c) contributors
+  Source:   https://github.com/allyourcodebase/zstd
 
 src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
   The Connection.Reader/Writer vtables follow tls.zig's src/connection.zig,
@@ -143,7 +173,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-D. Zlib licence text (allyourcodebase/boringssl build script)
+D. Zlib licence text (allyourcodebase/boringssl build script, zlib-ng)
 -------------------------------------------------------------
 
 This software is provided 'as-is', without any express or implied warranty.
@@ -371,3 +401,40 @@ not compiled into BoringSSL and so is not reproduced here.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+
+F. BSD-3-Clause licence text (zstd)
+-----------------------------------
+
+Copied verbatim from the LICENSE file of zstd 1.5.7.
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

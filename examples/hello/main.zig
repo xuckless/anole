@@ -10,7 +10,8 @@
 //!
 //!   GET /          -> "hello"
 //!   GET /users/:id -> "user <id>"
-//!   POST /echo     -> the request body, streamed back
+//!   POST /echo     -> the request body, streamed back (a gzip body is decoded)
+//!   GET /big       -> 200 lines of text, gzipped for a client that accepts it
 //!
 //! Every response carries `X-Thread: <os thread id>` so a test can see which
 //! executor served it: under `.pinned` a connection's task stays on the
@@ -65,6 +66,15 @@ fn handleEcho(req: *http.Request, res: *http.Response) !void {
         error.WriteFailed => return out.err orelse error.Unexpected,
     };
     try out.end();
+}
+
+/// A compressible page, gzipped when the client accepts it (with
+/// -Dcompression, on zlib-ng).
+fn handleBig(_: *http.Request, res: *http.Response) !void {
+    res.compress = true;
+    var w = res.writer();
+    for (0..200) |i| try w.interface.print("line {d}: the quick brown fox jumps over the lazy dog\n", .{i});
+    try w.end();
 }
 
 fn waitForSignal(kind: zio.SignalKind) !void {
@@ -128,6 +138,7 @@ pub fn main(init: std.process.Init) !void {
     server.router.get("/", handleRoot);
     server.router.get("/users/:id", handleUser);
     server.router.post("/echo", handleEcho);
+    server.router.get("/big", handleBig);
 
     // SIGINT, SIGTERM and the server run as three tasks of one std.Io.Select;
     // whichever finishes first decides. The buffer holds all three results

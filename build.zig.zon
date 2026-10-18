@@ -16,8 +16,8 @@
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#9c9e7ad5e566ff1a2d22d5a5435826cf01845de8",
-            .hash = "dusty-0.4.0-Qdw7Rm77JQAhMSMEkM3bToxPng7eu0agvuGR4zMqpj8c",
+            .url = "git+https://github.com/xuckless/dusty#347faf545018498c00fbfee2867c0362b417e9a2",
+            .hash = "dusty-0.4.0-Qdw7Rsn-JQCGukbR-fTQMKCwQfePAmmxkk-YQzUSXUy6",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -45,6 +45,25 @@
         .ngtcp2 = .{
             .url = "https://github.com/ngtcp2/ngtcp2/releases/download/v1.25.0/ngtcp2-1.25.0.tar.xz",
             .hash = "N-V-__8AADwxaQCTJkOX_hQ27ZB-ox3TiXC3K25GoJCazPOJ",
+            .lazy = true,
+        },
+        // -Dcompression: zlib-ng 2.3.3 (zlib-compat, runtime SIMD dispatch) and
+        // zstd 1.5.7, built by build/zlib_ng.zig and build/zstd.zig; and
+        // lalinsky/zlib.zig (the commit dusty pins) for its std.Io wrapper,
+        // src/root.zig only.
+        .zlib_ng = .{
+            .url = "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz",
+            .hash = "N-V-__8AAPaJcABkB6U-96R7h2xuXX5TlDMvwPbE4PucPI59",
+            .lazy = true,
+        },
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+            .lazy = true,
+        },
+        .zlib_zig = .{
+            .url = "git+https://github.com/lalinsky/zlib.zig#537dbce25b1b29a0361845b019711dad35699aa6",
+            .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
             .lazy = true,
         },
         .nghttp3 = .{
