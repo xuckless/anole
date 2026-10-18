@@ -18,17 +18,15 @@
 //! executor it was spawned on, so every request on one keep-alive connection
 //! reports the same thread.
 //!
-//! SIGINT/SIGTERM cancel `Server.run`, which stops the accept loops and drains
-//! in-flight requests (dusty server.zig `drainConnections`) before returning.
+//! SIGINT/SIGTERM end `anole.Server.run`, which stops the accept loops and
+//! drains in-flight requests before returning.
 const std = @import("std");
-const builtin = @import("builtin");
 const anole = @import("anole");
-const zio = anole.zio;
 const http = anole.http;
 
 /// Compile-time zio configuration, read by zio from the root module
 /// (zio src/options.zig). `.pinned`: many executors, a task never migrates.
-pub const zio_options: zio.Options = .{ .scheduling = .pinned };
+pub const zio_options = anole.zio_options;
 
 // No `std_options_debug_io = zio.debug_io` (zio's examples set it so logging
 // yields): std.debug uses that Io for stack unwinding too, and Debug builds
@@ -77,14 +75,6 @@ fn handleBig(_: *http.Request, res: *http.Response) !void {
     try w.end();
 }
 
-fn waitForSignal(kind: zio.SignalKind) !void {
-    var sig = try zio.Signal.init(kind);
-    defer sig.deinit();
-    try sig.wait();
-}
-
-const has_tls = anole.features.tls != .none;
-
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8080;
     var tls_port: u16 = 8443;
@@ -93,86 +83,30 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     if (args.next()) |p| tls_port = try std.fmt.parseInt(u16, p, 10);
 
-    // One executor per CPU (cgroup-aware); executor 0 is this thread.
-    const rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
-    defer rt.deinit();
-    const io = rt.io();
+    // The runtime (one executor per CPU, pinned), an HTTP listener with h2c,
+    // and an HTTPS one with ALPN h2/http1.1 on a fresh in-memory certificate.
+    var app = try anole.Server(void).init(init.gpa, .{
+        .http = .{ .port = port },
+        .https = if (anole.features.tls != .none) .{ .port = tls_port, .cert = .dev_self_signed } else null,
+    }, {});
+    defer app.deinit();
 
-    std.log.info("zio scheduling={t} executors={d}", .{ zio_options.scheduling, rt.executors.items.len });
+    // Every response gets an X-Request-Id and an access-log line.
+    app.use(http.middleware.RequestId.init(.{}));
+    app.use(http.middleware.Logger.init());
+
+    app.get("/", handleRoot);
+    app.get("/users/:id", handleUser);
+    app.post("/echo", handleEcho);
+    app.get("/big", handleBig);
+
     std.log.info("anole features: tls={t} http2={} http3={} websocket={}", .{
         anole.features.tls, anole.features.http2, anole.features.http3, anole.features.websocket,
     });
-
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
-    // One accept loop per executor (the default on a multi-executor zio);
-    // on Linux each also gets its own SO_REUSEPORT socket, so the kernel
-    // spreads new connections over the executors' queues.
-    const per_core_sockets = builtin.os.tag == .linux;
-    var listeners: [2]http.Listener = .{ .{
-        .address = addr,
-        .http2_prior_knowledge = anole.features.http2,
-        .socket_per_acceptor = per_core_sockets,
-    }, undefined };
-    var listener_count: usize = 1;
-
-    var dev_cert = if (has_tls) try anole.tls.selfSigned(init.gpa, .{}) else {};
-    defer if (has_tls) dev_cert.deinit(init.gpa);
-    if (has_tls) {
-        listeners[1] = .{
-            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", tls_port) },
-            .socket_per_acceptor = per_core_sockets,
-            .tls = .{
-                .pem = .{ .cert = dev_cert.cert, .key = dev_cert.key },
-                .alpn_protocols = if (anole.features.http2) &.{ "h2", "http/1.1" } else &.{"http/1.1"},
-            },
-        };
-        listener_count = 2;
-    }
-
-    var server = http.Server(void).init(init.gpa, io, .{
-        .listeners = listeners[0..listener_count],
-        .http2 = .{ .max_concurrent_streams = 250 },
-    }, {});
-    defer server.deinit();
-
-    // Every response gets an X-Request-Id and an access-log line.
-    var request_id = http.middleware.RequestId.init(.{});
-    var access_log = http.middleware.Logger.init();
-    server.router.use(http.Middleware(void).init(&request_id));
-    server.router.use(http.Middleware(void).init(&access_log));
-
-    server.router.get("/", handleRoot);
-    server.router.get("/users/:id", handleUser);
-    server.router.post("/echo", handleEcho);
-    server.router.get("/big", handleBig);
-
-    // SIGINT, SIGTERM and the server run as three tasks of one std.Io.Select;
-    // whichever finishes first decides. The buffer holds all three results
-    // so cancelDiscard below cannot deadlock (std/Io.zig Select.cancel).
-    const Done = union(enum) {
-        int: anyerror!void,
-        term: anyerror!void,
-        served: anyerror!void,
-    };
     std.log.info("listening on http://127.0.0.1:{d}", .{port});
-    if (has_tls) std.log.info("listening on https://127.0.0.1:{d} (self-signed, BoringSSL)", .{tls_port});
-    var done_buf: [3]Done = undefined;
-    var sel = std.Io.Select(Done).init(io, &done_buf);
-    try sel.concurrent(.int, waitForSignal, .{.interrupt});
-    try sel.concurrent(.term, waitForSignal, .{.terminate});
-    try sel.concurrent(.served, serve, .{&server});
-
-    const first = try sel.await();
-    switch (first) {
-        .served => |r| std.log.err("server stopped on its own: {any}", .{r}),
-        .int, .term => std.log.info("signal received ({t}); shutting down", .{first}),
-    }
-    // Cancels Server.run: the accept loops stop, in-flight requests drain
-    // (bounded by timeout.shutdown), then the other signal watcher is canceled.
-    sel.cancelDiscard();
+    if (anole.features.tls != .none) std.log.info("listening on https://127.0.0.1:{d} (self-signed, BoringSSL)", .{tls_port});
+    // Until SIGINT or SIGTERM; then the accept loops stop and in-flight
+    // requests drain (bounded by timeout.shutdown).
+    try app.run();
     std.log.info("server stopped cleanly", .{});
-}
-
-fn serve(server: *http.Server(void)) anyerror!void {
-    return server.run();
 }

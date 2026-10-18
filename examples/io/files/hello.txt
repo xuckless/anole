@@ -1,0 +1,1 @@
+Served through std.Io: on zio the read suspends the handler, not the thread.

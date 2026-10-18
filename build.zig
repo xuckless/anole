@@ -15,6 +15,8 @@
 //!               one build of each C library (run when the target is native)
 //!   hello       install examples/hello (also part of the default install step)
 //!   run-hello   run examples/hello (`zig build run-hello -- 8080`)
+//!   io          install examples/io (handlers waiting on I/O through std.Io)
+//!   run-io      run examples/io (`zig build run-io -- 8081`)
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -193,6 +195,24 @@ pub fn build(b: *std.Build) void {
     const run_hello = b.addRunArtifact(hello);
     run_hello.addPassthruArgs();
     b.step("run-hello", "Run examples/hello (pass a port after --, default 8080)").dependOn(&run_hello.step);
+
+    // examples/io: handlers that wait on timers, files and outbound requests
+    // through std.Io.
+    const io_example = b.addExecutable(.{
+        .name = "io-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/io/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+        }),
+    });
+    const install_io = b.addInstallArtifact(io_example, .{});
+    b.step("io", "Build and install examples/io").dependOn(&install_io.step);
+    test_step.dependOn(&io_example.step);
+    const run_io = b.addRunArtifact(io_example);
+    run_io.addPassthruArgs();
+    b.step("run-io", "Run examples/io (pass a port after --, default 8081)").dependOn(&run_io.step);
 }
 
 /// Reads -Dprofile and the per-feature overrides. A feature that depends on a
