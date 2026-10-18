@@ -230,6 +230,9 @@ pub fn Server(comptime Ctx: type) type {
                 if (comptime !features.http3) return error.Http3NotBuilt;
                 if (comptime features.http3) {
                     const https = opts.https orelse return error.Http3NeedsHttps;
+                    // The QUIC endpoint does not ask for client certificates
+                    // yet, so HTTP/3 would be a way around mutual TLS.
+                    if (https.client_auth != null) return error.Http3WithClientAuth;
                     const tls_config = listeners.items[listeners.items.len - 1].tls.?;
                     var cert_pem: []const u8 = undefined;
                     var key_pem: []const u8 = undefined;
@@ -493,4 +496,14 @@ test "anole.Server: one call each to serve HTTP/1.1 and HTTPS, routes and middle
     }.run, .{&app});
     try app.run();
     try client_future.await(app.io());
+}
+
+test "anole.Server: HTTP/3 is refused beside mutual TLS, which QUIC does not check yet" {
+    if (comptime !features.http3) return error.SkipZigTest;
+    try std.testing.expectError(error.Http3WithClientAuth, Server(void).init(std.testing.allocator, .{
+        .http = null,
+        .https = .{ .port = 0, .cert = .dev_self_signed, .client_auth = .{ .ca = .system } },
+        .http3 = .{ .port = 0 },
+        .executors = .exact(1),
+    }, {}));
 }

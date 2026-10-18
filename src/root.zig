@@ -43,7 +43,8 @@ pub const tls = if (features.tls == .boringssl) @import("tls/root.zig") else str
 /// fork and serves through `Server`.
 pub const h2 = if (features.http2) @import("h2/root.zig") else struct {};
 
-/// ngtcp2 + nghttp3 bindings (-Dhttp3). The QUIC endpoint is later work.
+/// HTTP/3 over QUIC on ngtcp2 + nghttp3 (-Dhttp3): the endpoint `Server`
+/// runs when `Options.http3` is set, and a client (`ClientConnection`).
 pub const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 
 /// gzip/deflate on zlib-ng and zstd (-Dcompression). dusty uses the zlib

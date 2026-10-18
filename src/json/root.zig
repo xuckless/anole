@@ -224,10 +224,18 @@ fn toValue(doc: *c.yyjson_mut_doc, value: anytype, options: StringifyOptions) Er
     return v orelse error.OutOfMemory;
 }
 
-/// The request body parsed as a `T`, in the request's arena.
+/// The request body parsed as a `T`, in the request's arena. A body that
+/// is missing or does not fit `T` fails with an error the server answers
+/// with 400 when the handler returns it (the std.json names dusty maps):
+/// `UnexpectedEndOfInput`, `UnexpectedToken` for a value of the wrong
+/// type, `InvalidNumber` for one out of range, or `parse`'s own.
 pub fn readBody(comptime T: type, req: *dusty.Request) !T {
-    const body = (try req.body()) orelse return error.MissingBody;
-    return parse(T, req.arena, body, .{});
+    const body = (try req.body()) orelse return error.UnexpectedEndOfInput;
+    return parse(T, req.arena, body, .{}) catch |err| switch (err) {
+        error.UnexpectedType => error.UnexpectedToken,
+        error.Overflow => error.InvalidNumber,
+        else => |e| e,
+    };
 }
 
 /// Sends `value` as the JSON body, with its content type.
