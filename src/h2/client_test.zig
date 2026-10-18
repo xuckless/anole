@@ -158,3 +158,101 @@ test "h2 client: over TLS with ALPN h2" {
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h2", body);
 }
+
+/// A handler that sleeps for 10 s unless it is canceled, and says how it
+/// ended.
+const Sleeper = struct {
+    var started: std.atomic.Value(bool) = .init(false);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        defer done.store(true, .release);
+        started.store(true, .release);
+        req.io.sleep(.fromSeconds(10), .awake) catch |err| {
+            canceled.store(true, .release);
+            return err;
+        };
+        res.body = "slept";
+    }
+
+    fn reset() void {
+        started.store(false, .release);
+        canceled.store(false, .release);
+        done.store(false, .release);
+    }
+
+    fn waitStarted(io: std.Io) !void {
+        while (!started.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+    }
+
+    /// The handler ended, canceled, within `ms` of `since`.
+    fn expectCanceledWithin(io: std.Io, since: std.Io.Clock.Timestamp, ms: i64) !void {
+        while (!done.load(.acquire)) {
+            try std.testing.expect(since.durationTo(.now(io, .awake)).raw.toMilliseconds() < ms);
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
+        try std.testing.expect(canceled.load(.acquire));
+    }
+};
+
+test "h2 engine: a client's RST_STREAM or a lost connection cancels the stream's handler" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const server = try startServer(gpa, io, &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }});
+    defer gpa.destroy(server);
+    defer server.deinit();
+    server.router.get("/sleep", Sleeper.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const sleep_request = [_]h2.Header{
+        .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/sleep" },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    };
+    {
+        // RST_STREAM: the handler's sleep ends at once with error.Canceled,
+        // and the connection serves on.
+        const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+        defer conn.close();
+        Sleeper.reset();
+        const s = try conn.request(&sleep_request, .{});
+        defer s.release();
+        try Sleeper.waitStarted(io);
+        const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
+        s.cancel();
+        try Sleeper.expectCanceledWithin(io, reset_at, 1000);
+        const body = try get(conn, "/hello", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("hello over h2", body);
+    }
+    {
+        // The client goes away with its request whole, without a reset or
+        // GOAWAY: the server tells a closed connection from a half-close
+        // by its probe, then cancels. By hand, as no client library drops
+        // a connection this bluntly.
+        Sleeper.reset();
+        const socket = try server.address.ip.connect(io, .{ .mode = .stream });
+        var buf: [256]u8 = undefined;
+        var w = socket.writer(io, &buf);
+        try w.interface.writeAll("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        try w.interface.writeAll(&.{ 0, 0, 0, 4, 0, 0, 0, 0, 0 }); // SETTINGS
+        // HEADERS, END_STREAM | END_HEADERS, stream 1: GET http /sleep,
+        // HPACK static indices and literals with indexed names.
+        const block = "\x82\x86\x04\x06/sleep\x01\x09localhost";
+        try w.interface.writeAll(&.{ 0, 0, block.len, 1, 0x05, 0, 0, 0, 1 });
+        try w.interface.writeAll(block);
+        try w.interface.flush();
+        try Sleeper.waitStarted(io);
+        const closed_at: std.Io.Clock.Timestamp = .now(io, .awake);
+        socket.close(io);
+        try Sleeper.expectCanceledWithin(io, closed_at, 3000);
+    }
+}

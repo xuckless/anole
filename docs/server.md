@@ -259,6 +259,13 @@ handlers as HTTP/1.1.
   HTTP/2 ("prior knowledge", `curl --http2-prior-knowledge`); others get
   HTTP/1.1 on the same port. `.http = .{ .h2c = false }` turns this off. The
   old `Upgrade: h2c` handshake is not supported.
+- When the client resets a stream (RST_STREAM) before its response is
+  complete, or the connection is lost, the stream's handler is canceled: its
+  next wait on `req.io` returns `error.Canceled`. A connection that ends
+  cleanly may be a half-close, so handlers with their whole request keep
+  running while the server checks with a PING every 500 ms; once a write
+  fails, they are canceled too. `res.peerGone()` tells the same without a
+  wait.
 
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
 (64 KiB, also each stream's body buffer), `connection_window` (1 MiB),
