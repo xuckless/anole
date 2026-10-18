@@ -20,6 +20,7 @@
 //! SIGINT/SIGTERM cancel `Server.run`, which stops the accept loops and drains
 //! in-flight requests (dusty server.zig `drainConnections`) before returning.
 const std = @import("std");
+const builtin = @import("builtin");
 const anole = @import("anole");
 const zio = anole.zio;
 const http = anole.http;
@@ -93,7 +94,15 @@ pub fn main(init: std.process.Init) !void {
     });
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
-    var listeners: [2]http.Listener = .{ .{ .address = addr, .http2_prior_knowledge = anole.features.http2 }, undefined };
+    // One accept loop per executor (the default on a multi-executor zio);
+    // on Linux each also gets its own SO_REUSEPORT socket, so the kernel
+    // spreads new connections over the executors' queues.
+    const per_core_sockets = builtin.os.tag == .linux;
+    var listeners: [2]http.Listener = .{ .{
+        .address = addr,
+        .http2_prior_knowledge = anole.features.http2,
+        .socket_per_acceptor = per_core_sockets,
+    }, undefined };
     var listener_count: usize = 1;
 
     var dev_cert = if (has_tls) try anole.tls.selfSigned(init.gpa, .{}) else {};
@@ -101,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
     if (has_tls) {
         listeners[1] = .{
             .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", tls_port) },
+            .socket_per_acceptor = per_core_sockets,
             .tls = .{
                 .pem = .{ .cert = dev_cert.cert, .key = dev_cert.key },
                 .alpn_protocols = if (anole.features.http2) &.{ "h2", "http/1.1" } else &.{"http/1.1"},

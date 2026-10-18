@@ -29,7 +29,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
   Source:   https://github.com/lalinsky/dusty, used through Anole's fork
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches, each offered upstream)
-  Pinned:   commit 62ad04f5cfed9e3c760225e21215ccc23f4bb337 of the fork
+  Pinned:   commit a700c4505f8ddc821119bc17b2ef3188ca9c8383 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
