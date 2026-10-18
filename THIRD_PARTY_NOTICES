@@ -68,10 +68,11 @@ ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
   Includes: lib/ngtcp2_pcg.c (PCG random number generator,
             Copyright 2014-2019 Melissa O'Neill and the PCG Project
             contributors, Apache-2.0 OR MIT, used under MIT), compiled in
-  Ported:   src/h3/server.zig and src/h3/quic_tls.zig are a Zig port of
-            examples/server.cc, examples/http3_server_proto_codec.cc and
-            examples/tls_server_{context,session}_boringssl.cc (same
-            licence and copyright)
+  Ported:   src/h3/server.zig, src/h3/client.zig, src/h3/bridge.zig and
+            src/h3/quic_tls.zig are a Zig port of examples/server.cc,
+            examples/client.cc, examples/http3_{server,client}_proto_codec.cc
+            and examples/tls_{server,client}_{context,session}_boringssl.cc
+            (same licence and copyright)
   Linked:   -Dhttp3=true
 
 nghttp3 1.18.0 (HTTP/3 and QPACK)

@@ -1,7 +1,8 @@
 //! HTTP/3: ngtcp2 1.25.0 (QUIC transport) with its BoringSSL crypto helper, and
 //! nghttp3 1.18.0 (HTTP/3 + QPACK), all MIT, built from the release tarballs.
 //! `Endpoint` is the server: a QUIC endpoint whose requests reach the same
-//! router as HTTP/1.1 and HTTP/2.
+//! router as HTTP/1.1 and HTTP/2. `ClientConnection` is the client, with the
+//! HTTP/2 client's API.
 const std = @import("std");
 
 /// ngtcp2 bindings (`ngtcp2.c`) plus typed wrappers for its `*_versioned` macros.
@@ -11,6 +12,11 @@ pub const nghttp3 = @import("nghttp3.zig");
 /// The HTTP/3 server endpoint for a dusty server's router.
 pub const Endpoint = @import("server.zig").Endpoint;
 pub const EndpointOptions = @import("server.zig").Options;
+/// An HTTP/3 client connection: many concurrent requests over one QUIC
+/// connection.
+pub const ClientConnection = @import("client.zig").ClientConnection;
+pub const ClientStream = @import("client.zig").Stream;
+pub const ConnectOptions = @import("client.zig").ConnectOptions;
 
 /// Runtime version strings of the linked libraries.
 pub fn ngtcp2Version() []const u8 {
@@ -166,4 +172,9 @@ fn layoutTest() !void {
     try expect(layout.nghttp3_callbacks_size_get(), @as(usize, @sizeOf(h3.Callbacks)));
     try expect(layout.nghttp3_pri_size_get(), @as(usize, @sizeOf(h3.Pri)));
     try expect(layout.nghttp3_pri_align_get(), @as(usize, @alignOf(h3.Pri)));
+}
+
+test {
+    _ = @import("bridge.zig");
+    _ = @import("client_test.zig");
 }

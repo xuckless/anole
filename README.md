@@ -51,11 +51,11 @@ and Linux (x86_64), and cross-compiles for aarch64 Linux:
 - operations: zero-downtime restart on SIGUSR2 (the new process inherits the
   listening sockets), and systemd socket activation;
 - HTTP/3 on ngtcp2 and nghttp3: the same handlers over QUIC, advertised with
-  `Alt-Svc`, with Retry, stateless reset and a GOAWAY drain; checked against
-  aioquic's independent client.
+  `Alt-Svc`, with Retry, stateless reset and a GOAWAY drain, and an HTTP/3
+  client with the HTTP/2 client's API; both checked against aioquic.
 
-The HTTP/3 client, 0-RTT, connection migration and WebTransport are still to
-come, as is gRPC JSON transcoding.
+0-RTT, connection migration and WebTransport are still to come, as is gRPC
+JSON transcoding.
 Nothing is stable before 1.0.
 
 ## Requirements

@@ -145,7 +145,7 @@ test "h2 client: over TLS with ALPN h2" {
     defer server_future.cancel(io) catch {};
     try server.ready.wait(io);
 
-    var bundle = try bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
+    var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
     defer bundle.deinit(gpa);
     const conn = try h2.ClientConnection.connect(gpa, io, .{
         .host = "localhost",
@@ -157,24 +157,4 @@ test "h2 client: over TLS with ALPN h2" {
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h2", body);
-}
-
-/// A CA bundle holding the one PEM certificate in `pem`.
-fn bundleFromPem(gpa: std.mem.Allocator, now_sec: i64, pem: []const u8) !std.crypto.Certificate.Bundle {
-    var bundle: std.crypto.Certificate.Bundle = .empty;
-    errdefer bundle.deinit(gpa);
-    const begin = "-----BEGIN CERTIFICATE-----";
-    const end = "-----END CERTIFICATE-----";
-    const start = (std.mem.indexOf(u8, pem, begin) orelse return error.NoCertificate) + begin.len;
-    const stop = std.mem.indexOfPos(u8, pem, start, end) orelse return error.NoCertificate;
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
-    for (pem[start..stop]) |ch| if (ch != '\n' and ch != '\r') try text.append(gpa, ch);
-    const len = try std.base64.standard.Decoder.calcSizeForSlice(text.items);
-    const decoded_start: u32 = @intCast(bundle.bytes.items.len);
-    try bundle.bytes.ensureUnusedCapacity(gpa, len);
-    try std.base64.standard.Decoder.decode(bundle.bytes.unusedCapacitySlice()[0..len], text.items);
-    bundle.bytes.items.len += len;
-    try bundle.parseCert(gpa, decoded_start, now_sec);
-    return bundle;
 }

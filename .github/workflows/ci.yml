@@ -101,7 +101,7 @@ jobs:
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
 
   h3:
-    name: HTTP/3 against aioquic (${{ matrix.os }})
+    name: HTTP/3 server and client against aioquic (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -114,10 +114,10 @@ jobs:
           version: 0.17.0
           cache-key: h3
       # Debug, so the debug allocator reports any leak at exit.
-      - name: Build the HTTP/3 test server
-        run: zig build h3-test-server --summary all
-      - name: Downloads, uploads, echoes, 100 streams, drain
-        run: tests/h3/run.sh ./zig-out/bin/h3-test-server
+      - name: Build the HTTP/3 test server and client
+        run: zig build h3-test-server h3-test-client --summary all
+      - name: Server and client against aioquic
+        run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
 
   grpc-interop:
     name: gRPC interop (both directions with grpc-go, cleartext HTTP/2)

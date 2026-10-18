@@ -237,6 +237,18 @@ pub fn build(b: *std.Build) void {
         });
         b.step("h3-test-server", "Build the HTTP/3 test server (tests/h3/run.sh drives it with aioquic)").dependOn(&b.addInstallArtifact(h3_server, .{}).step);
         test_step.dependOn(&h3_server.step);
+        // And anole.h3's client against aioquic's server (tests/h3/peer_server.py).
+        const h3_client = b.addExecutable(.{
+            .name = "h3-test-client",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/h3/client.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        b.step("h3-test-client", "Build the HTTP/3 test client (tests/h3/run.sh drives it against aioquic)").dependOn(&b.addInstallArtifact(h3_client, .{}).step);
+        test_step.dependOn(&h3_client.step);
     }
 
     // examples/io: handlers that wait on timers, files and outbound requests

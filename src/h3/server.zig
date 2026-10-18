@@ -33,6 +33,12 @@ const dusty = @import("dusty");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
+const net = @import("net.zig");
+const bridge = @import("bridge.zig");
+const Addr = net.Addr;
+const CidKey = net.CidKey;
+const now = net.now;
+const wallClock = net.wallClock;
 
 const c = ngtcp2.c;
 const h = nghttp3.c;
@@ -48,8 +54,6 @@ const SendError = dusty.Response.SendError;
 const scid_len = 18;
 /// Packets written per driver round (one send each).
 const burst = 10;
-/// Response bytes a stream may have unacknowledged or unsent.
-const out_ring_len = 64 * 1024;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
 /// Largest UDP payload read.
@@ -74,61 +78,6 @@ pub const Options = struct {
     /// Largest request header section.
     max_field_section_size: u64 = 64 * 1024,
 };
-
-/// A socket address as ngtcp2 takes it.
-const Addr = struct {
-    storage: std.Io.Threaded.PosixAddress = undefined,
-    len: std.posix.socklen_t = 0,
-
-    fn from(address: std.Io.net.IpAddress) Addr {
-        var a: Addr = .{};
-        a.len = std.Io.Threaded.addressToPosix(&address, &a.storage);
-        return a;
-    }
-
-    fn fromNgtcp2(addr: c.ngtcp2_addr) Addr {
-        var a: Addr = .{};
-        const len: usize = @intCast(addr.addrlen);
-        @memcpy(std.mem.asBytes(&a.storage)[0..len], @as([*]const u8, @ptrCast(addr.addr))[0..len]);
-        a.len = @intCast(len);
-        return a;
-    }
-
-    fn ip(self: *const Addr) std.Io.net.IpAddress {
-        return std.Io.Threaded.addressFromPosix(&self.storage);
-    }
-
-    fn ngtcp2Addr(self: *Addr) c.ngtcp2_addr {
-        return .{ .addr = @ptrCast(&self.storage), .addrlen = @intCast(self.len) };
-    }
-};
-
-/// A connection ID as a map key.
-const CidKey = struct {
-    len: u8,
-    bytes: [c.NGTCP2_MAX_CIDLEN]u8,
-
-    fn of(data: []const u8) CidKey {
-        var k: CidKey = .{ .len = @intCast(data.len), .bytes = @splat(0) };
-        @memcpy(k.bytes[0..data.len], data);
-        return k;
-    }
-
-    fn ofCid(cid: *const c.ngtcp2_cid) CidKey {
-        return of(cid.data[0..cid.datalen]);
-    }
-};
-
-/// For nghttp3's `rand` callback, which gets no user data.
-var rand_io: ?std.Io = null;
-
-fn now(io: std.Io) u64 {
-    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-}
-
-fn wallClock(io: std.Io) u64 {
-    return @intCast(std.Io.Clock.real.now(io).nanoseconds);
-}
 
 /// One HTTP/3 listener, serving `server`'s router.
 pub fn Endpoint(comptime Ctx: type) type {
@@ -175,7 +124,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .listener = .{ .address = .{ .ip = socket.address } },
             };
             io.random(&self.secret);
-            rand_io = io;
+            net.rand_io = io;
             return self;
         }
 
@@ -882,73 +831,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.h3 = hc;
             }
 
-            /// Feeds nghttp3 the stream data ngtcp2 delivered, and gives
-            /// back the flow-control credit for nghttp3's own framing (the
-            /// body's comes back as the handler reads it). Locked.
-            fn recvStreamData(conn: *Conn, flags: u32, stream_id: i64, data: []const u8) c_int {
-                const hc = conn.h3 orelse return 0;
-                const n = h.nghttp3_conn_read_stream2(hc, stream_id, data.ptr, data.len, @intFromBool(flags & c.NGTCP2_STREAM_DATA_FLAG_FIN != 0), c.ngtcp2_conn_get_timestamp(conn.q));
-                if (n < 0) {
-                    log.debug("nghttp3_conn_read_stream2: {s}", .{h.nghttp3_strerror(@intCast(n))});
-                    c.ngtcp2_ccerr_set_application_error(&conn.last_error, h.nghttp3_err_infer_quic_app_error_code(@intCast(n)), null, 0);
-                    return c.NGTCP2_ERR_CALLBACK_FAILURE;
-                }
-                conn.consume(stream_id, @intCast(n));
-                return 0;
+            fn side(conn: *Conn) bridge.Side {
+                return .{ .q = conn.q, .h3 = conn.h3, .last_error = &conn.last_error };
             }
 
             fn consume(conn: *Conn, stream_id: i64, n: u64) void {
-                _ = c.ngtcp2_conn_extend_max_stream_offset(conn.q, stream_id, n);
-                c.ngtcp2_conn_extend_max_offset(conn.q, n);
-            }
-
-            /// ngtcp2 pulls packets; nghttp3 supplies what goes in them.
-            /// Locked (inside `flush`). From ProtoCodec::write_pkt.
-            fn writePacket(conn: *Conn, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, dest_len: usize, ts: u64) c.ngtcp2_ssize {
-                var vec: [16]h.nghttp3_vec = undefined;
-                while (true) {
-                    var stream_id: i64 = -1;
-                    var fin: c_int = 0;
-                    var count: h.nghttp3_ssize = 0;
-                    if (conn.h3) |hc| if (c.ngtcp2_conn_get_max_data_left2(conn.q) > 0) {
-                        count = h.nghttp3_conn_writev_stream(hc, &stream_id, &fin, &vec, vec.len);
-                        if (count < 0) {
-                            c.ngtcp2_ccerr_set_application_error(&conn.last_error, h.nghttp3_err_infer_quic_app_error_code(@intCast(count)), null, 0);
-                            return c.NGTCP2_ERR_CALLBACK_FAILURE;
-                        }
-                    };
-                    var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
-                    if (fin != 0) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
-                    var data_len: c.ngtcp2_ssize = -1;
-                    const datav: []const c.ngtcp2_vec = @as([*]const c.ngtcp2_vec, @ptrCast(&vec))[0..@intCast(count)];
-                    const n = ngtcp2.connWritevStream(conn.q, p, pi, dest[0..dest_len], &data_len, flags, stream_id, datav, ts);
-                    if (n < 0) {
-                        switch (n) {
-                            c.NGTCP2_ERR_STREAM_DATA_BLOCKED => {
-                                _ = h.nghttp3_conn_block_stream(conn.h3, stream_id);
-                                continue;
-                            },
-                            c.NGTCP2_ERR_STREAM_SHUT_WR => {
-                                _ = h.nghttp3_conn_shutdown_stream_write(conn.h3, stream_id);
-                                continue;
-                            },
-                            c.NGTCP2_ERR_WRITE_MORE => {
-                                if (h.nghttp3_conn_add_write_offset(conn.h3, stream_id, @intCast(data_len)) != 0)
-                                    return c.NGTCP2_ERR_CALLBACK_FAILURE;
-                                continue;
-                            },
-                            else => {
-                                c.ngtcp2_ccerr_set_liberr(&conn.last_error, @intCast(n), null, 0);
-                                return c.NGTCP2_ERR_CALLBACK_FAILURE;
-                            },
-                        }
-                    }
-                    if (data_len >= 0) {
-                        if (h.nghttp3_conn_add_write_offset(conn.h3, stream_id, @intCast(data_len)) != 0)
-                            return c.NGTCP2_ERR_CALLBACK_FAILURE;
-                    }
-                    return n;
-                }
+                bridge.consume(conn.q, stream_id, n);
             }
 
             fn streamOf(conn: *Conn, stream_id: i64) ?*Stream {
@@ -997,13 +885,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             ended: bool = false,
             /// nghttp3 asked for data and got none: resume it on the next.
             deferred: bool = false,
-            /// The body ring: [acked, sent) handed to nghttp3 and not yet
-            /// acknowledged, [sent, written) not yet handed over. Counters
-            /// only grow; positions are taken modulo the ring.
-            ring: []u8 = &.{},
-            acked: u64 = 0,
-            sent: u64 = 0,
-            written: u64 = 0,
+            /// The response body until the peer acknowledges it.
+            out: bridge.Ring = .{},
 
             fn create(conn: *Conn, id: i64) !*Stream {
                 const gpa = conn.ep.gpa;
@@ -1015,7 +898,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn free(s: *Stream) void {
                 const gpa = s.conn.ep.gpa;
                 s.body.deinit(gpa);
-                if (s.ring.len > 0) gpa.free(s.ring);
+                s.out.deinit(gpa);
                 s.arena.deinit();
                 gpa.destroy(s);
             }
@@ -1378,27 +1261,15 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return self.fail(error.ConnectionResetByPeer);
                     }
-                    if (s.ring.len == 0) {
-                        s.ring = conn.ep.gpa.alloc(u8, out_ring_len) catch {
-                            conn.unlock();
-                            return self.fail(error.SystemResources);
-                        };
-                    }
                     self.submit() catch |err| {
                         conn.unlock();
                         return err;
                     };
-                    const free = s.ring.len - @as(usize, @intCast(s.written - s.acked));
-                    const n = @min(free, rest.len);
+                    const n = s.out.write(conn.ep.gpa, rest) catch {
+                        conn.unlock();
+                        return self.fail(error.SystemResources);
+                    };
                     if (n > 0) {
-                        var i: usize = 0;
-                        while (i < n) {
-                            const pos: usize = @intCast((s.written + i) % s.ring.len);
-                            const k = @min(n - i, s.ring.len - pos);
-                            @memcpy(s.ring[pos..][0..k], rest[i..][0..k]);
-                            i += k;
-                        }
-                        s.written += n;
                         rest = rest[n..];
                         s.resume_();
                     }
@@ -1514,7 +1385,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onRecvStreamData(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, _: u64, data: [*c]const u8, len: usize, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            return conn.recvStreamData(flags, stream_id, if (len == 0) &.{} else data[0..len]);
+            return bridge.recvStreamData(conn.side(), flags, stream_id, if (len == 0) &.{} else data[0..len]);
         }
 
         fn onAckedStreamDataOffset(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, len: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
@@ -1537,21 +1408,13 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onStreamClose(_: ?*c.ngtcp2_conn, flags: u32, stream_id: i64, rx_code: u64, tx_code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
-            if (conn.h3) |hc| {
-                var h3_flags: u32 = h.NGHTTP3_STREAM_CLOSE_FLAG_NONE;
-                if (flags & c.NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET != 0) h3_flags |= h.NGHTTP3_STREAM_CLOSE_FLAG_RX_APP_ERROR_CODE_SET;
-                if (flags & c.NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET != 0) h3_flags |= h.NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET;
-                const rv = h.nghttp3_conn_close_stream2(hc, h3_flags, stream_id, rx_code, tx_code);
-                if (rv != 0 and rv != h.NGHTTP3_ERR_STREAM_NOT_FOUND) {
-                    c.ngtcp2_ccerr_set_application_error(&conn.last_error, h.nghttp3_err_infer_quic_app_error_code(rv), null, 0);
-                    return c.NGTCP2_ERR_CALLBACK_FAILURE;
-                }
-            }
+            const rv = bridge.closeStream(conn.side(), flags, stream_id, rx_code, tx_code);
+            if (rv != 0) return rv;
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
-                    if (!(s.ended and s.sent == s.written and s.body_done)) s.reset = true;
+                    if (!(s.ended and s.out.allSent() and s.body_done)) s.reset = true;
                     s.release(.quic);
                 }
             }
@@ -1619,7 +1482,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         fn writePkt(_: ?*c.ngtcp2_conn, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: [*c]u8, len: usize, ts: c.ngtcp2_tstamp, user_data: ?*anyopaque) callconv(.c) c.ngtcp2_ssize {
-            return connOf(user_data).writePacket(p, pi, dest, len, ts);
+            return bridge.writePacket(connOf(user_data).side(), p, pi, dest, len, ts);
         }
 
         // -- nghttp3 callbacks: inside nghttp3_conn_* calls, locked.
@@ -1635,7 +1498,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             cb.stop_sending = onH3StopSending;
             cb.end_stream = onH3EndStream;
             cb.reset_stream = onH3ResetStream;
-            cb.rand = onH3Rand;
+            cb.rand = net.h3Rand;
             break :blk cb;
         };
 
@@ -1645,7 +1508,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onH3AckedStreamData(_: ?*h.nghttp3_conn, _: i64, len: u64, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
-            s.acked += len;
+            s.out.acked += len;
             // Room in the ring: a handler waiting to write may go on.
             s.conn.kick();
             return 0;
@@ -1726,18 +1589,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
-        /// nghttp3's randomness (GREASE values) has no user data, so it
-        /// comes from the `Io` an endpoint recorded.
-        fn onH3Rand(dest: [*c]u8, len: usize) callconv(.c) void {
-            (rand_io orelse unreachable).random(dest[0..len]);
-        }
-
         /// nghttp3 pulls response body bytes: what is in the ring and not
         /// yet handed over, then the end (with trailers, if any). Locked.
         fn readData(_: ?*h.nghttp3_conn, stream_id: i64, vec: [*c]h.nghttp3_vec, veccnt: usize, pflags: [*c]u32, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) h.nghttp3_ssize {
             const s = streamOfUser(sud) orelse return h.NGHTTP3_ERR_CALLBACK_FAILURE;
-            const pending = s.written - s.sent;
-            if (pending == 0) {
+            if (s.out.allSent()) {
                 if (!s.ended) {
                     s.deferred = true;
                     return h.NGHTTP3_ERR_WOULDBLOCK;
@@ -1750,18 +1606,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 return 0;
             }
-            // One or two runs: the ring may wrap.
-            var count: usize = 0;
-            var from = s.sent;
-            while (from < s.written and count < veccnt) {
-                const pos: usize = @intCast(from % s.ring.len);
-                const k: usize = @min(@as(usize, @intCast(s.written - from)), s.ring.len - pos);
-                vec[count] = .{ .base = s.ring[pos..].ptr, .len = k };
-                count += 1;
-                from += k;
-            }
-            s.sent = from;
-            if (s.ended and s.sent == s.written) {
+            const count = s.out.take(vec, veccnt);
+            if (s.ended and s.out.allSent()) {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
