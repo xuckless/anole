@@ -16,9 +16,6 @@ const std = @import("std");
 const anole = @import("anole");
 const websocket = anole.websocket;
 
-/// Pinned scheduling, one executor per core.
-pub const zio_options = anole.zio_options;
-
 /// Log lines read `anole` and `access`, not the libraries underneath.
 pub const std_options: std.Options = .{
     .logFn = anole.logFn,
@@ -42,47 +39,21 @@ fn versionName(ws: *const websocket.Socket) []const u8 {
     };
 }
 
-/// Echoes every text and binary message. Pings are answered inside
-/// `receive`, and a close from the client is echoed there too.
-fn echo(_: *App, req: *anole.Request, res: *anole.Response) !void {
-    var ws = (try websocket.upgrade(req, res, .{
-        // A bigger message is refused with close code 1009.
-        .max_message_size = 1024 * 1024,
-    })) orelse {
-        // Not a WebSocket handshake: answer it as plain HTTP.
-        res.status = .bad_request;
-        try res.print(.text, "this endpoint speaks WebSocket\n", .{});
-        return;
-    };
-    defer ws.deinit();
-    log.info("echo: WebSocket over {s}", .{versionName(&ws)});
-
-    while (true) {
-        // The peer went away, or sent something invalid (the socket has
-        // already sent the matching close code). Either way, done.
-        const msg = ws.receive() catch return;
-        switch (msg.type) {
-            .text, .binary => ws.send(msg.type, msg.data) catch return,
-            .close => return,
-            else => {},
-        }
-    }
+/// Echoes every text and binary message. `next` answers pings and returns
+/// null once the client closes (its close is echoed for it) or goes away;
+/// `app.ws` closes the socket when this returns.
+fn echo(ws: *websocket.Socket, _: *anole.Request) !void {
+    log.info("echo: WebSocket over {s}", .{versionName(ws)});
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
 }
 
 /// Joins the socket to the room named in the path. Every message a member
 /// sends goes to every member, the sender included.
-fn chat(app: *App, req: *anole.Request, res: *anole.Response) !void {
+fn chat(app: *App, ws: *websocket.Socket, req: *anole.Request) !void {
     const room = req.params.get("room") orelse "lobby";
-    var ws = (try websocket.upgrade(req, res, .{})) orelse {
-        res.status = .bad_request;
-        try res.print(.text, "this endpoint speaks WebSocket\n", .{});
-        return;
-    };
-    // Defers run last-first: the socket leaves the room before it goes away.
-    defer ws.deinit();
-    try app.rooms.join(room, &ws);
-    defer app.rooms.leave(room, &ws);
-    log.info("chat: WebSocket over {s} joined {s}", .{ versionName(&ws), room });
+    try app.rooms.join(room, ws);
+    defer app.rooms.leave(room, ws);
+    log.info("chat: WebSocket over {s} joined {s}", .{ versionName(ws), room });
 
     var buf: [128]u8 = undefined;
     const hello = try std.fmt.bufPrint(&buf, "* joined {s} ({d} here)", .{ room, app.rooms.count(room) });
@@ -90,18 +61,14 @@ fn chat(app: *App, req: *anole.Request, res: *anole.Response) !void {
 
     while (true) {
         // An idle limit: the timer restarts before every wait. When it
-        // runs out the connection is closed and `receive` fails.
+        // runs out the connection is closed and `next` returns null.
         req.setTimeout(.{ .duration = .{ .raw = chat_idle, .clock = .awake } });
-        const msg = ws.receive() catch return;
-        switch (msg.type) {
-            .text, .binary => _ = app.rooms.broadcast(room, msg.type, msg.data, null),
-            .close => return,
-            else => {},
-        }
+        const msg = try ws.next() orelse return;
+        _ = app.rooms.broadcast(room, msg.type, msg.data, null);
     }
 }
 
-fn page(_: *App, _: *anole.Request, res: *anole.Response) !void {
+fn page(_: *anole.Request, res: *anole.Response) !void {
     try res.print(.html, "{s}", .{chat_page});
 }
 
@@ -138,7 +105,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     if (args.next()) |p| tls_port = try std.fmt.parseInt(u16, p, 10);
 
-    var state: App = undefined;
+    // The rooms take the runtime's Io from the first socket that joins, so
+    // they can be made before the server.
+    var state: App = .{ .rooms = .init(init.gpa) };
+    defer state.rooms.deinit();
     var app = try anole.Server(App).init(init.gpa, .{
         // HTTP/1.1, plus HTTP/2 (h2c) for clients that open with its preface.
         .http = .{ .port = port },
@@ -149,14 +119,13 @@ pub fn main(init: std.process.Init) !void {
         .server = .{ .timeout = .{ .shutdown = .fromSeconds(5) } },
     }, &state);
     defer app.deinit();
-    // The rooms take the runtime's Io, which exists once the server does.
-    state = .{ .rooms = .init(init.gpa) };
-    defer state.rooms.deinit();
 
     app.use(anole.middleware.Logger.init());
     app.get("/", page);
-    app.get("/echo", echo);
-    app.get("/chat/:room", chat);
+    // A plain HTTP request to either gets 426 Upgrade Required. A message
+    // bigger than 1 MiB is refused with close code 1009.
+    app.wsWith("/echo", echo, .{ .max_message_size = 1024 * 1024 });
+    app.ws("/chat/:room", chat);
 
     log.info("listening on http://127.0.0.1:{d}", .{port});
     if (anole.features.tls != .none) log.info("listening on https://127.0.0.1:{d} (self-signed)", .{tls_port});

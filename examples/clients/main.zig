@@ -9,6 +9,8 @@
 //! trusts as a CA given as PEM in memory. It calls the server with each
 //! client and prints what came back:
 //!
+//!   anole.client(io)           the server's own client: a GET with an
+//!                              inline header
 //!   anole.http.Client          an HTTPS GET over HTTP/1.1, and one over
 //!                              HTTP/2 (`.http2 = true`)
 //!   anole.h2.ClientConnection  a GET, a streamed POST with a trailer, and
@@ -26,8 +28,6 @@ const http = anole.http;
 const h2 = anole.h2;
 const h3 = anole.h3;
 const grpc = anole.grpc;
-
-pub const zio_options = anole.zio_options;
 
 /// Log lines read `anole` and `access`, not the libraries underneath.
 pub const std_options: std.Options = .{
@@ -163,6 +163,16 @@ fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8) !void {
 
     var url_buf: [128]u8 = undefined;
 
+    // The server's own client, from any task of its runtime (a handler
+    // passes `req`). It trusts the system store, so a plain http:// URL
+    // here.
+    {
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{http_addr.getPort()});
+        var response = try anole.client(io).fetch(url, .{ .headers = &.{.{ "User-Agent", "anole-example" }} });
+        defer response.deinit();
+        try out.print("anole.client       GET  /hello  {d} \"{s}\"\n", .{ @backingInt(response.status()), try response.body() });
+    }
+
     // dusty's client: pooled keep-alive connections, HTTP/1.1.
     var client = http.Client.init(gpa, io, .{
         .tls = .{ .ca = ca },
@@ -262,9 +272,7 @@ pub fn main(init: std.process.Init) !void {
     }, &app);
     defer server.deinit();
 
-    var health: grpc.Health = .init(gpa, server.io());
-    defer health.deinit();
-    health.registerOn(App, server.router);
+    _ = server.grpcHealth();
     server.get("/hello", hello);
     server.post("/echo", echo);
     server.get("/relay", relay);

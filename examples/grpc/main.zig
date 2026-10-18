@@ -34,8 +34,6 @@ const std = @import("std");
 const anole = @import("anole");
 const pb = @import("greeter_pb");
 
-pub const zio_options = anole.zio_options;
-
 pub const std_options: std.Options = .{
     .logFn = anole.logFn,
     // zio's per-thread startup lines are debug noise here.
@@ -43,9 +41,6 @@ pub const std_options: std.Options = .{
 };
 
 const Call = anole.grpc.Call;
-
-/// The generated method table, with `Call` as each method's first argument.
-const Greeter = pb.Greeter(Call, anyerror);
 
 fn sayHello(call: *Call, req: pb.HelloRequest) anyerror!pb.HelloReply {
     if (req.name.len == 0) return call.fail(.invalid_argument, "name must not be empty");
@@ -86,15 +81,14 @@ pub fn main(init: std.process.Init) !void {
 
     app.use(anole.middleware.Logger.init());
 
-    // One POST route per method: /greeter.Greeter/SayHello.
-    anole.grpc.register(void, app.router, Greeter, .{ .SayHello = sayHello });
+    // One POST route per method (/greeter.Greeter/SayHello), Connect GET,
+    // and the REST routes of its google.api.http annotation.
+    app.grpc(pb.Greeter, .{ .SayHello = sayHello });
 
     // grpc.health.v1.Health: Check, List and Watch. The empty service name
-    // is the server as a whole and starts SERVING.
-    var health: anole.grpc.Health = .init(init.gpa, app.io());
-    defer health.deinit();
-    health.registerOn(void, app.router);
-    try health.set("greeter.Greeter", .SERVING);
+    // is the server as a whole and starts SERVING; every service turns
+    // NOT_SERVING when the server drains.
+    try app.grpcHealth().set("greeter.Greeter", .SERVING);
 
     std.log.info("gRPC (h2c), gRPC-Web and Connect on http://127.0.0.1:{d}", .{port});
     if (anole.features.tls != .none) std.log.info("gRPC over TLS on https://127.0.0.1:{d} (self-signed)", .{tls_port});

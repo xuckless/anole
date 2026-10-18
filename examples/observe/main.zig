@@ -21,8 +21,6 @@ const http = anole.http;
 const observe = anole.observe;
 const metrics = observe.metrics;
 
-pub const zio_options = anole.zio_options;
-
 /// Log lines read `anole` and `access`, not the libraries underneath.
 pub const std_options: std.Options = .{
     .logFn = anole.logFn,
@@ -38,8 +36,6 @@ pub const std_options: std.Options = .{
 /// What every handler shares, passed as the handler's first argument.
 const App = struct {
     port: u16,
-    /// For /chain: one client and its connection pool for all requests.
-    client: http.Client,
     maintenance: std.atomic.Value(bool) = .init(false),
     /// Custom metrics, beside the HTTP ones.
     lookups: *metrics.Family(metrics.Counter),
@@ -59,12 +55,14 @@ fn handleUser(app: *App, req: *http.Request, res: *http.Response) !void {
 fn handleChain(app: *App, req: *http.Request, res: *http.Response) !void {
     const id = std.fmt.parseInt(u32, req.params.get("id").?, 10) catch return error.NotFound;
     const url = try std.fmt.allocPrint(req.arena, "http://127.0.0.1:{d}/users/{d}", .{ app.port, id });
-    var headers = try http.Headers.init(req.arena, 1);
     var tp_buf: [55]u8 = undefined;
-    if (observe.trace.outgoing(req, &tp_buf)) |tp| try headers.put("traceparent", tp);
-    var response = try app.client.fetch(url, .{ .headers = &headers });
+    const traceparent = observe.trace.outgoing(req, &tp_buf);
+    // The server's own client, its connections pooled across requests.
+    var response = try anole.client(req).fetch(url, .{
+        .headers = if (traceparent) |tp| &.{.{ "traceparent", tp }} else &.{},
+    });
     defer response.deinit();
-    const body = try req.arena.dupe(u8, (try response.body()) orelse "");
+    const body = try req.arena.dupe(u8, try response.body());
     try res.print(.text, "downstream said: {s}", .{body});
 }
 
@@ -95,53 +93,37 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |f| log_format = std.meta.stringToEnum(observe.access_log.Format, f) orelse return error.UnknownLogFormat;
     const otlp_endpoint = init.environ_map.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "http://127.0.0.1:4318";
 
-    var app: App = .{ .port = port, .client = undefined, .lookups = undefined, .maintenance_gauge = undefined };
-    var server = try anole.Server(App).init(init.gpa, .{ .http = .{ .port = port } }, &app);
+    var app: App = .{ .port = port, .lookups = undefined, .maintenance_gauge = undefined };
+    var server = try anole.Server(App).init(init.gpa, .{}, &app);
     defer server.deinit();
-    const io = server.io();
-    app.client = http.Client.init(init.gpa, io, .{});
-    defer app.client.deinit();
 
+    // Order matters only for what runs first: the IDs are set before the
+    // handler runs, and the access log writes its line after it. `tracing`
+    // and `metrics` add middleware too, so they come with the `use` calls.
+    server.use(anole.middleware.RequestId.init(.{}));
+    // Traces: a batching task sends finished spans to the collector; the
+    // server sends what is left when it is freed.
+    const exporter = try server.tracing(.{ .endpoint = otlp_endpoint, .service_name = "anole-observe-example" });
+    server.use(observe.AccessLog.init(.{ .format = log_format, .exclude = &observe.probe_paths }));
     // Metrics: the HTTP series come from a middleware, the rest from the
-    // application.
-    var registry = metrics.Registry.init(init.gpa, io);
-    defer registry.deinit();
-    const http_metrics = try metrics.HttpMetrics.init(&registry, .{});
+    // application, on the registry the server serves at /metrics.
+    const registry = server.metrics(.{});
     app.lookups = try registry.counter("example_user_lookups_total", "User lookups, by how they arrived.", &.{"via"});
     app.maintenance_gauge = try registry.gauge("example_maintenance", "1 while in maintenance mode.", &.{});
     app.maintenance_gauge.with(&.{}).set(0);
-
-    // Traces: a batching task sends finished spans to the collector.
-    var exporter = try observe.trace.Exporter.init(init.gpa, io, &app.client, .{
-        .endpoint = otlp_endpoint,
-        .service_name = "anole-observe-example",
-    });
-    errdefer exporter.deinit();
-    try exporter.start();
-
-    // Order matters only for what runs first: the IDs are set before the
-    // handler runs, and the access log writes its line after it.
-    server.use(anole.middleware.RequestId.init(.{}));
-    server.use(observe.trace.Middleware.init(&exporter));
-    server.use(observe.AccessLog.init(.{ .format = log_format, .exclude = &observe.probe_paths }));
-    server.use(http_metrics);
+    // /healthz and /readyz, with a readiness check of our own.
+    try server.health(.{}).addCheck("maintenance", notInMaintenance, &app);
 
     server.get("/users/:id", handleUser);
     server.get("/chain/:id", handleChain);
     server.post("/maintenance", handleMaintenanceOn);
     server.delete("/maintenance", handleMaintenanceOff);
-    registry.serveOn(App, server.router, "/metrics");
 
-    var health = observe.Health.init(.{});
-    try health.addCheck("maintenance", notInMaintenance, &app);
-    health.registerOn(App, server.router, server.server);
-
-    std.log.info("listening on http://127.0.0.1:{d}", .{port});
     std.log.info("sending spans to {s}/v1/traces", .{otlp_endpoint});
-    try server.run();
-    // Sends what is still queued, then stops the batching task.
-    exporter.deinit();
-    std.log.info("stopped; spans exported {d}, dropped {d}", .{
+    var addr_buf: [32]u8 = undefined;
+    try server.listen(try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port}));
+    // `deinit` sends what is still queued.
+    std.log.info("stopped; spans exported {d}, dropped {d} so far", .{
         exporter.exported.load(.monotonic), exporter.dropped.load(.monotonic),
     });
 }
