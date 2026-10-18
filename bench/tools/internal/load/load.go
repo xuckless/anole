@@ -27,6 +27,7 @@ type Result struct {
 	MeanMS   float64 `json:"mean_ms"`
 	P50MS    float64 `json:"p50_ms,omitempty"`
 	P90MS    float64 `json:"p90_ms,omitempty"`
+	P95MS    float64 `json:"p95_ms,omitempty"`
 	P99MS    float64 `json:"p99_ms,omitempty"`
 	P999MS   float64 `json:"p999_ms,omitempty"`
 	MaxMS    float64 `json:"max_ms"`

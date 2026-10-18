@@ -69,7 +69,7 @@ func cpusetSize(set string) int {
 }
 
 var allServers = "anole,fiber,gohttp,axum,express,fastify,fastapi,nginx"
-var allScenarios = []string{"raw", "conns", "latency"}
+var allScenarios = []string{"raw", "conns", "latency", "twelve", "ws", "mem", "gc", "video"}
 
 func runSuite(args []string) {
 	fs := flag.NewFlagSet("suite", flag.ExitOnError)
@@ -121,6 +121,16 @@ func runSuite(args []string) {
 			s.Conns()
 		case "latency":
 			s.Latency()
+		case "ws":
+			s.WebSockets()
+		case "mem":
+			s.Memory()
+		case "gc":
+			s.GC()
+		case "video":
+			s.Video()
+		case "twelve":
+			s.Twelve(env("PG_CPUS_TWELVE", "16-27"), env("PG_CPUS", "16-19"))
 		default:
 			log.Printf("unknown scenario %s (skipped)", sc)
 		}

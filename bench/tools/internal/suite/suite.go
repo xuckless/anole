@@ -15,6 +15,8 @@ import (
 
 	"github.com/xuckless/anole/bench/tools/internal/load"
 	"github.com/xuckless/anole/bench/tools/internal/sut"
+	"github.com/xuckless/anole/bench/tools/internal/video"
+	"github.com/xuckless/anole/bench/tools/internal/ws"
 )
 
 // Profile sets how long each case runs and how often it repeats.
@@ -50,8 +52,12 @@ type Case struct {
 	SUT      sut.Usage   `json:"sut"`
 	LoadCPU  float64     `json:"loadgen_cpu"`
 	Note     string      `json:"note,omitempty"`
-	Error    string      `json:"error,omitempty"`
-	At       time.Time   `json:"at"`
+	// Feed: the fan-out and trading details (scenario ws).
+	Feed *ws.FeedResult `json:"feed,omitempty"`
+	// Video: the paced viewers' playback (scenario video).
+	Video *video.Result `json:"video,omitempty"`
+	Error string        `json:"error,omitempty"`
+	At    time.Time     `json:"at"`
 }
 
 type Suite struct {

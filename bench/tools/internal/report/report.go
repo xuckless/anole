@@ -140,6 +140,15 @@ func Write(dir string) error {
 	raw(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "raw" }))
 	conns(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "conns" }))
 	latency(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "latency" }))
+	twelveSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "twelve" }))
+	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "ws" }), "WebSockets (HTTP/1.1)",
+		"Idle: sockets held open and the memory each costs. Echo: closed-loop 64-byte messages, msgs/s and round trip. Fan-out: subscribers on /ws/feed at the tick rate; delivered msgs/s against expected, and tick lag (receive time minus the server's send stamp). Trading: one bot in ten also sends orders on /ws/trade and waits for each fill; order round trip in the notes and the feed column.")
+	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "mem" }), "Memory pressure",
+		"Idle keep-alive: connections that made one request and stay open; memory per connection in the notes. Upload: 64 connections POSTing 1 MiB bodies to /echo (throughput in MB/s is req/s × 2 MiB on the wire). Cap: /list at 1024 connections with the container capped at 256 MB.")
+	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "video" }), "4K video streaming",
+		"The 60 s 4K60 AV1 clip at 25 Mbit/s (bench/media/gen.sh). Unpaced: 64 concurrent whole-file downloads (HTTP/1.1, wrk) or 16 connections × 4 streams (HTTP/2, HTTP/3, h2load); throughput in the notes. Paced: viewers that play in real time, keep 30 s buffered and start after 2 s; progressive MP4 through 2 MB Range requests, or HLS 4 s segments. Stalls, startup time and memory per stream in the notes. Cleartext HTTP/1.1 can use sendfile; TLS, HTTP/2 and HTTP/3 encrypt in user space for every server.")
+	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "gc" }), "Garbage-collection pressure",
+		"1,000,000 retained objects (RETAIN) that a collector keeps tracing, and /gc/alloc building and serializing 2,000 objects per request. Closed loop for the maximum, then a fixed rate at half of it (oha, latency-corrected) for the tail.")
 	if len(d.notes) > 0 {
 		d.WriteString("## Notes\n\n")
 		for i, n := range d.notes {
@@ -270,6 +279,80 @@ func latency(d *doc, cases []suite.Case) {
 		}
 		fmt.Fprintf(d, "| %s | %s | %s | %s%s | %.2f | %.2f | %.2f | %.1f | %.0f | %.2f |\n", c.Server, c.Proto, c.Param,
 			num(c.Load.RPS), d.note(c), c.Load.P50MS, c.Load.P99MS, c.Load.P999MS, c.Load.MaxMS, c.SUT.MemMB, c.SUT.CPU)
+	}
+	d.WriteString("\n")
+}
+
+func twelveSection(d *doc, cases []suite.Case) {
+	if len(cases) == 0 {
+		return
+	}
+	d.WriteString("## The $12 server challenge (Postgres)\n\n")
+	d.WriteString("load.js's users (feed, think, post, think, 15% like, 2% write, idle), added in steps; each step's window must keep p95 < 500 ms, p99 < 1 s and < 1% errors. Score: the most users that passed. Server memory is the peak in that step.\n\n")
+	for _, tier := range uniq(cases, func(c suite.Case) string { return c.Tier }, []string{"1cpu", "4cpu"}) {
+		sub := filter(cases, func(c suite.Case) bool { return c.Tier == tier })
+		fmt.Fprintf(d, "### %s\n\n| Server | Score (users) | req/s at score | p95 ms | p99 ms | memory MB | cores busy |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n", tier)
+		for _, srv := range uniq(sub, func(c suite.Case) string { return c.Server }, serverOrder) {
+			var score *suite.Case
+			var at *suite.Case
+			for i := range sub {
+				c := &sub[i]
+				if c.Server != srv {
+					continue
+				}
+				if c.Error != "" {
+					fmt.Fprintf(d, "| %s | fail%s | | | | | |\n", srv, d.note(*c))
+				}
+				if c.Param == "score" {
+					score = c
+				}
+			}
+			if score == nil {
+				continue
+			}
+			for i := range sub {
+				c := &sub[i]
+				if c.Server == srv && c.Param == fmt.Sprintf("users=%d", score.Load.Requests) {
+					at = c
+				}
+			}
+			if at == nil {
+				fmt.Fprintf(d, "| %s | %s | | | | | |\n", srv, num(float64(score.Load.Requests)))
+				continue
+			}
+			fmt.Fprintf(d, "| %s | **%s** | %s | %.0f | %.0f | %.0f | %.2f |\n", srv, num(float64(score.Load.Requests)),
+				num(at.Load.RPS), at.Load.P95MS, at.Load.P99MS, at.SUT.MemMB, at.SUT.CoresBusy)
+		}
+		d.WriteString("\n")
+	}
+}
+
+func listSection(d *doc, cases []suite.Case, title, intro string) {
+	if len(cases) == 0 {
+		return
+	}
+	fmt.Fprintf(d, "## %s\n\n%s\n\n", title, intro)
+	d.WriteString("| Server | Case | Count | Rate/s | p50 ms | p99 ms | p99.9 ms | max ms | Memory MB | Cores busy | Notes |\n| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
+	sort.SliceStable(cases, func(i, j int) bool {
+		return rank(serverOrder, cases[i].Server) < rank(serverOrder, cases[j].Server)
+	})
+	for _, c := range cases {
+		label := strings.TrimSpace(c.Endpoint + " " + c.Param)
+		if c.Error != "" {
+			fmt.Fprintf(d, "| %s | %s | fail | | | | | | | | %s |\n", c.Server, label, firstLine(c.Error))
+			continue
+		}
+		note := c.Note
+		if c.Feed != nil {
+			f := c.Feed
+			note = strings.TrimPrefix(note+fmt.Sprintf("; %d/%d connected, %.0f of %.0f msgs/s expected, %d gaps", f.Connected, f.Subscribers, f.Delivered, f.Expected, f.Gaps), "; ")
+			if f.Orders > 0 || f.OrderErrors > 0 {
+				note += fmt.Sprintf("; orders %.0f/s, rtt p50 %.2f p99 %.2f p99.9 %.2f ms, %d errors", f.OrdersPS, f.OrderRTT.P50MS, f.OrderRTT.P99MS, f.OrderRTT.P999MS, f.OrderErrors)
+			}
+		}
+		fmt.Fprintf(d, "| %s | %s | %s | %s | %.2f | %.2f | %.2f | %.1f | %.0f | %.2f | %s |\n", c.Server, label,
+			num(float64(c.Load.Requests)), num(c.Load.RPS), c.Load.P50MS, c.Load.P99MS, c.Load.P999MS, c.Load.MaxMS,
+			c.SUT.MemMB, c.SUT.CoresBusy, note)
 	}
 	d.WriteString("\n")
 }

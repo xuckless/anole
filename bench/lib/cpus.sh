@@ -4,8 +4,11 @@
 #   SUT_CPUS_1  the 1-CPU tier: one P-core thread, its sibling left idle
 #   SUT_CPUS_4  the 4-CPU tier: one thread on each of four P-cores, siblings idle
 #   PG_CPUS     the shared Postgres
+#   PG_CPUS_TWELVE  Postgres while the $12 test runs: more cores, so the
+#               frameworks rather than the database set the score
 #   LOAD_CPUS   load generators and the orchestrator
 : "${SUT_CPUS_1:=2}"
 : "${SUT_CPUS_4:=0,2,4,6}"
 : "${PG_CPUS:=16-19}"
+: "${PG_CPUS_TWELVE:=16-27}"
 : "${LOAD_CPUS:=8-15,20-27}"

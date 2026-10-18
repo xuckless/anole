@@ -11,7 +11,15 @@ RUN curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/$ZIG/zig-x86_64-l
  && mkdir /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz
 ENV PATH=/opt/zig:$PATH
 WORKDIR /src
-COPY . .
+# Only what the build reads, so that changes elsewhere in bench/ keep the
+# cached image.
+COPY build.zig build.zig.zon LICENSE THIRD_PARTY_NOTICES README.md ./
+COPY build/ build/
+COPY src/ src/
+COPY tests/ tests/
+COPY examples/ examples/
+COPY bench/servers/anole/build.zig bench/servers/anole/build.zig.zon bench/servers/anole/
+COPY bench/servers/anole/src/ bench/servers/anole/src/
 # Baseline x86-64, as Go (GOAMD64=v1) and Rust build by default; Zig's own
 # default, the build host's CPU, would give Anole an edge the others lack.
 RUN --mount=type=cache,target=/root/.cache/zig \

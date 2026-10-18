@@ -23,6 +23,12 @@ for a in "$@"; do
 done
 
 "$bench/lib/certs.sh"
+# Postgres is needed by the $12 scenario (in every run without -only).
+case " $* " in
+*twelve*) "$bench/postgres/run.sh" start ;;
+*" -only "*) ;;
+*) "$bench/postgres/run.sh" start ;;
+esac
 mkdir -p "$bench/.data/media" "$bench/results"
 
 if [ -z "${NO_BUILD:-}" ]; then
@@ -71,4 +77,5 @@ exec docker run --rm --name anole-bench-loadgen --network host \
   -v "$bench:/bench" \
   -e BENCH_HOST_DIR="$bench" -e HOST_CGROUP=/host/cgroup \
   -e SUT_CPUS_1="$SUT_CPUS_1" -e SUT_CPUS_4="$SUT_CPUS_4" -e LOAD_CPUS="$LOAD_CPUS" \
+  -e PG_CPUS="$PG_CPUS" -e PG_CPUS_TWELVE="$PG_CPUS_TWELVE" \
   anole-bench/loadgen suite "$@" -out "/bench/results/$id"

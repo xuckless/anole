@@ -193,14 +193,20 @@ type Usage struct {
 	// MemAvgMB: its average.
 	MemAvgMB float64 `json:"mem_avg_mb"`
 	// CurrentPeakMB: peak of memory.current (page cache included).
-	CurrentPeakMB float64  `json:"current_peak_mb"`
-	Samples       []Sample `json:"samples,omitempty"`
+	CurrentPeakMB float64 `json:"current_peak_mb"`
+	// CoresBusy: how busy the server's cpuset was (from /proc/stat), in
+	// cores. It includes the kernel's softirq network work, which no cgroup
+	// is charged for (on loopback it is a large share), so it is the
+	// number that says whether the server's CPUs were saturated.
+	CoresBusy float64  `json:"cores_busy"`
+	Samples   []Sample `json:"samples,omitempty"`
 }
 
 type Sample struct {
 	T     float64 `json:"t"`
 	MemMB float64 `json:"mem_mb"`
 	CPU   float64 `json:"cpu"`
+	Busy  float64 `json:"busy,omitempty"`
 }
 
 // Sampler reads a cgroup every interval until Stop.
@@ -245,7 +251,7 @@ func (sm *Sampler) loop() {
 	t0 := time.Now()
 	cpu0 := cpuUsec(sm.dir)
 	busy0 := busyTicks(sm.cpus)
-	prevT, prevCPU := t0, cpu0
+	prevT, prevCPU, prevBusy := t0, cpu0, busy0
 	var memSum float64
 	n := 0
 	tick := time.NewTicker(sm.interval)
@@ -269,6 +275,7 @@ func (sm *Sampler) loop() {
 			mem := float64(st["anon"]+st["kernel"]) / (1 << 20)
 			cur := float64(readInt(filepath.Join(sm.dir, "memory.current"))) / (1 << 20)
 			c := cpuUsec(sm.dir)
+			b := busyTicks(sm.cpus)
 			memSum += mem
 			n++
 			if mem > sm.u.MemMB {
@@ -282,9 +289,10 @@ func (sm *Sampler) loop() {
 					T:     now.Sub(t0).Seconds(),
 					MemMB: mem,
 					CPU:   float64(c-prevCPU) / 1e6 / now.Sub(prevT).Seconds(),
+					Busy:  float64(b-prevBusy) / clockTicks / now.Sub(prevT).Seconds(),
 				})
 			}
-			prevT, prevCPU = now, c
+			prevT, prevCPU, prevBusy = now, c, b
 		}
 	}
 }
