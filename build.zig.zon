@@ -73,8 +73,8 @@
             .lazy = true,
         },
         .nghttp3 = .{
-            .url = "https://github.com/ngtcp2/nghttp3/releases/download/v1.18.0/nghttp3-1.18.0.tar.xz",
-            .hash = "N-V-__8AACIRMQC5n2gMbQs6uNoXpnY00q7K_3ePaRDb3r0s",
+            .url = "https://github.com/xuckless/nghttp3/archive/de4bcb905eca28cdfe0e6ef4280b355e1c29660d.tar.gz",
+            .hash = "N-V-__8AAEFLFQDX6X1kJVbgLtI2HqUnToQWeqwqMuAlG7Oa",
             .lazy = true,
         },
         .websocket_zig = .{
