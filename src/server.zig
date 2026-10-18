@@ -42,6 +42,9 @@ const observe = @import("observe/root.zig");
 const websocket = if (features.websocket) @import("websocket/root.zig") else struct {
     pub const UpgradeOptions = struct {};
 };
+const webtransport_mod = if (features.http3) @import("webtransport.zig") else struct {
+    pub const AcceptOptions = struct {};
+};
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
     pub const RegisterOptions = struct {};
@@ -162,6 +165,12 @@ pub const Options = struct {
         /// socket: null for one per executor, as the TCP accept loops. At
         /// most 255; macOS always uses one.
         sockets: ?u16 = null,
+        /// Extended CONNECT (RFC 9220): WebSockets over HTTP/3, as over
+        /// HTTP/2.
+        enable_connect_protocol: bool = true,
+        /// Speak WebTransport (draft-02, what Chrome and Firefox use), for
+        /// `anole.webtransport.accept`. `app.webtransport` turns it on.
+        webtransport: bool = false,
     };
 
     pub const Https = struct {
@@ -260,6 +269,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             grpc_health: ?*grpc_mod.Health = null,
             exporter: ?*observe.trace.Exporter = null,
             dirs: std.ArrayList(std.Io.Dir) = .empty,
+            /// A WebTransport route exists: the HTTP/3 listener speaks it.
+            webtransport: bool = false,
         };
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
@@ -547,6 +558,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         .idle_timeout_ms = q.idle_timeout_ms,
                         .hq_interop_root = q.hq_interop_root,
                         .early_data = q.early_data,
+                        .enable_connect_protocol = q.enable_connect_protocol,
+                        .webtransport = q.webtransport or self.extras.webtransport,
                         .client_auth = h3ClientAuth(https.client_auth, client_ca),
                         .fds = h3_fds,
                         .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
@@ -775,6 +788,43 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.router.get(path, websocket.route(Ctx, handler, upgrade));
         }
 
+        /// A WebTransport endpoint at `path` (draft-02, what Chrome and
+        /// Firefox speak), on the HTTP/3 listener, which this turns
+        /// WebTransport on for: `handler` gets the open session, which is
+        /// closed when it returns, and on the server's drain. A request
+        /// there that is no WebTransport session gets 400. `handler` is
+        /// `fn (session: *anole.webtransport.Session, req: *anole.Request)
+        /// !void` (the request may be left out; the server's state may
+        /// come first):
+        ///
+        ///     fn echo(session: *anole.webtransport.Session) !void {
+        ///         while (true) {
+        ///             const stream = session.acceptStream() catch return;
+        ///             defer stream.release();
+        ///             ...
+        ///         }
+        ///     }
+        ///     app.webtransport("/echo", echo);
+        pub fn webtransport(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.webtransportWith(path, handler, .{});
+        }
+
+        /// `webtransport` with accept options (the drain's close, timeout).
+        pub fn webtransportWith(self: *Self, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+            if (comptime !features.http3) @compileError("app.webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+            self.enableWebTransport();
+            self.router.get(path, webtransport_mod.route(Ctx, handler, accept));
+        }
+
+        /// The HTTP/3 listener speaks WebTransport, now or once it is set
+        /// up.
+        fn enableWebTransport(self: *Self) void {
+            self.extras.webtransport = true;
+            if (comptime features.http3) if (self.h3) |ep| {
+                ep.options.webtransport = true;
+            };
+        }
+
         /// Serves the files under `dir` below `prefix`: ranges, ETags and
         /// conditional requests, and precompressed copies (`style.css.br`,
         /// `.zst`, `.gz`) when `opts.precompressed` lists them. `dir` must
@@ -891,6 +941,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
+            }
+            pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.webtransportWith(path, handler, .{});
+            }
+            pub fn webtransportWith(g: Group, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+                if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+                g.server.enableWebTransport();
+                g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
                 g.inner.static(prefix, dir, opts);

@@ -1,5 +1,6 @@
-//! WebSocket for handlers, over HTTP/1.1 (RFC 6455 upgrade) and HTTP/2
-//! (RFC 8441 extended CONNECT), behind one `Socket`. The short form is a
+//! WebSocket for handlers, over HTTP/1.1 (RFC 6455 upgrade), HTTP/2
+//! (RFC 8441 extended CONNECT) and HTTP/3 (RFC 9220, the same over HTTP/3),
+//! behind one `Socket`. The short form is a
 //! route of its own (`Server.ws`, through `route`):
 //!
 //!     fn echo(ws: *anole.websocket.Socket, _: *anole.Request) !void {
@@ -23,17 +24,18 @@
 //!         }
 //!     }
 //!
-//! HTTP/1.1 runs on dusty's RFC 6455 implementation (MIT). HTTP/2 runs on
-//! the sans-IO frame codec of xuckless/websocket-zig (a fork of
-//! mattrobenolt/websocket-zig, MIT) over the stream's request body and
+//! HTTP/1.1 runs on dusty's RFC 6455 implementation (MIT). HTTP/2 and
+//! HTTP/3 run on the sans-IO frame codec of xuckless/websocket-zig (a fork
+//! of mattrobenolt/websocket-zig, MIT) over the stream's request body and
 //! streamed response; this file is the message layer over it, with dusty's
 //! semantics: pings are answered and pongs dropped inside `receive`, a close
 //! is echoed and returned, a text message must be valid UTF-8.
 //!
-//! The HTTP/2 engine advertises extended CONNECT, and a browser that sees it
-//! (Firefox does) opens WebSockets over HTTP/2: answer upgrades with
-//! `upgrade` here, not dusty's HTTP/1.1-only `res.upgradeWebSocket`, or turn
-//! `http2.enable_connect_protocol` off.
+//! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
+//! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
+//! upgrades with `upgrade` here, not dusty's HTTP/1.1-only
+//! `res.upgradeWebSocket`, or turn `http2.enable_connect_protocol` (and
+//! `http3.enable_connect_protocol`) off.
 //!
 //! permessage-deflate (RFC 7692) is accepted when offered and
 //! `-Dcompression` is on (`UpgradeOptions.compression`), on either version.
@@ -112,6 +114,7 @@ pub const Socket = struct {
     /// drain watch, a `Rooms.broadcast`) acts on the same one.
     pub const Conn = union(enum) {
         h1: *WebSocket,
+        /// An HTTP/2 or an HTTP/3 stream (RFC 8441, RFC 9220).
         h2: *H2Socket,
     };
 
@@ -225,9 +228,10 @@ pub const Socket = struct {
 /// handler answers it as it sees fit). The socket lives as long as the
 /// handler: the request's arena holds it.
 pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions) !?Socket {
+    // An extended CONNECT, over HTTP/2 or HTTP/3.
     const h2 = req.protocol != null;
     if (h2) {
-        if (!features.http2 or !std.ascii.eqlIgnoreCase(req.protocol.?, "websocket")) return null;
+        if (!(features.http2 or features.http3) or !std.ascii.eqlIgnoreCase(req.protocol.?, "websocket")) return null;
         const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
         if (!std.mem.eql(u8, version, "13")) return null;
     }
@@ -493,8 +497,9 @@ pub const Rooms = struct {
     }
 };
 
-/// A WebSocket on an HTTP/2 stream (RFC 8441): frames arrive in the
-/// request body and leave in the streamed response.
+/// A WebSocket on an HTTP/2 stream (RFC 8441) or an HTTP/3 one (RFC
+/// 9220): frames arrive in the request body and leave in the streamed
+/// response.
 pub const H2Socket = struct {
     io: std.Io,
     arena: std.mem.Allocator,

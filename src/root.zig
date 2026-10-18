@@ -88,6 +88,11 @@ pub const compression = if (features.compression) @import("compression/root.zig"
 /// over HTTP/2 behind one `upgrade`, permessage-deflate, and `Rooms`.
 pub const websocket = if (features.websocket) @import("websocket/root.zig") else struct {};
 
+/// WebTransport over HTTP/3 (-Dhttp3; draft-02, what Chrome and Firefox
+/// speak): sessions with streams and datagrams, `accept` from a handler or
+/// `Server.webtransport` for a route.
+pub const webtransport = if (features.http3) @import("webtransport.zig") else struct {};
+
 /// JSON on yyjson (-Djson): parse into and stringify Zig types.
 pub const json = if (features.json) @import("json/root.zig") else struct {};
 
@@ -133,6 +138,7 @@ test {
     _ = h2;
     _ = h3;
     _ = websocket;
+    _ = webtransport;
     _ = compression;
     _ = grpc;
     _ = json;
