@@ -15,6 +15,7 @@
 //!               one build of each C library (run when the target is native)
 //!   hello       install examples/hello (also part of the default install step)
 //!   run-hello   run examples/hello (`zig build run-hello -- 8080`)
+//!   bench-server  the Anole side of bench/run.sh (with -Doptimize=ReleaseFast)
 //!   io          install examples/io (handlers waiting on I/O through std.Io)
 //!   run-io      run examples/io (`zig build run-io -- 8081`)
 const std = @import("std");
@@ -207,6 +208,21 @@ pub fn build(b: *std.Build) void {
     const run_hello = b.addRunArtifact(hello);
     run_hello.addPassthruArgs();
     b.step("run-hello", "Run examples/hello (pass a port after --, default 8080)").dependOn(&run_hello.step);
+
+    // bench/anole: the Anole side of the Fiber benchmark (bench/run.sh).
+    if (features.json) {
+        const bench = b.addExecutable(.{
+            .name = "bench-server",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/anole/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        });
+        b.step("bench-server", "Build the benchmark server (bench/run.sh; use -Doptimize=ReleaseFast)").dependOn(&b.addInstallArtifact(bench, .{}).step);
+        test_step.dependOn(&bench.step);
+    }
 
     // examples/io: handlers that wait on timers, files and outbound requests
     // through std.Io.

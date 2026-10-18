@@ -30,10 +30,30 @@ and Linux (x86_64), and cross-compiles for aarch64 Linux:
   the same router and handlers, with streaming bodies, flow control and
   trailers; h2spec 2.6.0 passes every case in strict mode, over h2c and TLS;
   a drain sends every connection a two-phase GOAWAY;
+- WebSockets over HTTP/1.1 and over HTTP/2 (RFC 8441 extended CONNECT), with
+  permessage-deflate and a rooms helper for broadcast; Autobahn passes all
+  517 cases;
+- gRPC server and client over HTTP/2 (all four call modes, deadlines,
+  metadata, gzip), plus gRPC-Web and Buf's Connect protocol, and the
+  `grpc.health.v1` service; grpc-go's interop client passes 14/14 cases
+  against Anole and Anole's client passes 11/11 against grpc-go's server;
+  `zig build` runs protoc and the Zig code generator, so nothing extra to install;
+- an HTTP/2 client (nghttp2), used by the gRPC client;
+- JSON on yyjson, a Redis/Valkey client on hiredis, server-side sessions in
+  memory or Redis and sealed cookie sessions;
+- rate limiting (token buckets in memory or Redis, a 429 middleware);
+- auth: JWS/JWT verification with one pinned algorithm per key and JWKS
+  keyrings, OIDC sign-in (PKCE; Google and Apple presets), CSRF tokens,
+  Argon2id passwords, API keys and RBAC;
+- observability: Prometheus `/metrics`, OpenTelemetry traces (W3C
+  `traceparent`, OTLP/HTTP export), JSON or text access logs with request and
+  trace IDs, `/healthz` and `/readyz`;
+- operations: zero-downtime restart on SIGUSR2 (the new process inherits the
+  listening sockets), and systemd socket activation;
 - ngtcp2 and nghttp3 bindings, with a smoke test.
 
-There is no HTTP/3 endpoint, gRPC or auth code yet. Nothing is
-stable before 1.0.
+There is no HTTP/3 endpoint yet, and gRPC JSON transcoding is still to come.
+Nothing is stable before 1.0.
 
 ## Requirements
 
@@ -87,6 +107,36 @@ With the hello world running, `curl localhost:8080/` returns `hello` and
 self-signed certificate generated at startup and kept in memory, so use
 `curl -k https://localhost:8443/`. Pass other ports with
 `zig build run-hello -- 9000 9443`.
+
+## Benchmarks
+
+**macOS arm64, local** (2026-10-18). One Apple M2 Pro (6 performance and 4
+efficiency cores, 16 GB, macOS 27.0) runs both the servers and the load
+generators, over loopback. Each case gets a 5 s warm-up, then three 15 s runs;
+the table shows the median run. Reproduce with `bench/run.sh`.
+
+| Case | Anole req/s | Anole p99 | Other req/s | Other p99 | Anole/Other |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP/1.1 GET /plaintext (vs Fiber) | 158535 | 1.88 ms | 164403 | 2.03 ms | 0.96x |
+| HTTP/1.1 GET /json (vs Fiber) | 158155 | 1.87 ms | 164517 | 2.14 ms | 0.96x |
+| HTTP/1.1 GET /users/42 (vs Fiber) | 159047 | 1.99 ms | 164147 | 1.94 ms | 0.97x |
+| HTTP/2 h2c GET /plaintext, 64 conns x 10 streams (Fiber: none) | 570863 | 7.75 ms | - | - | - |
+| gRPC unary (vs grpc-go 1.84) | 65287 | 2.31 ms | 59248 | 1.99 ms | 1.10x |
+
+- Anole: commit 1e72ac9, `-Doptimize=ReleaseFast`, `anole.Server` defaults (one
+  pinned executor per core), no middleware (`bench/anole`). Fiber v3.6.1 on
+  Go 1.27.2, no middleware (`bench/fiber`). grpc-go 1.84.0's interop server
+  and Anole's (`tests/grpc/interop`) for gRPC.
+- HTTP/1.1: wrk 4.2.0, 4 threads, 256 connections. HTTP/2: h2load 1.70.0,
+  4 threads, 64 connections with 10 streams each. gRPC: ghz 0.121.0, 64
+  concurrent unary `TestService/UnaryCall`s with 13-byte payloads.
+- Fiber has no HTTP/2 or gRPC, so the HTTP/2 row has no comparison and the
+  gRPC row compares against grpc-go.
+- Read the HTTP/1.1 rows with care: both servers sit near the ceiling of the
+  load generator on this machine (wrk gives about 160k req/s with 4 or 8
+  threads, oha less), so they measure the shared machine as much as the
+  servers. The performance bar in the plan (equal or better than Fiber on
+  req/s and p99) is judged on a dedicated Linux box, which is still to come.
 
 ## Build flags
 
