@@ -122,6 +122,44 @@ comptime {
     }
 }
 
+/// What `addProtoGen` generates code for.
+pub const ProtoGenOptions = struct {
+    /// The .proto files.
+    source_files: []const std.Build.LazyPath,
+    /// Where protoc resolves imports from (its `-I`).
+    include_directories: []const std.Build.LazyPath = &.{},
+    /// Where the .pb.zig files go: a directory in the project's source tree,
+    /// committed like any other source.
+    destination_directory: std.Build.LazyPath,
+};
+
+/// For a project that depends on Anole: makes `step` generate Zig from
+/// .proto files, with the protoc binary and protoc-gen-zig that Anole pins
+/// (downloaded and built by `zig build`, nothing to install). Anole must be
+/// fetched with gRPC on (the default profile). The generated files import
+/// "protobuf": give their module `anole_dep.module("protobuf")`.
+///
+///     const anole_build = @import("anole");
+///     const gen = b.step("gen-proto", "Generate Zig from the .proto files");
+///     anole_build.addProtoGen(gen, anole_dep, .{
+///         .source_files = &.{b.path("proto/greeter.proto")},
+///         .include_directories = &.{b.path("proto")},
+///         .destination_directory = b.path("src/gen"),
+///     });
+pub fn addProtoGen(step: *std.Build.Step, anole_dep: *std.Build.Dependency, options: ProtoGenOptions) void {
+    const b = step.owner;
+    // Lazy, like inside Anole: on the first configure pass these are null,
+    // and the build runner fetches them and configures again.
+    const pb = anole_dep.builder.lazyImport(@This(), "protobuf") orelse return;
+    const pb_dep = anole_dep.builder.lazyDependency("protobuf", .{ .target = b.graph.host }) orelse return;
+    const run = pb.RunProtocStep.createWithGenerator(b, pb_dep.artifact("protoc-gen-zig"), .{
+        .source_files = options.source_files,
+        .include_directories = options.include_directories,
+        .destination_directory = options.destination_directory,
+    });
+    step.dependOn(run.step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -145,6 +183,9 @@ pub fn build(b: *std.Build) void {
 
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
     const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .public = true });
+    // zig-protobuf's runtime, which the code `addProtoGen` generates imports
+    // as "protobuf": `anole_dep.module("protobuf")`.
+    if (c_mods.protobuf) |m| _ = b.modules.getOrPutValue(b.graph.arena, "protobuf", m) catch @panic("OOM");
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");

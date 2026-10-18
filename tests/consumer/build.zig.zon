@@ -1,0 +1,12 @@
+.{
+    .name = .anole_consumer,
+    .fingerprint = 0xbb289f2d4ef88865,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // tests/consumer/run.sh replaces this with the published package
+        // (`zig fetch --save`), as a user would add it.
+        .anole = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "proto" },
+}

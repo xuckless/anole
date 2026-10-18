@@ -1,0 +1,4 @@
+src/gen/
+zig-out/
+.zig-cache/
+zig-pkg/
