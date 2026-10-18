@@ -26,8 +26,10 @@ zio (async runtime)
 
 dusty (HTTP/1.1 server, router, client, WebSocket)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
-  Source:   https://github.com/lalinsky/dusty
-  Pinned:   commit d3cb485a644a18bee7e03b4a51577990455b23b3
+  Source:   https://github.com/lalinsky/dusty, used through Anole's fork
+            https://github.com/xuckless/dusty (branch anole: upstream
+            d3cb485 plus Anole's patches, each offered upstream)
+  Pinned:   commit b6b8a4572cef15cd9280431b51e62ebb5e8bf211 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -102,8 +104,17 @@ build/ngtcp2.zig, build/nghttp3.zig
   Licence:  MIT. Copyright (c) 2025 Glenford Williams
   Source:   https://github.com/kingwill101/server_native
 
-src/http/root.zig (loopback test harness), examples/hello/main.zig (wiring)
-  Follow the shape of dusty's src/server_test.zig and its README examples.
+src/tls/dusty_tls.zig (Reader/Writer adapters and the module surface)
+  The Connection.Reader/Writer vtables follow tls.zig's src/connection.zig,
+  and the declarations mirror the tls.zig API that dusty compiles against.
+  Licence:  MIT. Copyright (c) 2024 Igor Anić
+  Source:   https://github.com/ianic/tls.zig (as forked at
+            https://github.com/lalinsky/tls.zig, commit 60d0ced)
+
+src/http/root.zig, src/tls/root.zig (loopback test harnesses),
+examples/hello/main.zig (wiring)
+  Follow the shape of dusty's src/server_test.zig, src/client_test.zig and
+  its README examples.
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
   Source:   https://github.com/lalinsky/dusty
 

@@ -1,8 +1,12 @@
 //! Anole hello world: HTTP/1.1 (dusty on zio), pinned scheduling, one executor per CPU.
 //! The server and router wiring follows dusty's README examples (lalinsky/dusty, MIT, d3cb485).
 //!
-//!   zig build run-hello            # listens on 127.0.0.1:8080
-//!   zig build run-hello -- 9000    # another port
+//!   zig build run-hello                 # http://127.0.0.1:8080 and https://127.0.0.1:8443
+//!   zig build run-hello -- 9000 9443    # other ports
+//!
+//! With TLS built in (the default; not with -Dtls=none) the HTTPS listener
+//! uses a self-signed certificate for localhost that is generated at startup
+//! and held only in memory, so clients need `curl -k` or similar.
 //!
 //!   GET /          -> "hello"
 //!   GET /users/:id -> "user <id>"
@@ -50,11 +54,15 @@ fn waitForSignal(kind: zio.SignalKind) !void {
     try sig.wait();
 }
 
+const has_tls = anole.features.tls != .none;
+
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8080;
+    var tls_port: u16 = 8443;
     var args = init.minimal.args.iterate();
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
+    if (args.next()) |p| tls_port = try std.fmt.parseInt(u16, p, 10);
 
     // One executor per CPU (cgroup-aware); executor 0 is this thread.
     const rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
@@ -67,8 +75,24 @@ pub fn main(init: std.process.Init) !void {
     });
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
+    var listeners: [2]http.Listener = .{ .{ .address = addr }, undefined };
+    var listener_count: usize = 1;
+
+    var dev_cert = if (has_tls) try anole.tls.selfSigned(init.gpa, .{}) else {};
+    defer if (has_tls) dev_cert.deinit(init.gpa);
+    if (has_tls) {
+        listeners[1] = .{
+            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", tls_port) },
+            .tls = .{
+                .pem = .{ .cert = dev_cert.cert, .key = dev_cert.key },
+                .alpn_protocols = &.{"http/1.1"},
+            },
+        };
+        listener_count = 2;
+    }
+
     var server = http.Server(void).init(init.gpa, io, .{
-        .listeners = &.{.{ .address = addr }},
+        .listeners = listeners[0..listener_count],
     }, {});
     defer server.deinit();
 
@@ -84,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
         served: anyerror!void,
     };
     std.log.info("listening on http://127.0.0.1:{d}", .{port});
+    if (has_tls) std.log.info("listening on https://127.0.0.1:{d} (self-signed, BoringSSL)", .{tls_port});
     var done_buf: [3]Done = undefined;
     var sel = std.Io.Select(Done).init(io, &done_buf);
     try sel.concurrent(.int, waitForSignal, .{.interrupt});

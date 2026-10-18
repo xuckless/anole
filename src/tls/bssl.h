@@ -6,6 +6,7 @@
 #include <openssl/evp.h>
 #include <openssl/ec_key.h>
 #include <openssl/nid.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>

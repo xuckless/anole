@@ -1,6 +1,9 @@
 //! TLS: BoringSSL (Apache-2.0) at 22a0079b, built by build/boringssl.zig, with
 //! bindings from the official translate-c package over src/tls/bssl.h.
-//! Only the bindings exist so far; a TLS module for dusty's TLS seam comes next.
+//!
+//! `dusty_tls` is the module dusty uses for every HTTPS listener and every
+//! HTTPS/WSS client connection; `selfSigned` makes a development certificate
+//! in memory.
 //!
 //! The smoke test below is the M1 BoringSSL proof: an in-memory TLS handshake
 //! between a client SSL and a server SSL over a BIO pair, with an ALPN select
@@ -10,6 +13,107 @@ const std = @import("std");
 
 /// The translated BoringSSL headers listed in bssl.h.
 pub const c = @import("anole_boringssl_c");
+
+/// dusty's `tls` module, on BoringSSL (src/tls/dusty_tls.zig).
+pub const dusty_tls = @import("anole_dusty_tls");
+
+/// A certificate and private key as PEM text, owned by the allocator that
+/// made them.
+pub const Pem = struct {
+    cert: []u8,
+    key: []u8,
+
+    pub fn deinit(self: *Pem, gpa: std.mem.Allocator) void {
+        gpa.free(self.cert);
+        std.crypto.secureZero(u8, self.key);
+        gpa.free(self.key);
+        self.* = undefined;
+    }
+};
+
+pub const SelfSignedOptions = struct {
+    /// Subject CN, also the first DNS subjectAltName.
+    common_name: []const u8 = "localhost",
+    /// subjectAltName entries, in OpenSSL config syntax.
+    alt_names: []const u8 = "DNS:localhost,IP:127.0.0.1,IP:::1",
+    valid_for_seconds: i64 = 7 * 24 * 3600,
+};
+
+/// A fresh P-256 key and a self-signed certificate for it, for development
+/// and tests: nothing touches the disk. The certificate is its own CA
+/// (`CA:TRUE`), so a client can trust it directly.
+pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
+    c.ERR_clear_error();
+    defer c.ERR_clear_error();
+    const pkey = c.EVP_PKEY_new() orelse return error.OutOfMemory;
+    defer c.EVP_PKEY_free(pkey);
+    {
+        const ec = c.EC_KEY_new_by_curve_name(c.NID_X9_62_prime256v1) orelse return error.OutOfMemory;
+        if (c.EC_KEY_generate_key(ec) != 1 or c.EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+            c.EC_KEY_free(ec);
+            return error.TlsKeyGenerationFailed;
+        }
+    }
+
+    const x = c.X509_new() orelse return error.OutOfMemory;
+    defer c.X509_free(x);
+    var serial: [16]u8 = undefined;
+    if (c.RAND_bytes(&serial, serial.len) != 1) return error.TlsKeyGenerationFailed;
+    serial[0] &= 0x7f; // positive
+    const bn = c.BN_bin2bn(&serial, serial.len, null) orelse return error.OutOfMemory;
+    defer c.BN_free(bn);
+    if (c.X509_set_version(x, c.X509_VERSION_3) != 1 or
+        c.BN_to_ASN1_INTEGER(bn, c.X509_get_serialNumber(x)) == null or
+        c.X509_gmtime_adj(c.X509_getm_notBefore(x), -60) == null or
+        c.X509_gmtime_adj(c.X509_getm_notAfter(x), @intCast(opt.valid_for_seconds)) == null)
+        return error.TlsCertificateFailed;
+
+    var cn_buf: [256]u8 = undefined;
+    const cn = std.fmt.bufPrintSentinel(&cn_buf, "{s}", .{opt.common_name}, 0) catch return error.NameTooLong;
+    const name = c.X509_get_subject_name(x);
+    if (c.X509_NAME_add_entry_by_txt(name, "CN", c.MBSTRING_UTF8, cn.ptr, -1, -1, 0) != 1 or
+        c.X509_set_issuer_name(x, name) != 1 or
+        c.X509_set_pubkey(x, pkey) != 1)
+        return error.TlsCertificateFailed;
+
+    var san_buf: [1024]u8 = undefined;
+    const san = std.fmt.bufPrintSentinel(&san_buf, "{s}", .{opt.alt_names}, 0) catch return error.NameTooLong;
+    const exts = [_]struct { nid: c_int, value: [*:0]const u8 }{
+        .{ .nid = c.NID_subject_alt_name, .value = san.ptr },
+        .{ .nid = c.NID_basic_constraints, .value = "critical,CA:TRUE" },
+        .{ .nid = c.NID_key_usage, .value = "critical,digitalSignature,keyCertSign" },
+        .{ .nid = c.NID_ext_key_usage, .value = "serverAuth,clientAuth" },
+    };
+    var v3: c.X509V3_CTX = undefined;
+    c.X509V3_set_ctx(&v3, x, x, null, null, 0);
+    for (exts) |e| {
+        const ext = c.X509V3_EXT_nconf_nid(null, &v3, e.nid, e.value) orelse return error.TlsCertificateFailed;
+        defer c.X509_EXTENSION_free(ext);
+        if (c.X509_add_ext(x, ext, -1) != 1) return error.TlsCertificateFailed;
+    }
+    if (c.X509_sign(x, pkey, c.EVP_sha256()) <= 0) return error.TlsCertificateFailed;
+
+    const cert = try toPem(gpa, x, null);
+    errdefer gpa.free(cert);
+    return .{ .cert = cert, .key = try toPem(gpa, null, pkey) };
+}
+
+fn toPem(gpa: std.mem.Allocator, x: ?*c.X509, pkey: ?*c.EVP_PKEY) ![]u8 {
+    const bio = c.BIO_new(c.BIO_s_mem()) orelse return error.OutOfMemory;
+    defer _ = c.BIO_free(bio);
+    const ok = if (x) |cert|
+        c.PEM_write_bio_X509(bio, cert)
+    else
+        c.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null);
+    if (ok != 1) return error.TlsCertificateFailed;
+    var contents: [*c]const u8 = null;
+    var len: usize = 0;
+    if (c.BIO_mem_contents(bio, &contents, &len) != 1) return error.OutOfMemory;
+    const out = try gpa.dupe(u8, contents[0..len]);
+    // The memory BIO's copy of a private key is wiped before BIO_free.
+    std.crypto.secureZero(u8, @constCast(contents[0..len]));
+    return out;
+}
 
 /// BORINGSSL_API_VERSION from base.h of the pinned tree.
 pub const api_version: c_int = c.BORINGSSL_API_VERSION;
@@ -220,4 +324,184 @@ fn handshake(client_ctx: *c.SSL_CTX, server_ctx: *c.SSL_CTX, client_max: ?u16) !
 
     if (!std.mem.eql(u8, client_alpn_got, "h2") or !std.mem.eql(u8, server_alpn_got, "h2")) return error.AlpnNotH2;
     if (verify != c.X509_V_OK) return error.VerifyFailed;
+}
+
+// HTTPS over loopback through dusty's TLS seam: a dusty server and a dusty
+// client, both on the BoringSSL module, as tasks of one zio runtime. The
+// harness shape follows dusty's client_test.zig (lalinsky/dusty, MIT).
+
+const dusty = @import("dusty");
+const zio = @import("zio");
+
+const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+
+const Https = struct {
+    rt: *zio.Runtime,
+    io: std.Io,
+    pem: Pem,
+    /// Holds cert.pem for the client's CA file (dusty's client reads its
+    /// trust anchors from a file); the key never leaves memory.
+    tmp: std.testing.TmpDir,
+
+    fn init() !Https {
+        const gpa = std.testing.allocator;
+        const rt = try zio.Runtime.init(gpa, .{});
+        errdefer rt.deinit();
+        var pem = try selfSigned(gpa, .{});
+        errdefer pem.deinit(gpa);
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(rt.io(), .{ .sub_path = "cert.pem", .data = pem.cert });
+        return .{ .rt = rt, .io = rt.io(), .pem = pem, .tmp = tmp };
+    }
+
+    fn deinit(self: *Https) void {
+        self.tmp.cleanup();
+        self.pem.deinit(std.testing.allocator);
+        self.rt.deinit();
+    }
+
+    fn caFile(self: *Https) dusty.TlsCa {
+        return .{ .file = .{ .path = "cert.pem", .dir = self.tmp.dir } };
+    }
+};
+
+fn handleHello(req: *dusty.Request, res: *dusty.Response) !void {
+    try std.testing.expect(req.secure);
+    try res.print(.text, "hello over {s}", .{"tls"});
+}
+
+fn runServer(s: *dusty.Server(void)) !void {
+    try s.run();
+}
+
+test "TLS hello: HTTPS GET through dusty's seam, certificate verified, ALPN http/1.1" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{
+            .pem = .{ .cert = h.pem.cert, .key = h.pem.key },
+            .alpn_protocols = &.{"http/1.1"},
+        } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa) !void {
+            try s.ready.wait(_io);
+            var client = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            // Two requests: the second reuses the pooled TLS connection.
+            for (0..2) |_| {
+                const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqual(.ok, response.status());
+                try std.testing.expectEqualStrings("hello over tls", (try response.body()).?);
+            }
+            // By IP literal: no SNI, verified against the IP subjectAltName.
+            const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{s.address.ip.getPort()});
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.ok, response.status());
+        }
+    }.run, .{ &server, io, h.caFile() });
+    try client_future.await(io);
+}
+
+test "TLS hello: a client that does not trust the certificate is refused" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    // A different self-signed certificate as the only trust anchor.
+    var other = try selfSigned(std.testing.allocator, .{});
+    defer other.deinit(std.testing.allocator);
+    try h.tmp.dir.writeFile(io, .{ .sub_path = "other.pem", .data = other.cert });
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, dir: std.Io.Dir) !void {
+            try s.ready.wait(_io);
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = "other.pem", .dir = dir } } },
+            });
+            defer client.deinit();
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+            try std.testing.expectError(error.TlsCertificateVerifyFailed, client.fetch(url, .{}));
+        }
+    }.run, .{ &server, io, h.tmp.dir });
+    try client_future.await(io);
+}
+
+test "TLS hello: mutual TLS rejects a client without a certificate and accepts one with it" {
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    // dusty's client loads its certificate from files; this one is a test key.
+    try h.tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = h.pem.key });
+
+    // The self-signed certificate is CA:TRUE, so it is the server identity,
+    // the client identity and the CA that verifies both.
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{
+            .pem = .{ .cert = h.pem.cert, .key = h.pem.key },
+            .client_auth = .{ .ca = h.caFile() },
+        } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa, dir: std.Io.Dir) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+            {
+                var anon = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
+                defer anon.deinit();
+                // TLS 1.3: the client's flight is done before the server
+                // refuses it, so the refusal is the alert on the first read,
+                // or a reset when the server closed with the client's request
+                // still unread (it does not linger), whichever arrives first.
+                if (anon.fetch(url, .{})) |r| {
+                    var resp = r;
+                    resp.deinit();
+                    return error.ServedWithoutClientCertificate;
+                } else |err| switch (err) {
+                    error.TlsAlert, error.ConnectionResetByPeer => {},
+                    else => return err,
+                }
+            }
+            var authed = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{
+                .ca = ca,
+                .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = dir },
+            } });
+            defer authed.deinit();
+            var response = try authed.fetch(url, .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.ok, response.status());
+        }
+    }.run, .{ &server, io, h.caFile(), h.tmp.dir });
+    try client_future.await(io);
 }

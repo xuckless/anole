@@ -4,16 +4,18 @@
     .fingerprint = 0xe9214b117feef58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Core, always used. Pinned by commit (main HEADs on 2026-10-17); zio's
-        // v0.19.x tags are the Zig 0.16 line. dusty moves to an xuckless/dusty
-        // fork once that fork carries Anole's TLS seam and HTTP/2 patches.
+        // Core, always used, pinned by commit. zio: main HEAD on 2026-10-17
+        // (its v0.19.x tags are the Zig 0.16 line). dusty: Anole's fork
+        // xuckless/dusty, branch `anole`, which is lalinsky/dusty d3cb485 plus
+        // the patches Anole needs (TLS state teardown, server ALPN, in-memory PEM, handshake log level), each
+        // offered upstream.
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#4e4e1ed10da974f15b119207d346a78cc6c363e4",
             .hash = "zio-0.19.0-xHbVVN3FLABm8N_sLa1zfHWookpE3lCqjjoHw8Xr4GTF",
         },
         .dusty = .{
-            .url = "git+https://github.com/lalinsky/dusty#d3cb485a644a18bee7e03b4a51577990455b23b3",
-            .hash = "dusty-0.4.0-Qdw7Rg3ZIwATZGFAofGR5RJXtRyvqQw91MUsPlfBFePh",
+            .url = "git+https://github.com/xuckless/dusty#b6b8a4572cef15cd9280431b51e62ebb5e8bf211",
+            .hash = "dusty-0.4.0-Qdw7RknuIwCRCt6qoNIxSeG_ETcZhagqgpUtbZ5qt6vB",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

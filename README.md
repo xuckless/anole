@@ -11,11 +11,12 @@ build flag, so whatever you turn off is neither downloaded nor compiled.
 
 ## Status
 
-Pre-alpha, Milestone 1. The dependency layer builds and passes its smoke tests
-on macOS (arm64) and Linux (x86_64), and cross-compiles for aarch64 Linux:
+Pre-alpha. The dependency layer builds and passes its tests on macOS (arm64)
+and Linux (x86_64), and cross-compiles for aarch64 Linux:
 
 - an HTTP/1.1 server and router (dusty on zio), with a runnable hello world;
-- BoringSSL, with an in-memory TLS 1.3/1.2 handshake that negotiates ALPN;
+- HTTPS through BoringSSL: TLS 1.3 and 1.2, ALPN, certificate verification,
+  mutual TLS, for both the server and dusty's HTTP client;
 - nghttp2, ngtcp2 and nghttp3 bindings, each with a smoke test.
 
 There is no HTTP/2 server, HTTP/3 endpoint, gRPC or auth code yet. Nothing is
@@ -32,12 +33,14 @@ stable before 1.0.
 ```sh
 zig build test          # unit tests plus smoke tests for the enabled features
 zig build test-flags    # the tests for every preset and edge flag combination
-zig build run-hello     # HTTP/1.1 hello world on http://127.0.0.1:8080
+zig build run-hello     # hello world on http://127.0.0.1:8080 and https://127.0.0.1:8443
 ```
 
 With the hello world running, `curl localhost:8080/` returns `hello` and
-`curl localhost:8080/users/42` returns `user 42`. Pass another port with
-`zig build run-hello -- 9000`.
+`curl localhost:8080/users/42` returns `user 42`. The HTTPS listener uses a
+self-signed certificate generated at startup and kept in memory, so use
+`curl -k https://localhost:8443/`. Pass other ports with
+`zig build run-hello -- 9000 9443`.
 
 ## Build flags
 

@@ -18,7 +18,8 @@ pub const zio = @import("zio");
 /// HTTP/1.1 server, router and client (lalinsky/dusty, on zio). Always on.
 pub const http = @import("http/root.zig");
 
-/// BoringSSL bindings (-Dtls=boringssl).
+/// TLS on BoringSSL (-Dtls=boringssl): the bindings, the module dusty uses for
+/// HTTPS, and `selfSigned` for development certificates.
 pub const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 
 /// nghttp2 bindings (-Dhttp2). The HTTP/2 server engine is Milestone 2.
