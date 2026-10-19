@@ -932,7 +932,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             close_next_reply: u32 = 1,
             /// When the closing or draining period ends.
             period_end: u64 = 0,
-            streams: std.AutoHashMapUnmanaged(i64, *Stream) = .empty,
+            /// The request streams. An array map: removing leaves no
+            /// tombstones behind, which in a hash map with a stream opening
+            /// and one closing for every request soon made each insert and
+            /// lookup walk most of the table.
+            streams: std.AutoArrayHashMapUnmanaged(i64, *Stream) = .empty,
             /// The request tasks.
             group: std.Io.Group = .init,
             tx: []u8,
@@ -1028,8 +1032,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gpa = conn.ep.gpa;
                 for (conn.hq_streams.values()) |hs| hs.free(gpa);
                 conn.hq_streams.deinit(gpa);
-                var it = conn.streams.valueIterator();
-                while (it.next()) |s| s.*.free();
+                for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
                 if (conn.wt) |w| w.destroy();
                 if (conn.h3) |hc| h.nghttp3_conn_del(hc);
@@ -1374,8 +1377,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Every stream's handler sees the connection gone.
             fn wakeStreams(conn: *Conn) void {
-                var it = conn.streams.valueIterator();
-                while (it.next()) |s| s.*.reset = true;
+                for (conn.streams.values()) |s| s.reset = true;
                 if (conn.wt) |w| w.connectionClosed();
             }
 
@@ -1655,7 +1657,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .handler => s.refs.handler = false,
                 }
                 if (s.refs.quic or s.refs.handler) return;
-                _ = s.conn.streams.remove(s.id);
+                _ = s.conn.streams.swapRemove(s.id);
                 s.free();
             }
 
@@ -2253,7 +2255,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
             const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
             // A bidirectional stream WebTransport took is no request.
-            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchRemove(stream_id)) |e| e.value.free();
+            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| e.value.free();
             return rv;
         }
 
