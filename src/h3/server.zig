@@ -285,6 +285,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// What the socket is read into.
         rx: []u8,
         stats: Stats = .{},
+        /// Request streams kept for the next ones, with their arenas and
+        /// small response rings (`Stream.create`, `Stream.free`). Every
+        /// connection's tasks run on the endpoint's executor, so the lock
+        /// is never contended there; it only keeps other `Io`s safe.
+        pool_lock: std.atomic.Mutex = .unlocked,
+        pool: std.ArrayList(*Stream) = .empty,
         /// The thread serving the endpoint, in test builds (`Stats.foreign`).
         thread: ?std.Thread.Id = null,
 
@@ -439,7 +445,27 @@ pub fn Endpoint(comptime Ctx: type) type {
             var left: [1]*Forwarded = undefined;
             while ((self.inbox.getUncancelable(self.io, &left, 0) catch 0) == 1) self.freeForwarded(left[0]);
             self.gpa.free(self.rx);
+            for (self.pool.items) |s| s.destroy(self.gpa);
+            self.pool.deinit(self.gpa);
             self.gpa.destroy(self);
+        }
+
+        /// Streams kept at most per endpoint.
+        const pool_max = 256;
+
+        fn takeStream(self: *Self) ?*Stream {
+            while (!self.pool_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.pool_lock.unlock();
+            return self.pool.pop();
+        }
+
+        /// Keeps `s` for reuse; false when the pool is full.
+        fn keepStream(self: *Self, s: *Stream) bool {
+            while (!self.pool_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.pool_lock.unlock();
+            if (self.pool.items.len >= pool_max) return false;
+            self.pool.append(self.gpa, s) catch return false;
+            return true;
         }
 
         /// The listener's endpoints, in socket order (`sockets` of them):
@@ -1573,16 +1599,49 @@ pub fn Endpoint(comptime Ctx: type) type {
             deferred: bool = false,
             /// The response body until the peer acknowledges it.
             out: bridge.Ring = .{},
+            /// The response's Content-Length, when the head named one:
+            /// sizes the ring and the body buffer.
+            length_hint: ?usize = null,
+
+            /// What a stream keeps when it goes back to the pool: enough
+            /// for a typical request's head and a small response, so most
+            /// requests allocate nothing.
+            const arena_keep = 8 * 1024;
+            const ring_keep = 16 * 1024;
+            const body_keep = 4 * 1024;
 
             fn create(conn: *Conn, id: i64) !*Stream {
-                const gpa = conn.ep.gpa;
-                const s = try gpa.create(Stream);
-                s.* = .{ .conn = conn, .id = id, .arena = .init(gpa) };
+                const ep = conn.ep;
+                if (ep.takeStream()) |s| {
+                    const arena = s.arena;
+                    const body = s.body;
+                    const ring = s.out.buf;
+                    s.* = .{ .conn = conn, .id = id, .arena = arena, .body = body };
+                    s.out.buf = ring;
+                    return s;
+                }
+                const s = try ep.gpa.create(Stream);
+                s.* = .{ .conn = conn, .id = id, .arena = .init(ep.gpa) };
                 return s;
             }
 
+            /// Back to the endpoint's pool, or freed when it is full.
             fn free(s: *Stream) void {
-                const gpa = s.conn.ep.gpa;
+                const ep = s.conn.ep;
+                const gpa = ep.gpa;
+                if (s.body.capacity > body_keep) {
+                    s.body.deinit(gpa);
+                    s.body = .empty;
+                } else s.body.clearRetainingCapacity();
+                if (s.out.buf.len > ring_keep) {
+                    gpa.free(s.out.buf);
+                    s.out.buf = &.{};
+                }
+                _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
+                if (!ep.keepStream(s)) s.destroy(gpa);
+            }
+
+            fn destroy(s: *Stream, gpa: std.mem.Allocator) void {
                 s.body.deinit(gpa);
                 s.out.deinit(gpa);
                 s.arena.deinit();
@@ -1937,6 +1996,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
                     nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
                 }
+                s.length_hint = content_length;
                 if (!has_length and statusHasLength(status)) {
                     if (content_length) |len| {
                         const text = std.fmt.allocPrint(arena, "{d}", .{len}) catch return self.fail(error.SystemResources);
@@ -1964,7 +2024,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn body(ptr: *anyopaque) *std.Io.Writer {
                 const self = fromPtr(ptr);
                 if (self.writer.buffer.len == 0) {
-                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, 16 * 1024) catch &.{};
+                    // A known length needs no more; at least a little, so
+                    // that a body written in pieces is not sent in pieces.
+                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, 16 * 1024) else 16 * 1024;
+                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, size) catch &.{};
                 }
                 return &self.writer;
             }
@@ -2032,6 +2095,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return err;
                     };
+                    if (s.out.written == 0) s.out.reserve(conn.ep.gpa, ringSize(s.length_hint)) catch {
+                        conn.unlock();
+                        return self.fail(error.SystemResources);
+                    };
                     const n = s.out.write(conn.ep.gpa, rest) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
@@ -2082,6 +2149,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return s.reset;
             }
         };
+
+        /// A response ring for a body of `hint` bytes: no larger than it
+        /// needs, up to the full `Ring.len` when the length is unknown.
+        fn ringSize(hint: ?usize) usize {
+            const n = hint orelse return bridge.Ring.len;
+            return std.math.ceilPowerOfTwoAssert(usize, std.math.clamp(n, 1024, bridge.Ring.len));
+        }
 
         fn field(name: []const u8, value: []const u8) h.nghttp3_nv {
             return .{
