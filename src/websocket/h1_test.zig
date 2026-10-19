@@ -16,7 +16,18 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
     while (true) {
         const msg = ws.receive() catch return;
         switch (msg.type) {
-            .text, .binary => try ws.send(msg.type, msg.data),
+            .text, .binary => {
+                // A handler that goes off to wait for something with the
+                // peer's next message unread (cut short by the server's
+                // shutdown, which closes the socket under it).
+                const wait = std.mem.eql(u8, msg.data, "wait");
+                if (wait) {
+                    ws.send(msg.type, msg.data) catch return;
+                    req.io.sleep(.fromSeconds(10), .awake) catch return;
+                    return;
+                }
+                try ws.send(msg.type, msg.data);
+            },
             .close => {
                 saw_draining.store(ws.draining(), .release);
                 return;
@@ -50,10 +61,15 @@ const Raw = struct {
 
     /// One masked frame (zero key, so the payload goes as it is).
     fn send(self: *Raw, opcode: u8, payload: []const u8) !void {
+        try self.queue(opcode, payload);
+        try self.writer.interface.flush();
+    }
+
+    /// `send` without the flush: frames that leave together.
+    fn queue(self: *Raw, opcode: u8, payload: []const u8) !void {
         std.debug.assert(payload.len < 126);
         try self.writer.interface.writeAll(&.{ 0x80 | opcode, 0x80 | @as(u8, @intCast(payload.len)), 0, 0, 0, 0 });
         try self.writer.interface.writeAll(payload);
-        try self.writer.interface.flush();
     }
 
     /// The next frame's opcode and payload (unmasked, short).
@@ -147,4 +163,62 @@ test "WebSocket over HTTP/1.1: the drain closes an open socket with 1001 and doe
     try drain.await(io);
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expect(saw_draining.load(.acquire));
+}
+
+test "WebSocket over HTTP/1.1: pipelined messages are answered in order, a ping among them in its place" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    var a: Raw = undefined;
+    try a.open(io, server.address.ip);
+    defer a.stream.close(io);
+    var name: [8]u8 = undefined;
+    // In one write, so the server reads them as one batch.
+    for (0..33) |i| {
+        if (i == 16) try a.queue(0x9, "p") else try a.queue(0x1, try std.fmt.bufPrint(&name, "m{d}", .{i}));
+    }
+    try a.writer.interface.flush();
+    var buf: [16]u8 = undefined;
+    for (0..33) |i| {
+        const f = try a.next(&buf);
+        if (i == 16) {
+            try std.testing.expectEqual(@as(u8, 0xA), f.opcode);
+            try std.testing.expectEqualStrings("p", f.payload);
+        } else {
+            try std.testing.expectEqual(@as(u8, 0x1), f.opcode);
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "m{d}", .{i}), f.payload);
+        }
+    }
+    try a.send(0x8, &.{ 0x03, 0xe8 });
+    _ = try a.expectClose(1000, &buf);
+}
+
+test "WebSocket over HTTP/1.1: an answer held for a batch goes out while the handler waits on something else" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    var a: Raw = undefined;
+    try a.open(io, server.address.ip);
+    defer a.stream.close(io);
+    // "wait" with "x" behind it: the echo of "wait" is held for the batch,
+    // and the handler then sleeps with "x" unread.
+    try a.queue(0x1, "wait");
+    try a.queue(0x1, "x");
+    try a.writer.interface.flush();
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("wait", (try a.next(&buf)).payload);
+    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }

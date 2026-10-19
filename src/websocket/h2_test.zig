@@ -26,7 +26,18 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
             else => |e| return e,
         };
         switch (msg.type) {
-            .text, .binary => try ws.send(msg.type, msg.data),
+            .text, .binary => {
+                // A handler that goes off to wait for something with the
+                // peer's next message unread (cut short by the server's
+                // shutdown, which closes the socket under it).
+                const wait = std.mem.eql(u8, msg.data, "wait");
+                if (wait) {
+                    ws.send(msg.type, msg.data) catch return;
+                    req.io.sleep(.fromSeconds(10), .awake) catch return;
+                    return;
+                }
+                try ws.send(msg.type, msg.data);
+            },
             .close => {
                 saw_draining.store(ws.draining(), .release);
                 return;
@@ -58,6 +69,8 @@ const Client = struct {
     /// WebSocket bytes received.
     incoming: [8192]u8 = undefined,
     in_len: usize = 0,
+    /// DATA frames received.
+    data_frames: usize = 0,
 
     fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
@@ -192,6 +205,7 @@ const Client = struct {
         const self: *Client = @ptrCast(@alignCast(user.?));
         @memcpy(self.incoming[self.in_len..][0..len], data[0..len]);
         self.in_len += len;
+        self.data_frames += 1;
         return 0;
     }
 
@@ -404,4 +418,78 @@ test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 ans
     try drain.await(io);
     // The loop ended on the close, not on an error.
     try std.testing.expect(route_ended_clean.load(.acquire));
+}
+
+fn startEcho(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!void) {
+    server.router.get("/chat", echo);
+    const future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{server});
+    try server.waitReady(io);
+    return future;
+}
+
+test "WebSocket over HTTP/2: pipelined messages are answered in one DATA frame, in order, a pong in its place" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    var server_future = try startEcho(&server, io);
+    defer server_future.cancel(io) catch {};
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    var name: [8]u8 = undefined;
+    // Queued together, so they leave in one DATA frame.
+    for (0..17) |i| {
+        if (i == 8) try client.sendFrame(.ping, "p") else try client.sendFrame(.text, try std.fmt.bufPrint(&name, "m{d}", .{i}));
+    }
+    const before = client.data_frames;
+    var op: wsc.Opcode = undefined;
+    var buf: [64]u8 = undefined;
+    for (0..17) |i| {
+        const payload = try client.nextFrame(&op, &buf);
+        if (i == 8) {
+            try std.testing.expectEqual(wsc.Opcode.pong, op);
+            try std.testing.expectEqualStrings("p", payload);
+        } else {
+            try std.testing.expectEqual(wsc.Opcode.text, op);
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "m{d}", .{i}), payload);
+        }
+    }
+    // One write for the batch; unbatched it was one DATA frame per answer.
+    try std.testing.expectEqual(@as(usize, 1), client.data_frames - before);
+}
+
+test "WebSocket over HTTP/2: an answer held for a batch goes out while the handler waits on something else" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    var server_future = try startEcho(&server, io);
+    defer server_future.cancel(io) catch {};
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try client.sendFrame(.text, "wait");
+    try client.sendFrame(.text, "x");
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    var op: wsc.Opcode = undefined;
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("wait", try client.nextFrame(&op, &buf));
+    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
