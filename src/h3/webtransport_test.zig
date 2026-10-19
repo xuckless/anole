@@ -15,6 +15,7 @@ const webtransport = @import("../webtransport.zig");
 const websocket = if (features.websocket) @import("../websocket/root.zig") else struct {};
 const wsc = if (features.websocket) @import("anole_websocket_codec").client else struct {};
 const placement = dusty.placement;
+const Relay = @import("client_test.zig").Relay;
 
 /// What the last session's handler saw when it ended.
 var last_close: struct {
@@ -246,6 +247,72 @@ test "WebTransport: streams both ways, datagrams, and a close the server sees" {
     try std.testing.expectEqual(@as(u32, 42), last_close.code);
     try std.testing.expectEqualStrings("bye now", last_close.reason[0..last_close.reason_len]);
     try std.testing.expectEqual(.peer, last_close.by.?);
+}
+
+test "WebTransport: a client that closes its session and then its connection at once still delivers the close" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    // The close has to reach the server before the connection's end, on
+    // every try: neither the session's release (which used to reset the
+    // CONNECT stream) nor the connection's close may cut it off.
+    for (0..40) |_| {
+        const done_before = handlers_done.load(.acquire);
+        {
+            const conn = try f.connect(gpa, io);
+            defer conn.close();
+            const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" });
+            defer session.deinit();
+            try session.close(4242, "client done");
+        }
+        try waitHandlers(io, done_before + 1);
+        try std.testing.expectEqual(.peer, last_close.by.?);
+        try std.testing.expectEqual(@as(u32, 4242), last_close.code);
+        try std.testing.expectEqualStrings("client done", last_close.reason[0..last_close.reason_len]);
+    }
+}
+
+test "WebTransport: a client's close waits a bounded time for a server slow to answer, and the close still arrives" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const done_before = handlers_done.load(.acquire);
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = relay.front.socket.address,
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .webtransport = true,
+    });
+    const session = conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" }) catch |err| {
+        conn.close();
+        return err;
+    };
+    // The close waits at the relay past the client's patience (about three
+    // PTOs, here 100 ms), so `close` gives up waiting for the server's end
+    // and sends CONNECTION_CLOSE behind the capsule.
+    relay.holdNext(400);
+    session.close(4242, "client done") catch |err| {
+        session.deinit();
+        conn.close();
+        return err;
+    };
+    const started = std.Io.Clock.awake.now(io);
+    session.deinit();
+    conn.close();
+    const waited = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(waited >= 90 and waited < 1100);
+    try waitHandlers(io, done_before + 1);
+    try std.testing.expectEqual(.peer, last_close.by.?);
+    try std.testing.expectEqual(@as(u32, 4242), last_close.code);
 }
 
 test "WebTransport: a megabyte each way on many streams at once, past the stream limit" {
