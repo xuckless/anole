@@ -7,5 +7,5 @@
   "tls_alpn": [],
   "ws": "dusty WebSocket (upstream)",
   "ws_h2": false,
-  "scenarios": ["ws"]
+  "scenarios": ["ws", "wspipe"]
 }
