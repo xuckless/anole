@@ -209,6 +209,46 @@ pub const Udp = struct {
         const err, const count = self.socket.receiveManyTimeout(io, (&msg)[0..1], buf, .{}, timeout);
         if (err) |e| return e;
         std.debug.assert(count == 1);
+        return self.datagramOf(&msg);
+    }
+
+    /// Room for `Batch.len` datagrams of the largest size (a GRO batch is
+    /// up to 64 KiB): what a receive buffer for `receiveBatch` needs, so
+    /// that no datagram is ever cut short.
+    pub const batch_buffer_len = Batch.len * 65535;
+
+    /// Several datagrams in one wait: what the kernel already holds, up to
+    /// `len`. Each is read with a non-blocking call of its own, but the
+    /// task yields once for them all, so whatever they ask of a connection
+    /// goes out in one flush rather than one flush per datagram.
+    pub const Batch = struct {
+        pub const len = 16;
+        msgs: [len]std.Io.net.IncomingMessage = @splat(.init),
+        controls: [len]Control align(cmsg_align) = undefined,
+        count: usize = 0,
+
+        pub fn datagram(b: *Batch, udp: *const Udp, i: usize) Datagram {
+            return udp.datagramOf(&b.msgs[i]);
+        }
+    };
+
+    /// Fills `batch` with at least one datagram; `buf` is
+    /// `batch_buffer_len` bytes or more. Returns how many came.
+    pub fn receiveBatch(self: *const Udp, io: std.Io, buf: []u8, batch: *Batch, timeout: std.Io.Timeout) ReceiveError!usize {
+        std.debug.assert(buf.len >= batch_buffer_len);
+        for (&batch.msgs, &batch.controls) |*m, *ctl| {
+            m.* = .init;
+            m.control = ctl;
+        }
+        const err, const count = self.socket.receiveManyTimeout(io, &batch.msgs, buf, .{}, timeout);
+        batch.count = count;
+        // What came before a failure is handled; the failure, if it lasts,
+        // comes back on the next call.
+        if (count > 0) return count;
+        return err orelse error.Unexpected;
+    }
+
+    fn datagramOf(self: *const Udp, msg: *const std.Io.net.IncomingMessage) Datagram {
         var d: Datagram = .{ .from = msg.from, .local = null, .ecn = 0, .data = msg.data, .segment = msg.data.len };
         var it: cmsg.Iterator = .{ .control = @alignCast(msg.control) };
         while (it.next()) |m| {

@@ -177,6 +177,16 @@ pub const Ring = struct {
         r.* = undefined;
     }
 
+    /// Makes the buffer at least `size` bytes, before anything is written
+    /// (a stream from a pool may bring one of another size).
+    pub fn reserve(r: *Ring, gpa: std.mem.Allocator, size: usize) error{OutOfMemory}!void {
+        std.debug.assert(r.written == 0);
+        if (r.buf.len >= size) return;
+        if (r.buf.len > 0) gpa.free(r.buf);
+        r.buf = &.{};
+        r.buf = try gpa.alloc(u8, size);
+    }
+
     /// Copies in what fits; returns how much did.
     pub fn write(r: *Ring, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!usize {
         if (r.buf.len == 0) r.buf = try gpa.alloc(u8, len);

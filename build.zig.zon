@@ -18,8 +18,8 @@
         // server engine. Fork-only since: h2c, PROXY protocol, inherited
         // listeners, HTTP/3 seams, TLS close_notify and the rest.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#4ed4b8d39769f2646518c54ded4db7e15b5f1a24",
-            .hash = "zio-0.19.0-xHbVVMPaLACJ4tW7SxBGwyhGgLgQ0CatxXNCUPrtVoC4",
+            .url = "git+https://github.com/xuckless/zio#5b2e92981e5340a345f6f28fd4a34b3f9d9f8f56",
+            .hash = "zio-0.19.0-xHbVVIToLACSKnx0ule_Xedmdn2Yi_HbCGrpuIurzGtC",
         },
         .dusty = .{
             .url = "git+https://github.com/xuckless/dusty#4bb98f61f470d5506d0609c909c64afd47ac415c",
