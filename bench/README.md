@@ -56,7 +56,9 @@ and HTTP/3; a dash means nothing idiomatic exists, and the report shows N/A.
   challenge forbids. Logging is at warn with no access log for everyone.
 - **Settings changed for everyone, for the same reason.** Keep-alive is at
   least 75 s (the challenge's requirement; Node and uvicorn default to 5 s,
-  QUIC stacks to 30 s idle). Request bodies up to 8 MiB. Anole's 10 000
+  QUIC stacks to 30 s idle), and per-connection request caps are lifted
+  (nginx's `keepalive_requests` and Hypercorn's `keep_alive_max_requests`
+  default to 1000, and h2load does not reconnect). Request bodies up to 8 MiB. Anole's 10 000
   connection cap and 30 s whole-request timeout are lifted (the connection
   tests go past one, video streams past the other).
 - **Same budget.** Every server gets the same cpuset, CPU count (`WORKERS`:

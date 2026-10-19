@@ -1,0 +1,4 @@
+# Hypercorn closes a connection after 1000 requests by default; the load
+# generators (h2load) do not reconnect, so the cap would end every
+# connection mid-run. Raised to nginx's setting here (keepalive_requests).
+keep_alive_max_requests = 1000000

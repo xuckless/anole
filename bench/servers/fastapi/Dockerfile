@@ -16,6 +16,6 @@ WORKDIR /app
 COPY bench/servers/fastapi/requirements.txt .
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 COPY --from=proto /gen/ /app/
-COPY bench/servers/fastapi/app.py bench/servers/fastapi/grpc_server.py \
+COPY bench/servers/fastapi/app.py bench/servers/fastapi/grpc_server.py bench/servers/fastapi/hypercorn.toml \
      bench/servers/fastapi/h3_workers.py bench/servers/fastapi/entrypoint.sh ./
 ENTRYPOINT ["/app/entrypoint.sh"]

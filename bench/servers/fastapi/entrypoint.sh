@@ -14,7 +14,7 @@ tls)
     --ssl-certfile "$CERT_FILE" --ssl-keyfile "$KEY_FILE" \
     --timeout-keep-alive 75 --no-access-log --log-level warning ;;
 h2c)
-  exec hypercorn app:app --bind "0.0.0.0:$HTTP_PORT" --workers "$WORKERS" \
+  exec hypercorn app:app --config hypercorn.toml --bind "0.0.0.0:$HTTP_PORT" --workers "$WORKERS" \
     --keep-alive 75 --log-level warning ;;
 h3)
   # Hypercorn's --workers shares one UDP socket across processes, which breaks
@@ -22,7 +22,7 @@ h3)
   # Hypercorn per worker on its own SO_REUSEPORT sockets instead.
   export HTTPS_PORT CERT_FILE KEY_FILE
   [ "$WORKERS" -gt 1 ] && exec python h3_workers.py
-  exec hypercorn app:app --certfile "$CERT_FILE" --keyfile "$KEY_FILE" \
+  exec hypercorn app:app --config hypercorn.toml --certfile "$CERT_FILE" --keyfile "$KEY_FILE" \
     --bind "0.0.0.0:$HTTPS_PORT" --quic-bind "0.0.0.0:$HTTPS_PORT" \
     --keep-alive 75 --log-level warning ;;
 grpc)

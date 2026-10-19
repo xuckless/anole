@@ -31,7 +31,7 @@ for _ in range(workers):
     procs.append(
         subprocess.Popen(
             [
-                "hypercorn", "app:app",
+                "hypercorn", "app:app", "--config", "hypercorn.toml",
                 "--certfile", os.environ["CERT_FILE"], "--keyfile", os.environ["KEY_FILE"],
                 "--bind", f"fd://{tcp.fileno()}", "--quic-bind", f"fd://{udp.fileno()}",
                 "--keep-alive", "75", "--log-level", "warning",
