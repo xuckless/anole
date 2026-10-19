@@ -135,6 +135,33 @@ Idle: sockets held open and the memory each costs. Echo: closed-loop 64-byte mes
 | fastapi | /ws/feed trading-500bots | 500 | 100,003 | 1.33 | 2.71 | 3.45 | 4.2 | 59 | 0.55 | 500/500 connected, 100003 of 100000 msgs/s expected, 0 gaps; orders 1000/s, rtt p50 5.70 p99 6.67 p99.9 6.95 ms, 0 errors |
 | fastapi | /ws/feed trading-2000bots | 2,000 | 160,357 | 6.14 | 12.25 | 13.17 | 13.6 | 111 | 1.00 | 2000/2000 connected, 160357 of 1000000 msgs/s expected, 0 gaps; orders 407/s, rtt p50 92.33 p99 124.36 p99.9 124.99 ms, 159 errors |
 
+## gRPC
+
+ghz, unary grpc.testing.TestService/UnaryCall (the interop semantics: a reply of response_size zero bytes) over plaintext HTTP/2, 8 connections with 64 calls in flight; ghz has no p99.9. Anole uses its interop server; the others the standard library of their language (grpc-go, tonic, @grpc/grpc-js, grpcio aio).
+
+| Server | Case | Count | Rate/s | p50 ms | p99 ms | p99.9 ms | max ms | Memory MB | Cores busy | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| anole | UnaryCall 1cpu, 0 B reply | 997,999 | 66,536 | 0.72 | 1.65 | 0.00 | 5.3 | 30 | 0.93 |  |
+| anole | UnaryCall 1cpu, 1024 B reply | 900,655 | 60,048 | 0.83 | 1.84 | 0.00 | 5.3 | 32 | 0.94 |  |
+| anole | UnaryCall 4cpu, 0 B reply | 1,096,285 | 73,090 | 0.25 | 1.95 | 0.00 | 9.8 | 51 | 1.76 | load generator at 13.2 of 16 CPUs |
+| anole | UnaryCall 4cpu, 1024 B reply | 1,069,821 | 71,326 | 0.25 | 2.01 | 0.00 | 8.0 | 55 | 1.82 | load generator at 13.2 of 16 CPUs |
+| gohttp | UnaryCall 1cpu, 0 B reply | 1,044,779 | 69,656 | 0.47 | 1.74 | 0.00 | 7.1 | 7 | 0.86 |  |
+| gohttp | UnaryCall 1cpu, 1024 B reply | 926,600 | 61,770 | 0.72 | 2.01 | 0.00 | 5.3 | 7 | 0.92 |  |
+| gohttp | UnaryCall 4cpu, 0 B reply | 1,055,960 | 70,397 | 0.29 | 1.99 | 0.00 | 8.6 | 9 | 2.49 | load generator at 12.3 of 16 CPUs |
+| gohttp | UnaryCall 4cpu, 1024 B reply | 1,007,294 | 67,150 | 0.33 | 2.29 | 0.00 | 8.4 | 9 | 2.57 | load generator at 12.1 of 16 CPUs |
+| axum | UnaryCall 1cpu, 0 B reply | 1,078,688 | 71,915 | 0.55 | 1.50 | 0.00 | 6.9 | 2 | 0.87 |  |
+| axum | UnaryCall 1cpu, 1024 B reply | 930,978 | 62,063 | 0.75 | 1.71 | 0.00 | 6.7 | 2 | 0.92 |  |
+| axum | UnaryCall 4cpu, 0 B reply | 1,119,966 | 74,666 | 0.22 | 1.76 | 0.00 | 7.2 | 3 | 2.34 | load generator at 13.3 of 16 CPUs |
+| axum | UnaryCall 4cpu, 1024 B reply | 1,067,262 | 71,153 | 0.26 | 1.85 | 0.00 | 9.3 | 3 | 2.53 | load generator at 13.2 of 16 CPUs |
+| fastify | UnaryCall 1cpu, 0 B reply | 632,431 | 42,164 | 1.02 | 11.74 | 0.00 | 36.7 | 257 | 0.95 |  |
+| fastify | UnaryCall 1cpu, 1024 B reply | 587,726 | 39,184 | 1.08 | 12.46 | 0.00 | 32.1 | 257 | 0.96 |  |
+| fastify | UnaryCall 4cpu, 0 B reply | 946,086 | 63,074 | 0.33 | 5.63 | 0.00 | 27.4 | 884 | 2.83 | load generator at 11.8 of 16 CPUs |
+| fastify | UnaryCall 4cpu, 1024 B reply | 906,809 | 60,452 | 0.37 | 6.19 | 0.00 | 33.0 | 911 | 2.90 | load generator at 11.5 of 16 CPUs |
+| fastapi | UnaryCall 1cpu, 0 B reply | 156,784 | 10,453 | 6.03 | 6.67 | 0.00 | 9.2 | 22 | 0.99 |  |
+| fastapi | UnaryCall 1cpu, 1024 B reply | 151,559 | 10,104 | 6.24 | 6.98 | 0.00 | 10.7 | 22 | 0.99 |  |
+| fastapi | UnaryCall 4cpu, 0 B reply | 417,640 | 27,844 | 2.17 | 3.84 | 0.00 | 10.0 | 81 | 3.88 |  |
+| fastapi | UnaryCall 4cpu, 1024 B reply | 396,576 | 26,439 | 2.30 | 4.10 | 0.00 | 11.1 | 82 | 3.87 |  |
+
 ## WebTransport (draft-02)
 
 wtload (webtransport-go v0.10.0, the last draft-02 release) against /wt/echo. Sessions: QUIC handshake plus extended CONNECT, 64 at a time; the latency columns are the handshake. Streams: 16 sessions with 4 bidirectional streams each in flight, 16 KiB echoed per stream; rate is streams/s. Datagrams: 64 sessions each sending 1000 64-byte datagrams/s, echoed back; rate is received/s, loss in the notes. Anole serves it from its own HTTP/3; Go from webtransport-go, Rust from wtransport, Node from @fails-components/webtransport (Chromium's QUICHE), Python from aioquic.
