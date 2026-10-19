@@ -290,7 +290,8 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
             var name_buf: [32]u8 = undefined;
             if (req.headers.get(concat(&name_buf, prefix, "content-encoding", "encoding"))) |enc| {
                 call.request_compression = Compression.parse(enc) orelse {
-                    try res.header(concat(&name_buf, prefix, "accept-encoding", "accept-encoding"), acceptEncoding());
+                    // Not `concat`: the response keeps the name past this frame.
+                    try res.header(if (call.protocol == .connect_stream) "connect-accept-encoding" else "grpc-accept-encoding", acceptEncoding());
                     return finish(&call, call.fail(.unimplemented, "unsupported message encoding"));
                 };
                 if (call.request_compression == .gzip and !features.compression)
@@ -485,9 +486,9 @@ fn finish(call: *Call, result: anyerror!void) !void {
     }
     switch (call.protocol) {
         .grpc => {
-            var code_buf: [4]u8 = undefined;
-            const code_text = std.fmt.bufPrint(&code_buf, "{d}", .{@backingInt(call.status)}) catch unreachable;
-            try call.res.trailer("grpc-status", code_text);
+            // Static text: the response keeps the slice, and HTTP/2 sends the
+            // trailers from its writer task after this frame has returned.
+            try call.res.trailer("grpc-status", statusText(call.status));
             if (call.status_message.len > 0) try call.res.trailer("grpc-message", try percentEncode(call.arena, call.status_message));
             for (call.trailers.items) |t| try call.res.trailer(t.key, t.value);
             if (call.out) |*o| {
@@ -796,6 +797,19 @@ fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
     }
     const framed = try frame.encodeWithCompression(call.arena, payload, call.response_compression);
     try writeBytes(call, framed);
+}
+
+/// The decimal text of a status code, for the grpc-status trailer. Static,
+/// so it outlives the call: a response holds its trailer values by
+/// reference until they are on the wire.
+fn statusText(code: status_mod.Code) []const u8 {
+    const texts = comptime blk: {
+        const values = @typeInfo(status_mod.Code).@"enum".field_values;
+        var out: [values.len][]const u8 = undefined;
+        for (values) |v| out[v] = std.fmt.comptimePrint("{d}", .{v});
+        break :blk out;
+    };
+    return texts[@backingInt(code)];
 }
 
 /// One frame with these flags (gRPC-Web's trailers, Connect's end of

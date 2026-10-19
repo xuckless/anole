@@ -770,3 +770,57 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
     const r = try client.unary("Unary", arena, .{ .message = "after" }, .{});
     try std.testing.expectEqual(grpc.Code.ok, r.status.code);
 }
+
+test "gRPC: grpc-status survives concurrent unary calls on several executors" {
+    // The status trailer once pointed at the finishing function's stack.
+    // HTTP/2 sends trailers from its writer task, after that frame has
+    // returned, so under load another stream's task could reuse the stack
+    // first and the client read a garbled grpc-status (2% of calls in a
+    // 4-core benchmark).
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+
+    const h2 = @import("anole_h2_client");
+    const Caller = struct {
+        /// Counts every call that failed or did not end with OK.
+        fn run(channel: *grpc.Channel, calls: usize, bad: *std.atomic.Value(usize)) void {
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            for (0..calls) |_| {
+                var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+                defer arena_state.deinit();
+                const r = client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{}) catch {
+                    _ = bad.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (r.status.code != .ok) _ = bad.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var conns: [4]*h2.ClientConnection = undefined;
+    var channels: [conns.len]grpc.Channel = undefined;
+    for (&conns, &channels) |*conn, *channel| {
+        conn.* = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+        channel.* = .{ .conn = conn.*, .authority = "localhost" };
+    }
+    defer for (conns) |conn| conn.close();
+    var bad: std.atomic.Value(usize) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..32) |i| try group.concurrent(io, Caller.run, .{ &channels[i % channels.len], 100, &bad });
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 0), bad.load(.monotonic));
+}
