@@ -48,6 +48,21 @@ pub const RegisterOptions = struct {
     /// REST routes for the methods annotated with `google.api.http` (JSON
     /// transcoding). False registers the gRPC routes alone.
     transcode: bool = true,
+    /// When response messages are gzipped. Needs `-Dcompression` and a
+    /// client whose grpc-accept-encoding lists gzip, which most clients
+    /// send on every call whether or not they compress themselves.
+    response_compression: ResponseCompression = .mirror,
+};
+
+pub const ResponseCompression = enum {
+    /// When the request came gzipped too, as grpc-go does by default.
+    mirror,
+    /// Whenever the client accepts gzip: a deflate per message, worth it
+    /// for large, compressible messages on slow links. On small ones it
+    /// costs more CPU than the call itself (zlib-ng zeroes a 128 KiB hash
+    /// table per message).
+    accepted,
+    never,
 };
 
 const default_options: RegisterOptions = .{};
@@ -297,7 +312,12 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
                 if (call.request_compression == .gzip and !features.compression)
                     return finish(&call, call.fail(.unimplemented, "gzip is not built in"));
             }
-            if (features.compression) if (req.headers.get(concat(&name_buf, prefix, "accept-encoding", "accept-encoding"))) |accepted| {
+            const compress = switch (options.response_compression) {
+                .mirror => call.request_compression == .gzip,
+                .accepted => true,
+                .never => false,
+            };
+            if (features.compression and compress) if (req.headers.get(concat(&name_buf, prefix, "accept-encoding", "accept-encoding"))) |accepted| {
                 if (std.mem.indexOf(u8, accepted, "gzip") != null) call.response_compression = .gzip;
             };
             if (call.response_compression == .gzip) try res.header(if (call.protocol == .connect_stream) "connect-content-encoding" else "grpc-encoding", "gzip");

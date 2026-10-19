@@ -147,6 +147,7 @@ app.grpcWith(pb.Greeter, .{ .SayHello = sayHello }, .{
     .max_message_size = 64 * 1024, // default anole.grpc.default_max_message_size, 4 MiB
     .data = &greeter_state, // `call.data` in each handler of this registration
     .transcode = false, // gRPC routes only
+    .response_compression = .accepted, // default .mirror; see Compression
 });
 ```
 
@@ -270,9 +271,13 @@ handler.
 ### Compression
 
 With `-Dcompression` (on by default), Anole reads gzip request messages
-(`grpc-encoding: gzip`) and compresses responses with gzip when the client's
-`grpc-accept-encoding` lists it. A request in any other encoding fails with
-UNIMPLEMENTED. Connect unary uses HTTP's `Content-Encoding` instead, and
+(`grpc-encoding: gzip`). A request in any other encoding fails with
+UNIMPLEMENTED. Responses are gzipped only for a client whose
+`grpc-accept-encoding` lists gzip, and by default (`.response_compression =
+.mirror`, grpc-go's behaviour) only when the request came gzipped too: most
+clients list gzip on every call, and a deflate per message costs more CPU
+than a small call itself. `.accepted` compresses whenever the client accepts
+gzip (for large, compressible messages on slow links); `.never` never does. Connect unary uses HTTP's `Content-Encoding` instead, and
 compresses JSON responses only.
 
 ## Try it with curl
