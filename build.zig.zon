@@ -11,7 +11,9 @@
         // HTTP/1.1 p99 at 256+ connections per executor), and an accept loop
         // that keeps up on a busy executor (direct accept with its own
         // budget, spawn backpressure every 64 spawns), and idle tasks that
-        // give back their deeper stack pages (Linux, pinned). dusty: Anole's fork
+        // give back their deeper stack pages (Linux, pinned), and a spawn
+        // cache per executor (stacks and task allocations without the
+        // runtime's locks). dusty: Anole's fork
         // xuckless/dusty, branch `anole`: lalinsky/dusty d3cb485 plus the
         // patches Anole needs. Open upstream (lalinsky/dusty #263-#270): TLS
         // teardown, server ALPN, in-memory PEM, handshake log level, nghttp2
@@ -19,8 +21,8 @@
         // server engine. Fork-only since: h2c, PROXY protocol, inherited
         // listeners, HTTP/3 seams, TLS close_notify and the rest.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#6904bacd634cc1edf5ea24adba660f25ad82b940",
-            .hash = "zio-0.19.0-xHbVVNb9LABIuXiv29tx0MyGX01VmeSJb7HrZhTjMyXr",
+            .url = "git+https://github.com/xuckless/zio#c25bf8eafa81c62a452b7727fbd97f435db0601b",
+            .hash = "zio-0.19.0-xHbVVJcLLQDP8LJUbog0c5xgmESi2qxVdcQrY8NuKGlk",
         },
         .dusty = .{
             .url = "git+https://github.com/xuckless/dusty#c718299858cb17d1a32daf4f79cb5b2ad697c326",
@@ -60,8 +62,8 @@
         // nghttp3_conn_add_extra_setting, which sends the SETTINGS
         // WebTransport needs (0x2b603742 for Chrome and Firefox).
         .ngtcp2 = .{
-            .url = "https://github.com/xuckless/ngtcp2/archive/591e959bc67820226651ee8f009a265899bfc71c.tar.gz",
-            .hash = "N-V-__8AABJoQwBrzAagy2GLO39dOB29jJX9PivETrPyVl0y",
+            .url = "https://github.com/xuckless/ngtcp2/archive/f47d1322abb7d65e48920f3e539f113866824478.tar.gz",
+            .hash = "N-V-__8AAId1QwDyGLzdKzb96fSz-DZFWxuXnebZVCUeHJ3_",
             .lazy = true,
         },
         // -Dcompression: zlib-ng 2.3.3 (zlib-compat, runtime SIMD dispatch) and
