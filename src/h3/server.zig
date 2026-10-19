@@ -70,6 +70,10 @@ const scid_len = steer.cid_len;
 const burst = 10;
 /// What a driver round may write at most.
 const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+/// How long a connection's flush waits at most for the requests a batch
+/// of datagrams started (`Conn.holding`), so that their answers and the
+/// ACK leave together in as few packets as they fit.
+const hold_ns = std.time.ns_per_ms;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
 /// QUIC v2 first when the client offers both.
@@ -1056,6 +1060,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             streams: std.AutoArrayHashMapUnmanaged(i64, *Stream) = .empty,
             /// The request tasks.
             group: std.Io.Group = .init,
+            /// The receive round (`Endpoint.serve`'s batch, by its clock
+            /// reading) that last brought this connection packets, and
+            /// when the flush stops waiting for the requests it started.
+            round_ts: u64 = 0,
+            round: std.atomic.Value(u32) = .init(0),
+            hold_until: u64 = 0,
+            /// Requests of the latest round whose handlers have yet to
+            /// answer or wait: the flush holds for them (`hold_ns`).
+            holding: std.atomic.Value(u32) = .init(0),
             drain: enum { none, notice, final } = .none,
             /// The connection speaks "hq-interop", not HTTP/3.
             hq: bool = false,
@@ -1241,6 +1254,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                     },
                     .draining, .closed => return,
                 }
+                if (ts != conn.round_ts) {
+                    // The first packet of a new batch: what it starts
+                    // is what the next flush waits for.
+                    conn.round_ts = ts;
+                    _ = conn.round.fetchAdd(1, .monotonic);
+                    conn.holding.store(0, .monotonic);
+                    conn.hold_until = ts + hold_ns;
+                }
                 var r = remote;
                 var l: Addr = if (local) |a| .from(a) else conn.local;
                 var p: c.ngtcp2_path = .{ .local = l.ngtcp2Addr(), .remote = r.ngtcp2Addr(), .user_data = null };
@@ -1300,6 +1321,25 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.lock();
                         if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
                         conn.unlock();
+                    }
+                    if (conn.holding.load(.monotonic) > 0) {
+                        // Requests of the latest batch are still on their
+                        // way to an answer: their packets, and the ACK
+                        // that would otherwise leave alone, wait a little
+                        // for them. Each answer kicks.
+                        const t = now(io);
+                        if (t < conn.hold_until) {
+                            io.futexWaitTimeout(u32, &conn.gen.raw, gen, .{ .duration = .{
+                                .raw = .fromNanoseconds(@intCast(conn.hold_until - t)),
+                                .clock = .awake,
+                            } }) catch {
+                                conn.lock();
+                                conn.abortLocked();
+                                conn.unlock();
+                                return;
+                            };
+                            continue;
+                        }
                     }
                     const flushed_at = conn.flush();
 
@@ -1683,9 +1723,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn startStream(conn: *Conn, stream: *Stream) void {
                 stream.started = true;
                 stream.refs.handler = true;
+                // The flush waits for its answer (`Stream.unhold`).
+                stream.round = conn.round.load(.monotonic);
+                stream.holds = true;
+                _ = conn.holding.fetchAdd(1, .monotonic);
                 placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
                     log.err("HTTP/3: no task for stream {d}", .{stream.id});
                     stream.refs.handler = false;
+                    stream.unhold();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
                     conn.kick();
                 };
@@ -1735,6 +1780,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             protocol: []const u8 = "",
             /// Who still holds the stream.
             refs: struct { quic: bool = true, handler: bool = false } = .{},
+            /// The connection's flush waits for this request's answer
+            /// (`Conn.holding`), counted in receive round `round`. Only the
+            /// stream's task changes it once the task runs.
+            holds: bool = false,
+            round: u32 = 0,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -1805,9 +1855,23 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.free();
             }
 
+            /// The flush need not wait for this request any longer: it has
+            /// answered, or waits for something itself (the peer, most
+            /// likely, which the flush must let hear from us first).
+            fn unhold(s: *Stream) void {
+                if (!s.holds) return;
+                s.holds = false;
+                const conn = s.conn;
+                // A later round has started counting afresh.
+                if (s.round != conn.round.load(.monotonic)) return;
+                const left = conn.holding.fetchSub(1, .monotonic);
+                if (left == 0) conn.holding.store(0, .monotonic);
+            }
+
             fn run(s: *Stream) std.Io.Cancelable!void {
                 const conn = s.conn;
                 defer {
+                    s.unhold();
                     conn.lock();
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
@@ -2006,6 +2070,13 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Waits for the connection to change. Unlocked.
             fn wait(s: *Stream, gen: u32) std.Io.Cancelable!void {
+                if (s.holds) {
+                    // The flush must not wait for a request that waits
+                    // for it; the kick lets a holding driver go on.
+                    s.unhold();
+                    s.conn.kick();
+                    return;
+                }
                 try s.conn.ep.io.futexWait(u32, &s.conn.gen.raw, gen);
             }
 
@@ -2285,6 +2356,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.ended = true;
                 try self.submit();
                 s.resume_();
+                s.unhold();
                 conn.kick();
             }
 
