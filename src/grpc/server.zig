@@ -52,6 +52,12 @@ pub const RegisterOptions = struct {
     /// client whose grpc-accept-encoding lists gzip, which most clients
     /// send on every call whether or not they compress themselves.
     response_compression: ResponseCompression = .mirror,
+    /// The unary methods' handlers never wait (see `anole.noWait`): no
+    /// database, cache or other service, no sleeping. Over HTTP/2 a call
+    /// that arrives whole in one read then runs right where the connection
+    /// reads it, without a task, and its `grpc-timeout` is not enforced
+    /// (it has nothing to wait for). Streaming methods keep their tasks.
+    no_wait: bool = false,
 };
 
 pub const ResponseCompression = enum {
@@ -241,8 +247,9 @@ pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Ser
                 return Adapter.run(ctx, req, res);
             }
         }.h;
-        router.addRoute(.post, path, route, registration);
-        if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) router.addRoute(.get, path, route, registration);
+        const route_options: dusty.RouteOptions = .{ .data = registration, .no_wait = options.no_wait and M.kind == .unary };
+        router.addRouteWith(.post, path, route, route_options);
+        if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) router.addRouteWith(.get, path, route, route_options);
         if (comptime transcode.annotated(Service, name)) {
             if (options.transcode) transcode.registerMethod(Ctx, router, Service, name, M, handler, registration);
         }

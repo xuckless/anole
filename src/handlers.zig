@@ -16,6 +16,7 @@ const dusty = @import("dusty");
 /// server with state (which it then ignores).
 pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Handler {
     const F = @TypeOf(handler);
+    if (comptime isNoWait(F)) return adapt(Ctx, F.no_wait_handler);
     const info = switch (@typeInfo(F)) {
         .@"fn" => |f| f,
         else => @compileError("a handler is a function taking (*anole.Request, *anole.Response), not " ++ @typeName(F)),
@@ -30,6 +31,41 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
     @compileError("a handler takes (*anole.Request, *anole.Response)" ++
         (if (Ctx == void) "" else ", or (*" ++ @typeName(Ctx) ++ ", *anole.Request, *anole.Response) for the server's state") ++
         ", but this one is " ++ @typeName(F));
+}
+
+/// `handler`, marked as one that never waits: it answers from what it has
+/// (the request and its body, the server's state, memory) without I/O,
+/// sleeping, or a lock another task holds across a wait, and so does every
+/// middleware that runs for its route. On HTTP/2 its requests that arrive
+/// whole (body included) in one read then run on the connection's reader,
+/// right after that read, rather than on a task each, and their responses
+/// go out in that read's one write:
+///
+///     app.get("/plaintext", anole.noWait(plaintext));
+///
+/// A handler that waits anyway still works, but holds up every other
+/// request on its connection meanwhile, and gets no request timeout. Leave
+/// the mark off a handler that queries a database, a cache or another
+/// service: those keep a task per request, so a slow query delays nothing
+/// else. Elsewhere (HTTP/1.1, HTTP/3) the mark changes nothing.
+pub fn noWait(comptime handler: anytype) NoWait(handler) {
+    return .{};
+}
+
+pub fn NoWait(comptime handler: anytype) type {
+    if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function, not " ++ @typeName(@TypeOf(handler)));
+    return struct {
+        pub const no_wait_handler = handler;
+    };
+}
+
+fn isNoWait(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "no_wait_handler");
+}
+
+/// The router options a handler as `Server` takes it implies.
+pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
+    return .{ .no_wait = comptime isNoWait(@TypeOf(handler)) };
 }
 
 /// What a function middleware calls to run the rest of the chain (the
@@ -94,4 +130,17 @@ test "adapt: a (req, res) handler on a server with state" {
     const b: dusty.Router(State).Handler = adapt(State, H.stateful);
     const c: dusty.Router(void).Handler = adapt(void, H.plain);
     _ = .{ a, b, c };
+}
+
+test "noWait: the handler adapts as it is, and marks its route" {
+    const State = struct { n: u32 };
+    const H = struct {
+        fn plain(_: *dusty.Request, res: *dusty.Response) !void {
+            res.status = .accepted;
+        }
+    };
+    const a: dusty.Router(State).Handler = adapt(State, noWait(H.plain));
+    _ = a;
+    try std.testing.expect(routeOptions(noWait(H.plain)).no_wait);
+    try std.testing.expect(!routeOptions(H.plain).no_wait);
 }

@@ -13,6 +13,7 @@ const websocket = if (features.websocket) @import("websocket/root.zig") else str
 };
 const grpc = if (features.grpc) @import("grpc/root.zig") else struct {};
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
+const h2 = if (features.http2) @import("h2/root.zig") else struct {};
 
 const App = server_mod.App;
 const Server = server_mod.Server;
@@ -282,6 +283,60 @@ test "anole.Server(State): served" {
     var checking = try app.io().concurrent(Check.run, .{&app});
     // `run` sets up what `init` left: 127.0.0.1:8080 by default, so a
     // port of our own here.
+    try app.listen("127.0.0.1:0");
+    try checking.await(app.io());
+}
+
+test "anole.noWait: a marked route answers over HTTP/1.1 and HTTP/2, beside a waiting one" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.get("/quick/:n", handlers.noWait(struct {
+        fn h(req: *Request, res: *Response) !void {
+            try res.print(.text, "quick {s}", .{req.params.get("n").?});
+        }
+    }.h));
+    app.get("/slow", struct {
+        fn h(req: *Request, res: *Response) !void {
+            try req.io.sleep(.fromMilliseconds(20), .awake);
+            res.body = "slow";
+        }
+    }.h);
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            var arena_state: std.heap.ArenaAllocator = .init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const port = a.addresses()[0].ip.getPort();
+            try std.testing.expectEqualStrings("quick 1", (try get(io_, arena, try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/quick/1", .{port}), &.{})).body);
+            if (comptime !features.http2) return;
+            const conn = try h2.ClientConnection.connect(alloc, io_, .{ .host = "127.0.0.1", .port = port });
+            defer conn.close();
+            var streams: [8]*h2.Stream = undefined;
+            for (&streams, 0..) |*st, i| {
+                const path = if (i == 3) "/slow" else try std.fmt.allocPrint(arena, "/quick/{d}", .{i});
+                st.* = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = path },
+                    .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+            }
+            for (streams, 0..) |st, i| {
+                defer st.release();
+                try st.waitHead();
+                try std.testing.expectEqual(@as(u16, 200), st.status);
+                const body = try st.reader().allocRemaining(arena, .unlimited);
+                if (i == 3) {
+                    try std.testing.expectEqualStrings("slow", body);
+                } else {
+                    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "quick {d}", .{i}), body);
+                }
+            }
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }

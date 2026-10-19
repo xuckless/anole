@@ -561,3 +561,24 @@ executors and the request's arena is not thread-safe, so give each one memory
 of its own. [examples/io](../examples/io/main.zig) makes two outbound
 requests in parallel this way and reads files through the `Io`
 (`zig build run-io`).
+
+### Handlers that never wait
+
+On HTTP/2 each request normally runs on a task of its own, so a handler
+that waits holds up nothing else. A handler that never waits (it answers
+from the request and its body, the server's state or memory: no I/O, no
+sleep, no lock another task holds across a wait) can say so:
+
+```zig
+app.get("/plaintext", anole.noWait(plaintext));
+app.get("/json", anole.noWait(json));
+```
+
+Its HTTP/2 requests that arrive whole (a body included) in one read then
+run right where the connection reads them, without a task, and the
+responses to one read go out in one write: about 1.7x the requests per core
+for small responses. The promise covers every middleware that runs for the
+route too. A handler marked this way that waits anyway still works, but
+holds up every other request on its connection meanwhile and gets no
+request timeout, so leave the mark off anything that queries a database, a
+cache or another service. On HTTP/1.1 and HTTP/3 the mark changes nothing.

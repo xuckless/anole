@@ -31,6 +31,14 @@
 //! semantics: pings are answered and pongs dropped inside `receive`, a close
 //! is echoed and returned, a text message must be valid UTF-8.
 //!
+//! On every version, replies go out once per read: while the peer's next
+//! message is already buffered, what the handler sends waits for the batch
+//! to end (the answer to the last buffered message, a read that would
+//! wait, or the handler waiting for anything else), so a client that
+//! pipelines messages gets one write for them, not one each. Sends from
+//! other tasks (`Rooms.broadcast`) go out at once. dusty's
+//! `WebSocketBatch` has the rule.
+//!
 //! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
 //! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
 //! upgrades with `upgrade` here, not dusty's HTTP/1.1-only
@@ -547,6 +555,10 @@ pub const H2Socket = struct {
     /// Sending is over: a close went out.
     closed: bool = false,
     write_mutex: std.Io.Mutex = .init,
+    /// One write per read, as over HTTP/1.1 (dusty's `WebSocket`): what
+    /// the reading task sends while the peer's next message is already
+    /// buffered goes out with the batch.
+    batch: dusty.WebSocketBatch = .{},
 
     fn accept(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, deflate: bool) !*H2Socket {
         const self = try req.arena.create(H2Socket);
@@ -572,10 +584,22 @@ pub const H2Socket = struct {
     }
 
     pub fn deinit(self: *H2Socket) void {
+        self.batch.deinit(self.io);
         self.out.end() catch {};
     }
 
     pub fn receive(self: *H2Socket) !Message {
+        const msg = self.receiveMessage() catch |err| {
+            self.batch.endRound();
+            return err;
+        };
+        // A batch lasts while the peer's next message is already here (the
+        // codec is between frames once it hands a message on).
+        self.batch.round(self.io, WebSocket.bufferedMessage(self.body.interface.buffered()) != null);
+        return msg;
+    }
+
+    fn receiveMessage(self: *H2Socket) !Message {
         self.message.clearRetainingCapacity();
         const reader = &self.body.interface;
         while (true) {
@@ -585,10 +609,15 @@ pub const H2Socket = struct {
                 self.fail(.protocol_error);
                 return err;
             };
-            const message = try self.handle(result.message);
+            // A control frame's event comes at its end, so what follows
+            // it starts the next frame.
+            const next_frame = WebSocket.bufferedFrame(reader.buffered()[result.consumed..]) != null;
+            const message = try self.handle(result.message, next_frame);
             reader.toss(result.consumed);
             if (message) |msg| return msg;
             if (result.message == .need_more) {
+                // The batch ends where reading would wait for the peer.
+                if (self.batch.deferred.load(.monotonic)) try self.flushDeferred();
                 reader.fillMore() catch |err| switch (err) {
                     // The stream ended without a close frame.
                     error.EndOfStream => return error.ConnectionClosed,
@@ -601,7 +630,7 @@ pub const H2Socket = struct {
     /// Acts on one codec event, before its bytes are let go (payloads are
     /// slices of the read buffer). A message for the caller, or null to
     /// keep reading.
-    fn handle(self: *H2Socket, event: codec.FrameHandler.Message) !?Message {
+    fn handle(self: *H2Socket, event: codec.FrameHandler.Message, next_frame: bool) !?Message {
         switch (event) {
             .data => |payload| {
                 if (self.message.items.len + payload.len > self.max_message_size) {
@@ -621,7 +650,8 @@ pub const H2Socket = struct {
                 return .{ .type = msg_type, .data = self.message.items, .compressed = end.compressed };
             },
             .ping => |payload| {
-                try self.writeFrame(.pong, payload);
+                // In the batch when the next frame is here already.
+                try self.writeFrameOpts(.{ .opcode = .pong }, payload, if (next_frame) .batch else .now);
                 return null;
             },
             .pong, .need_more => return null,
@@ -657,13 +687,17 @@ pub const H2Socket = struct {
             .close => return self.close(.normal, data),
             else => return error.InvalidOpcode,
         };
-        try self.writeFrameOpts(.{ .opcode = opcode, .compressed = compressed }, data);
+        try self.writeFrameOpts(.{ .opcode = opcode, .compressed = compressed }, data, self.sendFlush());
+    }
+
+    fn sendFlush(self: *H2Socket) Flush {
+        return if (self.batch.holds(self.io)) .batch else .now;
     }
 
     pub fn ping(self: *H2Socket, data: []const u8) !void {
         // As over HTTP/1.1; the codec asserts it rather than failing.
         if (data.len > codec.max_control_payload_len) return error.LargeControlFrame;
-        try self.writeFrame(.ping, data);
+        try self.writeFrameOpts(.{ .opcode = .ping }, data, self.sendFlush());
     }
 
     pub fn close(self: *H2Socket, code: CloseCode, reason: []const u8) !void {
@@ -686,16 +720,45 @@ pub const H2Socket = struct {
     }
 
     fn writeFrame(self: *H2Socket, opcode: codec.Opcode, payload: []const u8) !void {
-        return self.writeFrameOpts(.{ .opcode = opcode }, payload);
+        return self.writeFrameOpts(.{ .opcode = opcode }, payload, .now);
     }
 
-    fn writeFrameOpts(self: *H2Socket, opts: codec.WriteFrameOptions, payload: []const u8) !void {
+    /// What happens to the response buffer after a frame.
+    const Flush = enum {
+        /// Out now, with whatever else it held.
+        now,
+        /// Held for the reading task's batch.
+        batch,
+    };
+
+    fn writeFrameOpts(self: *H2Socket, opts: codec.WriteFrameOptions, payload: []const u8, after: Flush) !void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
         const w = &self.out.interface;
         codec.writeFrame(w, payload, opts) catch return self.out.err orelse error.WriteFailed;
+        if (after == .batch and self.batch.hold(self.io, flushHeld)) return;
         w.flush() catch return self.out.err orelse error.WriteFailed;
+        self.batch.flushed();
+    }
+
+    /// Writes out what a batch held, if anything still holds it.
+    fn flushDeferred(self: *H2Socket) !void {
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (!self.batch.deferred.load(.monotonic) or self.closed) return;
+        self.out.interface.flush() catch return self.out.err orelse error.WriteFailed;
+        self.batch.flushed();
+    }
+
+    /// The batch's backstop (`dusty.WebSocketBatch.hold`).
+    fn flushHeld(batch: *dusty.WebSocketBatch) std.Io.Cancelable!void {
+        const self: *H2Socket = @alignCast(@fieldParentPtr("batch", batch));
+        self.flushDeferred() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // The handler learns of it when its own read or write fails.
+            else => {},
+        };
     }
 };
 

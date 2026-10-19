@@ -31,6 +31,7 @@ pub const Cert = ServerOptions.Cert;
 /// `use`, `group` and `with` also take the bare function.
 pub const func = @import("handlers.zig").func;
 pub const Next = @import("handlers.zig").Next;
+pub const noWait = @import("handlers.zig").noWait;
 /// The server's outbound HTTP client, from a request or a `std.Io` of the
 /// server's runtime: `anole.client(req).fetch(url, .{})`.
 pub const client = @import("client.zig").client;
