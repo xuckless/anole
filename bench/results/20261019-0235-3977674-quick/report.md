@@ -135,3 +135,25 @@ Idle: sockets held open and the memory each costs. Echo: closed-loop 64-byte mes
 | fastapi | /ws/feed trading-500bots | 500 | 100,003 | 1.33 | 2.71 | 3.45 | 4.2 | 59 | 0.55 | 500/500 connected, 100003 of 100000 msgs/s expected, 0 gaps; orders 1000/s, rtt p50 5.70 p99 6.67 p99.9 6.95 ms, 0 errors |
 | fastapi | /ws/feed trading-2000bots | 2,000 | 160,357 | 6.14 | 12.25 | 13.17 | 13.6 | 111 | 1.00 | 2000/2000 connected, 160357 of 1000000 msgs/s expected, 0 gaps; orders 407/s, rtt p50 92.33 p99 124.36 p99.9 124.99 ms, 159 errors |
 
+## WebTransport (draft-02)
+
+wtload (webtransport-go v0.10.0, the last draft-02 release) against /wt/echo. Sessions: QUIC handshake plus extended CONNECT, 64 at a time; the latency columns are the handshake. Streams: 16 sessions with 4 bidirectional streams each in flight, 16 KiB echoed per stream; rate is streams/s. Datagrams: 64 sessions each sending 1000 64-byte datagrams/s, echoed back; rate is received/s, loss in the notes. Anole serves it from its own HTTP/3; Go from webtransport-go, Rust from wtransport, Node from @fails-components/webtransport (Chromium's QUICHE), Python from aioquic.
+
+| Server | Case | Count | Rate/s | p50 ms | p99 ms | p99.9 ms | max ms | Memory MB | Cores busy | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| anole | /wt/echo sessions n=2000 c=64 | 2,000 | 2,759 | 6.50 | 206.92 | 242.67 | 602.5 | 88 | 0.63 |  |
+| anole | /wt/echo streams 16 sessions x 4, 16 KiB | 317,917 | 21,129 | 1.36 | 30.47 | 82.44 | 189.5 | 88 | 0.99 |  |
+| anole | /wt/echo datagrams 64 sessions x 1000/s, 64 B | 959,394 | 63,960 | 0.60 | 1.33 | 2.27 | 4.4 | 88 | 0.74 | loss 0.06% (542 of 959936) |
+| gohttp-wt | /wt/echo sessions n=2000 c=64 | 2,000 | 2,639 | 23.46 | 42.59 | 48.33 | 49.9 | 15 | 0.96 |  |
+| gohttp-wt | /wt/echo streams 16 sessions x 4, 16 KiB | 252,948 | 16,861 | 3.97 | 5.99 | 6.75 | 8.3 | 18 | 1.00 |  |
+| gohttp-wt | /wt/echo datagrams 64 sessions x 1000/s, 64 B | 959,936 | 63,996 | 0.66 | 2.75 | 3.55 | 5.3 | 17 | 0.60 | loss 0.00% (0 of 959936) |
+| axum-wt | /wt/echo sessions n=2000 c=64 | 2,000 | 3,473 | 9.40 | 202.56 | 211.92 | 212.5 | 25 | 0.71 |  |
+| axum-wt | /wt/echo streams 16 sessions x 4, 16 KiB | 432,071 | 28,738 | 1.40 | 28.57 | 80.75 | 395.8 | 25 | 1.00 |  |
+| axum-wt | /wt/echo datagrams 64 sessions x 1000/s, 64 B | 959,911 | 63,994 | 0.40 | 1.22 | 1.52 | 3.3 | 25 | 0.55 | loss 0.00% (25 of 959936) |
+| fastify-wt | /wt/echo sessions n=2000 c=64 | 2,000 | 1,723 | 14.56 | 227.27 | 628.76 | 671.3 | 109 | 0.89 |  |
+| fastify-wt | /wt/echo streams 16 sessions x 4, 16 KiB | 35,677 | 2,364 | 16.30 | 171.94 | 291.37 | 458.2 | 181 | 1.00 |  |
+| fastify-wt | /wt/echo datagrams 64 sessions x 1000/s, 64 B | 581,671 | 38,778 | 3.67 | 15.41 | 17.24 | 18.4 | 214 | 0.93 | loss 39.41% (378265 of 959936) |
+| fastapi-wt | /wt/echo sessions n=2000 c=64 | 2,000 | 533 | 41.15 | 731.87 | 1442.52 | 3003.1 | 124 | 0.82 |  |
+| fastapi-wt | /wt/echo streams 16 sessions x 4, 16 KiB | 9,469 | 381 | 67.21 | 381.39 | 666.79 | 2350.3 | 125 | 0.61 | 10x read: deadline exceeded |
+| fastapi-wt | /wt/echo datagrams 64 sessions x 1000/s, 64 B | 192,439 | 12,829 | 13.24 | 159.32 | 2825.30 | 11952.1 | 126 | 0.73 | loss 68.84% (425201 of 617640) |
+
