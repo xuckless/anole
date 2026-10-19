@@ -134,6 +134,13 @@ stops at the first window that misses p95 < 500 ms, p99 < 1 s or < 1%
 errors; the score is the last window that passed. The full profile uses
 the challenge's 5-minute holds.
 
+What the score measures: many mostly idle users with occasional activity.
+Each user thinks 3-15 s between requests (about one request every 9 s), so
+30 000 users are about 3 200 req/s. On one CPU every compiled stack runs out
+of memory long before CPU, which makes the score a ranking of memory per
+idle connection, not of throughput or of behavior under load; `raw`,
+`conns`, `latency`, `ws` and `video` measure those.
+
 ### Deviations worth knowing
 
 - **Anole's Postgres client** (`servers/anole/src/pg.zig`) is bench-local:
