@@ -23,11 +23,22 @@ pub fn encodeWithCompression(
     if (comptime !features.compression) return error.CompressionUnsupported;
     var output = try std.Io.Writer.Allocating.initCapacity(allocator, 64);
     defer output.deinit();
-    var compressor = try zlib.Compress.init(allocator, &output.writer, &.{}, .gzip, .{});
+    var compressor = try zlib.Compress.init(allocator, &output.writer, &.{}, .gzip, deflateOptions(payload.len));
     defer compressor.deinit();
     compressor.writer.writeAll(payload) catch return error.OutOfMemory;
     compressor.finish() catch return error.OutOfMemory;
     return encodePayload(allocator, output.written(), true);
+}
+
+/// Deflate sized to one message: a window no larger than the message
+/// (a match cannot reach further back than its start anyway, so the output
+/// is as small) and a memory level whose symbol buffer holds the whole
+/// message, so it stays one deflate block as at the defaults. zlib's defaults allocate about
+/// 320 KiB and zero 192 KiB of it per message; for a 1 KiB message this
+/// takes 130 KiB and zeroes the 128 KiB hash table alone (fixed in zlib-ng).
+fn deflateOptions(len: usize) zlib.Options {
+    const bits: u4 = if (len <= 1 << 9) 9 else if (len >= 1 << 15) 15 else @intCast(std.math.log2_int_ceil(usize, len));
+    return .{ .window_bits = bits, .mem_level = @min(8, bits - 6) };
 }
 
 fn encodePayload(allocator: std.mem.Allocator, payload: []const u8, compressed: bool) ![]u8 {
@@ -273,6 +284,34 @@ test "gzip frame round trips and marks compressed payload" {
     const decoded = try decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip);
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("compress me compress me", decoded);
+}
+
+test "gzip with the window sized to the message: round trips, and compresses as well as the defaults" {
+    if (comptime !features.compression) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const random = prng.random();
+    for ([_]usize{ 0, 1, 100, 511, 512, 513, 1024, 1500, 4096, 20_000, 32_768, 40_000, 100_000 }) |len| {
+        for ([_]bool{ false, true }) |noisy| {
+            const payload = try gpa.alloc(u8, len);
+            defer gpa.free(payload);
+            // Text-like, so there is something to match; or bytes.
+            for (payload, 0..) |*b, i| b.* = if (noisy) random.int(u8) else "abcdefgh ijk lmnop"[(i * 7 + i / 64) % 18];
+            const encoded = try encodeWithCompression(gpa, payload, .gzip);
+            defer gpa.free(encoded);
+            const decoded = try decodeUnaryWithCompression(gpa, encoded, 1 << 20, .gzip);
+            defer gpa.free(decoded);
+            try std.testing.expectEqualSlices(u8, payload, decoded);
+
+            var reference = try std.Io.Writer.Allocating.initCapacity(gpa, 64);
+            defer reference.deinit();
+            var compressor = try zlib.Compress.init(gpa, &reference.writer, &.{}, .gzip, .{});
+            defer compressor.deinit();
+            try compressor.writer.writeAll(payload);
+            try compressor.finish();
+            try std.testing.expect(encoded.len - header_size <= reference.written().len + 8);
+        }
+    }
 }
 
 test "gzip decoding rejects malformed data and compression mismatches" {
