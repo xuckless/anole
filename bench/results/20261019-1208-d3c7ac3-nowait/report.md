@@ -70,3 +70,13 @@ ghz, unary grpc.testing.TestService/UnaryCall (the interop semantics: a reply of
 | anole | UnaryCall 4cpu, 0 B reply | 1,231,196 | 82,083 | 0.15 | 1.57 | 0.00 | 6.4 | 8 | 1.10 | load generator at 13.5 of 16 CPUs |
 | anole | UnaryCall 4cpu, 1024 B reply | 1,183,440 | 78,902 | 0.16 | 1.68 | 0.00 | 7.5 | 11 | 1.10 | load generator at 13.4 of 16 CPUs |
 
+## WebTransport (draft-02)
+
+wtload (webtransport-go v0.10.0, the last draft-02 release) against /wt/echo. Sessions: QUIC handshake plus extended CONNECT, 64 at a time; the latency columns are the handshake. Streams: 16 sessions with 4 bidirectional streams each in flight, 16 KiB echoed per stream; rate is streams/s. Datagrams: 64 sessions each sending 1000 64-byte datagrams/s, echoed back; rate is received/s, loss in the notes. Anole serves it from its own HTTP/3; Go from webtransport-go, Rust from wtransport, Node from @fails-components/webtransport (Chromium's QUICHE), Python from aioquic.
+
+| Server | Case | Count | Rate/s | p50 ms | p99 ms | p99.9 ms | max ms | Memory MB | Cores busy | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| anole | /wt/echo sessions n=2000 c=64 | 2,000 | 3,702 | 8.62 | 201.86 | 209.25 | 209.3 | 90 | 0.66 |  |
+| anole | /wt/echo streams 16 sessions x 4, 16 KiB | 505,806 | 33,670 | 1.00 | 28.65 | 55.81 | 186.7 | 90 | 0.99 |  |
+| anole | /wt/echo datagrams 64 sessions x 1000/s, 64 B | 959,935 | 63,996 | 0.30 | 0.82 | 1.26 | 4.3 | 89 | 0.53 | loss 0.00% (1 of 959936) |
+
