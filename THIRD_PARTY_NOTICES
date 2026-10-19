@@ -21,8 +21,12 @@ A. Fetched packages
 
 zio (async runtime)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky
-  Source:   https://github.com/lalinsky/zio
-  Pinned:   commit 4e4e1ed10da974f15b119207d346a78cc6c363e4
+  Source:   https://github.com/lalinsky/zio, used through Anole's fork
+            https://github.com/xuckless/zio (branch anole: upstream main
+            plus Anole's scheduler, accept, spawn-cache, idle-stack and
+            recvmmsg/sendmmsg patches; some are open upstream as
+            lalinsky/zio #836-#838)
+  Pinned:   commit ebb701426b4431a1e04ab1efb1d1cb43fc7f0c12 of the fork
   Linked:   always
 
 dusty (HTTP/1.1 server, router, client, WebSocket)
@@ -31,7 +35,7 @@ dusty (HTTP/1.1 server, router, client, WebSocket)
             https://github.com/xuckless/dusty (branch anole: upstream
             d3cb485 plus Anole's patches; the first ones are open
             upstream as lalinsky/dusty #263-#270, the rest are fork-only)
-  Pinned:   commit 5085df32e52b20a926cb8eb6b4d7077ae1458d71 of the fork
+  Pinned:   commit 86d152f353c8ec029185e75ce5d2caf8d5756e59 of the fork
   Linked:   always
 
 llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
@@ -70,7 +74,7 @@ ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
             its generated version.h, and Anole's patches keeping a server's
             fallback connection ID across a migration after a NAT rebinding
             and retransmitting two Initial packets on a server PTO)
-  Pinned:   commit 591e959bc67820226651ee8f009a265899bfc71c of the fork
+  Pinned:   commit f47d1322abb7d65e48920f3e539f113866824478 of the fork
   Includes: lib/ngtcp2_pcg.c (PCG random number generator,
             Copyright 2014-2019 Melissa O'Neill and the PCG Project
             contributors, Apache-2.0 OR MIT, used under MIT), compiled in
