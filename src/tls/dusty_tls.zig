@@ -33,8 +33,11 @@ const Allocator = std.mem.Allocator;
 /// records itself, so this only batches socket reads (tls.zig needs a whole
 /// 16 KiB record here).
 pub const input_buffer_len: usize = 8 * 1024;
-/// Ciphertext write buffer dusty gives the TCP writer.
-pub const output_buffer_len: usize = 8 * 1024;
+/// Ciphertext write buffer dusty gives the TCP writer: none. Records reach
+/// the socket from `Shared.sending` in one write each flush, so a buffer
+/// here would only copy them once more, and keep pages per connection that
+/// every response dirties.
+pub const output_buffer_len: usize = 0;
 
 /// Largest TLS record payload; SSL_write is called with at most this much.
 const max_plaintext_len = 16 * 1024;
@@ -598,14 +601,7 @@ pub const Connection = struct {
                 switch (pattern.len) {
                     0 => {},
                     1 => {
-                        var chunk: [max_plaintext_len]u8 = undefined;
-                        @memset(&chunk, pattern[0]);
-                        var remaining = splat;
-                        while (remaining > 0) {
-                            const len = @min(remaining, chunk.len);
-                            try self.writeAll(chunk[0..len]);
-                            remaining -= len;
-                        }
+                        try self.writeRepeated(pattern[0], splat);
                         n += splat;
                     },
                     else => for (0..splat) |_| {
@@ -619,6 +615,22 @@ pub const Connection = struct {
                 return error.WriteFailed;
             };
             return n;
+        }
+
+        /// `byte`, `count` times. Out of line and from a small chunk: every
+        /// write on the connection goes through `drain`, and a record-sized
+        /// buffer in its frame pushed everything below it (BoringSSL
+        /// included) 16 KiB further down the stack, pages a connection then
+        /// keeps.
+        noinline fn writeRepeated(self: *Writer, byte: u8, count: usize) std.Io.Writer.Error!void {
+            var chunk: [512]u8 = undefined;
+            @memset(&chunk, byte);
+            var remaining = count;
+            while (remaining > 0) {
+                const len = @min(remaining, chunk.len);
+                try self.writeAll(chunk[0..len]);
+                remaining -= len;
+            }
         }
 
         fn writeAll(self: *Writer, bytes: []const u8) std.Io.Writer.Error!void {
