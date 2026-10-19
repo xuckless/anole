@@ -143,6 +143,8 @@ func Write(dir string) error {
 	twelveSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "twelve" }))
 	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "ws" }), "WebSockets (HTTP/1.1)",
 		"Idle: sockets held open and the memory each costs. Echo: closed-loop 64-byte messages, msgs/s and round trip. Fan-out: subscribers on /ws/feed at the tick rate; delivered msgs/s against expected, and tick lag (receive time minus the server's send stamp). Trading: one bot in ten also sends orders on /ws/trade and waits for each fill; order round trip in the notes and the feed column.")
+	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "wspipe" }), "WebSocket echo, 16 in flight (HttpArena echo-ws-pipeline)",
+		"gcannon (HttpArena's load generator) in WebSocket mode: each connection keeps 16 five-byte text messages (\"hello\") in flight on /ws/echo; 512, 4,096 and 16,384 connections. Rate is echoed frames/s; latency is per frame.")
 	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "mem" }), "Memory pressure",
 		"Idle keep-alive: connections that made one request and stay open; memory per connection in the notes. Upload: 64 connections POSTing 1 MiB bodies to /echo (throughput in MB/s is req/s × 2 MiB on the wire). Cap: /list at 1024 connections with the container capped at 256 MB.")
 	listSection(&d, filter(cases, func(c suite.Case) bool { return c.Scenario == "video" }), "4K video streaming",

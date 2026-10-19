@@ -69,7 +69,7 @@ func cpusetSize(set string) int {
 }
 
 var allServers = "anole,dusty,fiber,gohttp,axum,express,fastify,fastapi,bun,nginx,gohttp-wt,axum-wt,fastify-wt,fastapi-wt"
-var allScenarios = []string{"raw", "conns", "latency", "twelve", "ws", "mem", "gc", "video", "grpc", "wt"}
+var allScenarios = []string{"raw", "conns", "latency", "twelve", "ws", "mem", "gc", "video", "grpc", "wt", "wspipe"}
 
 func runSuite(args []string) {
 	fs := flag.NewFlagSet("suite", flag.ExitOnError)
@@ -143,6 +143,8 @@ func runSuite(args []string) {
 			s.Video()
 		case "twelve":
 			s.Twelve(env("PG_CPUS_TWELVE", "16-27"), env("PG_CPUS", "16-19"))
+		case "wspipe":
+			s.WsPipe()
 		case "grpc":
 			s.GRPC()
 		case "wt":

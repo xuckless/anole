@@ -73,6 +73,7 @@ docker rm -f anole-bench-loadgen >/dev/null 2>&1 || true
 exec docker run --rm --name anole-bench-loadgen --network host \
   --cpuset-cpus "$LOAD_CPUS" --ulimit nofile=1048576:1048576 \
   --security-opt label=disable \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
   -u "$(id -u):$(id -g)" --group-add "$(stat -c %g /var/run/docker.sock)" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /sys/fs/cgroup:/host/cgroup:ro \

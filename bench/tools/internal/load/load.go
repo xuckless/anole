@@ -309,3 +309,55 @@ func Ghz(o GhzOpts) (Result, error) {
 	}
 	return r, nil
 }
+
+// GcannonWS: gcannon's WebSocket echo (HttpArena's ws-echo profiles).
+type GcannonWS struct {
+	URL      string // ws://127.0.0.1:8080/ws/echo as http://, gcannon's form
+	Conns    int
+	Threads  int
+	Pipeline int // messages in flight per connection
+	Duration time.Duration
+}
+
+// Gcannon runs gcannon --ws --json. Its rate is echoed frames per second.
+func Gcannon(o GcannonWS) (Result, error) {
+	args := []string{o.URL, "--ws", "--json", "-c", strconv.Itoa(o.Conns), "-t", strconv.Itoa(o.Threads),
+		"-p", strconv.Itoa(o.Pipeline), "-d", fmt.Sprintf("%ds", int(o.Duration.Seconds()))}
+	out, err := run(o.Duration+time.Minute, "gcannon", args...)
+	r := Result{Tool: "gcannon", Args: strings.Join(args[1:], " ")}
+	if err != nil {
+		return r, err
+	}
+	var g struct {
+		Elapsed   float64 `json:"elapsed_sec"`
+		Responses int64   `json:"responses"`
+		RPS       float64 `json:"rps"`
+		WSFrames  int64   `json:"ws_frames"`
+		WSUpgr    int64   `json:"ws_upgrades"`
+		Latency   struct {
+			Avg, P50, P90, P99, P999 float64
+		} `json:"latency_us"`
+		Errors struct {
+			Connect, Read, Timeout int64
+		} `json:"errors"`
+		Reconnects int64 `json:"reconnects"`
+	}
+	i := strings.IndexByte(out, '{')
+	if i < 0 || json.Unmarshal([]byte(out[i:]), &g) != nil {
+		return r, fmt.Errorf("gcannon: no JSON in %q", tail(out, 400))
+	}
+	frames := g.WSFrames
+	if frames == 0 {
+		frames = g.Responses
+	}
+	r.Requests, r.RPS = frames, g.RPS
+	if g.Elapsed > 0 && frames > 0 {
+		r.RPS = float64(frames) / g.Elapsed
+	}
+	r.Errors = g.Errors.Connect + g.Errors.Read + g.Errors.Timeout
+	r.MeanMS, r.P50MS, r.P90MS, r.P99MS, r.P999MS = g.Latency.Avg/1e3, g.Latency.P50/1e3, g.Latency.P90/1e3, g.Latency.P99/1e3, g.Latency.P999/1e3
+	if r.Requests == 0 {
+		return r, fmt.Errorf("gcannon: no frames echoed: %q", tail(out, 400))
+	}
+	return r, nil
+}
