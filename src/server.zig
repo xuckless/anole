@@ -93,6 +93,16 @@ pub const Options = struct {
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
+    /// The most stack a task (a connection, a stream, a socket) may grow
+    /// to; past it the process crashes. Address space, not memory: a task
+    /// holds only the pages it touches, and gives back those below where it
+    /// waits once it has waited a second (Linux). What the size does cost
+    /// is page tables: a 4 KiB page-table page per open connection at the
+    /// default, about 2 KiB at 1 MiB. Below 1 MiB is not advised: some
+    /// bundled code takes a lot of stack at once (zlib-ng's CRC-32 for
+    /// gzip, 128 KiB in one frame; the DNS resolver, 73 KiB), and a
+    /// handler's own needs are the application's to know.
+    max_stack_size: usize = 8 * 1024 * 1024,
     /// The process's arguments and environment (`init.minimal`). With them
     /// the server takes listening sockets handed over by systemd socket
     /// activation or by the process it replaces (`LISTEN_FDS`), restarts
@@ -393,7 +403,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const a = arena.allocator();
 
-            const rt = try zio.Runtime.init(gpa, .{ .executors = opts.executors });
+            const rt = try zio.Runtime.init(gpa, .{
+                .executors = opts.executors,
+                .stack_pool = .{
+                    .maximum_size = opts.max_stack_size,
+                    .committed_size = @min(opts.max_stack_size, 256 * 1024),
+                },
+            });
             errdefer rt.deinit();
             const rt_io = rt.io();
             server_on_thread = true;
