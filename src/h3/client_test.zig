@@ -566,7 +566,7 @@ test "h3 client: connect_timeout bounds a handshake nobody answers" {
 /// packets back once the server has answered (so 0-RTT requests are sure to
 /// be handled before the handshake completes) and record what the client
 /// sent (to replay it).
-const Relay = struct {
+pub const Relay = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// Where the client sends.
@@ -584,7 +584,7 @@ const Relay = struct {
     recorded: std.ArrayList([]u8) = .empty,
     group: std.Io.Group = .init,
 
-    fn start(gpa: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress) !*Relay {
+    pub fn start(gpa: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress) !*Relay {
         const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
         const r = try gpa.create(Relay);
         errdefer gpa.destroy(r);
@@ -600,7 +600,7 @@ const Relay = struct {
         return r;
     }
 
-    fn stop(r: *Relay) void {
+    pub fn stop(r: *Relay) void {
         r.group.cancel(r.io);
         r.front.socket.close(r.io);
         r.back.socket.close(r.io);
@@ -623,6 +623,15 @@ const Relay = struct {
         r.recording = true;
         r.answered = false;
         r.hold_ms = hold_ms;
+    }
+
+    /// The client's next datagram, and so all after it, waits `ms` once:
+    /// whatever the client sends meanwhile reaches the server together.
+    pub fn holdNext(r: *Relay, ms: u32) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.answered = true;
+        r.hold_ms = ms;
     }
 
     fn disarm(r: *Relay) void {

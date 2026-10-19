@@ -108,7 +108,7 @@ against lalinsky/dusty (#263-#270) are left as they are.
   runs pinned). Its changes: the pinned mode's run queue (`pinned-fifo`), and
   accepting on a busy executor (`accept-now`: a direct accept with its own
   budget, and spawn backpressure every 64 spawns instead of on every one).
-  `bench/` measures both (`conns`, `raw`).
+  The bench suite's `conns` and `raw` scenarios measure both.
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.

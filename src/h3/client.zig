@@ -497,9 +497,14 @@ pub const ClientConnection = struct {
     }
 
     /// Sends CONNECTION_CLOSE (H3_NO_ERROR), stops the reader and the
-    /// driver, and frees everything. Release every stream first.
+    /// driver, and frees everything. Release every stream first. A stream
+    /// let go while its end was still on its way (a WebTransport session's
+    /// close capsule and FIN) gets a moment to reach the server first:
+    /// `close` waits until QUIC closes it, for about three PTOs at most (at
+    /// least 100 ms, at most a second).
     pub fn close(self: *ClientConnection) void {
         const io = self.io;
+        self.settle();
         self.lock();
         self.closing = true;
         if (self.state != .closed) {
@@ -525,6 +530,44 @@ pub const ClientConnection = struct {
         self.gpa.free(self.tx);
         self.gpa.free(self.rx);
         self.gpa.destroy(self);
+    }
+
+    /// Before a close: waits while a stream let go with `releaseSent`
+    /// is still open in QUIC, that is until the server has everything it
+    /// was sent, the end included, and ended its own side (as a
+    /// WebTransport peer does on a close), or the time runs out. Without it
+    /// the CONNECTION_CLOSE could overtake data still waiting to go out
+    /// (paced, or lost and not yet resent), which the server would then
+    /// never see.
+    fn settle(self: *ClientConnection) void {
+        const io = self.io;
+        self.lock();
+        const pto: u64 = if (self.state == .open) c.ngtcp2_conn_get_pto2(self.q) else 0;
+        self.unlock();
+        const deadline = now(io) + @min(@max(3 * pto, 100 * std.time.ns_per_ms), std.time.ns_per_s);
+        while (true) {
+            const gen = self.gen.load(.acquire);
+            self.lock();
+            const waiting = self.state == .open and self.lingering();
+            self.unlock();
+            if (!waiting) return;
+            const t = now(io);
+            if (t >= deadline) return;
+            io.futexWaitTimeout(u32, &self.gen.raw, gen, .{ .duration = .{
+                .raw = .fromNanoseconds(@intCast(deadline - t)),
+                .clock = .awake,
+            } }) catch return;
+        }
+    }
+
+    /// A stream let go with `releaseSent` is still open in QUIC. Locked.
+    fn lingering(self: *ClientConnection) bool {
+        var it = self.live.first;
+        while (it) |node| : (it = node.next) {
+            const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+            if (stream.lingering and !stream.protocol_done) return true;
+        }
+        return false;
     }
 
     fn getConn(conn_ref: [*c]c.ngtcp2_crypto_conn_ref) callconv(.c) ?*c.ngtcp2_conn {
@@ -650,7 +693,10 @@ pub const ClientConnection = struct {
 
         fn release(ctx: *anyopaque) void {
             const self: *ClientSession = @ptrCast(@alignCast(ctx));
-            self.stream.release();
+            // The session ended its side with a capsule (a close) and FIN:
+            // they must still go out. `release` would reset the stream,
+            // and the close with it, while the server's side is open.
+            self.stream.releaseSent();
             self.gpa.destroy(self);
         }
     };
@@ -1167,6 +1213,11 @@ pub const ClientConnection = struct {
             bridge.consume(self.q, stream_id, len);
             return 0;
         };
+        if (s.user_done) {
+            // Let go (`releaseSent`): nobody reads it.
+            bridge.consume(self.q, stream_id, len);
+            return 0;
+        }
         // The server cannot send past the stream's window, so this is
         // bounded by `stream_window`.
         s.body.appendSlice(self.gpa, data[0..len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -1309,6 +1360,9 @@ pub const Stream = struct {
 
     /// Both the caller (`release`) and QUIC (stream close) are done.
     user_done: bool = false,
+    /// Let go with `releaseSent`: what it sent is still on its way, and
+    /// `ClientConnection.close` waits for it.
+    lingering: bool = false,
     protocol_done: bool = false,
     /// The request's head, while it went in 0-RTT that the server may
     /// still refuse.
@@ -1483,6 +1537,35 @@ pub const Stream = struct {
         self.user_done = true;
         // A stream QUIC never got, or one the connection's end left
         // behind, has no close to wait for.
+        if (!self.submitted or conn.state == .closed) self.protocol_done = true;
+        self.maybeFree();
+    }
+
+    /// Done with a stream whose request body the caller ended: unlike
+    /// `release`, it neither resets the stream nor stops the response
+    /// (a server may take STOP_SENDING for a cancel and drop the request
+    /// body still in flight), so what was written and the end still reach
+    /// the server, and `ClientConnection.close` waits for them. The rest
+    /// of the response is dropped. A stream not ended that way is released
+    /// as by `release`.
+    fn releaseSent(self: *Stream) void {
+        const conn = self.conn;
+        conn.lock();
+        const ended = self.send_closed and self.cause == null and !self.send_stopped;
+        if (!ended) {
+            conn.unlock();
+            return self.release();
+        }
+        defer conn.unlock();
+        // The response from here on is dropped, its credit given back, so
+        // the server can always reach its end.
+        const unread = self.body.items.len - self.body_start;
+        if (unread > 0 and self.submitted and !self.protocol_done and conn.state != .closed)
+            bridge.consume(conn.q, self.id, unread);
+        self.body.clearRetainingCapacity();
+        self.body_start = 0;
+        self.lingering = true;
+        self.user_done = true;
         if (!self.submitted or conn.state == .closed) self.protocol_done = true;
         self.maybeFree();
     }
