@@ -8,5 +8,7 @@
     "h3":  "Bun.serve 1.4.3 (http3: true; experimental)"
   },
   "tls_alpn": ["h2", "http/1.1"],
-  "scenarios": ["raw"]
+  "ws": "Bun.serve websocket (uWebSockets)",
+  "ws_h2": false,
+  "scenarios": ["raw", "wspipe"]
 }

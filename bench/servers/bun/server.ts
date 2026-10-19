@@ -1,4 +1,4 @@
-// Bun bench server (raw routes only, for now). See bench/SPEC.md.
+// Bun bench server: the raw routes and /ws/echo (for now). See bench/SPEC.md.
 // One process per CPU sharing the port with reusePort, as Bun's docs do it.
 const env = process.env;
 const MODE = env.MODE ?? 'h1';
@@ -43,6 +43,17 @@ if (WORKERS > 1 && !env.BUN_WORKER) {
       '/users/:id': (req) => new Response(`user ${req.params.id}`, { headers: { 'Content-Type': 'text/plain' } }),
       '/list': () => Response.json(items()),
     },
-    fetch: () => Response.json({ error: 'not found' }, { status: 404 }),
+    fetch(req, server) {
+      if (new URL(req.url).pathname === '/ws/echo' && server.upgrade(req)) return;
+      return Response.json({ error: 'not found' }, { status: 404 });
+    },
+    // Bun's own WebSocket server: every message straight back.
+    websocket: {
+      idleTimeout: 960, // seconds, Bun's maximum
+      maxPayloadLength: 1 << 20,
+      message(ws, message) {
+        ws.send(message);
+      },
+    },
   });
 }
