@@ -1,0 +1,12 @@
+{
+  "name": "bun",
+  "label": "Bun 1.4.3 (Bun.serve)",
+  "modes": {
+    "h1":  "Bun.serve 1.4.3",
+    "h2c": "Bun.serve 1.4.3 (http2: true, prior knowledge; experimental)",
+    "tls": "Bun.serve 1.4.3 (http2: true over TLS, BoringSSL; experimental)",
+    "h3":  "Bun.serve 1.4.3 (http3: true; experimental)"
+  },
+  "tls_alpn": ["h2", "http/1.1"],
+  "scenarios": ["raw"]
+}

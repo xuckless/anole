@@ -68,7 +68,7 @@ func cpusetSize(set string) int {
 	return n
 }
 
-var allServers = "anole,fiber,gohttp,axum,express,fastify,fastapi,nginx,gohttp-wt,axum-wt,fastify-wt,fastapi-wt"
+var allServers = "anole,fiber,gohttp,axum,express,fastify,fastapi,bun,nginx,gohttp-wt,axum-wt,fastify-wt,fastapi-wt"
 var allScenarios = []string{"raw", "conns", "latency", "twelve", "ws", "mem", "gc", "video", "grpc", "wt"}
 
 func runSuite(args []string) {

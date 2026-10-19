@@ -13,7 +13,7 @@ import (
 	"github.com/xuckless/anole/bench/tools/internal/suite"
 )
 
-var serverOrder = []string{"anole", "fiber", "gohttp", "axum", "express", "fastify", "fastapi", "nginx", "gohttp-wt", "axum-wt", "fastify-wt", "fastapi-wt"}
+var serverOrder = []string{"anole", "fiber", "gohttp", "axum", "express", "fastify", "fastapi", "bun", "nginx", "gohttp-wt", "axum-wt", "fastify-wt", "fastapi-wt"}
 var protoOrder = []string{"h1", "h1-tls", "h2c", "h2-tls", "h3"}
 
 func rank(order []string, s string) int {
