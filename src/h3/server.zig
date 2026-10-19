@@ -2278,6 +2278,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 try self.submit();
+                // The handler wants what it wrote sent now (an event of a
+                // stream, say): the flush need not wait for it.
+                self.stream.unhold();
+                conn.kick();
             }
 
             fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
