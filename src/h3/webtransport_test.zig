@@ -547,8 +547,11 @@ test "WebSocket over HTTP/3: the drain closes an open socket with 1001" {
     try s.waitHead();
     try std.testing.expectEqual(@as(u16, 200), s.status);
     var frames: Frames = .{ .stream = s };
+    // What the server's drain does: the signal, then the hooks a socket
+    // registered to hear about it.
     f.http.draining.set(io);
     defer f.http.draining.reset();
+    f.http.drain_hooks.fire(io);
     var op: wsc.Opcode = undefined;
     var buf: [256]u8 = undefined;
     const payload = try frames.next(&op, &buf);
