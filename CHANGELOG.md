@@ -26,6 +26,11 @@ for macOS and Linux.
 - Plain `(req, res)` handlers on a `Server(App)`; function middleware
   (`fn (req, res, next: anole.Next) !void`, or `anole.func(f)`) in `use`,
   `group` and the new `with` (middleware for some routes, no prefix).
+- `anole.noWait(handler)` marks a handler (and its route's middleware) as
+  never waiting: on HTTP/2 its whole requests run on the connection's reader
+  without a task, the responses to one read in one write. gRPC takes it per
+  registration: `app.grpcWith(Service, impl, .{ .no_wait = true })` for
+  unary methods.
 - `anole.client(req)` / `app.client()`: the server's pooled outbound HTTP
   client, with inline headers and `response.json(T, allocator)`.
 - `anole.Server(Ctx)`: one call sets up the zio runtime (one pinned executor
@@ -61,6 +66,10 @@ for macOS and Linux.
   out a new token when the IP address changed, and reports the new address
   to handlers. The ngtcp2 fork fixes a migration right after a NAT
   rebinding, which stock 1.25.0 closed with CONNECTION_ID_LIMIT_ERROR.
+- HTTP/3 handshakes under loss: a server PTO retransmits both Initial
+  packets of a ServerHello that needs two (a post-quantum key share), so a
+  client that lost the second is not sent the first again and again (an
+  ngtcp2 fork patch).
 - HTTP/3 on every core on Linux: one SO_REUSEPORT UDP socket and endpoint
   per executor (`http3.sockets`, one per executor by default; macOS keeps
   one). The server's connection IDs name their endpoint in one byte, and a

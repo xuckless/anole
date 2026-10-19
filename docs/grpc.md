@@ -148,6 +148,7 @@ app.grpcWith(pb.Greeter, .{ .SayHello = sayHello }, .{
     .data = &greeter_state, // `call.data` in each handler of this registration
     .transcode = false, // gRPC routes only
     .response_compression = .accepted, // default .mirror; see Compression
+    .no_wait = true, // the unary handlers never wait; see below
 });
 ```
 
@@ -157,6 +158,15 @@ anyerror), impl)` (and `registerWith`), which work on any dusty router.
 `max_message_size` bounds each request message after decompression; a larger
 one fails the call with RESOURCE_EXHAUSTED. `data` is for handlers that serve
 more than one registration, such as the same service on two servers.
+
+`no_wait` is `anole.noWait` ([routing.md](routing.md)) for the
+registration's unary methods: their handlers answer from the request and
+memory alone, with no database, cache or other service and no sleeping. A
+call that arrives whole in one read (HEADERS and its message, as clients
+send a small unary call) then runs right where the HTTP/2 connection reads
+it, without a task, which nearly doubles small unary calls per core. Such a
+call's `grpc-timeout` is not enforced, since it has nothing to wait for.
+Streaming methods keep their tasks either way.
 
 ## Handler shapes
 

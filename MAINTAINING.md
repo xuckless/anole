@@ -57,8 +57,12 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
    - **ngtcp2** comes from the fork too: the tag, the release's generated
      `lib/includes/ngtcp2/version.h`, and a patch that keeps a server's
      fallback connection ID across a migration right after a NAT rebinding
-     (`conn_stop_pv_keep`, with `test_ngtcp2_conn_server_migration_after_nat_rebinding`).
-     On a new tag: drop the patch if upstream fixed the bug (run that test
+     (`conn_stop_pv_keep`, with `test_ngtcp2_conn_server_migration_after_nat_rebinding`),
+     and one that makes a server PTO in the Initial space reclaim two
+     packets as the client's does (`conn_write_pkt`, with
+     `test_ngtcp2_conn_server_initial_pto_reclaim`; without it a ServerHello
+     split over two packets stalls quic-go's lossy handshakes).
+     On a new tag: drop a patch if upstream fixed its bug (run its test
      against the new tag), otherwise rebase it on a new branch, run ngtcp2's
      unit tests, commit the new `version.h`, merge into `anole`, and pin the
      merge commit. Then run Anole's migration test ("a client that moves to
