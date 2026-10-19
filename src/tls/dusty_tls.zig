@@ -12,7 +12,11 @@
 //!
 //! - every `SSL_*` call runs under the connection's spin lock, which is never
 //!   held across I/O, and BoringSSL's per-thread error queue is cleared and
-//!   read inside it;
+//!   read inside it. `SSL_read`, `SSL_write`, `SSL_do_handshake` and
+//!   `SSL_shutdown` clear the queue themselves on entry (ssl_lib.cc
+//!   `ssl_reset_error_state`), so it is cleared here only after a call that
+//!   failed: `ERR_clear_error` walks all 16 slots and frees each, and calling
+//!   it around every record was a tenth of a TLS request's CPU;
 //! - the BIO never waits. Its read callback hands over only ciphertext that the
 //!   reader task already has buffered (WANT_READ otherwise, and the reader
 //!   refills from the socket with the lock released); its write callback
@@ -437,9 +441,8 @@ pub const Connection = struct {
     pub fn close(self: *Connection) void {
         const sh = self.shared orelse return;
         sh.lock();
-        c.ERR_clear_error();
-        _ = c.SSL_shutdown(sh.ssl);
-        c.ERR_clear_error();
+        // SSL_shutdown clears the error queue on entry.
+        if (c.SSL_shutdown(sh.ssl) < 0) c.ERR_clear_error();
         sh.unlock();
         sh.sendPending() catch return;
         sh.output.flush() catch {};
@@ -459,11 +462,25 @@ pub const Connection = struct {
         const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
         while (true) {
             sh.lock();
-            c.ERR_clear_error();
+            // Nothing buffered on either side of BoringSSL: wait for the
+            // socket first, rather than call SSL_read only to hear
+            // WANT_READ. That is the usual state between requests, and it
+            // saves an SSL_read (and its error-queue reset) per request.
+            if (sh.input.bufferedLen() == 0 and !sh.input_eof and c.SSL_has_pending(sh.ssl) == 0) {
+                sh.unlock();
+                sh.fill() catch |err| switch (err) {
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                continue;
+            }
+            // SSL_read empties the error queue on entry.
             const rc = c.SSL_read(sh.ssl, buf.ptr, len);
+            // It may have queued handshake messages (a KeyUpdate reply) for
+            // the writing side to send.
+            sh.write_owed = true;
             const code = if (rc > 0) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
             const failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_read") else null;
-            c.ERR_clear_error();
+            if (rc <= 0) c.ERR_clear_error();
             const eof = sh.input_eof;
             sh.unlock();
 
@@ -491,10 +508,15 @@ pub const Connection = struct {
         while (rest.len > 0) {
             const n = @min(rest.len, max_plaintext_len);
             sh.lock();
-            c.ERR_clear_error();
+            // SSL_write empties the error queue on entry, and a non-empty
+            // one sends whatever the reading side queued ahead of its record.
             const rc = c.SSL_write(sh.ssl, rest.ptr, @intCast(n));
-            if (rc <= 0) logErrors("SSL_write");
-            c.ERR_clear_error();
+            if (rc > 0) {
+                sh.write_owed = false;
+            } else {
+                logErrors("SSL_write");
+                c.ERR_clear_error();
+            }
             sh.unlock();
             // The memory BIO cannot fail a write, so any failure is TLS-level.
             if (rc <= 0) return error.TlsFailure;
@@ -506,13 +528,19 @@ pub const Connection = struct {
     /// Sends everything queued. A zero-length SSL_write first makes
     /// BoringSSL emit anything the reading side queued without writing it
     /// (a KeyUpdate reply rides on the next write; ssl.h `SSL_write`), so a
-    /// connection that only reads still answers its peer.
+    /// connection that only reads still answers its peer. It is needed only
+    /// when SSL_read has run since the last SSL_write that sent a record,
+    /// which already carried anything queued before it: a response written
+    /// and flushed costs one SSL_write, not two.
     fn flush(self: *Connection) WriteError!void {
         const sh = self.shared.?;
         sh.lock();
-        c.ERR_clear_error();
-        _ = c.SSL_write(sh.ssl, "", 0);
-        c.ERR_clear_error();
+        if (sh.write_owed) {
+            // Returns 0 for success as well as for some failures.
+            _ = c.SSL_write(sh.ssl, "", 0);
+            if (c.ERR_peek_error() != 0) c.ERR_clear_error();
+            sh.write_owed = false;
+        }
         sh.unlock();
         try sh.sendPending();
         sh.output.flush() catch return error.WriteFailed;
@@ -615,7 +643,7 @@ pub const Connection = struct {
 fn handshake(sh: *Shared) HandshakeError!void {
     while (true) {
         sh.lock();
-        c.ERR_clear_error();
+        // SSL_do_handshake empties the error queue on entry.
         const rc = c.SSL_do_handshake(sh.ssl);
         const code = if (rc == 1) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
         var failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_do_handshake") else null;
@@ -625,7 +653,7 @@ fn handshake(sh: *Shared) HandshakeError!void {
             log.debug("certificate verification failed: {s}", .{std.mem.span(c.X509_verify_cert_error_string(v))});
             failure = verifyError(v);
         }
-        c.ERR_clear_error();
+        if (rc != 1) c.ERR_clear_error();
         const eof = sh.input_eof;
         sh.unlock();
 
@@ -1114,6 +1142,11 @@ const Shared = struct {
     filling: bool = false,
     /// Records BoringSSL produced, not yet handed to `output`.
     pending: std.ArrayList(u8) = .empty,
+    /// SSL_read has run since the last SSL_write that sent a record, so
+    /// BoringSSL may hold handshake messages (a KeyUpdate reply) that only
+    /// a write sends; `Connection.flush` then writes zero bytes to send
+    /// them. Set from the start, for anything the handshake left queued.
+    write_owed: bool = true,
 
     /// Owned by the writing side: the other half of the double buffer.
     sending: std.ArrayList(u8) = .empty,
