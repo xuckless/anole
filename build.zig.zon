@@ -21,12 +21,12 @@
         // server engine. Fork-only since: h2c, PROXY protocol, inherited
         // listeners, HTTP/3 seams, TLS close_notify and the rest.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#c25bf8eafa81c62a452b7727fbd97f435db0601b",
-            .hash = "zio-0.19.0-xHbVVJcLLQDP8LJUbog0c5xgmESi2qxVdcQrY8NuKGlk",
+            .url = "git+https://github.com/xuckless/zio#3912c4b981b6b33ebc68f7e35806cffc3a5e5289",
+            .hash = "zio-0.19.0-xHbVVFwMLQDJBeKyZc7skCV_kPlZ3llUCyZvf4BLMYAz",
         },
         .dusty = .{
-            .url = "git+https://github.com/xuckless/dusty#c718299858cb17d1a32daf4f79cb5b2ad697c326",
-            .hash = "dusty-0.4.0-Qdw7Rn9zKgCQEr5e3Db68jYaZIt1lBSqttXbr7uBrqe8",
+            .url = "git+https://github.com/xuckless/dusty#86d152f353c8ec029185e75ce5d2caf8d5756e59",
+            .hash = "dusty-0.4.0-Qdw7RtFQKwBobVvKbvycZKv4kJD1GOi0-3ueWTfSIOF8",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
