@@ -206,6 +206,9 @@ for macOS and Linux.
   call. grpc-go's interop client passes 14/14 cases against Anole and Anole's
   client 11/11 against grpc-go, each over h2c and TLS; grpc's
   `tools/http2_interop` server checks run too.
+- Responses are gzipped only when the request was (grpc-go's rule);
+  `RegisterOptions.response_compression` = `.accepted` gzips whenever the
+  client accepts it, `.never` never.
 - `registerWith` options per registration: the request message limit
   (`default_max_message_size`, 4 MiB, by default) and data for the handlers.
   A handler's own error reaches the client as UNKNOWN "Application error
