@@ -295,6 +295,29 @@ pub const Udp = struct {
             return;
         }
         var control: Control align(cmsg_align) = undefined;
+        const w = self.controlFor(&control, local, ecn, data.len, seg);
+        var msg: std.Io.net.OutgoingMessage = .{ .address = &to, .data_ptr = data.ptr, .data_len = data.len, .control = control[0..w] };
+        const err, _ = self.socket.sendManyTimeout(io, (&msg)[0..1], .{}, .none);
+        if (err) |e| {
+            // A datagram may be lost, the cancelation may not: callers go
+            // on to a cancelation point (the endpoint's next receive) that
+            // must see it, or a canceled task never ends.
+            if (e == error.Canceled) return io.recancel();
+            if (data.len > seg) {
+                // The kernel or the NIC refused GSO: per datagram from now on.
+                log.debug("UDP GSO off: {t}", .{e});
+                self.gso.store(false, .monotonic);
+                return self.send(io, to, local, ecn, data, seg);
+            }
+            log.debug("UDP send: {t}", .{e});
+        }
+    }
+
+    /// The control messages a datagram of `len` bytes (several of
+    /// `segment` each, with GSO, when longer) goes out with: its source
+    /// address on a wildcard socket, its ECN codepoint, the segment size.
+    /// Returns the bytes used.
+    fn controlFor(self: *const Udp, control: *align(cmsg_align) Control, local: ?std.Io.net.IpAddress, ecn: u8, len: usize, segment: usize) usize {
         var w: usize = 0;
         if (self.wildcard) if (local) |l| switch (l) {
             .ip4 => |a| {
@@ -313,25 +336,135 @@ pub const Udp = struct {
             w += put(control[w..], posix.IPPROTO.IPV6, posix.IPV6.TCLASS, std.mem.asBytes(&tos))
         else
             w += put(control[w..], posix.IPPROTO.IP, posix.IP.TOS, std.mem.asBytes(&tos));
-        if (native_os == .linux and data.len > seg) {
-            const size: u16 = @intCast(seg);
+        if (native_os == .linux and len > segment) {
+            const size: u16 = @intCast(segment);
             w += put(control[w..], posix.IPPROTO.UDP, linux.UDP.SEGMENT, std.mem.asBytes(&size));
         }
-        var msg: std.Io.net.OutgoingMessage = .{ .address = &to, .data_ptr = data.ptr, .data_len = data.len, .control = control[0..w] };
-        const err, _ = self.socket.sendManyTimeout(io, (&msg)[0..1], .{}, .none);
-        if (err) |e| {
-            // A datagram may be lost, the cancelation may not: callers go
-            // on to a cancelation point (the endpoint's next receive) that
-            // must see it, or a canceled task never ends.
+        return w;
+    }
+
+    /// Packets written by several connections, to go out together: one
+    /// `sendmmsg` for all of them on Linux (`send`), each connection's run
+    /// of packets one GSO message within it. A connection writes its
+    /// packets straight into `space` and `commit`s them.
+    pub const Outbox = struct {
+        buf: []u8,
+        len: usize = 0,
+        msgs: []std.Io.net.OutgoingMessage,
+        /// Where each message goes; `msgs[i].address` points here.
+        addrs: []std.Io.net.IpAddress,
+        /// Each message's source address and ECN codepoint, for when it
+        /// must go again without GSO.
+        locals: []?std.Io.net.IpAddress,
+        ecns: []u8,
+        controls: []align(cmsg_align) Control,
+        count: usize = 0,
+        /// Datagrams in all the messages.
+        datagrams: usize = 0,
+
+        pub const buf_len = 128 * 1024;
+        pub const max_msgs = 128;
+
+        pub fn init(gpa: std.mem.Allocator) !Outbox {
+            const buf = try gpa.alloc(u8, buf_len);
+            errdefer gpa.free(buf);
+            const msgs = try gpa.alloc(std.Io.net.OutgoingMessage, max_msgs);
+            errdefer gpa.free(msgs);
+            const addrs = try gpa.alloc(std.Io.net.IpAddress, max_msgs);
+            errdefer gpa.free(addrs);
+            const locals = try gpa.alloc(?std.Io.net.IpAddress, max_msgs);
+            errdefer gpa.free(locals);
+            const ecns = try gpa.alloc(u8, max_msgs);
+            errdefer gpa.free(ecns);
+            const controls = try gpa.alignedAlloc(Control, .fromByteUnits(cmsg_align), max_msgs);
+            return .{ .buf = buf, .msgs = msgs, .addrs = addrs, .locals = locals, .ecns = ecns, .controls = controls };
+        }
+
+        pub fn deinit(o: *Outbox, gpa: std.mem.Allocator) void {
+            gpa.free(o.buf);
+            gpa.free(o.msgs);
+            gpa.free(o.addrs);
+            gpa.free(o.locals);
+            gpa.free(o.ecns);
+            gpa.free(o.controls);
+        }
+
+        /// Room for `bytes` more, in up to `datagrams` messages.
+        pub fn fits(o: *const Outbox, bytes: usize, datagrams: usize) bool {
+            return o.buf.len - o.len >= bytes and o.msgs.len - o.count >= datagrams;
+        }
+
+        /// Where the next packets are written.
+        pub fn space(o: *Outbox) []u8 {
+            return o.buf[o.len..];
+        }
+
+        /// The first `n` bytes of `space`, written: one datagram, or with
+        /// `segment` less than `n` several of `segment` bytes (the last
+        /// may be shorter), to `to` from `local`. One GSO message where
+        /// the socket has GSO, one message each otherwise; `fits` must
+        /// have said there is room for that many.
+        pub fn commit(o: *Outbox, udp: *const Udp, to: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, n: usize, segment: usize) void {
+            const seg = if (segment == 0 or segment > n) n else segment;
+            const gso = native_os == .linux and udp.gso.load(.monotonic);
+            var at = o.len;
+            const end = o.len + n;
+            while (at < end) {
+                const len = if (gso) end - at else @min(seg, end - at);
+                const i = o.count;
+                o.addrs[i] = to;
+                o.locals[i] = local;
+                o.ecns[i] = ecn;
+                const w = udp.controlFor(&o.controls[i], local, ecn, len, seg);
+                o.msgs[i] = .{ .address = &o.addrs[i], .data_ptr = o.buf[at..].ptr, .data_len = len, .control = o.controls[i][0..w] };
+                o.count += 1;
+                o.datagrams += std.math.divCeil(usize, len, seg) catch unreachable;
+                at += len;
+            }
+            o.len = end;
+        }
+
+        pub fn clear(o: *Outbox) void {
+            o.len = 0;
+            o.count = 0;
+            o.datagrams = 0;
+        }
+    };
+
+    /// Sends what `outbox` holds and empties it. A message the kernel
+    /// refuses is dropped (QUIC takes it as lost), unless it was refused
+    /// for its GSO segments: then GSO goes off and its datagrams go one by
+    /// one.
+    pub fn sendOutbox(self: *Udp, io: std.Io, outbox: *Outbox) void {
+        defer outbox.clear();
+        var rest = outbox.msgs[0..outbox.count];
+        while (rest.len > 0) {
+            const err, const sent = self.socket.sendManyTimeout(io, rest, .{}, .none);
+            rest = rest[sent..];
+            const e = err orelse continue;
             if (e == error.Canceled) return io.recancel();
-            if (data.len > seg) {
-                // The kernel or the NIC refused GSO: per datagram from now on.
+            if (rest.len == 0) break;
+            const i = outbox.count - rest.len;
+            const failed = rest[0];
+            rest = rest[1..];
+            const seg = segmentOf(failed.control);
+            if (seg != 0 and failed.data_len > seg) {
                 log.debug("UDP GSO off: {t}", .{e});
                 self.gso.store(false, .monotonic);
-                return self.send(io, to, local, ecn, data, seg);
+                self.send(io, failed.address.*, outbox.locals[i], outbox.ecns[i], failed.data_ptr[0..failed.data_len], seg);
+                continue;
             }
             log.debug("UDP send: {t}", .{e});
         }
+    }
+
+    /// The UDP_SEGMENT size among a message's control messages; 0 for none.
+    fn segmentOf(control: []const u8) usize {
+        if (native_os != .linux or control.len == 0) return 0;
+        var it: cmsg.Iterator = .{ .control = @alignCast(@constCast(control)) };
+        while (it.next()) |m| if (m.header.level == posix.IPPROTO.UDP and m.header.type == linux.UDP.SEGMENT and m.data.len >= 2)
+            return std.mem.readInt(u16, m.data[0..2], native_endian);
+        return 0;
     }
 
     /// Appends one control message; returns the bytes used.
@@ -444,4 +577,49 @@ test "UDP: SO_REUSEPORT sockets share a port, and the probe sees any socket on i
     first_open = false;
     try checkUdpAddressFree(taken);
     try checkUdpAddressFree(lo);
+}
+
+test "UDP: an outbox sends several destinations' packets at once, a run of them as one GSO message" {
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var a: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    defer a.socket.close(io);
+    var b: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    defer b.socket.close(io);
+    var sender: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    defer sender.socket.close(io);
+
+    var outbox: Udp.Outbox = try .init(std.testing.allocator);
+    defer outbox.deinit(std.testing.allocator);
+    try std.testing.expect(outbox.fits(10, 3));
+    // Three datagrams of 4, 4 and 2 bytes for `a`, one for `b`.
+    @memcpy(outbox.space()[0..10], "aaaabbbbcc");
+    outbox.commit(&sender, a.socket.address, null, 2, 10, 4);
+    @memcpy(outbox.space()[0..4], "dddd");
+    outbox.commit(&sender, b.socket.address, null, 1, 4, 0);
+    try std.testing.expectEqual(@as(usize, 4), outbox.datagrams);
+    const gso = @import("builtin").os.tag == .linux and sender.gso.load(.monotonic);
+    try std.testing.expectEqual(@as(usize, if (gso) 2 else 4), outbox.count);
+    sender.sendOutbox(io, &outbox);
+    try std.testing.expectEqual(@as(usize, 0), outbox.count);
+    try std.testing.expect(outbox.fits(Udp.Outbox.buf_len, Udp.Outbox.max_msgs));
+
+    var buf: [2048]u8 = undefined;
+    var control: Udp.Control align(cmsg_align) = undefined;
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } };
+    var got: usize = 0;
+    while (got < 3) {
+        var dg = try a.receive(io, &buf, &control, timeout);
+        try std.testing.expectEqual(@as(u8, 2), dg.ecn);
+        while (dg.next()) |d| {
+            try std.testing.expectEqualStrings(([_][]const u8{ "aaaa", "bbbb", "cc" })[got], d);
+            got += 1;
+        }
+    }
+    const dg = try b.receive(io, &buf, &control, timeout);
+    try std.testing.expectEqualStrings("dddd", dg.data);
+    try std.testing.expectEqual(@as(u8, 1), dg.ecn);
 }

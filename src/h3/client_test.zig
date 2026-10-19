@@ -272,6 +272,12 @@ test "h3 client: GET, a large streamed echo, trailers and 40 concurrent streams"
         try group.await(io);
         try std.testing.expectEqual(@as(usize, 40), ok.load(.monotonic));
     }
+    // Every packet went out through the endpoint's outbox, and its sends
+    // carried several at a time: the 3 MiB alone is thousands of packets.
+    const stats = &f.ep.stats;
+    const datagrams = stats.datagrams_out.load(.monotonic);
+    try std.testing.expect(datagrams > 2000);
+    try std.testing.expect(stats.tx_flushes.load(.monotonic) < datagrams);
 }
 
 test "h3 client: certificate checks, and a server that goes away" {

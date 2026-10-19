@@ -13,8 +13,11 @@
 //!     no connection (version negotiation, stateless reset); it passes a
 //!     packet for another endpoint's connection on to that endpoint;
 //!   * the inbox task: handles what other endpoints pass on;
-//!   * one driver task per connection: writes the connection's packets,
-//!     runs its timers, and its closing and draining periods;
+//!   * the sender task: sends what the connections wrote, together (one
+//!     `sendmmsg` on Linux for every connection's packets of a round);
+//!   * one driver task per connection: writes the connection's packets
+//!     into the endpoint's outbox, runs its timers, and its closing and
+//!     draining periods;
 //!   * one task per request: builds the `Request` and the `Response` and
 //!     runs the router.
 //!
@@ -63,8 +66,10 @@ const SendError = dusty.Response.SendError;
 /// Our connection IDs' length, as ngtcp2's examples use; one byte of them
 /// names the endpoint (`steer`).
 const scid_len = steer.cid_len;
-/// Packets written per driver round (one send each).
+/// Packets written per driver round (one message, with GSO, each).
 const burst = 10;
+/// What a driver round may write at most.
+const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
 /// QUIC v2 first when the client offers both.
@@ -234,6 +239,11 @@ pub const Stats = struct {
     /// Packets handled on another thread than the endpoint's own: always
     /// zero; counted in test builds only.
     foreign: std.atomic.Value(u64) = .init(0),
+    /// Datagrams the connections sent, and the outbox sends they went
+    /// out in (each a `sendmmsg` per 32 messages on Linux, a `sendmsg`
+    /// per message elsewhere): how well the endpoint batches.
+    datagrams_out: std.atomic.Value(u64) = .init(0),
+    tx_flushes: std.atomic.Value(u64) = .init(0),
 };
 
 /// One HTTP/3 listener, serving `server`'s router: one endpoint per UDP
@@ -294,6 +304,16 @@ pub fn Endpoint(comptime Ctx: type) type {
         inbox_buf: [inbox_len]*Forwarded = undefined,
         /// What the socket is read into.
         rx: []u8,
+        /// What the connections have written and not yet sent: they fill
+        /// one outbox (`tx_fill`) while the other is being sent.
+        /// `tx_lock` covers the filling one, and is never held across a
+        /// yield; `tx_send` lets one task at a time send.
+        tx: [2]net.Udp.Outbox,
+        tx_fill: u1 = 0,
+        tx_lock: std.atomic.Mutex = .unlocked,
+        tx_send: std.Io.Mutex = .init,
+        /// Bumped to wake the sender task.
+        tx_gen: std.atomic.Value(u32) = .init(0),
         stats: Stats = .{},
         /// Request streams kept for the next ones, with their arenas and
         /// small response rings (`Stream.create`, `Stream.free`). Every
@@ -301,6 +321,8 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// is never contended there; it only keeps other `Io`s safe.
         pool_lock: std.atomic.Mutex = .unlocked,
         pool: std.ArrayList(*Stream) = .empty,
+        /// No sender task: each driver round sends its own packets.
+        tx_direct: bool = true,
         /// The thread serving the endpoint, in test builds (`Stats.foreign`).
         thread: ?std.Thread.Id = null,
 
@@ -388,6 +410,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn initOne(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options, socket: std.Io.net.Socket, index: u8, shared: *Shared, secret: [32]u8) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
+            var tx0: net.Udp.Outbox = try .init(gpa);
+            errdefer tx0.deinit(gpa);
+            var tx1: net.Udp.Outbox = try .init(gpa);
+            errdefer tx1.deinit(gpa);
             self.* = .{
                 .gpa = gpa,
                 .io = io,
@@ -401,6 +427,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .listener = .{ .address = .{ .ip = socket.address } },
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
+                .tx = .{ tx0, tx1 },
             };
             self.inbox = .init(&self.inbox_buf);
             return self;
@@ -455,6 +482,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             var left: [1]*Forwarded = undefined;
             while ((self.inbox.getUncancelable(self.io, &left, 0) catch 0) == 1) self.freeForwarded(left[0]);
             self.gpa.free(self.rx);
+            for (&self.tx) |*o| o.deinit(self.gpa);
             for (self.pool.items) |s| s.destroy(self.gpa);
             self.pool.deinit(self.gpa);
             self.gpa.destroy(self);
@@ -585,6 +613,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             var reader: std.Io.Group = .init;
             // Without the task, packets passed on to it are dropped.
             placement.concurrent(&reader, io, .local, readInbox, .{self}) catch self.inbox.close(io);
+            // Without it, every driver round sends its own packets.
+            const sender = if (placement.concurrent(&reader, io, .local, sendLoop, .{self})) true else |_| false;
+            self.tx_direct = !sender;
             var batch: net.Udp.Batch = .{};
             while (true) {
                 const n = self.udp.receiveBatch(io, self.rx, &batch, .none) catch |err| switch (err) {
@@ -604,6 +635,75 @@ pub fn Endpoint(comptime Ctx: type) type {
             self.shutdown(&batch.controls[0]);
             self.inbox.close(io);
             reader.cancel(io);
+            // What the connections wrote last (their CONNECTION_CLOSEs on
+            // a hand-over, say).
+            self.txFlush();
+        }
+
+        // -- Packets out -----------------------------------------------------
+
+        fn lockTx(self: *Self) void {
+            while (!self.tx_lock.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        /// The outbox to write a driver round into, locked, with room for
+        /// the round; null when it has none (send it, then try again).
+        fn txReserve(self: *Self) ?*net.Udp.Outbox {
+            self.lockTx();
+            const o = &self.tx[self.tx_fill];
+            if (o.fits(tx_round, burst)) return o;
+            self.tx_lock.unlock();
+            return null;
+        }
+
+        /// After a round written into the outbox `txReserve` gave: unlocks
+        /// it and, when the round was its first, has it sent soon.
+        fn txCommitted(self: *Self, first: bool) void {
+            self.tx_lock.unlock();
+            if (self.tx_direct) return self.txFlush();
+            if (!first) return;
+            _ = self.tx_gen.fetchAdd(1, .release);
+            self.io.futexWake(u32, &self.tx_gen.raw, 1);
+        }
+
+        /// Sends whatever the connections have written. Never with a
+        /// connection's lock held: it may wait for the socket.
+        fn txFlush(self: *Self) void {
+            const io = self.io;
+            self.tx_send.lockUncancelable(io);
+            defer self.tx_send.unlock(io);
+            self.lockTx();
+            const o = &self.tx[self.tx_fill];
+            if (o.count == 0) {
+                self.tx_lock.unlock();
+                return;
+            }
+            self.tx_fill +%= 1;
+            self.tx_lock.unlock();
+            _ = self.stats.datagrams_out.fetchAdd(o.datagrams, .monotonic);
+            _ = self.stats.tx_flushes.fetchAdd(1, .monotonic);
+            self.udp.sendOutbox(io, o);
+        }
+
+        /// The sender: once the connections have written, and every task
+        /// already queued on the executor has had its turn (the drivers of
+        /// the other connections the same batch of datagrams woke), one
+        /// send for all of it.
+        fn sendLoop(self: *Self) std.Io.Cancelable!void {
+            const io = self.io;
+            const on_zio = placement.executorCount(io) != null;
+            while (true) {
+                const gen = self.tx_gen.load(.acquire);
+                self.lockTx();
+                const pending = self.tx[self.tx_fill].count > 0;
+                self.tx_lock.unlock();
+                if (!pending) {
+                    try io.futexWait(u32, &self.tx_gen.raw, gen);
+                    continue;
+                }
+                if (on_zio) try zio.yield();
+                self.txFlush();
+            }
         }
 
         /// Handles what other endpoints pass on, until the inbox closes.
@@ -672,6 +772,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unref();
                 }
                 self.gpa.free(conns);
+                self.txFlush();
                 self.group.cancel(self.io);
                 return;
             }
@@ -955,7 +1056,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             streams: std.AutoArrayHashMapUnmanaged(i64, *Stream) = .empty,
             /// The request tasks.
             group: std.Io.Group = .init,
-            tx: []u8,
             drain: enum { none, notice, final } = .none,
             /// The connection speaks "hq-interop", not HTTP/3.
             hq: bool = false,
@@ -971,8 +1071,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gpa = ep.gpa;
                 const conn = try gpa.create(Conn);
                 errdefer gpa.destroy(conn);
-                const tx = try gpa.alloc(u8, burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE);
-                errdefer gpa.free(tx);
                 conn.* = .{
                     .ep = ep,
                     .q = undefined,
@@ -981,7 +1079,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .scid = undefined,
                     .local = if (local) |l| .from(l) else ep.local,
                     .remote = remote,
-                    .tx = tx,
                 };
                 c.ngtcp2_ccerr_default(&conn.last_error);
                 conn.scid.datalen = scid_len;
@@ -1055,7 +1152,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 c.ngtcp2_conn_del(conn.q);
                 c.SSL_free(conn.ssl);
                 if (conn.close_pkt.len > 0) gpa.free(conn.close_pkt);
-                gpa.free(conn.tx);
                 gpa.destroy(conn);
             }
 
@@ -1256,9 +1352,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
-            /// Writes and sends whatever the connection has to send.
-            /// Returns a clock reading no earlier than any time ngtcp2 was
-            /// given.
+            /// Writes whatever the connection has to send into the
+            /// endpoint's outbox, which the sender task sends with every
+            /// other connection's. Returns a clock reading no earlier than
+            /// any time ngtcp2 was given.
             fn flush(conn: *Conn) u64 {
                 const ep = conn.ep;
                 while (true) {
@@ -1267,27 +1364,38 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return now(ep.io);
                     }
+                    const out = ep.txReserve() orelse {
+                        // Full: send it, outside the connection's lock.
+                        conn.unlock();
+                        ep.txFlush();
+                        continue;
+                    };
                     var ps: c.ngtcp2_path_storage = undefined;
                     c.ngtcp2_path_storage_zero(&ps);
                     var pi: c.ngtcp2_pkt_info = undefined;
                     var gso: usize = 0;
                     const ts = now(ep.io);
                     const quantum = c.ngtcp2_conn_get_send_quantum(conn.q);
-                    const len = @min(conn.tx.len, @max(quantum, c.NGTCP2_MAX_UDP_PAYLOAD_SIZE));
-                    const n = ngtcp2.connWriteAggregatePkt2(conn.q, &ps.path, &pi, conn.tx[0..len], &gso, writePkt, burst, ts);
-                    if (n < 0) {
-                        if (conn.last_error.error_code == 0)
-                            c.ngtcp2_ccerr_set_liberr(&conn.last_error, @intCast(n), null, 0);
-                        conn.fail();
+                    const len = @min(tx_round, @max(quantum, c.NGTCP2_MAX_UDP_PAYLOAD_SIZE));
+                    const n = ngtcp2.connWriteAggregatePkt2(conn.q, &ps.path, &pi, out.space()[0..len], &gso, writePkt, burst, ts);
+                    if (n <= 0) {
+                        ep.tx_lock.unlock();
+                        if (n < 0) {
+                            if (conn.last_error.error_code == 0)
+                                c.ngtcp2_ccerr_set_liberr(&conn.last_error, @intCast(n), null, 0);
+                            conn.fail();
+                            conn.unlock();
+                            return now(ep.io);
+                        }
+                        c.ngtcp2_conn_update_pkt_tx_time(conn.q, ts);
                         conn.unlock();
-                        return now(ep.io);
+                        return ts;
                     }
                     c.ngtcp2_conn_update_pkt_tx_time(conn.q, ts);
+                    const first = out.count == 0;
+                    out.commit(&ep.udp, Addr.fromNgtcp2(ps.path.remote).ip(), Addr.fromNgtcp2(ps.path.local).ip(), pi.ecn, @intCast(n), gso);
                     conn.unlock();
-                    if (n == 0) return ts;
-                    const to = Addr.fromNgtcp2(ps.path.remote).ip();
-                    const from = Addr.fromNgtcp2(ps.path.local).ip();
-                    ep.udp.send(ep.io, to, from, pi.ecn, conn.tx[0..@intCast(n)], gso);
+                    ep.txCommitted(first);
                 }
             }
 
@@ -1346,6 +1454,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
                 conn.unlock();
                 _ = conn.flush();
+                // The GOAWAY out before the CONNECTION_CLOSE.
+                conn.ep.txFlush();
                 conn.abort();
             }
 
