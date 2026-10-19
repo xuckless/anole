@@ -26,6 +26,7 @@ plus two static-ish binaries (`anole-bench`, `grpc-interop-server`).
 | WebSockets | `app.ws(path, handler)`; echo 2 lines, feed (Rooms + ticker task) 25, trade 30. Also over HTTP/2 (RFC 8441) with no extra code | anole |
 | Static + Range | `try app.staticDir("/static", dir, .{})`, 1 line; sendfile on cleartext | anole |
 | JSON | `res.json(value)` (std.json), key order from the struct | anole |
+| noWait | `anole.noWait(handler)` on the four raw routes that never wait: on HTTP/2 a request that arrives whole runs on the connection's reader, without a task. Not for anything that queries a database or another service. | anole |
 | $12 | `anole.auth.verify` for HS256, `req.bind`/`std.json` for bodies, and a hand-written Postgres client | anole |
 
 Every protocol in the matrix is one option in `anole.Server`'s init. No other

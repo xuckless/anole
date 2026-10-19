@@ -229,10 +229,12 @@ pub fn main(init: std.process.Init) !void {
     }, &state);
     defer app.deinit();
 
-    app.get("/plaintext", plaintext);
-    app.get("/json", json);
-    app.get("/users/:id", user);
-    app.get("/list", list);
+    // Handlers that never wait (docs/routing.md): on HTTP/2 a request that
+    // arrives whole runs where the connection reads it, without a task.
+    app.get("/plaintext", anole.noWait(plaintext));
+    app.get("/json", anole.noWait(json));
+    app.get("/users/:id", anole.noWait(user));
+    app.get("/list", anole.noWait(list));
     app.post("/echo", echo);
     app.get("/gc/alloc", gcAlloc);
     app.get("/gc/stats", gcStats);
