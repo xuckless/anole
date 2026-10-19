@@ -584,9 +584,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                         continue;
                     },
                 };
+                // One clock read for the batch: it came in at once.
+                const ts = now(io);
                 for (0..n) |i| {
                     var dg = batch.datagram(&self.udp, i);
-                    self.onDatagram(&dg);
+                    self.onDatagram(&dg, ts);
                 }
             }
             self.shutdown(&batch.controls[0]);
@@ -603,7 +605,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
                 defer self.freeForwarded(f);
                 _ = self.stats.forwarded_in.fetchAdd(1, .monotonic);
-                self.onPacket(f.from, f.local, f.ecn, f.data);
+                self.onPacket(f.from, f.local, f.ecn, f.data, now(self.io));
             }
         }
 
@@ -643,8 +645,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = self.stats.dropped.fetchAdd(1, .monotonic);
         }
 
-        fn onDatagram(self: *Self, dg: *net.Udp.Datagram) void {
-            while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data);
+        /// `ts`: when it came in.
+        fn onDatagram(self: *Self, dg: *net.Udp.Datagram, ts: u64) void {
+            while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data, ts);
         }
 
         fn shutdown(self: *Self, control: *align(std.Io.net.cmsg_align) net.Udp.Control) void {
@@ -678,7 +681,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .raw = .fromMilliseconds(50),
                     .clock = .awake,
                 } }) catch continue;
-                self.onDatagram(&dg);
+                self.onDatagram(&dg, now(self.io));
             }
             // Whatever is left is closed now.
             const left = self.liveConns();
@@ -746,7 +749,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// One packet, from this endpoint's socket or passed on to it. The
         /// endpoint task and its inbox task both call it, on one executor,
         /// so it keeps nothing in the endpoint across a yield.
-        fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
+        fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
             var vc: c.ngtcp2_version_cid = undefined;
             switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, scid_len)) {
                 0 => {},
@@ -764,7 +767,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             const remote: Addr = .from(from);
             if (self.lookup(.of(vc.dcid[0..vc.dcidlen]))) |conn| {
                 defer conn.unref();
-                conn.onPacket(remote, local, ecn, data);
+                conn.onPacket(remote, local, ecn, data, ts);
                 return;
             }
             if (self.draining) return;
@@ -1110,7 +1113,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // -- In: a packet from the endpoint task --------------------
 
-            fn onPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
+            fn onPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
                 conn.lock();
                 defer conn.unlock();
                 switch (conn.state) {
@@ -1133,7 +1136,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 var l: Addr = if (local) |a| .from(a) else conn.local;
                 var p: c.ngtcp2_path = .{ .local = l.ngtcp2Addr(), .remote = r.ngtcp2Addr(), .user_data = null };
                 const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
-                const rv = ngtcp2.connReadPkt(conn.q, &p, &pi, data, now(conn.ep.io));
+                // Never earlier than what the driver has already used.
+                const rv = ngtcp2.connReadPkt(conn.q, &p, &pi, data, @max(ts, c.ngtcp2_conn_get_timestamp(conn.q)));
                 if (rv != 0) {
                     switch (rv) {
                         c.NGTCP2_ERR_DRAINING => {
@@ -1175,11 +1179,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return;
                     };
                     const gen = conn.gen.load(.acquire);
-                    conn.flush();
+                    const flushed_at = conn.flush();
 
                     conn.lock();
                     const state = conn.state;
-                    const t = now(io);
+                    // The flush's last clock read, when nothing went out
+                    // after it, which is how a flush ends; else a fresh one.
+                    const t = @max(flushed_at, c.ngtcp2_conn_get_timestamp(conn.q));
                     var deadline: u64 = switch (state) {
                         .open => c.ngtcp2_conn_get_expiry2(conn.q),
                         .closing, .draining => conn.period_end,
@@ -1225,13 +1231,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// Writes and sends whatever the connection has to send.
-            fn flush(conn: *Conn) void {
+            /// Returns a clock reading no earlier than any time ngtcp2 was
+            /// given.
+            fn flush(conn: *Conn) u64 {
                 const ep = conn.ep;
                 while (true) {
                     conn.lock();
                     if (conn.state != .open) {
                         conn.unlock();
-                        return;
+                        return now(ep.io);
                     }
                     var ps: c.ngtcp2_path_storage = undefined;
                     c.ngtcp2_path_storage_zero(&ps);
@@ -1246,11 +1254,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                             c.ngtcp2_ccerr_set_liberr(&conn.last_error, @intCast(n), null, 0);
                         conn.fail();
                         conn.unlock();
-                        return;
+                        return now(ep.io);
                     }
                     c.ngtcp2_conn_update_pkt_tx_time(conn.q, ts);
                     conn.unlock();
-                    if (n == 0) return;
+                    if (n == 0) return ts;
                     const to = Addr.fromNgtcp2(ps.path.remote).ip();
                     const from = Addr.fromNgtcp2(ps.path.local).ip();
                     ep.udp.send(ep.io, to, from, pi.ecn, conn.tx[0..@intCast(n)], gso);
@@ -1311,7 +1319,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     _ = h.nghttp3_conn_shutdown(hc);
                 };
                 conn.unlock();
-                conn.flush();
+                _ = conn.flush();
                 conn.abort();
             }
 
@@ -1986,26 +1994,29 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = fromPtr(ptr);
                 const s = self.stream;
                 const arena = s.arena.allocator();
-                var nv: std.ArrayList(h.nghttp3_nv) = .empty;
-                const status_text = std.fmt.allocPrint(arena, "{d}", .{@backingInt(status)}) catch return self.fail(error.SystemResources);
-                nv.append(arena, field(":status", status_text)) catch return self.fail(error.SystemResources);
+                // The status, every header, and a length: one allocation.
+                const nv = arena.alloc(h.nghttp3_nv, headers.count() + 2) catch return self.fail(error.SystemResources);
+                var n: usize = 0;
+                nv[n] = field(":status", statusText(arena, status) catch return self.fail(error.SystemResources));
+                n += 1;
                 var has_length = false;
                 var it = headers.iterator();
                 while (it.next()) |entry| {
                     // RFC 9114 §4.2: connection-specific fields are malformed.
                     if (isConnectionSpecific(entry.key)) continue;
                     if (std.ascii.eqlIgnoreCase(entry.key, "content-length")) has_length = true;
-                    const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                    nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
+                    nv[n] = field(lowerName(arena, entry.key) catch return self.fail(error.SystemResources), entry.value);
+                    n += 1;
                 }
                 s.length_hint = content_length;
                 if (!has_length and statusHasLength(status)) {
                     if (content_length) |len| {
                         const text = std.fmt.allocPrint(arena, "{d}", .{len}) catch return self.fail(error.SystemResources);
-                        nv.append(arena, field("content-length", text)) catch return self.fail(error.SystemResources);
+                        nv[n] = field("content-length", text);
+                        n += 1;
                     }
                 }
-                s.response_nv = nv.items;
+                s.response_nv = nv[0..n];
             }
 
             fn interim(ptr: *anyopaque, status: dusty.Status) std.Io.Writer.Error!void {
@@ -2167,6 +2178,29 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .valuelen = value.len,
                 .flags = h.NGHTTP3_NV_FLAG_NONE,
             };
+        }
+
+        /// Every three-digit status as text, so that a head formats none.
+        const status_texts: [900][3]u8 = blk: {
+            @setEvalBranchQuota(20_000);
+            var t: [900][3]u8 = undefined;
+            for (&t, 100..) |*e, code| e.* = .{ '0' + code / 100, '0' + code / 10 % 10, '0' + code % 10 };
+            break :blk t;
+        };
+
+        fn statusText(arena: std.mem.Allocator, status: dusty.Status) ![]const u8 {
+            const code: usize = @backingInt(status);
+            if (code >= 100 and code < 1000) return &status_texts[code - 100];
+            return std.fmt.allocPrint(arena, "{d}", .{code});
+        }
+
+        /// HTTP/3 field names are lowercase (RFC 9114 §4.2): `name` itself
+        /// when it already is, a lowercase copy otherwise.
+        fn lowerName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+            for (name) |ch| {
+                if (std.ascii.isUpper(ch)) return std.ascii.allocLowerString(arena, name);
+            }
+            return name;
         }
 
         fn isConnectionSpecific(name: []const u8) bool {
