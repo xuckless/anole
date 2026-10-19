@@ -67,8 +67,6 @@ const scid_len = steer.cid_len;
 const burst = 10;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
-/// Largest UDP payload read.
-const max_datagram = 65527;
 /// QUIC v2 first when the client offers both.
 const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
 
@@ -386,7 +384,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .secret = secret,
                 .listener = .{ .address = .{ .ip = socket.address } },
                 .inbox = undefined,
-                .rx = try gpa.alloc(u8, max_datagram),
+                .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
             };
             self.inbox = .init(&self.inbox_buf);
             return self;
@@ -551,18 +549,21 @@ pub fn Endpoint(comptime Ctx: type) type {
             var reader: std.Io.Group = .init;
             // Without the task, packets passed on to it are dropped.
             placement.concurrent(&reader, io, .local, readInbox, .{self}) catch self.inbox.close(io);
-            var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+            var batch: net.Udp.Batch = .{};
             while (true) {
-                var dg = self.udp.receive(io, self.rx, &control, .none) catch |err| switch (err) {
+                const n = self.udp.receiveBatch(io, self.rx, &batch, .none) catch |err| switch (err) {
                     error.Canceled => break,
                     else => {
                         log.debug("receive: {t}", .{err});
                         continue;
                     },
                 };
-                self.onDatagram(&dg);
+                for (0..n) |i| {
+                    var dg = batch.datagram(&self.udp, i);
+                    self.onDatagram(&dg);
+                }
             }
-            self.shutdown(&control);
+            self.shutdown(&batch.controls[0]);
             self.inbox.close(io);
             reader.cancel(io);
         }
