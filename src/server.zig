@@ -753,32 +753,32 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.get(path, route(handler));
+            self.router.addRouteWith(.get, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.head(path, route(handler));
+            self.router.addRouteWith(.head, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.post(path, route(handler));
+            self.router.addRouteWith(.post, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.put(path, route(handler));
+            self.router.addRouteWith(.put, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.patch(path, route(handler));
+            self.router.addRouteWith(.patch, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.delete(path, route(handler));
+            self.router.addRouteWith(.delete, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.options(path, route(handler));
+            self.router.addRouteWith(.options, path, route(handler), handlers.routeOptions(handler));
         }
         /// The HTTP QUERY method (a GET with a body).
         pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.query(path, route(handler));
+            self.router.addRouteWith(.query, path, route(handler), handlers.routeOptions(handler));
         }
         pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.any(path, route(handler));
+            self.router.addRouteWith(null, path, route(handler), handlers.routeOptions(handler));
         }
 
         /// A WebSocket endpoint at `path`, over HTTP/1.1, HTTP/2 (RFC
@@ -925,31 +925,31 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 return g.group("", middlewares);
             }
             pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.get(path, route(handler));
+                g.inner.addRouteWith(.get, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.head(path, route(handler));
+                g.inner.addRouteWith(.head, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.post(path, route(handler));
+                g.inner.addRouteWith(.post, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.put(path, route(handler));
+                g.inner.addRouteWith(.put, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.patch(path, route(handler));
+                g.inner.addRouteWith(.patch, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.delete(path, route(handler));
+                g.inner.addRouteWith(.delete, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.options(path, route(handler));
+                g.inner.addRouteWith(.options, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.query(path, route(handler));
+                g.inner.addRouteWith(.query, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.any(path, route(handler));
+                g.inner.addRouteWith(null, path, route(handler), handlers.routeOptions(handler));
             }
             pub fn ws(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.wsWith(path, handler, .{});
