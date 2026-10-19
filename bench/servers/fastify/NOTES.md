@@ -56,6 +56,11 @@ its list, as the spec says.
     `jwtVerify()` failure to 401 `invalid or expired token`.
   - Malformed JSON comes in as `FST_ERR_CTP_INVALID_JSON_BODY` (or `..._EMPTY_JSON_BODY`) through
     `setErrorHandler`.
+  - The challenge's load.js likes a post with `Content-Type: application/json` and no body, which
+    Fastify's JSON parser rejects with a 400 (`FST_ERR_CTP_EMPTY_JSON_BODY`); the golden tests
+    don't send that, so it showed up only under load, as 7% errors and a score of 0. The $12 scope
+    replaces the JSON parser with one that takes an empty body as none and hands the rest to
+    `getDefaultJsonParser('error', 'error')`. Every other stack here accepts the empty body as is.
   - `setErrorHandler`/`setNotFoundHandler` must be set before `register()`ing the plugins, or the
     encapsulated scopes keep Fastify's defaults.
   - pg `bigint` comes back as strings, so the same global `setTypeParser(INT8, parseInt)` as Express.

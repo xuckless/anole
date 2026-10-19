@@ -54,6 +54,14 @@ export default async function twelve(app, { databaseUrl, pgPool, jwtSecret }) {
 
   await app.register(fastifyJwt, { secret: jwtSecret, verify: { algorithms: ['HS256'] } });
 
+  // load.js likes a post with Content-Type: application/json and no body,
+  // which Fastify's JSON parser rejects (FST_ERR_CTP_EMPTY_JSON_BODY): an
+  // empty body is no body here, anything else goes to Fastify's own parser.
+  const json = app.getDefaultJsonParser('error', 'error');
+  app.removeContentTypeParser('application/json');
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) =>
+    body === '' ? done(null, undefined) : json(request, body, done));
+
   // onRequest runs before the body is parsed, so auth is checked before anything else.
   async function authenticate(request, reply) {
     const header = request.headers.authorization;

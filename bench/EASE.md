@@ -94,6 +94,9 @@ line count is dominated by the database client it had to bring itself.
   Content-Type; Node's 5 s keep-alive default.
 
 **Fastify**
+- An empty body sent as `application/json` is a 400 by default, and the
+  challenge's own load script sends one for every like: the JSON parser had
+  to be replaced in the $12 scope.
 - Auth must move to `onRequest` because the body is parsed before
   `preHandler`; @fastify/jwt's errors do not match a typical API's; error
   and 404 handlers must be registered before plugins; the HTTP/2 server's
