@@ -47,7 +47,7 @@ func pgCpuset(set string) error {
 
 // TwelveSteps: users per step for the quick search; a step's window must
 // pass the challenge's thresholds for the next one to run.
-var twelveSteps = []int{2500, 5000, 10000, 15000, 20000, 25000, 30000, 40000, 50000, 60000}
+var twelveSteps = []int{2500, 5000, 10000, 15000, 20000, 25000, 30000, 40000, 50000, 60000, 80000, 100000}
 
 // Twelve: the $12 challenge on Postgres. Each server is first checked with
 // the challenge's golden tests on a fresh database, then driven with

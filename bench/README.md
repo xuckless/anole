@@ -129,7 +129,7 @@ writes a post (2%) and idles 5-15 s. k6 needs megabytes per virtual user,
 and the search goes to tens of thousands of them, so `tools/internal/twelve`
 replays the script in goroutines (users spread over 127.0.0.1-8 so they do
 not run out of ports). The quick profile adds users in steps (2 500, 5 000,
-10 000, ... 60 000; 20 s ramp, 40 s window) after a 1 000-user warm-up and
+10 000, ... 60 000, 80 000, 100 000; 20 s ramp, 40 s window) after a 1 000-user warm-up and
 stops at the first window that misses p95 < 500 ms, p99 < 1 s or < 1%
 errors; the score is the last window that passed. The full profile uses
 the challenge's 5-minute holds.
