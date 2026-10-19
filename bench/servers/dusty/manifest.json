@@ -1,0 +1,11 @@
+{
+  "name": "dusty",
+  "label": "dusty 74b455a on zio aa447c5 (upstream)",
+  "modes": {
+    "h1": "dusty (lalinsky/dusty 74b455a) on zio aa447c5 (main)"
+  },
+  "tls_alpn": [],
+  "ws": "dusty WebSocket (upstream)",
+  "ws_h2": false,
+  "scenarios": ["ws"]
+}

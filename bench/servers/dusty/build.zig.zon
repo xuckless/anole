@@ -1,0 +1,20 @@
+.{
+    .name = .dusty_bench,
+    .fingerprint = 0x5e0c41123098acc0,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // Upstream dusty and upstream zio, unmodified: Anole's ancestors.
+        // dusty: lalinsky/dusty main at 74b455a. zio: lalinsky/zio main at
+        // aa447c5 (2026-10-18); its last release, v0.19.1, predates Zig 0.17.
+        .dusty = .{
+            .url = "git+https://github.com/lalinsky/dusty#74b455a3ffcfb80bec355ccfd2bddb09082877aa",
+            .hash = "dusty-0.4.0-Qdw7RnjpIwAL_TxTlCFILDzCDTPASgw28iTTYyK4qzrv",
+        },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#aa447c5b1afcb0739385230aa57e05a96d82183d",
+            .hash = "zio-0.19.0-xHbVVCfXLACY4UlUXdbGZJDU1FkIXktIgdc317cB01Gc",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

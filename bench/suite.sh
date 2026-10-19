@@ -16,7 +16,7 @@ bench=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$bench")
 . "$bench/lib/cpus.sh"
 
-servers=anole,fiber,gohttp,axum,express,fastify,fastapi,bun,nginx,gohttp-wt,axum-wt,fastify-wt,fastapi-wt
+servers=anole,dusty,fiber,gohttp,axum,express,fastify,fastapi,bun,nginx,gohttp-wt,axum-wt,fastify-wt,fastapi-wt
 prev=
 for a in "$@"; do
   case "$prev" in -servers|--servers) servers=$a ;; esac
