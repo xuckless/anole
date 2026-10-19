@@ -78,6 +78,7 @@ func runSuite(args []string) {
 	only := fs.String("only", strings.Join(allScenarios, ","), "scenarios")
 	servers := fs.String("servers", allServers, "servers")
 	out := fs.String("out", "", "results directory")
+	modes := fs.String("modes", "", "comma-separated server modes raw runs (h1, tls, h2c, h3); default all")
 	prior := fs.String("prior", "", "comma-separated cases.jsonl files from earlier runs (max req/s for latency rates)")
 	fs.Parse(args)
 	if *out == "" {
@@ -107,6 +108,9 @@ func runSuite(args []string) {
 		log.Fatal(err)
 	}
 	defer s.Close()
+	if *modes != "" {
+		s.Modes = strings.Split(*modes, ",")
+	}
 	if *prior != "" {
 		s.LoadPrior(strings.Split(*prior, ","))
 	}

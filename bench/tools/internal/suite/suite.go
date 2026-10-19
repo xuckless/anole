@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +69,8 @@ type Suite struct {
 	Servers   []string
 	Tiers     []sut.Tier
 	LoadCPUs  int
+	// Modes, when set, limits raw to those server modes (h1, tls, h2c, h3).
+	Modes     []string
 	mu        sync.Mutex
 	cases     []Case
 	f         *os.File
@@ -238,7 +241,7 @@ func (s *Suite) Raw() {
 		for _, name := range s.Servers {
 			m := s.manifests[name]
 			for _, mode := range rawModes {
-				if !m.Supports(mode) {
+				if !m.Supports(mode) || (len(s.Modes) > 0 && !slices.Contains(s.Modes, mode)) {
 					continue
 				}
 				srv, err := sut.Start(s.Cfg, name, mode, tier, nil, 0)
