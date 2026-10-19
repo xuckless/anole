@@ -143,8 +143,18 @@ pub const Options = struct {
 fn http3Settings(options: *const Options) nghttp3.Settings {
     var settings: nghttp3.Settings = undefined;
     nghttp3.settingsDefault(&settings);
+    // The client's requests may use a dynamic table (smaller requests
+    // in; looking an entry up costs the decoder little).
     settings.qpack_max_dtable_capacity = 4096;
     settings.qpack_blocked_streams = 100;
+    // Our responses use the static table and literals only: searching the
+    // dynamic table for every field of every response was ~8% of a
+    // hello-world profile (Bun's, on lsquic's encoder; nghttp3's does the
+    // same work), for heads that are a few dozen bytes anyway. Nothing the
+    // peer sees changes but the bytes: no encoder stream instructions, no
+    // blocked streams on its side. Not advertised, so not part of the
+    // 0-RTT context.
+    settings.qpack_encoder_max_dtable_capacity = 0;
     settings.max_field_section_size = options.max_field_section_size;
     settings.enable_connect_protocol = @intFromBool(options.enable_connect_protocol or options.webtransport);
     settings.h3_datagram = @intFromBool(options.webtransport);
