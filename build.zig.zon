@@ -52,7 +52,9 @@
         // `anole`: the v1.25.0 tag plus its generated version.h and a patch
         // that keeps the connection ID a server falls back to when a client
         // migrates right after a NAT rebinding (stock 1.25.0 retires it and
-        // then closes with CONNECTION_ID_LIMIT_ERROR). nghttp3 1.18.0 from
+        // then closes with CONNECTION_ID_LIMIT_ERROR), and one that makes a
+        // server PTO in the Initial space retransmit two packets, not one (a
+        // post-quantum ServerHello spans two). nghttp3 1.18.0 from
         // Anole's fork xuckless/nghttp3, branch `anole`: the v1.18.0 tag plus
         // the release's generated version.h and bundled sfparse, and
         // nghttp3_conn_add_extra_setting, which sends the SETTINGS
