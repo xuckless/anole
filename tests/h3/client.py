@@ -32,17 +32,24 @@ class Client(QuicConnectionProtocol):
         self.waiters = {}
         self.responses = {}
 
+    def response(self, stream_id):
+        # A bytearray, not bytes: `bytes += chunk` copies the whole body on
+        # every chunk, which made a 10 MB download cost the client about
+        # 40 GB of copying (6-11 s on GitHub's Linux runners, against the
+        # 10 s a request may take), whatever the server did.
+        return self.responses.setdefault(stream_id, {"headers": [], "body": bytearray(), "trailers": []})
+
     def quic_event_received(self, event):
         for ev in self.http.handle_event(event):
             if isinstance(ev, HeadersReceived):
-                r = self.responses.setdefault(ev.stream_id, {"headers": [], "body": b"", "trailers": []})
+                r = self.response(ev.stream_id)
                 if "status" in r:
                     r["trailers"] = ev.headers
                 else:
                     r["headers"] = ev.headers
                     r["status"] = dict(ev.headers).get(b":status", b"?").decode()
             elif isinstance(ev, DataReceived):
-                self.responses.setdefault(ev.stream_id, {"headers": [], "body": b"", "trailers": []})["body"] += ev.data
+                self.response(ev.stream_id)["body"].extend(ev.data)
             if getattr(ev, "stream_ended", False) and ev.stream_id in self.waiters:
                 self.waiters.pop(ev.stream_id).set_result(self.responses.pop(ev.stream_id))
 

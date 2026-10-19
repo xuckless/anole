@@ -67,8 +67,6 @@ const scid_len = steer.cid_len;
 const burst = 10;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
-/// Largest UDP payload read.
-const max_datagram = 65527;
 /// QUIC v2 first when the client offers both.
 const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
 
@@ -287,6 +285,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// What the socket is read into.
         rx: []u8,
         stats: Stats = .{},
+        /// Request streams kept for the next ones, with their arenas and
+        /// small response rings (`Stream.create`, `Stream.free`). Every
+        /// connection's tasks run on the endpoint's executor, so the lock
+        /// is never contended there; it only keeps other `Io`s safe.
+        pool_lock: std.atomic.Mutex = .unlocked,
+        pool: std.ArrayList(*Stream) = .empty,
         /// The thread serving the endpoint, in test builds (`Stats.foreign`).
         thread: ?std.Thread.Id = null,
 
@@ -386,7 +390,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .secret = secret,
                 .listener = .{ .address = .{ .ip = socket.address } },
                 .inbox = undefined,
-                .rx = try gpa.alloc(u8, max_datagram),
+                .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
             };
             self.inbox = .init(&self.inbox_buf);
             return self;
@@ -441,7 +445,27 @@ pub fn Endpoint(comptime Ctx: type) type {
             var left: [1]*Forwarded = undefined;
             while ((self.inbox.getUncancelable(self.io, &left, 0) catch 0) == 1) self.freeForwarded(left[0]);
             self.gpa.free(self.rx);
+            for (self.pool.items) |s| s.destroy(self.gpa);
+            self.pool.deinit(self.gpa);
             self.gpa.destroy(self);
+        }
+
+        /// Streams kept at most per endpoint.
+        const pool_max = 256;
+
+        fn takeStream(self: *Self) ?*Stream {
+            while (!self.pool_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.pool_lock.unlock();
+            return self.pool.pop();
+        }
+
+        /// Keeps `s` for reuse; false when the pool is full.
+        fn keepStream(self: *Self, s: *Stream) bool {
+            while (!self.pool_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.pool_lock.unlock();
+            if (self.pool.items.len >= pool_max) return false;
+            self.pool.append(self.gpa, s) catch return false;
+            return true;
         }
 
         /// The listener's endpoints, in socket order (`sockets` of them):
@@ -551,18 +575,23 @@ pub fn Endpoint(comptime Ctx: type) type {
             var reader: std.Io.Group = .init;
             // Without the task, packets passed on to it are dropped.
             placement.concurrent(&reader, io, .local, readInbox, .{self}) catch self.inbox.close(io);
-            var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+            var batch: net.Udp.Batch = .{};
             while (true) {
-                var dg = self.udp.receive(io, self.rx, &control, .none) catch |err| switch (err) {
+                const n = self.udp.receiveBatch(io, self.rx, &batch, .none) catch |err| switch (err) {
                     error.Canceled => break,
                     else => {
                         log.debug("receive: {t}", .{err});
                         continue;
                     },
                 };
-                self.onDatagram(&dg);
+                // One clock read for the batch: it came in at once.
+                const ts = now(io);
+                for (0..n) |i| {
+                    var dg = batch.datagram(&self.udp, i);
+                    self.onDatagram(&dg, ts);
+                }
             }
-            self.shutdown(&control);
+            self.shutdown(&batch.controls[0]);
             self.inbox.close(io);
             reader.cancel(io);
         }
@@ -576,7 +605,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 };
                 defer self.freeForwarded(f);
                 _ = self.stats.forwarded_in.fetchAdd(1, .monotonic);
-                self.onPacket(f.from, f.local, f.ecn, f.data);
+                self.onPacket(f.from, f.local, f.ecn, f.data, now(self.io));
             }
         }
 
@@ -616,8 +645,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = self.stats.dropped.fetchAdd(1, .monotonic);
         }
 
-        fn onDatagram(self: *Self, dg: *net.Udp.Datagram) void {
-            while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data);
+        /// `ts`: when it came in.
+        fn onDatagram(self: *Self, dg: *net.Udp.Datagram, ts: u64) void {
+            while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data, ts);
         }
 
         fn shutdown(self: *Self, control: *align(std.Io.net.cmsg_align) net.Udp.Control) void {
@@ -651,7 +681,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .raw = .fromMilliseconds(50),
                     .clock = .awake,
                 } }) catch continue;
-                self.onDatagram(&dg);
+                self.onDatagram(&dg, now(self.io));
             }
             // Whatever is left is closed now.
             const left = self.liveConns();
@@ -719,7 +749,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// One packet, from this endpoint's socket or passed on to it. The
         /// endpoint task and its inbox task both call it, on one executor,
         /// so it keeps nothing in the endpoint across a yield.
-        fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
+        fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
             var vc: c.ngtcp2_version_cid = undefined;
             switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, scid_len)) {
                 0 => {},
@@ -737,7 +767,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             const remote: Addr = .from(from);
             if (self.lookup(.of(vc.dcid[0..vc.dcidlen]))) |conn| {
                 defer conn.unref();
-                conn.onPacket(remote, local, ecn, data);
+                conn.onPacket(remote, local, ecn, data, ts);
                 return;
             }
             if (self.draining) return;
@@ -905,7 +935,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             close_next_reply: u32 = 1,
             /// When the closing or draining period ends.
             period_end: u64 = 0,
-            streams: std.AutoHashMapUnmanaged(i64, *Stream) = .empty,
+            /// The peer closed the connection, and the streams have yet to
+            /// hear of it: the driver tells them (`wakeStreams`).
+            wake_pending: std.atomic.Value(bool) = .init(false),
+            /// The request streams. An array map: removing leaves no
+            /// tombstones behind, which in a hash map with a stream opening
+            /// and one closing for every request soon made each insert and
+            /// lookup walk most of the table.
+            streams: std.AutoArrayHashMapUnmanaged(i64, *Stream) = .empty,
             /// The request tasks.
             group: std.Io.Group = .init,
             tx: []u8,
@@ -1001,8 +1038,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gpa = conn.ep.gpa;
                 for (conn.hq_streams.values()) |hs| hs.free(gpa);
                 conn.hq_streams.deinit(gpa);
-                var it = conn.streams.valueIterator();
-                while (it.next()) |s| s.*.free();
+                for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
                 if (conn.wt) |w| w.destroy();
                 if (conn.h3) |hc| h.nghttp3_conn_del(hc);
@@ -1080,7 +1116,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // -- In: a packet from the endpoint task --------------------
 
-            fn onPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8) void {
+            fn onPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
                 conn.lock();
                 defer conn.unlock();
                 switch (conn.state) {
@@ -1103,11 +1139,20 @@ pub fn Endpoint(comptime Ctx: type) type {
                 var l: Addr = if (local) |a| .from(a) else conn.local;
                 var p: c.ngtcp2_path = .{ .local = l.ngtcp2Addr(), .remote = r.ngtcp2Addr(), .user_data = null };
                 const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
-                const rv = ngtcp2.connReadPkt(conn.q, &p, &pi, data, now(conn.ep.io));
+                // Never earlier than what the driver has already used.
+                const rv = ngtcp2.connReadPkt(conn.q, &p, &pi, data, @max(ts, c.ngtcp2_conn_get_timestamp(conn.q)));
                 if (rv != 0) {
                     switch (rv) {
                         c.NGTCP2_ERR_DRAINING => {
-                            conn.enterPeriod(.draining);
+                            // The peer closed. What it sent just before
+                            // (a WebTransport session's close capsule, a
+                            // request's last bytes) may still be with the
+                            // tasks that earlier packets of this batch
+                            // woke, so the streams hear of the end from
+                            // the driver, after those have run, not here.
+                            conn.state = .draining;
+                            conn.period_end = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
+                            conn.wake_pending.store(true, .monotonic);
                             conn.kick();
                             return;
                         },
@@ -1130,14 +1175,33 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn drive(conn: *Conn) std.Io.Cancelable!void {
                 const io = conn.ep.io;
+                const on_zio = placement.executorCount(io) != null;
                 defer conn.finish();
                 while (true) {
+                    // Let the tasks already queued on this executor run
+                    // first: a batch of datagrams starts many requests, and
+                    // their responses then go out together, in as few
+                    // packets and sends as they fit, instead of one flush
+                    // for the first response and more for the rest.
+                    if (on_zio) zio.yield() catch {
+                        conn.lock();
+                        conn.abortLocked();
+                        conn.unlock();
+                        return;
+                    };
                     const gen = conn.gen.load(.acquire);
-                    conn.flush();
+                    if (conn.wake_pending.load(.monotonic)) {
+                        conn.lock();
+                        if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
+                        conn.unlock();
+                    }
+                    const flushed_at = conn.flush();
 
                     conn.lock();
                     const state = conn.state;
-                    const t = now(io);
+                    // The flush's last clock read, when nothing went out
+                    // after it, which is how a flush ends; else a fresh one.
+                    const t = @max(flushed_at, c.ngtcp2_conn_get_timestamp(conn.q));
                     var deadline: u64 = switch (state) {
                         .open => c.ngtcp2_conn_get_expiry2(conn.q),
                         .closing, .draining => conn.period_end,
@@ -1183,13 +1247,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// Writes and sends whatever the connection has to send.
-            fn flush(conn: *Conn) void {
+            /// Returns a clock reading no earlier than any time ngtcp2 was
+            /// given.
+            fn flush(conn: *Conn) u64 {
                 const ep = conn.ep;
                 while (true) {
                     conn.lock();
                     if (conn.state != .open) {
                         conn.unlock();
-                        return;
+                        return now(ep.io);
                     }
                     var ps: c.ngtcp2_path_storage = undefined;
                     c.ngtcp2_path_storage_zero(&ps);
@@ -1204,11 +1270,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                             c.ngtcp2_ccerr_set_liberr(&conn.last_error, @intCast(n), null, 0);
                         conn.fail();
                         conn.unlock();
-                        return;
+                        return now(ep.io);
                     }
                     c.ngtcp2_conn_update_pkt_tx_time(conn.q, ts);
                     conn.unlock();
-                    if (n == 0) return;
+                    if (n == 0) return ts;
                     const to = Addr.fromNgtcp2(ps.path.remote).ip();
                     const from = Addr.fromNgtcp2(ps.path.local).ip();
                     ep.udp.send(ep.io, to, from, pi.ecn, conn.tx[0..@intCast(n)], gso);
@@ -1269,7 +1335,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     _ = h.nghttp3_conn_shutdown(hc);
                 };
                 conn.unlock();
-                conn.flush();
+                _ = conn.flush();
                 conn.abort();
             }
 
@@ -1335,8 +1401,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Every stream's handler sees the connection gone.
             fn wakeStreams(conn: *Conn) void {
-                var it = conn.streams.valueIterator();
-                while (it.next()) |s| s.*.reset = true;
+                for (conn.streams.values()) |s| s.reset = true;
                 if (conn.wt) |w| w.connectionClosed();
             }
 
@@ -1560,16 +1625,49 @@ pub fn Endpoint(comptime Ctx: type) type {
             deferred: bool = false,
             /// The response body until the peer acknowledges it.
             out: bridge.Ring = .{},
+            /// The response's Content-Length, when the head named one:
+            /// sizes the ring and the body buffer.
+            length_hint: ?usize = null,
+
+            /// What a stream keeps when it goes back to the pool: enough
+            /// for a typical request's head and a small response, so most
+            /// requests allocate nothing.
+            const arena_keep = 8 * 1024;
+            const ring_keep = 16 * 1024;
+            const body_keep = 4 * 1024;
 
             fn create(conn: *Conn, id: i64) !*Stream {
-                const gpa = conn.ep.gpa;
-                const s = try gpa.create(Stream);
-                s.* = .{ .conn = conn, .id = id, .arena = .init(gpa) };
+                const ep = conn.ep;
+                if (ep.takeStream()) |s| {
+                    const arena = s.arena;
+                    const body = s.body;
+                    const ring = s.out.buf;
+                    s.* = .{ .conn = conn, .id = id, .arena = arena, .body = body };
+                    s.out.buf = ring;
+                    return s;
+                }
+                const s = try ep.gpa.create(Stream);
+                s.* = .{ .conn = conn, .id = id, .arena = .init(ep.gpa) };
                 return s;
             }
 
+            /// Back to the endpoint's pool, or freed when it is full.
             fn free(s: *Stream) void {
-                const gpa = s.conn.ep.gpa;
+                const ep = s.conn.ep;
+                const gpa = ep.gpa;
+                if (s.body.capacity > body_keep) {
+                    s.body.deinit(gpa);
+                    s.body = .empty;
+                } else s.body.clearRetainingCapacity();
+                if (s.out.buf.len > ring_keep) {
+                    gpa.free(s.out.buf);
+                    s.out.buf = &.{};
+                }
+                _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
+                if (!ep.keepStream(s)) s.destroy(gpa);
+            }
+
+            fn destroy(s: *Stream, gpa: std.mem.Allocator) void {
                 s.body.deinit(gpa);
                 s.out.deinit(gpa);
                 s.arena.deinit();
@@ -1583,7 +1681,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .handler => s.refs.handler = false,
                 }
                 if (s.refs.quic or s.refs.handler) return;
-                _ = s.conn.streams.remove(s.id);
+                _ = s.conn.streams.swapRemove(s.id);
                 s.free();
             }
 
@@ -1913,25 +2011,29 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const self = fromPtr(ptr);
                 const s = self.stream;
                 const arena = s.arena.allocator();
-                var nv: std.ArrayList(h.nghttp3_nv) = .empty;
-                const status_text = std.fmt.allocPrint(arena, "{d}", .{@backingInt(status)}) catch return self.fail(error.SystemResources);
-                nv.append(arena, field(":status", status_text)) catch return self.fail(error.SystemResources);
+                // The status, every header, and a length: one allocation.
+                const nv = arena.alloc(h.nghttp3_nv, headers.count() + 2) catch return self.fail(error.SystemResources);
+                var n: usize = 0;
+                nv[n] = field(":status", statusText(arena, status) catch return self.fail(error.SystemResources));
+                n += 1;
                 var has_length = false;
                 var it = headers.iterator();
                 while (it.next()) |entry| {
                     // RFC 9114 §4.2: connection-specific fields are malformed.
                     if (isConnectionSpecific(entry.key)) continue;
                     if (std.ascii.eqlIgnoreCase(entry.key, "content-length")) has_length = true;
-                    const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                    nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
+                    nv[n] = field(lowerName(arena, entry.key) catch return self.fail(error.SystemResources), entry.value);
+                    n += 1;
                 }
+                s.length_hint = content_length;
                 if (!has_length and statusHasLength(status)) {
                     if (content_length) |len| {
                         const text = std.fmt.allocPrint(arena, "{d}", .{len}) catch return self.fail(error.SystemResources);
-                        nv.append(arena, field("content-length", text)) catch return self.fail(error.SystemResources);
+                        nv[n] = field("content-length", text);
+                        n += 1;
                     }
                 }
-                s.response_nv = nv.items;
+                s.response_nv = nv[0..n];
             }
 
             fn interim(ptr: *anyopaque, status: dusty.Status) std.Io.Writer.Error!void {
@@ -1952,7 +2054,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn body(ptr: *anyopaque) *std.Io.Writer {
                 const self = fromPtr(ptr);
                 if (self.writer.buffer.len == 0) {
-                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, 16 * 1024) catch &.{};
+                    // A known length needs no more; at least a little, so
+                    // that a body written in pieces is not sent in pieces.
+                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, 16 * 1024) else 16 * 1024;
+                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, size) catch &.{};
                 }
                 return &self.writer;
             }
@@ -2020,6 +2125,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return err;
                     };
+                    if (s.out.written == 0) s.out.reserve(conn.ep.gpa, ringSize(s.length_hint)) catch {
+                        conn.unlock();
+                        return self.fail(error.SystemResources);
+                    };
                     const n = s.out.write(conn.ep.gpa, rest) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
@@ -2071,6 +2180,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
         };
 
+        /// A response ring for a body of `hint` bytes: no larger than it
+        /// needs, up to the full `Ring.len` when the length is unknown.
+        fn ringSize(hint: ?usize) usize {
+            const n = hint orelse return bridge.Ring.len;
+            return std.math.ceilPowerOfTwoAssert(usize, std.math.clamp(n, 1024, bridge.Ring.len));
+        }
+
         fn field(name: []const u8, value: []const u8) h.nghttp3_nv {
             return .{
                 .name = name.ptr,
@@ -2079,6 +2195,29 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .valuelen = value.len,
                 .flags = h.NGHTTP3_NV_FLAG_NONE,
             };
+        }
+
+        /// Every three-digit status as text, so that a head formats none.
+        const status_texts: [900][3]u8 = blk: {
+            @setEvalBranchQuota(20_000);
+            var t: [900][3]u8 = undefined;
+            for (&t, 100..) |*e, code| e.* = .{ '0' + code / 100, '0' + code / 10 % 10, '0' + code % 10 };
+            break :blk t;
+        };
+
+        fn statusText(arena: std.mem.Allocator, status: dusty.Status) ![]const u8 {
+            const code: usize = @backingInt(status);
+            if (code >= 100 and code < 1000) return &status_texts[code - 100];
+            return std.fmt.allocPrint(arena, "{d}", .{code});
+        }
+
+        /// HTTP/3 field names are lowercase (RFC 9114 §4.2): `name` itself
+        /// when it already is, a lowercase copy otherwise.
+        fn lowerName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+            for (name) |ch| {
+                if (std.ascii.isUpper(ch)) return std.ascii.allocLowerString(arena, name);
+            }
+            return name;
         }
 
         fn isConnectionSpecific(name: []const u8) bool {
@@ -2166,7 +2305,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
             const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
             // A bidirectional stream WebTransport took is no request.
-            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchRemove(stream_id)) |e| e.value.free();
+            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| e.value.free();
             return rv;
         }
 

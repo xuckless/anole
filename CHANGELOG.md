@@ -61,6 +61,10 @@ for macOS and Linux.
   out a new token when the IP address changed, and reports the new address
   to handlers. The ngtcp2 fork fixes a migration right after a NAT
   rebinding, which stock 1.25.0 closed with CONNECTION_ID_LIMIT_ERROR.
+- HTTP/3 handshakes under loss: a server PTO retransmits both Initial
+  packets of a ServerHello that needs two (a post-quantum key share), so a
+  client that lost the second is not sent the first again and again (an
+  ngtcp2 fork patch).
 - HTTP/3 on every core on Linux: one SO_REUSEPORT UDP socket and endpoint
   per executor (`http3.sockets`, one per executor by default; macOS keeps
   one). The server's connection IDs name their endpoint in one byte, and a
