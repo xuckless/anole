@@ -34,12 +34,12 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
 }
 
 /// `handler`, marked as one that never waits: it answers from what it has
-/// (the request, the server's state, memory) without I/O, sleeping, a lock
-/// another task holds across a wait, or reading a request body, and so does
-/// every middleware that runs for its route. On HTTP/2 its requests that
-/// arrive whole then run on the connection's reader, right after the read
-/// that brought them, rather than on a task each, and their responses go
-/// out in that read's one write:
+/// (the request and its body, the server's state, memory) without I/O,
+/// sleeping, or a lock another task holds across a wait, and so does every
+/// middleware that runs for its route. On HTTP/2 its requests that arrive
+/// whole (body included) in one read then run on the connection's reader,
+/// right after that read, rather than on a task each, and their responses
+/// go out in that read's one write:
 ///
 ///     app.get("/plaintext", anole.noWait(plaintext));
 ///
