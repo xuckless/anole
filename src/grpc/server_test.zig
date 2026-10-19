@@ -105,6 +105,12 @@ const Client = struct {
     closed: bool = false,
 
     fn call(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const c.nghttp2_nv) !*Client {
+        return callCompressed(gpa, io, addr, path, messages, extra, .identity);
+    }
+
+    /// `call` with the request messages in `compression` (the caller sends
+    /// the matching grpc-encoding in `extra`).
+    fn callCompressed(gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, messages: []const pb.EchoRequest, extra: []const c.nghttp2_nv, compression: grpc.Compression) !*Client {
         const self = try gpa.create(Client);
         self.* = .{ .io = io, .gpa = gpa, .stream = try addr.connect(io, .{ .mode = .stream }) };
         self.reader = self.stream.reader(io, &self.read_buf);
@@ -115,7 +121,7 @@ const Client = struct {
             var enc: std.Io.Writer.Allocating = .init(gpa);
             defer enc.deinit();
             try m.encode(&enc.writer, gpa);
-            const framed = try grpc.frame.encode(gpa, enc.written());
+            const framed = try grpc.frame.encodeWithCompression(gpa, enc.written(), compression);
             defer gpa.free(framed);
             try body.writer.writeAll(framed);
         }
@@ -311,8 +317,17 @@ test "gRPC: unary, server, client and bidi streaming; status and trailers; deadl
         try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 2, 0x08, 0x01 }, cl.data.items);
     }
     if (features.compression) {
-        // The response is gzipped for a client that accepts it.
-        const cl = try Client.call(gpa, io, addr, "/anole.test.Echo/Unary", &.{.{ .message = "squeeze me" }}, &.{Client.nv("grpc-accept-encoding", "gzip")});
+        // By default (`.mirror`) the response is gzipped for a client that
+        // accepts it only when the request came gzipped too.
+        const plain = try Client.call(gpa, io, addr, "/anole.test.Echo/Unary", &.{.{ .message = "squeeze me" }}, &.{Client.nv("grpc-accept-encoding", "gzip")});
+        defer plain.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), plain.grpc_status);
+        try std.testing.expectEqual(@as(u8, 0), plain.data.items[0]); // compressed flag
+        try std.testing.expectEqualStrings("squeeze me", (try plain.responses(a))[0].message);
+
+        const cl = try Client.callCompressed(gpa, io, addr, "/anole.test.Echo/Unary", &.{.{ .message = "squeeze me" }}, &.{
+            Client.nv("grpc-encoding", "gzip"), Client.nv("grpc-accept-encoding", "gzip"),
+        }, .gzip);
         defer cl.deinit();
         try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
         try std.testing.expectEqual(@as(u8, 1), cl.data.items[0]); // compressed flag
@@ -574,7 +589,7 @@ test "gRPC: generic UNKNOWN, initial metadata after the head, per-registration l
         .ClientStream = clientStream,
         .Bidi = bidi,
     });
-    grpc.registerWith(void, &server.router, Lookup, .{ .Find = find, .Store = store }, .{ .max_message_size = 64 });
+    grpc.registerWith(void, &server.router, Lookup, .{ .Find = find, .Store = store }, .{ .max_message_size = 64, .response_compression = .accepted });
     var server_future = try startServer(&server, io);
     defer server_future.cancel(io) catch {};
     const addr = server.address.ip;
@@ -582,6 +597,15 @@ test "gRPC: generic UNKNOWN, initial metadata after the head, per-registration l
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    if (features.compression) {
+        // `.accepted`: gzipped whenever the client accepts it.
+        const cl = try Client.call(gpa, io, addr, "/anole.test.Lookup/Find", &.{.{ .message = "squeeze me" }}, &.{Client.nv("grpc-accept-encoding", "gzip")});
+        defer cl.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+        try std.testing.expectEqual(@as(u8, 1), cl.data.items[0]); // compressed flag
+        try std.testing.expectEqualStrings("squeeze me", (try cl.responses(arena))[0].message);
+    }
 
     {
         // A handler's own error: UNKNOWN, with nothing of its name. (The
@@ -769,4 +793,58 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
     // The connection serves on.
     const r = try client.unary("Unary", arena, .{ .message = "after" }, .{});
     try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+}
+
+test "gRPC: grpc-status survives concurrent unary calls on several executors" {
+    // The status trailer once pointed at the finishing function's stack.
+    // HTTP/2 sends trailers from its writer task, after that frame has
+    // returned, so under load another stream's task could reuse the stack
+    // first and the client read a garbled grpc-status (2% of calls in a
+    // 4-core benchmark).
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+
+    const h2 = @import("anole_h2_client");
+    const Caller = struct {
+        /// Counts every call that failed or did not end with OK.
+        fn run(channel: *grpc.Channel, calls: usize, bad: *std.atomic.Value(usize)) void {
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            for (0..calls) |_| {
+                var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+                defer arena_state.deinit();
+                const r = client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{}) catch {
+                    _ = bad.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (r.status.code != .ok) _ = bad.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var conns: [4]*h2.ClientConnection = undefined;
+    var channels: [conns.len]grpc.Channel = undefined;
+    for (&conns, &channels) |*conn, *channel| {
+        conn.* = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+        channel.* = .{ .conn = conn.*, .authority = "localhost" };
+    }
+    defer for (conns) |conn| conn.close();
+    var bad: std.atomic.Value(usize) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..32) |i| try group.concurrent(io, Caller.run, .{ &channels[i % channels.len], 100, &bad });
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 0), bad.load(.monotonic));
 }

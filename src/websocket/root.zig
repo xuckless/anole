@@ -100,9 +100,8 @@ pub const Socket = struct {
     /// The server's drain signal (`Request.drain`); null in a request the
     /// server did not build.
     drain: ?*std.Io.Event = null,
-    /// The task that sends 1001 when the drain starts
-    /// (`UpgradeOptions.close_on_drain`).
-    drain_watch: ?*std.Io.Group = null,
+    /// Sends 1001 when the drain starts (`UpgradeOptions.close_on_drain`).
+    drain_watch: ?*DrainWatch = null,
     /// A close went out through `close`, or came in through `receive` (and
     /// was answered), or `next` saw the connection end.
     closed: std.atomic.Value(bool) = .init(false),
@@ -197,7 +196,7 @@ pub const Socket = struct {
 
     /// Sends a close frame. The peer's answer still arrives through
     /// `receive`.
-    pub fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
+    pub noinline fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
         self.closed.store(true, .release);
         return switch (self.conn) {
             inline else => |ws| ws.close(code, reason),
@@ -206,20 +205,48 @@ pub const Socket = struct {
 
     pub fn deinit(self: *Socket) void {
         // First, so nothing sends on the socket once it is gone.
-        if (self.drain_watch) |g| g.cancel(self.io);
+        if (self.drain_watch) |w| w.stop();
         if (comptime features.compression) if (self.deflate) |d| d.deinit(self.allocator);
         switch (self.conn) {
             inline else => |ws| ws.deinit(),
         }
     }
 
-    /// Sends close 1001 once the drain starts. Runs beside the handler, on
-    /// its executor, until `deinit` cancels it.
-    fn closeOnDrain(drain: *std.Io.Event, io: std.Io, conn: Conn, reason: []const u8) std.Io.Cancelable!void {
-        try drain.wait(io);
-        switch (conn) {
-            inline else => |ws| ws.close(.going_away, reason) catch {},
+};
+
+/// Sends close 1001 when the server starts to drain, through the server's
+/// drain hooks (`Request.drain_hooks`): a socket keeps no task of its own
+/// waiting for the drain, only this, in the request's arena. The close is
+/// sent from a task started when the drain does, on the socket's executor,
+/// so a peer that does not read holds up only its own.
+const DrainWatch = struct {
+    hook: dusty.DrainHooks.Hook = .{ .callback = onDrain },
+    hooks: *dusty.DrainHooks,
+    io: std.Io,
+    conn: Socket.Conn,
+    reason: []const u8,
+    /// The socket's executor, where the close goes.
+    executor: ?usize,
+    sender: std.Io.Group = .init,
+
+    fn onDrain(hook: *dusty.DrainHooks.Hook) void {
+        const self: *DrainWatch = @fieldParentPtr("hook", hook);
+        const where: placement.Where = if (self.executor) |i| .{ .executor = i } else .local;
+        // Without a task to spare, the socket lives on until the handler
+        // ends it or the drain's deadline does.
+        placement.concurrent(&self.sender, self.io, where, send, .{self}) catch {};
+    }
+
+    fn send(self: *DrainWatch) std.Io.Cancelable!void {
+        switch (self.conn) {
+            inline else => |ws| ws.close(.going_away, self.reason) catch {},
         }
+    }
+
+    /// Out of the hooks, and any close under way finished or canceled.
+    fn stop(self: *DrainWatch) void {
+        self.hooks.remove(self.io, &self.hook);
+        self.sender.cancel(self.io);
     }
 };
 
@@ -270,17 +297,35 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
         socket.conn = .{ .h1 = ws };
     }
     req.setTimeout(options.timeout);
-    if (options.close_on_drain) if (req.drain) |drain| {
-        const group = try req.arena.create(std.Io.Group);
-        group.* = .init;
-        const reason = try req.arena.dupe(u8, options.drain_reason);
-        // Without a task to spare, the socket lives on until the handler
-        // ends it or the drain's deadline does.
-        if (placement.concurrent(group, req.io, .local, Socket.closeOnDrain, .{ drain, req.io, socket.conn, reason })) |_| {
-            socket.drain_watch = group;
-        } else |_| {}
+    if (options.close_on_drain) if (req.drain_hooks) |hooks| {
+        const watch = try req.arena.create(DrainWatch);
+        watch.* = .{
+            .hooks = hooks,
+            .io = req.io,
+            .conn = socket.conn,
+            .reason = try req.arena.dupe(u8, options.drain_reason),
+            .executor = placement.currentExecutor(req.io),
+        };
+        hooks.add(req.io, &watch.hook);
+        socket.drain_watch = watch;
     };
     return socket;
+}
+
+// Out of line, like everything a socket's handler does not run while it
+// waits: `serve`'s frame is under every wait of an open socket, and its
+// pages stay with the task.
+noinline fn refuse(res: *dusty.Response) anyerror!void {
+    res.fail(.upgrade_required, "this endpoint speaks WebSocket");
+    return res.header("Upgrade", "websocket");
+}
+
+noinline fn failed(ws: *Socket, req: *dusty.Request, res: *dusty.Response, err: anyerror) anyerror!void {
+    if (err == error.Canceled) return err;
+    // The peer went away mid-send: not the handler's fault.
+    if (res.peerGone()) return;
+    std.log.scoped(.anole).warn("WebSocket handler for {s} failed: {t}", .{ req.url, err });
+    if (!ws.closed.load(.acquire)) ws.close(.internal_error, "") catch {};
 }
 
 /// A route handler for `Server.ws`: upgrades, runs `handler` with the open
@@ -298,10 +343,7 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
     }
     const S = struct {
         fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
-            var ws = (try upgrade(req, res, options)) orelse {
-                res.fail(.upgrade_required, "this endpoint speaks WebSocket");
-                return res.header("Upgrade", "websocket");
-            };
+            var ws = (try upgrade(req, res, options)) orelse return refuse(res);
             defer ws.deinit();
             const result = switch (params.len) {
                 1 => handler(&ws),
@@ -309,15 +351,7 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
                 3 => handler(ctx, &ws, req),
                 else => unreachable,
             };
-            result catch |err| {
-                const e: anyerror = err;
-                if (e == error.Canceled) return e;
-                // The peer went away mid-send: not the handler's fault.
-                if (res.peerGone()) return;
-                std.log.scoped(.anole).warn("WebSocket handler for {s} failed: {t}", .{ req.url, e });
-                if (!ws.closed.load(.acquire)) ws.close(.internal_error, "") catch {};
-                return;
-            };
+            result catch |err| return failed(&ws, req, res, err);
             if (!ws.closed.load(.acquire)) ws.close(.normal, "") catch {};
         }
     };
