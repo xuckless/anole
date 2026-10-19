@@ -218,11 +218,12 @@ pub const Udp = struct {
     pub const batch_buffer_len = Batch.len * 65535;
 
     /// Several datagrams in one wait: what the kernel already holds, up to
-    /// `len`. Each is read with a non-blocking call of its own, but the
-    /// task yields once for them all, so whatever they ask of a connection
-    /// goes out in one flush rather than one flush per datagram.
+    /// `len`, in one `recvmmsg` on Linux (each with its control messages:
+    /// ECN, PKTINFO, the GRO segment size), one non-blocking `recvmsg` each
+    /// elsewhere. The task yields once for them all, so whatever they ask
+    /// of a connection goes out in one flush rather than one per datagram.
     pub const Batch = struct {
-        pub const len = 16;
+        pub const len = 32;
         msgs: [len]std.Io.net.IncomingMessage = @splat(.init),
         controls: [len]Control align(cmsg_align) = undefined,
         count: usize = 0,
