@@ -1131,8 +1131,20 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn drive(conn: *Conn) std.Io.Cancelable!void {
                 const io = conn.ep.io;
+                const on_zio = placement.executorCount(io) != null;
                 defer conn.finish();
                 while (true) {
+                    // Let the tasks already queued on this executor run
+                    // first: a batch of datagrams starts many requests, and
+                    // their responses then go out together, in as few
+                    // packets and sends as they fit, instead of one flush
+                    // for the first response and more for the rest.
+                    if (on_zio) zio.yield() catch {
+                        conn.lock();
+                        conn.abortLocked();
+                        conn.unlock();
+                        return;
+                    };
                     const gen = conn.gen.load(.acquire);
                     conn.flush();
 
