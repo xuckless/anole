@@ -79,6 +79,7 @@ func runSuite(args []string) {
 	servers := fs.String("servers", allServers, "servers")
 	out := fs.String("out", "", "results directory")
 	modes := fs.String("modes", "", "comma-separated server modes raw runs (h1, tls, h2c, h3); default all")
+	twelveFrom := fs.String("twelve-from", "", "cases.jsonl of an earlier $12 run: bisect each server's bracket instead of climbing the ladder")
 	prior := fs.String("prior", "", "comma-separated cases.jsonl files from earlier runs (max req/s for latency rates)")
 	fs.Parse(args)
 	if *out == "" {
@@ -110,6 +111,11 @@ func runSuite(args []string) {
 	defer s.Close()
 	if *modes != "" {
 		s.Modes = strings.Split(*modes, ",")
+	}
+	if *twelveFrom != "" {
+		if err := s.LoadTwelveBrackets(*twelveFrom); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if *prior != "" {
 		s.LoadPrior(strings.Split(*prior, ","))

@@ -1,7 +1,9 @@
 package suite
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -81,76 +83,157 @@ func (s *Suite) Twelve(pgCPUs, pgCPUsDefault string) {
 			fail := func(err error) {
 				s.record(Case{Scenario: "twelve", Server: name, Mode: "h1", Proto: "h1", Tier: tier.Name, Error: err.Error()})
 			}
-			// Correctness first, on its own fresh database.
-			if err := resetDB(); err != nil {
-				fail(err)
-				continue
-			}
-			srv, err := sut.Start(s.Cfg, name, "h1", tier, env, 0)
-			if err != nil {
-				fail(err)
-				continue
-			}
-			golden := exec.Command("bash", filepath.Join(s.BenchDir, "twelve", "test.sh"), "http://127.0.0.1:8080")
-			golden.Env = append(golden.Environ(), "GOLDEN="+filepath.Join(s.BenchDir, "twelve", "golden"))
-			out, err := golden.CombinedOutput()
-			sut.Stop()
-			if err != nil {
-				fail(fmt.Errorf("golden tests failed: %s", lastLines(string(out), 6)))
-				continue
+			var lo, hi int
+			var u sut.Usage
+			if s.TwelveBrackets != nil {
+				// Refining an earlier run: only the bisection, between the
+				// last step that passed and the first that failed.
+				b, ok := s.TwelveBrackets[tier.Name+"|"+name]
+				if !ok {
+					continue
+				}
+				lo, hi = b[0], b[1]
+			} else {
+				// Correctness first, on its own fresh database.
+				if err := resetDB(); err != nil {
+					fail(err)
+					continue
+				}
+				if _, err := sut.Start(s.Cfg, name, "h1", tier, env, 0); err != nil {
+					fail(err)
+					continue
+				}
+				golden := exec.Command("bash", filepath.Join(s.BenchDir, "twelve", "test.sh"), "http://127.0.0.1:8080")
+				golden.Env = append(golden.Environ(), "GOLDEN="+filepath.Join(s.BenchDir, "twelve", "golden"))
+				out, err := golden.CombinedOutput()
+				sut.Stop()
+				if err != nil {
+					fail(fmt.Errorf("golden tests failed: %s", lastLines(string(out), 6)))
+					continue
+				}
+
+				if err := resetDB(); err != nil {
+					fail(err)
+					continue
+				}
+				srv, err := sut.Start(s.Cfg, name, "h1", tier, env, 0)
+				if err != nil {
+					fail(err)
+					continue
+				}
+				d := &twelve.Driver{Base: "http://127.0.0.1:8080", Tokens: tokens, SourceIPs: 8}
+				steps := []twelve.Step{{Users: 1000, Ramp: ramp, Hold: warm}}
+				for _, n := range twelveSteps {
+					steps = append(steps, twelve.Step{Users: n, Ramp: ramp, Hold: hold})
+				}
+				smp := srv.Sample(time.Second, true)
+				self := sut.StartSampler("/sys/fs/cgroup", time.Second, false)
+				first := true
+				windows := d.Run(steps, func(w twelve.Window) bool {
+					if first { // the warm-up step is not scored
+						first = false
+						return false
+					}
+					exited, _ := srv.Exited()
+					return exited || !w.Pass()
+				})
+				u = smp.Stop()
+				lu := self.Stop()
+				for i, w := range windows {
+					c := s.twelveCase(name, tier, w, u, lu.CPU)
+					if i == 0 {
+						c.Param = "warmup"
+					} else if w.Pass() {
+						lo = w.Users
+					} else {
+						hi = w.Users
+					}
+					// The server's fate (an OOM kill, an exit) belongs to the
+					// window it ended in, not to every window before it.
+					if i == len(windows)-1 {
+						if n := s.note(srv, 0); n != "" {
+							c.Note = strings.TrimPrefix(c.Note+"; "+n, "; ")
+						}
+					}
+					s.record(c)
+				}
+				sut.Stop()
 			}
 
-			if err := resetDB(); err != nil {
-				fail(err)
-				continue
-			}
-			srv, err = sut.Start(s.Cfg, name, "h1", tier, env, 0)
-			if err != nil {
-				fail(err)
-				continue
-			}
-			d := &twelve.Driver{Base: "http://127.0.0.1:8080", Tokens: tokens, SourceIPs: 8}
-			steps := []twelve.Step{{Users: 1000, Ramp: ramp, Hold: warm}}
-			for _, u := range twelveSteps {
-				steps = append(steps, twelve.Step{Users: u, Ramp: ramp, Hold: hold})
-			}
-			smp := srv.Sample(time.Second, true)
-			self := sut.StartSampler("/sys/fs/cgroup", time.Second, false)
-			first := true
-			windows := d.Run(steps, func(w twelve.Window) bool {
-				if first { // the warm-up step is not scored
-					first = false
-					return false
-				}
-				exited, _ := srv.Exited()
-				return exited || !w.Pass()
-			})
-			u := smp.Stop()
-			lu := self.Stop()
-			score := 0
-			for i, w := range windows {
-				c := Case{Scenario: "twelve", Server: name, Mode: "h1", Proto: "h1", Tier: tier.Name,
-					Param: fmt.Sprintf("users=%d", w.Users),
-					Load: load.Result{Tool: "benchctl vu", Requests: int64(w.Requests), RPS: w.RPS, Errors: int64(w.Failed),
-						P50MS: w.P50MS, P95MS: w.P95MS, P99MS: w.P99MS, MaxMS: w.MaxMS},
-					SUT: windowUsage(u, w.Start, w.End), LoadCPU: lu.CPU}
-				if i == 0 {
-					c.Param = "warmup"
-				} else if w.Pass() {
-					score = w.Users
+			// Bisect between the last window that passed and the first that
+			// failed, each probe on a fresh server and database (the failure
+			// may have been an OOM kill), until the bracket is within 5%.
+			for hi > 0 && hi-lo > max(1000, lo/20) {
+				mid := (lo + hi) / 2
+				mid -= mid % 250
+				_, pu, ok := s.twelveProbe(name, tier, env, tokens, mid, ramp, hold)
+				if ok {
+					lo = mid
+					u = pu
 				} else {
-					c.Note = "failed the thresholds"
+					hi = mid
 				}
-				if n := s.note(srv, 0); n != "" {
-					c.Note = strings.TrimPrefix(c.Note+"; "+n, "; ")
-				}
-				s.record(c)
 			}
 			s.record(Case{Scenario: "twelve", Server: name, Mode: "h1", Proto: "h1", Tier: tier.Name, Param: "score",
-				Load: load.Result{Tool: "benchctl vu", Requests: int64(score)}, SUT: sut.Usage{MemMB: u.MemMB, CoresBusy: u.CoresBusy}})
-			sut.Stop()
+				Load: load.Result{Tool: "benchctl vu", Requests: int64(lo)}, SUT: sut.Usage{MemMB: u.MemMB, CoresBusy: u.CoresBusy},
+				Note: fmt.Sprintf("passed %d users, failed %d", lo, hi)})
 		}
 	}
+}
+
+// twelveCase is a scored window as a case.
+func (s *Suite) twelveCase(name string, tier sut.Tier, w twelve.Window, u sut.Usage, loadCPU float64) Case {
+	c := Case{Scenario: "twelve", Server: name, Mode: "h1", Proto: "h1", Tier: tier.Name,
+		Param: fmt.Sprintf("users=%d", w.Users),
+		Load: load.Result{Tool: "benchctl vu", Requests: int64(w.Requests), RPS: w.RPS, Errors: int64(w.Failed),
+			P50MS: w.P50MS, P95MS: w.P95MS, P99MS: w.P99MS, MaxMS: w.MaxMS},
+		SUT: windowUsage(u, w.Start, w.End), LoadCPU: loadCPU}
+	if !w.Pass() {
+		c.Note = "failed the thresholds"
+	}
+	return c
+}
+
+// twelveProbe runs one bisection probe: a fresh database and server, a
+// short warm-up at 1 000 users, a ramp to users at no more than 1 000 new
+// users a second, and one scored window. It records the window and says
+// whether it passed.
+func (s *Suite) twelveProbe(name string, tier sut.Tier, env map[string]string, tokens []twelve.Token, users int, ramp, hold time.Duration) (twelve.Window, sut.Usage, bool) {
+	fail := func(err error) {
+		s.record(Case{Scenario: "twelve", Server: name, Mode: "h1", Proto: "h1", Tier: tier.Name,
+			Param: fmt.Sprintf("users=%d (bisect)", users), Error: err.Error()})
+	}
+	if err := resetDB(); err != nil {
+		fail(err)
+		return twelve.Window{}, sut.Usage{}, false
+	}
+	srv, err := sut.Start(s.Cfg, name, "h1", tier, env, 0)
+	if err != nil {
+		fail(err)
+		return twelve.Window{}, sut.Usage{}, false
+	}
+	defer sut.Stop()
+	d := &twelve.Driver{Base: "http://127.0.0.1:8080", Tokens: tokens, SourceIPs: 8}
+	up := max(ramp, time.Duration(users-1000)*time.Millisecond)
+	smp := srv.Sample(time.Second, true)
+	self := sut.StartSampler("/sys/fs/cgroup", time.Second, false)
+	windows := d.Run([]twelve.Step{{Users: 1000, Ramp: ramp, Hold: 30 * time.Second}, {Users: users, Ramp: up, Hold: hold}},
+		func(twelve.Window) bool { return false })
+	u := smp.Stop()
+	lu := self.Stop()
+	if len(windows) < 2 {
+		fail(fmt.Errorf("no window at %d users", users))
+		return twelve.Window{}, u, false
+	}
+	w := windows[len(windows)-1]
+	c := s.twelveCase(name, tier, w, u, lu.CPU)
+	c.Param = fmt.Sprintf("users=%d (bisect)", users)
+	exited, _ := srv.Exited()
+	if n := s.note(srv, 0); n != "" {
+		c.Note = strings.TrimPrefix(c.Note+"; "+n, "; ")
+	}
+	s.record(c)
+	return w, u, w.Pass() && !exited && srv.OOMEvents() == 0
 }
 
 // windowUsage is the peak memory and mean CPU of the samples in [from, to).
@@ -181,4 +264,41 @@ func lastLines(s string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, " | ")
+}
+
+// LoadTwelveBrackets reads an earlier $12 run's windows and keeps, per tier
+// and server, the most users that passed and the fewest that failed, for
+// servers that failed somewhere (one that passed every step has no bracket).
+// A bisection probe that ended with the server gone counts as failed.
+func (s *Suite) LoadTwelveBrackets(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lo, hi := map[string]int{}, map[string]int{}
+	for _, line := range strings.Split(string(b), "\n") {
+		var c Case
+		if json.Unmarshal([]byte(line), &c) != nil || c.Scenario != "twelve" || c.Error != "" {
+			continue
+		}
+		var users int
+		if _, err := fmt.Sscanf(c.Param, "users=%d", &users); err != nil {
+			continue
+		}
+		k := c.Tier + "|" + c.Server
+		failed := strings.Contains(c.Note, "failed the thresholds") ||
+			(strings.HasSuffix(c.Param, "(bisect)") && (strings.Contains(c.Note, "server ") || strings.Contains(c.Note, "OOM")))
+		if failed {
+			if hi[k] == 0 || users < hi[k] {
+				hi[k] = users
+			}
+		} else if users > lo[k] {
+			lo[k] = users
+		}
+	}
+	s.TwelveBrackets = map[string][2]int{}
+	for k, h := range hi {
+		s.TwelveBrackets[k] = [2]int{min(lo[k], h), h}
+	}
+	return nil
 }

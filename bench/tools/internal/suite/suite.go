@@ -62,19 +62,22 @@ type Case struct {
 }
 
 type Suite struct {
-	Cfg       sut.Config
-	BenchDir  string
-	Out       string
-	Profile   Profile
-	Servers   []string
-	Tiers     []sut.Tier
-	LoadCPUs  int
+	Cfg      sut.Config
+	BenchDir string
+	Out      string
+	Profile  Profile
+	Servers  []string
+	Tiers    []sut.Tier
+	LoadCPUs int
 	// Modes, when set, limits raw to those server modes (h1, tls, h2c, h3).
-	Modes     []string
-	mu        sync.Mutex
-	cases     []Case
-	f         *os.File
-	manifests map[string]sut.Manifest
+	Modes []string
+	// TwelveBrackets, when set, makes the $12 scenario refine an earlier
+	// run: per "tier|server", the users that passed and the users that failed.
+	TwelveBrackets map[string][2]int
+	mu             sync.Mutex
+	cases          []Case
+	f              *os.File
+	manifests      map[string]sut.Manifest
 }
 
 func New(cfg sut.Config, benchDir, out string, p Profile, servers []string, tiers []sut.Tier, loadCPUs int) (*Suite, error) {
