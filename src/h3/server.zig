@@ -935,6 +935,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             close_next_reply: u32 = 1,
             /// When the closing or draining period ends.
             period_end: u64 = 0,
+            /// The peer closed the connection, and the streams have yet to
+            /// hear of it: the driver tells them (`wakeStreams`).
+            wake_pending: std.atomic.Value(bool) = .init(false),
             /// The request streams. An array map: removing leaves no
             /// tombstones behind, which in a hash map with a stream opening
             /// and one closing for every request soon made each insert and
@@ -1141,7 +1144,15 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (rv != 0) {
                     switch (rv) {
                         c.NGTCP2_ERR_DRAINING => {
-                            conn.enterPeriod(.draining);
+                            // The peer closed. What it sent just before
+                            // (a WebTransport session's close capsule, a
+                            // request's last bytes) may still be with the
+                            // tasks that earlier packets of this batch
+                            // woke, so the streams hear of the end from
+                            // the driver, after those have run, not here.
+                            conn.state = .draining;
+                            conn.period_end = now(conn.ep.io) + 3 * c.ngtcp2_conn_get_pto2(conn.q);
+                            conn.wake_pending.store(true, .monotonic);
                             conn.kick();
                             return;
                         },
@@ -1179,6 +1190,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return;
                     };
                     const gen = conn.gen.load(.acquire);
+                    if (conn.wake_pending.load(.monotonic)) {
+                        conn.lock();
+                        if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
+                        conn.unlock();
+                    }
                     const flushed_at = conn.flush();
 
                     conn.lock();
