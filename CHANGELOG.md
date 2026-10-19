@@ -28,7 +28,9 @@ for macOS and Linux.
   `group` and the new `with` (middleware for some routes, no prefix).
 - `anole.noWait(handler)` marks a handler (and its route's middleware) as
   never waiting: on HTTP/2 its whole requests run on the connection's reader
-  without a task, the responses to one read in one write.
+  without a task, the responses to one read in one write. gRPC takes it per
+  registration: `app.grpcWith(Service, impl, .{ .no_wait = true })` for
+  unary methods.
 - `anole.client(req)` / `app.client()`: the server's pooled outbound HTTP
   client, with inline headers and `response.json(T, allocator)`.
 - `anole.Server(Ctx)`: one call sets up the zio runtime (one pinned executor

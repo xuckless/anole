@@ -120,7 +120,9 @@ pub fn main(init: std.process.Init) !void {
         .http = .{ .address = "127.0.0.1", .port = port, .h2c = true },
     }, {});
     defer app.deinit();
-    anole.grpc.register(void, app.router, TestService, .{
+    // The unary handlers here never wait, so they run without a task on
+    // HTTP/2 (`no_wait`), and the interop suites cover that path.
+    anole.grpc.registerWith(void, app.router, TestService, .{
         .EmptyCall = emptyCall,
         .UnaryCall = unaryCall,
         .CacheableUnaryCall = unaryCall,
@@ -129,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
         .FullDuplexCall = fullDuplexCall,
         .HalfDuplexCall = halfDuplexCall,
         .UnimplementedCall = unimplemented,
-    });
+    }, .{ .no_wait = true });
     std.log.info("interop server on 127.0.0.1:{d} ({s})", .{ port, if (cert_path != null) "TLS" else "h2c" });
     try app.run();
 }
