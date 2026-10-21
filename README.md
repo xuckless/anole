@@ -268,6 +268,8 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
     database and reads on the blocking pool;
   - MongoDB, Anole's own client on the drivers' specifications (OP_MSG,
     SCRAM, replica-set discovery, retryable writes) with a Zig BSON codec;
+  - Redis and Valkey (plain or TLS), with pipelines, `acquire` for
+    WATCH/MULTI and pub/sub, under the same shape (`-Dredis`);
   - one shared shape: a pool per core, calls take the request first
     (`app.db.all(Post, req, sql, .{args})`), request deadlines cancel
     queries, and rows land in the request's arena;
@@ -321,6 +323,9 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dauth=bool` | false | true | true | JWT, OIDC, CSRF, passwords, API keys, RBAC |
 | `-Djson=bool` | false | true | true | yyjson |
 | `-Dredis=bool` | false | false | true | hiredis (Redis/Valkey client, stores) |
+| `-Dpostgres=bool` | false | true | true | PostgreSQL client (pg.zig fork) |
+| `-Dsqlite=bool` | false | true | true | SQLite (amalgamation, zig-sqlite fork) |
+| `-Dmongodb=bool` | false | false | true | MongoDB client and BSON |
 
 Constraints:
 - gRPC needs HTTP/2, so `-Dhttp2=false` turns gRPC off. Asking for both
@@ -372,16 +377,19 @@ set up this way, and CI builds it from an empty cache on every push.
 - [docs/server.md](docs/server.md): listeners, TLS, HTTP/2, HTTP/3, draining,
   restarts, socket activation, proxies.
 - [docs/routing.md](docs/routing.md): routes, middleware, requests and
-  responses, errors, static files, compression, timeouts and limits.
+  responses, errors, static files, compression, the response cache,
+  timeouts and limits.
 - [docs/websocket.md](docs/websocket.md),
   [docs/webtransport.md](docs/webtransport.md), [docs/grpc.md](docs/grpc.md),
   [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
   [docs/observability.md](docs/observability.md).
-- [docs/database.md](docs/database.md): PostgreSQL, SQLite and MongoDB,
-  the calls every connector shares, errors as statuses, transactions, pools.
+- [docs/database.md](docs/database.md): PostgreSQL, SQLite, MongoDB and
+  Redis, the calls every connector shares, errors as statuses,
+  transactions, pools, coalescing and caching.
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,
   `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`,
-  `sqlite`, `mongodb`, and `full` (every listener and option spelled out).
+  `sqlite`, `mongodb`, `redis`, and `full` (every listener and option
+  spelled out).
 - [CHANGELOG.md](CHANGELOG.md) and [MAINTAINING.md](MAINTAINING.md): pins,
   forks, the Zig version policy, releases.
 

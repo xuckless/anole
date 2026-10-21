@@ -6,6 +6,23 @@ back as your structs in the request's arena (nothing to free), and a
 database error becomes an HTTP status. The SQL stays yours: there is no
 query builder.
 
+Each connector is a build flag, downloaded and compiled only when it is on:
+
+| Connector | Flag | Profiles | Handle |
+| --- | --- | --- | --- |
+| [PostgreSQL](#postgresql) | `-Dpostgres` | `web`, `full` | `anole.pg.Db`, from `app.postgres(.{})` |
+| [SQLite](#sqlite) | `-Dsqlite` | `web`, `full` | `anole.sqlite.Db`, from `app.sqlite("app.db")` |
+| [MongoDB](#mongodb) | `-Dmongodb` | `full` | `anole.mongodb.Client`, from `app.mongodb(.{})` |
+| [Redis and Valkey](#redis-and-valkey) | `-Dredis` | `full` | `anole.redis.Client`, from `app.redis(.{})` |
+
+A flag overrides the profile: `-Dprofile=web -Dmongodb=true` adds MongoDB,
+`-Dpostgres=false` drops PostgreSQL. Calling `app.mongodb` (or another
+connector's) in a build without it is a compile error that names the flag.
+Choose them where you add the dependency, as for the other
+[build flags](server.md#build-flags).
+
+The calls:
+
 | Call | Returns |
 | --- | --- |
 | `exec(req, sql, args)` | rows changed (`u64`) |
@@ -16,7 +33,18 @@ query builder.
 | `begin(req, opts)` | a transaction: the same calls, `commit()`, `rollback()`, `deinit()` |
 | `transaction(req, opts, func, args)` | `func(&tx, args...)`, committed, retried after a serialization failure |
 | `acquire(req)` | the driver's own connection, given back with `release()` |
-| `with(.{ .timeout, .prepare })` | the same calls with options |
+| `with(.{ .timeout, .prepare, .coalesce, .cache })` | the same calls with options; see [Caching](#caching) |
+
+Each connector has the calls its database can do:
+
+| | PostgreSQL | SQLite | MongoDB | Redis |
+| --- | --- | --- | --- | --- |
+| `exec` | yes | yes | `db(name).exec(req, command)` | `command(req, args)` |
+| `one`, `optional`, `all` | yes | yes | yes, on a collection | yes |
+| `iterate` | yes | yes | yes, a cursor | no |
+| `begin`, `transaction` | yes | yes | not yet | no; MULTI in a `pipeline` |
+| `acquire` | yes | yes, the writer | no | yes |
+| `with` | yes | yes | on a collection or `db(name)` | yes |
 
 `args` is a tuple: `.{ id, name }`. Outside a handler (startup, a
 background task) pass an `anole.db.Ctx` instead of the request:
@@ -157,7 +185,7 @@ state.db = try app.postgres(.{ .errors = .{ .foreign_key = .unprocessable_entity
 Or catch one case in the handler:
 
 ```zig
-app.db.exec(req, "INSERT INTO users (email) VALUES ($1)", .{email}) catch |err| {
+_ = app.db.exec(req, "INSERT INTO users (email) VALUES ($1)", .{email}) catch |err| {
     if (err == error.Conflict) return res.fail(.conflict, "that email is taken");
     return err;
 };
@@ -209,6 +237,9 @@ try tx.commit();
   it); `TxOptions.timeout` a whole transaction. The server's own
   `statement_timeout` (`?options=-c%20statement_timeout%3D5s`) is a 504
   as well.
+- **Shared and cached reads.** `with(.{ .coalesce = true })` and
+  `with(.{ .cache = .{ .ttl = ... } })`, off by default: see
+  [Caching](#caching).
 - **Handlers that wait.** A database call suspends the handler's
   coroutine, never the thread. Don't mark such routes `anole.noWait`.
 - **Raw access.** `app.db.acquire(req)` hands over pg.zig's connection
@@ -245,8 +276,10 @@ zig build test-postgres -Dpostgres-test-url='postgres://postgres:pw@127.0.0.1:54
 
 ## SQLite
 
-SQLite is compiled into your program (the amalgamation, 3.54.1): no server,
-no install, one file.
+Built in with `-Dsqlite` (on in the `web` and `full` profiles). SQLite is
+compiled into your program (the amalgamation, 3.54.1, through Anole's fork
+of [zig-sqlite](https://github.com/vrischmann/zig-sqlite)): no server, no
+install, one file.
 
 ```zig
 const App = struct { db: *anole.sqlite.Db = undefined };
@@ -315,7 +348,9 @@ no statement runs on an executor:
 Each connection runs with `journal_mode=WAL`, `synchronous=NORMAL`,
 `busy_timeout=5000` and `foreign_keys=ON`. Prepared statements are kept per
 connection, by SQL text (64 by default; `.prepare = false` for SQL built at
-run time).
+run time). `with(.{ .timeout })` bounds a call, interrupting the statement
+past it; `.coalesce` and `.cache` share and keep reads, as for every
+connector ([Caching](#caching)).
 
 ### Transactions
 
@@ -334,7 +369,14 @@ write on the `Db` would wait for the transaction's own writer. `transaction`
 runs again after `SQLITE_BUSY` (another process held the file past
 `busy_timeout_ms`, as during a restart), up to `retries` more times.
 `begin(req, .{ .read_only = true })` is a snapshot on a reader that writes
-do not disturb.
+do not disturb. By hand, `commit` and `rollback` take the request too:
+
+```zig
+var tx = try app.db.begin(req, .{});
+defer tx.deinit(); // rolls back unless committed
+_ = try tx.exec(req, "DELETE FROM notes WHERE done = 1", .{});
+try tx.commit(req);
+```
 
 ### Options
 
@@ -397,8 +439,10 @@ Built in with `-Dmongodb` (in the `full` profile): Anole's own client on
 handshake, SCRAM, the connection string, server discovery and monitoring,
 connection pooling, sessions, retryable reads and writes), with documents
 in BSON (`anole.bson`). TLS goes through the same BoringSSL as the rest of
-Anole. MongoDB 4.2 and later; CI runs 7.0, 8.0 and 9.0. `examples/mongodb` is
-a small users API:
+Anole. MongoDB 4.2 and later. CI tests 7.0 on ubuntu-latest, and 8.0 and
+9.0 only on ubuntu-22.04: they do not run on newer Linux kernels yet (see
+[below](#testing-against-mongodb)). `examples/mongodb` is a small users
+API:
 
 ```sh
 docker run --rm -d --name mongo -p 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
@@ -415,7 +459,7 @@ pub fn main(init: std.process.Init) !void {
     var state: App = undefined;
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
-    state.mongo = try app.mongodb(.{ .environ = init.minimal.environ }); // MONGODB_URI
+    state.mongo = try app.mongodb(.{}); // MONGODB_URI
     _ = app.metrics(.{}); // pool and command metrics
     _ = app.health(.{}); // /readyz pings the primary
     app.get("/users/:id", get);
@@ -484,7 +528,7 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
 
 | Call | Returns |
 | --- | --- |
-| `find(T, req, filter, opts)` | every match (`[]T`); options `sort`, `projection`, `skip`, `limit`, `batch_size`, `hint`, `collation`, `comment`, `allow_disk_use`, `let` |
+| `find(T, req, filter, opts)` | every match (`[]T`); options `sort`, `projection`, `skip`, `limit`, `batch_size`, `hint`, `collation`, `comment`, `allow_disk_use`, `let`, `max`, `min`, `return_key`, `show_record_id` |
 | `findOne(T, req, filter, opts)` | the first match; none is `error.NotFound` (404) |
 | `findOptional(T, req, filter, opts)` | the first match, or null |
 | `iterate(T, req, filter, opts)` | a cursor: `while (try cur.next()) \|doc\|`, then `deinit()` |
@@ -497,9 +541,13 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
 | `deleteOne`, `deleteMany(req, filter, opts)` | `deleted_count` |
 | `findOneAndUpdate`, `findOneAndReplace`, `findOneAndDelete(T, req, ...)` | the document before (or, with `.return_document = .after`, after), or null |
 | `createIndex(req, keys, opts)`, `dropIndex(req, name)`, `drop(req)` | indexes and the collection |
-| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document` |
+| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document`; `db(name).exec` is the same call under the shared verb's name |
 | `one`, `optional`, `all` | the shared verbs: `findOne`, `findOptional`, `find` without options |
-| `with(.{ .timeout })` | the same calls with a timeout of their own |
+| `with(.{ .timeout })` | the same calls with a timeout of their own (on a collection or a `db(name)`) |
+| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
+
+There are no transactions yet: each call stands alone, and is retried on
+its own.
 
 `client.collection(name)` is in the connection string's database (else
 `"test"`, as the drivers do); `client.db(name).collection(name)` names
@@ -550,19 +598,342 @@ command's name as the operation, the collection as the target), and a
 `/readyz` check that fails when the primary does not answer a `ping`
 (checked at most once a second).
 
-### Testing against a server
+### Testing against MongoDB
 
 `tests/mongodb/run.sh [image]` starts MongoDB in Docker (`mongo:8.0` by
-default; CI runs 7.0, 8.0 and 9.0) as a replica set of one with
-authentication and test commands on, with a CA and certificate made for
-the run, and runs `zig build test-mongodb` three times: SCRAM-SHA-256,
-SCRAM-SHA-1, and over TLS. MongoDB 8.0.21 and later and 9.x refuse to
-start on Linux kernels 6.19 to 7.0.13 (a TCMalloc incompatibility,
+default) as a replica set of one with authentication and test commands on,
+with a CA and certificate made for the run, and runs `zig build
+test-mongodb` three times: SCRAM-SHA-256, SCRAM-SHA-1, and over TLS.
+
+MongoDB 8.x and 9.x are tested only on `ubuntu-22.04` (kernel 6.8). They do
+not run on Linux kernels from 6.19 to 7.0.13, which newer runners and
+distributions ship: 8.0.21 and later and every 9.x refuse to start there
+(TCMalloc and rseq,
+[SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912),
 [SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742)), and
-earlier 8.0 releases crash there; the script says so when it sees it.
-On such a host use `mongo:7.0` or a kernel from 7.0.14 (CI runs 8.0 and
-9.0 on `ubuntu-22.04`, kernel 6.8). Against a server of your own:
+earlier 8.0 releases start but crash within minutes. The script says so
+when it sees it. On such a host test with `mongo:7.0`, which CI runs on
+`ubuntu-latest`, or use a kernel before 6.19 or from 7.0.14. Against a
+server of your own:
 
 ```sh
 zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?replicaSet=rs0&authSource=admin'
 ```
+
+## Redis and Valkey
+
+Built in with `-Dredis` (on in the `full` profile). hiredis parses the
+replies; the connections, pools and TLS are Anole's, the same shape as
+the other connectors: a handle in your App state, the request first,
+replies in the request's arena, errors as statuses. `examples/redis` has a
+counter, a cache, a leaderboard and pub/sub streamed as Server-Sent Events:
+
+```sh
+docker run --rm -d -p 6379:6379 redis:7     # or valkey/valkey:8
+zig build run-redis                         # REDIS_URL, else redis://127.0.0.1:6379
+```
+
+### Setup
+
+```zig
+const App = struct { cache: *anole.redis.Client };
+
+pub fn main(init: std.process.Init) !void {
+    var state: App = undefined;
+    var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
+    defer app.deinit();
+    state.cache = try app.redis(.{}); // REDIS_URL
+    _ = app.metrics(.{}); // pool and command metrics
+    _ = app.health(.{}); // /readyz sends PING
+    app.get("/hits", hits);
+    try app.listen(":3000");
+}
+```
+
+`app.redis` reads `.url`, else `REDIS_URL`, else `redis://127.0.0.1:6379`,
+and like `app.postgres` opens nothing before a handler needs it
+(`.connect_at_start = true` to refuse to start without the server). The
+URL is the one go-redis and redis-py take:
+
+| URL | |
+| --- | --- |
+| `redis://host:6379/2` | plain text, database 2 (SELECT); `?db=2` works too |
+| `redis://:password@host` | AUTH with the password (the default user) |
+| `redis://user:password@host` | AUTH as an ACL user (Redis 6+, Valkey) |
+| `rediss://...` | TLS, the certificate checked against the system's store |
+| `rediss://...?ssl_ca_certs=/etc/ca.pem` | ... against this CA instead (or `.tls.ca`) |
+| `rediss://...?ssl_certfile=c.pem&ssl_keyfile=k.pem` | a client certificate (or `.tls.client_certificate`) |
+| `rediss://...?ssl_cert_reqs=none` | any certificate: a managed server with a self-signed one |
+| `unix:///run/redis.sock?db=0` | a Unix socket |
+
+`anole.redis.Options` has the rest: `max_connections` (ten per executor),
+`acquire_timeout` (5 s), `connect_timeout` (10 s), `idle_timeout` (5 min:
+an idle connection older than this is replaced, in case a proxy dropped
+it), `errors`, `name` (the `db` label, `"redis"`). Redis Cluster and
+Sentinel are not supported; a URL with several hosts is refused.
+
+### Handlers
+
+```zig
+fn hits(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    try res.json(.{ .hits = try app.cache.incr(req, "hits") });
+}
+
+const Profile = struct { name: []const u8, visits: u32, plan: enum { free, pro } = .free };
+
+fn profile(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const id = req.params.get("id") orelse return error.NotFound;
+    const key = try std.fmt.allocPrint(req.arena, "user:{s}", .{id});
+    try res.json(try app.cache.hgetAll(Profile, req, key)); // no such hash: 404
+}
+
+fn page(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    if (try app.cache.get(req, "page:/")) |body| {
+        res.body = body;
+        return;
+    }
+    const body = try render(req); // the slow part
+    _ = try app.cache.set(req, "page:/", body, .{ .ttl = .fromSeconds(30) });
+    res.body = body;
+}
+```
+
+Any command goes through `command`, which returns the `Reply`, or through
+the typed calls, which read it into your type:
+
+| Call | Returns |
+| --- | --- |
+| `command(req, .{ "INCR", key })` | the `Reply` (`.int`, `.string`, `.array`, `.nil`...) |
+| `one(T, req, args)` | the reply as a `T`; nil (or an empty hash, for a struct) is `error.NotFound` (404) |
+| `optional(T, req, args)` | the reply as a `T`, or null |
+| `all(T, req, args)` | an array reply as `[]T` |
+| `pipeline(req, .{ cmd1, cmd2 })` | every reply, in one round trip |
+| `acquire(req)` | one connection for several calls, given back with `release()` |
+| `subscribe(req, channels)`, `psubscribe` | a pub/sub connection of its own |
+| `with(.{ .timeout })` | the same calls, bounded |
+| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
+
+The arguments are a tuple: strings as they are (binary-safe), numbers in
+decimal, `bool` as 1 or 0, enums by name, null left out, slices and
+nested tuples item by item, and a struct as its field names and values:
+`.{ "HSET", key, profile }`, `.{ "DEL", keys }`, `.{ "SET", key, value, "EX", 60 }`.
+Replies read into integers (from integers or numeric strings), floats,
+`bool` (1/0, OK), `[]const u8`, enums, slices (`all(?[]const u8, req, .{ "MGET", keys })`),
+structs (from a hash, by field name; a missing field keeps its default or
+is `error.MissingColumn`) and optionals.
+
+For what most apps do there are helpers: `get`, `set` (`.ttl`, `.nx`, `.xx`,
+`.keep_ttl`; false when NX/XX kept it from being set), `del`, `incr`,
+`incrBy`, `expire`; `hget`, `hset` (from a struct), `hgetAll` (into one),
+`hdel`, `hincrBy`; `lpush`, `rpush`, `lrange`; `sadd`, `srem`, `smembers`,
+`sismember`; `zadd`, `zincrBy`, `zscore`, `zrem`, `zrange`,
+`zrangeWithScores` (a leaderboard: `zrangeWithScores(req, "board", 0, 9, .{ .rev = true })`);
+`publish`. Everything else is `command` or a typed call.
+
+`.coalesce` and `.cache` apply to `one`, `optional` and `all` and the
+read helpers (`get`, `hget`, `hgetAll`, `lrange`, `smembers`,
+`sismember`, `zscore`, `zrange`, `zrangeWithScores`) when the command
+only reads: `GET`, `MGET`, `HGETALL`, `ZRANGE` and the other names in
+`anole.redis.read_commands`. Every other command, `command`, pipelines,
+pub/sub and calls on an `acquire`d connection run as they are, whatever
+the options. A nil reply is a reply, and kept.
+
+```zig
+const profile = try app.cache.with(.{ .cache = .{ .ttl = .fromSeconds(30), .tag = "profiles" } }).hgetAll(Profile, req, key);
+// After a write:
+_ = try app.cache.hset(req, key, changed);
+app.cache.cache.invalidate(.{ .tag = "profiles" });
+```
+
+### Pipelines and transactions
+
+```zig
+// One round trip; MULTI ... EXEC makes it atomic.
+const r = try app.cache.pipeline(req, .{ .{"MULTI"}, .{ "INCR", key }, .{ "EXPIRE", key, 60 }, .{"EXEC"} });
+const count = r[3].array[0].int;
+```
+
+A pipeline fails with its first error reply, after every reply was read,
+so the connection stays usable; errors inside EXEC's reply come back as
+`.err` replies. WATCH needs one connection across round trips:
+
+```zig
+var conn = try app.cache.acquire(req);
+defer conn.release();
+_ = try conn.command(req, .{ "WATCH", key });
+const stock = try conn.one(i64, req, .{ "GET", key });
+const r = try conn.pipeline(req, .{ .{"MULTI"}, .{ "SET", key, stock - 1 }, .{"EXEC"} });
+if (r[2] == .nil) return error.Conflict; // the key changed: nothing was set
+```
+
+A connection that a call leaves inside MULTI or WATCH, on another
+database (SELECT), subscribed, or with other connection state (`CLIENT
+SETNAME`, `CLIENT TRACKING`...) is closed rather than given to the next
+call.
+
+### Pub/sub
+
+```zig
+fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    req.setTimeout(.none); // a stream
+    const sub = try app.cache.subscribe(req, "room:lobby");
+    defer sub.close();
+    var buf: [1024]u8 = undefined;
+    var stream = try res.startEventStream(&buf);
+    while (try sub.next(req)) |msg| try stream.send(msg.payload, .{});
+    try stream.body.end();
+}
+
+fn post(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    try res.json(.{ .receivers = try app.cache.publish(req, "room:lobby", (try req.body()).?) });
+}
+```
+
+A subscriber has a connection of its own, outside the pools, confirmed by
+the server when `subscribe` returns. `next` waits for a message (valid
+until the next `next`) and returns null once nothing is subscribed, after
+`stop()` (from any task), or when the server starts to drain, so a stream
+like the one above ends in time. `subscribe`, `psubscribe`, `unsubscribe`
+and `punsubscribe` on the subscriber change what it listens to without
+waiting, even while another task waits in `next`.
+
+### Errors and timeouts
+
+| Reply or failure | Error | Status |
+| --- | --- | --- |
+| nil from `one` | `NotFound` | 404 |
+| `LOADING`, `MASTERDOWN`, `BUSY`, `READONLY`, `OOM`, `TRYAGAIN`, `CLUSTERDOWN`, `NOREPLICAS`, `MISCONF`; a refused login (`WRONGPASS`, `NOAUTH`); no connection (refused, pool busy past `acquire_timeout`) | `ServiceUnavailable` | 503 |
+| a call past `with(.{ .timeout })` | `GatewayTimeout` | 504 |
+| any other error reply (`WRONGTYPE`, `ERR`, a script's), a reply that does not fit the type asked for | `Database` | 500 |
+
+`anole.db.lastError(req)` has the server's message (`.code` is its first
+word, `WRONGTYPE`), and `.errors` moves a class, as for PostgreSQL. A
+call canceled in flight (the request's deadline, an HTTP/2 reset,
+`with(.{ .timeout })`) closes its connection, since the reply may still
+be on its way; the next call opens another. A blocking command
+(`BLPOP`, `XREAD BLOCK`) holds its pooled connection while it waits, so
+give it a `timeout` of its own or `acquire` one.
+
+### Sessions and rate limits
+
+`anole.session.RedisStore` and `anole.ratelimit.RedisLimiter` take the
+same client and use its pools ([auth.md](auth.md)):
+
+```zig
+var sessions: anole.session.RedisStore = .{ .client = state.cache, .gpa = gpa };
+var limits: anole.ratelimit.RedisLimiter = .{ .client = state.cache, .gpa = gpa };
+```
+
+### Observability
+
+With `app.metrics`, the series of the PostgreSQL section appear with
+`system="redis"` (command times, errors by name, the pools); with
+`app.tracing`, each call in a traced request is a client span named after
+the command (`PIPELINE` for a pipeline); with `app.health`, `/readyz`
+fails while the server does not answer PING (checked at most once a
+second).
+
+### Testing against a server
+
+`tests/redis/run.sh` starts `redis:7` (or `REDIS_IMAGE=valkey/valkey:8`)
+in Docker, with a CA and certificate made for the run, and runs
+`zig build test-redis` twice: in plain text as the default user, and over
+TLS as an ACL user on database 1. Against a server of your own:
+
+```sh
+zig build test-redis -Dredis-test-url='redis://127.0.0.1:6379'
+```
+
+## Caching
+
+Two opt-in options on the reads (`one`, `optional`, `all`) of every
+connector, and on MongoDB's `find`, `findOne`, `findOptional`, `distinct`,
+`estimatedDocumentCount`, `countDocuments` and `aggregate` (a pipeline
+written as a tuple of stages that ends in neither `$out` nor `$merge`;
+any other runs unshared), and on Redis's read commands and read helpers
+([above](#redis-and-valkey)). Nothing is shared or cached unless a call asks: a call without
+them is the plain call, with nothing added (no key, no lookup, no
+allocation).
+
+```zig
+// Identical reads in flight at once share one round trip.
+const feed = try app.db.with(.{ .coalesce = true }).all(Post, req, feed_sql, .{limit});
+
+// The result kept for 5 s and served from memory meanwhile.
+const top = try app.db.with(.{ .cache = .{ .ttl = .fromSeconds(5), .tag = "posts" } }).all(Post, req, top_sql, .{});
+
+// After a write: drop what it changed, on every executor.
+_ = try app.db.exec(req, "INSERT INTO posts (body) VALUES ($1)", .{body});
+app.db.cache.invalidate(.{ .tag = "posts" });
+```
+
+**Coalescing** (`.coalesce = true`): calls on one executor that are
+identical (the same connector, statement, arguments, verb and row type)
+and in flight at the same time run the statement once. Each caller waits
+under its own deadline and cancellation and gets its own copy of the rows
+in its own arena. A caller that is canceled or runs out of time leaves on
+its own; the others still get the rows. When every caller has left, the
+statement is canceled as a plain call's would be (a CancelRequest for
+PostgreSQL, an interrupt for SQLite, a closed connection for MongoDB). Errors reach every caller, with the
+detail in `lastError(req)`.
+
+**Result cache** (`.cache = .{ .ttl, .tag }`): the result is kept per
+executor for `ttl` and copied into the caller's arena on a hit. A miss
+coalesces, so a burst of misses for one key runs the statement once per
+executor. Errors are never kept (`one`'s `NotFound` included); an empty
+result from `optional` or `all` is a result and is kept.
+
+**Invalidation**: `app.db.cache.invalidate(.all)`, `.invalidate(.{ .tag =
+"posts" })` for the results cached with that tag, or
+`.invalidateQuery(sql, .{args})` for one statement's results (for
+MongoDB, invalidate by tag: `app.mongo.cache.invalidate(.{ .tag = "users" })`;
+for Redis, the command's name, then the rest:
+`app.cache.cache.invalidateQuery("GET", .{key})`). It reaches
+every executor at once, including a statement still running: a result read
+before the invalidation is not kept, and a caller arriving after it does
+not join that statement.
+
+**Coherence**: each executor keeps its own results (no lock between
+threads on the way), so two executors may answer from results read up to
+`ttl` apart, and a write shows in the cache only after `ttl` or an
+invalidation. Coalescing has a smaller window of its own: a caller that
+joins a statement already running gets what that statement reads, which
+may predate a write that committed a moment before the caller arrived,
+unless that write invalidated.
+
+Bounds are per connector, split between the executors, and least recently
+used results go first: `.cache = .{ .max_entries = 4096, .max_bytes = 32 << 20 }`
+in the connector's options (`app.postgres(.{ .cache = ... })`,
+`app.sqlite(.{ .path = ..., .cache = ... })`, `app.mongodb(.{ .cache = ... })`,
+`app.redis(.{ .cache = ... })`). A result larger than an
+executor's share is not kept. With `app.metrics`, each cache reports
+`anole_cache_hits_total`, `anole_cache_misses_total`,
+`anole_cache_coalesced_total`, `anole_cache_stores_total`,
+`anole_cache_evictions_total`, `anole_cache_entries` and
+`anole_cache_bytes`, labelled `kind="db"` and the database's name;
+`app.db.cache.stats()` has the same numbers.
+
+Rows are copied, so their types must be copyable: numbers, `bool`, enums,
+optionals, arrays, structs, tagged unions and slices of these (strings
+included). A row type with another kind of pointer (`std.json.Value`, a
+pointer to a single value) runs its calls unshared, with a warning logged
+once. Arguments are compared by value: `5` as a `u8` and as an `i64` are
+the same key, the string `"5"` is not; a MongoDB filter `.{ .age = 18 }`
+is not `.{ .score = 18 }`.
+
+When not to use them:
+
+- Anything that must see its own or another request's write at once
+  (read-your-writes, balances, stock counts), unless every write
+  invalidates what it changes.
+- Per-user data with the user in the key only through a session, not the
+  SQL arguments: the key is the statement and its arguments, so a read
+  that depends on who asks must take that as an argument.
+- Statements with side effects (`nextval`, `INSERT ... RETURNING` through
+  `one`): the statement runs once for all the callers that share it.
+- Large or one-off results: each kept result takes memory on every
+  executor that reads it, and a cache that never hits only adds a copy.
+- Transactions: calls on a `Tx` are never shared.
+
+For whole responses rather than rows, see `ResponseCache` in
+[routing.md](routing.md#response-cache).

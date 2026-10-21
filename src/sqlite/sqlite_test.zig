@@ -319,6 +319,56 @@ test "sqlite: a file on 4 pinned executors: reads beside an open write transacti
     try testing.expectEqual(@as(i64, 0), db.in_use.load(.monotonic));
 }
 
+test "sqlite: coalesced and cached reads on 4 executors; invalidation after a write" {
+    var r: Runtime = undefined;
+    try r.init(4, 8);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Db.init(gpa, io, .{ .path = tmp.file("shared.db") });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+
+    // A read slow enough that the callers on each executor meet in flight.
+    const slow = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?) SELECT count(*) FROM n";
+    const Worker = struct {
+        fn run(d: *sqlite.Db, io_: std.Io, failures: *std.atomic.Value(u32)) void {
+            var sc: Scratch = undefined;
+            sc.init(io_);
+            defer sc.deinit();
+            const n = d.with(.{ .coalesce = true }).one(i64, &sc.ctx, slow, .{1_000_000}) catch 0;
+            if (n != 1_000_000) _ = failures.fetchAdd(1, .monotonic);
+        }
+    };
+    var failures: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..32) |n| try dusty.placement.concurrent(&group, io, .{ .executor = n % 4 }, Worker.run, .{ db, io, &failures });
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try testing.expectEqual(@as(u64, 28), db.cache.stats().coalesced);
+
+    // Cached until invalidated: a write does not show until then.
+    const cached: anole_db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(60), .tag = "notes" } };
+    const count = "SELECT count(*) FROM notes";
+    try testing.expectEqual(@as(i64, 0), try db.with(cached).one(i64, ctx, count, .{}));
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('new')", .{});
+    try testing.expectEqual(@as(i64, 0), try db.with(cached).one(i64, ctx, count, .{}));
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, count, .{}));
+    db.cache.invalidate(.{ .tag = "notes" });
+    try testing.expectEqual(@as(i64, 1), try db.with(cached).one(i64, ctx, count, .{}));
+    // Rows with strings come back whole, in the caller's arena.
+    const notes = try db.with(cached).all(Note, ctx, "SELECT id, title, done FROM notes", .{});
+    try testing.expectEqualStrings("new", notes[0].title);
+    try testing.expectEqualStrings("new", (try db.with(cached).all(Note, ctx, "SELECT id, title, done FROM notes", .{}))[0].title);
+    try testing.expectEqual(@as(u64, 2), db.cache.stats().hits);
+}
+
 test "sqlite: :memory: is one database seen from every executor" {
     var r: Runtime = undefined;
     try r.init(4, 2);

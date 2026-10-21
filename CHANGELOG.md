@@ -162,7 +162,9 @@ for macOS and Linux.
   close). The HTTP/3 client opens sessions too (`openWebTransport`).
   Checked against aioquic both ways, and in the interop runner's
   WebTransport mode against flupke (all seven cases); the browser images
-  have not been run yet.
+  have not been run yet. A session ends only through its CONNECT stream's
+  reader, so a peer that closes its session and then its connection at
+  once counts as `.peer`, with its code, in `closeInfo()`.
 - TLS through BoringSSL, built from source by Zig: TLS 1.3 and 1.2, ALPN,
   mutual TLS (with the acceptable CAs named in the request, and the client's
   certificate for handlers through `req.peerCertificate()` on HTTP/1.1,
@@ -267,6 +269,15 @@ for macOS and Linux.
   - The HTTP core's log scopes are `anole` (was `dusty`), `access` (was
     `dusty_access`) and `anole_h2` (was `dusty_h2`); a `log_scope_levels`
     entry naming `.dusty` should name `.anole`.
+- A response cache: `anole.cached(.{ .ttl }, handler)` for one route, or
+  `app.responseCache(.{})` (`anole.middleware.ResponseCache`) for several
+  through `with`, `group` or `use`. Answers to `GET` (and `HEAD` from a
+  kept `GET`) with a cacheable status and a body in memory are kept per
+  executor and served without running the handler; never one that sets a
+  cookie or says `no-store`, `no-cache` or `private`, and not for requests
+  that carry credentials unless `.authenticated`. `Cache-Control`'s
+  `s-maxage` or `max-age` sets how long, `Vary` is honoured, and
+  `invalidate(.all)` or `.{ .path }` reaches every executor at once.
 - Deprecated, removed after 0.1: reading `RequireJwt`'s claims from
   `req.session` (`"jwt_sub"` and the `.claims` mapping's keys) and the API
   key owner from `req.session.get("api_key_owner")`. Both are still set,
@@ -367,7 +378,97 @@ for macOS and Linux.
 - Sessions in memory or Redis/Valkey, and sealed cookie sessions;
   `anole.session.regenerate` issues a new session ID at sign-in.
 - Rate limiting with token buckets in memory or Redis and a 429 middleware.
-- JSON on yyjson and a Redis/Valkey client on hiredis.
+- `RedisStore` and `RedisLimiter` run on the Redis connector's pools
+  (`app.redis`), with their options as before.
+- JSON on yyjson.
+
+### Databases
+
+- One shape for every connector (`anole.db`, docs/database.md): the
+  handle lives in the App state, every call takes the request first (an
+  `anole.db.Ctx` outside a handler), and rows come back as your structs in
+  the request's arena, nothing to free. The verbs are shared: `exec`,
+  `one`, `optional`, `all`, `iterate`, `begin`, `transaction`, `acquire`,
+  and `with(.{ .timeout, .prepare, .coalesce, .cache })` for options per
+  call; each connector has the ones its database can do. A pool per
+  executor, the connection limit split between them, so no lock is shared
+  between threads. A request's deadline, a client gone or an HTTP/2 reset
+  cancels its query (PostgreSQL is sent a CancelRequest, SQLite's statement
+  is interrupted, a MongoDB or Redis connection is closed).
+- Errors are statuses: `NotFound` 404, `Conflict` 409 (unique and
+  exclusion violations, serialization failures and deadlocks),
+  `ServiceUnavailable` 503, `GatewayTimeout` 504, anything else `Database`
+  500. What the database said stays in the log and in
+  `anole.db.lastError(req)`, never in the response; `.errors`
+  (`anole.db.ErrorMap`) moves a class to another status, such as foreign
+  keys to 422.
+- Each connector reports to what the app has, in any order: `anole_db_*`
+  metrics labelled `system` and `db` (`app.metrics`), a client span per
+  call with OpenTelemetry's `db.*` attributes (`app.tracing`), and a check
+  behind `/readyz` (`app.health`). The server closes it after the drain.
+  `anole.db.Time` is a timestamp that reads and writes RFC 3339 in JSON.
+- PostgreSQL (`-Dpostgres`, on in `web` and `full`; `anole.pg`,
+  `app.postgres(.{})`): on Anole's fork of pg.zig, with TLS on BoringSSL
+  (libpq's `sslmode`s, `sslnegotiation=direct`, client certificates). The
+  connection comes from `.url`, `DATABASE_URL` or libpq's `PG*` variables.
+  Statements are prepared once per connection and kept; a canceled call
+  sends a CancelRequest; `transaction` runs again after a serialization
+  failure or a deadlock; `listener()` opens a connection for
+  `LISTEN`/`NOTIFY`. Checked against postgres:17 with scram-sha-256, in
+  plain text and with `sslmode=verify-full`.
+- SQLite (`-Dsqlite`, on in `web` and `full`; `anole.sqlite`,
+  `app.sqlite("app.db")`): the 3.54.1 amalgamation compiled in, through
+  Anole's fork of zig-sqlite. One writer thread per database owns the
+  read-write connection; reads run on the blocking pool over read-only
+  connections in WAL mode, and a read that turns out to write moves to the
+  writer. `:memory:` is one database for the whole app. A cancel or a
+  timeout interrupts the running statement, and `transaction` retries past
+  `SQLITE_BUSY`. `app.sqlite` starts the blocking pool when the app has
+  none.
+- MongoDB (`-Dmongodb`, on in `full`; `anole.mongodb`, `app.mongodb(.{})`):
+  Anole's own client on `std.Io`, written to MongoDB's driver
+  specifications: OP_MSG, SCRAM-SHA-256 and SCRAM-SHA-1 (PLAIN and X.509
+  too), the connection string (`MONGODB_URI`), server discovery and
+  monitoring with primary selection, pools per executor, implicit
+  sessions, retryable reads and writes, and TLS on BoringSSL. The calls
+  are the official drivers', with the request first (`find`, `findOne`,
+  `insertOne`, `updateMany`, `findOneAndUpdate`, `aggregate`, cursors,
+  counts, `distinct`, indexes, `runCommand`), with filters, updates and
+  pipelines as Zig literals. MongoDB 4.2 and later. CI runs 7.0 on
+  ubuntu-latest, and 8.0 and 9.0 on ubuntu-22.04 only: they do not run on
+  Linux kernels from 6.19 to 7.0.13 (SERVER-121912, SERVER-125742).
+- BSON (`anole.bson`, with `-Dmongodb`): documents checked once and then
+  read in place, a builder, struct mapping at compile time, Decimal128,
+  ObjectId and Extended JSON v2. The BSON corpus of
+  mongodb/specifications passes with no case skipped.
+- Redis and Valkey (`-Dredis`, on in `full`; `anole.redis`,
+  `app.redis(.{})`) on the same shape: `command`, `one`/`optional`/`all`
+  into your types, `pipeline`, `acquire` for WATCH and MULTI,
+  `subscribe`/`psubscribe` on a connection of their own that ends on the
+  drain, and helpers for strings, hashes (into and from structs), lists,
+  sets, sorted sets and `publish`. The URL as go-redis and redis-py read
+  it (`REDIS_URL`): `redis://`, `rediss://` (TLS on BoringSSL), `unix://`,
+  ACL users, the database to SELECT. hiredis only parses the replies.
+- Opt-in caches for reads, off unless a call asks, so a plain call costs
+  nothing extra: `with(.{ .coalesce = true })` makes identical reads in
+  flight on one executor share one round trip, each caller with its own
+  deadline and its own copy of the rows; `with(.{ .cache = .{ .ttl, .tag
+  } })` keeps a result per executor for `ttl`. `cache.invalidate(.all)`,
+  `.invalidate(.{ .tag })` and `.invalidateQuery(sql, args)` reach every
+  executor at once, a statement still running included. Bounded per
+  connector (`Options.cache`), with `anole_cache_*` metrics.
+- `anole.net.ClientStream`: the plain or TLS client socket the connectors
+  share (TCP or a Unix socket, `startTls` for PostgreSQL's SSLRequest).
+- `anole.blocking.runWith(io, .{ .on_cancel = ... }, func, args)`: a hook
+  called when the waiting caller is canceled while its job runs (SQLite
+  interrupts the statement there); a job whose caller was canceled before
+  it started no longer starts.
+- Breaking: `anole.redis.Client.connect(gpa, io, .{ .host, .port })` is
+  `app.redis(.{ .url = ... })` (or `anole.redis.Client.init`), `close` is
+  `deinit`, and `command` takes the request (or an `anole.db.Ctx`) and a
+  tuple, `.{ "SET", key, value }`, instead of an allocator and a slice of
+  strings. `-Dredis-test-url` joins `-Dredis-test-port` for the live
+  tests.
 
 ### Observability
 
@@ -383,14 +484,18 @@ for macOS and Linux.
   nanoseconds), and bucket bounds are checked. `/readyz` answers 503 to
   anything still routed during a drain. `Exporter.deinit` returns without
   waiting out `interval_ms`.
+- A metric registered twice under one name is one metric: `Registry`'s
+  `counter`, `gauge` and `histogram` return the family already there.
 - Breaking: `HttpMetrics.init` takes options, and `statusOf` the request.
 
 ### Build
 
 - Every bundled library sits behind a build flag (`-Dtls`, `-Dhttp2`,
   `-Dhttp3`, `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dcompression`, `-Dbrotli`,
-  `-Djson`, `-Dredis`) and presets (`-Dprofile=minimal|web|full`); what is off is
-  neither downloaded nor compiled.
+  `-Djson`, `-Dredis`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb`) and presets
+  (`-Dprofile=minimal|web|full`); what is off is neither downloaded nor
+  compiled. `web` has PostgreSQL and SQLite; `full` adds MongoDB and
+  Redis.
 - Release binaries of examples/full on x86_64 Linux: 5.0 MB with
   everything, 1.1 MB minimal. Brotli adds about 0.8 MB (its encoder and the
   122 KB dictionary with its lookup tables), so `-Dbrotli=false` is the
@@ -404,12 +509,16 @@ for macOS and Linux.
 - docs/from-fiber.md: Go Fiber v3's API next to Anole's, and what differs
   in Zig (arenas, error unions, no `recover`).
 - Guides for the server, routing, WebSockets, WebTransport, gRPC, clients,
-  auth and observability, with every Zig snippet compiled against the API.
+  databases, auth and observability, with every Zig snippet compiled
+  against the API.
 - Examples, each with `zig build run-<name>`: `hello` (the smallest
   server), `rest` (a JSON CRUD API behind an API-key middleware, checked
   by tests/rest_test.zig), `websocket`, `grpc`, `auth`, `clients`,
-  `observe`, `io`, and `full` (every listener and option spelled out; the
-  server that h2spec and the restart test drive).
+  `observe`, `io`, `postgres` (a posts API with a transaction), `sqlite`
+  (a to-do API), `mongodb` (a users API), `redis` (a counter, a cache, a
+  leaderboard and pub/sub as Server-Sent Events), and `full` (every
+  listener and option spelled out; the server that h2spec and the restart
+  test drive).
 
 ### Quality
 
@@ -422,8 +531,16 @@ for macOS and Linux.
   HTTP/2 and permessage-deflate, gRPC frames, metadata and timeouts,
   Connect GET messages, JSON, session cookies, traceparent, JWS and JWK
   Sets, OIDC discovery, token responses and ID token claims,
-  `LISTEN_FDS`), a clean-consumer build, and a weekly check of the C
-  libraries' pins against known advisories.
+  `LISTEN_FDS`, BSON and MongoDB's wire messages), a clean-consumer
+  build, and a weekly check of the C libraries' pins (SQLite's included)
+  against known advisories.
+- The database connectors against real servers in Docker: postgres:17
+  (plain and `verify-full` TLS), MongoDB 7.0, 8.0 and 9.0 as a replica set
+  (SCRAM-SHA-256, SCRAM-SHA-1 and TLS, retries through `failCommand`; 8.0
+  and 9.0 on ubuntu-22.04),
+  redis:7 and valkey:8 (plain, and TLS with an ACL user). MongoDB's
+  connection-string, URI-options and server discovery spec tests and the
+  BSON corpus run in `zig build test`.
 
 ### Not yet
 
@@ -432,5 +549,8 @@ for macOS and Linux.
   and per-session flow control), and checks against real browsers.
 - gRPC over HTTP/3; JSON transcoding of client and bidirectional streaming
   methods.
+- MongoDB: transactions, change streams, `mongodb+srv://`, read
+  preferences other than `primary`, `loadBalanced`, compression, and the
+  request's own deadline sent as `maxTimeMS`. Redis Cluster and Sentinel.
 - Benchmarks on a dedicated Linux machine (the first results, on a Mac, are
   in the README).

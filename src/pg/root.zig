@@ -107,6 +107,9 @@ pub const Options = struct {
     application_name: ?[]const u8 = null,
     /// What `/readyz` waits for the database's answer.
     ping_timeout: Duration = .fromSeconds(2),
+    /// The bounds of the results kept for calls with `.cache`
+    /// (`anole.db.QueryOptions`).
+    cache: db.CacheOptions = .{},
     /// Where `DATABASE_URL` and the `PG*` variables come from; null: the
     /// process's environment (`app.postgres` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
@@ -336,6 +339,9 @@ pub const Db = struct {
     connect_timeout: ?Duration,
     ping_timeout: Duration,
     connect_at_start: bool,
+    /// Calls with `.coalesce` or `.cache` (`with`), and `invalidate` for
+    /// cached results: `app.db.cache.invalidate(.{ .tag = "posts" })`.
+    cache: db.QueryCache,
     /// What verify-ca and verify-full trust, when not the system's store.
     store: if (has_tls) @FieldType(pg.TlsConfig, "store") else void = if (has_tls) null else {},
     /// The client certificate, when there is one.
@@ -360,7 +366,9 @@ pub const Db = struct {
             .connect_timeout = undefined,
             .ping_timeout = opts.ping_timeout,
             .connect_at_start = opts.connect_at_start,
+            .cache = try .init(gpa, io, .postgresql, opts.name, opts.cache),
         };
+        errdefer self.cache.deinit();
         errdefer self.arena.deinit();
         const a = self.arena.allocator();
         const s = try Settings.resolve(a, opts);
@@ -465,6 +473,8 @@ pub const Db = struct {
     /// `deinit` does it then).
     pub fn deinit(self: *Db) void {
         const gpa = self.gpa;
+        // First: a statement still running for the cache holds a connection.
+        self.cache.deinit();
         for (self.pools.pools) |*shard| shard.pool.deinit();
         self.pools.deinit(gpa);
         if (comptime has_tls) self.freeTls();
@@ -489,6 +499,7 @@ pub const Db = struct {
     /// a connection per executor and fails if one cannot.
     pub fn start(self: *Db, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.postgresql, self.name, registry, tracer);
+        try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
         if (!self.connect_at_start) return;
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
@@ -861,16 +872,19 @@ pub const Query = struct {
         return self.db.call(c, self.opts.timeout, null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
+    // The reads go through the cache, which shares them when `opts`
+    // asks (`coalesce`, `cache`) and makes the plain call otherwise.
+
     pub fn one(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
-        return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.cache.read(T, c, self.opts, sql, args, Read(T, .one){ .query = self });
     }
 
     pub fn optional(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
-        return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.cache.read(?T, c, self.opts, sql, args, Read(T, .optional){ .query = self });
     }
 
     pub fn all(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
-        return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.cache.read([]T, c, self.opts, sql, args, Read(T, .all){ .query = self });
     }
 
     /// The timeout bounds the statement until its first rows; reading the
@@ -879,6 +893,19 @@ pub const Query = struct {
         return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 };
+
+/// A read as `anole.db.QueryCache` makes it: the plain call, with the
+/// caller's context or a shared call's own.
+fn Read(comptime T: type, comptime mode: Mode) type {
+    return struct {
+        query: Query,
+
+        pub fn run(r: @This(), c: anytype, sql: []const u8, args: anytype) Error!Fetch(T, mode, @TypeOf(args)).Out {
+            const q = r.query;
+            return q.db.call(c, q.opts.timeout, null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
+        }
+    };
+}
 
 /// A transaction (`Db.begin`): the verbs on its one connection, then
 /// `commit`, or `rollback`; `deinit` rolls back unless one of them ran,

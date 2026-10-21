@@ -33,7 +33,10 @@ pub const Readiness = struct {
     /// The `observe.Health` check.
     pub fn check(context: ?*anyopaque) bool {
         const self: *Readiness = @ptrCast(@alignCast(context.?));
-        self.mutex.lock(self.io) catch return false;
+        self.mutex.lock(self.io) catch {
+            self.io.recancel();
+            return false;
+        };
         defer self.mutex.unlock(self.io);
         const now: std.Io.Clock.Timestamp = .now(self.io, .awake);
         if (self.checked_at) |at| {

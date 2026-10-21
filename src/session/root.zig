@@ -20,6 +20,7 @@ const std = @import("std");
 const dusty = @import("dusty");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
+const db = @import("../db/root.zig");
 
 const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;
@@ -126,7 +127,7 @@ pub const MemoryStore = struct {
 };
 
 /// Sessions in Redis/Valkey (-Dredis), keys `prefix ++ id` with the
-/// session's TTL.
+/// session's TTL, on the client's pools (`app.redis`).
 pub const RedisStore = if (features.redis) struct {
     client: *redis.Client,
     prefix: []const u8 = "anole:session:",
@@ -143,13 +144,8 @@ pub const RedisStore = if (features.redis) struct {
     fn load(ptr: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var buf: [256]u8 = undefined;
-        const reply = try self.client.command(arena, &.{ "GET", try self.key(&buf, id) });
-        return switch (reply) {
-            .nil => null,
-            .string => |s| s,
-            .err => error.RedisError,
-            else => error.UnexpectedReply,
-        };
+        var c: db.Ctx = .{ .io = self.client.io, .arena = arena };
+        return self.client.get(&c, try self.key(&buf, id));
     }
 
     fn save(ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!void {
@@ -157,9 +153,8 @@ pub const RedisStore = if (features.redis) struct {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         var buf: [256]u8 = undefined;
-        var ttl_buf: [16]u8 = undefined;
-        const reply = try self.client.command(arena.allocator(), &.{ "SET", try self.key(&buf, id), data, "EX", try std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl_seconds}) });
-        if (reply == .err) return error.RedisError;
+        var c: db.Ctx = .{ .io = self.client.io, .arena = arena.allocator() };
+        _ = try self.client.set(&c, try self.key(&buf, id), data, .{ .ttl = .fromSeconds(ttl_seconds) });
     }
 
     fn destroy(ptr: *anyopaque, id: []const u8) anyerror!void {
@@ -167,7 +162,8 @@ pub const RedisStore = if (features.redis) struct {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         var buf: [256]u8 = undefined;
-        _ = try self.client.command(arena.allocator(), &.{ "DEL", try self.key(&buf, id) });
+        var c: db.Ctx = .{ .io = self.client.io, .arena = arena.allocator() };
+        _ = try self.client.del(&c, try self.key(&buf, id));
     }
 } else struct {};
 

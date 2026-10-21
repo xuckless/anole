@@ -266,7 +266,8 @@ pub const ClientConnection = struct {
             }
         }
         self.kickWriter();
-        self.group.await(self.io) catch {};
+        // The tasks have ended either way; a cancel is the caller's to see.
+        self.group.await(self.io) catch self.io.recancel();
         {
             self.lock();
             defer self.unlock();

@@ -57,6 +57,11 @@
 //! Pools: `PerExecutor(Pool)` keeps one per executor, so a call never
 //! waits on another executor's connections.
 //!
+//! Sharing, opt-in per call: `QueryOptions.coalesce` and
+//! `QueryOptions.cache`, built once in `QueryCache`, which a connector's
+//! `one`, `optional` and `all` go through. A call without them is the
+//! plain call.
+//!
 //! Observability: each handle keeps an `Observer` (metrics when the app
 //! has a registry, a client span per call in a traced request) and calls
 //! `start`/`end` around every round trip, and its pools report through
@@ -114,17 +119,30 @@ pub const QueryOptions = struct {
     /// SQLite: run on the writer connection, for a write that does not
     /// look like one (a `SELECT` with side effects, `WITH ... RETURNING`).
     write: bool = false,
-    /// Identical reads in flight at once on one executor share one round
-    /// trip. Not built yet: taken, and the call goes the plain way.
+    /// Reads (`one`, `optional`, `all`): identical ones in flight at once
+    /// on one executor (same statement, arguments, verb and row type)
+    /// share one round trip, each caller getting its own copy of the rows.
+    /// A caller canceled or out of time leaves alone; the others still get
+    /// the rows. See `QueryCache`.
     coalesce: bool = false,
-    /// Results kept per executor for `ttl` and served from memory. Not
-    /// built yet: taken, and the call goes the plain way.
+    /// Reads: the result kept per executor for `ttl` and served from
+    /// memory meanwhile, a miss coalescing with any identical one in
+    /// flight. Errors are not kept. Drop results early with the
+    /// connector's `cache.invalidate`. See `QueryCache`.
     cache: ?Cache = null,
 
     pub const Cache = struct {
         ttl: std.Io.Duration,
+        /// A name to drop the result by: `cache.invalidate(.{ .tag = "posts" })`.
+        tag: ?[]const u8 = null,
     };
 };
+
+/// A connector's coalescing and result cache (`app.db.cache`), behind
+/// `QueryOptions.coalesce` and `QueryOptions.cache`.
+pub const QueryCache = @import("cache.zig").Cache;
+/// Its bounds (each connector's `Options.cache`).
+pub const CacheOptions = @import("cache.zig").Options;
 
 pub const TxOptions = struct {
     /// Null: the database's default.
@@ -290,17 +308,25 @@ pub fn fail(c: anytype, map: ErrorMap, detail: ErrorDetail) Error {
 }
 
 fn record(c: anytype, detail: ErrorDetail, err: Error) void {
+    keepError(c, detail);
+    const kept = lastError(c).?;
+    const id = if (comptime @hasField(Pointee(@TypeOf(c)), "id")) c.id else "";
+    switch (err) {
+        error.Database, error.ServiceUnavailable, error.GatewayTimeout => log.warn("{s}{s}database error: {f}", .{ id, if (id.len > 0) " " else "", kept }),
+        else => log.debug("{s}{s}database error: {f}", .{ id, if (id.len > 0) " " else "", kept }),
+    }
+}
+
+/// Records `detail` as `c`'s last error (copied into its arena) without
+/// logging it: for a failure that was logged where it happened, such as
+/// a shared call's (`QueryOptions.coalesce`) for each caller.
+pub fn keepError(c: anytype, detail: ErrorDetail) void {
     comptime checkContext(@TypeOf(c));
     const kept = detail.dupe(c.arena) catch ErrorDetail{ .system = detail.system, .class = detail.class, .message = "(detail lost: out of memory)" };
     if (comptime hasLocals(@TypeOf(c))) {
         c.locals.put(c.arena, last_error_key, kept) catch {};
     } else {
         c.last_error = kept;
-    }
-    const id = if (comptime @hasField(Pointee(@TypeOf(c)), "id")) c.id else "";
-    switch (err) {
-        error.Database, error.ServiceUnavailable, error.GatewayTimeout => log.warn("{s}{s}database error: {f}", .{ id, if (id.len > 0) " " else "", kept }),
-        else => log.debug("{s}{s}database error: {f}", .{ id, if (id.len > 0) " " else "", kept }),
     }
 }
 
@@ -448,6 +474,9 @@ pub fn PerExecutor(comptime Pool: type) type {
 const testing = std.testing;
 
 test {
+    _ = @import("copy.zig");
+    _ = @import("cache.zig");
+    _ = @import("../cache/store.zig");
     _ = @import("time.zig");
     _ = @import("url.zig");
     _ = @import("observe.zig");

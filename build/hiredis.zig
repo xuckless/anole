@@ -1,6 +1,6 @@
 //! redis/hiredis 1.5.0 (release tarball, BSD-3-Clause). Anole uses its RESP
-//! reader and command formatter only; the socket I/O is Anole's, on
-//! std.Io. net.c and async.c are compiled because hiredis.c refers to them
+//! reader only (src/redis writes the commands); the socket I/O is Anole's,
+//! on std.Io. net.c and async.c are compiled because hiredis.c refers to them
 //! (async.c includes dict.c).
 const std = @import("std");
 

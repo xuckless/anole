@@ -34,7 +34,11 @@ pub const AccessLog = struct {
         const status = statusOf(req, res, result);
         const line = format(req.arena, self.options.format, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
         const file = self.options.file orelse std.Io.File.stderr();
-        file.writeStreamingAll(req.io, line) catch {};
+        file.writeStreamingAll(req.io, line) catch |err| switch (err) {
+            // The request's cancel (its deadline, the drain) is for what runs next.
+            error.Canceled => req.io.recancel(),
+            else => {},
+        };
         return result;
     }
 };

@@ -68,6 +68,9 @@ pub const Options = struct {
     retry_writes: bool = true,
     /// Which error classes become which statuses.
     errors: shared.ErrorMap = .{},
+    /// The bounds of the results kept for reads with `.cache`
+    /// (`anole.db.QueryOptions`).
+    cache: shared.CacheOptions = .{},
 };
 
 pub const default_url = "mongodb://localhost:27017";
@@ -148,6 +151,9 @@ pub const Client = struct {
     closing: std.atomic.Value(bool) = .init(false),
     scram_cache: scram.Cache = .{},
     sessions: shared.PerExecutor(SessionPool),
+    /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
+    /// cached results: `app.mongo.cache.invalidate(.{ .tag = "users" })`.
+    cache: shared.QueryCache,
 
     /// Parses the connection string (`opts.url`, else `MONGODB_URI`, else
     /// localhost) and starts monitoring its servers. Opens no connection
@@ -170,7 +176,9 @@ pub const Client = struct {
             .observer = .{ .system = .mongodb, .name = opts.name },
             .topology = undefined,
             .sessions = undefined,
+            .cache = try .init(gpa, io, .mongodb, opts.name, opts.cache),
         };
+        errdefer self.cache.deinit();
         errdefer self.arena_state.deinit();
         const arena = self.arena_state.allocator();
 
@@ -311,6 +319,7 @@ pub const Client = struct {
     /// app's metrics registry, tracer and health checks, when it has them.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.mongodb, self.options.name, registry, tracer);
+        try self.cache.observe(registry);
         if (health) |h| {
             self.readiness = .{ .io = self.io, .context = self, .ping = readyPing };
             try self.readiness.register(h, self.options.name);
@@ -332,6 +341,8 @@ pub const Client = struct {
     /// have finished.
     pub fn deinit(self: *Client) void {
         const io = self.io;
+        // First: a read still running for the cache holds a connection.
+        self.cache.deinit();
         self.endSessions();
         self.closing.store(true, .release);
         self.mutex.lockUncancelable(io);
@@ -819,6 +830,10 @@ pub const Client = struct {
                         x.txn_number = x.session.?.txn_number;
                     }
                     const reply = self.send(c, &x, ctx, deadline) catch |err| {
+                        // Read before the release: a broken connection is
+                        // closed and freed there.
+                        const generation = connection.generation;
+                        const max_wire_version = connection.max_wire_version;
                         self.release(server, connection, io);
                         switch (err) {
                             error.Canceled => {
@@ -833,7 +848,7 @@ pub const Client = struct {
                         // The exchange broke off: a network error (or a
                         // reply we could not read).
                         if (x.session) |sess| sess.dirty = true;
-                        self.handleError(server, .{ .address = "", .generation = connection.generation, .max_wire_version = connection.max_wire_version, .kind = .network, .message = @errorName(err) });
+                        self.handleError(server, .{ .address = "", .generation = generation, .max_wire_version = max_wire_version, .kind = .network, .message = @errorName(err) });
                         if (retry_allowed and (op.retry == .read or x.txn_number != null)) continue;
                         return c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = "the connection to the server failed mid-command", .table = op.collection });
                     };

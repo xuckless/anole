@@ -355,6 +355,96 @@ test "pg: live a pool per executor" {
     }
 }
 
+test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    const app_name = "anole-pg-share-test";
+    const d = try open(io, .{ .max_connections = 8, .application_name = app_name });
+    defer d.deinit();
+    const watcher = try open(io, .{});
+    defer watcher.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    _ = try d.exec(&c, "DROP SEQUENCE IF EXISTS anole_pg_seq; CREATE SEQUENCE anole_pg_seq", .{});
+
+    // Each run of the statement takes the next number: callers that share
+    // one get the same number.
+    const next = "SELECT nextval('anole_pg_seq') AS n FROM pg_sleep($1::float8)";
+    const Got = struct { n: i64 };
+    const Worker = struct {
+        fn run(db_: *pg.Db, io_: std.Io, opts: db.QueryOptions, delay: f64, seen: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
+            const got = db_.with(opts).one(Got, &ctx, next, .{delay}) catch {
+                _ = wrong.fetchAdd(1, .monotonic);
+                return;
+            };
+            const here = db.executorIndex(io_).?;
+            if (seen[here].cmpxchgStrong(0, got.n, .monotonic, .monotonic)) |prev| {
+                if (prev != got.n) _ = wrong.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    // 32 callers over 4 executors: one statement per executor.
+    var seen: [4]std.atomic.Value(i64) = @splat(.init(0));
+    var wrong: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..32) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 4 }, Worker.run, .{ d, io, .{ .coalesce = true }, 0.2, &seen, &wrong });
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), wrong.load(.monotonic));
+    try testing.expectEqual(@as(i64, 4), try d.one(i64, &c, "SELECT last_value FROM anole_pg_seq", .{}));
+    try testing.expectEqual(@as(u64, 28), d.cache.stats().coalesced);
+
+    // The first caller canceled: the others still get the row, from the
+    // one statement.
+    var first: std.Io.Group = .init;
+    seen = @splat(.init(0));
+    try dusty.placement.concurrent(&first, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 0.3, &seen, &wrong });
+    try io.sleep(.fromMilliseconds(50), .awake);
+    for (0..3) |_| try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 0.3, &seen, &wrong });
+    try io.sleep(.fromMilliseconds(20), .awake);
+    first.cancel(io);
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 1), wrong.load(.monotonic));
+    try testing.expectEqual(@as(i64, 5), seen[1].load(.monotonic));
+    try testing.expectEqual(@as(i64, 5), try d.one(i64, &c, "SELECT last_value FROM anole_pg_seq", .{}));
+
+    // Every caller gone: the statement is stopped on the server.
+    var gone: std.Io.Group = .init;
+    for (0..3) |_| try dusty.placement.concurrent(&gone, io, .{ .executor = 2 }, Worker.run, .{ d, io, .{ .coalesce = true }, 30.0, &seen, &wrong });
+    for (0..40) |_| {
+        if (try sleeping(watcher, &c, app_name) == 1) break;
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    gone.cancel(io);
+    const level = quiet();
+    defer testing.log_level = level;
+    try expectStopped(io, watcher, &c, app_name);
+
+    // Cached: the same number until the ttl, or an invalidation.
+    const cached: db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(30), .tag = "seq" } };
+    const a = try d.with(cached).one(Got, &c, next, .{0.0});
+    try testing.expectEqual(a.n, (try d.with(cached).one(Got, &c, next, .{0.0})).n);
+    // An identical call on another executor fills its own.
+    seen = @splat(.init(0));
+    try dusty.placement.concurrent(&group, io, .{ .executor = 3 }, Worker.run, .{ d, io, cached, 0.0, &seen, &wrong });
+    try group.await(io);
+    try testing.expect(seen[3].load(.monotonic) > a.n);
+    d.cache.invalidate(.{ .tag = "seq" });
+    const b = try d.with(cached).one(Got, &c, next, .{0.0});
+    try testing.expect(b.n > a.n);
+    try testing.expectEqual(b.n, (try d.with(cached).one(Got, &c, next, .{0.0})).n);
+    d.cache.invalidateQuery(next, .{0.0});
+    try testing.expect((try d.with(cached).one(Got, &c, next, .{0.0})).n > b.n);
+    try testing.expect(d.cache.stats().hits >= 2);
+}
+
 test "pg: live TLS as the URL asks, and a refused login" {
     _ = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });

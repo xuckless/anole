@@ -467,8 +467,9 @@ with a limit that stays at 1024, about 800. Past the cap the server stops
 accepting and new connections wait in the kernel's accept queue, rather than
 `accept` failing for want of a descriptor. 10,000 on Windows. Set
 `.server = .{ .max_connections = 50_000 }` to cap it lower, as memory
-suggests: an idle connection costs a few kilobytes and one with TLS about 35
-KiB (see `ServerConfig.max_connections`); `null` lifts the cap. The startup
+suggests: an idle connection costs a few kilobytes, about 20 KB with TLS on
+Linux, and a request in progress its buffers on top (see
+`ServerConfig.max_connections`); `null` lifts the cap. The startup
 debug log names the cap it worked out.
 
 To allow more, raise the hard limit where the process starts:
@@ -521,7 +522,9 @@ handlers as HTTP/1.1.
   wait.
 
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
-(64 KiB, also each stream's body buffer), `connection_window` (1 MiB),
+(64 KiB, also each stream's body buffer), `stream_window_reading` (1 MiB:
+the window and buffer from the handler's first read of the body),
+`connection_window` (16 MiB),
 `max_header_list_size` (64 KiB), `stream_reset_burst` and
 `stream_reset_rate` (rapid-reset protection), `max_continuations` (8) and
 `enable_connect_protocol` (on, for RFC 8441 WebSockets).

@@ -39,6 +39,10 @@ pub const onlyOn = @import("server.zig").onlyOn;
 pub const func = @import("handlers.zig").func;
 pub const Next = @import("handlers.zig").Next;
 pub const noWait = @import("handlers.zig").noWait;
+/// A route whose answers are kept per executor and served from memory:
+/// `app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed))`.
+/// See `middleware.ResponseCache`.
+pub const cached = @import("handlers.zig").cached;
 /// The server's outbound HTTP client, from a request or a `std.Io` of the
 /// server's runtime: `anole.client(req).fetch(url, .{})`.
 pub const client = @import("client.zig").client;
@@ -66,7 +70,19 @@ pub const logFn = @import("log.zig").logFn;
 pub const http = @import("http/root.zig");
 pub const Request = http.Request;
 pub const Response = http.Response;
-pub const middleware = http.middleware;
+/// The built-in middleware: the HTTP core's (`Cors`, `Compress`,
+/// `RequestId`, `Logger`, `Session`) and `ResponseCache`.
+pub const middleware = struct {
+    pub const Cors = http.middleware.Cors;
+    pub const Compress = http.middleware.Compress;
+    pub const RequestId = http.middleware.RequestId;
+    pub const Logger = http.middleware.Logger;
+    pub const Session = http.middleware.Session;
+    /// Whole responses kept per executor and served without running the
+    /// handler; `anole.cached` puts one on a route, `app.responseCache`
+    /// makes one for several.
+    pub const ResponseCache = @import("cache/response.zig").ResponseCache;
+};
 pub const Middleware = http.Middleware;
 /// The answer the server gives a handler error when nothing else does
 /// (status-named errors such as `error.Unauthorized` to their status,
@@ -104,7 +120,10 @@ pub const webtransport = if (features.http3) @import("webtransport.zig") else st
 /// JSON on yyjson (-Djson): parse into and stringify Zig types.
 pub const json = if (features.json) @import("json/root.zig") else struct {};
 
-/// A Redis/Valkey client on std.Io (-Dredis), with hiredis's RESP parser.
+/// Redis and Valkey (-Dredis): `app.redis(.{})` (REDIS_URL), then
+/// `app.cache.get(req, key)`, `command(req, .{ "INCR", key })`, pipelines
+/// and pub/sub, with the `anole.db` calling convention and a pool per
+/// executor.
 pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 
 /// What the database connectors share: calls that take the request, a
@@ -168,6 +187,8 @@ test {
     _ = @import("client.zig");
     _ = @import("app_test.zig");
     _ = @import("handoff.zig");
+    _ = @import("cache/response.zig");
+    _ = @import("cache/response_test.zig");
     _ = blocking;
     _ = @import("sd_notify.zig");
     _ = @import("fuzz.zig");
