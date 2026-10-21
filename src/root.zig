@@ -116,6 +116,15 @@ pub const pg = if (features.postgres) @import("pg/root.zig") else struct {};
 /// thread, reads on the blocking pool; `app.sqlite("app.db")`.
 pub const sqlite = if (features.sqlite) @import("sqlite/root.zig") else struct {};
 
+/// A MongoDB client on std.Io (-Dmongodb): OP_MSG, SCRAM, TLS, replica
+/// sets, a pool per executor, CRUD, aggregation and cursors, retryable
+/// reads and writes. `app.mongodb(.{})` connects from `MONGODB_URI`.
+pub const mongodb = if (features.mongodb) @import("mongodb/root.zig") else struct {};
+
+/// BSON (-Dmongodb): documents, the struct mapping, ObjectId, Decimal128
+/// and Extended JSON, as the MongoDB client reads and writes them.
+pub const bson = if (features.mongodb) @import("bson") else struct {};
+
 /// Outbound connections for the database clients: `ClientStream`, TCP or
 /// a Unix socket, plain or TLS on BoringSSL.
 pub const net = struct {
@@ -170,6 +179,7 @@ test {
     _ = sqlite;
     _ = db;
     _ = pg;
+    _ = mongodb;
     _ = @import("net/client_stream.zig");
     _ = session;
     _ = early_data;
