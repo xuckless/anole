@@ -22,6 +22,8 @@
 //!   bench-server  the Anole side of bench/run.sh (with -Doptimize=ReleaseFast)
 //!   io          install examples/io (handlers waiting on I/O through std.Io)
 //!   run-io      run examples/io (`zig build run-io -- 8081`)
+//!   docs        the API reference (Zig autodoc of the `anole` module) in
+//!               zig-out/docs; the docs site (site/) serves it at /anole/api/
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -434,6 +436,20 @@ pub fn build(b: *std.Build) void {
     // zig-protobuf's runtime, which the code `addProtoGen` generates imports
     // as "protobuf": `anole_dep.module("protobuf")`.
     if (c_mods.protobuf) |m| _ = b.modules.getOrPutValue(b.graph.arena, "protobuf", m) catch @panic("OOM");
+
+    // docs: Zig's autodoc for the `anole` module, in zig-out/docs (the docs
+    // site serves it at /anole/api/). It documents the features that are on,
+    // so run it with the default full profile. Only the docs are emitted
+    // (-fno-emit-bin), though the C libraries the module links are built.
+    if (b.isRoot()) {
+        const docs_obj = b.addObject(.{ .name = "anole", .root_module = anole_mod });
+        const install_docs = b.addInstallDirectory(.{
+            .source_dir = docs_obj.getEmittedDocs(),
+            .install_dir = .prefix,
+            .install_subdir = "docs",
+        });
+        b.step("docs", "Generate the API reference (Zig autodoc for the anole module) into zig-out/docs").dependOn(&install_docs.step);
+    }
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
