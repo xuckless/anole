@@ -164,6 +164,10 @@ pub fn main(init: std.process.Init) !void {
     app.get("/slow", slow);
     app.post("/upload", upload);
     app.post("/echo", echo);
+    // The same, run inline when the request arrives whole (`noWait`): the
+    // responses outgrow the ring with nothing waiting for the peer.
+    app.get("/nw/download", anole.noWait(download));
+    app.post("/nw/echo", anole.noWait(echo));
     app.get("/early", early);
     app.post("/early", early);
     if (anole.features.websocket) app.ws("/ws", wsEcho);

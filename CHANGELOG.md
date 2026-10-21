@@ -43,7 +43,8 @@ for macOS and Linux.
   `group` and the new `with` (middleware for some routes, no prefix).
 - `anole.noWait(handler)` marks a handler (and its route's middleware) as
   never waiting: on HTTP/2 its whole requests run on the connection's reader
-  without a task, the responses to one read in one write. gRPC takes it per
+  without a task, the responses to one read in one write; on HTTP/3 on the
+  endpoint task, right after the packet that completes them. gRPC takes it per
   registration: `app.grpcWith(Service, impl, .{ .no_wait = true })` for
   unary methods.
 - `anole.client(req)` / `app.client()`: the server's pooled outbound HTTP

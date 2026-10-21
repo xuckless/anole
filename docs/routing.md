@@ -564,8 +564,8 @@ requests in parallel this way and reads files through the `Io`
 
 ### Handlers that never wait
 
-On HTTP/2 each request normally runs on a task of its own, so a handler
-that waits holds up nothing else. A handler that never waits (it answers
+On HTTP/2 and HTTP/3 each request normally runs on a task of its own, so a
+handler that waits holds up nothing else. A handler that never waits (it answers
 from the request and its body, the server's state or memory: no I/O, no
 sleep, no lock another task holds across a wait) can say so:
 
@@ -577,8 +577,11 @@ app.get("/json", anole.noWait(json));
 Its HTTP/2 requests that arrive whole (a body included) in one read then
 run right where the connection reads them, without a task, and the
 responses to one read go out in one write: about 1.7x the requests per core
-for small responses. The promise covers every middleware that runs for the
-route too. A handler marked this way that waits anyway still works, but
-holds up every other request on its connection meanwhile and gets no
-request timeout, so leave the mark off anything that queries a database, a
-cache or another service. On HTTP/1.1 and HTTP/3 the mark changes nothing.
+for small responses. Over HTTP/3 the same goes for a request that arrives
+whole in one packet: it runs where the endpoint reads the packet, and its
+response leaves with the rest of the batch. The promise covers every
+middleware that runs for the route too. A handler marked this way that
+waits anyway still works, but holds up every other request on its
+connection (on HTTP/3, every connection of its endpoint) meanwhile and gets
+no request timeout, so leave the mark off anything that queries a database,
+a cache or another service. On HTTP/1.1 the mark changes nothing.
