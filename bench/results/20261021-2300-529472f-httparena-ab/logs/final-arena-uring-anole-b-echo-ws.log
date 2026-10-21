@@ -1,0 +1,299 @@
+[info] available CPUs: 28
+[info] load generators: docker mode
+[info] framework: anole-b (anole, Zig)
+[info] subscribed tests: baseline,pipelined,limited-conn,async,latency-1m,latency-10k,latency-500k-8cpu,json-comp,json-tls,8gbit,static-tls,baseline-h2,static-h2,baseline-h2c,json-h2c,baseline-h3,static-h3,unary-grpc,unary-grpc-tls,echo-ws,echo-ws-pipeline,echo-ws-limited
+[info] building image: httparena-anole-b
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.26kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 0.2s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 126B done
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 631B done
+#4 DONE 0.0s
+
+#5 [build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#5 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#5 DONE 0.0s
+
+#6 [build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#6 CACHED
+
+#7 [build 6/8] COPY src ./src
+#7 CACHED
+
+#8 [build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#8 CACHED
+
+#9 [build 7/8] COPY proto ./proto
+#9 CACHED
+
+#10 [build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#10 CACHED
+
+#11 [build 5/8] COPY build.zig build.zig.zon ./
+#11 CACHED
+
+#12 [stage-1 2/3] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#12 CACHED
+
+#13 [build 3/8] WORKDIR /server
+#13 CACHED
+
+#14 [stage-1 3/3] COPY entrypoint.sh /entrypoint.sh
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:5d00e334acf6ea32c4bf4f2a9bd763099702bf0ff1c5679de663f11ca6c8d8ad done
+#15 exporting config sha256:397de417369d1fe2b4fb15edebb802aa881907d563cc8df0688071aaa161a761 done
+#15 exporting attestation manifest sha256:05c4f5e6c28c2274e17208eab7504a1ea8035938e5187743ff5033b8df1f5590 0.0s done
+#15 exporting manifest list sha256:15b0dfd94a4044b088ee479ffb5955fbb9ab08fb89a51cc356a9c48b2172df27 0.0s done
+#15 naming to docker.io/library/httparena-anole-b:latest
+#15 naming to docker.io/library/httparena-anole-b:latest done
+#15 unpacking to docker.io/library/httparena-anole-b:latest done
+#15 DONE 0.1s
+[info] skipping system tuning as requested (SKIP_TUNE=true)
+
+==============================================
+=== anole-b / echo-ws / 512c (tool=gcannon) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     512 (8/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency    305us     56us    126us   7.53ms   15.90ms
+
+  8608789 frames sent in 5.00s, 8608437 frames received
+  Throughput: 1.72M req/s
+  Bandwidth:  11.50MB/s
+  WS upgrades: 512
+  WS frames:   8608437
+  Latency samples: 8608437 / 8608437 responses (100.0%)
+[info] CPU 720.7% | Mem 29MiB
+
+[run 2/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     512 (8/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency    381us     72us    173us   9.10ms   16.00ms
+
+  6878880 frames sent in 5.01s, 6878653 frames received
+  Throughput: 1.37M req/s
+  Bandwidth:  9.17MB/s
+  WS upgrades: 512
+  WS frames:   6878653
+  Latency samples: 6878653 / 6878653 responses (100.0%)
+[info] CPU 783.6% | Mem 30MiB
+
+[run 3/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     512 (8/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency    399us     76us    183us   9.21ms   16.20ms
+
+  6614326 frames sent in 5.01s, 6614086 frames received
+  Throughput: 1.32M req/s
+  Bandwidth:  8.81MB/s
+  WS upgrades: 512
+  WS frames:   6614086
+  Latency samples: 6614086 / 6614086 responses (100.0%)
+[info] CPU 783.9% | Mem 30MiB
+
+=== Best: 1721687 req/s (CPU: 720.7%, Mem: 29MiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-b
+httparena-bench-anole-b
+
+==============================================
+=== anole-b / echo-ws / 4096c (tool=gcannon) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     4096 (64/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   2.42ms    465us   9.21ms   18.30ms   24.60ms
+
+  8396592 frames sent in 5.02s, 8392496 frames received
+  Throughput: 1.67M req/s
+  Bandwidth:  11.29MB/s
+  WS upgrades: 4096
+  WS frames:   8392496
+  Latency samples: 8392496 / 8392496 responses (100.0%)
+[info] CPU 712.2% | Mem 132MiB
+
+[run 2/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     4096 (64/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   3.04ms    610us   10.60ms   20.00ms   29.50ms
+
+  6865789 frames sent in 5.01s, 6865223 frames received
+  Throughput: 1.37M req/s
+  Bandwidth:  9.16MB/s
+  WS upgrades: 4096
+  WS frames:   6865223
+  Latency samples: 6865223 / 6865223 responses (100.0%)
+[info] CPU 781.0% | Mem 132MiB
+
+[run 3/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     4096 (64/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   3.18ms    683us   10.90ms   19.30ms   25.90ms
+
+  6518235 frames sent in 5.01s, 6518107 frames received
+  Throughput: 1.30M req/s
+  Bandwidth:  8.69MB/s
+  WS upgrades: 4096
+  WS frames:   6518107
+  Latency samples: 6518107 / 6518107 responses (100.0%)
+[info] CPU 812.4% | Mem 127MiB
+
+=== Best: 1671811 req/s (CPU: 712.2%, Mem: 132MiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-b
+httparena-bench-anole-b
+
+==============================================
+=== anole-b / echo-ws / 16384c (tool=gcannon) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     16384 (256/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   13.18ms   11.60ms   27.70ms   45.20ms   57.30ms
+
+  6085340 frames sent in 5.02s, 6068956 frames received
+  Throughput: 1.21M req/s
+  Bandwidth:  8.59MB/s
+  WS upgrades: 16384
+  WS frames:   6068956
+  Latency samples: 6068956 / 6068956 responses (100.0%)
+[info] CPU 683.1% | Mem 436MiB
+
+[run 2/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     16384 (256/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   14.01ms   13.20ms   28.00ms   40.90ms   51.10ms
+
+  5861439 frames sent in 5.00s, 5848163 frames received
+  Throughput: 1.17M req/s
+  Bandwidth:  8.22MB/s
+  WS upgrades: 16384
+  WS frames:   5848163
+  Latency samples: 5848163 / 5848163 responses (100.0%)
+[info] CPU 783.7% | Mem 438MiB
+
+[run 3/3]
+gcannon v0.6.1 [WS]
+  Target:    localhost:8080/ws
+  Threads:   64
+  Conns:     16384 (256/thread)
+  Pipeline:  1
+  Req/conn:  unlimited (keep-alive)
+  Expected:  200
+  Duration:  5s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   15.87ms   15.00ms   30.10ms   41.50ms   52.30ms
+
+  5180985 frames sent in 5.00s, 5168457 frames received
+  Throughput: 1.03M req/s
+  Bandwidth:  7.29MB/s
+  WS upgrades: 16384
+  WS frames:   5168457
+  Latency samples: 5168457 / 5168457 responses (100.0%)
+[info] CPU 857.0% | Mem 438MiB
+
+=== Best: 1208955 req/s (CPU: 683.1%, Mem: 436MiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-b
+httparena-bench-anole-b
+[info] done
