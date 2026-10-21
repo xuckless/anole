@@ -372,13 +372,15 @@ set up this way, and CI builds it from an empty cache on every push.
 - [docs/server.md](docs/server.md): listeners, TLS, HTTP/2, HTTP/3, draining,
   restarts, socket activation, proxies.
 - [docs/routing.md](docs/routing.md): routes, middleware, requests and
-  responses, errors, static files, compression, timeouts and limits.
+  responses, errors, static files, compression, the response cache,
+  timeouts and limits.
 - [docs/websocket.md](docs/websocket.md),
   [docs/webtransport.md](docs/webtransport.md), [docs/grpc.md](docs/grpc.md),
   [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
   [docs/observability.md](docs/observability.md).
 - [docs/database.md](docs/database.md): PostgreSQL, SQLite and MongoDB,
-  the calls every connector shares, errors as statuses, transactions, pools.
+  the calls every connector shares, errors as statuses, transactions, pools,
+  coalescing and caching.
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,
   `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`,
   `sqlite`, `mongodb`, and `full` (every listener and option spelled out).

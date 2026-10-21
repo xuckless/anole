@@ -98,6 +98,9 @@ pub const Options = struct {
     pragmas: []const []const u8 = &.{},
     /// What error each class of SQLite error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
+    /// The bounds of the results kept for calls with `.cache`
+    /// (`anole.db.QueryOptions`).
+    cache: db.CacheOptions = .{},
 };
 
 /// A BLOB parameter or column: bytes that are not text.
@@ -130,6 +133,9 @@ pub const Db = struct {
     readiness: db.Readiness,
     /// Connections in use (readers taken, the writer held), for the gauges.
     in_use: std.atomic.Value(i64) = .init(0),
+    /// Calls with `.coalesce` or `.cache` (`with`), and `invalidate` for
+    /// cached results: `app.notes.cache.invalidate(.{ .tag = "notes" })`.
+    cache: db.QueryCache,
 
     /// Opens the database (the file is created when missing) and its
     /// connections, and starts the writer thread. `io` is the runtime the
@@ -155,7 +161,9 @@ pub const Db = struct {
             .readers = .{},
             .observer = .{ .system = .sqlite, .name = name },
             .readiness = .{ .io = io, .context = self, .ping = ping },
+            .cache = try .init(gpa, io, .sqlite, name, options.cache),
         };
+        errdefer self.cache.deinit();
 
         // The writer first: it creates the file and turns WAL on, which
         // the read-only connections cannot.
@@ -179,6 +187,8 @@ pub const Db = struct {
     /// Stops the writer thread and closes every connection. Nothing may be
     /// using the database (no call in flight, no `Tx`, `Rows` or `Conn`).
     pub fn deinit(self: *Db) void {
+        // First: a statement still running for the cache holds a connection.
+        self.cache.deinit();
         const w = &self.writer;
         w.mutex.lockUncancelable(self.io);
         w.closing = true;
@@ -210,6 +220,7 @@ pub const Db = struct {
         }
         if (tracer) |t| self.observer.tracer = t;
         if (health) |h| try self.readiness.register(h, self.name);
+        try self.cache.observe(registry);
     }
 
     /// Runs `sql`, one or more statements with no parameters, on the
@@ -472,16 +483,31 @@ pub const Query = struct {
         return q.call(.exec, void, cx, sql, args);
     }
 
+    // The reads go through the cache, which shares them when the options
+    // ask (`coalesce`, `cache`) and makes the plain call otherwise.
+
     pub fn one(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!T {
-        return q.call(.one, T, cx, sql, args);
+        return q.db.cache.read(T, cx, q.options, sql, args, Read(.one, T){ .q = q });
     }
 
     pub fn optional(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!?T {
-        return q.call(.optional, T, cx, sql, args);
+        return q.db.cache.read(?T, cx, q.options, sql, args, Read(.optional, T){ .q = q });
     }
 
     pub fn all(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError![]T {
-        return q.call(.all, T, cx, sql, args);
+        return q.db.cache.read([]T, cx, q.options, sql, args, Read(.all, T){ .q = q });
+    }
+
+    /// A read as `anole.db.QueryCache` makes it: the plain call, with the
+    /// caller's context or a shared call's own.
+    fn Read(comptime op: Op, comptime T: type) type {
+        return struct {
+            q: Query,
+
+            pub fn run(r: @This(), cx: anytype, sql: []const u8, args: anytype) CallError!Out(op, T) {
+                return r.q.call(op, T, cx, sql, args);
+            }
+        };
     }
 
     /// `Db.iterate`. `options.timeout` bounds starting it, not each `next`.

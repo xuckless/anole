@@ -1702,6 +1702,28 @@ pub const Response = struct {
         return std.fmt.parseInt(usize, value, 10) catch error.InvalidContentLength;
     }
 
+    /// The length of a body held in memory, as it stands (what a body
+    /// writer collected, else `body`), for middleware that keeps whole
+    /// responses after the handler (`anole.middleware.ResponseCache`);
+    /// `copyBody` takes its bytes. Null for any other: a file, a stream,
+    /// a body writer still open, or headers already sent.
+    pub fn memoryBodyLen(self: *const Response) ?usize {
+        if (self.file != null or self.headers_written or self.body_writer_open or self.streaming or self.chunked) return null;
+        return self.bodyLen();
+    }
+
+    /// Copies a body held in memory into `out`, `memoryBodyLen` bytes.
+    pub fn copyBody(self: *const Response, out: []u8) void {
+        if (self.body_buffer.len() == 0) return @memcpy(out[0..self.body.len], self.body);
+        var at: usize = 0;
+        var it = self.body_buffer.segments.first;
+        while (it) |node| : (it = node.next) {
+            const segment = BodyBuffer.Segment.fromNode(node);
+            @memcpy(out[at..][0..segment.len], segment.bytes()[0..segment.len]);
+            at += segment.len;
+        }
+    }
+
     /// The length of the body as set so far: what the body writer
     /// collected, else the `body` field.
     fn bodyLen(self: *const Response) usize {

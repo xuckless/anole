@@ -155,7 +155,7 @@ app.use(Timing{});
 
 ### Built-in middleware
 
-`anole.middleware` holds dusty's:
+`anole.middleware` holds the HTTP core's, and `ResponseCache`:
 
 | Middleware | What it does |
 | --- | --- |
@@ -164,6 +164,7 @@ app.use(Timing{});
 | `Compress.init()` | Sets `res.compress` on every response; see [Compression](#compression). |
 | `Cors.init(.{})` | CORS for browsers: any origin by default, preflights answered with 204; see [CORS](#cors). |
 | `Session.init(.{ .secret_key = ... })` | `req.session` in a signed, not encrypted, cookie. Returns an error union. |
+| `ResponseCache` | Whole responses kept per executor and answered from memory; see [Response cache](#response-cache). |
 
 ```zig
 app.use(anole.middleware.RequestId.init(.{})); // first, so the rest see req.id
@@ -205,6 +206,90 @@ for other methods, the router runs the middleware of the route the preflight
 asks about, so the group's `Cors` answers it. Put `Cors` ahead of
 middleware that refuses requests (authentication): a preflight carries no
 credentials.
+
+### Response cache
+
+A route can have its answers kept and served from memory, without running
+its handler, for a while:
+
+```zig
+app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed));
+```
+
+One cache for several routes is `app.responseCache`, used through `with`,
+`group` or `use`, and invalidated when what it serves changes:
+
+```zig
+const App = struct { db: *anole.pg.Db, pages: *anole.middleware.ResponseCache };
+
+state.pages = app.responseCache(.{ .ttl = .fromSeconds(60), .name = "pages" });
+app.with(.{state.pages}).get("/posts/:id", showPost);
+app.put("/posts/:id", editPost);
+
+fn editPost(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const id = req.params.get("id").?;
+    // ... the update ...
+    app.pages.invalidate(.{ .path = try std.fmt.allocPrint(req.arena, "/posts/{s}", .{id}) });
+    res.status = .no_content;
+}
+```
+
+What is kept:
+
+- Answers to `GET`. A `HEAD` is answered from a kept `GET`; other methods
+  pass through.
+- Statuses a cache may keep without being told: 200, 203, 204, 300, 301,
+  308, 404 and 410. Not errors, not 304.
+- Bodies held in memory: not `sendFile`, a stream, an event stream, a
+  WebSocket upgrade, or a response with trailers. At most
+  `max_entry_bytes` (1 MiB).
+- The headers the route set (and middleware after the cache), replayed on
+  a hit. Middleware before the cache runs on every request as usual, so its
+  headers (`X-Request-Id`, CORS for the caller's origin) are fresh.
+
+What is not:
+
+- A response that sets a cookie, or whose `Cache-Control` says `no-store`,
+  `no-cache` or `private`. Its `s-maxage`, else `max-age`, is how long it is
+  kept (0: not at all); with neither, the cache's `ttl` (10 s by default).
+- Requests that carry credentials (`Authorization`, `Cookie`, `X-API-Key`;
+  `credential_headers`): they neither read the cache nor fill it.
+  `.authenticated = true` lets them, for routes whose answer does not depend
+  on who asks: the credentials are not part of the key.
+- `Vary: *`. Other `Vary` headers are honoured: each combination of the
+  named request headers is kept apart.
+
+The key is the scheme, the `Host` header and the target, query included as
+sent. Each executor keeps its own entries (no lock between threads), so two
+executors may answer from responses up to `ttl` apart; `invalidate(.all)`
+and `invalidate(.{ .path = "/posts/7" })` (every query and `Vary` variant
+of that path) reach every executor at once. The bounds (`max_entries`,
+1024; `max_bytes`, 16 MiB) are split between the executors, least recently
+used first out. With `app.metrics`, each cache reports
+`anole_cache_hits_total`, `anole_cache_misses_total`,
+`anole_cache_stores_total`, `anole_cache_evictions_total`,
+`anole_cache_entries` and `anole_cache_bytes`, labelled `kind="http"` and
+its name (the route's path for `anole.cached`); `cache.stats()` has the
+same numbers.
+
+The body is kept as the handler wrote it, so with `Compress` each hit is
+compressed again for its client.
+
+When not to use it:
+
+- Pages that differ by who asks, unless the difference is in the URL or a
+  `Vary` header: a session read from a cookie makes the request bypass the
+  cache, but a user identified some other way (a client certificate, a
+  header not in `credential_headers`) would get another user's page.
+  Add such headers to `credential_headers`, or keep the cache off the route.
+- Anything that must show a write at once, unless the write invalidates it.
+- Routes behind authorization middleware that runs after the cache (a
+  route's own `with`, in a group whose cache comes first): a hit skips it.
+  Put authentication before the cache, or the cache on public routes only.
+- Large downloads and files: `staticDir` already serves files with ETags
+  and ranges.
+
+For rows rather than responses, see [Caching](database.md#caching).
 
 Elsewhere in Anole: encrypted-cookie and server-side sessions, CSRF, API
 keys, roles and rate limiting ([auth.md](auth.md)); a JSON or text access

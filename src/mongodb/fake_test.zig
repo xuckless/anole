@@ -28,6 +28,9 @@ const Fake = struct {
     lsids: [8][16]u8 = undefined,
     killed: std.atomic.Value(u32) = .init(0),
     get_mores: std.atomic.Value(u32) = .init(0),
+    /// Finds answered, and how long each waits first.
+    finds: std.atomic.Value(u32) = .init(0),
+    find_delay_ms: std.atomic.Value(u32) = .init(0),
 
     fn init(f: *Fake, io: std.Io) !void {
         const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -96,12 +99,16 @@ const Fake = struct {
             try b.append("ok", .{ .double = 1 });
         } else if (std.mem.eql(u8, command, "find")) {
             if (dec(&f.drop_finds)) return false;
-            // Ten documents, four per batch: cursor 42.
-            try f.batch(b, "firstBatch", 0, 42);
+            _ = f.finds.fetchAdd(1, .monotonic);
+            const delay = f.find_delay_ms.load(.monotonic);
+            if (delay > 0) try io.sleep(.fromMilliseconds(delay), .awake);
+            // Ten documents, four per batch. The cursor id is where the
+            // next batch starts, so cursors running at once stay apart.
+            try f.batch(b, "firstBatch", 0, 4);
         } else if (std.mem.eql(u8, command, "getMore")) {
-            const n = f.get_mores.fetchAdd(1, .monotonic);
-            const start: i32 = @intCast(4 * (n % 2 + 1));
-            try f.batch(b, "nextBatch", start, if (start + 4 >= 10) 0 else 42);
+            _ = f.get_mores.fetchAdd(1, .monotonic);
+            const start: i32 = @intCast(msg.body.get("getMore").?.int64);
+            try f.batch(b, "nextBatch", start, if (start + 4 >= 10) 0 else start + 4);
         } else if (std.mem.eql(u8, command, "killCursors")) {
             _ = f.killed.fetchAdd(1, .monotonic);
             try b.append("ok", .{ .double = 1 });
@@ -138,7 +145,6 @@ const Fake = struct {
         } else {
             try b.append("ok", .{ .double = 1 });
         }
-        _ = io;
         try m.endBody();
         const bytes = try m.finish(9);
         std.mem.writeInt(i32, b.buf.items[8..12], msg.header.request_id, .little);
@@ -254,4 +260,66 @@ test "fake mongod: no server, a timeout and a bad connection string" {
     try testing.expectError(error.InvalidUri, mongodb.Client.connect(gpa, io, .{ .url = "mongodb://host:99999/" }));
     try testing.expectError(error.Unsupported, mongodb.Client.connect(gpa, io, .{ .url = "mongodb://host/?readPreference=secondary" }));
     try testing.expectError(error.Unsupported, mongodb.Client.connect(gpa, io, .{ .url = "mongodb+srv://cluster.example.com/" }));
+}
+
+test "fake mongod: coalesced and cached reads, invalidation" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
+    const client = try mongodb.Client.connect(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // Found before the counting starts.
+    try client.ping(&c);
+
+    // 8 callers on each of 2 executors: one find per executor.
+    fake.find_delay_ms.store(100, .monotonic);
+    const Worker = struct {
+        fn run(coll: mongodb.Collection, io_: std.Io, bad: *std.atomic.Value(u32)) void {
+            var a: std.heap.ArenaAllocator = .init(gpa);
+            defer a.deinit();
+            var ctx: db.Ctx = .{ .io = io_, .arena = a.allocator() };
+            const rows = coll.with(.{ .coalesce = true }).find(Row, &ctx, .{ .active = true }, .{ .batch_size = 4 }) catch {
+                _ = bad.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (rows.len != 10 or rows[9].n != 9) _ = bad.fetchAdd(1, .monotonic);
+        }
+    };
+    var bad: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..16) |i| try @import("dusty").placement.concurrent(&group, io, .{ .executor = i % 2 }, Worker.run, .{ users, io, &bad });
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), fake.finds.load(.monotonic));
+    try testing.expectEqual(@as(u64, 14), client.cache.stats().coalesced);
+    fake.find_delay_ms.store(0, .monotonic);
+
+    // Cached: one find until invalidated. Another filter is another key,
+    // and so is the same value under another field name.
+    const cached = users.with(.{ .cache = .{ .ttl = .fromSeconds(60), .tag = "users" } });
+    fake.finds.store(0, .monotonic);
+    try testing.expectEqual(@as(i32, 0), (try cached.findOne(Row, &c, .{ .name = "Ada" }, .{})).n);
+    try testing.expectEqual(@as(i32, 0), (try cached.findOne(Row, &c, .{ .name = "Ada" }, .{})).n);
+    try testing.expectEqual(@as(usize, 10), (try cached.find(Row, &c, .{ .name = "Ada" }, .{})).len);
+    try testing.expectEqual(@as(u32, 2), fake.finds.load(.monotonic));
+    _ = try cached.findOne(Row, &c, .{ .email = "Ada" }, .{});
+    try testing.expectEqual(@as(u32, 3), fake.finds.load(.monotonic));
+    client.cache.invalidate(.{ .tag = "users" });
+    _ = try cached.findOne(Row, &c, .{ .name = "Ada" }, .{});
+    try testing.expectEqual(@as(u32, 4), fake.finds.load(.monotonic));
+    // A plain find is never cached.
+    _ = try users.findOne(Row, &c, .{ .name = "Ada" }, .{});
+    _ = try users.findOne(Row, &c, .{ .name = "Ada" }, .{});
+    try testing.expectEqual(@as(u32, 6), fake.finds.load(.monotonic));
 }
