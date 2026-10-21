@@ -5,16 +5,17 @@
 # client failing to connect (Docker Desktop's host.docker.internal path
 # drops a connection now and then), or one that wrote no report, is
 # retried, twice at most; a run with no report prints both logs.
-#   tests/autobahn/run.sh [path-to-echo-binary]
+#   tests/autobahn/run.sh [path-to-echo-binary [loop|callbacks]]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-zig-out/bin/autobahn-echo}
+mode=${2:-loop}
 image=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
 attempt=1
 while :; do
   reports=$(mktemp -d)
   echo "reports: $reports (attempt $attempt)"
-  "$bin" 9001 >"$reports/server.log" 2>&1 &
+  "$bin" 9001 "$mode" >"$reports/server.log" 2>&1 &
   pid=$!
   sleep 1
   docker run --rm --add-host=host.docker.internal:host-gateway \

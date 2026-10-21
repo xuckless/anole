@@ -36,6 +36,15 @@ for macOS and Linux.
   connections left unused, and a WebSocket's reply batching shares one
   backstop task per executor instead of one per socket: a busy pipelining
   WebSocket holds about 34 KB instead of 43.
+- Idle connections park: an HTTP/1.1 connection that has had nothing to
+  read for `timeout.idle_park` (1 s, null turns it off) ends its coroutine
+  and waits as a heap object whose socket its executor watches (a readiness
+  poll in a zio `CompletionQueue` that one driver task per executor owns);
+  its next request starts a coroutine on the same executor. Keep-alive deadlines, the drain and the stop cover parked
+  connections. `app.wsCallbacks(path, Callbacks)` serves a WebSocket
+  through `open`/`message`/`close` callbacks, and over HTTP/1.1 such a
+  socket parks the same way between messages (`Response.adopt` in the
+  HTTP core hands the connection over to it after the handshake).
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with

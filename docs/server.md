@@ -475,11 +475,23 @@ To allow more, raise the hard limit where the process starts:
 `LimitNOFILE=1048576` in a systemd unit, `--ulimit nofile=1048576:1048576`
 for `docker run`, `ulimit -Hn` in a shell (as root).
 
-Each open connection also has a coroutine, and each coroutine's stack is two
-memory mappings. Linux caps mappings per process with `vm.max_map_count`,
+An HTTP/1.1 connection that has waited `timeout.idle_park` (1 s) for its
+next request, with nothing buffered, ends its coroutine and parks: it is
+then a small heap object whose socket the executor watches, and the next
+request starts a coroutine for it again on the same executor. Keep-alive
+and first-request timeouts still apply to parked connections, to about a
+second, and the drain and the stop close them. A WebSocket served through
+callbacks ([`app.wsCallbacks`](websocket.md#callbacks)) parks the same
+way between messages. HTTP/2 connections, and WebSockets served by a
+handler that loops on `ws.next()`, keep their coroutines. Set
+`server.timeout.idle_park` to null to keep every connection's coroutine
+(parking needs zio's pinned executors, which `run` uses).
+
+Each connection with a coroutine has a stack, which is two memory mappings.
+Linux caps mappings per process with `vm.max_map_count`,
 which is 65,530 by default on Debian, RHEL and their derivatives (Ubuntu
 22.10 and later default to 1,048,576), so a server there stops taking new
-connections at about 30,000 open at once, whatever the cap. Raise it on
+connections at about 30,000 busy at once, whatever the cap. Raise it on
 hosts that hold more:
 
 ```sh

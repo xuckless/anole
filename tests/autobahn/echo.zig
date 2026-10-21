@@ -1,7 +1,10 @@
 //! The Autobahn fuzzing client's peer: every text or binary message is
-//! echoed back on the socket it arrived on.
+//! echoed back on the socket it arrived on, from a `receive` loop, or with
+//! `callbacks` as the second argument through WebSocket callbacks, parking
+//! the socket whenever it has nothing to read for a millisecond.
 //!
 //!   zig build autobahn-echo -Doptimize=ReleaseSafe && tests/autobahn/run.sh
+//!   tests/autobahn/run.sh zig-out/bin/autobahn-echo callbacks
 const std = @import("std");
 const anole = @import("anole");
 
@@ -28,16 +31,24 @@ fn echo(req: *anole.Request, res: *anole.Response) !void {
     }
 }
 
+const Echo = struct {
+    pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void {
+        try ws.send(msg.type, msg.data);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 9001;
     var args = init.minimal.args.iterate();
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
+    const callbacks = if (args.next()) |mode| std.mem.eql(u8, mode, "callbacks") else false;
     var app = try anole.Server(void).init(init.gpa, .{
         // Docker reaches the host through its gateway, not loopback.
         .http = .{ .address = "0.0.0.0", .port = port },
+        .server = .{ .timeout = .{ .idle_park = if (callbacks) .fromMilliseconds(1) else .fromSeconds(1) } },
     }, {});
     defer app.deinit();
-    app.get("/", echo);
+    if (callbacks) app.wsCallbacks("/", Echo) else app.get("/", echo);
     try app.run();
 }
