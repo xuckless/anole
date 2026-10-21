@@ -98,49 +98,56 @@ Where to go next:
 
 Measured on one Linux box (Intel i7-14700F, Fedora 44) against the stacks
 people actually deploy. Each server runs in its own container, pinned to
-dedicated P-cores, with idle siblings and a memory cap. Load comes from wrk
-and h2load on other cores. Each server is set up the way its own docs say to,
-under the same rules for everyone. Server and load generator share the box
-and talk over loopback, so read the comparisons, not the absolute numbers.
+dedicated P-cores, with idle siblings and a memory cap. Load comes from wrk,
+h2load and gcannon on other cores. Each server is set up the way its own docs
+say to, under the same rules for everyone. Server and load generator share the
+box and talk over loopback, so read the comparisons, not the absolute numbers.
 The harness, every server's code and the raw results are in `bench/` on the
-[`bench/suite`](https://github.com/xuckless/anole/tree/bench/suite/bench) branch
-(numbers from its quick profile, 2026-10-19, one 15 s run per case after a
-5 s warm-up).
+[`bench/suite`](https://github.com/xuckless/anole/tree/bench/suite/bench) branch.
+The tables mix runs, each from the newest result for that row: Anole's HTTP/2,
+HTTP/3, TLS, WebSocket and WebTransport numbers are from 2026-10-19 (`nowait`)
+and 2026-10-21 (`backstop`), Bun's from 2026-10-19 (`bun`), and the other
+servers' from 2026-10-19 (`quick`, `h3`, `wspipe`). Anole's plain HTTP/1.1
+row has not been re-run since `quick`. One 15 s run per case after a 5 s
+warm-up.
 
 **One CPU, `/plaintext`, requests per second:**
 
-| Protocol | Anole | Fiber | Axum | Go net/http | Fastify | FastAPI | nginx (ceiling) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| HTTP/1.1 | **243.7k** | 237.5k | 223.5k | 145.3k | 123.3k | 23.2k | 257.9k |
-| HTTP/1.1 + TLS | **203.4k** | 200.6k | 199.5k | 137.5k | 94.5k | 20.8k | 186.1k |
-| HTTP/2 + TLS | **393.0k** | – | 259.4k | 65.2k | 64.9k | – | 222.3k |
-| HTTP/2 cleartext | **409.5k** | – | 276.0k | 65.0k | 69.0k | 5.7k | – |
-| HTTP/3 | **279.6k** | – | 112.6k | 84.0k | – | 2.6k | 437.3k |
+| Protocol | Anole | Bun | Fiber | Axum | Go net/http | Fastify | FastAPI | nginx (ceiling) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HTTP/1.1 | **243.7k** | 215.5k | 237.5k | 223.5k | 145.3k | 123.3k | 23.2k | 257.9k |
+| HTTP/1.1 + TLS | **209.7k** | 195.1k | 200.6k | 199.5k | 137.5k | 94.5k | 20.8k | 186.1k |
+| HTTP/2 + TLS | **685.0k** | 544.3k | – | 259.4k | 65.2k | 64.9k | – | 222.3k |
+| HTTP/2 cleartext | **722.5k** | 563.6k | – | 276.0k | 65.0k | 69.0k | 5.7k | – |
+| HTTP/3 | 328.3k | **394.9k** | – | 112.6k | 84.0k | – | 2.6k | 437.3k |
 
 **Four CPUs:**
 
-| Protocol | Anole | Fiber | Axum | nginx |
-| --- | ---: | ---: | ---: | ---: |
-| HTTP/1.1 | **618.0k** | 477.3k | 457.3k | 609.5k |
-| HTTP/1.1 + TLS | **509.9k** | 426.2k | 406.6k | 444.5k |
-| HTTP/2 + TLS | **901.0k** | – | 561.0k | 644.7k |
-| HTTP/2 cleartext | **954.4k** | – | 599.3k | – |
-| HTTP/3 | **907.6k** | – | 273.7k | 1,267.5k |
+| Protocol | Anole | Bun | Fiber | Axum | nginx |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP/1.1 | **618.0k** | 545.0k | 477.3k | 457.3k | 609.5k |
+| HTTP/1.1 + TLS | **531.9k** | 475.8k | 426.2k | 406.6k | 444.5k |
+| HTTP/2 + TLS | **1,899.6k** | 1,501.6k | – | 561.0k | 644.7k |
+| HTTP/2 cleartext | **2,023.8k** | 1,581.8k | – | 599.3k | – |
+| HTTP/3 | **1,064.7k** | 1,054.9k | – | 273.7k | 1,267.5k |
 
 What we read in these numbers:
 
-- **On one core, Anole leads every app framework on every protocol here.**
-  The only server ahead of it is nginx on cleartext HTTP/1.1 and HTTP/3, and
-  nginx is serving a fixed string from its config. It's the ceiling, not a
-  competitor.
+- **Anole leads every app framework on HTTP/1.1 and HTTP/2, on one core and
+  on four.** HTTP/2 is 1.3× Bun and 2.6–3.4× Axum. The servers ahead of it
+  are nginx on cleartext HTTP/1.1 on one core and on HTTP/3, and nginx is
+  serving a fixed string from its config. It's the ceiling, not a competitor.
+- **HTTP/3 is the exception:** Bun is 20% ahead on one core (395k against
+  328k) and the two are level on four. Closing that gap is the next
+  performance item.
 - **The tail stays short.** HTTP/1.1 p99 on four cores is 0.50 ms for Anole,
-  1.06 ms for Axum and 3.87 ms for Fiber.
-- **It stays small.** Anole used 12–67 MB here. nginx used 31–150 MB, and the
-  Node stacks hundreds.
-- **HTTP/3 got 1.8–2.4× faster this week:** 157k → 280k on one core and
-  379k → 908k on four, mostly from batching packets per wake and per flush.
-  These rows come from the `perf-h3-bench` branch, which is on its way to
-  `main`.
+  0.85 ms for Bun, 1.06 ms for Axum and 3.87 ms for Fiber.
+- **It stays small.** Anole used 12–77 MB here. nginx used 31–150 MB, Bun
+  14–80 MB, and the Node stacks hundreds.
+- **It got a lot faster since the first runs.** HTTP/2 cleartext went from 409k to
+  722k on one core and from 954k to 2.02M on four (requests that arrive whole
+  now run without a task of their own). HTTP/3 went from 157k to 328k and
+  from 379k to 1.06M, mostly from batching packets per wake and per flush.
 - **Not every stack has every protocol.** "–" means the framework has no
   idiomatic way to serve it. Fiber has no HTTP/2 or HTTP/3, and Go's numbers
   use net/http and quic-go.
@@ -149,25 +156,47 @@ What we read in these numbers:
 
 | | Anole | Fiber | Go | Axum | Express | Fastify | FastAPI |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Echo, msgs/s (64 conns) | **279k** | 237k | 188k | 178k | 209k | 195k | 94k |
-| Fan-out 1,000 × 1 kHz, lag p99 | **3.6 ms** | 1.37 s | 6.8 ms | 4.19 s | 4.0 ms | 3.8 ms | 5.4 ms |
-| Fan-out 10,000 × 100 Hz, lag p99 | 43.6 ms | 14.7 s | 19.2 s | 32.5 s | 48.0 ms¹ | 44.0 ms¹ | 35.9 ms¹ |
-| Trading bots (2,000), order p99 | **1.0 ms** | 1.0 s | 10.0 ms | 438 ms | 49.1 ms | 46.9 ms | 124 ms |
-| Memory per idle socket | 54.5 KB | 20.6 KB | 27.8 KB | 137.6 KB | 10.2 KB | 14.7 KB | 34.6 KB |
+| Echo, msgs/s (64 conns) | **281k** | 237k | 188k | 178k | 209k | 195k | 94k |
+| Fan-out 1,000 × 1 kHz, lag p99 | **3.7 ms** | 1.37 s | 6.8 ms | 4.19 s | 4.0 ms | 3.8 ms | 5.4 ms |
+| Fan-out 10,000 × 100 Hz, lag p99 | 44.0 ms | 14.7 s | 19.2 s | 32.5 s | 48.0 ms¹ | 44.0 ms¹ | 35.9 ms¹ |
+| Trading bots (2,000), order p99 | **1.1 ms** | 1.0 s | 10.0 ms | 438 ms | 49.1 ms | 46.9 ms | 124 ms |
+| Memory per idle socket | 31.5 KB | 20.6 KB | 27.8 KB | 137.6 KB | 10.2 KB | 14.7 KB | 34.6 KB |
 
 ¹ Not all subscribers connected: Express held 9,698 of 10,000, Fastify 8,938
 and FastAPI 4,896. Anole held all 10,000.
 
 Under fan-out pressure Anole keeps everyone current, while several stacks
-quietly queue up seconds of backlog. The weak spot is memory: 54.5 KB per idle
-socket is too much, and a fix is in progress.
+quietly queue up seconds of backlog. Memory per idle socket fell from 54.5 KB
+to 31.5 KB, still above Fiber, Go and the Node stacks; more trimming is in
+progress.
+
+**WebSocket echo with 16 messages in flight per connection** (HttpArena's
+`echo-ws-pipeline` shape, gcannon, 5-byte text frames), echoed frames per
+second. Anole and Bun are from 2026-10-21, with Anole on io_uring (epoll is
+3.24M, 2.42M and 2.12M on one core), and the rest from 2026-10-19:
+
+| Connections | Anole | Bun | Fiber | Axum | Go | Fastify |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 CPU, 512 | **3.68M** | 3.19M | 2.55M | 1.19M | 0.21M | 0.28M |
+| 1 CPU, 4,096 | 2.49M | **2.65M** | 1.98M | 1.01M | 0.21M | 0.27M |
+| 1 CPU, 16,384 | 2.16M | **2.58M** | 1.88M | 0.26M² | 0.22M | 0.22M |
+| 4 CPUs, 512 | **9.70M** | 8.46M | 5.95M | 3.23M | 0.59M | 0.76M |
+| 4 CPUs, 4,096 | 7.45M | **7.46M** | 5.37M | 2.84M | 0.58M | 0.74M |
+| 4 CPUs, 16,384 | 5.19M | **7.17M** | 4.85M | 2.28M | 0.58M | 0.73M |
+
+² Axum's server was killed for running out of memory.
+
+Anole is ahead at 512 connections and about level with Bun at 4,096. At
+16,384 connections Bun is ahead, 1.2× on one core and 1.4× on four, and it
+uses 70–190 MB where Anole uses about 535 MB. That is the same per-connection
+memory work as above.
 
 **WebTransport (draft-02), one CPU:**
 
 Anole serves WebTransport from the same HTTP/3 listener as everything else.
-Its 16 KiB stream echo reaches 466 MB/s, level with Rust's wtransport
-(471 MB/s), ahead of Go's webtransport-go (299 MB/s), and 10–70× the Node
-and Python libraries.
+Its 16 KiB stream echo reaches 552 MB/s, ahead of Rust's wtransport
+(471 MB/s) and Go's webtransport-go (299 MB/s), and 14–80× the Node and Python
+libraries. Datagrams echo at 64k/s across 64 sessions with no loss.
 
 **Still cooking:**
 - **gRPC:** published once an error count we saw at four cores is explained.
