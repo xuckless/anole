@@ -45,11 +45,13 @@ trap cleanup EXIT
   openssl x509 -req -in server.csr -CA root.crt -CAkey ca.key -CAcreateserial -days 1 \
     -extfile server.ext -out server.crt 2>/dev/null
   rm -f server.csr server.ext ca.key root.srl
-  # The server runs as its own user, whatever owns the files here.
+  # The server runs as its own user, whatever owns the files here, and
+  # mktemp made the directory 0700.
   chmod 644 server.key server.crt root.crt
 )
+chmod 755 "$CERTS"
 
-docker run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:6379" -p "127.0.0.1:$TLS_PORT:6380" \
+docker run -d --name "$NAME" -p "127.0.0.1:$PORT:6379" -p "127.0.0.1:$TLS_PORT:6380" \
   -v "$CERTS:/tls:ro" "$IMAGE" "$SERVER" \
   --port 6379 --tls-port 6380 \
   --tls-cert-file /tls/server.crt --tls-key-file /tls/server.key \
@@ -60,7 +62,11 @@ for _ in $(seq 1 60); do
   if docker exec "$NAME" "${SERVER%-server}-cli" ping 2>/dev/null | grep -q PONG; then break; fi
   sleep 1
 done
-docker exec "$NAME" "${SERVER%-server}-cli" ping | grep -q PONG
+if ! docker exec "$NAME" "${SERVER%-server}-cli" ping 2>/dev/null | grep -q PONG; then
+  echo "the server did not answer; its log:" >&2
+  docker logs "$NAME" >&2 || true
+  exit 1
+fi
 
 echo "== $IMAGE, plain"
 "$ZIG" build test-redis --summary all -Dredis-test-url="redis://127.0.0.1:$PORT" "$@"
