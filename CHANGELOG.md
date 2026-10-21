@@ -132,8 +132,11 @@ for macOS and Linux.
   gzip on a tie (`Accept-Encoding: gzip, br` gets `br`). Buffered and
   streamed bodies, flushes included. Quality 5 by default
   (`ServerConfig.response.brotli_quality`, `res.brotli_quality`): 10-15%
-  smaller than gzip on JSON of a few KB. Precompressed `.br` files are served
-  as before.
+  smaller than gzip on JSON of a few KB. The encoder's large blocks, and
+  zlib-ng's deflate state for a buffered gzip body, are cached per executor
+  (at most 4 MiB, trimmed when idle) instead of mapped and unmapped per
+  response or kept in each connection's arena. Precompressed `.br` files
+  are served as before.
 - The PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies.
 - Zero-downtime restart on SIGUSR2 (the new process inherits the listening
   sockets, HTTP/3's UDP sockets included; HTTP/3 connections are closed and

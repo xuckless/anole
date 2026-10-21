@@ -24,6 +24,7 @@ const default_listeners = @import("config.zig").default_listeners;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
+const block_cache = @import("block_cache.zig");
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
@@ -1229,12 +1230,15 @@ pub fn Server(comptime Ctx: type) type {
         /// Gives back, every `request_buffers_trim_interval`, the request
         /// buffer sets this executor's connections left unused since the
         /// last time, and the first executor's the shared ones too
-        /// (`RequestBuffersPool.trimLocal`, `trimShards`).
+        /// (`RequestBuffersPool.trimLocal`, `trimShards`); and the
+        /// compressors' blocks it cached that no response took
+        /// (`block_cache`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
             while (true) {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
+                if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
             }
         }
 

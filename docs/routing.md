@@ -399,7 +399,10 @@ the handler sets `res.compress = true`, or always through `Compress`.
   quality 4, at about twice gzip's CPU time; quality 6 gains under 1% more,
   and 11 is for precompressed files (`precompressed = &.{.br}`), not for
   responses. Its window is at most 64 KiB, so each Brotli response in
-  flight takes about 512 KiB, freed when it ends.
+  flight takes about 600 KiB. Its large blocks, and gzip's for a buffered
+  body, come from a cache per executor, reused from one response to the
+  next (no `mmap` or page faults per response, with glibc or musl),
+  holding at most 4 MiB and trimmed back to one encoder's worth when idle.
 - Only compressible types: text, JSON, JavaScript, XML, SVG, `+json` and
   `+xml` types and the like. Not images, video, fonts or archives.
 - Buffered bodies under 128 bytes, or that do not shrink, go out as they are.

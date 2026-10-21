@@ -6,13 +6,14 @@
 //! (brotli/encode.h bindings): `Compress` brotli-compresses what is written
 //! to it into another writer. Only built with `use_brotli`.
 //!
-//! Unlike zstd_io, the encoder's memory comes from libc's malloc, not the
-//! request's arena: about 512 KiB per encoder at the window used here, which
-//! an arena would keep for as long as it is reused (an HTTP/1.1 connection
-//! keeps its arena's capacity between requests). So `deinit` must run,
-//! finished or not.
+//! Unlike zstd_io, the encoder's memory does not come from the request's
+//! arena: an encoder takes about 600 KiB at the window used here, which an
+//! arena would keep for as long as it is reused (an HTTP/1.1 connection
+//! keeps its arena's capacity between requests). It comes from
+//! `block_cache` instead, so `deinit` must run, finished or not.
 const std = @import("std");
 const c = @import("brotli");
+const block_cache = @import("block_cache.zig");
 
 const Writer = std.Io.Writer;
 
@@ -38,6 +39,21 @@ pub fn windowFor(len: usize) u5 {
     return @intCast(std.math.clamp(std.math.log2_int_ceil(usize, @max(len, 1)), min_lgwin, max_lgwin));
 }
 
+fn brotliAlloc(_: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    return block_cache.alloc(size);
+}
+
+fn brotliFree(_: ?*anyopaque, address: ?*anyopaque) callconv(.c) void {
+    block_cache.free(address);
+}
+
+pub const State = c.BrotliEncoderState;
+
+/// Frees an encoder whose `Compress` is gone (`Compress.state`).
+pub fn destroy(state: *State) void {
+    c.BrotliEncoderDestroyInstance(state);
+}
+
 pub const Compress = struct {
     writer: Writer,
     output: *Writer,
@@ -56,7 +72,7 @@ pub const Compress = struct {
             .output = output,
             .state = null,
         };
-        const state = c.BrotliEncoderCreateInstance(null, null, null) orelse return error.OutOfMemory;
+        const state = c.BrotliEncoderCreateInstance(brotliAlloc, brotliFree, null) orelse return error.OutOfMemory;
         errdefer c.BrotliEncoderDestroyInstance(state);
         // BROTLI_MAX_QUALITY and BROTLI_MAX_WINDOW_BITS.
         const quality: u32 = @min(options.quality, 11);
@@ -202,6 +218,50 @@ test "brotli_io: a round trip, whole and with flushes that decode as they go" {
     const decoded = try testDecode(gpa, encoded.written(), input.len);
     defer gpa.free(decoded);
     try std.testing.expectEqualStrings(input, decoded);
+}
+
+test "brotli_io: an encoder's large blocks are reused by the next, and trimmed when idle (block_cache)" {
+    const gpa = std.testing.allocator;
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    for (0..400) |i| try text.writer.print("{{\"id\":{d},\"name\":\"item {d}\"}},", .{ i, i % 13 });
+    const input = text.written();
+
+    var after_first: usize = 0;
+    for (0..3) |round| {
+        var encoded: std.Io.Writer.Allocating = try .initCapacity(gpa, 1024);
+        defer encoded.deinit();
+        var z: Compress = undefined;
+        try z.init(&encoded.writer, &.{}, .{ .lgwin = windowFor(input.len), .size_hint = input.len });
+        try z.writer.writeAll(input);
+        try z.finish();
+        z.deinit();
+        const decoded = try testDecode(gpa, encoded.written(), input.len);
+        defer gpa.free(decoded);
+        try std.testing.expectEqualStrings(input, decoded);
+        // The first encoder leaves its large blocks; the next ones take them
+        // and give them back, so the cache stops growing.
+        if (round == 0) after_first = block_cache.cached().count else try std.testing.expectEqual(after_first, block_cache.cached().count);
+    }
+    // At least its two hash tables.
+    try std.testing.expect(after_first >= 2);
+
+    // Two encoders at once (two streams) need twice the blocks; once idle
+    // for a whole trim interval, the cache goes back to `trim_keep`.
+    var outs: [2]std.Io.Writer.Allocating = .{ try .initCapacity(gpa, 256), try .initCapacity(gpa, 256) };
+    defer for (&outs) |*o| o.deinit();
+    var zs: [2]Compress = undefined;
+    for (&zs, &outs) |*z, *o| try z.init(&o.writer, &.{}, .{});
+    for (&zs) |*z| try z.writer.writeAll(input);
+    for (&zs) |*z| {
+        try z.finish();
+        z.deinit();
+    }
+    try std.testing.expect(block_cache.cached().count > block_cache.trim_keep);
+    block_cache.trimLocal(); // the low mark of the interval that just ended
+    block_cache.trimLocal(); // nothing taken since: down to trim_keep
+    try std.testing.expectEqual(@as(usize, block_cache.trim_keep), block_cache.cached().count);
+    try std.testing.expect(block_cache.cached().bytes <= block_cache.max_cached);
 }
 
 test "brotli_io: the window fits the body, up to 64 KiB" {

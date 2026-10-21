@@ -16,6 +16,7 @@ const ErrorFormat = @import("config.zig").ErrorFormat;
 const statusBody = @import("middleware.zig").statusBody;
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 const brotli_io = if (build_options.use_brotli) @import("brotli_io.zig") else struct {};
+const block_cache = @import("block_cache.zig");
 
 var no_buf: [0]u8 = .{};
 
@@ -571,21 +572,26 @@ const StreamCompressor = struct {
                 self.coder = .{ .zstd = undefined };
                 try self.coder.zstd.init(res.arena, &self.out, &.{}, .{});
             } else unreachable,
-            // Its memory is malloc'd: `deinit` frees it, from `finish` or
-            // from `Response.deinit` for a body never ended.
+            // Its memory is not the arena's: `finish` frees it, or
+            // `Response.deinit` for a body never ended (`brotli_encoder`).
             .br => if (build_options.use_brotli) {
                 self.coder = .{ .br = undefined };
                 try self.coder.br.init(&self.out, &.{}, .{ .quality = res.brotli_quality });
+                res.brotli_encoder = self.coder.br.state;
             } else unreachable,
             else => self.coder = .{ .gzip = try .init(res.arena, &self.out, &.{}, .gzip, options) },
         }
         return self;
     }
 
-    /// Frees what is not the arena's (Brotli's encoder). Idempotent.
+    /// Frees what is not the arena's (Brotli's encoder), and says so to
+    /// the response.
     fn deinit(self: *StreamCompressor) void {
         switch (self.coder) {
-            .br => |*z| if (build_options.use_brotli) z.deinit() else unreachable,
+            .br => |*z| if (build_options.use_brotli) {
+                z.deinit();
+                self.res.brotli_encoder = null;
+            } else unreachable,
             else => {},
         }
     }
@@ -712,9 +718,10 @@ pub const Response = struct {
     /// server from `ServerConfig.response.brotli_quality`; a handler may
     /// change it for its own response before the headers go out.
     brotli_quality: u4 = 5,
-    /// The streamed body's compressor, once `stream` made one: freed by
-    /// `deinit` if the body was never ended.
-    stream_compressor: ?*StreamCompressor = null,
+    /// A streamed body's Brotli encoder until the body ends: freed by
+    /// `deinit` if it never does. Held here, not only in the compressor,
+    /// which lives in the arena: the server may reset that before `deinit`.
+    brotli_encoder: if (build_options.use_brotli) ?*brotli_io.State else void = if (build_options.use_brotli) null else {},
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
@@ -815,7 +822,8 @@ pub const Response = struct {
     /// Closes a file body that `write` never got to send.
     pub fn deinit(self: *Response) void {
         self.closeFile();
-        if (self.stream_compressor) |compressor| compressor.deinit();
+        if (build_options.use_brotli) if (self.brotli_encoder) |state| brotli_io.destroy(state);
+        if (build_options.use_brotli) self.brotli_encoder = null;
     }
 
     pub const SendFileOptions = struct {
@@ -907,7 +915,6 @@ pub const Response = struct {
             }
         else
             null;
-        self.stream_compressor = compressor;
         self.headers_written = true;
 
         if (compression != .off) self.addVary();
@@ -1432,9 +1439,12 @@ pub const Response = struct {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
         // Sized to the body, and zlib's memory with it: a window much past
-        // the body finds nothing more to match.
+        // the body finds nothing more to match. That memory (140 KiB and
+        // more) comes from `block_cache`, not the arena: an HTTP/2 or
+        // HTTP/3 stream's arena keeps less than that between requests, so
+        // it would be mapped again for each one.
         const window_bits: u4 = @intCast(std.math.clamp(std.math.log2_int_ceil(usize, len), 9, 15));
-        var gzip = try zlib.Compress.init(self.arena, &out.interface, &.{}, .gzip, .{
+        var gzip = try zlib.Compress.init(block_cache.allocator, &out.interface, &.{}, .gzip, .{
             .level = compression_level,
             .window_bits = window_bits,
             // Any less and the symbol buffer ends deflate blocks early
@@ -3938,8 +3948,8 @@ test "Response: a streamed body goes out as br, each flush decodable" {
     }
     try std.testing.expect(chunks >= 5);
     try std.testing.expectEqualStrings(plain.written(), try testBrotliDecode(arena.allocator(), encoded.written(), plain.written().len));
-    // The encoder's memory (malloc'd) went back when the body ended.
-    try std.testing.expect(response.stream_compressor.?.coder.br.state == null);
+    // The encoder's memory went back when the body ended.
+    try std.testing.expect(response.brotli_encoder == null);
 }
 
 test "Response.deinit frees the Brotli encoder of a stream never ended" {
@@ -3957,9 +3967,12 @@ test "Response.deinit frees the Brotli encoder of a stream never ended" {
     var stream_buf: [64]u8 = undefined;
     var w = try response.stream(&stream_buf);
     try w.interface.writeAll("abandoned half way");
-    try std.testing.expect(response.stream_compressor.?.coder.br.state != null);
+    try std.testing.expect(response.brotli_encoder != null);
+    // As the HTTP/1.1 loop does: the arena (where the compressor is) goes
+    // before the response.
+    _ = arena.reset(.free_all);
     response.deinit();
-    try std.testing.expect(response.stream_compressor.?.coder.br.state == null);
+    try std.testing.expect(response.brotli_encoder == null);
 }
 
 const test_templates = struct {
