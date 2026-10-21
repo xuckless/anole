@@ -134,7 +134,11 @@ pub const WebSocket = struct {
     /// receiveMany() or tryReceive().
     pub fn receive(self: *WebSocket) !Message {
         self.resetMessages();
-        return self.nextMessage();
+        // Inlined down to the frame, so a loop that reads gets one function
+        // however many other paths share the parts (`receiveStarted`,
+        // `tryReceive`, the pongs): a call for each layer costs an echo
+        // about a tenth of its CPU.
+        return @call(.always_inline, nextMessage, .{self});
     }
 
     /// Like `receive`, but also returns every further message already
@@ -213,7 +217,7 @@ pub const WebSocket = struct {
     }
 
     fn nextMessage(self: *WebSocket) !Message {
-        const msg = self.readMessageOrFail() catch |err| {
+        const msg = @call(.always_inline, readMessageOrFail, .{self}) catch |err| {
             self.batch.endRound();
             return err;
         };
@@ -223,7 +227,7 @@ pub const WebSocket = struct {
     }
 
     fn readMessageOrFail(self: *WebSocket) !Message {
-        return self.readMessage() catch |err| switch (err) {
+        return @call(.always_inline, readMessage, .{self}) catch |err| switch (err) {
             // The reads inside can only report the sentinel; the transport
             // knows what actually happened.
             error.ReadFailed => self.transport.getReadError() orelse error.Unexpected,
@@ -310,7 +314,7 @@ pub const WebSocket = struct {
             if (self.batch.deferred.load(.monotonic) and bufferedFrame(self.transport.reader.buffered()) == null) {
                 try self.flushDeferred();
             }
-            const frame = try self.readFrame();
+            const frame = try @call(.always_inline, readFrame, .{self});
             // RSV1 marks a compressed message on its first frame only.
             if (frame.rsv1 and (frame.opcode != .text and frame.opcode != .binary)) return Error.ReservedFlags;
 

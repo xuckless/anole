@@ -155,10 +155,15 @@ pub const Socket = struct {
 
     /// The next text, binary or close message. Pings are answered and
     /// pongs dropped on the way; a compressed message is inflated.
+    ///
+    /// Its parts are inlined into it, and it into `next`, whoever else
+    /// calls them (the callbacks): a message read in one function, rather
+    /// than through a call for each layer, which costs an echo loop about a
+    /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
-        return self.finishMessage(switch (self.conn) {
-            inline else => |ws| try ws.receive(),
-        });
+        return @call(.always_inline, finishMessage, .{ self, switch (self.conn) {
+            inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
+        } });
     }
 
     /// Over HTTP/1.1, for a reading task that waits for the peer in its
@@ -230,7 +235,7 @@ pub const Socket = struct {
     ///     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
     pub fn next(self: *Socket) anyerror!?Message {
         while (true) {
-            const msg = self.receive() catch |err| {
+            const msg = @call(.always_inline, receive, .{self}) catch |err| {
                 const e: anyerror = err;
                 if (e == error.Canceled or e == error.OutOfMemory) return e;
                 self.end_error = e;
