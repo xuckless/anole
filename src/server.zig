@@ -2086,7 +2086,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             // HTTP/1.1, without a certificate and with one.
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/peer", .{port});
-            const ca: http.dusty_module.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
+            const ca: http.core.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
             {
                 var anon = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
                 defer anon.deinit();
@@ -2641,7 +2641,7 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
 
             // TLS, HTTP/1.1 only: a client that offers h2 alone does not
             // get it; one that offers both gets HTTP/1.1. No Alt-Svc.
-            const ca: http.dusty_module.TlsCa = .{ .pem = p.cert };
+            const ca: http.core.TlsCa = .{ .pem = p.cert };
             try std.testing.expect(std.meta.isError(h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h1tls,
