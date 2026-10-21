@@ -151,6 +151,16 @@ pub const Listener = struct {
     /// `Tls.alpn_protocols` instead. The deprecated `Upgrade: h2c` is not
     /// supported.
     http2_prior_knowledge: bool = false,
+    /// Serve HTTP/1.x here. Off, the listener speaks HTTP/2 alone: on a
+    /// cleartext listener (with `http2_prior_knowledge`) a connection that
+    /// does not open with the HTTP/2 preface is closed, and on a TLS one a
+    /// connection whose ALPN did not agree on "h2" is closed after the
+    /// handshake (leave "http/1.1" out of `Tls.alpn_protocols` too).
+    http1: bool = true,
+    /// What the application calls this listener ("admin", "public"), for
+    /// handlers and middleware that tell listeners apart through
+    /// `Request.listener`. Not used by the server itself.
+    name: []const u8 = "",
     /// Every connection here starts with a PROXY protocol header, v1 or v2
     /// (HAProxy, nginx `proxy_protocol on`, AWS NLB, Envoy), read before
     /// TLS: the client address it carries becomes `Request.remote_address`,
@@ -258,13 +268,19 @@ pub const ServerConfig = struct {
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
+    /// The default, `max_connections_from_fd_limit`, is worked out when the
+    /// server starts, from the process's open-file limit (the soft
+    /// RLIMIT_NOFILE) less what is kept back for other descriptors (see
+    /// `fd_limit.maxConnections`): past that limit `accept` fails anyway.
+    /// 10,000 on Windows, which has no such limit.
+    ///
     /// An open connection costs about 2K, 33K more under TLS, and
     /// `request.buffer_size + response.write_buffer_size + 9K` more while a
     /// request is being served, or for as long as it is open with
     /// `request.keep_buffers_between_requests` on. A request with a body
     /// with a `Content-Encoding` takes 70K more while `request.decompress`
     /// is on.
-    max_connections: ?u32 = 10_000,
+    max_connections: ?u32 = max_connections_from_fd_limit,
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
     errors: ErrorFormat = .auto,
@@ -274,6 +290,10 @@ pub const ServerConfig = struct {
     /// without a context of its own. A context's `uncaughtError` comes
     /// first.
     error_handler: ?ErrorHandler = null,
+    /// `max_connections`'s default: worked out from the open-file limit
+    /// when the server starts.
+    pub const max_connections_from_fd_limit: u32 = std.math.maxInt(u32);
+
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.

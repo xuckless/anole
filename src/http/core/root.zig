@@ -76,6 +76,8 @@ pub const checkAddressFree = @import("server.zig").checkAddressFree;
 /// What the startup line says about a listener: "https://127.0.0.1:8443
 /// (HTTP/2, HTTP/1.1)".
 pub const describeListener = @import("server.zig").describeListener;
+/// The open-file limit, and the connection cap worked out from it.
+pub const fd_limit = @import("fd_limit.zig");
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
@@ -104,6 +106,7 @@ comptime {
     _ = @import("deadline.zig");
     _ = @import("cgroup.zig");
     _ = @import("somaxconn.zig");
+    _ = @import("fd_limit.zig");
     _ = @import("config.zig");
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
