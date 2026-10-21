@@ -18,7 +18,7 @@ const anole = @import("anole");
 pub const std_options = anole.std_options;
 
 pub const App = struct {
-    db: *anole.sqlite.Db = undefined,
+    db: *anole.sqlite.Client = undefined,
 };
 
 const Todo = struct { id: i64, title: []const u8, done: bool, created_at: anole.db.Time };

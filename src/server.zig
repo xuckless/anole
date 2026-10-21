@@ -48,11 +48,11 @@ const webtransport_mod = if (features.http3) @import("webtransport.zig") else st
     pub const AcceptOptions = struct {};
 };
 const sqlite_mod = if (features.sqlite) @import("sqlite/root.zig") else struct {
-    pub const Db = void;
+    pub const Client = void;
 };
 const pg_mod = if (features.postgres) @import("pg/root.zig") else struct {
     pub const Options = struct {};
-    pub const Db = void;
+    pub const Client = void;
 };
 const mongodb_mod = if (features.mongodb) @import("mongodb/root.zig") else struct {
     pub const Options = struct {};
@@ -1636,15 +1636,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.health` (a ping behind `/readyz`) when the app has them,
         /// and it is closed with the server, after the drain. See
         /// `anole.pg`.
-        pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Db {
+        pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Client {
             if (comptime !features.postgres) @compileError("app.postgres needs PostgreSQL (-Dpostgres, on in the web and full profiles)");
             var opts = config;
             if (opts.environ == null) if (self.process) |p| {
                 opts.environ = p.environ;
             };
-            const d = try pg_mod.Db.init(self.gpa, self.rt.io(), opts);
+            const d = try pg_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer d.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Db, d));
+            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Client, d));
             return d;
         }
 
@@ -1658,7 +1658,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     state.db = try app.sqlite("app.db");
         ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout_ms = 10_000 });
-        pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Db {
+        pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
             if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
             const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {
                 .pointer => .{ .path = config },
@@ -1669,9 +1669,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 try p.init(self.rt, .{});
                 self.blocking_pool = p;
             }
-            const d = try sqlite_mod.Db.init(self.gpa, self.rt.io(), opts);
+            const d = try sqlite_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer d.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Db, d));
+            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Client, d));
             return d;
         }
 

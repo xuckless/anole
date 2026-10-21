@@ -220,7 +220,7 @@ One cache for several routes is `app.responseCache`, used through `with`,
 `group` or `use`, and invalidated when what it serves changes:
 
 ```zig
-const App = struct { db: *anole.pg.Db, pages: *anole.middleware.ResponseCache };
+const App = struct { db: *anole.pg.Client, pages: *anole.middleware.ResponseCache };
 
 state.pages = app.responseCache(.{ .ttl = .fromSeconds(60), .name = "pages" });
 app.with(.{state.pages}).get("/posts/:id", showPost);
