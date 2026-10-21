@@ -1676,7 +1676,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         /// A MongoDB client for the handlers, owned by the server:
-        /// `state.mongo = try app.mongodb(.{});` reads `MONGODB_URI` (or
+        /// `state.db = try app.mongodb(.{});` reads `MONGODB_URI` (or
         /// `options.url`), else mongodb://localhost:27017. It starts
         /// monitoring the servers at once; connections for calls open when
         /// a handler needs one. Once serving, it reports to `app.metrics`,
@@ -1696,7 +1696,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         /// A Redis or Valkey client for the handlers, owned by the server:
-        /// `state.cache = try app.redis(.{});` reads `REDIS_URL` (or
+        /// `state.redis = try app.redis(.{});` reads `REDIS_URL` (or
         /// `options.url`), else uses `redis://127.0.0.1:6379`. No
         /// connection opens before a handler needs one (unless
         /// `connect_at_start`). Once serving, it reports to `app.metrics`,

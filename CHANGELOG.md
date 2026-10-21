@@ -354,12 +354,17 @@ for macOS and Linux.
 ### Databases
 
 - One shape for every connector (`anole.db`, docs/database.md): the
-  handle lives in the App state, every call takes the request first (an
-  `anole.db.Ctx` outside a handler), and rows come back as your structs in
-  the request's arena, nothing to free. The verbs are shared: `exec`,
-  `one`, `optional`, `all`, `iterate`, `begin`, `transaction`, `acquire`,
-  and `with(.{ .timeout, .prepare, .coalesce, .cache })` for options per
-  call; each connector has the ones its database can do. A pool per
+  handle is each connector's `Client` (`anole.pg.Client`,
+  `anole.sqlite.Client`, `anole.mongodb.Client`, `anole.redis.Client`) and
+  lives in the App state, every call takes the request first (an
+  `anole.db.Ctx` outside a handler), rows come back as your structs in the
+  request's arena, nothing to free, and calls fail with the connector's
+  `Error`. The verbs are shared, and a verb means the same thing in every
+  connector: `exec` (rows changed), `one`, `optional`, `all`, `iterate`,
+  `begin` (a `Tx` whose `commit(req)` and `rollback(req)` take the request
+  like every other call), `transaction`, `acquire`, and
+  `with(.{ .timeout, .prepare, .coalesce, .cache })` for options per call;
+  each connector has the ones its database can do. A pool per
   executor, the connection limit split between them, so no lock is shared
   between threads. A request's deadline, a client gone or an HTTP/2 reset
   cancels its query (PostgreSQL is sent a CancelRequest, SQLite's statement
@@ -403,7 +408,9 @@ for macOS and Linux.
   are the official drivers', with the request first (`find`, `findOne`,
   `insertOne`, `updateMany`, `findOneAndUpdate`, `aggregate`, cursors,
   counts, `distinct`, indexes, `runCommand`), with filters, updates and
-  pipelines as Zig literals. MongoDB 4.2 and later. CI runs 7.0 on
+  pipelines as Zig literals; `one`, `optional` and `all` are `findOne`,
+  `findOptional` and `find` under the shared names, and `with` takes the
+  shared options on the client, a database or a collection. MongoDB 4.2 and later. CI runs 7.0 on
   ubuntu-latest, and 8.0 and 9.0 on ubuntu-22.04 only: they do not run on
   Linux kernels from 6.19 to 7.0.13 (SERVER-121912, SERVER-125742).
 - BSON (`anole.bson`, with `-Dmongodb`): documents checked once and then
@@ -432,12 +439,6 @@ for macOS and Linux.
   called when the waiting caller is canceled while its job runs (SQLite
   interrupts the statement there); a job whose caller was canceled before
   it started no longer starts.
-- Breaking: `anole.redis.Client.connect(gpa, io, .{ .host, .port })` is
-  `app.redis(.{ .url = ... })` (or `anole.redis.Client.init`), `close` is
-  `deinit`, and `command` takes the request (or an `anole.db.Ctx`) and a
-  tuple, `.{ "SET", key, value }`, instead of an allocator and a slice of
-  strings. `-Dredis-test-url` joins `-Dredis-test-port` for the live
-  tests.
 
 ### Observability
 

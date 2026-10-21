@@ -1,17 +1,18 @@
 # Databases
 
 Anole's database connectors share one shape (`anole.db`): the database is
-a handle in your App state, every call takes the request first, rows come
-back as your structs in the request's arena (nothing to free), and a
-database error becomes an HTTP status. The SQL stays yours: there is no
-query builder.
+a handle in your App state (each connector's `Client`), every call takes
+the request first, rows come back as your structs in the request's arena
+(nothing to free), and a database error becomes an HTTP status (each
+connector's `Error` is `anole.db.Error` plus a cancel and memory). The
+SQL stays yours: there is no query builder.
 
 Each connector is a build flag, downloaded and compiled only when it is on:
 
 | Connector | Flag | Profiles | Handle |
 | --- | --- | --- | --- |
-| [PostgreSQL](#postgresql) | `-Dpostgres` | `web`, `full` | `anole.pg.Db`, from `app.postgres(.{})` |
-| [SQLite](#sqlite) | `-Dsqlite` | `web`, `full` | `anole.sqlite.Db`, from `app.sqlite("app.db")` |
+| [PostgreSQL](#postgresql) | `-Dpostgres` | `web`, `full` | `anole.pg.Client`, from `app.postgres(.{})` |
+| [SQLite](#sqlite) | `-Dsqlite` | `web`, `full` | `anole.sqlite.Client`, from `app.sqlite("app.db")` |
 | [MongoDB](#mongodb) | `-Dmongodb` | `full` | `anole.mongodb.Client`, from `app.mongodb(.{})` |
 | [Redis and Valkey](#redis-and-valkey) | `-Dredis` | `full` | `anole.redis.Client`, from `app.redis(.{})` |
 
@@ -30,21 +31,22 @@ The calls:
 | `optional(T, req, sql, args)` | the first row, or null |
 | `all(T, req, sql, args)` | every row (`[]T`) |
 | `iterate(T, req, sql, args)` | rows one at a time: `next()`, then `deinit()` |
-| `begin(req, opts)` | a transaction: the same calls, `commit()`, `rollback()`, `deinit()` |
+| `begin(req, opts)` | a transaction: the same calls, `commit(req)`, `rollback(req)`, `deinit()` |
 | `transaction(req, opts, func, args)` | `func(&tx, args...)`, committed, retried after a serialization failure |
 | `acquire(req)` | the driver's own connection, given back with `release()` |
 | `with(.{ .timeout, .prepare, .coalesce, .cache })` | the same calls with options; see [Caching](#caching) |
 
-Each connector has the calls its database can do:
+Each connector has the calls its database can do, and a call of the same
+name means the same thing in each:
 
 | | PostgreSQL | SQLite | MongoDB | Redis |
 | --- | --- | --- | --- | --- |
-| `exec` | yes | yes | `db(name).exec(req, command)` | `command(req, args)` |
-| `one`, `optional`, `all` | yes | yes | yes, on a collection | yes |
+| `exec` | yes | yes | no: writes return their counts (`updateMany`...), and `db(name).runCommand(req, command)` runs any command | no: `command(req, args)` runs any command |
+| `one`, `optional`, `all` | yes | yes | yes, on a collection: a filter and find options for the SQL and its arguments | yes, a command for the SQL |
 | `iterate` | yes | yes | yes, a cursor | no |
 | `begin`, `transaction` | yes | yes | not yet | no; MULTI in a `pipeline` |
 | `acquire` | yes | yes, the writer | no | yes |
-| `with` | yes | yes | on a collection or `db(name)` | yes |
+| `with` | yes | yes | yes, and on a `db(name)` or a collection | yes |
 
 `args` is a tuple: `.{ id, name }`. Outside a handler (startup, a
 background task) pass an `anole.db.Ctx` instead of the request:
@@ -71,7 +73,7 @@ DATABASE_URL=postgres://postgres:pw@127.0.0.1:5433/postgres zig build run-postgr
 ### Setup
 
 ```zig
-const App = struct { db: *anole.pg.Db };
+const App = struct { db: *anole.pg.Client };
 
 pub fn main(init: std.process.Init) !void {
     var state: App = undefined;
@@ -215,7 +217,7 @@ a serialization failure or a deadlock. By hand:
 var tx = try app.db.begin(req, .{ .isolation = .repeatable_read });
 defer tx.deinit(); // rolls back unless committed
 _ = try tx.exec(req, "...", .{});
-try tx.commit();
+try tx.commit(req); // under the request's deadline, like every call
 ```
 
 ### Pools, statements, timeouts
@@ -282,7 +284,7 @@ of [zig-sqlite](https://github.com/vrischmann/zig-sqlite)): no server, no
 install, one file.
 
 ```zig
-const App = struct { db: *anole.sqlite.Db = undefined };
+const App = struct { db: *anole.sqlite.Client = undefined };
 
 pub fn main(init: std.process.Init) !void {
     var state: App = .{};
@@ -364,12 +366,12 @@ try app.db.transaction(req, .{ .retries = 3 }, move, .{ req, from, to, amount })
 ```
 
 A transaction holds the writer (`BEGIN IMMEDIATE`) until it commits or
-rolls back, so make it short, and inside it use the `Tx`, not the `Db`: a
-write on the `Db` would wait for the transaction's own writer. `transaction`
+rolls back, so make it short, and inside it use the `Tx`, not the `Client`: a
+write on the `Client` would wait for the transaction's own writer. `transaction`
 runs again after `SQLITE_BUSY` (another process held the file past
 `busy_timeout_ms`, as during a restart), up to `retries` more times.
 `begin(req, .{ .read_only = true })` is a snapshot on a reader that writes
-do not disturb. By hand, `commit` and `rollback` take the request too:
+do not disturb. By hand, as with PostgreSQL:
 
 ```zig
 var tx = try app.db.begin(req, .{});
@@ -453,13 +455,13 @@ MONGODB_URI='mongodb://localhost:27017/app?directConnection=true' zig build run-
 ### Setup
 
 ```zig
-const App = struct { mongo: *anole.mongodb.Client };
+const App = struct { db: *anole.mongodb.Client };
 
 pub fn main(init: std.process.Init) !void {
     var state: App = undefined;
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
-    state.mongo = try app.mongodb(.{}); // MONGODB_URI
+    state.db = try app.mongodb(.{}); // MONGODB_URI
     _ = app.metrics(.{}); // pool and command metrics
     _ = app.health(.{}); // /readyz pings the primary
     app.get("/users/:id", get);
@@ -506,11 +508,11 @@ const User = struct { _id: anole.bson.ObjectId, name: []const u8, email: []const
 
 fn get(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const id = anole.bson.ObjectId.parse(req.params.get("id").?) catch return error.NotFound;
-    try res.json(try app.mongo.collection("users").findOne(User, req, .{ ._id = id }, .{})); // none: 404
+    try res.json(try app.db.collection("users").findOne(User, req, .{ ._id = id }, .{})); // none: 404
 }
 
 fn recent(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    const users = app.mongo.db("app").collection("users");
+    const users = app.db.db("app").collection("users");
     try res.json(try users.find(User, req, .{ .tags = "beta", .age = .{ .@"$gte" = 18 } }, .{
         .sort = .{ .created = -1 },
         .limit = 20,
@@ -520,7 +522,7 @@ fn recent(app: *App, req: *anole.Request, res: *anole.Response) !void {
 
 fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const in = try req.bind(struct { name: []const u8, email: []const u8 });
-    const r = try app.mongo.collection("users").insertOne(req, in); // a duplicate email: 409
+    const r = try app.db.collection("users").insertOne(req, in); // a duplicate email: 409
     res.status = .created;
     try res.json(.{ .id = r.objectId().? });
 }
@@ -541,17 +543,19 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
 | `deleteOne`, `deleteMany(req, filter, opts)` | `deleted_count` |
 | `findOneAndUpdate`, `findOneAndReplace`, `findOneAndDelete(T, req, ...)` | the document before (or, with `.return_document = .after`, after), or null |
 | `createIndex(req, keys, opts)`, `dropIndex(req, name)`, `drop(req)` | indexes and the collection |
-| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document`; `db(name).exec` is the same call under the shared verb's name |
-| `one`, `optional`, `all` | the shared verbs: `findOne`, `findOptional`, `find` without options |
-| `with(.{ .timeout })` | the same calls with a timeout of their own (on a collection or a `db(name)`) |
+| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document` |
+| `one(T, req, filter, opts)`, `optional`, `all` | the shared verbs: `findOne`, `findOptional` and `find` under the names the other connectors use |
+| `with(.{ .timeout })` | the same calls with a timeout of their own (`app.db.with(...)`, or on a `db(name)` or a collection) |
 | `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
 
 There are no transactions yet: each call stands alone, and is retried on
 its own.
 
-`client.collection(name)` is in the connection string's database (else
-`"test"`, as the drivers do); `client.db(name).collection(name)` names
-it. An option a call does not take is a compile error that lists those it
+`app.db.collection(name)` is in the connection string's database (else
+`"test"`, as the drivers do); `app.db.db(name).collection(name)` names
+it. MongoDB has no `exec`: a write returns its own counts
+(`matched_count`, `deleted_count`...), and `runCommand` returns the reply
+of any command, as the official drivers name it. An option a call does not take is a compile error that lists those it
 does.
 
 Documents map onto structs by field name, through `anole.bson`: integers,
@@ -636,13 +640,13 @@ zig build run-redis                         # REDIS_URL, else redis://127.0.0.1:
 ### Setup
 
 ```zig
-const App = struct { cache: *anole.redis.Client };
+const App = struct { redis: *anole.redis.Client };
 
 pub fn main(init: std.process.Init) !void {
     var state: App = undefined;
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
-    state.cache = try app.redis(.{}); // REDIS_URL
+    state.redis = try app.redis(.{}); // REDIS_URL
     _ = app.metrics(.{}); // pool and command metrics
     _ = app.health(.{}); // /readyz sends PING
     app.get("/hits", hits);
@@ -676,7 +680,7 @@ Sentinel are not supported; a URL with several hosts is refused.
 
 ```zig
 fn hits(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    try res.json(.{ .hits = try app.cache.incr(req, "hits") });
+    try res.json(.{ .hits = try app.redis.incr(req, "hits") });
 }
 
 const Profile = struct { name: []const u8, visits: u32, plan: enum { free, pro } = .free };
@@ -684,16 +688,16 @@ const Profile = struct { name: []const u8, visits: u32, plan: enum { free, pro }
 fn profile(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const id = req.params.get("id") orelse return error.NotFound;
     const key = try std.fmt.allocPrint(req.arena, "user:{s}", .{id});
-    try res.json(try app.cache.hgetAll(Profile, req, key)); // no such hash: 404
+    try res.json(try app.redis.hgetAll(Profile, req, key)); // no such hash: 404
 }
 
 fn page(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    if (try app.cache.get(req, "page:/")) |body| {
+    if (try app.redis.get(req, "page:/")) |body| {
         res.body = body;
         return;
     }
     const body = try render(req); // the slow part
-    _ = try app.cache.set(req, "page:/", body, .{ .ttl = .fromSeconds(30) });
+    _ = try app.redis.set(req, "page:/", body, .{ .ttl = .fromSeconds(30) });
     res.body = body;
 }
 ```
@@ -739,17 +743,17 @@ pub/sub and calls on an `acquire`d connection run as they are, whatever
 the options. A nil reply is a reply, and kept.
 
 ```zig
-const profile = try app.cache.with(.{ .cache = .{ .ttl = .fromSeconds(30), .tag = "profiles" } }).hgetAll(Profile, req, key);
+const profile = try app.redis.with(.{ .cache = .{ .ttl = .fromSeconds(30), .tag = "profiles" } }).hgetAll(Profile, req, key);
 // After a write:
-_ = try app.cache.hset(req, key, changed);
-app.cache.cache.invalidate(.{ .tag = "profiles" });
+_ = try app.redis.hset(req, key, changed);
+app.redis.cache.invalidate(.{ .tag = "profiles" });
 ```
 
 ### Pipelines and transactions
 
 ```zig
 // One round trip; MULTI ... EXEC makes it atomic.
-const r = try app.cache.pipeline(req, .{ .{"MULTI"}, .{ "INCR", key }, .{ "EXPIRE", key, 60 }, .{"EXEC"} });
+const r = try app.redis.pipeline(req, .{ .{"MULTI"}, .{ "INCR", key }, .{ "EXPIRE", key, 60 }, .{"EXEC"} });
 const count = r[3].array[0].int;
 ```
 
@@ -758,7 +762,7 @@ so the connection stays usable; errors inside EXEC's reply come back as
 `.err` replies. WATCH needs one connection across round trips:
 
 ```zig
-var conn = try app.cache.acquire(req);
+var conn = try app.redis.acquire(req);
 defer conn.release();
 _ = try conn.command(req, .{ "WATCH", key });
 const stock = try conn.one(i64, req, .{ "GET", key });
@@ -776,7 +780,7 @@ call.
 ```zig
 fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
     req.setTimeout(.none); // a stream
-    const sub = try app.cache.subscribe(req, "room:lobby");
+    const sub = try app.redis.subscribe(req, "room:lobby");
     defer sub.close();
     var buf: [1024]u8 = undefined;
     var stream = try res.startEventStream(&buf);
@@ -785,7 +789,7 @@ fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
 }
 
 fn post(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    try res.json(.{ .receivers = try app.cache.publish(req, "room:lobby", (try req.body()).?) });
+    try res.json(.{ .receivers = try app.redis.publish(req, "room:lobby", (try req.body()).?) });
 }
 ```
 
@@ -820,8 +824,8 @@ give it a `timeout` of its own or `acquire` one.
 same client and use its pools ([auth.md](auth.md)):
 
 ```zig
-var sessions: anole.session.RedisStore = .{ .client = state.cache, .gpa = gpa };
-var limits: anole.ratelimit.RedisLimiter = .{ .client = state.cache, .gpa = gpa };
+var sessions: anole.session.RedisStore = .{ .client = state.redis, .gpa = gpa };
+var limits: anole.ratelimit.RedisLimiter = .{ .client = state.redis, .gpa = gpa };
 ```
 
 ### Observability
@@ -886,9 +890,9 @@ result from `optional` or `all` is a result and is kept.
 **Invalidation**: `app.db.cache.invalidate(.all)`, `.invalidate(.{ .tag =
 "posts" })` for the results cached with that tag, or
 `.invalidateQuery(sql, .{args})` for one statement's results (for
-MongoDB, invalidate by tag: `app.mongo.cache.invalidate(.{ .tag = "users" })`;
+MongoDB, invalidate by tag: `app.db.cache.invalidate(.{ .tag = "users" })`;
 for Redis, the command's name, then the rest:
-`app.cache.cache.invalidateQuery("GET", .{key})`). It reaches
+`app.redis.cache.invalidateQuery("GET", .{key})`). It reaches
 every executor at once, including a statement still running: a result read
 before the invalidation is not kept, and a caller arriving after it does
 not join that statement.
