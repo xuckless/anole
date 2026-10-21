@@ -222,9 +222,15 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
     _ = try users.insertOne(&c, .{ .name = "Grace" });
     try testing.expectEqual(fake.txn_numbers[1] + 1, fake.txn_numbers[2]);
 
-    // Twice: the retry fails as well, and the call with it.
+    // Twice: the retry fails as well, and the call with it (a warning
+    // the test expects, kept out of its output).
     fake.fail_inserts.store(2, .monotonic);
-    try testing.expectError(error.ServiceUnavailable, users.insertOne(&c, .{ .name = "Linus" }));
+    {
+        const level = testing.log_level;
+        testing.log_level = .err;
+        defer testing.log_level = level;
+        try testing.expectError(error.ServiceUnavailable, users.insertOne(&c, .{ .name = "Linus" }));
+    }
     try testing.expectEqualStrings("10107", db.lastError(&c).?.code);
 
     // A duplicate key: a Conflict, not retried.
@@ -242,6 +248,10 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
 }
 
 test "fake mongod: no server, a timeout and a bad connection string" {
+    // Every call here fails on purpose, and logs a warning saying why.
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
