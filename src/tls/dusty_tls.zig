@@ -401,8 +401,10 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
 /// state). dusty stores it in place after the handshake and frees it with
 /// `deinit` (dusty fork patch: TLS state teardown).
 ///
-/// After the handshake, one task may read while another writes. `deinit`
-/// and `close` must not overlap either of them: join both first.
+/// After the handshake, one task may read while another writes. `close`
+/// is a write: the writing side may call it while the reading side reads
+/// (HTTP/2's writer does, when the session ends). `deinit` must not
+/// overlap either of them: join both first.
 pub const Connection = struct {
     shared: ?*Shared = null,
     /// The negotiated ALPN protocol: one of the strings the caller passed in
