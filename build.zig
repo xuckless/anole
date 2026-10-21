@@ -354,6 +354,10 @@ pub fn build(b: *std.Build) void {
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
     const use_llvm = b.option(bool, "llvm", "Build the unit tests with LLVM (needed for --fuzz on x86_64-linux)");
+    // The BSON corpus, a test-only download: requested here so a fresh cache
+    // fetches it with the C libraries, and never for a project depending on
+    // Anole.
+    const mongodb_specs = if (b.isRoot()) b.lazyDependency("mongodb_specs", .{}) else null;
 
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
@@ -465,6 +469,46 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(t);
         run.skip_foreign_checks = true;
         flags_step.dependOn(&run.step);
+    }
+
+    // BSON (src/bson), the codec under the MongoDB client: pure Zig, its own
+    // module, so its tests run in every build whatever the flags. Its
+    // "fuzz:" targets get src/fuzz.zig as the module "fuzz".
+    const bson_mod = b.createModule(.{ .root_source_file = b.path("src/bson/root.zig"), .target = target, .optimize = optimize });
+    const bson_tests = b.addTest(.{
+        .name = "bson-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bson/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
+        }),
+        .use_llvm = use_llvm,
+    });
+    const run_bson_tests = b.addRunArtifact(bson_tests);
+    run_bson_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_bson_tests.step);
+    const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
+    bson_step.dependOn(&run_bson_tests.step);
+    // tests/bson/corpus_test.zig over the corpus files, which it embeds:
+    // both are copied into one generated directory.
+    if (mongodb_specs) |specs| {
+        const files = b.addWriteFiles();
+        _ = files.addCopyDirectory(specs.path("source/bson-corpus/tests"), "corpus", .{ .include_extensions = &.{".json"} });
+        const corpus_tests = b.addTest(.{
+            .name = "bson-corpus",
+            .root_module = b.createModule(.{
+                .root_source_file = files.addCopyFile(b.path("tests/bson/corpus_test.zig"), "corpus_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "bson", .module = bson_mod }},
+            }),
+            .use_llvm = use_llvm,
+        });
+        const run_corpus = b.addRunArtifact(corpus_tests);
+        run_corpus.skip_foreign_checks = true;
+        test_step.dependOn(&run_corpus.step);
+        bson_step.dependOn(&run_corpus.step);
     }
 
     // tests/tls_duplex.zig: the multi-threaded full-duplex TLS check.

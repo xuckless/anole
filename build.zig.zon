@@ -109,6 +109,15 @@
             .hash = "zig_jwt-1.7.6-w3q9SD1JHwCv7Y7wd9cdliyEaGpggJhl1M9QbZm2oNP6",
             .lazy = true,
         },
+        // Tests only, fetched only when Anole is the root build: the BSON
+        // corpus (source/bson-corpus/tests) of mongodb/specifications. The
+        // repository is CC BY-NC-SA 3.0 US, so it is fetched, never vendored
+        // or shipped.
+        .mongodb_specs = .{
+            .url = "https://github.com/mongodb/specifications/archive/7235b61bde1bc75e51f28d8f67dd935198969c02.tar.gz",
+            .hash = "N-V-__8AAHq03wFyL3GDg1B5WQRqK98uTOOjLUIriuv5DdbW",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
