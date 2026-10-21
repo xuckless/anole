@@ -17,7 +17,8 @@ const zig_jwt = @import("anole_jwt");
 
 const b64 = std.base64.url_safe_no_pad;
 
-/// What a provider's discovery document says, owned by `arena`.
+/// An OpenID provider's endpoints: from its discovery document
+/// (`discover`), or a preset (`google`, `apple`).
 pub const Provider = struct {
     issuer: []const u8,
     authorization_endpoint: []const u8,
@@ -26,8 +27,11 @@ pub const Provider = struct {
     userinfo_endpoint: ?[]const u8 = null,
     arena: ?*std.heap.ArenaAllocator = null,
 
-    /// Fetches `issuer/.well-known/openid-configuration`; its `issuer`
-    /// must be `issuer` exactly (OIDC Discovery 4.3).
+    /// Fetches `issuer/.well-known/openid-configuration` with `client`
+    /// (`app.client().http`); its `issuer` must be `issuer` exactly (OIDC
+    /// Discovery 4.3), else `error.IssuerMismatch`. A document that cannot
+    /// be fetched or lacks an endpoint is `error.DiscoveryFailed`. Free the
+    /// result with `deinit(gpa)`.
     pub fn discover(client: *dusty.Client, gpa: std.mem.Allocator, issuer: []const u8) !Provider {
         const arena = try gpa.create(std.heap.ArenaAllocator);
         arena.* = .init(gpa);
@@ -62,6 +66,8 @@ pub const Provider = struct {
         };
     }
 
+    /// Frees what `discover` allocated, with the allocator it was given. A
+    /// preset owns nothing.
     pub fn deinit(self: *Provider, gpa: std.mem.Allocator) void {
         if (self.arena) |a| {
             a.deinit();
@@ -157,16 +163,23 @@ pub const Identity = struct {
     refresh_token: ?[]const u8,
 };
 
+/// This application as the provider's client: `begin` starts a sign-in,
+/// `finish` completes it at the redirect URI. A value with no state of its
+/// own: one serves every request.
 pub const RelyingParty = struct {
     provider: *const Provider,
     client_id: []const u8,
     /// client_secret_post; null with `apple_secret` or for a public client.
     client_secret: ?[]const u8 = null,
     apple_secret: ?AppleSecret = null,
+    /// Where the provider sends the user back; registered with the provider.
     redirect_uri: []const u8,
+    /// The scopes asked for, space-separated; must include `openid`.
     scope: []const u8 = "openid email profile",
     /// Apple asks for form_post when name or email is in scope.
     response_mode: ?[]const u8 = null,
+    /// The provider's signing keys (`Keyring` on its `jwks_uri`), for the ID
+    /// token.
     keyring: *Keyring,
     /// Clock skew allowed on the ID token's times.
     leeway_seconds: i64 = 60,
@@ -195,8 +208,12 @@ pub const RelyingParty = struct {
         return .{ .url = url.written(), .state = state, .nonce = nonce, .code_verifier = verifier };
     }
 
-    /// Checks the callback against what `begin` handed out, exchanges the
-    /// code, and verifies the ID token.
+    /// Checks the callback against what `begin` handed out (`saved`, kept in
+    /// the session), exchanges the code at the token endpoint, verifies the ID
+    /// token and returns who signed in, in `arena`. Fails with
+    /// `error.StateMismatch` (a forged or stale callback),
+    /// `error.TokenRequestFailed`, `error.NoIdToken`, a `jws.Error` from the ID
+    /// token, `error.NonceMismatch`, `error.AzpMismatch` or `error.NoSubject`.
     pub fn finish(self: *const RelyingParty, arena: std.mem.Allocator, io: std.Io, client: *dusty.Client, callback: Callback, saved: Start) !Identity {
         // state: the response is to our request (CSRF, RFC 6749 10.12).
         if (callback.state.len != saved.state.len or !constTimeEql(callback.state, saved.state)) return error.StateMismatch;

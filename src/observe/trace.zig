@@ -3,6 +3,9 @@
 //! otherwise), and batches of finished spans sent to an OTLP/HTTP collector
 //! as JSON (`POST {endpoint}/v1/traces`).
 //!
+//! In an app, `_ = try app.tracing(.{ .service_name = "api" });` does all
+//! of this (see `TracingOptions` for the endpoint). By hand:
+//!
 //!     var exporter = try anole.observe.trace.Exporter.init(gpa, io, &client, .{
 //!         .endpoint = "http://otel-collector:4318", .service_name = "api" });
 //!     defer exporter.deinit();
@@ -39,6 +42,7 @@ pub const Context = struct {
         return c;
     }
 
+    /// Writes the context as a `traceparent` value (`{f}`).
     pub fn format(self: Context, w: *std.Io.Writer) !void {
         try w.print("00-{s}-{s}-{s}", .{ &self.trace_id, &self.span_id, if (self.sampled) "01" else "00" });
     }
@@ -123,6 +127,7 @@ pub const Span = struct {
         error_type: [32]u8 = undefined,
         error_type_len: u8 = 0,
 
+        /// The attributes from their values, each cut to its field's size.
         pub fn init(system: []const u8, namespace: []const u8, operation: []const u8, collection: ?[]const u8, error_type: ?[]const u8) Db {
             var d: Db = .{};
             d.system_len = put(&d.system, system);
@@ -141,9 +146,11 @@ pub const Span = struct {
     };
 };
 
+/// `Exporter` settings.
 pub const Options = struct {
     /// The collector's OTLP/HTTP base URL ("http://localhost:4318").
     endpoint: []const u8,
+    /// `service.name` on every span.
     service_name: []const u8,
     /// Spans sent per request to the collector, and how often.
     batch_size: usize = 256,
@@ -159,6 +166,10 @@ pub const Options = struct {
     exclude: []const []const u8 = &.{},
 };
 
+/// Queues finished spans and sends them to the collector in batches from a
+/// task of its own, through `client`. A full queue drops spans rather than
+/// slow requests. `app.tracing(.{})` makes one owned by the server,
+/// already started.
 pub const Exporter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -169,9 +180,14 @@ pub const Exporter = struct {
     task: ?std.Io.Future(void) = null,
     /// Set by `deinit`: wakes the task from its pause between batches.
     closing: std.Io.Event = .unset,
+    /// Spans dropped: the queue was full, or the collector did not take
+    /// them.
     dropped: std.atomic.Value(u64) = .init(0),
+    /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
 
+    /// An exporter with its queue allocated. Nothing is sent until `start`.
+    /// `client` must outlive it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *dusty.Client, options: Options) !Exporter {
         const buffer = try gpa.alloc(Span, options.queue_len);
         return .{ .gpa = gpa, .io = io, .client = client, .options = options, .queue = .init(buffer), .buffer = buffer };
@@ -300,6 +316,7 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
 pub const Middleware = struct {
     exporter: *Exporter,
 
+    /// The middleware, queueing spans on `exporter`, which must outlive it.
     pub fn init(exporter: *Exporter) Middleware {
         return .{ .exporter = exporter };
     }

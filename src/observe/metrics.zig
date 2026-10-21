@@ -2,12 +2,19 @@
 //! text exposition format, a middleware for the HTTP metrics, and the
 //! `/metrics` route.
 //!
+//! In an app, `app.metrics(.{})` sets all of this up and returns the
+//! registry for metrics of your own:
+//!
+//!     const registry = app.metrics(.{});
+//!     const jobs = try registry.counter("jobs_total", "Jobs run.", &.{"queue"});
+//!     jobs.with(&.{"email"}).inc();
+//!
+//! By hand, with a registry of your own:
+//!
 //!     var registry = anole.observe.metrics.Registry.init(gpa, io);
 //!     defer registry.deinit();
 //!     app.use(try anole.observe.metrics.HttpMetrics.init(&registry, .{}));
 //!     registry.serveOn(void, app.router, "/metrics");
-//!     const jobs = try registry.counter("jobs_total", "Jobs run.", &.{"queue"});
-//!     jobs.with(&.{"email"}).inc();
 //!
 //! HTTP series are labelled by route pattern (`/users/:id`), never by the
 //! raw path, so their number stays bounded.
@@ -15,23 +22,31 @@ const std = @import("std");
 const dusty = @import("dusty");
 const common = @import("common.zig");
 
+/// A value that only goes up (requests, errors, bytes). Safe from any
+/// thread.
 pub const Counter = struct {
     value: std.atomic.Value(u64) = .init(0),
 
+    /// Adds one.
     pub fn inc(self: *Counter) void {
         _ = self.value.fetchAdd(1, .monotonic);
     }
+    /// Adds `n`.
     pub fn add(self: *Counter, n: u64) void {
         _ = self.value.fetchAdd(n, .monotonic);
     }
 };
 
+/// A value that goes up and down (connections open, queue length). Safe
+/// from any thread.
 pub const Gauge = struct {
     value: std.atomic.Value(i64) = .init(0),
 
+    /// Sets the value to `v`.
     pub fn set(self: *Gauge, v: i64) void {
         self.value.store(v, .monotonic);
     }
+    /// Adds `v`, which may be negative.
     pub fn add(self: *Gauge, v: i64) void {
         _ = self.value.fetchAdd(v, .monotonic);
     }
@@ -40,6 +55,8 @@ pub const Gauge = struct {
 /// Prometheus' default buckets, in seconds.
 pub const default_buckets = [_]f64{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 };
 
+/// A distribution of observed values (latencies, sizes), counted into
+/// buckets, with their sum and count. Safe from any thread.
 pub const Histogram = struct {
     /// Upper bounds (`le`), strictly increasing and finite.
     bounds: []const f64,
@@ -51,6 +68,7 @@ pub const Histogram = struct {
     /// values' own unit, with no truncation or overflow.
     sum_bits: std.atomic.Value(u64) = .init(@bitCast(@as(f64, 0))),
 
+    /// Counts `v` into its buckets and the sum.
     pub fn observe(self: *Histogram, v: f64) void {
         // From +Inf down, each release: a scrape reads upward with acquire,
         // so a bucket it sees counted has every larger one counted too, and
@@ -66,6 +84,7 @@ pub const Histogram = struct {
         while (self.sum_bits.cmpxchgWeak(old, @bitCast(@as(f64, @bitCast(old)) + v), .monotonic, .monotonic)) |seen| old = seen;
     }
 
+    /// The sum of every value observed so far.
     pub fn sum(self: *const Histogram) f64 {
         return @bitCast(self.sum_bits.load(.monotonic));
     }
@@ -209,6 +228,9 @@ fn escape(w: *std.Io.Writer, v: []const u8) !void {
     };
 }
 
+/// The metrics an application exposes, rendered at once for a scrape.
+/// `app.metrics(.{})` makes one owned by the server; make your own for
+/// anything else.
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -217,10 +239,12 @@ pub const Registry = struct {
     gauges: std.ArrayList(*Family(Gauge)) = .empty,
     histograms: std.ArrayList(*Family(Histogram)) = .empty,
 
+    /// An empty registry.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Registry {
         return .{ .gpa = gpa, .io = io };
     }
 
+    /// Frees every metric; no `Family` or series pointer may be used after.
     pub fn deinit(self: *Registry) void {
         inline for (.{ &self.counters, &self.gauges, &self.histograms }) |list| {
             for (list.items) |f| {
@@ -231,9 +255,14 @@ pub const Registry = struct {
         }
     }
 
+    /// A counter family named `name` (by convention ending in `_total`) with
+    /// these label names; `.with(values)` picks a series. A name already
+    /// registered returns that family. `name`, `help` and `labels` must
+    /// outlive the registry.
     pub fn counter(self: *Registry, name: []const u8, help: []const u8, labels: []const []const u8) !*Family(Counter) {
         return self.add(Counter, &self.counters, name, help, labels, &.{});
     }
+    /// A gauge family, as `counter`.
     pub fn gauge(self: *Registry, name: []const u8, help: []const u8, labels: []const []const u8) !*Family(Gauge) {
         return self.add(Gauge, &self.gauges, name, help, labels, &.{});
     }
@@ -303,6 +332,8 @@ pub const HttpMetrics = struct {
         exclude: []const []const u8 = &.{},
     };
 
+    /// Registers the HTTP metrics in `registry` and returns the middleware
+    /// that keeps them. `app.metrics(.{})` does this for you.
     pub fn init(registry: *Registry, options: Options) !HttpMetrics {
         return .{
             .options = options,

@@ -8,8 +8,11 @@ const std = @import("std");
 const dusty = @import("dusty");
 const common = @import("common.zig");
 
+/// `text`: `GET /users/42 200 153us 10.0.0.7:51234 id=...`; `json`: one
+/// object per line with the same fields.
 pub const Format = enum { text, json };
 
+/// `AccessLog` settings.
 pub const Options = struct {
     format: Format = .text,
     /// Where lines go; stderr by default.
@@ -19,9 +22,12 @@ pub const Options = struct {
     exclude: []const []const u8 = &.{},
 };
 
+/// The access log middleware. Put it first among `use` calls (after
+/// `RequestId`) so the time it records covers the rest.
 pub const AccessLog = struct {
     options: Options,
 
+    /// The middleware for `options`.
     pub fn init(options: Options) AccessLog {
         return .{ .options = options };
     }
@@ -43,8 +49,14 @@ pub const AccessLog = struct {
     }
 };
 
+/// The status the client got, as the access log records it:
+/// `statusOf(req, res, result)` with `result` what the rest of the chain
+/// returned. For an error, the status the server answers it with
+/// (`anole.errorStatus`, else 500), unless the head had already gone out.
 pub const statusOf = common.statusOf;
 
+/// One log line for `req`, ending in a newline, in `arena`: what the
+/// middleware writes, for a logger of your own.
 pub fn format(arena: std.mem.Allocator, fmt: Format, req: *const dusty.Request, status: u16, micros: i64, now_ms: i64, err: ?anyerror) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;

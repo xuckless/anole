@@ -10,6 +10,11 @@ const std = @import("std");
 const dusty = @import("dusty");
 const jws = @import("jws.zig");
 
+/// A provider's JWK Set behind a URL, fetched on first use and kept. Give it
+/// the server's client (`app.client().http`) and the provider's `jwks_uri`:
+///
+///     var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client().http, provider.jwks_uri);
+///     defer keyring.deinit();
 pub const Keyring = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -42,6 +47,8 @@ pub const Keyring = struct {
         refs: usize = 1,
     };
 
+    /// A keyring for the JWK Set at `url`, fetched through `client`. Nothing is
+    /// fetched until the first `verify`. `client` and `url` must outlive it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *dusty.Client, url: []const u8) Keyring {
         return .{ .gpa = gpa, .io = io, .client = client, .url = url };
     }
