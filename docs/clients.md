@@ -52,17 +52,20 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
   `""` when there is none) and `json(T, allocator)`, which parses the body
   into `T`, skipping fields `T` does not have, with memory from `allocator`
   that outlives the response. It does not check the status.
-- `deinit` hands the connection back to the pool. `.inner` is dusty's
-  response, `.http` (on the client) dusty's client, for the rest of what
-  `anole.http.Client` below offers.
+- `deinit` hands the connection back to the pool. `.inner` is the HTTP
+  core's response, `.http` (on the client) the core's client, for the rest
+  of what `anole.http.Client` below offers.
 
 It trusts the system's CA store and has the defaults below. A client with
 other settings (CAs, a client certificate, HTTP/2) is an
-`anole.http.Client` of your own.
+`anole.http.Client` of your own. The APIs that make requests for you
+(`anole.auth.Keyring`, `anole.auth.oidc`, `anole.observe.trace.Exporter`)
+take the `anole.Client` that `app.client()` and `anole.client(req)` return;
+wrap one of your own as `.{ .http = &my_client }`.
 
 ## HTTP/1.1 and HTTPS
 
-`anole.http.Client` is dusty's client. Create one, share it, and call `fetch`:
+`anole.http.Client` is the HTTP core's client. Create one, share it, and call `fetch`:
 
 ```zig
 var client = anole.http.Client.init(gpa, io, .{});

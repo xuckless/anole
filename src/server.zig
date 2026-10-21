@@ -1610,7 +1610,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.router.has_routes) @panic("app.tracing() adds a middleware, so it goes before the routes, with app.use()");
             const env = if (self.process) |p| p.environ else null;
             const e = try self.arena.allocator().create(observe.trace.Exporter);
-            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), &self.extras.client, .{
+            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), self.client(), .{
                 .endpoint = opts.endpoint orelse (if (env) |v| v.getPosix("OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
                 .service_name = opts.service_name orelse (if (env) |v| v.getPosix("OTEL_SERVICE_NAME") else null) orelse "anole",
                 .sample_all = opts.sample_all,

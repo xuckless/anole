@@ -43,8 +43,11 @@ pub const FetchOptions = struct {
     decompress: bool = true,
 };
 
-/// A handle on a server's outbound client (`anole.client(req)`): cheap to
-/// copy, valid while the server lives.
+/// A handle on a server's outbound client (`anole.client(req)`,
+/// `app.client()`): cheap to copy, valid while the server lives. What the
+/// APIs that make requests take (`auth.Keyring`, `auth.oidc`,
+/// `observe.trace.Exporter`); a core client of your own fits as
+/// `.{ .http = &my_client }`.
 pub const Client = struct {
     /// dusty's client, for everything `fetch` does not cover (streamed
     /// bodies, WebSocket, Unix sockets).
@@ -74,7 +77,7 @@ pub const Client = struct {
 /// read on demand. `deinit` it to hand the connection back.
 pub const Response = struct {
     /// dusty's response, for streaming the body (`reader`) and the rest.
-    inner: http.dusty_module.ClientResponse,
+    inner: http.core.ClientResponse,
 
     /// The response's status.
     pub fn status(self: *const Response) http.Status {

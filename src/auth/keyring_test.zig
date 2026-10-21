@@ -77,7 +77,7 @@ test "Keyring: one fetch for concurrent verifiers, and known keys never wait on 
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{server.address.ip.getPort()});
-    var keyring = Keyring.init(gpa, io, &client, url);
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
     defer keyring.deinit();
     keyring.min_refresh_seconds = 0;
 
@@ -147,7 +147,7 @@ test "Keyring: requests waiting on a fetch that fails get an error, and nothing 
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{port});
-    var keyring = Keyring.init(gpa, io, &client, url);
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
     defer keyring.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();

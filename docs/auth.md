@@ -121,15 +121,15 @@ services hold only a public key.
 `use: enc` keys. A key without `alg` gets the one its type implies: RSA gets
 RS256, P-256 gets ES256, P-384 gets ES384 and Ed25519 gets EdDSA.
 
-For a provider's `jwks_uri`, use `anole.auth.Keyring`. It fetches the set on
-first use, fetches it again after `ttl_seconds` (3600), and fetches it once
-more when a token names an unknown `kid`. Providers rotate keys, but those
+For a provider's `jwks_uri`, use `anole.auth.Keyring`. Give it the
+server's client, `app.client()` (or `anole.client(io)`), and the URL. It
+fetches the set on first use, fetches it again after `ttl_seconds` (3600),
+and fetches it once more when a token names an unknown `kid`. Providers rotate keys, but those
 extra fetches are at least `min_refresh_seconds` (60) apart, so bogus tokens
 can't make you hammer the provider.
 
 ```zig
-var client = anole.http.Client.init(gpa, io, .{});
-var keyring = anole.auth.Keyring.init(gpa, io, &client, "https://issuer.example/jwks.json");
+var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client(), "https://issuer.example/jwks.json");
 defer keyring.deinit();
 const v = try keyring.verify(req.arena, token, .{ .issuer = "https://issuer.example", .audience = "api" });
 ```
@@ -150,9 +150,8 @@ the ID-token checks of OIDC Core 3.1.3.7: signature, `iss`, `aud`, `exp`,
 You need a `Provider`, a `Keyring` on its `jwks_uri`, and a `RelyingParty`:
 
 ```zig
-var client = anole.http.Client.init(gpa, io, .{});
-const provider = anole.auth.oidc.Provider.google; // or: try Provider.discover(&client, gpa, issuer_url)
-var keyring = anole.auth.Keyring.init(gpa, io, &client, provider.jwks_uri);
+const provider = anole.auth.oidc.Provider.google; // or: try Provider.discover(gpa, app.client(), issuer_url)
+var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client(), provider.jwks_uri);
 const rp: anole.auth.oidc.RelyingParty = .{
     .provider = &provider,
     .client_id = google_client_id,         // from your configuration, never from source
@@ -187,7 +186,7 @@ const callback: anole.auth.oidc.Callback = .{
     .code = req.query.get("code") orelse return refuse(res),
     .state = req.query.get("state") orelse return refuse(res),
 };
-const id = rp.finish(req.arena, req.io, &app.client, callback, saved) catch |err| {
+const id = rp.finish(req.arena, req.io, anole.client(req), callback, saved) catch |err| {
     std.log.info("sign-in refused: {t}", .{err}); // StateMismatch, NonceMismatch, TokenRequestFailed, ...
     return refuse(res);
 };
