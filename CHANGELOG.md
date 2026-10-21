@@ -126,6 +126,14 @@ for macOS and Linux.
   that fails changes nothing.
 - Response compression with zstd or gzip (zlib-ng) by the client's q-values,
   and compressed request bodies.
+- Brotli responses (`Content-Encoding: br`, google/brotli 1.2.0) with
+  `-Dbrotli`, on in `web` and `full`: the Compress middleware and
+  `res.compress` pick `br` by the client's q-values, after zstd and before
+  gzip on a tie (`Accept-Encoding: gzip, br` gets `br`). Buffered and
+  streamed bodies, flushes included. Quality 5 by default
+  (`ServerConfig.response.brotli_quality`, `res.brotli_quality`): 10-15%
+  smaller than gzip on JSON of a few KB. Precompressed `.br` files are served
+  as before.
 - The PROXY protocol (v1 and v2) and `X-Forwarded-*` from trusted proxies.
 - Zero-downtime restart on SIGUSR2 (the new process inherits the listening
   sockets, HTTP/3's UDP sockets included; HTTP/3 connections are closed and
@@ -328,11 +336,13 @@ for macOS and Linux.
 ### Build
 
 - Every bundled library sits behind a build flag (`-Dtls`, `-Dhttp2`,
-  `-Dhttp3`, `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dcompression`, `-Djson`,
-  `-Dredis`) and presets (`-Dprofile=minimal|web|full`); what is off is
+  `-Dhttp3`, `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dcompression`, `-Dbrotli`,
+  `-Djson`, `-Dredis`) and presets (`-Dprofile=minimal|web|full`); what is off is
   neither downloaded nor compiled.
 - Release binaries of examples/full on x86_64 Linux: 5.0 MB with
-  everything, 1.1 MB minimal.
+  everything, 1.1 MB minimal. Brotli adds about 0.8 MB (its encoder and the
+  122 KB dictionary with its lookup tables), so `-Dbrotli=false` is the
+  first flag to drop for a smaller binary that still compresses.
 
 ### Docs and examples
 

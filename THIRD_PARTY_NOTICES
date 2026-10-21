@@ -13,8 +13,8 @@ attribution header and are listed in part B; that includes the HTTP core
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
 `-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
-ngtcp2 and nghttp3; `-Dpostgres` adds pg.zig and buffer.zig; `-Dsqlite`
-adds SQLite and zig-sqlite.
+ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dpostgres` adds pg.zig and
+buffer.zig; `-Dsqlite` adds SQLite and zig-sqlite.
 
 
 A. Fetched packages
@@ -93,6 +93,11 @@ zstd 1.5.7 (Zstandard)
             affiliates.
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
+
+Brotli 1.2.0 (Brotli compression)
+  Licence:  MIT. Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+  Source:   https://github.com/google/brotli (tag archive v1.2.0)
+  Linked:   -Dbrotli=true (the encoder; the decoder only in Anole's tests)
 
 zig-jwt (JWT building and signing)
   Licence:  Apache License 2.0 (text in part E). Copyright deatil

@@ -7,7 +7,7 @@
 # CI, since its tests need a git submodule the tarball lacks. BoringSSL tests
 # itself under sanitizers upstream at every commit.)
 #
-#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd]
+#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli]
 #
 # Needs clang, make, cmake, curl, tar and git (ngtcp2 and nghttp3 come from
 # the xuckless forks, whose archives lack the tests' munit submodule, so
@@ -20,7 +20,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=${SANITIZE_WORK:-$(mktemp -d)}
 mkdir -p "$work"
 libs=("$@")
-[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd)
+[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd brotli)
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 export CC=${CC:-clang}
@@ -96,6 +96,20 @@ for lib in "${libs[@]}"; do
       make -C tests -j"$jobs" fuzzer zstreamtest MOREFLAGS="$san" >/dev/null
       ./tests/fuzzer -T60s
       ./tests/zstreamtest -T60s
+      ;;
+    brotli)
+      fetch brotli "google/brotli/archive"
+      # Its CTest suite: the CLI round-trips files at qualities 1, 6, 9 and
+      # 11 and decodes the reference streams in tests/testdata. The corpus
+      # is a release asset of the same tag (the tag archive has a few files).
+      tag=$(url_of "google/brotli/archive")
+      tag=${tag##*/tags/}
+      tag=${tag%.tar.gz}
+      curl -fsSL "https://github.com/google/brotli/releases/download/$tag/testdata.txz" | tar -xJ
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" >/dev/null
+      cmake --build build -j"$jobs" >/dev/null
+      (cd build && ctest --output-on-failure -j"$jobs" | tail -3)
       ;;
     *)
       echo "unknown library: $lib" >&2

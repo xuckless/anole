@@ -25,6 +25,7 @@ VERSIONED = {
     "nghttp3": ("ngtcp2/nghttp3", "1.18.0", r"xuckless/nghttp3/archive/de4bcb905eca28cdfe0e6ef4280b355e1c29660d"),
     "zlib-ng": ("zlib-ng/zlib-ng", "2.3.3", r"zlib-ng/archive/refs/tags/2\.3\.3\.tar"),
     "zstd": ("facebook/zstd", "1.5.7", r"zstd/archive/refs/tags/v1\.5\.7\.tar"),
+    "brotli": ("google/brotli", "1.2.0", r"brotli/archive/refs/tags/v1\.2\.0\.tar"),
     "yyjson": ("ibireme/yyjson", "0.13.0", r"yyjson/archive/refs/tags/0\.13\.0\.tar"),
     "hiredis": ("redis/hiredis", "1.5.0", r"hiredis/archive/refs/tags/v1\.5\.0\.tar"),
 }
