@@ -66,7 +66,8 @@ pub const RouteOptions = struct {
     /// request on a task of its own may then run this route's requests that
     /// arrived whole right where it reads them, without a task (HTTP/2
     /// does, for a request whose end, body included, came in the read that
-    /// brought its HEADERS). A handler that waits anyway still works,
+    /// brought its HEADERS; HTTP/3 for one whose end came in the packet
+    /// that completed its head). A handler that waits anyway still works,
     /// but holds up every other request on its connection meanwhile, and
     /// gets no request timeout. Leave it off for anything that talks to a
     /// database, a cache, another service or the file system.

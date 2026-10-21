@@ -39,15 +39,16 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
 /// middleware that runs for its route. On HTTP/2 its requests that arrive
 /// whole (body included) in one read then run on the connection's reader,
 /// right after that read, rather than on a task each, and their responses
-/// go out in that read's one write:
+/// go out in that read's one write; on HTTP/3 those that arrive whole in
+/// one packet run on the endpoint task, right after that packet:
 ///
 ///     app.get("/plaintext", anole.noWait(plaintext));
 ///
 /// A handler that waits anyway still works, but holds up every other
-/// request on its connection meanwhile, and gets no request timeout. Leave
-/// the mark off a handler that queries a database, a cache or another
-/// service: those keep a task per request, so a slow query delays nothing
-/// else. Elsewhere (HTTP/1.1, HTTP/3) the mark changes nothing.
+/// request on its connection (on HTTP/3, its endpoint) meanwhile, and gets
+/// no request timeout. Leave the mark off a handler that queries a
+/// database, a cache or another service: those keep a task per request, so
+/// a slow query delays nothing else. On HTTP/1.1 the mark changes nothing.
 pub fn noWait(comptime handler: anytype) NoWait(handler) {
     return .{};
 }
