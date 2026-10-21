@@ -196,6 +196,16 @@ Moving to the next minor version (0.18):
 - Zig: move when the next minor version is released and every Zig dependency
   supports it.
 
+## The wiki
+
+The GitHub wiki is a copy of `docs/`. The `Wiki` workflow runs
+`tools/docs2wiki.py` on every push to main that touches `docs/` and pushes the
+pages: links between guides become wiki links, other repository links point
+at the commit, and `Home`, `_Sidebar` and `_Footer` are generated. Edit
+`docs/`, never the wiki. A new guide needs an entry in the script's `PAGES`;
+a renamed or removed guide leaves its old page behind, to delete in the wiki
+by hand.
+
 ## Cutting a release
 
 1. Update CHANGELOG.md: turn "Unreleased" into the version and date.
