@@ -26,6 +26,12 @@ for macOS and Linux.
 
 ### Server
 
+- Memory per connection: each task's stack reserves 1 MiB by default
+  (`Options.max_stack_size`, was zio's 8 MiB), about 2 KiB of page tables
+  per open connection instead of 4. An idle TLS connection holds no
+  ciphertext buffer (a 1 KiB stash, blocks borrowed from a per-thread pool
+  while records are in flight) and BoringSSL sheds its handshake
+  configuration: about 20 KB per idle TLS connection instead of 29 on Linux.
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with

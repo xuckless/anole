@@ -97,12 +97,13 @@ pub const Options = struct {
     /// to; past it the process crashes. Address space, not memory: a task
     /// holds only the pages it touches, and gives back those below where it
     /// waits once it has waited a second (Linux). What the size does cost
-    /// is page tables: a 4 KiB page-table page per open connection at the
-    /// default, about 2 KiB at 1 MiB. Below 1 MiB is not advised: some
+    /// is page tables: about 2 KiB per open connection at the default,
+    /// 4 KiB at 8 MiB. Raise it for handlers that recurse deeply or keep
+    /// large buffers on the stack. Below 1 MiB is not advised: some
     /// bundled code takes a lot of stack at once (zlib-ng's CRC-32 for
     /// gzip, 128 KiB in one frame; the DNS resolver, 73 KiB), and a
     /// handler's own needs are the application's to know.
-    max_stack_size: usize = 8 * 1024 * 1024,
+    max_stack_size: usize = 1024 * 1024,
     /// The process's arguments and environment (`init.minimal`). With them
     /// the server takes listening sockets handed over by systemd socket
     /// activation or by the process it replaces (`LISTEN_FDS`), restarts
