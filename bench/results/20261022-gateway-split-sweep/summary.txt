@@ -1,0 +1,16 @@
+gateway-64 proxy1c: 512c=52542 (289.2%) === anole / gateway-64 / 1024c (tool=h2load) ===	=== Best: 44644 req/s (CPU: 347.7%, Mem: 1.0GiB) === 
+gateway-64 proxy2c: 512c=107157 (654.4%) === anole / gateway-64 / 1024c (tool=h2load) ===	=== Best: 97492 req/s (CPU: 735.1%, Mem: 1.2GiB) === 
+gateway-64 proxy3c: 512c=137602 (1051.1%) === anole / gateway-64 / 1024c (tool=h2load) ===	=== Best: 120750 req/s (CPU: 962.7%, Mem: 1.7GiB) === 
+gateway-64 proxy4c: === anole / gateway-64 / 512c (tool=h2load) ===	=== Best: 115065 req/s (CPU: 930.9%, Mem: 1.2GiB) === === anole / gateway-64 / 1024c (tool=h2load) ===	=== Best: 108630 req/s (CPU: 819.8%, Mem: 2.0GiB) === 
+gateway-64 proxy5c: === anole / gateway-64 / 512c (tool=h2load) ===	=== Best: 80886 req/s (CPU: 560.4%, Mem: 1.2GiB) === === anole / gateway-64 / 1024c (tool=h2load) ===	=== Best: 78195 req/s (CPU: 752.0%, Mem: 2.1GiB) === 
+gateway-h3 nginx-proxy2c: 64c=128586 (791.8%) 256c=119410 (744.0%) 
+gateway-h3 nginx-proxy3c: 64c=146249 (797.9%) 256c=138035 (823.5%) 
+gateway-h3 nginx-proxy4c: 64c=114648 (632.8%) 256c=110242 (739.4%) 
+gateway-h3 caddy-proxy2c: 64c=27052 (452.7%) === anole / gateway-h3 / 256c (tool=h2load-h3) ===	=== Best: 22324 req/s (CPU: 441.3%, Mem: 1.0GiB) === 
+gateway-h3 caddy-proxy3c: 64c=40038 (647.3%) === anole / gateway-h3 / 256c (tool=h2load-h3) ===	=== Best: 32950 req/s (CPU: 676.3%, Mem: 1.1GiB) === 
+gateway-h3 caddy-proxy4c: 64c=53033 (928.3%) === anole / gateway-h3 / 256c (tool=h2load-h3) ===	=== Best: 44079 req/s (CPU: 910.8%, Mem: 1.2GiB) === 
+production-stack e3c1a1s2: 256c=14942 (273.4%) === anole / production-stack / 1024c (tool=h2load) ===	=== Best: 37053 req/s (CPU: 465.6%, Mem: 1.3GiB) === 
+production-stack e2c1a2s2: 256c=28130 (323.6%) === anole / production-stack / 1024c (tool=h2load) ===	=== Best: 32697 req/s (CPU: 420.2%, Mem: 1.3GiB) === 
+production-stack e3c1a2s1: 256c=7554 (236.3%) === anole / production-stack / 1024c (tool=h2load) ===	=== Best: 18674 req/s (CPU: 315.3%, Mem: 1.3GiB) === 
+production-stack e2c1a1s3: 256c=20016 (290.9%) === anole / production-stack / 1024c (tool=h2load) ===	=== Best: 29099 req/s (CPU: 443.5%, Mem: 1.2GiB) === 
+production-stack e4c1a1s1: 256c=11098 (249.8%) === anole / production-stack / 1024c (tool=h2load) ===	=== Best: 14964 req/s (CPU: 226.9%, Mem: 1.4GiB) === 

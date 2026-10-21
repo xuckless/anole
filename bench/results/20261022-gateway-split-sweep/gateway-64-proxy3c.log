@@ -1,0 +1,529 @@
+[info] available CPUs: 28
+[info] load generators: docker mode
+[info] framework: anole (anole, Zig)
+[info] subscribed tests: baseline,pipelined,limited-conn,async,latency-1m,latency-10k,latency-500k-8cpu,json-comp,json-tls,8gbit,static-tls,baseline-h2,static-h2,baseline-h2c,json-h2c,baseline-h3,static-h3,unary-grpc,unary-grpc-tls,echo-ws,echo-ws-pipeline,echo-ws-limited,gateway-64,gateway-h3,production-stack
+[info] building image: httparena-anole
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.0s
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.22kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 0.1s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 126B done
+#3 DONE 0.0s
+
+#4 [build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#4 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 539B done
+#5 DONE 0.0s
+
+#6 [build 3/8] WORKDIR /server
+#6 CACHED
+
+#7 [build 5/8] COPY build.zig build.zig.zon ./
+#7 CACHED
+
+#8 [build 6/8] COPY src ./src
+#8 CACHED
+
+#9 [build 7/8] COPY proto ./proto
+#9 CACHED
+
+#10 [build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#10 CACHED
+
+#11 [build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#11 CACHED
+
+#12 [build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#12 CACHED
+
+#13 [stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#13 CACHED
+
+#14 exporting to image
+#14 exporting layers done
+#14 exporting manifest sha256:b728c8a0c14c61a63c3db04d1584b173e476507c3e386bfc348083105096e9c5 done
+#14 exporting config sha256:04679976930dd6476d718bbb353609d50b7a1ccb14dbf489a8265d237236c7af done
+#14 exporting attestation manifest sha256:a61057e92f5edfd7ef3b59a89f56f2393fa14e1ea11cd21f718b7cd5cf98f02d done
+#14 exporting manifest list sha256:06680d401558839137628c927fe2424ff6753230d1d089c645fc09917d8e67c4 done
+#14 naming to docker.io/library/httparena-anole:latest done
+#14 unpacking to docker.io/library/httparena-anole:latest done
+#14 DONE 0.0s
+[info] skipping system tuning as requested (SKIP_TUNE=true)
+[info] starting postgres sidecar
+[info] postgres ready (seeded)
+
+==============================================
+=== anole / gateway-64 / 512c (tool=h2load) ===
+==============================================
+[info] starting gateway compose stack: anole (gateway-64)
+ Image httparena-anole-gateway-64-proxy Building 
+ Image httparena-anole-gateway-64-server Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 1.07kB done
+#1 DONE 0.0s
+
+#2 [server internal] load build definition from Dockerfile
+#2 transferring dockerfile: 1.22kB done
+#2 DONE 0.0s
+
+#3 [proxy internal] load build definition from Dockerfile
+#3 transferring dockerfile: 734B done
+#3 DONE 0.0s
+
+#4 [proxy internal] load metadata for docker.io/library/nginx:1.27-alpine
+#4 DONE 0.0s
+
+#5 [proxy internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [proxy 1/4] FROM docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+#6 resolve docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10 0.0s done
+#6 DONE 0.0s
+
+#7 [proxy internal] load build context
+#7 transferring context: 180B done
+#7 DONE 0.0s
+
+#8 [proxy 2/4] COPY nginx.conf /etc/nginx/nginx.conf
+#8 CACHED
+
+#9 [proxy 3/4] COPY workers.sh /docker-entrypoint.d/30-workers.sh
+#9 CACHED
+
+#10 [proxy 4/4] RUN chmod +x /docker-entrypoint.d/30-workers.sh  && mkdir -p /var/lib/nginx/tmp/body /var/lib/nginx/tmp/proxy              /var/lib/nginx/tmp/fastcgi /var/lib/nginx/tmp/uwsgi /var/lib/nginx/tmp/scgi  && chown -R nginx:nginx /var/lib/nginx
+#10 CACHED
+
+#11 [proxy] exporting to image
+#11 exporting layers done
+#11 exporting manifest sha256:e9d428a1cb3b1d3053ff0cec31f9e1668af48bee564ddc08c5db2e5f3013c086 done
+#11 exporting config sha256:b0ce6f0147e73feb64463e1feba1f001d588079ac5b6f142d428732d579cd623 done
+#11 exporting attestation manifest sha256:ff45f4bedd08a7ccce74b6cb76a532b0dd614880066010e9f15835fb5622aa78 done
+#11 exporting manifest list sha256:60ced9b0ea1b4ade51d60a2faa610ab5c8e34d80c6eb2806e63514ce9a8efd6c
+#11 exporting manifest list sha256:60ced9b0ea1b4ade51d60a2faa610ab5c8e34d80c6eb2806e63514ce9a8efd6c done
+#11 naming to docker.io/library/httparena-anole-gateway-64-proxy:latest done
+#11 unpacking to docker.io/library/httparena-anole-gateway-64-proxy:latest done
+#11 DONE 0.0s
+
+#12 [server internal] load metadata for docker.io/library/alpine:3.20
+#12 DONE 0.1s
+
+#13 [server internal] load .dockerignore
+#13 transferring context: 126B done
+#13 DONE 0.0s
+
+#14 [server build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#14 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#14 DONE 0.0s
+
+#15 [server internal] load build context
+#15 transferring context: 539B done
+#15 DONE 0.0s
+
+#16 [proxy] resolving provenance for metadata file
+#16 DONE 0.0s
+
+#17 [server build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#17 CACHED
+
+#18 [server build 7/8] COPY proto ./proto
+#18 CACHED
+
+#19 [server build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#19 CACHED
+
+#20 [server build 3/8] WORKDIR /server
+#20 CACHED
+
+#21 [server build 5/8] COPY build.zig build.zig.zon ./
+#21 CACHED
+
+#22 [server build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#22 CACHED
+
+#23 [server build 6/8] COPY src ./src
+#23 CACHED
+
+#24 [server stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#24 CACHED
+
+#25 [server] exporting to image
+#25 exporting layers done
+#25 exporting manifest sha256:7fb48617e513f9933143979c8c5ea97589596fdbcb54cf95678bb37cb2ab7f7d done
+#25 exporting config sha256:51b9ee6ce1acf175c9509e48ca3c26f11dff830f9ab50d99b6eb8aad310c583a done
+#25 exporting attestation manifest sha256:aa55c046132ef21fbe98e1cca35f916e3096786fb4cccb43942840e39c699067 done
+#25 exporting manifest list sha256:ca5b6ae35d3b3fa4a797c46a68d02be5715c4688260d0e6f11b08d73827afd8c done
+#25 naming to docker.io/library/httparena-anole-gateway-64-server:latest done
+#25 unpacking to docker.io/library/httparena-anole-gateway-64-server:latest done
+#25 DONE 0.0s
+
+#26 [server] resolving provenance for metadata file
+#26 DONE 0.0s
+ Image httparena-anole-gateway-64-proxy Built 
+ Image httparena-anole-gateway-64-server Built 
+ Container httparena-anole-gateway-64-server-1 Creating 
+ Container httparena-anole-gateway-64-server-1 Created 
+ Container httparena-anole-gateway-64-proxy-1 Creating 
+ Container httparena-anole-gateway-64-proxy-1 Created 
+ Container httparena-anole-gateway-64-server-1 Starting 
+ Container httparena-anole-gateway-64-server-1 Started 
+ Container httparena-anole-gateway-64-proxy-1 Starting 
+ Container httparena-anole-gateway-64-proxy-1 Started 
+[info] gateway containers: 2 (b7d9c8fff409 1bde44817d25 )
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+34Warm-up started for thread #57.
+
+.41Main benchmark duration is started for thread #2.
+.
+
+58Main benchmark duration is started for thread #46.
+.
+.
+13.
+
+3.
+
+54.Main benchmark duration is started for thread #26.
+
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+7. Stopping all clients.
+
+24Main benchmark duration is over for thread #61. Stopping all clients.Main benchmark duration is over for thread #
+43. Stopping all clients.
+
+
+
+45
+
+
+finished in 5.05s, 138978.80 req/s, 1.68GB/s
+requests: 694894 total, 711278 started, 694894 done, 694894 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 694894 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 8.42GB (9042740679) total, 62.30MB (65321996) headers (space savings 39.34%), 8.34GB (8956025552) data
+                     min         max         mean         sd        +/- sd
+time for request:       73us       4.47s    107.80ms    214.38ms    93.19%
+time for connect:     2.06ms    118.17ms     58.09ms     35.12ms    55.08%
+time to 1st byte:     5.89ms    235.79ms    126.27ms     66.40ms    57.81%
+req/s           :     217.88      375.53      271.37       35.78    68.36%
+[info] CPU 1051.1% | Mem 990MiB
+[info]   proxy: 450% 434MiB | server: 601% 559MiB
+
+[run 2/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+54.
+.Warm-up phase is over for thread #3.
+.
+16.
+50.
+21.
+
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+23.
+
+
+
+3
+38. Stopping all clients.
+
+51
+11Main benchmark duration is over for thread #20. Stopping all clients.
+14. Stopping all clients.
+31Stopped all clients for thread #5
+. Stopping all clients.
+56
+49. Stopping all clients.
+
+finished in 5.05s, 110075.40 req/s, 1.34GB/s
+requests: 550377 total, 566761 started, 550377 done, 550377 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 550377 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 6.69GB (7184615745) total, 49.30MB (51698643) headers (space savings 39.36%), 6.63GB (7115934493) data
+                     min         max         mean         sd        +/- sd
+time for request:       72us       4.48s    141.33ms    229.33ms    93.05%
+time for connect:     1.63ms    122.97ms     64.43ms     38.14ms    55.47%
+time to 1st byte:     3.64ms    263.17ms    137.01ms     68.73ms    59.38%
+req/s           :     158.52      289.53      214.92       25.63    65.23%
+[info] CPU 1102.3% | Mem 1.0GiB
+[info]   proxy: 415% 442MiB | server: 687% 596MiB
+
+[run 3/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+59Warm-up started for thread #9.
+.
+.
+.
+39.
+progress: Main benchmark duration is started for thread #57.
+
+18
+75% of clients started
+38.Main benchmark duration is started for thread #13.
+10.
+
+.
+
+
+48Main benchmark duration is started for thread #42.
+.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+
+55. Stopping all clients.
+40. Stopping all clients.
+2
+. Stopping all clients.Stopped all clients for thread #47
+
+
+finished in 5.05s, 110096.80 req/s, 1.34GB/s
+requests: 550484 total, 566868 started, 550484 done, 550484 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 550485 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 6.68GB (7173124420) total, 49.26MB (51648221) headers (space savings 39.38%), 6.62GB (7104493518) data
+                     min         max         mean         sd        +/- sd
+time for request:      122us       3.33s    143.59ms    171.78ms    93.57%
+time for connect:     1.42ms    131.93ms     64.31ms     39.15ms    55.66%
+time to 1st byte:     3.09ms    264.92ms    137.20ms     69.36ms    58.20%
+req/s           :     164.59      270.95      214.96       25.34    59.18%
+[info] CPU 1011.6% | Mem 1.0GiB
+[info]   proxy: 448% 436MiB | server: 564% 591MiB
+
+=== Best: 137602 req/s (CPU: 1051.1%, Mem: 990MiB) ===
+[info] dry-run — not saving (use --save to persist)
+
+==============================================
+=== anole / gateway-64 / 1024c (tool=h2load) ===
+==============================================
+[info] starting gateway compose stack: anole (gateway-64)
+ Image httparena-anole-gateway-64-proxy Building 
+ Image httparena-anole-gateway-64-server Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 1.07kB done
+#1 DONE 0.0s
+
+#2 [server internal] load build definition from Dockerfile
+#2 transferring dockerfile: 1.22kB done
+#2 DONE 0.0s
+
+#3 [proxy internal] load build definition from Dockerfile
+#3 transferring dockerfile: 734B done
+#3 DONE 0.0s
+
+#4 [proxy internal] load metadata for docker.io/library/nginx:1.27-alpine
+#4 DONE 0.0s
+
+#5 [proxy internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [proxy 1/4] FROM docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+#6 resolve docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10 0.0s done
+#6 DONE 0.0s
+
+#7 [proxy internal] load build context
+#7 transferring context: 180B done
+#7 DONE 0.0s
+
+#8 [proxy 3/4] COPY workers.sh /docker-entrypoint.d/30-workers.sh
+#8 CACHED
+
+#9 [proxy 2/4] COPY nginx.conf /etc/nginx/nginx.conf
+#9 CACHED
+
+#10 [proxy 4/4] RUN chmod +x /docker-entrypoint.d/30-workers.sh  && mkdir -p /var/lib/nginx/tmp/body /var/lib/nginx/tmp/proxy              /var/lib/nginx/tmp/fastcgi /var/lib/nginx/tmp/uwsgi /var/lib/nginx/tmp/scgi  && chown -R nginx:nginx /var/lib/nginx
+#10 CACHED
+
+#11 [proxy] exporting to image
+#11 exporting layers done
+#11 exporting manifest sha256:e9d428a1cb3b1d3053ff0cec31f9e1668af48bee564ddc08c5db2e5f3013c086 done
+#11 exporting config sha256:b0ce6f0147e73feb64463e1feba1f001d588079ac5b6f142d428732d579cd623 done
+#11 exporting attestation manifest sha256:74a5ea9d75fbb9ad13f854531dc878e685423f9fe59020ea064faa4c1510f0f6 done
+#11 exporting manifest list sha256:b0f238679953f87d48a7e97477dbf8b868f976db5f3553d893d038d890b62e41 done
+#11 naming to docker.io/library/httparena-anole-gateway-64-proxy:latest
+#11 naming to docker.io/library/httparena-anole-gateway-64-proxy:latest done
+#11 unpacking to docker.io/library/httparena-anole-gateway-64-proxy:latest done
+#11 DONE 0.0s
+
+#12 [server internal] load metadata for docker.io/library/alpine:3.20
+#12 DONE 0.1s
+
+#13 [server internal] load .dockerignore
+#13 transferring context: 126B done
+#13 DONE 0.0s
+
+#14 [server build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#14 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#14 DONE 0.0s
+
+#15 [server internal] load build context
+#15 transferring context: 539B done
+#15 DONE 0.0s
+
+#16 [server build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#16 CACHED
+
+#17 [server build 5/8] COPY build.zig build.zig.zon ./
+#17 CACHED
+
+#18 [server build 3/8] WORKDIR /server
+#18 CACHED
+
+#19 [server build 6/8] COPY src ./src
+#19 CACHED
+
+#20 [server build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#20 CACHED
+
+#21 [server build 7/8] COPY proto ./proto
+#21 CACHED
+
+#22 [server build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#22 CACHED
+
+#23 [server stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#23 CACHED
+
+#24 [proxy] resolving provenance for metadata file
+#24 DONE 0.0s
+
+#25 [server] exporting to image
+#25 exporting layers done
+#25 exporting manifest sha256:7fb48617e513f9933143979c8c5ea97589596fdbcb54cf95678bb37cb2ab7f7d done
+#25 exporting config sha256:51b9ee6ce1acf175c9509e48ca3c26f11dff830f9ab50d99b6eb8aad310c583a done
+#25 exporting attestation manifest sha256:16d2e6f04ae1b7a1f56141de606a8408b7dfe2a98d0f86b3f97e49f6ea681c37 done
+#25 exporting manifest list sha256:5b4073eb25080076ec90f93706c674259190db74f9f21df20728472dc6053494 done
+#25 naming to docker.io/library/httparena-anole-gateway-64-server:latest done
+#25 unpacking to docker.io/library/httparena-anole-gateway-64-server:latest done
+#25 DONE 0.0s
+
+#26 [server] resolving provenance for metadata file
+#26 DONE 0.0s
+ Image httparena-anole-gateway-64-server Built 
+ Image httparena-anole-gateway-64-proxy Built 
+ Container httparena-anole-gateway-64-server-1 Creating 
+ Container httparena-anole-gateway-64-server-1 Created 
+ Container httparena-anole-gateway-64-proxy-1 Creating 
+ Container httparena-anole-gateway-64-proxy-1 Created 
+ Container httparena-anole-gateway-64-server-1 Starting 
+ Container httparena-anole-gateway-64-server-1 Started 
+ Container httparena-anole-gateway-64-proxy-1 Starting 
+ Container httparena-anole-gateway-64-proxy-1 Started 
+[info] gateway containers: 2 (14a34c3211fc 7b718a58221c )
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+20.
+37.
+.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+. Stopping all clients.
+
+
+finished in 5.06s, 122199.80 req/s, 1.51GB/s
+requests: 610999 total, 643767 started, 610999 done, 610999 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 610999 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 7.56GB (8117742773) total, 55.25MB (57929816) headers (space savings 39.23%), 7.49GB (8040869468) data
+                     min         max         mean         sd        +/- sd
+time for request:       65us       4.87s    205.17ms    394.43ms    93.81%
+time for connect:     3.71ms    233.88ms    108.25ms     62.22ms    58.69%
+time to 1st byte:    38.92ms    511.36ms    296.72ms    113.65ms    70.31%
+req/s           :      81.13      169.38      119.27       13.95    67.58%
+[info] CPU 962.7% | Mem 1.7GiB
+[info]   proxy: 451% 685MiB | server: 512% 1.1GiB
+
+[run 2/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+50.
+
+
+14
+.Main benchmark duration is started for thread #40.
+
+10.
+37.
+
+.
+62
+.
+% of clients started
+24.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+48. Stopping all clients.Stopped all clients for thread #
+46
+16. Stopping all clients.
+
+finished in 5.07s, 104680.40 req/s, 1.30GB/s
+requests: 523402 total, 556170 started, 523402 done, 523402 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 523402 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 6.50GB (6979872108) total, 47.21MB (49507133) headers (space savings 39.28%), 6.44GB (6914076036) data
+                     min         max         mean         sd        +/- sd
+time for request:      132us       4.76s    272.57ms    378.34ms    93.47%
+time for connect:     2.11ms    235.97ms    115.66ms     70.21ms    56.05%
+time to 1st byte:     4.92ms    496.04ms    284.76ms    126.36ms    63.38%
+req/s           :      74.16      139.56      102.18        9.71    66.80%
+[info] CPU 1104.9% | Mem 1.7GiB
+[info]   proxy: 419% 672MiB | server: 686% 1.1GiB
+
+[run 3/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+.42Warm-up phase is over for thread #35.
+28.
+3.
+
+
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+
+finished in 5.06s, 103085.80 req/s, 1.28GB/s
+requests: 515429 total, 548197 started, 515429 done, 515429 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 515430 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 6.41GB (6885248604) total, 46.55MB (48807864) headers (space savings 39.26%), 6.35GB (6820395026) data
+                     min         max         mean         sd        +/- sd
+time for request:       94us       4.74s    271.12ms    393.91ms    93.59%
+time for connect:     3.65ms    228.10ms    107.50ms     61.05ms    59.77%
+time to 1st byte:    22.30ms    470.10ms    294.94ms    106.42ms    65.43%
+req/s           :      78.96      126.41      100.61        8.45    66.02%
+[info] CPU 920.9% | Mem 1.7GiB
+[info]   proxy: 447% 682MiB | server: 474% 1.0GiB
+
+=== Best: 120750 req/s (CPU: 962.7%, Mem: 1.7GiB) ===
+[info] dry-run — not saving (use --save to persist)
+[info] done
+httparena-postgres
