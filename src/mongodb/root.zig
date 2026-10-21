@@ -3,13 +3,13 @@
 //! (OP_MSG, the handshake, SCRAM, the connection string, discovery and
 //! monitoring, pooling, implicit sessions, retryable reads and writes).
 //!
-//!     const App = struct { mongo: *anole.mongodb.Client };
-//!     state.mongo = try app.mongodb(.{}); // MONGODB_URI, else localhost
+//!     const App = struct { db: *anole.mongodb.Client };
+//!     state.db = try app.mongodb(.{}); // MONGODB_URI, else localhost
 //!
 //!     const User = struct { _id: anole.bson.ObjectId, name: []const u8, email: []const u8 };
 //!
 //!     fn byEmail(app: *App, req: *anole.Request, res: *anole.Response) !void {
-//!         const users = app.mongo.collection("users");
+//!         const users = app.db.collection("users");
 //!         const email = req.query.get("email") orelse return error.BadRequest;
 //!         try res.json(try users.findOne(User, req, .{ .email = email }, .{})); // none: 404
 //!     }
@@ -19,17 +19,21 @@
 //! are `anole.db` errors that become statuses. See docs/database.md.
 const std = @import("std");
 
-/// The handle in the App state: `app.mongodb(.{})`, or `Client.connect`
+/// The handle in the App state: `app.mongodb(.{})`, or `Client.init`
 /// outside `anole.Server`. `client.collection("users")` and
-/// `client.db("app")` lead to the calls.
+/// `client.db("app")` lead to the calls; `client.with(.{ ... })` to the
+/// same with options.
 pub const Client = @import("client.zig").Client;
-/// `app.mongodb(options)` and `Client.connect`: the connection string,
+/// `app.mongodb(options)` and `Client.init`: the connection string,
 /// pool bounds, timeouts, TLS, retries, and how errors map to statuses.
 pub const Options = @import("client.zig").Options;
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
-pub const CallError = @import("client.zig").CallError;
+pub const Error = @import("client.zig").Error;
+/// What `Client.with` returns: `db` and `collection`, whose calls take
+/// its options.
+pub const Query = @import("client.zig").Query;
 /// A database of the client (`client.db("app")`): `collection`,
-/// `runCommand`, `drop`.
+/// `runCommand` (any command; its reply as a `bson.Document`), `drop`.
 pub const Database = @import("collection.zig").Database;
 /// A collection (`client.collection("users")`): find, aggregate, count,
 /// insert, update, replace, delete, find-and-modify, indexes.
@@ -51,24 +55,12 @@ pub const ReturnDocument = @import("collection.zig").ReturnDocument;
 /// `anole.bson.ObjectId`, the usual `_id`.
 pub const ObjectId = @import("bson").ObjectId;
 
-/// The pieces, for tests and tools: the connection string parser.
-pub const uri = @import("uri.zig");
-/// SCRAM-SHA-1 and SCRAM-SHA-256 authentication.
-pub const scram = @import("scram.zig");
-/// OP_MSG messages on the wire.
-pub const wire = @import("wire.zig");
-/// Server discovery and monitoring: the topology and server selection.
-pub const sdam = @import("sdam.zig");
-/// One connection to one server: the handshake, authentication and
-/// command round trips.
-pub const connection = @import("connection.zig");
-
 test {
-    _ = uri;
-    _ = scram;
-    _ = wire;
-    _ = sdam;
-    _ = connection;
+    _ = @import("uri.zig");
+    _ = @import("scram.zig");
+    _ = @import("wire.zig");
+    _ = @import("sdam.zig");
+    _ = @import("connection.zig");
     _ = @import("client.zig");
     _ = @import("collection.zig");
     _ = @import("fake_test.zig");

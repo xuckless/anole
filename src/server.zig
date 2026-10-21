@@ -1689,7 +1689,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (opts.environ == null) if (self.process) |p| {
                 opts.environ = p.environ;
             };
-            const mongo = try mongodb_mod.Client.connect(self.gpa, self.rt.io(), opts);
+            const mongo = try mongodb_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer mongo.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(mongodb_mod.Client, mongo));
             return mongo;

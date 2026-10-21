@@ -35,7 +35,7 @@ const Fixture = struct {
         f.rt = try zio.Runtime.init(gpa, if (executors) |n| .{ .executors = .exact(@intCast(n)) } else .{});
         errdefer f.rt.deinit();
         const io = f.rt.io();
-        f.client = try mongodb.Client.connect(gpa, io, .{ .url = url().?, .database = "anole_test", .server_selection_timeout = .fromSeconds(10) });
+        f.client = try mongodb.Client.init(gpa, io, .{ .url = url().?, .database = "anole_test", .server_selection_timeout = .fromSeconds(10) });
         f.arena = .init(gpa);
         f.c = .{ .io = io, .arena = f.arena.allocator() };
         var random: [4]u8 = undefined;

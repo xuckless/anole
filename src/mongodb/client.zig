@@ -31,7 +31,7 @@ pub const Collection = coll_mod.Collection;
 const placement = dusty.placement;
 const log = std.log.scoped(.anole);
 
-/// `app.mongodb(options)` and `Client.connect`. Every field has a
+/// `app.mongodb(options)` and `Client.init`. Every field has a
 /// default, so `.{}` connects from `MONGODB_URI`.
 pub const Options = struct {
     /// The connection string. Null: `MONGODB_URI` from the environment,
@@ -117,6 +117,23 @@ pub const Server = struct {
     }
 };
 
+/// The client with `QueryOptions` (`Client.with`): the databases and
+/// collections it leads to make their calls with them.
+pub const Query = struct {
+    client: *Client,
+    options: shared.QueryOptions,
+
+    /// `Client.db`, with the options.
+    pub fn db(self: Query, name: []const u8) Database {
+        return self.client.db(name).with(self.options);
+    }
+
+    /// `Client.collection`, with the options.
+    pub fn collection(self: Query, name: []const u8) Collection {
+        return self.client.collection(name).with(self.options);
+    }
+};
+
 /// A server session (driver-sessions): its id and transaction number.
 pub const Session = struct {
     id: [16]u8,
@@ -136,7 +153,7 @@ const SessionPool = struct {
 /// deployment's servers, keeps a connection pool per server and executor,
 /// and runs every call on the primary. Safe to use from any task.
 ///
-///     const users = app.mongo.collection("users");
+///     const users = app.db.collection("users");
 ///     const user = try users.findOne(User, req, .{ .email = email }, .{});
 pub const Client = struct {
     gpa: std.mem.Allocator,
@@ -147,7 +164,7 @@ pub const Client = struct {
     settings: conn_mod.Settings,
     default_database: []const u8,
     options: Options,
-    error_map: shared.ErrorMap,
+    errors: shared.ErrorMap,
     /// Write and read concerns from the URL, as BSON (empty when unset).
     write_concern: ?[]const u8 = null,
     read_concern: ?[]const u8 = null,
@@ -167,7 +184,7 @@ pub const Client = struct {
     scram_cache: scram.Cache = .{},
     sessions: internal.PerExecutor(SessionPool),
     /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
-    /// cached results: `app.mongo.cache.invalidate(.{ .tag = "users" })`.
+    /// cached results: `app.db.cache.invalidate(.{ .tag = "users" })`.
     cache: shared.QueryCache,
 
     /// Parses the connection string (`opts.url`, else `MONGODB_URI`, else
@@ -176,7 +193,7 @@ pub const Client = struct {
     /// at once on a bad connection string or an option the client cannot
     /// honour (a read preference other than primary, `mongodb+srv://`,
     /// a load balancer).
-    pub fn connect(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -186,7 +203,7 @@ pub const Client = struct {
             .settings = undefined,
             .default_database = undefined,
             .options = opts,
-            .error_map = opts.errors,
+            .errors = opts.errors,
             .direct = false,
             .observer = .{ .system = .mongodb, .name = opts.name },
             .topology = undefined,
@@ -325,8 +342,17 @@ pub const Client = struct {
         return self.db(self.default_database).collection(name);
     }
 
+    /// The calls with `opts`, as on the other connectors:
+    /// `app.db.with(.{ .timeout = .fromSeconds(2) }).collection("users").find(...)`.
+    /// A timeout bounds each call (server selection, the pool, the round
+    /// trips) and goes to the server as `maxTimeMS`; `coalesce` and `cache`
+    /// share or keep the reads (`anole.db.QueryOptions`).
+    pub fn with(self: *Client, opts: shared.QueryOptions) Query {
+        return .{ .client = self, .options = opts };
+    }
+
     /// Asks the primary to answer (`ping`).
-    pub fn ping(self: *Client, c: anytype) CallError!void {
+    pub fn ping(self: *Client, c: anytype) Error!void {
         _ = try self.db("admin").runCommand(c, .{ .ping = 1 });
     }
 
@@ -712,7 +738,7 @@ pub const Client = struct {
 
     /// Gives a server session back to the client's pool (a cursor's, when
     /// it ends); one that saw a network error is dropped instead.
-    pub fn giveSession(self: *Client, sess: *Session, io: std.Io) void {
+    fn giveSession(self: *Client, sess: *Session, io: std.Io) void {
         if (sess.dirty) {
             self.gpa.destroy(sess);
             return;
@@ -775,7 +801,7 @@ pub const Client = struct {
     ///     fn result(ctx, x: *Exchange, reply: bson.Document) !R
     /// and optionally
     ///     fn sequences(ctx, m: *wire.Message, x: *Exchange) !void  kind-1 sections
-    pub fn execute(self: *Client, c: *const Context, op: Operation, ctx: anytype) CallError!@typeInfo(@TypeOf(ctx)).pointer.child.Result {
+    fn execute(self: *Client, c: *const Context, op: Operation, ctx: anytype) Error!@typeInfo(@TypeOf(ctx)).pointer.child.Result {
         const Ctx = @typeInfo(@TypeOf(ctx)).pointer.child;
         const timeout = op.options.timeout orelse self.options.timeout;
         const deadline: ?std.Io.Clock.Timestamp = if (timeout) |t| .fromNow(c.io, .{ .raw = t, .clock = .awake }) else null;
@@ -783,7 +809,7 @@ pub const Client = struct {
         const result = if (timeout) |t| bounded: {
             const d: dusty.Deadline = .init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } });
             break :bounded d.run(Run(Ctx).attempt, .{ self, c, op, ctx, deadline }) catch |err| switch (err) {
-                error.Timeout => c.fail(self.error_map, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout", .table = op.collection }),
+                error.Timeout => c.fail(self.errors, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout", .table = op.collection }),
                 else => |e| e,
             };
         } else Run(Ctx).attempt(self, c, op, ctx, deadline);
@@ -798,7 +824,7 @@ pub const Client = struct {
 
     fn Run(comptime Ctx: type) type {
         return struct {
-            fn attempt(self: *Client, c: *const Context, op: Operation, ctx: *Ctx, deadline: ?std.Io.Clock.Timestamp) CallError!Ctx.Result {
+            fn attempt(self: *Client, c: *const Context, op: Operation, ctx: *Ctx, deadline: ?std.Io.Clock.Timestamp) Error!Ctx.Result {
                 const io = c.io;
                 var x: Exchange = .{ .client = self, .op = op, .server = op.server orelse undefined };
                 if (op.session and op.lsid == null) if (self.sessionTimeout()) |minutes| {
@@ -819,9 +845,9 @@ pub const Client = struct {
                         // The call's own timeout came first: a 504, as when
                         // the deadline cancels it anywhere else.
                         else => if (err == error.ServerSelectionTimeout and past(io, deadline))
-                            c.fail(self.error_map, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout waiting for a server", .table = op.collection })
+                            c.fail(self.errors, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout waiting for a server", .table = op.collection })
                         else
-                            c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = switch (err) {
+                            c.fail(self.errors, .{ .system = .mongodb, .class = .unavailable, .message = switch (err) {
                                 error.IncompatibleServer => "the server's wire version is outside the client's",
                                 else => "no server to send the command to (server selection timed out)",
                             }, .table = op.collection }),
@@ -829,14 +855,14 @@ pub const Client = struct {
                     const server = x.server;
                     const connection = self.acquire(server, io, deadline) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
-                        error.PoolTimeout => return c.fail(self.error_map, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .message = "no pooled connection free in time", .table = op.collection }),
+                        error.PoolTimeout => return c.fail(self.errors, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .message = "no pooled connection free in time", .table = op.collection }),
                         else => {
                             // A failed handshake or authentication: the
                             // server is marked Unknown and its pools cleared.
                             const auth = err == error.AuthenticationFailed;
                             self.handleError(server, .{ .address = "", .when = .before_handshake, .kind = if (auth) .command else .network, .message = @errorName(err) });
                             if (retry_allowed and !auth) continue;
-                            return c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = if (auth) "authentication failed" else "could not connect to the server", .table = op.collection });
+                            return c.fail(self.errors, .{ .system = .mongodb, .class = .unavailable, .message = if (auth) "authentication failed" else "could not connect to the server", .table = op.collection });
                         },
                     };
                     x.connection = connection;
@@ -858,8 +884,8 @@ pub const Client = struct {
                                 return error.Canceled;
                             },
                             error.OutOfMemory => return error.OutOfMemory,
-                            error.DocumentTooLarge => return c.fail(self.error_map, .{ .system = .mongodb, .class = .other, .message = "a document is larger than the server's maxBsonObjectSize", .table = op.collection }),
-                            error.InvalidDocument => return c.fail(self.error_map, .{ .system = .mongodb, .class = .other, .message = "a value could not be encoded as BSON (a key with a NUL byte, text that is not UTF-8)", .table = op.collection }),
+                            error.DocumentTooLarge => return c.fail(self.errors, .{ .system = .mongodb, .class = .other, .message = "a document is larger than the server's maxBsonObjectSize", .table = op.collection }),
+                            error.InvalidDocument => return c.fail(self.errors, .{ .system = .mongodb, .class = .other, .message = "a value could not be encoded as BSON (a key with a NUL byte, text that is not UTF-8)", .table = op.collection }),
                             else => {},
                         }
                         // The exchange broke off: a network error (or a
@@ -867,7 +893,7 @@ pub const Client = struct {
                         if (x.session) |sess| sess.dirty = true;
                         self.handleError(server, .{ .address = "", .generation = generation, .max_wire_version = max_wire_version, .kind = .network, .message = @errorName(err) });
                         if (retry_allowed and (op.retry == .read or x.txn_number != null)) continue;
-                        return c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = "the connection to the server failed mid-command", .table = op.collection });
+                        return c.fail(self.errors, .{ .system = .mongodb, .class = .unavailable, .message = "the connection to the server failed mid-command", .table = op.collection });
                     };
                     if (conn_mod.replyError(reply.body)) |se| {
                         if (se.kind != .write) self.handleError(server, .{
@@ -889,7 +915,7 @@ pub const Client = struct {
                         if (!accepts(ctx, se)) {
                             var code_buf: [24]u8 = undefined;
                             // Copied by `fail` before the connection is reused.
-                            const err = c.fail(self.error_map, .{
+                            const err = c.fail(self.errors, .{
                                 .system = .mongodb,
                                 .class = classify(se),
                                 .code = if (se.code) |code| std.fmt.bufPrint(&code_buf, "{d}", .{code}) catch "" else "",
@@ -905,8 +931,8 @@ pub const Client = struct {
                         return switch (@as(anyerror, err)) {
                             error.OutOfMemory => error.OutOfMemory,
                             error.Canceled => error.Canceled,
-                            error.MissingField => c.fail(self.error_map, .{ .system = .mongodb, .class = .other, .message = "a document lacks a field the struct has no default for", .table = op.collection }),
-                            else => c.fail(self.error_map, .{ .system = .mongodb, .class = .other, .message = "a document does not fit the struct it is read into", .table = op.collection }),
+                            error.MissingField => c.fail(self.errors, .{ .system = .mongodb, .class = .other, .message = "a document lacks a field the struct has no default for", .table = op.collection }),
+                            else => c.fail(self.errors, .{ .system = .mongodb, .class = .other, .message = "a document does not fit the struct it is read into", .table = op.collection }),
                         };
                     };
                     self.release(server, connection, io);
@@ -970,6 +996,18 @@ fn appendLsid(b: *bson.Builder, id: [16]u8) !void {
     try b.end();
 }
 
+/// `Client.execute`, for collection.zig: kept off `Client`'s public
+/// methods, since `anole.mongodb.Client` is API and this is the machinery
+/// under it.
+pub fn execute(client: *Client, c: *const Context, op: Operation, ctx: anytype) Error!@typeInfo(@TypeOf(ctx)).pointer.child.Result {
+    return client.execute(c, op, ctx);
+}
+
+/// `Client.giveSession`, for a cursor that ends (collection.zig).
+pub fn giveSession(client: *Client, sess: *Session, io: std.Io) void {
+    client.giveSession(sess, io);
+}
+
 /// A call's context with its type erased: the request (or `anole.db.Ctx`)
 /// a call was made with, so cursors can keep it and the command loop is
 /// compiled once.
@@ -1001,7 +1039,7 @@ pub fn erase(c: anytype) Context {
 
 /// What every call can fail with: the shared errors (`anole.db.Error`),
 /// a cancel, memory.
-pub const CallError = shared.Error || error{ Canceled, OutOfMemory };
+pub const Error = shared.Error || error{ Canceled, OutOfMemory };
 
 /// A command as `execute` runs it.
 pub const Operation = struct {
