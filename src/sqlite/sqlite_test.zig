@@ -5,6 +5,7 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const anole_db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
 const observe = @import("../observe/root.zig");
 const server_mod = @import("../server.zig");
@@ -87,7 +88,7 @@ fn quiet() std.log.Level {
 }
 
 test "sqlite: :memory: on std.Io.Threaded, the verbs" {
-    const db = try sqlite.Db.init(gpa, testing.io, .{ .path = "sqlite::memory:" });
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = "sqlite::memory:" });
     defer db.deinit();
     try testing.expectEqualStrings("memory", db.name);
     try testing.expectEqual(@as(usize, 0), db.readers.conns.len);
@@ -123,7 +124,7 @@ test "sqlite: :memory: on std.Io.Threaded, the verbs" {
 }
 
 test "sqlite: values both ways: times, enums, optionals, JSON, blobs, defaults" {
-    const db = try sqlite.Db.init(gpa, testing.io, .{ .path = ":memory:" });
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
     var s: Scratch = undefined;
     s.init(testing.io);
@@ -206,7 +207,7 @@ test "sqlite: values both ways: times, enums, optionals, JSON, blobs, defaults" 
 test "sqlite: constraint errors become statuses; ErrorMap moves them" {
     var tmp: TmpFile = .init();
     defer tmp.deinit();
-    const db = try sqlite.Db.init(gpa, testing.io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = tmp.file("app.db"), .readers = 1 });
     defer db.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -245,7 +246,7 @@ test "sqlite: constraint errors become statuses; ErrorMap moves them" {
     try testing.expectEqualStrings("users", unique.table.?);
 
     // An app that validates through its constraints.
-    const strict = try sqlite.Db.init(gpa, testing.io, .{ .path = tmp.file("app.db"), .readers = 1, .errors = .{ .foreign_key = .unprocessable_entity, .check = .bad_request } });
+    const strict = try sqlite.Client.init(gpa, testing.io, .{ .path = tmp.file("app.db"), .readers = 1, .errors = .{ .foreign_key = .unprocessable_entity, .check = .bad_request } });
     defer strict.deinit();
     try testing.expectError(error.UnprocessableEntity, strict.exec(&req, "INSERT INTO posts (user_id) VALUES (42)", .{}));
     try testing.expectError(error.BadRequest, strict.exec(&req, "INSERT INTO users (email, age) VALUES ('d@x', -1)", .{}));
@@ -259,7 +260,7 @@ test "sqlite: a file on 4 pinned executors: reads beside an open write transacti
     const io = r.io();
     var tmp: TmpFile = .init();
     defer tmp.deinit();
-    const db = try sqlite.Db.init(gpa, io, .{ .path = tmp.file("app.db") });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db") });
     defer db.deinit();
     try testing.expectEqual(@as(usize, 4), db.readers.conns.len);
     var s: Scratch = undefined;
@@ -287,7 +288,7 @@ test "sqlite: a file on 4 pinned executors: reads beside an open write transacti
     // 16 tasks over the 4 executors, each writing 25 rows and reading
     // between writes: every write lands, no SQLITE_BUSY.
     const Worker = struct {
-        fn run(d: *sqlite.Db, io_: std.Io, n: usize, failures: *std.atomic.Value(u32)) void {
+        fn run(d: *sqlite.Client, io_: std.Io, n: usize, failures: *std.atomic.Value(u32)) void {
             var sc: Scratch = undefined;
             sc.init(io_);
             defer sc.deinit();
@@ -326,7 +327,7 @@ test "sqlite: coalesced and cached reads on 4 executors; invalidation after a wr
     const io = r.io();
     var tmp: TmpFile = .init();
     defer tmp.deinit();
-    const db = try sqlite.Db.init(gpa, io, .{ .path = tmp.file("shared.db") });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("shared.db") });
     defer db.deinit();
     var s: Scratch = undefined;
     s.init(io);
@@ -337,7 +338,7 @@ test "sqlite: coalesced and cached reads on 4 executors; invalidation after a wr
     // A read slow enough that the callers on each executor meet in flight.
     const slow = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?) SELECT count(*) FROM n";
     const Worker = struct {
-        fn run(d: *sqlite.Db, io_: std.Io, failures: *std.atomic.Value(u32)) void {
+        fn run(d: *sqlite.Client, io_: std.Io, failures: *std.atomic.Value(u32)) void {
             var sc: Scratch = undefined;
             sc.init(io_);
             defer sc.deinit();
@@ -374,7 +375,7 @@ test "sqlite: :memory: is one database seen from every executor" {
     try r.init(4, 2);
     defer r.deinit();
     const io = r.io();
-    const db = try sqlite.Db.init(gpa, io, .{ .path = ":memory:" });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = ":memory:" });
     defer db.deinit();
     var s: Scratch = undefined;
     s.init(io);
@@ -382,11 +383,11 @@ test "sqlite: :memory: is one database seen from every executor" {
     _ = try db.exec(&s.ctx, "CREATE TABLE seen (executor INTEGER)", .{});
 
     const Worker = struct {
-        fn run(d: *sqlite.Db, io_: std.Io, out: *std.atomic.Value(u32)) void {
+        fn run(d: *sqlite.Client, io_: std.Io, out: *std.atomic.Value(u32)) void {
             var sc: Scratch = undefined;
             sc.init(io_);
             defer sc.deinit();
-            const here = anole_db.executorIndex(io_) orelse 99;
+            const here = internal.executorIndex(io_) orelse 99;
             _ = d.exec(&sc.ctx, "INSERT INTO seen VALUES (?)", .{here}) catch return;
             // Rows other executors wrote are visible here.
             const n = d.one(i64, &sc.ctx, "SELECT count(*) FROM seen", .{}) catch return;
@@ -413,9 +414,9 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
     var tmp: TmpFile = .init();
     defer tmp.deinit();
     // One reader, so the next read reuses the interrupted connection.
-    const file_db = try sqlite.Db.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    const file_db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
     defer file_db.deinit();
-    const memory_db = try sqlite.Db.init(gpa, io, .{ .path = ":memory:" });
+    const memory_db = try sqlite.Client.init(gpa, io, .{ .path = ":memory:" });
     defer memory_db.deinit();
     var s: Scratch = undefined;
     s.init(io);
@@ -424,7 +425,7 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
     const level = quiet();
     defer testing.log_level = level;
 
-    const Case = struct { db: *sqlite.Db, write: bool };
+    const Case = struct { db: *sqlite.Client, write: bool };
     for ([_]Case{ .{ .db = file_db, .write = false }, .{ .db = file_db, .write = true }, .{ .db = memory_db, .write = false } }) |case| {
         const q = case.db.with(.{ .timeout = .fromMilliseconds(50), .write = case.write });
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
@@ -436,7 +437,7 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
 
         // A canceled task (a request's deadline, an RST_STREAM).
         const Long = struct {
-            fn run(q_: sqlite.Query, io_: std.Io) sqlite.CallError!i64 {
+            fn run(q_: sqlite.Query, io_: std.Io) sqlite.Error!i64 {
                 var sc: Scratch = undefined;
                 sc.init(io_);
                 defer sc.deinit();
@@ -455,7 +456,7 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
         var tx = try file_db.begin(ctx, .{});
         _ = try tx.exec(ctx, "CREATE TABLE IF NOT EXISTS t (x)", .{});
         const Write = struct {
-            fn run(d: *sqlite.Db, io_: std.Io) sqlite.CallError!u64 {
+            fn run(d: *sqlite.Client, io_: std.Io) sqlite.Error!u64 {
                 var sc: Scratch = undefined;
                 sc.init(io_);
                 defer sc.deinit();
@@ -477,7 +478,7 @@ test "sqlite: with one executor, the server keeps running while SQLite works" {
     const io = r.io();
     var tmp: TmpFile = .init();
     defer tmp.deinit();
-    const db = try sqlite.Db.init(gpa, io, .{ .path = tmp.file("app.db") });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db") });
     defer db.deinit();
     var s: Scratch = undefined;
     s.init(io);
@@ -512,7 +513,7 @@ test "sqlite: transactions: commit, rollback, deinit, and transaction() retried 
     var tmp: TmpFile = .init();
     defer tmp.deinit();
     const path = tmp.file("app.db");
-    const db = try sqlite.Db.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout_ms = 20 });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout_ms = 20 });
     defer db.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -597,7 +598,7 @@ test "sqlite: iterate in batches, on a reader and on :memory:'s writer; RETURNIN
     var tmp: TmpFile = .init();
     defer tmp.deinit();
     for ([_][]const u8{ tmp.file("app.db"), ":memory:" }) |path| {
-        const db = try sqlite.Db.init(gpa, io, .{ .path = path, .readers = 1 });
+        const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 1 });
         defer db.deinit();
         var s: Scratch = undefined;
         s.init(io);
@@ -652,7 +653,7 @@ test "sqlite: iterate in batches, on a reader and on :memory:'s writer; RETURNIN
 }
 
 test "sqlite: the statement cache keeps the newest; prepare = false keeps none" {
-    const db = try sqlite.Db.init(gpa, testing.io, .{ .path = ":memory:", .statement_cache = 2 });
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:", .statement_cache = 2 });
     defer db.deinit();
     var s: Scratch = undefined;
     s.init(testing.io);
@@ -676,7 +677,7 @@ test "sqlite: metrics, readiness and the pool gauges, attached after the fact" {
     const io = r.io();
     var tmp: TmpFile = .init();
     defer tmp.deinit();
-    const db = try sqlite.Db.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 2 });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 2 });
     defer db.deinit();
     var registry = observe.metrics.Registry.init(gpa, io);
     defer registry.deinit();
@@ -705,7 +706,7 @@ test "sqlite: metrics, readiness and the pool gauges, attached after the fact" {
 }
 
 const App = struct {
-    db: *sqlite.Db = undefined,
+    db: *sqlite.Client = undefined,
 
     fn create(app: *App, req: *dusty.Request, res: *dusty.Response) !void {
         const title = req.query.get("title") orelse return error.BadRequest;

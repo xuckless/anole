@@ -4,13 +4,13 @@
 //! `anole.net.ClientStream` (plain or TLS on BoringSSL), so waiting for the
 //! server suspends the calling coroutine, never its thread.
 //!
-//!     const App = struct { cache: *anole.redis.Client };
+//!     const App = struct { redis: *anole.redis.Client };
 //!     var state: App = undefined;
 //!     var app = try anole.Server(App).init(gpa, .{}, &state);
-//!     state.cache = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379
+//!     state.redis = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379
 //!
 //!     fn hit(app: *App, req: *anole.Request, res: *anole.Response) !void {
-//!         const hits = try app.cache.incr(req, "hits");
+//!         const hits = try app.redis.incr(req, "hits");
 //!         try res.json(.{ .hits = hits });
 //!     }
 //!
@@ -81,6 +81,7 @@ const features = @import("build_options");
 const dusty = @import("dusty");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
@@ -174,7 +175,7 @@ pub const Options = struct {
 
 /// A connection's settings: the URL, the environment and `Options`,
 /// resolved. Strings point into the arena `resolve` was given.
-pub const Settings = struct {
+const Settings = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 6379,
     unix_path: ?[]const u8 = null,
@@ -401,7 +402,7 @@ pub const Client = struct {
     /// AUTH and SELECT, sent as a connection opens; empty when neither is
     /// needed.
     login: Batch,
-    pools: db.PerExecutor(Pool),
+    pools: internal.PerExecutor(Pool),
     errors: db.ErrorMap,
     observer: db.Observer,
     readiness: db.Readiness,
@@ -411,7 +412,7 @@ pub const Client = struct {
     ping_timeout: Duration,
     connect_at_start: bool,
     /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
-    /// kept replies: `app.cache.cache.invalidate(.{ .tag = "profiles" })`.
+    /// kept replies: `app.redis.cache.invalidate(.{ .tag = "profiles" })`.
     cache: db.QueryCache,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
@@ -471,7 +472,7 @@ pub const Client = struct {
         if (s.database != 0) try login.add(.{ "SELECT", s.database });
         self.login = login.finish();
 
-        const executors = db.executorCount(io);
+        const executors = internal.executorCount(io);
         const total: usize = opts.max_connections orelse 10 * executors;
         self.pools = try .init(gpa, io);
         var made: usize = 0;
@@ -529,7 +530,7 @@ pub const Client = struct {
 
     /// The calls with `opts` (of which Redis takes `timeout`, `coalesce`
     /// and `cache`, the last two for reads only; see the top of this file):
-    /// `app.cache.with(.{ .timeout = .fromMilliseconds(200) }).get(req, key)`.
+    /// `app.redis.with(.{ .timeout = .fromMilliseconds(200) }).get(req, key)`.
     pub fn with(self: *Client, opts: db.QueryOptions) Query {
         return .{ .client = self, .opts = opts };
     }
@@ -537,7 +538,7 @@ pub const Client = struct {
     /// Sends one command and returns its reply; an error reply fails the
     /// call (see the top of this file).
     ///
-    ///     const n = try app.cache.command(req, .{ "INCR", "hits" }); // .int
+    ///     const n = try app.redis.command(req, .{ "INCR", "hits" }); // .int
     pub fn command(self: *Client, c: anytype, args: anytype) Error!Reply {
         return self.with(.{}).command(c, args);
     }
@@ -545,7 +546,7 @@ pub const Client = struct {
     /// The reply as a `T`; nil (or a hash without fields, for a struct):
     /// `error.NotFound`, a 404.
     ///
-    ///     const name = try app.cache.one([]const u8, req, .{ "HGET", key, "name" });
+    ///     const name = try app.redis.one([]const u8, req, .{ "HGET", key, "name" });
     pub fn one(self: *Client, comptime T: type, c: anytype, args: anytype) Error!T {
         return self.with(.{}).one(T, c, args);
     }
@@ -557,7 +558,7 @@ pub const Client = struct {
 
     /// An array reply as a `[]T` (nil: empty).
     ///
-    ///     const names = try app.cache.all(?[]const u8, req, .{ "MGET", keys });
+    ///     const names = try app.redis.all(?[]const u8, req, .{ "MGET", keys });
     pub fn all(self: *Client, comptime T: type, c: anytype, args: anytype) Error![]T {
         return self.with(.{}).all(T, c, args);
     }
@@ -565,7 +566,7 @@ pub const Client = struct {
     /// Several commands in one round trip, on one connection; their replies
     /// in order. A tuple of commands, or a slice of `[]const []const u8`:
     ///
-    ///     const r = try app.cache.pipeline(req, .{ .{ "INCR", key }, .{ "EXPIRE", key, 60 } });
+    ///     const r = try app.redis.pipeline(req, .{ .{ "INCR", key }, .{ "EXPIRE", key, 60 } });
     ///     const n = r[0].int;
     ///
     /// When one of them fails, every reply is still read, and the call
@@ -590,7 +591,7 @@ pub const Client = struct {
     /// drain, so an event stream or a WebSocket that forwards it winds down
     /// in time.
     ///
-    ///     const sub = try app.cache.subscribe(req, "chat");
+    ///     const sub = try app.redis.subscribe(req, "chat");
     ///     defer sub.close();
     ///     while (try sub.next(req)) |msg| try events.send(msg.payload, .{});
     pub fn subscribe(self: *Client, c: anytype, channels: anytype) Error!*Subscriber {
@@ -632,7 +633,7 @@ pub const Client = struct {
 
     /// True when the server answers PING within `ping_timeout`: `/readyz`'s
     /// check. Its failures are not logged.
-    pub fn ping(context: *anyopaque, io: std.Io) bool {
+    fn ping(context: *anyopaque, io: std.Io) bool {
         const self: *Client = @ptrCast(@alignCast(context));
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
@@ -1115,7 +1116,7 @@ fn rest(args: anytype) Rest(@TypeOf(args)) {
 /// A connection taken with `Client.acquire`: the same calls, all on it,
 /// until `release`.
 ///
-///     var conn = try app.cache.acquire(req);
+///     var conn = try app.redis.acquire(req);
 ///     defer conn.release();
 ///     _ = try conn.command(req, .{ "WATCH", key });
 ///     const stock = try conn.one(i64, req, .{ "GET", key });
@@ -1334,8 +1335,8 @@ fn Commands(comptime Self: type) type {
         /// SET `value` (any argument: a string, a number...). False when
         /// `nx` or `xx` kept it from being set.
         ///
-        ///     _ = try app.cache.set(req, "page:/", html, .{ .ttl = .fromSeconds(30) });
-        ///     const mine = try app.cache.set(req, "lock:job", "1", .{ .nx = true, .ttl = .fromSeconds(30) });
+        ///     _ = try app.redis.set(req, "page:/", html, .{ .ttl = .fromSeconds(30) });
+        ///     const mine = try app.redis.set(req, "lock:job", "1", .{ .nx = true, .ttl = .fromSeconds(30) });
         pub fn set(self: Self, c: anytype, key: []const u8, value: anytype, opts: SetOptions) Error!bool {
             const Word = ?[]const u8;
             const ttl = opts.ttl;
@@ -1379,7 +1380,7 @@ fn Commands(comptime Self: type) type {
         /// HSET from a struct's fields (null ones left out), or from a
         /// tuple of field, value...; how many fields were new.
         ///
-        ///     _ = try app.cache.hset(req, "user:42", .{ .name = "Ada", .visits = 1 });
+        ///     _ = try app.redis.hset(req, "user:42", .{ .name = "Ada", .visits = 1 });
         pub fn hset(self: Self, c: anytype, key: []const u8, fields: anytype) Error!u64 {
             return self.one(u64, c, .{ "HSET", key, fields });
         }
@@ -1843,14 +1844,14 @@ fn decode(comptime T: type, r: Reply, d: *const Decoder) Error!T {
 }
 
 /// An error reply's code: its first word ("WRONGTYPE", "ERR").
-pub fn errorCode(message: []const u8) []const u8 {
+fn errorCode(message: []const u8) []const u8 {
     return message[0 .. std.mem.indexOfScalar(u8, message, ' ') orelse message.len];
 }
 
 /// The class of an error reply (`anole.db.Class`): `unavailable` when the
 /// server cannot serve now (loading, a replica, out of memory, a script
 /// running, a login refused), else `other`.
-pub fn classify(message: []const u8) db.Class {
+fn classify(message: []const u8) db.Class {
     const code = errorCode(message);
     for ([_][]const u8{ "LOADING", "MASTERDOWN", "BUSY", "TRYAGAIN", "CLUSTERDOWN", "READONLY", "NOREPLICAS", "MISCONF", "OOM", "NOAUTH", "WRONGPASS" }) |u| {
         if (std.mem.eql(u8, code, u)) return .unavailable;
@@ -1866,7 +1867,7 @@ const Ctx = struct {
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
 
-    /// `anole.db.fail` on the context it stands for.
+    /// `internal.fail` on the context it stands for.
     fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
@@ -1882,10 +1883,10 @@ fn erase(c: anytype) Ctx {
     if (C == *Ctx or C == *const Ctx) return c.*;
     const R = struct {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return db.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = db.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------

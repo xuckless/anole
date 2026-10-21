@@ -8,6 +8,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const http = @import("../http/root.zig");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const redis = @import("root.zig");
 const server_mod = @import("../server.zig");
 const client_mod = @import("../client.zig");
@@ -305,7 +306,7 @@ test "redis: live a pool per executor" {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
-            const here = db.executorIndex(io_).?;
+            const here = internal.executorIndex(io_).?;
             for (0..10) |_| {
                 const id = try cl.one(i64, &ctx, .{ "CLIENT", "ID" });
                 // Each executor keeps to its one connection.
@@ -361,29 +362,29 @@ test "redis: live TLS as the URL asks, and a refused login" {
     const detail = db.lastError(&c).?;
     try testing.expectEqual(db.Class.unavailable, detail.class);
     try testing.expect(std.mem.eql(u8, detail.code, "WRONGPASS") or std.mem.eql(u8, detail.code, "ERR"));
-    try testing.expect(!redis.Client.ping(refused, io));
+    try testing.expect(!refused.readiness.ping(refused, io));
 }
 
 const AppState = struct {
-    cache: *redis.Client,
+    redis: *redis.Client,
 };
 
 const AppRoutes = struct {
     fn hits(app: *AppState, req: *http.Request, res: *http.Response) !void {
-        try res.json(.{ .hits = try app.cache.incr(req, "anole:test:hits") });
+        try res.json(.{ .hits = try app.redis.incr(req, "anole:test:hits") });
     }
 
     fn profile(app: *AppState, req: *http.Request, res: *http.Response) !void {
         const id = req.params.get("id") orelse return error.NotFound;
         const key = try std.fmt.allocPrint(req.arena, "anole:test:profile:{s}", .{id});
-        try res.json(try app.cache.hgetAll(Profile, req, key));
+        try res.json(try app.redis.hgetAll(Profile, req, key));
     }
 
     /// Messages as Server-Sent Events, until the drain ends the
     /// subscription.
     fn events(app: *AppState, req: *http.Request, res: *http.Response) !void {
         req.setTimeout(.none);
-        const sub = try app.cache.subscribe(req, "anole:test:events");
+        const sub = try app.redis.subscribe(req, "anole:test:events");
         defer sub.close();
         var buf: [256]u8 = undefined;
         var stream = try res.startEventStream(&buf);
@@ -398,7 +399,7 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
     var app = try server_mod.Server(AppState).init(gpa, .{ .executors = .exact(2) }, &state);
     defer app.deinit();
     // Before `metrics` and `health`: it reaches them when serving starts.
-    state.cache = try app.redis(.{ .url = test_url, .environ = .empty });
+    state.redis = try app.redis(.{ .url = test_url, .environ = .empty });
     _ = app.metrics(.{});
     _ = app.health(.{});
     app.get("/hits", AppRoutes.hits);
@@ -408,8 +409,8 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
         var c: db.Ctx = .{ .io = app.io(), .arena = arena_state.allocator() };
-        _ = try state.cache.del(&c, .{ "anole:test:hits", "anole:test:profile:1" });
-        _ = try state.cache.hset(&c, "anole:test:profile:1", .{ .name = "Ada", .visits = 7 });
+        _ = try state.redis.del(&c, .{ "anole:test:hits", "anole:test:profile:1" });
+        _ = try state.redis.hset(&c, "anole:test:profile:1", .{ .name = "Ada", .visits = 7 });
     }
 
     const Check = struct {
@@ -469,7 +470,7 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
             try testing.expectEqualStrings("data: hi\n\n", got[1]);
         }
     };
-    var checking = try app.io().concurrent(Check.run, .{ &app, state.cache });
+    var checking = try app.io().concurrent(Check.run, .{ &app, state.redis });
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }

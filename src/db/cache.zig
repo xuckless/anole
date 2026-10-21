@@ -29,6 +29,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const db = @import("root.zig");
+const internal = @import("internal.zig");
 const copy = @import("copy.zig");
 const store = @import("../cache/store.zig");
 const observe_mod = @import("../observe/root.zig");
@@ -84,7 +85,7 @@ pub const Cache = struct {
         const locals: store.PerExecutor(Local) = try .init(gpa, io);
         const n = locals.items.len;
         for (locals.items, 0..) |*l, i| l.* = .{
-            .store = .init(gpa, if (opts.max_entries == 0) 0 else db.split(opts.max_entries, n, i), db.split(opts.max_bytes, n, i)),
+            .store = .init(gpa, if (opts.max_entries == 0) 0 else internal.split(opts.max_entries, n, i), internal.split(opts.max_bytes, n, i)),
             .key = .init(gpa),
         };
         return .{ .gpa = gpa, .io = io, .system = system, .name = name, .locals = locals };
@@ -189,13 +190,13 @@ pub const Cache = struct {
             return runner.run(c, sql, args);
         const T = Typed(Out, Args, @TypeOf(runner));
         defer f.leave();
-        db.bounded(c, self.system, opts.timeout, Flight.wait, .{ f, io }) catch |err| return switch (err) {
+        internal.bounded(c, self.system, opts.timeout, Flight.wait, .{ f, io }) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
             else => error.GatewayTimeout,
         };
         const typed: *T = @fieldParentPtr("base", f);
         const out = typed.result catch |err| {
-            if (f.ctx.last_error) |detail| db.keepError(c, detail);
+            if (f.ctx.last_error) |detail| internal.keepError(c, detail);
             return err;
         };
         return copy.deepCopy(Out, out, c.arena);
@@ -407,7 +408,7 @@ const Fake = struct {
             _ = self.canceled.fetchAdd(1, .monotonic);
             return error.Canceled;
         };
-        if (self.fail) return db.fail(ctx, .{}, .{ .system = .postgresql, .class = .unique, .code = "23505", .message = "duplicate" });
+        if (self.fail) return internal.fail(ctx, .{}, .{ .system = .postgresql, .class = .unique, .code = "23505", .message = "duplicate" });
         const rows = try ctx.arena.alloc(Row, 2);
         const tags = try ctx.arena.alloc([]const u8, 1);
         tags[0] = try ctx.arena.dupe(u8, "tag");

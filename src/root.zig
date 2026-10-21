@@ -210,9 +210,9 @@ pub const webtransport = if (features.http3) @import("webtransport.zig") else st
 /// JSON on yyjson (`-Djson`): parse into and stringify Zig types.
 pub const json = if (features.json) @import("json/root.zig") else struct {};
 
-/// Redis and Valkey (`-Dredis`): `state.cache = try app.redis(.{})`
-/// (REDIS_URL), then `state.cache.get(req, key)`,
-/// `state.cache.command(req, .{ "INCR", key })`, pipelines and pub/sub, with the `anole.db` calling convention and a pool per
+/// Redis and Valkey (`-Dredis`): `state.redis = try app.redis(.{})`
+/// (REDIS_URL), then `state.redis.get(req, key)`,
+/// `state.redis.command(req, .{ "INCR", key })`, pipelines and pub/sub, with the `anole.db` calling convention and a pool per
 /// executor.
 pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 

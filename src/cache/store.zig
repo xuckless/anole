@@ -313,8 +313,8 @@ pub const Store = struct {
     }
 };
 
-/// Part `index` of `total` split over `parts` executors, at least 1
-/// (`anole.db.split`).
+/// Part `index` of `total` split over `parts` executors, at least 1,
+/// as the database connectors split their pools.
 pub fn share(total: usize, parts: usize, index: usize) usize {
     if (total <= parts) return 1;
     return total / parts + @intFromBool(index < total % parts);

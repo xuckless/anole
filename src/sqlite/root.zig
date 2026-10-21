@@ -2,12 +2,12 @@
 //! amalgamation (public domain) compiled by Anole (build/sqlite.zig), opened
 //! through xuckless/zig-sqlite (MIT). Nothing to install, no server to run.
 //!
-//!     const App = struct { notes: *anole.sqlite.Db };
-//!     state.notes = try app.sqlite("notes.db"); // or ":memory:"
+//!     const App = struct { db: *anole.sqlite.Client };
+//!     state.db = try app.sqlite("notes.db"); // or ":memory:"
 //!
 //!     fn list(app: *App, req: *anole.Request, res: *anole.Response) !void {
 //!         const Note = struct { id: i64, title: []const u8, done: bool };
-//!         try res.json(try app.notes.all(Note, req, "SELECT id, title, done FROM notes ORDER BY id LIMIT ?", .{50}));
+//!         try res.json(try app.db.all(Note, req, "SELECT id, title, done FROM notes ORDER BY id LIMIT ?", .{50}));
 //!     }
 //!
 //! The calls are `anole.db`'s (see src/db/root.zig): `exec`, `one`,
@@ -35,7 +35,7 @@
 //!   the writer's connection, since each in-memory connection would be a
 //!   database of its own.
 //!
-//! `app.sqlite` makes sure the server has a blocking pool; a `Db` opened
+//! `app.sqlite` makes sure the server has a blocking pool; a `Client` opened
 //! outside `anole.Server` on a runtime without one reads on the caller's
 //! thread.
 //!
@@ -63,6 +63,7 @@
 const std = @import("std");
 const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
 const observe = @import("../observe/root.zig");
 
@@ -74,7 +75,7 @@ pub const driver = sqlite;
 
 const log = std.log.scoped(.anole);
 
-/// `app.sqlite(options)` and `Db.init`: the file, its connections and
+/// `app.sqlite(options)` and `Client.init`: the file, its connections and
 /// statement cache. `app.sqlite("app.db")` is `.{ .path = "app.db" }`.
 pub const Options = struct {
     /// A file (created when missing), `":memory:"` for one in-memory
@@ -117,17 +118,17 @@ pub const Blob = struct {
 };
 
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
-pub const CallError = db.Error || error{ Canceled, OutOfMemory };
+pub const Error = db.Error || error{ Canceled, OutOfMemory };
 
 /// One SQLite database: a writer thread with the read-write connection, and
 /// read-only connections for reads. Safe to use from any task.
-pub const Db = struct {
+pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     name: []const u8,
     path: [:0]const u8,
     memory: bool,
-    error_map: db.ErrorMap,
+    errors: db.ErrorMap,
     cache_size: usize,
     writer: Writer,
     readers: Readers,
@@ -138,16 +139,16 @@ pub const Db = struct {
     /// Connections in use (readers taken, the writer held), for the gauges.
     in_use: std.atomic.Value(i64) = .init(0),
     /// Calls with `.coalesce` or `.cache` (`with`), and `invalidate` for
-    /// cached results: `app.notes.cache.invalidate(.{ .tag = "notes" })`.
+    /// cached results: `app.db.cache.invalidate(.{ .tag = "notes" })`.
     cache: db.QueryCache,
 
     /// Opens the database (the file is created when missing) and its
     /// connections, and starts the writer thread. `io` is the runtime the
     /// calls will come from. Close it with `deinit`.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Db {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
         const path = stripScheme(options.path);
         const memory = std.mem.eql(u8, path, ":memory:");
-        const self = try gpa.create(Db);
+        const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         const path_z = try gpa.dupeSentinel(u8, path, 0);
         errdefer gpa.free(path_z);
@@ -159,7 +160,7 @@ pub const Db = struct {
             .name = name,
             .path = path_z,
             .memory = memory,
-            .error_map = options.errors,
+            .errors = options.errors,
             .cache_size = options.statement_cache,
             .writer = .{ .conn = undefined, .thread = undefined },
             .readers = .{},
@@ -173,7 +174,7 @@ pub const Db = struct {
         // the read-only connections cannot.
         self.writer.conn = try Connection.open(self, true, options);
         errdefer self.writer.conn.close(gpa);
-        const count = if (memory) 0 else options.readers orelse @min(db.executorCount(io), 8);
+        const count = if (memory) 0 else options.readers orelse @min(internal.executorCount(io), 8);
         self.readers.conns = try gpa.alloc(Connection, count);
         errdefer gpa.free(self.readers.conns);
         self.readers.free = try gpa.alloc(*Connection, count);
@@ -190,7 +191,7 @@ pub const Db = struct {
 
     /// Stops the writer thread and closes every connection. Nothing may be
     /// using the database (no call in flight, no `Tx`, `Rows` or `Conn`).
-    pub fn deinit(self: *Db) void {
+    pub fn deinit(self: *Client) void {
         // First: a statement still running for the cache holds a connection.
         self.cache.deinit();
         const w = &self.writer;
@@ -213,7 +214,7 @@ pub const Db = struct {
     /// once, before serving (`app.sqlite` does when `run` starts, so the
     /// order of `app.metrics`, `app.tracing` and `app.sqlite` does not
     /// matter).
-    pub fn start(self: *Db, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
+    pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         if (registry) |r| {
             const m = try db.Metrics.init(r, .sqlite, self.name);
             const total: i64 = @intCast(self.readers.conns.len + 1);
@@ -234,7 +235,7 @@ pub const Db = struct {
     ///         \\CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
     ///         \\CREATE INDEX IF NOT EXISTS notes_title ON notes (title);
     ///     );
-    pub fn execScript(self: *Db, sql: []const u8) CallError!void {
+    pub fn execScript(self: *Client, sql: []const u8) Error!void {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         var ctx: db.Ctx = .{ .io = self.io, .arena = arena.allocator() };
@@ -242,34 +243,34 @@ pub const Db = struct {
     }
 
     /// The calls below, with `options` (a timeout, `.write`, `.prepare`).
-    pub fn with(self: *Db, options: db.QueryOptions) Query {
+    pub fn with(self: *Client, options: db.QueryOptions) Query {
         return .{ .db = self, .options = options };
     }
 
     /// Runs `sql` (on the writer) and returns the rows it changed. With no
     /// `args`, `sql` may hold several statements, run in order (a schema).
-    pub fn exec(self: *Db, cx: anytype, sql: []const u8, args: anytype) CallError!u64 {
+    pub fn exec(self: *Client, cx: anytype, sql: []const u8, args: anytype) Error!u64 {
         return self.with(.{}).exec(cx, sql, args);
     }
 
     /// The first row; none: `error.NotFound` (404).
-    pub fn one(self: *Db, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!T {
+    pub fn one(self: *Client, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!T {
         return self.with(.{}).one(T, cx, sql, args);
     }
 
     /// The first row, or null.
-    pub fn optional(self: *Db, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!?T {
+    pub fn optional(self: *Client, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!?T {
         return self.with(.{}).optional(T, cx, sql, args);
     }
 
     /// Every row.
-    pub fn all(self: *Db, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError![]T {
+    pub fn all(self: *Client, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error![]T {
         return self.with(.{}).all(T, cx, sql, args);
     }
 
     /// The rows a batch at a time (`next`), holding a connection until
     /// `deinit`.
-    pub fn iterate(self: *Db, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!Rows(T) {
+    pub fn iterate(self: *Client, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         return self.with(.{}).iterate(T, cx, sql, args);
     }
 
@@ -277,15 +278,15 @@ pub const Db = struct {
     /// fails halfway for a lock), holding it until `commit`, `rollback` or
     /// `deinit`; with `.read_only`, on a reader, a snapshot that writes do
     /// not disturb. SQLite's transactions are serializable, whatever
-    /// `isolation` asks. Inside, use the `Tx`, not the `Db`: a write on the
-    /// `Db` would wait for the transaction's own writer.
+    /// `isolation` asks. Inside, use the `Tx`, not the `Client`: a write on the
+    /// `Client` would wait for the transaction's own writer.
     ///
-    ///     var tx = try app.notes.begin(req, .{});
+    ///     var tx = try app.db.begin(req, .{});
     ///     defer tx.deinit();
     ///     _ = try tx.exec(req, "UPDATE accounts SET balance = balance - ? WHERE id = ?", .{ amount, from });
     ///     _ = try tx.exec(req, "UPDATE accounts SET balance = balance + ? WHERE id = ?", .{ amount, to });
     ///     try tx.commit(req);
-    pub fn begin(self: *Db, cx: anytype, options: db.TxOptions) CallError!Tx {
+    pub fn begin(self: *Client, cx: anytype, options: db.TxOptions) Error!Tx {
         const reader = options.read_only and self.readers.conns.len > 0;
         const conn: *Connection = if (reader) try self.acquireReader(cx.io) else blk: {
             try self.lockWriter(cx.io);
@@ -305,10 +306,10 @@ pub const Db = struct {
     /// all of it.
     ///
     ///     fn move(tx: *anole.sqlite.Tx, req: *anole.Request, from: i64, to: i64) !void { ... }
-    ///     try app.notes.transaction(req, .{ .retries = 3 }, move, .{ req, from, to });
-    pub fn transaction(self: *Db, cx: anytype, options: db.TxOptions, comptime func: anytype, args: anytype) TxResult(func) {
+    ///     try app.db.transaction(req, .{ .retries = 3 }, move, .{ req, from, to });
+    pub fn transaction(self: *Client, cx: anytype, options: db.TxOptions, comptime func: anytype, args: anytype) TxResult(func) {
         const Run = struct {
-            fn run(d: *Db, c_: @TypeOf(cx), o: db.TxOptions, a: @TypeOf(args)) TxResult(func) {
+            fn run(d: *Client, c_: @TypeOf(cx), o: db.TxOptions, a: @TypeOf(args)) TxResult(func) {
                 var attempt: u8 = 0;
                 while (true) : (attempt += 1) {
                     var tx = d.begin(c_, o) catch |err| {
@@ -328,12 +329,12 @@ pub const Db = struct {
                 }
             }
         };
-        return unbound(TxResult(func), db.bounded(cx, .sqlite, options.timeout, Run.run, .{ self, cx, options, args }));
+        return unbound(TxResult(func), internal.bounded(cx, .sqlite, options.timeout, Run.run, .{ self, cx, options, args }));
     }
 
     /// The writer connection for the driver's own calls (`Conn.run`), held
     /// until `release`.
-    pub fn acquire(self: *Db, cx: anytype) CallError!Conn {
+    pub fn acquire(self: *Client, cx: anytype) Error!Conn {
         try self.lockWriter(cx.io);
         return .{ .db = self, .io = cx.io };
     }
@@ -341,7 +342,7 @@ pub const Db = struct {
     // -----------------------------------------------------------------------
     // Connections
 
-    fn acquireReader(self: *Db, io: std.Io) error{Canceled}!*Connection {
+    fn acquireReader(self: *Client, io: std.Io) error{Canceled}!*Connection {
         const r = &self.readers;
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
         try r.mutex.lock(io);
@@ -356,7 +357,7 @@ pub const Db = struct {
         return r.free[r.free_len];
     }
 
-    fn releaseReader(self: *Db, io: std.Io, conn: *Connection) void {
+    fn releaseReader(self: *Client, io: std.Io, conn: *Connection) void {
         const r = &self.readers;
         r.mutex.lockUncancelable(io);
         defer r.mutex.unlock(io);
@@ -367,7 +368,7 @@ pub const Db = struct {
     }
 
     /// Takes the writer: one call, transaction or `acquire` at a time.
-    fn lockWriter(self: *Db, io: std.Io) error{Canceled}!void {
+    fn lockWriter(self: *Client, io: std.Io) error{Canceled}!void {
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
         if (!self.writer.lock.tryLock()) {
             self.observer.waiting(1);
@@ -377,18 +378,18 @@ pub const Db = struct {
         self.taken(started.durationTo(.now(io, .awake)).raw);
     }
 
-    fn unlockWriter(self: *Db, io: std.Io) void {
+    fn unlockWriter(self: *Client, io: std.Io) void {
         self.writer.lock.unlock(io);
         self.given();
     }
 
-    fn taken(self: *Db, waited: std.Io.Duration) void {
+    fn taken(self: *Client, waited: std.Io.Duration) void {
         _ = self.in_use.fetchAdd(1, .monotonic);
         self.observer.connections(-1, 1);
         self.observer.acquired(waited);
     }
 
-    fn given(self: *Db) void {
+    fn given(self: *Client) void {
         _ = self.in_use.fetchSub(1, .monotonic);
         self.observer.connections(1, -1);
     }
@@ -402,7 +403,7 @@ pub const Db = struct {
     /// Runs `func(args...)` on the writer thread, which the caller holds
     /// (`lockWriter`); a cancel takes the job back before it starts, or
     /// interrupts its statement.
-    fn onWriter(self: *Db, io: std.Io, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) blocking.Result(@TypeOf(func)) {
+    fn onWriter(self: *Client, io: std.Io, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) blocking.Result(@TypeOf(func)) {
         const R = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
         const Typed = struct {
             job: Job = .{ .run = run },
@@ -440,7 +441,7 @@ pub const Db = struct {
 
     /// The readiness check: a `SELECT 1` within a second.
     fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Db = @ptrCast(@alignCast(context));
+        const self: *Client = @ptrCast(@alignCast(context));
         var buf: [1024]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var ctx: db.Ctx = .{ .io = io, .arena = fba.allocator() };
@@ -460,11 +461,11 @@ fn unbound(comptime R: type, result: anytype) R {
 
 /// What `transaction(cx, options, func, args)` returns: `func`'s result,
 /// with the calls' errors added.
-pub fn TxResult(comptime func: anytype) type {
+fn TxResult(comptime func: anytype) type {
     const R = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
     return switch (@typeInfo(R)) {
-        .error_union => |eu| (eu.error_set || CallError)!eu.payload,
-        else => CallError!R,
+        .error_union => |eu| (eu.error_set || Error)!eu.payload,
+        else => Error!R,
     };
 }
 
@@ -478,31 +479,31 @@ fn retryable(cx: anytype, err: anyerror) bool {
     return code & 0xff == c.SQLITE_BUSY;
 }
 
-/// The calls with options (`Db.with`).
+/// The calls with options (`Client.with`).
 pub const Query = struct {
-    db: *Db,
+    db: *Client,
     options: db.QueryOptions,
 
-    /// `Db.exec`, with the options.
-    pub fn exec(q: Query, cx: anytype, sql: []const u8, args: anytype) CallError!u64 {
+    /// `Client.exec`, with the options.
+    pub fn exec(q: Query, cx: anytype, sql: []const u8, args: anytype) Error!u64 {
         return q.call(.exec, void, cx, sql, args);
     }
 
     // The reads go through the cache, which shares them when the options
     // ask (`coalesce`, `cache`) and makes the plain call otherwise.
 
-    /// `Db.one`, with the options (`coalesce` and `cache` apply).
-    pub fn one(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!T {
+    /// `Client.one`, with the options (`coalesce` and `cache` apply).
+    pub fn one(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!T {
         return q.db.cache.read(T, cx, q.options, sql, args, Read(.one, T){ .q = q });
     }
 
-    /// `Db.optional`, with the options (`coalesce` and `cache` apply).
-    pub fn optional(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!?T {
+    /// `Client.optional`, with the options (`coalesce` and `cache` apply).
+    pub fn optional(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!?T {
         return q.db.cache.read(?T, cx, q.options, sql, args, Read(.optional, T){ .q = q });
     }
 
-    /// `Db.all`, with the options (`coalesce` and `cache` apply).
-    pub fn all(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError![]T {
+    /// `Client.all`, with the options (`coalesce` and `cache` apply).
+    pub fn all(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error![]T {
         return q.db.cache.read([]T, cx, q.options, sql, args, Read(.all, T){ .q = q });
     }
 
@@ -512,34 +513,34 @@ pub const Query = struct {
         return struct {
             q: Query,
 
-            pub fn run(r: @This(), cx: anytype, sql: []const u8, args: anytype) CallError!Out(op, T) {
+            pub fn run(r: @This(), cx: anytype, sql: []const u8, args: anytype) Error!Out(op, T) {
                 return r.q.call(op, T, cx, sql, args);
             }
         };
     }
 
-    /// `Db.iterate`. `options.timeout` bounds starting it, not each `next`.
-    pub fn iterate(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!Rows(T) {
+    /// `Client.iterate`. `options.timeout` bounds starting it, not each `next`.
+    pub fn iterate(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         const Run = struct {
-            fn run(q_: Query, c_: @TypeOf(cx), s: []const u8, a: @TypeOf(args)) CallError!Rows(T) {
+            fn run(q_: Query, c_: @TypeOf(cx), s: []const u8, a: @TypeOf(args)) Error!Rows(T) {
                 return Rows(T).start(q_, c_, s, a);
             }
         };
         const call_ = q.db.observer.start(cx);
-        const result = unbound(CallError!Rows(T), db.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
+        const result = unbound(Error!Rows(T), internal.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
         const kw = operation(sql);
         call_.end(cx, kw.text(), null, if (result) |_| null else |e| e);
         return result;
     }
 
-    fn call(q: Query, comptime op: Op, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!Out(op, T) {
+    fn call(q: Query, comptime op: Op, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Out(op, T) {
         const Run = struct {
-            fn run(q_: Query, c_: @TypeOf(cx), s: []const u8, a: @TypeOf(args)) CallError!Out(op, T) {
+            fn run(q_: Query, c_: @TypeOf(cx), s: []const u8, a: @TypeOf(args)) Error!Out(op, T) {
                 return q_.dispatch(op, T, c_, s, a);
             }
         };
         const call_ = q.db.observer.start(cx);
-        const result = unbound(CallError!Out(op, T), db.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
+        const result = unbound(Error!Out(op, T), internal.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
         const kw = operation(sql);
         call_.end(cx, kw.text(), null, if (result) |_| null else |e| e);
         return result;
@@ -547,7 +548,7 @@ pub const Query = struct {
 
     /// A reader when the statement reads, else (or when a reader finds it
     /// writes) the writer.
-    fn dispatch(q: Query, comptime op: Op, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!Out(op, T) {
+    fn dispatch(q: Query, comptime op: Op, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Out(op, T) {
         const self = q.db;
         const flags: Flags = .{ .prepare = q.options.prepare };
         if (op != .exec and !q.options.write and self.readers.conns.len > 0 and operation(sql).reads()) {
@@ -555,7 +556,7 @@ pub const Query = struct {
             var failure: Failure = .{};
             var probe = flags;
             probe.reader = true;
-            const read = Db.onReader(cx.io, conn, statement(op, T, @TypeOf(args)), .{ self, conn, cx.arena, sql, args, probe, &failure });
+            const read = Client.onReader(cx.io, conn, statement(op, T, @TypeOf(args)), .{ self, conn, cx.arena, sql, args, probe, &failure });
             // Back before waiting for the writer, which may be waiting for
             // a reader.
             self.releaseReader(cx.io, conn);
@@ -573,7 +574,7 @@ pub const Query = struct {
     }
 };
 
-fn runOnWriter(self: *Db, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) CallError!Out(op, T) {
+fn runOnWriter(self: *Client, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) Error!Out(op, T) {
     var failure: Failure = .{};
     return self.onWriter(cx.io, statement(op, T, @TypeOf(args)), .{ self, &self.writer.conn, cx.arena, sql, args, flags, &failure }) catch |err| switch (err) {
         error.NeedsWriter => unreachable,
@@ -582,47 +583,47 @@ fn runOnWriter(self: *Db, cx: anytype, comptime op: Op, comptime T: type, sql: [
     };
 }
 
-fn runOnReader(self: *Db, cx: anytype, conn: *Connection, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) CallError!Out(op, T) {
+fn runOnReader(self: *Client, cx: anytype, conn: *Connection, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) Error!Out(op, T) {
     var failure: Failure = .{};
-    return Db.onReader(cx.io, conn, statement(op, T, @TypeOf(args)), .{ self, conn, cx.arena, sql, args, flags, &failure }) catch |err| switch (err) {
+    return Client.onReader(cx.io, conn, statement(op, T, @TypeOf(args)), .{ self, conn, cx.arena, sql, args, flags, &failure }) catch |err| switch (err) {
         error.NeedsWriter => unreachable,
         error.Failed => failed(self, cx, &failure),
         else => |e| e,
     };
 }
 
-/// A transaction (`Db.begin`): the calls of `Db`, on its connection.
+/// A transaction (`Client.begin`): the calls of `Client`, on its connection.
 pub const Tx = struct {
-    db: *Db,
+    db: *Client,
     io: std.Io,
     conn: *Connection,
     on_writer: bool,
     /// Committed or rolled back.
     finished: bool = false,
 
-    /// `Db.exec` inside the transaction.
-    pub fn exec(tx: *Tx, cx: anytype, sql: []const u8, args: anytype) CallError!u64 {
+    /// `Client.exec` inside the transaction.
+    pub fn exec(tx: *Tx, cx: anytype, sql: []const u8, args: anytype) Error!u64 {
         return tx.run(cx, .exec, void, sql, args, .{});
     }
 
-    /// `Db.one` inside the transaction.
-    pub fn one(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!T {
+    /// `Client.one` inside the transaction.
+    pub fn one(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!T {
         return tx.run(cx, .one, T, sql, args, .{});
     }
 
-    /// `Db.optional` inside the transaction.
-    pub fn optional(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!?T {
+    /// `Client.optional` inside the transaction.
+    pub fn optional(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!?T {
         return tx.run(cx, .optional, T, sql, args, .{});
     }
 
-    /// `Db.all` inside the transaction.
-    pub fn all(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError![]T {
+    /// `Client.all` inside the transaction.
+    pub fn all(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error![]T {
         return tx.run(cx, .all, T, sql, args, .{});
     }
 
-    /// `Db.iterate` inside the transaction; `deinit` the rows before the
+    /// `Client.iterate` inside the transaction; `deinit` the rows before the
     /// next call on `tx`.
-    pub fn iterate(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!Rows(T) {
+    pub fn iterate(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         // Not probed (`owns` is false): never NeedsWriter.
         return Rows(T).startOn(tx.db, cx, tx.conn, tx.on_writer, false, sql, args) catch |err| switch (err) {
             error.NeedsWriter => unreachable,
@@ -632,7 +633,7 @@ pub const Tx = struct {
 
     /// Commits and gives the connection back; `deinit` after it does
     /// nothing. When it fails, `deinit` rolls back.
-    pub fn commit(tx: *Tx, cx: anytype) CallError!void {
+    pub fn commit(tx: *Tx, cx: anytype) Error!void {
         std.debug.assert(!tx.finished);
         _ = try tx.run(cx, .exec, void, "COMMIT", .{}, .{ .prepare = false });
         tx.release();
@@ -640,7 +641,7 @@ pub const Tx = struct {
 
     /// Rolls back and gives the connection back, failed or not. `deinit`
     /// does it too when neither this nor `commit` ran.
-    pub fn rollback(tx: *Tx, cx: anytype) CallError!void {
+    pub fn rollback(tx: *Tx, cx: anytype) Error!void {
         std.debug.assert(!tx.finished);
         defer tx.release();
         _ = try tx.run(cx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false });
@@ -665,7 +666,7 @@ pub const Tx = struct {
         if (tx.on_writer) tx.db.unlockWriter(tx.io) else tx.db.releaseReader(tx.io, tx.conn);
     }
 
-    fn run(tx: *Tx, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) CallError!Out(op, T) {
+    fn run(tx: *Tx, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) Error!Out(op, T) {
         std.debug.assert(!tx.finished);
         const call_ = tx.db.observer.start(cx);
         const result = if (tx.on_writer)
@@ -678,17 +679,17 @@ pub const Tx = struct {
     }
 };
 
-/// The writer connection, held (`Db.acquire`) for the driver's own calls.
+/// The writer connection, held (`Client.acquire`) for the driver's own calls.
 pub const Conn = struct {
-    db: *Db,
+    db: *Client,
     io: std.Io,
 
     /// Runs `func(driver_db, args...)` on the writer thread, with
-    /// `driver_db` zig-sqlite's `*Db` on the writer connection: what may
+    /// `driver_db` zig-sqlite's `*driver.Db` on the writer connection: what may
     /// take time must run there, not on the executor.
     pub fn run(self: Conn, comptime func: anytype, args: anytype) blocking.Result(@TypeOf(func)) {
         const Wrap = struct {
-            fn call(d: *Db, a: @TypeOf(args)) @typeInfo(@TypeOf(func)).@"fn".return_type.? {
+            fn call(d: *Client, a: @TypeOf(args)) @typeInfo(@TypeOf(func)).@"fn".return_type.? {
                 return @call(.auto, func, .{&d.writer.conn.handle} ++ a);
             }
         };
@@ -701,7 +702,7 @@ pub const Conn = struct {
     }
 };
 
-/// Rows one batch at a time (`Db.iterate`): `next` until null, then
+/// Rows one batch at a time (`Client.iterate`): `next` until null, then
 /// `deinit`, which gives the connection back (the writer, for a write or
 /// `:memory:`, which waits for it meanwhile).
 pub fn Rows(comptime T: type) type {
@@ -709,7 +710,7 @@ pub fn Rows(comptime T: type) type {
         const Self = @This();
         const batch_len = 64;
 
-        db: *Db,
+        db: *Client,
         conn: *Connection,
         io: std.Io,
         arena: std.mem.Allocator,
@@ -720,14 +721,14 @@ pub fn Rows(comptime T: type) type {
         columns: Columns(T),
         /// Records a failure on the caller's request.
         fail_ctx: *anyopaque,
-        fail_fn: *const fn (*anyopaque, *Db, *const Failure) db.Error,
+        fail_fn: *const fn (*anyopaque, *Client, *const Failure) db.Error,
         batch: []T = &.{},
         pos: usize = 0,
         done: bool = false,
         finished: bool = false,
         columns_ready: bool = false,
 
-        fn start(q: Query, cx: anytype, sql: []const u8, args: anytype) CallError!Self {
+        fn start(q: Query, cx: anytype, sql: []const u8, args: anytype) Error!Self {
             const d = q.db;
             if (!q.options.write and d.readers.conns.len > 0 and operation(sql).reads()) {
                 const conn = try d.acquireReader(cx.io);
@@ -746,10 +747,10 @@ pub fn Rows(comptime T: type) type {
             };
         }
 
-        fn startOn(d: *Db, cx: anytype, conn: *Connection, on_writer: bool, owns: bool, sql: []const u8, args: anytype) (CallError || error{NeedsWriter})!Self {
+        fn startOn(d: *Client, cx: anytype, conn: *Connection, on_writer: bool, owns: bool, sql: []const u8, args: anytype) (Error || error{NeedsWriter})!Self {
             const C = @TypeOf(cx);
             const Thunk = struct {
-                fn fail(p: *anyopaque, d_: *Db, f: *const Failure) db.Error {
+                fn fail(p: *anyopaque, d_: *Client, f: *const Failure) db.Error {
                     return failed(d_, @as(C, @ptrCast(@alignCast(p))), f);
                 }
                 fn open(rows: *Self, s: []const u8, a: @TypeOf(args), probe: bool, f: *Failure) JobError!void {
@@ -781,7 +782,7 @@ pub fn Rows(comptime T: type) type {
             const opened = if (on_writer)
                 d.onWriter(cx.io, Thunk.open, .{ &rows, sql, args, probe, &failure })
             else
-                Db.onReader(cx.io, conn, Thunk.open, .{ &rows, sql, args, probe, &failure });
+                Client.onReader(cx.io, conn, Thunk.open, .{ &rows, sql, args, probe, &failure });
             opened catch |err| switch (err) {
                 error.Failed => return failed(d, cx, &failure),
                 else => |e| return e,
@@ -790,7 +791,7 @@ pub fn Rows(comptime T: type) type {
         }
 
         /// The next row; null after the last.
-        pub fn next(self: *Self) CallError!?T {
+        pub fn next(self: *Self) Error!?T {
             std.debug.assert(!self.finished);
             if (self.pos == self.batch.len) {
                 if (self.done) return null;
@@ -798,7 +799,7 @@ pub fn Rows(comptime T: type) type {
                 const fetched = if (self.on_writer)
                     self.db.onWriter(self.io, fetchJob, .{ self, &failure })
                 else
-                    Db.onReader(self.io, self.conn, fetchJob, .{ self, &failure });
+                    Client.onReader(self.io, self.conn, fetchJob, .{ self, &failure });
                 fetched catch |err| switch (err) {
                     error.Failed => return self.fail_fn(self.fail_ctx, self.db, &failure),
                     error.NeedsWriter => unreachable,
@@ -871,7 +872,7 @@ const Writer = struct {
     running: ?*Job = null,
     closing: bool = false,
 
-    /// The thread: runs each job handed over, until `Db.deinit`.
+    /// The thread: runs each job handed over, until `Client.deinit`.
     fn loop(w: *Writer, io: std.Io) void {
         while (true) {
             w.mutex.lockUncancelable(io);
@@ -913,7 +914,7 @@ const Connection = struct {
 
     const Cached = struct { stmt: *c.sqlite3_stmt, used: u64 };
 
-    fn open(d: *Db, writer: bool, options: Options) !Connection {
+    fn open(d: *Client, writer: bool, options: Options) !Connection {
         var diags: sqlite.Diagnostics = .{};
         var handle = sqlite.Db.init(.{
             .mode = if (d.memory) @as(sqlite.Db.Mode, .Memory) else .{ .File = d.path },
@@ -968,7 +969,7 @@ const Connection = struct {
     }
 
     /// `sql` prepared, from the cache when `cache` (and kept there).
-    fn prepare(conn: *Connection, d: *Db, sql: []const u8, cache: bool, f: *Failure) PrepareError!Stmt {
+    fn prepare(conn: *Connection, d: *Client, sql: []const u8, cache: bool, f: *Failure) PrepareError!Stmt {
         const keep = cache and d.cache_size > 0;
         if (keep) if (conn.cache.getPtr(sql)) |e| {
             conn.tick += 1;
@@ -1056,9 +1057,9 @@ const JobError = error{ Failed, NeedsWriter, NotFound, MissingColumn, Canceled, 
 const PrepareError = error{ Failed, MultipleStatements, Canceled, OutOfMemory };
 
 /// The job for one statement: prepare, bind, step, decode into `arena`.
-fn statement(comptime op: Op, comptime T: type, comptime Args: type) fn (*Db, *Connection, std.mem.Allocator, []const u8, Args, Flags, *Failure) JobError!Out(op, T) {
+fn statement(comptime op: Op, comptime T: type, comptime Args: type) fn (*Client, *Connection, std.mem.Allocator, []const u8, Args, Flags, *Failure) JobError!Out(op, T) {
     return struct {
-        fn run(d: *Db, conn: *Connection, arena: std.mem.Allocator, sql: []const u8, args: Args, flags: Flags, f: *Failure) JobError!Out(op, T) {
+        fn run(d: *Client, conn: *Connection, arena: std.mem.Allocator, sql: []const u8, args: Args, flags: Flags, f: *Failure) JobError!Out(op, T) {
             f.quiet = flags.quiet;
             const stmt = conn.prepare(d, sql, flags.prepare, f) catch |err| switch (err) {
                 error.MultipleStatements => {
@@ -1189,7 +1190,7 @@ fn classify(code: c_int) db.Class {
 }
 
 /// Records `f` on the caller's request and returns its error.
-fn failed(d: *Db, cx: anytype, f: *const Failure) db.Error {
+fn failed(d: *Client, cx: anytype, f: *const Failure) db.Error {
     var code_buf: [16]u8 = undefined;
     const code = if (f.code != 0) std.fmt.bufPrint(&code_buf, "{d}", .{f.code}) catch "" else "";
     var detail: db.ErrorDetail = .{ .system = .sqlite, .class = f.class, .code = code, .message = f.message() };
@@ -1201,8 +1202,8 @@ fn failed(d: *Db, cx: anytype, f: *const Failure) db.Error {
             if (std.mem.indexOfScalar(u8, what, '.')) |dot| detail.table = what[0..dot];
         }
     }
-    if (f.quiet) return d.error_map.errorFor(f.class);
-    return db.fail(cx, d.error_map, detail);
+    if (f.quiet) return d.errors.errorFor(f.class);
+    return internal.fail(cx, d.errors, detail);
 }
 
 // ---------------------------------------------------------------------------

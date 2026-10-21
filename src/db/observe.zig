@@ -5,6 +5,7 @@ const std = @import("std");
 const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 const db = @import("root.zig");
+const internal = @import("internal.zig");
 
 const metrics = observe.metrics;
 
@@ -155,7 +156,7 @@ pub const Call = struct {
             if (err) |e| m.errors.with(&.{ m.system, m.name, @errorName(e) }).inc();
         }
         const exporter = o.tracer orelse return;
-        const req = db.requestOf(c) orelse return;
+        const req = internal.requestOf(c) orelse return;
         exporter.child(req, self.real_ns, std.Io.Clock.real.now(c.io).nanoseconds, .init(
             @tagName(o.system),
             o.name,

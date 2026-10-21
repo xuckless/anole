@@ -189,7 +189,7 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
 
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
-    const client = try mongodb.Client.connect(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+    const client = try mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
     defer client.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -201,6 +201,17 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
     const rows = try users.find(Row, &c, .{}, .{ .batch_size = 4 });
     try testing.expectEqual(@as(usize, 10), rows.len);
     for (rows, 0..) |row, i| try testing.expectEqual(@as(i32, @intCast(i)), row.n);
+
+    // The shared verbs are the same calls, and `Client.with` hands its
+    // options to the databases and collections it leads to.
+    try testing.expectEqual(@as(usize, 10), (try users.all(Row, &c, .{}, .{ .batch_size = 4 })).len);
+    try testing.expectEqual(@as(i32, 0), (try users.one(Row, &c, .{}, .{})).n);
+    try testing.expectEqual(@as(i32, 0), (try users.optional(Row, &c, .{}, .{})).?.n);
+    const timed = client.with(.{ .timeout = .fromSeconds(5) }).collection("users");
+    try testing.expect(timed.options.timeout != null);
+    try testing.expectEqualStrings("app", timed.database);
+    try testing.expectEqual(@as(usize, 10), (try timed.all(Row, &c, .{}, .{ .batch_size = 4 })).len);
+    try testing.expect(client.with(.{ .coalesce = true }).db("app").collection("users").options.coalesce);
 
     // A cursor left early is killed.
     fake.get_mores.store(0, .monotonic);
@@ -260,16 +271,16 @@ test "fake mongod: no server, a timeout and a bad connection string" {
     var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
 
     // Nothing listens on port 1: server selection gives up, 503.
-    const client = try mongodb.Client.connect(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=200" });
+    const client = try mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=200" });
     defer client.deinit();
     try testing.expectError(error.ServiceUnavailable, client.ping(&c));
     try testing.expectEqual(db.Class.unavailable, db.lastError(&c).?.class);
     // A timeout of the call's own, shorter than server selection: 504.
     try testing.expectError(error.GatewayTimeout, client.db("admin").with(.{ .timeout = .fromMilliseconds(50) }).runCommand(&c, .{ .ping = 1 }));
 
-    try testing.expectError(error.InvalidUri, mongodb.Client.connect(gpa, io, .{ .url = "mongodb://host:99999/" }));
-    try testing.expectError(error.Unsupported, mongodb.Client.connect(gpa, io, .{ .url = "mongodb://host/?readPreference=secondary" }));
-    try testing.expectError(error.Unsupported, mongodb.Client.connect(gpa, io, .{ .url = "mongodb+srv://cluster.example.com/" }));
+    try testing.expectError(error.InvalidUri, mongodb.Client.init(gpa, io, .{ .url = "mongodb://host:99999/" }));
+    try testing.expectError(error.Unsupported, mongodb.Client.init(gpa, io, .{ .url = "mongodb://host/?readPreference=secondary" }));
+    try testing.expectError(error.Unsupported, mongodb.Client.init(gpa, io, .{ .url = "mongodb+srv://cluster.example.com/" }));
 }
 
 test "fake mongod: coalesced and cached reads, invalidation" {
@@ -282,7 +293,7 @@ test "fake mongod: coalesced and cached reads, invalidation" {
 
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
-    const client = try mongodb.Client.connect(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+    const client = try mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
     defer client.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
