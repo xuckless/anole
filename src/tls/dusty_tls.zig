@@ -183,6 +183,10 @@ pub const config = struct {
         /// `trust` and `root_ca`.
         store: ?*c.X509_STORE = null,
         insecure_skip_verify: bool = false,
+        /// Verify the chain but not that it names `host`: libpq's
+        /// `sslmode=verify-ca`, MongoDB's `tlsAllowInvalidHostnames`. SNI
+        /// still carries `host`.
+        skip_host_check: bool = false,
         auth: ?*CertKeyPair = null,
         now: std.Io.Timestamp,
         rng: std.Random,
@@ -383,11 +387,13 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
             if (c.SSL_set1_verify_cert_store(ssl, store) != 1) return error.OutOfMemory;
         } else try setVerifyStore(ssl, opt.root_ca);
         c.SSL_set_verify(ssl, c.SSL_VERIFY_PEER, null);
-        const ok = if (host_is_ip)
-            c.X509_VERIFY_PARAM_set1_ip_asc(c.SSL_get0_param(ssl), host.ptr)
-        else
-            c.SSL_set1_host(ssl, host.ptr);
-        if (ok != 1) return error.TlsInvalidHostname;
+        if (!opt.skip_host_check) {
+            const ok = if (host_is_ip)
+                c.X509_VERIFY_PARAM_set1_ip_asc(c.SSL_get0_param(ssl), host.ptr)
+            else
+                c.SSL_set1_host(ssl, host.ptr);
+            if (ok != 1) return error.TlsInvalidHostname;
+        }
     }
     // RFC 6066: SNI carries host names only, never IP literals.
     if (!host_is_ip and c.SSL_set_tlsext_host_name(ssl, host.ptr) != 1) return error.TlsInvalidHostname;
