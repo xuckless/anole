@@ -16,7 +16,7 @@ query builder.
 | `begin(req, opts)` | a transaction: the same calls, `commit()`, `rollback()`, `deinit()` |
 | `transaction(req, opts, func, args)` | `func(&tx, args...)`, committed, retried after a serialization failure |
 | `acquire(req)` | the driver's own connection, given back with `release()` |
-| `with(.{ .timeout, .prepare })` | the same calls with options |
+| `with(.{ .timeout, .prepare, .coalesce, .cache })` | the same calls with options; see [Caching](#caching) |
 
 `args` is a tuple: `.{ id, name }`. Outside a handler (startup, a
 background task) pass an `anole.db.Ctx` instead of the request:
@@ -566,3 +566,88 @@ On such a host use `mongo:7.0` or a kernel from 7.0.14 (CI runs 8.0 and
 ```sh
 zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?replicaSet=rs0&authSource=admin'
 ```
+
+## Caching
+
+Two opt-in options on the reads (`one`, `optional`, `all`) of every
+connector. Nothing is shared or cached unless a call asks: a call without
+them is the plain call, with nothing added (no key, no lookup, no
+allocation).
+
+```zig
+// Identical reads in flight at once share one round trip.
+const feed = try app.db.with(.{ .coalesce = true }).all(Post, req, feed_sql, .{limit});
+
+// The result kept for 5 s and served from memory meanwhile.
+const top = try app.db.with(.{ .cache = .{ .ttl = .fromSeconds(5), .tag = "posts" } }).all(Post, req, top_sql, .{});
+
+// After a write: drop what it changed, on every executor.
+_ = try app.db.exec(req, "INSERT INTO posts (body) VALUES ($1)", .{body});
+app.db.cache.invalidate(.{ .tag = "posts" });
+```
+
+**Coalescing** (`.coalesce = true`): calls on one executor that are
+identical (the same connector, statement, arguments, verb and row type)
+and in flight at the same time run the statement once. Each caller waits
+under its own deadline and cancellation and gets its own copy of the rows
+in its own arena. A caller that is canceled or runs out of time leaves on
+its own; the others still get the rows. When every caller has left, the
+statement is canceled as a plain call's would be (a CancelRequest for
+PostgreSQL, an interrupt for SQLite). Errors reach every caller, with the
+detail in `lastError(req)`.
+
+**Result cache** (`.cache = .{ .ttl, .tag }`): the result is kept per
+executor for `ttl` and copied into the caller's arena on a hit. A miss
+coalesces, so a burst of misses for one key runs the statement once per
+executor. Errors are never kept (`one`'s `NotFound` included); an empty
+result from `optional` or `all` is a result and is kept.
+
+**Invalidation**: `app.db.cache.invalidate(.all)`, `.invalidate(.{ .tag =
+"posts" })` for the results cached with that tag, or
+`.invalidateQuery(sql, .{args})` for one statement's results. It reaches
+every executor at once, including a statement still running: a result read
+before the invalidation is not kept, and a caller arriving after it does
+not join that statement.
+
+**Coherence**: each executor keeps its own results (no lock between
+threads on the way), so two executors may answer from results read up to
+`ttl` apart, and a write shows in the cache only after `ttl` or an
+invalidation. Coalescing has a smaller window of its own: a caller that
+joins a statement already running gets what that statement reads, which
+may predate a write that committed a moment before the caller arrived,
+unless that write invalidated.
+
+Bounds are per connector, split between the executors, and least recently
+used results go first: `.cache = .{ .max_entries = 4096, .max_bytes = 32 << 20 }`
+in the connector's options (`app.postgres(.{ .cache = ... })`,
+`app.sqlite(.{ .path = ..., .cache = ... })`). A result larger than an
+executor's share is not kept. With `app.metrics`, each cache reports
+`anole_cache_hits_total`, `anole_cache_misses_total`,
+`anole_cache_coalesced_total`, `anole_cache_stores_total`,
+`anole_cache_evictions_total`, `anole_cache_entries` and
+`anole_cache_bytes`, labelled `kind="db"` and the database's name;
+`app.db.cache.stats()` has the same numbers.
+
+Rows are copied, so their types must be copyable: numbers, `bool`, enums,
+optionals, arrays, structs, tagged unions and slices of these (strings
+included). A row type with another kind of pointer (`std.json.Value`, a
+pointer to a single value) runs its calls unshared, with a warning logged
+once. Arguments are compared by value: `5` as a `u8` and as an `i64` are
+the same key, the string `"5"` is not.
+
+When not to use them:
+
+- Anything that must see its own or another request's write at once
+  (read-your-writes, balances, stock counts), unless every write
+  invalidates what it changes.
+- Per-user data with the user in the key only through a session, not the
+  SQL arguments: the key is the statement and its arguments, so a read
+  that depends on who asks must take that as an argument.
+- Statements with side effects (`nextval`, `INSERT ... RETURNING` through
+  `one`): the statement runs once for all the callers that share it.
+- Large or one-off results: each kept result takes memory on every
+  executor that reads it, and a cache that never hits only adds a copy.
+- Transactions: calls on a `Tx` are never shared.
+
+For whole responses rather than rows, see `ResponseCache` in
+[routing.md](routing.md#response-cache).
