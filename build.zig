@@ -71,7 +71,8 @@ pub const Features = struct {
     postgres: bool,
     /// SQLite, the library built in (`anole.sqlite`).
     sqlite: bool,
-    /// The MongoDB client (`anole.mongo`).
+    /// The MongoDB client (`anole.mongodb`) and its BSON codec
+    /// (`anole.bson`).
     mongodb: bool,
 
     pub fn preset(profile: Profile) Features {
@@ -385,7 +386,7 @@ pub fn build(b: *std.Build) void {
     // The BSON corpus, a test-only download: requested here so a fresh cache
     // fetches it with the C libraries, and never for a project depending on
     // Anole.
-    const mongodb_specs = if (b.isRoot()) b.lazyDependency("mongodb_specs", .{}) else null;
+    const mongodb_specs = if (b.isRoot() and features.mongodb) b.lazyDependency("mongodb_specs", .{}) else null;
 
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
@@ -410,8 +411,13 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "anole_dusty_tls", .module = core.tls_seam.? }},
     }));
 
+    // BSON (src/bson), the codec under the MongoDB client: pure Zig, its own
+    // module, imported by the anole module as "bson" when -Dmongodb is on
+    // (here or in a test-flags combination); nothing compiles it otherwise.
+    const bson_mod = b.createModule(.{ .root_source_file = b.path("src/bson/root.zig"), .target = target, .optimize = optimize });
+
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
-    const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .public = true });
+    const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .public = true });
     // zig-protobuf's runtime, which the code `addProtoGen` generates imports
     // as "protobuf": `anole_dep.module("protobuf")`.
     if (c_mods.protobuf) |m| _ = b.modules.getOrPutValue(b.graph.arena, "protobuf", m) catch @panic("OOM");
@@ -420,7 +426,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
@@ -441,6 +447,14 @@ pub fn build(b: *std.Build) void {
     if (features.sqlite) {
         const sqlite_tests = b.addTest(.{ .name = "anole-test-sqlite", .root_module = tests.root_module, .filters = &.{"sqlite:"}, .use_llvm = use_llvm });
         b.step("test-sqlite", "Run the SQLite tests").dependOn(&b.addRunArtifact(sqlite_tests).step);
+    }
+    // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
+    // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
+    if (features.mongodb) {
+        const mongo_tests = b.addTest(.{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const run_mongo_tests = b.addRunArtifact(mongo_tests);
+        run_mongo_tests.has_side_effects = mongodb_test_url != null;
+        b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
     }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
@@ -515,51 +529,73 @@ pub fn build(b: *std.Build) void {
         }
         const t = b.addTest(.{
             .name = b.fmt("anole-test-{s}", .{combo.name}),
-            .root_module = anoleModule(b, .{ .features = combo.features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true }),
+            .root_module = anoleModule(b, .{ .features = combo.features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true }),
         });
         const run = b.addRunArtifact(t);
         run.skip_foreign_checks = true;
         flags_step.dependOn(&run.step);
     }
 
-    // BSON (src/bson), the codec under the MongoDB client: pure Zig, its own
-    // module, so its tests run in every build whatever the flags. Its
-    // "fuzz:" targets get src/fuzz.zig as the module "fuzz".
-    const bson_mod = b.createModule(.{ .root_source_file = b.path("src/bson/root.zig"), .target = target, .optimize = optimize });
-    const bson_tests = b.addTest(.{
-        .name = "bson-test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bson/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
-        }),
-        .use_llvm = use_llvm,
-    });
-    const run_bson_tests = b.addRunArtifact(bson_tests);
-    run_bson_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_bson_tests.step);
-    const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
-    bson_step.dependOn(&run_bson_tests.step);
-    // tests/bson/corpus_test.zig over the corpus files, which it embeds:
-    // both are copied into one generated directory.
-    if (mongodb_specs) |specs| {
-        const files = b.addWriteFiles();
-        _ = files.addCopyDirectory(specs.path("source/bson-corpus/tests"), "corpus", .{ .include_extensions = &.{".json"} });
-        const corpus_tests = b.addTest(.{
-            .name = "bson-corpus",
+    // BSON (src/bson) and the MongoDB client's pure parts (src/mongodb:
+    // the connection string, SCRAM, the topology state machine), with
+    // -Dmongodb. The BSON tests' "fuzz:" targets get src/fuzz.zig as the
+    // module "fuzz".
+    if (features.mongodb) {
+        const bson = bson_mod;
+        const bson_tests = b.addTest(.{
+            .name = "bson-test",
             .root_module = b.createModule(.{
-                .root_source_file = files.addCopyFile(b.path("tests/bson/corpus_test.zig"), "corpus_test.zig"),
+                .root_source_file = b.path("src/bson/root.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "bson", .module = bson_mod }},
+                .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
             }),
             .use_llvm = use_llvm,
         });
-        const run_corpus = b.addRunArtifact(corpus_tests);
-        run_corpus.skip_foreign_checks = true;
-        test_step.dependOn(&run_corpus.step);
-        bson_step.dependOn(&run_corpus.step);
+        const run_bson_tests = b.addRunArtifact(bson_tests);
+        run_bson_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_bson_tests.step);
+        const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
+        bson_step.dependOn(&run_bson_tests.step);
+        const mongodb_spec_step = b.step("mongodb-spec-test", "Run the MongoDB client's spec tests (connection string, URI options, auth, SDAM) from mongodb/specifications");
+        // tests/bson/corpus_test.zig over the corpus files, which it embeds:
+        // both are copied into one generated directory.
+        if (mongodb_specs) |specs| {
+            const files = b.addWriteFiles();
+            _ = files.addCopyDirectory(specs.path("source/bson-corpus/tests"), "corpus", .{ .include_extensions = &.{".json"} });
+            const corpus_tests = b.addTest(.{
+                .name = "bson-corpus",
+                .root_module = b.createModule(.{
+                    .root_source_file = files.addCopyFile(b.path("tests/bson/corpus_test.zig"), "corpus_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "bson", .module = bson }},
+                }),
+                .use_llvm = use_llvm,
+            });
+            const run_corpus = b.addRunArtifact(corpus_tests);
+            run_corpus.skip_foreign_checks = true;
+            test_step.dependOn(&run_corpus.step);
+            bson_step.dependOn(&run_corpus.step);
+
+            // src/mongodb/spec_test.zig reads the spec's JSON test files at
+            // run time, from the specification's `source` directory.
+            const spec_tests = b.addTest(.{
+                .name = "mongodb-spec-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/mongodb/spec_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "bson", .module = bson }},
+                }),
+                .use_llvm = use_llvm,
+            });
+            const run_spec = b.addRunArtifact(spec_tests);
+            run_spec.skip_foreign_checks = true;
+            run_spec.setCwd(specs.path("source"));
+            test_step.dependOn(&run_spec.step);
+            mongodb_spec_step.dependOn(&run_spec.step);
+        }
     }
 
     // tests/tls_duplex.zig: the multi-threaded full-duplex TLS check.
@@ -592,6 +628,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
         .{ .name = "postgres", .needs = features.postgres, .about = "a posts API on PostgreSQL (DATABASE_URL), on port 3000" },
         .{ .name = "sqlite", .needs = features.sqlite, .about = "a to-do API on SQLite (todos.db, or a path after --), on port 3000" },
+        .{ .name = "mongodb", .needs = features.mongodb, .about = "a users API on MongoDB (MONGODB_URI), on port 3000" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;
@@ -1260,6 +1297,8 @@ const AnoleModuleOptions = struct {
     redis_test_port: ?u16 = null,
     postgres_test_url: ?[]const u8 = null,
     mongodb_test_url: ?[]const u8 = null,
+    /// src/bson as a module, for -Dmongodb.
+    bson: ?*std.Build.Module = null,
 };
 
 /// src/root.zig with its own build_options and only the binding modules its
@@ -1304,6 +1343,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
+    if (f.mongodb) mod.addImport("bson", o.bson.?);
     if (f.auth) mod.addImport("anole_jwt", o.c.jwt.?);
     if (f.postgres) mod.addImport("anole_pg", if (f.needsTls()) o.c.pg_tls.? else o.c.pg_plain.?);
     if (f.sqlite) mod.addImport("anole_sqlite", o.c.sqlite.?);

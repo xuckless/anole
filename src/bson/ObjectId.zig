@@ -55,6 +55,12 @@ pub fn format(id: ObjectId, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(&id.toHex());
 }
 
+/// `std.json` (`res.json`): the 24 hex digits as a string.
+pub fn jsonStringify(id: ObjectId, jw: anytype) !void {
+    const hex = id.toHex();
+    try jw.write(@as([]const u8, &hex));
+}
+
 pub fn eql(a: ObjectId, b: ObjectId) bool {
     return std.mem.eql(u8, &a.bytes, &b.bytes);
 }

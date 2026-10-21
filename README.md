@@ -266,7 +266,8 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
     BoringSSL stack;
   - SQLite, the amalgamation built by Zig, with one writer thread per
     database and reads on the blocking pool;
-  - MongoDB, Anole's own OP_MSG client with a Zig BSON codec;
+  - MongoDB, Anole's own client on the drivers' specifications (OP_MSG,
+    SCRAM, replica-set discovery, retryable writes) with a Zig BSON codec;
   - one shared shape: a pool per core, calls take the request first
     (`app.db.all(Post, req, sql, .{args})`), request deadlines cancel
     queries, and rows land in the request's arena;
@@ -375,11 +376,11 @@ set up this way, and CI builds it from an empty cache on every push.
   [docs/webtransport.md](docs/webtransport.md), [docs/grpc.md](docs/grpc.md),
   [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
   [docs/observability.md](docs/observability.md).
-- [docs/database.md](docs/database.md): PostgreSQL and SQLite, the calls
-  every connector shares, errors as statuses, transactions, pools.
+- [docs/database.md](docs/database.md): PostgreSQL, SQLite and MongoDB,
+  the calls every connector shares, errors as statuses, transactions, pools.
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,
   `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`,
-  `sqlite`, and `full` (every listener and option spelled out).
+  `sqlite`, `mongodb`, and `full` (every listener and option spelled out).
 - [CHANGELOG.md](CHANGELOG.md) and [MAINTAINING.md](MAINTAINING.md): pins,
   forks, the Zig version policy, releases.
 

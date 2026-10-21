@@ -52,6 +52,10 @@ const pg_mod = if (features.postgres) @import("pg/root.zig") else struct {
     pub const Options = struct {};
     pub const Db = void;
 };
+const mongodb_mod = if (features.mongodb) @import("mongodb/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = void;
+};
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
     pub const RegisterOptions = struct {};
@@ -1269,6 +1273,26 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer d.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Db, d));
             return d;
+        }
+
+        /// A MongoDB client for the handlers, owned by the server:
+        /// `state.mongo = try app.mongodb(.{});` reads `MONGODB_URI` (or
+        /// `options.url`), else mongodb://localhost:27017. It starts
+        /// monitoring the servers at once; connections for calls open when
+        /// a handler needs one. Once serving, it reports to `app.metrics`,
+        /// `app.tracing` and `app.health` (a ping behind `/readyz`) when the
+        /// app has them, and it is closed with the server, after the drain.
+        /// See `anole.mongodb`.
+        pub fn mongodb(self: *Self, config: mongodb_mod.Options) !*mongodb_mod.Client {
+            if (comptime !features.mongodb) @compileError("app.mongodb needs MongoDB (-Dmongodb, on in the full profile)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const mongo = try mongodb_mod.Client.connect(self.gpa, self.rt.io(), opts);
+            errdefer mongo.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(mongodb_mod.Client, mongo));
+            return mongo;
         }
 
         /// Loads the TLS certificate and key again (from their files, for

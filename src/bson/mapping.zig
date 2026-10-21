@@ -496,3 +496,15 @@ test "dynamic values, tuples and zero-copy decoding" {
     // Zero-copy: the string is a slice of the input.
     try testing.expect(@intFromPtr(v.s.ptr) > @intFromPtr(bytes.ptr) and @intFromPtr(v.s.ptr) < @intFromPtr(bytes.ptr) + bytes.len);
 }
+
+test "std.json: ObjectId as hex, dates as ISO strings, documents as relaxed Extended JSON" {
+    const id = try ObjectId.parse("5f1f7f1f7f1f7f1f7f1f7f1f");
+    const bytes = try encode(testing.allocator, .{ .n = 1, .d = document.Datetime{ .ms = 0 } }, .{});
+    defer testing.allocator.free(bytes);
+    const Out = struct { id: ObjectId, at: document.Datetime, doc: Document };
+    const text = try std.json.Stringify.valueAlloc(testing.allocator, Out{ .id = id, .at = .{ .ms = 1_600_000_000_123 }, .doc = .{ .bytes = bytes } }, .{});
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        \\{"id":"5f1f7f1f7f1f7f1f7f1f7f1f","at":"2020-09-13T12:26:40.123Z","doc":{"n":1,"d":{"$date":"1970-01-01T00:00:00Z"}}}
+    , text);
+}

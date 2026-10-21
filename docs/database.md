@@ -389,3 +389,180 @@ has, whatever the order of the calls: `anole_db_*` metrics with
 zig-sqlite (user functions, blobs, backups): `conn.run(func, args)` runs
 `func(driver_db, args...)` on the writer thread; `conn.release()` gives it
 back. `anole.sqlite.c` is the C API.
+
+## MongoDB
+
+Built in with `-Dmongodb` (in the `full` profile): Anole's own client on
+`std.Io`, written to MongoDB's driver specifications (OP_MSG, the
+handshake, SCRAM, the connection string, server discovery and monitoring,
+connection pooling, sessions, retryable reads and writes), with documents
+in BSON (`anole.bson`). TLS goes through the same BoringSSL as the rest of
+Anole. MongoDB 4.2 and later; CI runs 7.0, 8.0 and 9.0. `examples/mongodb` is
+a small users API:
+
+```sh
+docker run --rm -d --name mongo -p 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+docker exec mongo mongosh --quiet --eval 'rs.initiate()'
+MONGODB_URI='mongodb://localhost:27017/app?directConnection=true' zig build run-mongodb
+```
+
+### Setup
+
+```zig
+const App = struct { mongo: *anole.mongodb.Client };
+
+pub fn main(init: std.process.Init) !void {
+    var state: App = undefined;
+    var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
+    defer app.deinit();
+    state.mongo = try app.mongodb(.{ .environ = init.minimal.environ }); // MONGODB_URI
+    _ = app.metrics(.{}); // pool and command metrics
+    _ = app.health(.{}); // /readyz pings the primary
+    app.get("/users/:id", get);
+    try app.listen(":3000");
+}
+```
+
+`app.mongodb` reads the connection string from `.url`, else
+`MONGODB_URI`, else `mongodb://localhost:27017`. A string it cannot use
+stops the start with the reason logged (never the password). It starts a
+monitor per server at once; connections for calls open when a handler
+needs one, per executor. A replica set gets primary discovery, failover
+and retryable writes; a standalone server works without them; a
+`directConnection=true` connection talks to that one server only.
+
+The connection string takes the standard options; these are honoured:
+
+| Option | |
+| --- | --- |
+| `replicaSet`, `directConnection` | the topology |
+| `authSource`, `authMechanism` | `SCRAM-SHA-256` (the default when the server has it), `SCRAM-SHA-1`, `PLAIN`, `MONGODB-X509` |
+| `tls`, `tlsCAFile`, `tlsCertificateKeyFile`, `tlsInsecure`, `tlsAllowInvalidCertificates`, `tlsAllowInvalidHostnames` | TLS; the system's trust store when no CA is given |
+| `appName` | in the server's logs and `currentOp` |
+| `maxPoolSize` | connections in all, split between the executors (100) |
+| `waitQueueTimeoutMS`, `serverSelectionTimeoutMS`, `connectTimeoutMS`, `heartbeatFrequencyMS`, `maxIdleTimeMS` | the waits (10 s, 30 s, 10 s, 10 s, none) |
+| `timeoutMS` | a bound on every call, also sent as `maxTimeMS` |
+| `retryWrites`, `retryReads` | on by default |
+| `w`, `journal`, `wTimeoutMS`, `readConcernLevel` | the write and read concerns of every call |
+
+Not yet: `mongodb+srv://`, read preferences other than `primary`,
+`loadBalanced`, compression, and the GSSAPI, AWS and OIDC mechanisms; the
+client refuses them at start rather than ignore them. `anole.mongodb.Options`
+has the same settings as fields, plus `tls.ca` and `tls.client_certificate`
+in memory, `errors`, and `name` (the `db` label in metrics, `"mongodb"`).
+
+### Handlers
+
+The calls are the official drivers', with the request first. Filters,
+updates, projections and pipelines are Zig literals: an anonymous struct
+is a document, a tuple an array.
+
+```zig
+const User = struct { _id: anole.bson.ObjectId, name: []const u8, email: []const u8, tags: []const []const u8 = &.{} };
+
+fn get(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const id = anole.bson.ObjectId.parse(req.params.get("id").?) catch return error.NotFound;
+    try res.json(try app.mongo.collection("users").findOne(User, req, .{ ._id = id }, .{})); // none: 404
+}
+
+fn recent(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const users = app.mongo.db("app").collection("users");
+    try res.json(try users.find(User, req, .{ .tags = "beta", .age = .{ .@"$gte" = 18 } }, .{
+        .sort = .{ .created = -1 },
+        .limit = 20,
+        .projection = .{ .email = 0 },
+    }));
+}
+
+fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const in = try req.bind(struct { name: []const u8, email: []const u8 });
+    const r = try app.mongo.collection("users").insertOne(req, in); // a duplicate email: 409
+    res.status = .created;
+    try res.json(.{ .id = r.objectId().? });
+}
+```
+
+| Call | Returns |
+| --- | --- |
+| `find(T, req, filter, opts)` | every match (`[]T`); options `sort`, `projection`, `skip`, `limit`, `batch_size`, `hint`, `collation`, `comment`, `allow_disk_use`, `let` |
+| `findOne(T, req, filter, opts)` | the first match; none is `error.NotFound` (404) |
+| `findOptional(T, req, filter, opts)` | the first match, or null |
+| `iterate(T, req, filter, opts)` | a cursor: `while (try cur.next()) \|doc\|`, then `deinit()` |
+| `aggregate(T, req, pipeline, opts)` | the pipeline's documents; `aggregateIterate` for a cursor |
+| `countDocuments(req, filter, opts)`, `estimatedDocumentCount(req)` | a count |
+| `distinct(T, req, field, filter)` | the distinct values |
+| `insertOne(req, doc)` | `inserted_id` (an ObjectId made when the document has no `_id`) |
+| `insertMany(req, docs, opts)` | `inserted_count`, `inserted_ids` |
+| `updateOne`, `updateMany`, `replaceOne(req, filter, update, opts)` | `matched_count`, `modified_count`, `upserted_id` |
+| `deleteOne`, `deleteMany(req, filter, opts)` | `deleted_count` |
+| `findOneAndUpdate`, `findOneAndReplace`, `findOneAndDelete(T, req, ...)` | the document before (or, with `.return_document = .after`, after), or null |
+| `createIndex(req, keys, opts)`, `dropIndex(req, name)`, `drop(req)` | indexes and the collection |
+| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document` |
+| `one`, `optional`, `all` | the shared verbs: `findOne`, `findOptional`, `find` without options |
+| `with(.{ .timeout })` | the same calls with a timeout of their own |
+
+`client.collection(name)` is in the connection string's database (else
+`"test"`, as the drivers do); `client.db(name).collection(name)` names
+it. An option a call does not take is a compile error that lists those it
+does.
+
+Documents map onto structs by field name, through `anole.bson`: integers,
+floats, `bool`, `[]const u8`, enums (by name), slices, nested structs,
+optionals (missing or `null` is null), `anole.bson.ObjectId`,
+`anole.bson.Datetime`, and `anole.bson.Value` or `anole.bson.Document`
+for anything dynamic. A field the document lacks keeps its default, or
+the call fails (500, logged). Decoded strings are copies in the request's
+arena. In JSON responses an ObjectId is its hex string, a date an ISO
+8601 string, and a raw document relaxed Extended JSON.
+
+### Errors
+
+| Server error | Error | Status |
+| --- | --- | --- |
+| no document from `findOne` | `NotFound` | 404 |
+| 11000 duplicate key | `Conflict` | 409 |
+| 112 write conflict, 251 no such transaction | `Conflict` | 409 |
+| no primary within `serverSelectionTimeoutMS`, connection refused, authentication failed, a pool busy past `waitQueueTimeoutMS`, "not primary" and "node is recovering" after the retry | `ServiceUnavailable` | 503 |
+| 50 `MaxTimeMSExpired`, 262, 64 (write concern timeout), a call past its `timeout` | `GatewayTimeout` | 504 |
+| everything else, 121 document validation included | `Database` | 500 |
+
+`anole.db.lastError(req)` has the code (`"11000"`), the server's message
+and the collection. Writes that may be retried (single-document inserts,
+updates, deletes and findOneAnd*, on a replica set) are sent once more
+after a network error or a retryable error, with the same transaction
+number, so the server applies them once; reads are retried once too.
+`updateMany` and `deleteMany` are not retried, as the specifications say.
+
+### Timeouts and cancellation
+
+A request that ends early (a client gone, `req.setTimeout`, an HTTP/2
+reset) cancels the call where it waits; the connection it was using is
+closed, so no reply arrives on a reused one. `with(.{ .timeout = .fromSeconds(2) })`
+or `timeoutMS` bounds a call (server selection, the pool, the round trip)
+and sends the rest of the budget as `maxTimeMS`, so the server stops too.
+The request's own deadline is not sent as `maxTimeMS` yet.
+
+### Observability
+
+As for PostgreSQL, with `system="mongodb"`: the same metrics when the app
+has `app.metrics`, a client span per command in a traced request (the
+command's name as the operation, the collection as the target), and a
+`/readyz` check that fails when the primary does not answer a `ping`
+(checked at most once a second).
+
+### Testing against a server
+
+`tests/mongodb/run.sh [image]` starts MongoDB in Docker (`mongo:8.0` by
+default; CI runs 7.0, 8.0 and 9.0) as a replica set of one with
+authentication and test commands on, with a CA and certificate made for
+the run, and runs `zig build test-mongodb` three times: SCRAM-SHA-256,
+SCRAM-SHA-1, and over TLS. MongoDB 8.0.21 and later and 9.x refuse to
+start on Linux kernels 6.19 to 7.0.13 (a TCMalloc incompatibility,
+[SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742)), and
+earlier 8.0 releases crash there; the script says so when it sees it.
+On such a host use `mongo:7.0` or a kernel from 7.0.14 (CI runs 8.0 and
+9.0 on `ubuntu-22.04`, kernel 6.8). Against a server of your own:
+
+```sh
+zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?replicaSet=rs0&authSource=admin'
+```
