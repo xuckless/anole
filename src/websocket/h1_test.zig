@@ -6,6 +6,10 @@ const dusty = @import("dusty");
 const websocket = @import("root.zig");
 
 var saw_draining: std.atomic.Value(bool) = .init(false);
+/// Closes the echo handler has seen, and whether any of those sockets
+/// needed a flusher task of its own (`dusty.WebSocketBatch`).
+var closes_seen: std.atomic.Value(usize) = .init(0);
+var flusher_started: std.atomic.Value(bool) = .init(false);
 
 fn echo(req: *dusty.Request, res: *dusty.Response) !void {
     var ws = (try websocket.upgrade(req, res, .{ .max_message_size = 8 })) orelse {
@@ -30,6 +34,8 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
             },
             .close => {
                 saw_draining.store(ws.draining(), .release);
+                if (ws.conn == .h1 and ws.conn.h1.batch.started) flusher_started.store(true, .release);
+                _ = closes_seen.fetchAdd(1, .acq_rel);
                 return;
             },
             else => {},
@@ -235,7 +241,11 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
     var buf: [16]u8 = undefined;
 
     // One socket at a time: the backstop ends with the last socket on the
-    // executor and starts again with the next one's first batch.
+    // executor and starts again with the next one's first batch. Their
+    // readers flush on their way to the next read, so neither socket needs
+    // a flusher task of its own.
+    closes_seen.store(0, .release);
+    flusher_started.store(false, .release);
     for (0..2) |_| {
         var a: Raw = undefined;
         try a.open(io, server.address.ip);
@@ -246,6 +256,10 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
         try a.send(0x8, &.{ 0x03, 0xe8 });
         _ = try a.expectClose(1000, &buf);
     }
+    var polls: usize = 0;
+    while (closes_seen.load(.acquire) < 2 and polls < 2000) : (polls += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(@as(usize, 2), closes_seen.load(.acquire));
+    try std.testing.expect(!flusher_started.load(.acquire));
 
     // "wait" with "x" behind it: its handler sleeps with the echo held, and
     // the backstop has that socket's flusher send it.

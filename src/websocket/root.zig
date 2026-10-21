@@ -219,7 +219,6 @@ pub const Socket = struct {
             inline else => |ws| ws.deinit(),
         }
     }
-
 };
 
 /// Sends close 1001 when the server starts to drain, through the server's
@@ -738,8 +737,8 @@ pub const H2Socket = struct {
         const w = &self.out.interface;
         codec.writeFrame(w, payload, opts) catch return self.out.err orelse error.WriteFailed;
         if (after == .batch and self.batch.hold(self.io, flushHeld)) return;
+        self.batch.flushing();
         w.flush() catch return self.out.err orelse error.WriteFailed;
-        self.batch.flushed();
     }
 
     /// Writes out what a batch held, if anything still holds it.
@@ -747,8 +746,8 @@ pub const H2Socket = struct {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (!self.batch.deferred.load(.monotonic) or self.closed) return;
+        self.batch.flushing();
         self.out.interface.flush() catch return self.out.err orelse error.WriteFailed;
-        self.batch.flushed();
     }
 
     /// The batch's flush, for its backstop (`dusty.WebSocketBatch.hold`).

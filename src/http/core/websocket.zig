@@ -402,8 +402,8 @@ pub const WebSocket = struct {
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
         errdefer self.closed = true;
+        self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
-        self.batch.flushed();
     }
 
     /// Writes out what a batch held, if anything still holds it.
@@ -412,8 +412,8 @@ pub const WebSocket = struct {
         defer self.write_mutex.unlock(self.io);
         if (!self.batch.deferred.load(.monotonic) or self.closed) return;
         errdefer self.closed = true;
+        self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
-        self.batch.flushed();
     }
 
     /// The batch's flush, for its backstop (`Batch.hold`).
@@ -583,13 +583,13 @@ pub const WebSocket = struct {
         }
         switch (after) {
             .now => {
+                self.batch.flushing();
                 try self.transport.writer.flush();
-                self.batch.flushed();
             },
             .batch => if (!self.batch.hold(self.io, flushHeld)) {
                 // No backstop to be had: out now, as without a batch.
+                self.batch.flushing();
                 try self.transport.writer.flush();
-                self.batch.flushed();
             },
             .manual => {},
         }
@@ -651,14 +651,14 @@ pub const WebSocket = struct {
 ///
 /// Shared with layers that frame WebSocket messages themselves (over
 /// HTTP/2 and HTTP/3): the owner gives it a flush function and calls
-/// `flushed` under its write lock after every flush.
+/// `flushing` under its write lock as every flush starts.
 pub const Batch = struct {
     /// The reading task (`placement.taskId`) while the batch lasts; 0
     /// when there is none.
     owner: std.atomic.Value(usize) = .init(0),
     /// Frames sit in the write buffer for the batch. Set by the reading
-    /// task, cleared by whichever flush sends them; both under the owner's
-    /// write lock.
+    /// task, cleared by whichever flush sends them, as it starts; both
+    /// under the owner's write lock.
     deferred: std.atomic.Value(bool) = .init(false),
     /// The socket's own flusher: one task, parked between batches on
     /// `wake`, started when a batch first needs it.
@@ -741,8 +741,12 @@ pub const Batch = struct {
         };
     }
 
-    /// Under the owner's write lock, after a flush: nothing is held.
-    pub fn flushed(self: *Batch) void {
+    /// Under the owner's write lock, as a flush starts: what the batch
+    /// held goes out with it. Before the flush, not after: a write parks
+    /// the task (on zio, even one that completes at once), and the
+    /// backstop, running then, must not take the frames on their way out
+    /// for frames still held.
+    pub fn flushing(self: *Batch) void {
         self.deferred.store(false, .monotonic);
     }
 
