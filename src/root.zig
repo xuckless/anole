@@ -112,6 +112,10 @@ pub const db = @import("db/root.zig");
 /// on Anole's fork of pg.zig with a pool per executor.
 pub const pg = if (features.postgres) @import("pg/root.zig") else struct {};
 
+/// SQLite, built in (-Dsqlite): a file or `:memory:`, writes on a writer
+/// thread, reads on the blocking pool; `app.sqlite("app.db")`.
+pub const sqlite = if (features.sqlite) @import("sqlite/root.zig") else struct {};
+
 /// Outbound connections for the database clients: `ClientStream`, TCP or
 /// a Unix socket, plain or TLS on BoringSSL.
 pub const net = struct {
@@ -163,6 +167,7 @@ test {
     _ = grpc;
     _ = json;
     _ = redis;
+    _ = sqlite;
     _ = db;
     _ = pg;
     _ = @import("net/client_stream.zig");

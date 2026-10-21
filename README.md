@@ -375,11 +375,11 @@ set up this way, and CI builds it from an empty cache on every push.
   [docs/webtransport.md](docs/webtransport.md), [docs/grpc.md](docs/grpc.md),
   [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
   [docs/observability.md](docs/observability.md).
-- [docs/database.md](docs/database.md): PostgreSQL, the calls every
-  connector shares, errors as statuses, transactions, pools.
+- [docs/database.md](docs/database.md): PostgreSQL and SQLite, the calls
+  every connector shares, errors as statuses, transactions, pools.
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,
-  `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`, and `full`
-  (every listener and option spelled out).
+  `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`,
+  `sqlite`, and `full` (every listener and option spelled out).
 - [CHANGELOG.md](CHANGELOG.md) and [MAINTAINING.md](MAINTAINING.md): pins,
   forks, the Zig version policy, releases.
 
