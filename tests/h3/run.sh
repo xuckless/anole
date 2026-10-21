@@ -1,8 +1,9 @@
 #!/bin/sh
 # Anole's HTTP/3 server against aioquic's client (an independent QUIC and
-# HTTP/3 stack): downloads, uploads with checksums, echoes, many streams at
-# once, a drain that lets a download in flight finish, Retry, resumption and
-# 0-RTT, WebTransport and WebSocket over HTTP/3. Then
+# HTTP/3 stack): downloads, uploads with checksums, echoes (also on noWait
+# routes, run inline), many streams at once, a drain that lets a download in
+# flight finish, Retry, resumption and 0-RTT, WebTransport and WebSocket
+# over HTTP/3. Then
 # anole.h3's client against aioquic's server.
 #   tests/h3/run.sh [path-to-h3-test-server] [path-to-h3-test-client]
 # Needs python3; aioquic is installed into a throwaway venv.
@@ -43,6 +44,21 @@ done
 out=$($py "$url/download?n=100000" --parallel 50 --repeat 2 --quiet | grep -c "status 200 bytes 100000")
 [ "$out" = 100 ] || fail "parallel: $out of 100"
 echo "PASS 100 streams on one connection"
+for n in 0 1000 1000000; do
+  out=$($py "$url/nw/download?n=$n" --quiet) || fail "noWait download $n"
+  [ "$out" = "status 200 bytes $n
+1 responses" ] || fail "noWait download $n: $out"
+  echo "PASS noWait download $n"
+done
+for n in 1 50000 1000000; do
+  head -c $n /dev/urandom >"$work/body"
+  out=$($py "$url/nw/echo" --method POST --data-file "$work/body" --quiet | head -1)
+  [ "$out" = "status 200 bytes $n" ] || fail "noWait echo $n: $out"
+  echo "PASS noWait echo $n"
+done
+out=$($py "$url/nw/download?n=100000" --parallel 50 --repeat 2 --quiet | grep -c "status 200 bytes 100000")
+[ "$out" = 100 ] || fail "noWait parallel: $out of 100"
+echo "PASS noWait, 100 streams on one connection"
 out=$($py "$url/nothing-here" --quiet | head -1)
 [ "$out" = "status 404 bytes 14" ] || fail "404: $out"
 echo "PASS 404"

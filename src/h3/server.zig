@@ -20,7 +20,9 @@
 //!     they wrote together (one `sendmmsg` on Linux for every connection's
 //!     packets of a round). A connection costs no task of its own;
 //!   * one task per request: builds the `Request` and the `Response` and
-//!     runs the router.
+//!     runs the router. A request for a `no_wait` route that arrives whole
+//!     (`RouteOptions.no_wait`) runs without one, right where its last
+//!     packet was read, on the endpoint task.
 //!
 //! ngtcp2 and nghttp3 are not reentrant, so a connection's mutex covers
 //! every call into them; under it they only compute. Socket I/O and the
@@ -147,6 +149,13 @@ pub const Options = struct {
     /// unidirectional ones (the bidirectional ones share
     /// `max_streams_bidi`).
     webtransport_max_streams_uni: u64 = 100,
+    /// Requests for routes registered `no_wait` (`RouteOptions`) that
+    /// arrive whole (their end, body included, in the packet that brought
+    /// their HEADERS) run on the endpoint task right after that packet is
+    /// read, rather than on a task each, as HTTP/2 runs them on the
+    /// connection's reader. Never a request in 0-RTT, which may have to
+    /// wait for the handshake.
+    inline_no_wait: bool = true,
 };
 
 /// The SETTINGS every connection of an endpoint sends.
@@ -249,6 +258,9 @@ pub const Stats = struct {
     /// per message elsewhere): how well the endpoint batches.
     datagrams_out: std.atomic.Value(u64) = .init(0),
     tx_flushes: std.atomic.Value(u64) = .init(0),
+    /// Requests for `no_wait` routes run inline, without a task
+    /// (`Options.inline_no_wait`).
+    served_inline: std.atomic.Value(u64) = .init(0),
 };
 
 /// One HTTP/3 listener, serving `server`'s router: one endpoint per UDP
@@ -1249,6 +1261,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             streams: std.AutoArrayHashMapUnmanaged(i64, *Stream) = .empty,
             /// The request tasks.
             group: std.Io.Group = .init,
+            /// Requests of `no_wait` routes that arrived whole, to run
+            /// inline once the packet that completed them is read
+            /// (`onPacket`).
+            ready: std.ArrayList(*Stream) = .empty,
+            /// Requests of `no_wait` routes whose body was still coming
+            /// when their head was complete: inline too if it ends within
+            /// the same packet, else a task each once the packet is read.
+            awaiting: std.ArrayList(*Stream) = .empty,
             /// The receive round (`Endpoint.serve`'s batch, by its clock
             /// reading) that last brought this connection packets, and
             /// when the flush stops waiting for the requests it started.
@@ -1350,6 +1370,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.hq_streams.deinit(gpa);
                 for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
+                conn.ready.deinit(gpa);
+                conn.awaiting.deinit(gpa);
                 if (conn.wt) |w| w.destroy();
                 if (conn.h3) |hc| h.nghttp3_conn_del(hc);
                 c.ngtcp2_conn_del(conn.q);
@@ -1428,9 +1450,26 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // -- In: a packet from the endpoint task --------------------
 
+            /// Then runs the `no_wait` requests the packet completed, in
+            /// the order they came.
             fn onPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
                 conn.lock();
-                defer conn.unlock();
+                conn.readPacket(remote, local, ecn, data, ts);
+                if (conn.ready.items.len == 0) return conn.unlock();
+                // Taken out of the connection: a handler that waits after
+                // all lets another packet of this connection in meanwhile.
+                var ready = conn.ready;
+                conn.ready = .empty;
+                conn.unlock();
+                for (ready.items) |s| s.runInline();
+                ready.clearRetainingCapacity();
+                conn.lock();
+                if (conn.ready.capacity == 0) conn.ready = ready else ready.deinit(conn.ep.gpa);
+                conn.unlock();
+            }
+
+            /// Locked.
+            fn readPacket(conn: *Conn, remote: Addr, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
                 switch (conn.state) {
                     .open => {},
                     .closing => {
@@ -1461,6 +1500,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
                 // Never earlier than what the driver has already used.
                 const rv = ngtcp2.connReadPkt(conn.q, &p, &pi, data, @max(ts, c.ngtcp2_conn_get_timestamp(conn.q)));
+                if (conn.awaiting.items.len > 0) conn.startAwaiting();
                 if (rv != 0) {
                     switch (rv) {
                         c.NGTCP2_ERR_DRAINING => {
@@ -1911,6 +1951,43 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.kick();
                 };
             }
+
+            /// Whether the request's route was registered `no_wait`, to run
+            /// inline. Not in 0-RTT, which may wait for the handshake, and
+            /// never an extended CONNECT: it is a tunnel, whatever it
+            /// routes as. Locked.
+            fn noWaitRoute(conn: *Conn, stream: *Stream) bool {
+                const ep = conn.ep;
+                if (!ep.options.inline_no_wait or stream.early) return false;
+                const method = parseMethod(stream.method) orelse return false;
+                if (method == .connect) return false;
+                return ep.http.router.noWait(method, stream.path);
+            }
+
+            /// A `no_wait` request is whole: it runs once the packet is
+            /// read (`onPacket`). Locked.
+            fn queueInline(conn: *Conn, stream: *Stream) void {
+                conn.ready.append(conn.ep.gpa, stream) catch return conn.startStream(stream);
+                stream.started = true;
+                stream.refs.handler = true;
+                stream.inline_mode = true;
+            }
+
+            /// After a packet: the `no_wait` requests whose body did not
+            /// end in it get a task, as any other request; one reset
+            /// meanwhile is let go. Locked.
+            fn startAwaiting(conn: *Conn) void {
+                defer conn.awaiting.clearRetainingCapacity();
+                for (conn.awaiting.items) |stream| {
+                    if (!stream.await_body) continue;
+                    stream.await_body = false;
+                    if (stream.reset) {
+                        stream.release(.handler);
+                        continue;
+                    }
+                    conn.startStream(stream);
+                }
+            }
         };
 
         /// An hq-interop request: its line in, then the file out.
@@ -1961,6 +2038,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// stream's task changes it once the task runs.
             holds: bool = false,
             round: u32 = 0,
+            /// A `no_wait` route's request, run on the endpoint task
+            /// (`runInline`), which must never wait for the peer: what its
+            /// response does not fit in the ring waits in `spill`, which
+            /// grows as needed.
+            inline_mode: bool = false,
+            /// A `no_wait` route's request with its body still coming, in
+            /// `Conn.awaiting`.
+            await_body: bool = false,
+            spill: std.ArrayList(u8) = .empty,
+            spill_pos: usize = 0,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2009,11 +2096,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                     gpa.free(s.out.buf);
                     s.out.buf = &.{};
                 }
+                s.spill.deinit(gpa);
+                s.spill = .empty;
                 _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
                 if (!ep.keepStream(s)) s.destroy(gpa);
             }
 
             fn destroy(s: *Stream, gpa: std.mem.Allocator) void {
+                s.spill.deinit(gpa);
                 s.body.deinit(gpa);
                 s.out.deinit(gpa);
                 s.arena.deinit();
@@ -2059,27 +2149,52 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unlock();
                     conn.kick();
                 }
-                s.serve() catch |err| {
-                    if (err == error.Canceled) {
-                        s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
-                        return error.Canceled;
-                    }
-                    // `Response.abort`: the reset is the abort.
-                    if (err == error.ResponseAborted) {
-                        log.debug("HTTP/3 stream {d}: response aborted", .{s.id});
-                        s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
-                        return;
-                    }
-                    conn.lock();
-                    const gone = s.reset;
-                    conn.unlock();
-                    if (gone) {
-                        log.debug("HTTP/3 stream {d} reset: {t}", .{ s.id, err });
-                    } else {
-                        log.err("HTTP/3 stream {d}: {t}", .{ s.id, err });
-                        s.resetStream(h.NGHTTP3_H3_INTERNAL_ERROR);
-                    }
-                };
+                s.serve(false) catch |err| return s.failed(err);
+            }
+
+            /// A `no_wait` route's request, whole, on the endpoint task.
+            fn runInline(s: *Stream) void {
+                const conn = s.conn;
+                conn.lock();
+                const gone = s.reset;
+                conn.unlock();
+                if (!gone) {
+                    _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
+                    s.serve(true) catch |err| s.failed(err) catch {
+                        // The endpoint task itself is canceled: it stops
+                        // reading once these requests are done.
+                        conn.ep.io.recancel();
+                    };
+                }
+                conn.lock();
+                s.release(.handler);
+                conn.unlock();
+                conn.kick();
+            }
+
+            /// What a handler's error means for its stream.
+            /// `error.Canceled` to pass on.
+            fn failed(s: *Stream, err: anyerror) error{Canceled}!void {
+                const conn = s.conn;
+                if (err == error.Canceled) {
+                    s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
+                    return error.Canceled;
+                }
+                // `Response.abort`: the reset is the abort.
+                if (err == error.ResponseAborted) {
+                    log.debug("HTTP/3 stream {d}: response aborted", .{s.id});
+                    s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
+                    return;
+                }
+                conn.lock();
+                const gone = s.reset;
+                conn.unlock();
+                if (gone) {
+                    log.debug("HTTP/3 stream {d} reset: {t}", .{ s.id, err });
+                } else {
+                    log.err("HTTP/3 stream {d}: {t}", .{ s.id, err });
+                    s.resetStream(h.NGHTTP3_H3_INTERNAL_ERROR);
+                }
             }
 
             fn setTimeout(context: *anyopaque, _: std.Io, timeout: std.Io.Timeout) void {
@@ -2097,7 +2212,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.kick();
             }
 
-            fn serve(s: *Stream) !void {
+            /// `inline_mode`: on the endpoint task (a `no_wait` route),
+            /// with no request timeout, whose timer would cancel that task.
+            fn serve(s: *Stream, inline_mode: bool) !void {
                 const conn = s.conn;
                 const ep = conn.ep;
                 const server = ep.http;
@@ -2109,7 +2226,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // Running out cancels the task, which resets the stream.
                 var timer: zio.AutoCancel = .init;
                 defer timer.clear();
-                if (server.config.timeout.request) |d| setTimeout(&timer, io, .{ .duration = .{ .raw = d, .clock = .awake } });
+                if (!inline_mode) if (server.config.timeout.request) |d| setTimeout(&timer, io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
                 var request: dusty.Request = .{
                     .arena = arena,
@@ -2123,8 +2240,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .version_minor = 0,
                     .drain = &server.draining,
                     .drain_hooks = &server.drain_hooks,
-                    ._timeout_context = &timer,
-                    ._set_timeout = setTimeout,
+                    ._timeout_context = if (inline_mode) null else &timer,
+                    ._set_timeout = if (inline_mode) null else setTimeout,
                 };
                 var body_reader: BodyReader = .init(s);
                 request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
@@ -2236,6 +2353,26 @@ pub fn Endpoint(comptime Ctx: type) type {
                     else => |e| return e,
                 };
                 try response.write();
+            }
+
+            /// Every byte of the response body is in the ring and handed
+            /// to nghttp3. Locked.
+            fn allSent(s: *const Stream) bool {
+                return s.out.allSent() and s.spill_pos == s.spill.items.len;
+            }
+
+            /// Moves what waits in `spill` into the ring, as far as the
+            /// peer's acknowledgments have made room. Locked.
+            fn refill(s: *Stream) void {
+                if (s.spill_pos == s.spill.items.len) return;
+                const n = s.out.write(s.conn.ep.gpa, s.spill.items[s.spill_pos..]) catch return;
+                if (n == 0) return;
+                s.spill_pos += n;
+                if (s.spill_pos == s.spill.items.len) {
+                    s.spill.clearRetainingCapacity();
+                    s.spill_pos = 0;
+                }
+                s.resume_();
             }
 
             /// Tells nghttp3 there is more of the body, if it was waiting
@@ -2502,13 +2639,26 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return self.fail(error.SystemResources);
                     };
-                    const n = s.out.write(conn.ep.gpa, rest) catch {
+                    // Behind what already waits in the spill, if any.
+                    const n = if (s.spill.items.len > 0) 0 else s.out.write(conn.ep.gpa, rest) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
                     };
                     if (n > 0) {
                         rest = rest[n..];
                         s.resume_();
+                    }
+                    if (s.inline_mode and rest.len > 0) {
+                        // On the endpoint task, which must not wait for the
+                        // acknowledgments that make room: the rest goes out
+                        // as they come in (`refill`).
+                        s.spill.appendSlice(conn.ep.gpa, rest) catch {
+                            conn.unlock();
+                            return self.fail(error.SystemResources);
+                        };
+                        conn.unlock();
+                        conn.kick();
+                        return;
                     }
                     conn.unlock();
                     // Kick only for new bytes: a kick would also move `gen`
@@ -2738,7 +2888,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
-                    if (!(s.ended and s.out.allSent() and s.body_done)) s.reset = true;
+                    if (!(s.ended and s.allSent() and s.body_done)) s.reset = true;
                     s.release(.quic);
                 }
             }
@@ -2844,6 +2994,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3AckedStreamData(_: ?*h.nghttp3_conn, _: i64, len: u64, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
             s.out.acked += len;
+            s.refill();
             // Room in the ring: a handler waiting to write may go on.
             s.conn.kick();
             return 0;
@@ -2904,7 +3055,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             // On a server, 1-RTT data is only read once the handshake has
             // completed, so a head that ends before came in 0-RTT.
             s.early = !conn.handshakeDone();
-            conn.startStream(s);
+            if (!conn.noWaitRoute(s)) {
+                conn.startStream(s);
+            } else if (s.body_done) {
+                conn.queueInline(s);
+            } else if (conn.awaiting.append(conn.ep.gpa, s)) |_| {
+                s.started = true;
+                s.refs.handler = true;
+                s.await_body = true;
+            } else |_| conn.startStream(s);
             return 0;
         }
 
@@ -2912,6 +3071,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
             s.body_done = true;
+            if (s.await_body) {
+                // Whole within the packet: inline after all.
+                s.await_body = false;
+                conn.queueInline(s);
+            }
             conn.kick();
             return 0;
         }
@@ -2933,7 +3097,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn readData(_: ?*h.nghttp3_conn, stream_id: i64, vec: [*c]h.nghttp3_vec, veccnt: usize, pflags: [*c]u32, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) h.nghttp3_ssize {
             const s = streamOfUser(sud) orelse return h.NGHTTP3_ERR_CALLBACK_FAILURE;
             if (s.out.allSent()) {
-                if (!s.ended) {
+                if (!s.ended or !s.allSent()) {
                     s.deferred = true;
                     return h.NGHTTP3_ERR_WOULDBLOCK;
                 }
@@ -2946,7 +3110,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return 0;
             }
             const count = s.out.take(vec, veccnt);
-            if (s.ended and s.out.allSent()) {
+            if (s.ended and s.allSent()) {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {
                     pflags.* |= h.NGHTTP3_DATA_FLAG_NO_END_STREAM;
