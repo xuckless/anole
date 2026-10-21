@@ -814,14 +814,29 @@ test "HTTP/2: a warm connection serves requests without allocating" {
     for (0..5) |_| {
         _ = try client.request("GET", "/users/1", null);
         try client.run();
+        try awaitStreamsFreed(&server, io);
     }
     const before = counting.count.load(.monotonic);
     for (0..20) |_| {
         const id = try client.request("GET", "/users/2", null);
         try client.run();
         try std.testing.expectEqualStrings("user 2", client.get(id).body.items);
+        try awaitStreamsFreed(&server, io);
     }
     try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
+
+/// Waits until the server has freed every stream. The response can reach
+/// the client before its handler's task has let go of the stream (each
+/// task is a thread of its own under std.testing.io), and a request sent
+/// meanwhile rightly takes a second stream, which the pool then keeps:
+/// one request at a time is what the warm-path test measures.
+fn awaitStreamsFreed(server: *dusty.Server(void), io: std.Io) !void {
+    for (0..5000) |_| {
+        if (server.busy.load(.acquire).count == 0) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.Timeout;
 }
 
 fn stopFixture(f: *Fixture, io: std.Io) void {
