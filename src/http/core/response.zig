@@ -213,8 +213,15 @@ const BodyBuffer = struct {
     /// its memory between a connection's requests, so this is a bump.
     fn init(arena: std.mem.Allocator) std.mem.Allocator.Error!BodyBuffer {
         var self: BodyBuffer = .{};
-        self.segments.append(&(try Segment.create(arena, first_segment_len)).node);
+        try self.reserveFirst(arena);
         return self;
+    }
+
+    /// `init`'s first segment, for a buffer that has none yet: before a
+    /// writer is made over it.
+    fn reserveFirst(self: *BodyBuffer, arena: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (self.segments.first != null) return;
+        self.segments.append(&(try Segment.create(arena, first_segment_len)).node);
     }
 
     fn last(self: *const BodyBuffer) ?*Segment {
@@ -644,7 +651,12 @@ fn statusHasBody(status: http.Status) bool {
 pub const Response = struct {
     status: http.Status = .ok,
     body: []const u8 = "",
+    /// Set through `header` and `addHeader`, which grow the table up to
+    /// `max_headers`; it starts smaller.
     headers: http.Headers = .{},
+    /// Most headers the response can carry (`ServerConfig.response
+    /// .max_header_count`).
+    max_headers: usize = 64,
     content_type: ?http.ContentType = null,
     arena: std.mem.Allocator,
     /// The body, when it is written rather than set with `body`.
@@ -756,13 +768,20 @@ pub const Response = struct {
     /// `InvalidContentLength` is such a header that is not a number.
     pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
+    /// The headers a response starts with room for: enough for most, so
+    /// that an ordinary one takes little of the arena. The table grows to
+    /// `max_headers` for one with more.
+    const initial_header_room = 16;
+
+    /// The body buffer's first segment is taken once a body is written
+    /// (`writer`), so a response whose body is a slice takes none.
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .body_buffer = try .init(arena),
             .conn = conn,
             .io = conn.io,
-            .headers = try http.Headers.init(arena, max_headers),
+            .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
+            .max_headers = max_headers,
         };
     }
 
@@ -772,12 +791,27 @@ pub const Response = struct {
     pub fn initSink(arena: std.mem.Allocator, io: std.Io, sink: Sink, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .body_buffer = try .init(arena),
             .conn = undefined,
             .sink = sink,
             .io = io,
-            .headers = try http.Headers.init(arena, max_headers),
+            .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
+            .max_headers = max_headers,
         };
+    }
+
+    /// Room for `n` more headers, the table grown if it must be. False
+    /// past `max_headers`, or without the memory for a bigger table.
+    fn headerRoom(self: *Response, n: usize) bool {
+        while (self.headers.keys.len - self.headers.len < n) {
+            if (!self.headers.grow(self.arena, self.max_headers)) return false;
+        }
+        return true;
+    }
+
+    /// `headers.put`, the table grown first if it is full.
+    fn putHeader(self: *Response, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
+        if (self.headers.get(name) == null and !self.headerRoom(1)) return error.TooManyHeaders;
+        try self.headers.put(name, value);
     }
 
     /// Adds a trailer field, sent after the body. Carried only by a sink
@@ -807,9 +841,11 @@ pub const Response = struct {
         return self.conn.peerGone();
     }
 
-    /// Where body bytes go: the sink's writer, or the connection.
+    /// Where body bytes go: the sink's writer, or the connection, which
+    /// takes its write buffer now.
     fn bodyOut(self: *Response) *std.Io.Writer {
         if (self.sink) |sink| return sink.body();
+        self.conn.prepareWrite();
         return self.conn.writer;
     }
 
@@ -873,7 +909,17 @@ pub const Response = struct {
         if (self.headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
         try http.validateHeaderValue(value);
-        try self.headers.put(name, value);
+        try self.putHeader(name, value);
+    }
+
+    /// Adds a header even if the response has one by that name already:
+    /// for a field that may repeat or lists its values, such as `Vary`.
+    pub fn addHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
+        if (self.headers_written) return error.HeadersAlreadySent;
+        try http.validateHeaderName(name);
+        try http.validateHeaderValue(value);
+        if (!self.headerRoom(1)) return error.TooManyHeaders;
+        try self.headers.add(name, value);
     }
 
     /// A writer that collects the body without touching the connection.
@@ -884,6 +930,8 @@ pub const Response = struct {
     pub fn writer(self: *Response) BodyWriter {
         self.startBody();
         self.body_writer_buffering = true;
+        // Without the memory, the first write fails the same way.
+        self.body_buffer.reserveFirst(self.arena) catch {};
         return .init(self);
     }
 
@@ -1187,6 +1235,7 @@ pub const Response = struct {
         if (self.headers_written) return error.HeadersAlreadySent;
         const serialized = try serializeCookie(self.arena, name, value, opts);
         try http.validateHeaderValue(serialized);
+        if (!self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.add("Set-Cookie", serialized);
     }
 
@@ -1256,6 +1305,7 @@ pub const Response = struct {
         self.conn.shrinkForUpgrade();
         errdefer self.keepalive = false;
         try self.writeHeader();
+        self.conn.finishUpgrade();
         // The connection is the WebSocket's now, and whatever the peer sends
         // after the session is not an HTTP request.
         self.keepalive = false;
@@ -1327,7 +1377,7 @@ pub const Response = struct {
     /// Settles nothing: the headers that say so go on with `addVary` and
     /// `markCompressed`, which have their room reserved here, so that
     /// nothing fails after a response has started claiming a coding.
-    fn negotiateCompression(self: *const Response) Compression {
+    fn negotiateCompression(self: *Response) Compression {
         if (!(build_options.use_zlib or build_options.use_zstd or build_options.use_brotli) or !self.compress) return .off;
         if (self.file != null) return .off;
         // A tunnel (RFC 8441), not a representation.
@@ -1348,7 +1398,7 @@ pub const Response = struct {
         // can get wrong.
         var needed: usize = if (not_modified) 0 else 1;
         if (!self.variesByAcceptEncoding()) needed += 1;
-        if (self.headers.keys.len - self.headers.len < needed) return .off;
+        if (!self.headerRoom(needed)) return .off;
 
         const request = self.request orelse return .identity;
         // The client's q-values first; on a tie, zstd, then Brotli, then
@@ -1680,7 +1730,7 @@ pub const Response = struct {
     fn addSinkDate(self: *Response) std.Io.Writer.Error!void {
         if (self.send_date and self.headers.get("Date") == null) {
             const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
-            self.headers.put("Date", date) catch {};
+            self.putHeader("Date", date) catch {};
         }
     }
 

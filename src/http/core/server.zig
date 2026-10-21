@@ -25,6 +25,7 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
+const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
@@ -220,9 +221,10 @@ const TlsMaterial = struct {
     }
 };
 
-/// Primed into each pooled request arena, so an ordinary request is served
-/// without growing it. A request that needs more grows it once, and the
-/// arena keeps what it grew to.
+/// The part of each pooled request arena that lives in the set, so an
+/// ordinary request is served without the arena allocating. What a request
+/// takes beyond it goes back when the request ends
+/// (`RequestBuffers.resetArena`).
 const request_arena_reserve = 8 * 1024;
 
 /// How often each executor frees the request buffer sets that no request
@@ -240,9 +242,10 @@ const idle_read_buffer_len = 1024;
 
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer) and their buffers for one accepted connection. The buffer a
-/// request is read into and its arena are not the connection's: they come
-/// from the server's pool once its first request arrives, and go back when
-/// it closes.
+/// request is read into, its arena and the buffer its response is written
+/// through are not the connection's: they come from the server's pool once
+/// a request arrives (the write buffer once it writes), and go back when it
+/// is done.
 ///
 /// Initialized in place: `tls_conn` stores pointers into
 /// `tcp_reader`/`tcp_writer`, and `tls_reader`/`tls_writer` store a pointer
@@ -277,6 +280,15 @@ pub const Connection = struct {
     proxied_secure: bool = false,
     /// What took the connection over after an upgrade (`Response.adopt`).
     adopter: ?*Adopter = null,
+    /// Where the writer takes a buffer from when a response first writes
+    /// (`prepareWrite`), and gives it back to once that is out
+    /// (`releaseWriteBuffer`). Without one, the writer's buffer is what
+    /// `useWriteBuffer` gave it.
+    write_pool: ?*RequestBuffersPool = null,
+    /// The buffer the writer took from `write_pool`, while it has it.
+    write_held: ?*WriteBuffer = null,
+    /// A request upgraded it (`finishUpgrade`): no more responses.
+    upgraded: bool = false,
     tls_rng: std.Random.IoSource = undefined,
     tls_reader: tls.Connection.Reader = undefined,
     tls_writer: tls.Connection.Writer = undefined,
@@ -386,12 +398,28 @@ pub const Connection = struct {
         self.writer.buffer = buffer;
     }
 
-    /// Takes the write buffer back, throwing away what it holds. Every
-    /// response is flushed as it ends, so only a failed write leaves
-    /// anything, on a connection that is closing.
+    /// Before a response writes: gives the writer a buffer from
+    /// `write_pool` if it has none, so a request that is still waiting to
+    /// answer holds none. Without memory for one, the writes go out
+    /// unbuffered, one each.
+    pub fn prepareWrite(self: *Connection) void {
+        if (self.writer.buffer.len != 0 or self.upgraded) return;
+        const pool = self.write_pool orelse return;
+        const w = pool.takeWriteBuffer(@intFromPtr(self)) catch return;
+        self.write_held = w;
+        self.writer.buffer = pool.writeBytes(w);
+    }
+
+    /// Takes the write buffer back, throwing away what it holds, and gives
+    /// it back to `write_pool` if it came from there. Every response is
+    /// flushed as it ends, so only a failed write leaves anything, on a
+    /// connection that is closing.
     pub fn releaseWriteBuffer(self: *Connection) void {
         self.writer.buffer = &.{};
         self.writer.end = 0;
+        const w = self.write_held orelse return;
+        self.write_held = null;
+        self.write_pool.?.giveWriteBuffer(w);
     }
 
     /// Reads into `buffer` from now on, throwing away what the reader holds.
@@ -480,6 +508,16 @@ pub const Connection = struct {
         const to = std.mem.alignBackward(usize, release_end, page);
         if (to <= from) return;
         _ = std.os.linux.madvise(@ptrFromInt(from), to - from, std.os.linux.MADV.DONTNEED);
+    }
+
+    /// Once the 101 of an upgrade is out: the connection is the upgraded
+    /// protocol's, and its writer keeps the window `shrinkForUpgrade` gave
+    /// it, or none, rather than a buffer from `write_pool` that it would
+    /// hold for as long as it is open (and an adopter, past the request
+    /// that would give it back).
+    pub fn finishUpgrade(self: *Connection) void {
+        if (self.write_held != null) self.releaseWriteBuffer();
+        self.upgraded = true;
     }
 
     /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
@@ -2006,6 +2044,7 @@ pub fn Server(comptime Ctx: type) type {
 
                     connection.proxied_peer = proxied.source;
                     connection.proxied_secure = proxied.ssl;
+                    connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
                             // The engine's tasks have all ended when it
@@ -2028,6 +2067,7 @@ pub fn Server(comptime Ctx: type) type {
             try connection.initPlain(self.allocator, self.io, stream);
             connection.proxied_peer = proxied.source;
             connection.proxied_secure = proxied.ssl;
+            connection.write_pool = &self.request_buffers;
             return self.serveRequests(conn, timer, busy);
         }
 
@@ -2407,8 +2447,8 @@ pub fn Server(comptime Ctx: type) type {
                 if (buffers == null) {
                     const b = try self.request_buffers.acquire(@intFromPtr(connection));
                     buffers = b;
+                    // The write buffer once the response writes.
                     connection.useReadBuffer(b.read_buffer);
-                    connection.useWriteBuffer(b.write_buffer);
                     request.arena = b.arena.allocator();
                 }
 
@@ -2613,9 +2653,12 @@ pub fn Server(comptime Ctx: type) type {
                     break;
                 }
 
+                // The write buffer goes back between requests, so the next
+                // holds none while it waits to answer.
+                connection.releaseWriteBuffer();
                 parser.reset();
                 request.reset();
-                _ = buffers.?.arena.reset(.retain_capacity);
+                buffers.?.resetArena();
                 connection.rewindReader();
             }
             return .close;

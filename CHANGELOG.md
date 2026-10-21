@@ -45,6 +45,17 @@ for macOS and Linux.
   through `open`/`message`/`close` callbacks, and over HTTP/1.1 such a
   socket parks the same way between messages (`Response.adopt` in the
   HTTP core hands the connection over to it after the handshake).
+- A request waiting in its handler holds about 6 KB instead of 14: its
+  head, its arena's first chunk and the set's header share one page (sets
+  are carved page-aligned from slabs; a trimmed one gives its pages back
+  and is reused), the request's and the response's header tables start at
+  16 entries and grow to their limits, a buffered body's first segment is
+  taken when the body is written, and the write buffer comes from a pool of
+  its own at the response's first write and goes back once it is out. What
+  a request takes from its arena beyond the set's 10 KB goes back when it
+  ends rather than staying with the set. `res.addHeader` adds a header
+  that may repeat (`Vary`); adding to `res.headers` directly is limited to
+  its current room.
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with

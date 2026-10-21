@@ -512,7 +512,8 @@ pub fn Engine(comptime Ctx: type) type {
             const buffers = try server.request_buffers.acquire(@intFromPtr(connection));
             defer server.request_buffers.release(buffers);
             connection.useReadBuffer(buffers.read_buffer);
-            connection.useWriteBuffer(buffers.write_buffer);
+            connection.prepareWrite();
+            if (connection.writer.buffer.len == 0) return error.OutOfMemory;
             defer connection.releaseWriteBuffer();
 
             var conn: Conn = .{

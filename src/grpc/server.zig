@@ -563,7 +563,7 @@ fn finish(call: *Call, result: anyerror!void) !void {
                 call.res.body = call.unary_response orelse "";
             } else {
                 call.res.status = connectHttpStatus(call.status);
-                call.res.headers.put("content-type", "application/json") catch {};
+                call.res.header("content-type", "application/json") catch {};
                 call.res.body = try std.fmt.allocPrint(call.arena, "{{\"code\":\"{s}\",\"message\":{f}}}", .{ connectCode(call.status), std.json.fmt(call.status_message, .{}) });
             }
         },

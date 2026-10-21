@@ -275,11 +275,12 @@ pub const ServerConfig = struct {
     /// 10,000 on Windows, which has no such limit.
     ///
     /// An open connection costs about 2K, 33K more under TLS, and
-    /// `request.buffer_size + response.write_buffer_size + 9K` more while a
-    /// request is being served, or for as long as it is open with
-    /// `request.keep_buffers_between_requests` on. A request with a body
-    /// with a `Content-Encoding` takes 70K more while `request.decompress`
-    /// is on.
+    /// `request.buffer_size + 12K` more while a request is being served, or
+    /// for as long as it is open with `request.keep_buffers_between_requests`
+    /// on, of which an ordinary request touches one page; and
+    /// `response.write_buffer_size` more while its response is being
+    /// written. A request with a body with a `Content-Encoding` takes 70K
+    /// more while `request.decompress` is on.
     max_connections: ?u32 = max_connections_from_fd_limit,
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
@@ -484,8 +485,9 @@ pub const ServerConfig = struct {
         /// Buffer size (bytes) for writing to the connection while a request
         /// is served. A response head and a body that fits behind it go out
         /// in one write; a streamed chunk, an event or a WebSocket frame is
-        /// assembled in it and sent as it is finished. Taken with the
-        /// request's read buffer, and given back with it. Must not be 0.
+        /// assembled in it and sent as it is finished. Taken from a pool at
+        /// the response's first write, and given back once it is out, so a
+        /// request still waiting to answer holds none. Must not be 0.
         ///
         /// 16K is the most a TLS record carries, so under TLS a smaller
         /// buffer sends what passes through it, a file or a body written in
