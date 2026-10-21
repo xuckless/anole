@@ -236,7 +236,7 @@ fn writeDouble(w: *Writer, f: f64) Writer.Error!void {
 /// 9999-12-31T23:59:59.999Z
 const max_iso_ms: i64 = 253402300799999;
 
-fn writeIsoDate(w: *Writer, ms: i64) Writer.Error!void {
+pub fn writeIsoDate(w: *Writer, ms: i64) Writer.Error!void {
     const days = @divFloor(ms, std.time.ms_per_day);
     const in_day = @mod(ms, std.time.ms_per_day);
     const date = civilFromDays(days);

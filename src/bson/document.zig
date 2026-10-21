@@ -94,6 +94,18 @@ pub const Timestamp = struct {
 pub const Datetime = struct {
     ms: i64,
 
+    /// `std.json` (`res.json`): an ISO-8601 string in UTC, as relaxed
+    /// Extended JSON writes dates; outside years 1970-9999, the
+    /// milliseconds since the epoch.
+    pub fn jsonStringify(d: Datetime, jw: anytype) !void {
+        if (d.ms < 0 or d.ms > 253402300799999) return jw.write(d.ms);
+        try jw.beginWriteRaw();
+        defer jw.endWriteRaw();
+        try jw.writer.writeByte('"');
+        try @import("extjson.zig").writeIsoDate(jw.writer, d.ms);
+        try jw.writer.writeByte('"');
+    }
+
     pub fn fromSeconds(s: i64) Datetime {
         return .{ .ms = s * std.time.ms_per_s };
     }
@@ -129,6 +141,13 @@ pub const Value = union(Type) {
     /// Relaxed Extended JSON, for logs: `{f}`.
     pub fn format(v: Value, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return @import("extjson.zig").writeValue(w, v, .relaxed);
+    }
+
+    /// `std.json` (`res.json`): relaxed Extended JSON, as `format`.
+    pub fn jsonStringify(v: Value, jw: anytype) !void {
+        try jw.beginWriteRaw();
+        defer jw.endWriteRaw();
+        try @import("extjson.zig").writeValue(jw.writer, v, .relaxed);
     }
 
     /// A copy whose strings, binary data and documents live in `arena`.
@@ -258,6 +277,13 @@ pub const Document = struct {
     pub fn format(d: Document, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return @import("extjson.zig").write(w, d, .relaxed);
     }
+
+    /// `std.json` (`res.json`): relaxed Extended JSON, as `format`.
+    pub fn jsonStringify(d: Document, jw: anytype) !void {
+        try jw.beginWriteRaw();
+        defer jw.endWriteRaw();
+        try @import("extjson.zig").write(jw.writer, d, .relaxed);
+    }
 };
 
 /// A BSON array: a document whose keys are "0", "1", ... Readers ignore the
@@ -286,6 +312,13 @@ pub const Array = struct {
 
     pub fn format(a: Array, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return @import("extjson.zig").writeValue(w, .{ .array = a }, .relaxed);
+    }
+
+    /// `std.json` (`res.json`): relaxed Extended JSON, as `format`.
+    pub fn jsonStringify(a: Array, jw: anytype) !void {
+        try jw.beginWriteRaw();
+        defer jw.endWriteRaw();
+        try @import("extjson.zig").writeValue(jw.writer, .{ .array = a }, .relaxed);
     }
 };
 
