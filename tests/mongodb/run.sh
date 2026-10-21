@@ -69,7 +69,16 @@ mongosh() { docker exec "$name" mongosh --quiet --port "$port" -u root -p "$pass
 # The entrypoint starts mongod once to create the user, then again for good.
 ready=""
 for _ in $(seq 1 90); do
-    running || { echo "mongod exited during startup" >&2; exit 1; }
+    if ! running; then
+        if docker logs "$name" 2>&1 | grep SERVER-121912 >/dev/null; then
+            echo "$image refuses to start on this host's Linux kernel ($(uname -r)): MongoDB 8.0.21+ and 9.x" >&2
+            echo "exit at startup on kernels 6.19 to 7.0.13 (TCMalloc and rseq; https://jira.mongodb.org/browse/SERVER-125742)." >&2
+            echo "Use a host with a kernel before 6.19 or from 7.0.14, or mongo:7.0." >&2
+        else
+            echo "mongod exited during startup" >&2
+        fi
+        exit 1
+    fi
     if mongosh --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
 done

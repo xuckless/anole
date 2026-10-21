@@ -301,17 +301,24 @@ jobs:
 
   mongodb:
     name: MongoDB (live client tests)
-    runs-on: ubuntu-latest
+    # MongoDB 8.0.21+ and 9.x exit at startup on Linux kernels 6.19 to
+    # 7.0.13 (SERVER-125742; ubuntu-24.04 runs 7.0.0), and earlier 8.0s
+    # crash there: 8.0 and 9.0 run on ubuntu-22.04 (kernel 6.8) until the
+    # newer image's kernel reaches 7.0.14.
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        image: ["mongo:7.0", "mongo:8.0"]
+        include:
+          - { image: "mongo:7.0", os: ubuntu-latest }
+          - { image: "mongo:8.0", os: ubuntu-22.04 }
+          - { image: "mongo:9.0", os: ubuntu-22.04 }
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.17.0
-          cache-key: mongodb
+          cache-key: mongodb-${{ matrix.os }}
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # A replica set of one with authentication and failCommand, plain and

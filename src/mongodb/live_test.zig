@@ -1,5 +1,5 @@
 //! Tests against a live server: `zig build test -Dmongodb-test-url=mongodb://...`
-//! (tests/mongodb/run.sh starts MongoDB 7.0 and 8.0 in Docker: a replica
+//! (tests/mongodb/run.sh starts MongoDB 7.0, 8.0 or 9.0 in Docker: a replica
 //! set of one with authentication, plain and over TLS).
 const std = @import("std");
 const zio = @import("zio");

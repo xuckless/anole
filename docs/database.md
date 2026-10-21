@@ -397,7 +397,7 @@ Built in with `-Dmongodb` (in the `full` profile): Anole's own client on
 handshake, SCRAM, the connection string, server discovery and monitoring,
 connection pooling, sessions, retryable reads and writes), with documents
 in BSON (`anole.bson`). TLS goes through the same BoringSSL as the rest of
-Anole. MongoDB 4.2 and later; CI runs 7.0 and 8.0. `examples/mongodb` is
+Anole. MongoDB 4.2 and later; CI runs 7.0, 8.0 and 9.0. `examples/mongodb` is
 a small users API:
 
 ```sh
@@ -553,10 +553,15 @@ command's name as the operation, the collection as the target), and a
 ### Testing against a server
 
 `tests/mongodb/run.sh [image]` starts MongoDB in Docker (`mongo:8.0` by
-default; CI runs 7.0 and 8.0) as a replica set of one with
+default; CI runs 7.0, 8.0 and 9.0) as a replica set of one with
 authentication and test commands on, with a CA and certificate made for
 the run, and runs `zig build test-mongodb` three times: SCRAM-SHA-256,
-SCRAM-SHA-1, and over TLS. Against a server of your own:
+SCRAM-SHA-1, and over TLS. MongoDB 8.0.21 and later and 9.x refuse to
+start on Linux kernels 6.19 to 7.0.13 (a TCMalloc incompatibility,
+[SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742)), and
+earlier 8.0 releases crash there; the script says so when it sees it.
+On such a host use `mongo:7.0` or a kernel from 7.0.14 (CI runs 8.0 and
+9.0 on `ubuntu-22.04`, kernel 6.8). Against a server of your own:
 
 ```sh
 zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?replicaSet=rs0&authSource=admin'
