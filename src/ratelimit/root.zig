@@ -427,6 +427,10 @@ test "Middleware: 429 with Retry-After once the bucket is empty" {
 }
 
 test "Middleware: a key of the request's choosing, and on_error" {
+    // The failing limiter's warnings are expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
     const zio = @import("zio");
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});

@@ -460,6 +460,10 @@ test "keyFromBase64: 32 bytes in any base64 alphabet, nothing else" {
 }
 
 test "devKey: random, never all zeros in practice, and different each time" {
+    // Its warning is expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
     const a = devKey(std.testing.io);
     const b = devKey(std.testing.io);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
