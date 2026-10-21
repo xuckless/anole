@@ -51,6 +51,12 @@ const placement = @import("../placement.zig");
 
 const log = std.log.scoped(.anole_h2);
 
+/// Tests only: runs between the round that takes frames from the session
+/// and their write, so a test can hold frames there (h2_test.zig). Nothing
+/// outside tests.
+pub var test_before_flush: if (@import("builtin").is_test) ?*const fn (std.Io) std.Io.Cancelable!void else void =
+    if (@import("builtin").is_test) null else {};
+
 /// The client connection preface (RFC 9113 §3.4).
 pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -207,6 +213,17 @@ pub fn Engine(comptime Ctx: type) type {
             /// The final GOAWAY was handed to the writer; the hold goes
             /// once the writer has flushed it.
             drain_flush: bool = false,
+            /// Streams that are done but whose last frames the writer may
+            /// not have flushed yet. Each keeps its count in the server's
+            /// in-flight requests until the writer has flushed everything it
+            /// took before the stream finished (`settleFinished`): nghttp2
+            /// closes a stream when the writer takes its last frame, before
+            /// the write, and a drain that saw the count reach zero there
+            /// would cancel the connection with the response still unsent.
+            unflushed_finishes: usize = 0,
+            /// The writer has ended: a stream that finishes gives its count
+            /// back at once.
+            writer_gone: bool = false,
             /// In `Registry`.
             node: std.DoublyLinkedList.Node = .{},
 
@@ -260,6 +277,25 @@ pub fn Engine(comptime Ctx: type) type {
             /// raised one too. Under the mutex.
             fn ackedStreamWindow(conn: *Conn) u31 {
                 return @intCast(c.nghttp2_session_get_local_settings(conn.session, c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE));
+            }
+
+            /// Gives back the counts of `n` finished streams, once the writer
+            /// has flushed what it took up to their finish. Takes the mutex.
+            fn settleFinished(conn: *Conn, n: usize) void {
+                if (n == 0) return;
+                conn.lock();
+                conn.unflushed_finishes -= n;
+                conn.unlock();
+                for (0..n) |_| conn.server.finishRequest();
+            }
+
+            /// The writer has ended (or never started): what it still held
+            /// is given back, and from now on a stream's count at once.
+            /// Under the mutex.
+            fn writerGone(conn: *Conn) void {
+                conn.writer_gone = true;
+                for (0..conn.unflushed_finishes) |_| conn.server.finishRequest();
+                conn.unflushed_finishes = 0;
             }
 
             fn kickWriter(conn: *Conn) void {
@@ -470,7 +506,12 @@ pub fn Engine(comptime Ctx: type) type {
                 _ = conn.streams.remove(stream.id);
                 if (stream.counted) {
                     conn.open_streams -= 1;
-                    conn.server.finishRequest();
+                    if (conn.writer_gone) {
+                        conn.server.finishRequest();
+                    } else {
+                        conn.unflushed_finishes += 1;
+                        conn.kickWriter();
+                    }
                 }
                 if (conn.spare_streams.items.len < max_spare_streams) {
                     if (conn.spare_streams.append(conn.allocator, stream)) |_| return else |_| {}
@@ -536,6 +577,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // A drain still holding the server: give back its count.
                 conn.drain_notice = false;
                 conn.releaseDrainHold();
+                conn.writerGone();
                 // The tasks are joined (the group's cancel runs first), so
                 // each release here is the freeing one.
                 while (true) {
@@ -742,6 +784,7 @@ pub fn Engine(comptime Ctx: type) type {
             defer {
                 conn.lock();
                 defer conn.unlock();
+                conn.writerGone();
                 var it = conn.streams.valueIterator();
                 while (it.next()) |stream| {
                     stream.*.reset = true;
@@ -774,9 +817,13 @@ pub fn Engine(comptime Ctx: type) type {
             while (true) {
                 const gen = conn.write_gen.load(.acquire);
                 var closing = false;
+                // Streams finished by the time this round's frames were
+                // taken: their counts go back once those frames are flushed.
+                var settled: usize = 0;
                 {
                     conn.lock();
                     defer conn.unlock();
+                    defer settled = conn.unflushed_finishes;
                     closing = conn.closing;
                     while (true) {
                         var data: [*c]const u8 = undefined;
@@ -795,11 +842,13 @@ pub fn Engine(comptime Ctx: type) type {
                     }
                 }
                 if (writer.end > 0 or spill.items.len > 0) {
+                    if (comptime @import("builtin").is_test) if (test_before_flush) |hook| try hook(conn.io);
                     if (spill.items.len > 0) {
                         writer.writeAll(spill.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
                         spill.clearRetainingCapacity();
                     }
                     writer.flush() catch return conn.connection.getWriteError() orelse error.Unexpected;
+                    conn.settleFinished(settled);
                     // The drain's final GOAWAY is on the wire now.
                     if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
                         conn.lock();
@@ -808,6 +857,8 @@ pub fn Engine(comptime Ctx: type) type {
                     }
                     continue;
                 }
+                // Nothing taken this round: whatever came before is flushed.
+                conn.settleFinished(settled);
                 // The session is over (a GOAWAY went out, for a protocol
                 // error or after the last stream of a closing session, or
                 // came in with no stream open) and wants neither to read
