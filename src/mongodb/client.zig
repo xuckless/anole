@@ -830,6 +830,10 @@ pub const Client = struct {
                         x.txn_number = x.session.?.txn_number;
                     }
                     const reply = self.send(c, &x, ctx, deadline) catch |err| {
+                        // Read before the release: a broken connection is
+                        // closed and freed there.
+                        const generation = connection.generation;
+                        const max_wire_version = connection.max_wire_version;
                         self.release(server, connection, io);
                         switch (err) {
                             error.Canceled => {
@@ -844,7 +848,7 @@ pub const Client = struct {
                         // The exchange broke off: a network error (or a
                         // reply we could not read).
                         if (x.session) |sess| sess.dirty = true;
-                        self.handleError(server, .{ .address = "", .generation = connection.generation, .max_wire_version = connection.max_wire_version, .kind = .network, .message = @errorName(err) });
+                        self.handleError(server, .{ .address = "", .generation = generation, .max_wire_version = max_wire_version, .kind = .network, .message = @errorName(err) });
                         if (retry_allowed and (op.retry == .read or x.txn_number != null)) continue;
                         return c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = "the connection to the server failed mid-command", .table = op.collection });
                     };
