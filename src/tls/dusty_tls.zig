@@ -471,6 +471,23 @@ pub const Connection = struct {
         return block + sh.pending.mem.len + sh.sending.mem.len;
     }
 
+    /// Whether nothing is in flight in either direction: no ciphertext
+    /// buffered here or inside BoringSSL (a partial record included), and
+    /// nothing queued to send. A server can then set the connection aside
+    /// with no task reading it (a parked connection) and read it again when
+    /// the socket is readable. Gives back a read block it still held. Only
+    /// while neither side is using the connection.
+    pub fn parkable(self: *Connection) bool {
+        const sh = self.shared orelse return true;
+        sh.lock();
+        defer sh.unlock();
+        if (sh.filling or sh.input.bufferedLen() != 0 or sh.pending.len != 0 or sh.sending.len != 0) return false;
+        if (c.SSL_has_pending(sh.ssl) != 0) return false;
+        if (sh.block != null or sh.foreign) sh.useStash();
+        sh.read_full = false;
+        return true;
+    }
+
     /// Frees the SSL, which frees the BIO and the shared state with it.
     pub fn deinit(self: *Connection) void {
         if (self.shared) |sh| c.SSL_free(sh.ssl);

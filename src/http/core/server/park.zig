@@ -1,0 +1,264 @@
+// Anole code, written for the HTTP core after it left lalinsky/dusty; see
+// LICENSE.dusty and THIRD_PARTY_NOTICES for the rest of src/http/core.
+
+//! Idle connections without a task. A connection that has waited
+//! `timeout.idle_park` for its next request (or a callback WebSocket for its
+//! next message) with nothing buffered ends its task and waits here as a heap
+//! object. When its socket becomes readable, a task is started on the same
+//! executor to serve it, and that task parks it again when it goes idle once
+//! more.
+//!
+//! Each executor has a `Shelf` and a driver task (`drive`) that owns the
+//! shelf's zio `CompletionQueue`. A connection parks from its own task by
+//! submitting a readiness poll, which lives in its heap state, to the queue;
+//! the driver takes the polls as they complete and starts a task for each
+//! connection. Every second it looks for parked connections past their
+//! deadline (keep-alive, or the first request's) and shuts their sockets
+//! down, so that their polls come back through the queue, where the driver
+//! closes them: in any order, and without canceling polls one by one, which
+//! costs a walk of the queue each. When the server stops (`stop`), the driver
+//! does the same with all of them, and ends once every poll is back.
+//! Everything here happens on the shelf's executor, between tasks that do not
+//! yield while they touch it, so nothing takes a lock (the doorbell that
+//! `stop` rings is thread-safe).
+//!
+//! Only on zio with pinned executors: elsewhere `supported` is false, or the
+//! drivers cannot be placed (`spawnOn` fails), and connections keep their
+//! task while idle, as before.
+
+const std = @import("std");
+const zio = @import("zio");
+
+/// The `zio` in use has the completion queue and placement: not the core's
+/// test stub.
+pub const supported = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "CompletionQueue") and
+    @hasDecl(zio, "ev") and @hasDecl(zio.ev, "NetPoll") and @hasDecl(zio.ev, "Async") and
+    @hasDecl(zio, "Group") and @hasDecl(zio.Group, "spawnInto") and
+    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo");
+
+const NetPoll = if (supported) zio.ev.NetPoll else void;
+
+/// How often a shelf looks for parked connections past their deadline:
+/// the deadlines are kept to about this.
+pub const sweep_interval: std.Io.Duration = .fromSeconds(1);
+
+/// What a parked connection keeps for its shelf, in the connection's own
+/// heap state.
+pub const Parked = struct {
+    vtable: *const VTable,
+    /// The readiness poll in the shelf's queue, while parked.
+    poll: NetPoll = undefined,
+    node: std.DoublyLinkedList.Node = .{},
+    /// The shelf it is on, while parked.
+    shelf: ?*Shelf = null,
+    /// When the driver closes it (awake clock); null for never.
+    deadline: ?std.Io.Timestamp = null,
+    /// Its deadline passed, or the server is stopping: its socket is shut
+    /// down, and it closes when its poll comes back.
+    expired: bool = false,
+    /// `VTable.expire` is not done with it yet (it may wait).
+    expiring: bool = false,
+    /// Its poll came back while `expiring`: `expireDone` closes it.
+    back: bool = false,
+
+    pub fn isParked(self: *const Parked) bool {
+        return self.shelf != null;
+    }
+
+    /// From `VTable.expire`'s work, once done with the connection: shuts
+    /// its socket down so that its poll comes back for the driver to close
+    /// it, or closes it now if the poll is back already. On the shelf's
+    /// executor.
+    pub fn expireDone(self: *Parked) void {
+        self.expiring = false;
+        if (self.back) return self.vtable.close(self);
+        if (comptime supported) zio.os.net.shutdown(self.poll.handle, .both) catch {};
+    }
+};
+
+/// What a shelf does with a connection, supplied by its owner. Each is
+/// called from the shelf's driver task.
+pub const VTable = struct {
+    /// Starts a task to serve the connection (`spawnLocal`). An error
+    /// leaves it to the shelf, which closes it.
+    wake: *const fn (*Parked) anyerror!void,
+    /// Ends a connection whose deadline passed or whose server is stopping,
+    /// gracefully where that takes a write (a TLS close_notify, which may
+    /// wait): starts a task that does that and then calls
+    /// `Parked.expireDone`, or calls it at once. An error calls it from the
+    /// shelf.
+    expire: *const fn (*Parked) anyerror!void,
+    /// Closes the connection and frees it.
+    close: *const fn (*Parked) void,
+};
+
+/// One executor's parked connections.
+pub const Shelf = struct {
+    /// Those with a deadline, soonest first. A connection is added as it
+    /// parks, and every deadline is "parked at, plus a constant" for each
+    /// kind of wait, so it is nearly always added at the tail.
+    timed: std.DoublyLinkedList = .{},
+    untimed: std.DoublyLinkedList = .{},
+    /// How many polls are in the queue: parked connections, and expired
+    /// ones not closed yet. Written on the shelf's executor only, read from
+    /// anywhere (`Server.parkedConnections`).
+    count: std.atomic.Value(usize) = .init(0),
+    /// The server stopped taking parked connections (`stop`).
+    closed: bool = false,
+    cq: if (supported) zio.CompletionQueue else void = if (supported) .init() else {},
+    /// The driver's doorbell, rung by `stop` from any thread.
+    bell: if (supported) zio.ev.Async else void = if (supported) .init() else {},
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// The driver has ended, every connection parked here closed.
+    done: std.Io.Event = .unset,
+
+    /// Parks `p`, its socket `handle` watched for input. False when it
+    /// cannot be (the shelf is closed, or its queue refuses): the caller
+    /// keeps or closes the connection. Called on the executor that owns the
+    /// shelf, as the last thing the connection's task does with the
+    /// connection: from then on a task may be serving it.
+    pub fn park(self: *Shelf, p: *Parked, handle: anytype) bool {
+        if (comptime !supported) return false;
+        if (self.closed) return false;
+        p.poll = .init(handle, .recv);
+        p.expired = false;
+        p.expiring = false;
+        p.back = false;
+        self.cq.submit(&p.poll.c) catch return false;
+        self.insert(p);
+        _ = self.count.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    /// Asks the driver to close every parked connection and end. From any
+    /// thread; `done` is set once it has.
+    pub fn stop(self: *Shelf) void {
+        if (comptime !supported) return;
+        self.stopping.store(true, .release);
+        self.bell.notify();
+    }
+
+    fn insert(self: *Shelf, p: *Parked) void {
+        p.shelf = self;
+        const deadline = p.deadline orelse return self.untimed.append(&p.node);
+        var after = self.timed.last;
+        while (after) |n| : (after = n.prev) {
+            const other: *Parked = @alignCast(@fieldParentPtr("node", n));
+            if (other.deadline.?.nanoseconds <= deadline.nanoseconds) break;
+        }
+        if (after) |n| self.timed.insertAfter(n, &p.node) else self.timed.prepend(&p.node);
+    }
+
+    fn remove(self: *Shelf, p: *Parked) void {
+        if (p.deadline != null) self.timed.remove(&p.node) else self.untimed.remove(&p.node);
+        p.shelf = null;
+    }
+
+    /// Takes `p` off the lists and ends it: it closes when its poll is
+    /// back.
+    fn expire(self: *Shelf, p: *Parked) void {
+        self.remove(p);
+        p.expired = true;
+        p.expiring = true;
+        p.vtable.expire(p) catch p.expireDone();
+    }
+
+    /// Expires the connections whose deadline is not after `now`.
+    fn sweep(self: *Shelf, now: std.Io.Timestamp) void {
+        while (self.timed.first) |n| {
+            const p: *Parked = @alignCast(@fieldParentPtr("node", n));
+            if (p.deadline.?.nanoseconds > now.nanoseconds) break;
+            self.expire(p);
+        }
+    }
+
+    /// Expires every parked connection, and takes no more.
+    fn expireAll(self: *Shelf) void {
+        self.closed = true;
+        while (self.timed.first orelse self.untimed.first) |n| {
+            self.expire(@alignCast(@fieldParentPtr("node", n)));
+        }
+    }
+
+    /// `p`'s poll is back: its socket is readable (or failed, which the
+    /// next read reports), or was shut down.
+    fn pollBack(self: *Shelf, p: *Parked) void {
+        _ = self.count.fetchSub(1, .monotonic);
+        if (p.expired) {
+            if (p.expiring) p.back = true else p.vtable.close(p);
+            return;
+        }
+        self.remove(p);
+        p.vtable.wake(p) catch p.vtable.close(p);
+    }
+};
+
+/// A shelf's driver, on its executor: starts a task for each parked
+/// connection whose socket becomes readable, expires those past their
+/// deadline every `sweep_interval`, and once the shelf stops, expires the
+/// rest and ends when all of them are closed.
+pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
+    if (comptime !supported) return;
+    defer shelf.done.set(io);
+    // Refused only when the queue cannot be used at all.
+    shelf.cq.submit(&shelf.bell.c) catch {
+        shelf.closed = true;
+        return;
+    };
+    var next_sweep = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = sweep_interval, .clock = .awake });
+    while (!shelf.closed or shelf.count.load(.monotonic) > 0) {
+        const left = std.Io.Clock.Timestamp.now(io, .awake).durationTo(next_sweep).raw.nanoseconds;
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@max(0, left)), .clock = .awake } };
+        const c = shelf.cq.waitTimeout(.fromStd(timeout)) catch |err| switch (err) {
+            error.Timeout => {
+                const now = std.Io.Clock.Timestamp.now(io, .awake);
+                shelf.sweep(now.raw);
+                next_sweep = now.addDuration(.{ .raw = sweep_interval, .clock = .awake });
+                continue;
+            },
+            // Canceled rather than stopped: zio has canceled every poll and
+            // closed the queue, and what comes back is closed here.
+            error.Canceled => {
+                shelf.closed = true;
+                while (shelf.cq.next()) |back| {
+                    if (back == &shelf.bell.c) continue;
+                    const p: *Parked = @alignCast(@fieldParentPtr("poll", back.cast(NetPoll)));
+                    _ = shelf.count.fetchSub(1, .monotonic);
+                    if (!p.expired) {
+                        shelf.remove(p);
+                        p.vtable.close(p);
+                    } else if (p.expiring) p.back = true else p.vtable.close(p);
+                }
+                return error.Canceled;
+            },
+            error.Closed => break,
+        };
+        if (c == &shelf.bell.c) {
+            if (shelf.stopping.load(.acquire)) shelf.expireAll() else shelf.cq.submit(&shelf.bell.c) catch {};
+            continue;
+        }
+        shelf.pollBack(@alignCast(@fieldParentPtr("poll", c.cast(NetPoll))));
+    }
+    shelf.cq.close();
+}
+
+/// `group`'s `spawnInto(.local, func, args)`, from a task on an executor.
+pub fn spawnLocal(group: *std.Io.Group, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
+    if (comptime !supported) return error.Unsupported;
+    return zio.Group.fromStd(group).spawnInto(.local, func, args);
+}
+
+/// `group`'s `spawnInto(.{ .executor = index }, func, args)`. Fails with
+/// `error.InvalidPlacement` where tasks cannot be pinned (zio's
+/// work-stealing scheduling), and so where nothing can park.
+pub fn spawnOn(group: *std.Io.Group, index: usize, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
+    if (comptime !supported) return error.Unsupported;
+    return zio.Group.fromStd(group).spawnInto(.{ .executor = @intCast(index) }, func, args);
+}
+
+/// Whether the zio running `io` can park connections: placement applies
+/// (see `spawnOn` for the scheduling part).
+pub fn usable(io: std.Io) bool {
+    if (comptime !supported) return false;
+    return zio.Runtime.fromIo(io) != null;
+}

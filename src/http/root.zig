@@ -107,3 +107,7 @@ test "HTTP/1.1 smoke: GET /users/:id over loopback on zio" {
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     try std.testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nuser 42"));
 }
+
+test {
+    _ = @import("park_test.zig");
+}

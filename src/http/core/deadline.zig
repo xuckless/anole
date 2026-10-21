@@ -120,6 +120,13 @@ pub const Timer = if (have_auto_cancel) struct {
     pub fn canBound(_: *const @This()) bool {
         return true;
     }
+
+    /// Whether the cancel the task just got was this timer's, which it
+    /// then consumes; false for a cancel from anyone else (the server
+    /// stopping), which stays the task's.
+    pub fn fired(self: *@This()) bool {
+        return self.inner.check(error.Canceled);
+    }
 } else struct {
     /// Null when no deadline was configured.
     watch: ?*Watch = null,
@@ -142,6 +149,12 @@ pub const Timer = if (have_auto_cancel) struct {
     /// was configured for the connection.
     pub fn canBound(self: *const @This()) bool {
         return self.watch != null;
+    }
+
+    /// The watcher cancels the whole connection, so a cancel is never one
+    /// to carry on from.
+    pub fn fired(_: *@This()) bool {
+        return false;
     }
 };
 

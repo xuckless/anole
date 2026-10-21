@@ -404,6 +404,18 @@ pub const ServerConfig = struct {
         keepalive: ?std.Io.Duration = .fromSeconds(60),
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
+        /// How long an HTTP/1.1 connection waits for its next request on a
+        /// task of its own before it parks: the task ends, and the
+        /// connection waits as a small heap object until its socket is
+        /// readable, when a new task is started on the same executor to
+        /// serve it. A connection that sends again sooner keeps its task,
+        /// so a busy one never pays for parking. Only with something to
+        /// park: nothing buffered, and on TLS nothing pending in either
+        /// direction. A parked connection's `keepalive` (or first
+        /// `request`) deadline is kept to about a second. Null or zero
+        /// keeps idle connections on their task. Only on zio with pinned
+        /// executors; elsewhere connections never park.
+        idle_park: ?std.Io.Duration = .fromSeconds(1),
         /// Maximum time a graceful shutdown waits for the connections still
         /// in flight. Null waits for all of them, however long they take --
         /// which for a connection that never closes on its own, such as a
