@@ -562,6 +562,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .stack_pool = .{
                     .maximum_size = opts.max_stack_size,
                     .committed_size = @min(opts.max_stack_size, 256 * 1024),
+                    // The stacks of tasks that ended, such as those of
+                    // connections that parked (`timeout.idle_park`), go back
+                    // to the system within seconds rather than minutes: the
+                    // pool keeps what was in use at once during the last
+                    // interval, and half of what it kept before.
+                    .shrink_interval = .fromSeconds(2),
                 },
             });
             errdefer rt.deinit();
