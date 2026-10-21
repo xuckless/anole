@@ -622,7 +622,7 @@ pub fn Engine(comptime Ctx: type) type {
         fn lingeringClose(conn: *Conn) std.Io.Cancelable!void {
             var timer: Timer = .init(null);
             if (!timer.canBound()) return;
-            if (!shutSend(conn)) return;
+            if (!try shutSend(conn)) return;
             timer.set(conn.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
             defer timer.clear(conn.io);
             _ = conn.connection.reader.discardShort(linger_limit) catch {
@@ -639,7 +639,14 @@ pub fn Engine(comptime Ctx: type) type {
         /// so the peer reads a clean end after the last frame. Only from
         /// the side that writes: the writer while it runs, the connection's
         /// task after. Whether the peer may still be there to read from.
-        fn shutSend(conn: *Conn) bool {
+        ///
+        /// A cancel that arrives here is passed on, never dropped. The drain
+        /// cancels the connection as soon as its final GOAWAY is flushed,
+        /// which can land just before the shutdown below; a cancel taken
+        /// there and dropped left the send side open and the writer's wait
+        /// in `awaitReader` no longer cancelable, so the peer saw the end
+        /// only `linger_timeout` later.
+        fn shutSend(conn: *Conn) std.Io.Cancelable!bool {
             {
                 conn.lock();
                 defer conn.unlock();
@@ -652,9 +659,18 @@ pub fn Engine(comptime Ctx: type) type {
                 defer timer.clear(conn.io);
                 conn.connection.closeNotify();
             }
+            // close_notify's write took a cancel (the teardown's, or the
+            // bound above for a peer that stopped reading), which the TLS
+            // layer does not report: end both directions, so the reader
+            // stops too, and pass the cancel on.
+            if (conn.connection.getWriteError()) |err| if (err == error.Canceled) {
+                conn.connection.stream.shutdown(conn.io, .both) catch {};
+                return error.Canceled;
+            };
             conn.connection.stream.shutdown(conn.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return false,
+                error.Canceled => return error.Canceled,
                 else => {},
             };
             return true;
@@ -815,7 +831,7 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 conn.unlock();
                 if (finished) {
-                    _ = shutSend(conn);
+                    _ = try shutSend(conn);
                     return awaitReader(conn);
                 }
                 if (closing and !handlers_running) return;
