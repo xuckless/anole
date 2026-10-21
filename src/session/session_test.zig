@@ -4,7 +4,6 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const session = @import("root.zig");
 const features = @import("build_options");
-const redis = if (features.redis) @import("../redis/root.zig") else struct {};
 const RedisStore = if (features.redis) session.RedisStore else void;
 
 fn setUser(req: *dusty.Request, res: *dusty.Response) !void {
@@ -72,12 +71,13 @@ fn run(kind: Kind) !void {
         .cookie => {},
         .memory => store = mem.store(),
         .redis => if (comptime features.redis) {
-            const port = features.redis_test_port orelse return error.SkipZigTest;
-            redis_store = .{ .client = try redis.Client.connect(gpa, io, .{ .port = port }), .gpa = gpa };
+            const live = @import("../redis/live_test.zig");
+            if (live.url == null) return error.SkipZigTest;
+            redis_store = .{ .client = try live.open(io, .{}), .gpa = gpa };
             store = redis_store.store();
         } else return error.SkipZigTest,
     }
-    defer if (comptime features.redis) if (kind == .redis) redis_store.client.close();
+    defer if (comptime features.redis) if (kind == .redis) redis_store.client.deinit();
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
     defer server.deinit();
     var mw = session.Middleware.init(.{ .store = store, .key = @splat(3) });
@@ -158,6 +158,6 @@ test "session: memory store" {
     try run(.memory);
 }
 
-test "session: Redis store against a live server (-Dredis-test-port)" {
+test "redis: live session store (RedisStore)" {
     try run(.redis);
 }

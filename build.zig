@@ -388,7 +388,8 @@ pub fn build(b: *std.Build) void {
 
     // Options are declared before the lazy-dependency return below: one
     // first declared after it is "invalid" on a fresh cache's first pass.
-    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
+    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port of 127.0.0.1");
+    const redis_test_url = b.option([]const u8, "redis-test-url", "Run the Redis tests against a live Redis/Valkey at this URL (redis://, rediss://...)");
     const postgres_test_url = b.option([]const u8, "postgres-test-url", "Run the PostgreSQL tests against a live server at this URL (postgres://...)");
     const mongodb_test_url = b.option([]const u8, "mongodb-test-url", "Run the MongoDB tests against a live server at this URL (mongodb://...)");
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
@@ -438,7 +439,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
@@ -467,6 +468,16 @@ pub fn build(b: *std.Build) void {
         const run_mongo_tests = b.addRunArtifact(mongo_tests);
         run_mongo_tests.has_side_effects = mongodb_test_url != null;
         b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
+    }
+
+    // test-redis: the Redis tests alone ("redis: ..."), the session store's
+    // and the rate limiter's among them; with -Dredis-test-url (or
+    // -Dredis-test-port), against that server (tests/redis/run.sh).
+    if (features.redis) {
+        const redis_tests = b.addTest(.{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const run_redis_tests = b.addRunArtifact(redis_tests);
+        run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
+        b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
     }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
@@ -641,6 +652,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "postgres", .needs = features.postgres, .about = "a posts API on PostgreSQL (DATABASE_URL), on port 3000" },
         .{ .name = "sqlite", .needs = features.sqlite, .about = "a to-do API on SQLite (todos.db, or a path after --), on port 3000" },
         .{ .name = "mongodb", .needs = features.mongodb, .about = "a users API on MongoDB (MONGODB_URI), on port 3000" },
+        .{ .name = "redis", .needs = features.redis, .about = "a counter, a cache, a leaderboard and pub/sub on Redis (REDIS_URL), on port 3000" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;
@@ -1326,6 +1338,7 @@ const AnoleModuleOptions = struct {
     /// Add test-only imports (the h3 layout probe).
     for_test: bool = false,
     redis_test_port: ?u16 = null,
+    redis_test_url: ?[]const u8 = null,
     postgres_test_url: ?[]const u8 = null,
     mongodb_test_url: ?[]const u8 = null,
     /// src/bson as a module, for -Dmongodb.
@@ -1350,10 +1363,12 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "postgres", f.postgres);
     options.addOption(bool, "sqlite", f.sqlite);
     options.addOption(bool, "mongodb", f.mongodb);
-    // Live servers for tests (`-Dredis-test-port=6379`,
+    // Live servers for tests (`-Dredis-test-port=6379` or
+    // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
     // else those tests skip.
     options.addOption(?u16, "redis_test_port", o.redis_test_port);
+    options.addOption(?[]const u8, "redis_test_url", o.redis_test_url);
     options.addOption(?[]const u8, "postgres_test_url", o.postgres_test_url);
     options.addOption(?[]const u8, "mongodb_test_url", o.mongodb_test_url);
 

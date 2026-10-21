@@ -14,6 +14,7 @@ const std = @import("std");
 const dusty = @import("dusty");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
+const db = @import("../db/root.zig");
 
 pub const Policy = struct {
     /// Requests allowed per window.
@@ -178,7 +179,8 @@ pub const MemoryLimiter = struct {
 };
 
 /// Buckets in Redis/Valkey (-Dredis), shared by every node: one script
-/// refills and takes atomically, on the server's clock.
+/// refills and takes atomically, on the server's clock. On the client's
+/// pools (`app.redis`).
 pub const RedisLimiter = if (features.redis) struct {
     client: *redis.Client,
     gpa: std.mem.Allocator,
@@ -213,25 +215,18 @@ pub const RedisLimiter = if (features.redis) struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const k = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.prefix, key });
-        const reply = try self.client.command(arena, &.{
-            "EVAL",                                                     script,                                                      "1",                                           k,
-            try std.fmt.allocPrint(arena, "{d}", .{policy.capacity()}), try std.fmt.allocPrint(arena, "{d}", .{policy.ratePerMs()}), try std.fmt.allocPrint(arena, "{d}", .{cost}), try std.fmt.allocPrint(arena, "{d}", .{policy.window_ms}),
-        });
-        const items = switch (reply) {
-            .array => |a| a,
-            .err => return error.RedisError,
-            else => return error.UnexpectedReply,
-        };
+        var c: db.Ctx = .{ .io = self.client.io, .arena = arena };
+        const items = try self.client.all(i64, &c, .{ "EVAL", script, 1, k, policy.capacity(), policy.ratePerMs(), cost, policy.window_ms });
         if (items.len != 3) return error.UnexpectedReply;
-        const allowed = items[0].int == 1;
-        const tokens = @as(f64, @floatFromInt(items[1].int)) / 1000.0;
+        const allowed = items[0] == 1;
+        const tokens = @as(f64, @floatFromInt(items[1])) / 1000.0;
         const rate = policy.ratePerMs();
         return .{
             .allowed = allowed,
             .limit = policy.limit,
             .remaining = if (allowed) @intFromFloat(@floor(tokens)) else 0,
             .reset_seconds = if (rate > 0) @intFromFloat(@ceil((policy.capacity() - tokens) / (rate * 1000.0))) else 0,
-            .retry_after_seconds = if (allowed) 0 else @max(1, @as(u32, @intCast(@divFloor(items[2].int + 999, 1000)))),
+            .retry_after_seconds = if (allowed) 0 else @max(1, @as(u32, @intCast(@divFloor(items[2] + 999, 1000)))),
         };
     }
 } else struct {};
@@ -363,19 +358,21 @@ test "Middleware: 429 with Retry-After once the bucket is empty" {
     try std.testing.expect(std.mem.indexOf(u8, last[0..last_len], "RateLimit-Remaining: 0") != null);
 }
 
-test "RedisLimiter against a live server (-Dredis-test-port)" {
+test "redis: live rate limiter (RedisLimiter)" {
     if (!features.redis) return error.SkipZigTest;
-    const port = features.redis_test_port orelse return error.SkipZigTest;
+    const live = @import("../redis/live_test.zig");
+    if (live.url == null) return error.SkipZigTest;
     const zio = @import("zio");
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    const client = try redis.Client.connect(gpa, io, .{ .port = port });
-    defer client.close();
+    const client = try live.open(io, .{});
+    defer client.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    _ = try client.command(arena_state.allocator(), &.{ "DEL", "anole:rl:t" });
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    _ = try client.del(&c, "anole:rl:t");
     var rl: RedisLimiter = .{ .client = client, .gpa = gpa };
     const l = rl.limiter();
     const policy: Policy = .{ .limit = 3, .window_ms = 60_000 };

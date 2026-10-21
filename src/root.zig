@@ -120,7 +120,10 @@ pub const webtransport = if (features.http3) @import("webtransport.zig") else st
 /// JSON on yyjson (-Djson): parse into and stringify Zig types.
 pub const json = if (features.json) @import("json/root.zig") else struct {};
 
-/// A Redis/Valkey client on std.Io (-Dredis), with hiredis's RESP parser.
+/// Redis and Valkey (-Dredis): `app.redis(.{})` (REDIS_URL), then
+/// `app.cache.get(req, key)`, `command(req, .{ "INCR", key })`, pipelines
+/// and pub/sub, with the `anole.db` calling convention and a pool per
+/// executor.
 pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 
 /// What the database connectors share: calls that take the request, a
