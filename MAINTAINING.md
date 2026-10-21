@@ -15,7 +15,7 @@ that happens promptly.
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (tarball) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
-| zlib-ng, zstd, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
+| zlib-ng, zstd, Brotli, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
 | zig-protobuf | build.zig.zon | upstream commit; it pins protoc per platform |
 | websocket-zig, zig-jwt, zig-sqlite | build.zig.zon | commits of the xuckless forks, branch `anole` |
 | pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
@@ -30,7 +30,7 @@ updating that table makes the script exit 2.
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
 whenever build.zig.zon changes. It checks nghttp2, ngtcp2, nghttp3, zlib-ng,
-zstd, yyjson and hiredis against their GitHub security advisories, the
+zstd, Brotli, yyjson and hiredis against their GitHub security advisories, the
 BoringSSL commit against OSV, and SQLite against NVD's CVE list (SQLite
 publishes no GitHub advisories; `NVD_IGNORE` lists CVEs NVD matches to every
 SQLite version only because SQLite is the platform of the vulnerable product). A failure means a pinned version is affected:
@@ -84,6 +84,13 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      merge into `anole`, and pin the merge commit. Then run
      `tests/h3/run.sh` (WebTransport and RFC 9220 included) and
      `tests/interop/webtransport/run.sh`.
+   - **Brotli** (`-Dbrotli`): `build/brotli.zig` lists the `.c` files of
+     the tarball's `c/common`, `c/enc` and `c/dec` (what upstream's
+     CMakeLists.txt globs); compare the lists with the new tarball, and
+     keep `c/enc/static_init_lazy.cc` out (C++, only for
+     `BROTLI_STATIC_INIT_LAZY`). Then run `tools/sanitize-c-libs.sh brotli`
+     and the Brotli tests (`zig build test`: the round trips and the
+     "fuzz: Brotli" target in `src/http/core/brotli_io.zig`).
    - **SQLite** is the amalgamation zip from sqlite.org (the URL carries
      the year and the version as `3XXYYZZ`); check the zip's SHA3-256
      against the download page. Its compile-time options are
@@ -155,8 +162,8 @@ Anole code since 2026-10-20: changes land here directly. Keep the
 attribution header on every file and THIRD_PARTY_NOTICES part B current.
 
 - Its own tests run in `zig build test` (and alone as `zig build core-test`)
-  with its test runner and its zio stub, on Anole's TLS, nghttp2, zlib-ng
-  and zstd. Their certificate is made at build time by
+  with its test runner and its zio stub, on Anole's TLS, nghttp2, zlib-ng,
+  zstd and Brotli. Their certificate is made at build time by
   `tests/test_cert.zig`; no key is committed.
 - Its "fuzz:" targets run a second time under Zig's own test runner, so
   `zig build test --fuzz` fuzzes them with Anole's.

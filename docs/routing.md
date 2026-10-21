@@ -384,8 +384,25 @@ app.embedded("/favicon.ico", @embedFile("favicon.ico"), .{ .cache_control = "pub
 With `-Dcompression` (on in `web` and `full`), a response is compressed when
 the handler sets `res.compress = true`, or always through `Compress`.
 
-- zstd or gzip (zlib-ng) by the client's `Accept-Encoding` q-values, zstd on
-  a tie. Streamed bodies are compressed as they are written.
+- zstd, Brotli (`br`, with `-Dbrotli`, on in `web` and `full`) or gzip
+  (zlib-ng) by the client's `Accept-Encoding` q-values; on a tie zstd, then
+  `br`, then gzip. So browsers that offer zstd get zstd, and a client that
+  offers `gzip, br` (Safari, most HTTP benchmarks) gets `br`. `identity`
+  and `*` count as RFC 9110 says: `*` stands for every coding not named,
+  and `br;q=0` refuses one. Streamed bodies are compressed as they are
+  written, and each `flush` sends what was written so far in a form the
+  client can already decode.
+- Brotli runs at quality 5 by default
+  (`.server = .{ .response = .{ .brotli_quality = 5 } }`, 0 to 11), or per
+  response with `res.brotli_quality`. On JSON bodies of 1.5 to 12 KB,
+  quality 5 is 10-15% smaller than gzip and zstd and 8-13% smaller than
+  quality 4, at about twice gzip's CPU time; quality 6 gains under 1% more,
+  and 11 is for precompressed files (`precompressed = &.{.br}`), not for
+  responses. Its window is at most 64 KiB, so each Brotli response in
+  flight takes about 600 KiB. Its large blocks, and gzip's for a buffered
+  body, come from a cache per executor, reused from one response to the
+  next (no `mmap` or page faults per response, with glibc or musl),
+  holding at most 4 MiB and trimmed back to one encoder's worth when idle.
 - Only compressible types: text, JSON, JavaScript, XML, SVG, `+json` and
   `+xml` types and the like. Not images, video, fonts or archives.
 - Buffered bodies under 128 bytes, or that do not shrink, go out as they are.
