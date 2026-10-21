@@ -82,5 +82,5 @@ exec docker run --rm --name anole-bench-loadgen --network host \
   -e BENCH_HOST_DIR="$bench" -e HOST_CGROUP=/host/cgroup \
   -e SUT_CPUS_1="$SUT_CPUS_1" -e SUT_CPUS_4="$SUT_CPUS_4" -e LOAD_CPUS="$LOAD_CPUS" \
   -e PG_CPUS="$PG_CPUS" -e PG_CPUS_TWELVE="$PG_CPUS_TWELVE" \
-  -e SUT_URING="${SUT_URING:-}" \
+  -e SUT_URING="${SUT_URING:-}" -e WSPIPE_CONNS="${WSPIPE_CONNS:-}" -e WSPIPE_PATHS="${WSPIPE_PATHS:-}" \
   anole-bench/loadgen suite "$@" -out "/bench/results/$id"

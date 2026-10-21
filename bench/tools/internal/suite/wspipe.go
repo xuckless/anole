@@ -3,6 +3,9 @@ package suite
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xuckless/anole/bench/tools/internal/load"
@@ -21,6 +24,19 @@ var wspipePaths = []string{"/ws/echo", "/ws/echo-cb"}
 // (gcannon): every connection keeps 16 echo messages in flight on
 // /ws/echo. Every server with WebSockets, every tier.
 func (s *Suite) WsPipe() {
+	conns, paths := wspipeConns, wspipePaths
+	// WSPIPE_CONNS=512 and WSPIPE_PATHS=/ws/echo narrow a recheck to some cells.
+	if v := os.Getenv("WSPIPE_CONNS"); v != "" {
+		conns = nil
+		for _, f := range strings.Split(v, ",") {
+			if n, err := strconv.Atoi(f); err == nil {
+				conns = append(conns, n)
+			}
+		}
+	}
+	if v := os.Getenv("WSPIPE_PATHS"); v != "" {
+		paths = strings.Split(v, ",")
+	}
 	for _, tier := range s.Tiers {
 		for _, name := range s.Servers {
 			if s.manifests[name].WS == "" {
@@ -31,7 +47,7 @@ func (s *Suite) WsPipe() {
 				s.record(Case{Scenario: "wspipe", Server: name, Mode: "h1", Proto: "ws", Tier: tier.Name, Error: err.Error()})
 				continue
 			}
-			for _, path := range wspipePaths {
+			for _, path := range paths {
 				if path != "/ws/echo" {
 					// Optional routes (/ws/echo-cb: WebSocket callbacks) only
 					// where the server has them.
@@ -41,7 +57,7 @@ func (s *Suite) WsPipe() {
 						continue
 					}
 				}
-				for _, conns := range wspipeConns {
+				for _, conns := range conns {
 					r, u, lcpu, err := s.measure(srv, true, func(d time.Duration) (load.Result, error) {
 						return load.Gcannon(load.GcannonWS{URL: "http://127.0.0.1:8080" + path, Conns: conns,
 							Threads: min(s.LoadCPUs, 16), Pipeline: 16, Duration: d})
