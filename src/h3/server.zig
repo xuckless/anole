@@ -13,11 +13,12 @@
 //!     no connection (version negotiation, stateless reset); it passes a
 //!     packet for another endpoint's connection on to that endpoint;
 //!   * the inbox task: handles what other endpoints pass on;
-//!   * the sender task: sends what the connections wrote, together (one
-//!     `sendmmsg` on Linux for every connection's packets of a round);
-//!   * one driver task per connection: writes the connection's packets
-//!     into the endpoint's outbox, runs its timers, and its closing and
-//!     draining periods;
+//!   * the driver task: in rounds, writes the packets of every connection
+//!     that has something to send into the endpoint's outbox, runs the
+//!     connections' timers (loss detection, ACK delay, idle timeout, the
+//!     closing and draining periods) from one timer heap, and sends what
+//!     they wrote together (one `sendmmsg` on Linux for every connection's
+//!     packets of a round). A connection costs no task of its own;
 //!   * one task per request: builds the `Request` and the `Response` and
 //!     runs the router.
 //!
@@ -66,9 +67,9 @@ const SendError = dusty.Response.SendError;
 /// Our connection IDs' length, as ngtcp2's examples use; one byte of them
 /// names the endpoint (`steer`).
 const scid_len = steer.cid_len;
-/// Packets written per driver round (one message, with GSO, each).
+/// Packets a connection writes at a time (one message, with GSO).
 const burst = 10;
-/// What a driver round may write at most.
+/// What a connection may write at a time at most.
 const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 /// How long a connection's flush waits at most for the requests a batch
 /// of datagrams started (`Conn.holding`), so that their answers and the
@@ -290,8 +291,19 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// endpoint's connections only.
         map_mutex: std.Io.Mutex = .init,
         conns: std.AutoHashMapUnmanaged(CidKey, *Conn) = .empty,
-        /// The connections' driver tasks.
-        group: std.Io.Group = .init,
+        /// The connections the driver is to service in its next round
+        /// (`queue`): a stack any task pushes to, which the driver takes
+        /// whole.
+        dirty: std.atomic.Value(?*Conn) = .init(null),
+        /// Bumped to wake the driver.
+        drive_gen: std.atomic.Value(u32) = .init(0),
+        /// Every connection the driver owns, by when it next needs the
+        /// driver (`Conn.timer_at`): a binary heap that only the driver
+        /// touches.
+        timers: std.ArrayList(*Conn) = .empty,
+        /// Connections that closed with request tasks still running, each
+        /// waiting for them in a task of its own (`retire`).
+        finishers: std.Io.Group = .init,
         draining: bool = false,
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
@@ -316,8 +328,6 @@ pub fn Endpoint(comptime Ctx: type) type {
         tx_fill: u1 = 0,
         tx_lock: std.atomic.Mutex = .unlocked,
         tx_send: std.Io.Mutex = .init,
-        /// Bumped to wake the sender task.
-        tx_gen: std.atomic.Value(u32) = .init(0),
         stats: Stats = .{},
         /// Request streams kept for the next ones, with their arenas and
         /// small response rings (`Stream.create`, `Stream.free`). Every
@@ -325,8 +335,6 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// is never contended there; it only keeps other `Io`s safe.
         pool_lock: std.atomic.Mutex = .unlocked,
         pool: std.ArrayList(*Stream) = .empty,
-        /// No sender task: each driver round sends its own packets.
-        tx_direct: bool = true,
         /// The thread serving the endpoint, in test builds (`Stats.foreign`).
         thread: ?std.Thread.Id = null,
 
@@ -482,6 +490,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn deinitOne(self: *Self) void {
             self.udp.socket.close(self.io);
             self.conns.deinit(self.gpa);
+            self.timers.deinit(self.gpa);
             // What other endpoints passed on after this one stopped.
             var left: [1]*Forwarded = undefined;
             while ((self.inbox.getUncancelable(self.io, &left, 0) catch 0) == 1) self.freeForwarded(left[0]);
@@ -609,17 +618,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             group.await(io) catch io.recancel();
         }
 
-        /// One endpoint, on its executor: reads its socket, and its inbox
-        /// in a task beside it.
+        /// One endpoint, on its executor: reads its socket, with its inbox
+        /// and its driver in tasks beside it.
         fn serve(self: *Self) std.Io.Cancelable!void {
             const io = self.io;
             if (builtin.is_test) self.thread = std.Thread.getCurrentId();
             var reader: std.Io.Group = .init;
             // Without the task, packets passed on to it are dropped.
             placement.concurrent(&reader, io, .local, readInbox, .{self}) catch self.inbox.close(io);
-            // Without it, every driver round sends its own packets.
-            const sender = if (placement.concurrent(&reader, io, .local, sendLoop, .{self})) true else |_| false;
-            self.tx_direct = !sender;
+            placement.concurrent(&reader, io, .local, drive, .{self}) catch |err| {
+                log.err("HTTP/3: no task to drive the connections of {f}: {t}", .{ self.address(), err });
+                self.inbox.close(io);
+                reader.cancel(io);
+                return;
+            };
             var batch: net.Udp.Batch = .{};
             while (true) {
                 const n = self.udp.receiveBatch(io, self.rx, &batch, .none) catch |err| switch (err) {
@@ -638,6 +650,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
             self.shutdown(&batch.controls[0]);
             self.inbox.close(io);
+            // The driver closes and frees whatever connections are left.
             reader.cancel(io);
             // What the connections wrote last (their CONNECTION_CLOSEs on
             // a hand-over, say).
@@ -650,24 +663,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             while (!self.tx_lock.tryLock()) std.atomic.spinLoopHint();
         }
 
-        /// The outbox to write a driver round into, locked, with room for
-        /// the round; null when it has none (send it, then try again).
+        /// The outbox to write a connection's packets into, locked, with
+        /// room for `tx_round`; null when it has none (send it, then try
+        /// again).
         fn txReserve(self: *Self) ?*net.Udp.Outbox {
             self.lockTx();
             const o = &self.tx[self.tx_fill];
             if (o.fits(tx_round, burst)) return o;
             self.tx_lock.unlock();
             return null;
-        }
-
-        /// After a round written into the outbox `txReserve` gave: unlocks
-        /// it and, when the round was its first, has it sent soon.
-        fn txCommitted(self: *Self, first: bool) void {
-            self.tx_lock.unlock();
-            if (self.tx_direct) return self.txFlush();
-            if (!first) return;
-            _ = self.tx_gen.fetchAdd(1, .release);
-            self.io.futexWake(u32, &self.tx_gen.raw, 1);
         }
 
         /// Sends whatever the connections have written. Never with a
@@ -689,24 +693,198 @@ pub fn Endpoint(comptime Ctx: type) type {
             self.udp.sendOutbox(io, o);
         }
 
-        /// The sender: once the connections have written, and every task
-        /// already queued on the executor has had its turn (the drivers of
-        /// the other connections the same batch of datagrams woke), one
-        /// send for all of it.
-        fn sendLoop(self: *Self) std.Io.Cancelable!void {
+        // -- The driver ------------------------------------------------------
+
+        /// The driver: in rounds, services every connection kicked since
+        /// the last round (`queue`) and every one whose timer is due, then
+        /// sends what they wrote, together. Between rounds it waits for a
+        /// kick or the earliest timer. When canceled, closes and frees the
+        /// connections left.
+        fn drive(self: *Self) std.Io.Cancelable!void {
             const io = self.io;
             const on_zio = placement.executorCount(io) != null;
+            defer self.finishAll();
             while (true) {
-                const gen = self.tx_gen.load(.acquire);
-                self.lockTx();
-                const pending = self.tx[self.tx_fill].count > 0;
-                self.tx_lock.unlock();
-                if (!pending) {
-                    try io.futexWait(u32, &self.tx_gen.raw, gen);
-                    continue;
+                const gen = self.drive_gen.load(.acquire);
+                if (self.dirty.load(.acquire) == null) {
+                    const t = now(io);
+                    const next = self.nextTimer();
+                    if (next > t) {
+                        const wait: std.Io.Timeout = if (next == std.math.maxInt(u64)) .none else .{ .duration = .{
+                            .raw = .fromNanoseconds(@intCast(next - t)),
+                            .clock = .awake,
+                        } };
+                        try io.futexWaitTimeout(u32, &self.drive_gen.raw, gen, wait);
+                        continue;
+                    }
                 }
+                // Let the tasks already queued on this executor run first:
+                // a batch of datagrams starts many requests, and their
+                // responses then go out together, in as few packets and
+                // sends as they fit, instead of one flush for the first
+                // response and more for the rest.
                 if (on_zio) try zio.yield();
+                self.round();
                 self.txFlush();
+            }
+        }
+
+        /// One round: the kicked connections, in the order they were
+        /// kicked, then the ones whose timer is due.
+        fn round(self: *Self) void {
+            var list = takeDirty(self);
+            while (list) |conn| {
+                // Read before the flag goes: a kick from here on pushes
+                // the connection again, over `next_dirty`.
+                list = conn.next_dirty;
+                conn.queued.store(false, .release);
+                conn.service();
+                conn.unref();
+            }
+            // Servicing a connection moves its timer past the clock reading
+            // it took, which is no earlier than `t`.
+            const t = now(self.io);
+            while (self.timers.items.len > 0 and self.timers.items[0].timer_at <= t) self.timers.items[0].service();
+        }
+
+        /// Has the driver service `conn` in its next round, waking it if it
+        /// waits. Safe from any task or thread; never waits.
+        fn queue(self: *Self, conn: *Conn) void {
+            if (conn.queued.swap(true, .acq_rel)) return;
+            // The list's reference, until the round that services it.
+            conn.ref();
+            var head = self.dirty.load(.monotonic);
+            while (true) {
+                conn.next_dirty = head;
+                head = self.dirty.cmpxchgWeak(head, conn, .release, .monotonic) orelse break;
+            }
+            // The list was empty: the driver may be waiting.
+            if (head == null) {
+                _ = self.drive_gen.fetchAdd(1, .release);
+                self.io.futexWake(u32, &self.drive_gen.raw, 1);
+            }
+        }
+
+        /// The kicked connections, oldest first.
+        fn takeDirty(self: *Self) ?*Conn {
+            var stack = self.dirty.swap(null, .acquire);
+            var list: ?*Conn = null;
+            while (stack) |conn| {
+                stack = conn.next_dirty;
+                conn.next_dirty = list;
+                list = conn;
+            }
+            return list;
+        }
+
+        /// When the earliest timer is due; never when there is none.
+        fn nextTimer(self: *const Self) u64 {
+            return if (self.timers.items.len > 0) self.timers.items[0].timer_at else std.math.maxInt(u64);
+        }
+
+        /// Sets when `conn` next needs the driver, keeping it in the heap.
+        /// On the driver only.
+        fn setTimer(self: *Self, conn: *Conn, at: u64) error{OutOfMemory}!void {
+            if (conn.heap_index == Conn.no_timer) {
+                try self.timers.append(self.gpa, conn);
+                conn.heap_index = @intCast(self.timers.items.len - 1);
+                conn.timer_at = at;
+                return self.siftUp(conn.heap_index);
+            }
+            const earlier = at < conn.timer_at;
+            conn.timer_at = at;
+            if (earlier) self.siftUp(conn.heap_index) else self.siftDown(conn.heap_index);
+        }
+
+        /// Takes `conn` out of the heap. On the driver only.
+        fn removeTimer(self: *Self, conn: *Conn) void {
+            const i = conn.heap_index;
+            if (i == Conn.no_timer) return;
+            conn.heap_index = Conn.no_timer;
+            const last = self.timers.pop().?;
+            if (last == conn) return;
+            self.timers.items[i] = last;
+            last.heap_index = i;
+            self.siftUp(i);
+            self.siftDown(last.heap_index);
+        }
+
+        fn siftUp(self: *Self, start: u32) void {
+            const items = self.timers.items;
+            var i = start;
+            const conn = items[i];
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (items[parent].timer_at <= conn.timer_at) break;
+                items[i] = items[parent];
+                items[i].heap_index = i;
+                i = parent;
+            }
+            items[i] = conn;
+            conn.heap_index = i;
+        }
+
+        fn siftDown(self: *Self, start: u32) void {
+            const items = self.timers.items;
+            const n: u32 = @intCast(items.len);
+            var i = start;
+            const conn = items[i];
+            while (true) {
+                var child = 2 * i + 1;
+                if (child >= n) break;
+                if (child + 1 < n and items[child + 1].timer_at < items[child].timer_at) child += 1;
+                if (conn.timer_at <= items[child].timer_at) break;
+                items[i] = items[child];
+                items[i].heap_index = i;
+                i = child;
+            }
+            items[i] = conn;
+            conn.heap_index = i;
+        }
+
+        /// A connection that is over: out of the heap, then its requests
+        /// end, its IDs go, and the driver's reference with them. Requests
+        /// still running may take a while to see the cancel, so they are
+        /// waited for in a task of their own, not here. On the driver only.
+        fn retire(self: *Self, conn: *Conn) void {
+            self.removeTimer(conn);
+            conn.retired = true;
+            if (conn.tasks.load(.acquire) == 0) return conn.finish();
+            placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
+        }
+
+        /// Closes `conn` at once and frees it once its requests have ended,
+        /// waiting for them. On the driver only.
+        fn closeNow(self: *Self, conn: *Conn) void {
+            conn.abort();
+            self.removeTimer(conn);
+            conn.retired = true;
+            conn.finish();
+        }
+
+        /// The driver's end: closes every connection left, and frees it
+        /// once its requests have ended.
+        fn finishAll(self: *Self) void {
+            const io = self.io;
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            // Connections the driver has yet to see, then the rest.
+            var list = takeDirty(self);
+            while (list) |conn| {
+                list = conn.next_dirty;
+                conn.queued.store(false, .release);
+                if (!conn.retired and conn.heap_index == Conn.no_timer) self.closeNow(conn);
+                conn.unref();
+            }
+            while (self.timers.items.len > 0) self.closeNow(self.timers.items[0]);
+            self.finishers.await(io) catch io.recancel();
+            // What the closing connections kicked on their way out holds a
+            // reference each.
+            list = takeDirty(self);
+            while (list) |conn| {
+                list = conn.next_dirty;
+                conn.queued.store(false, .release);
+                conn.unref();
             }
         }
 
@@ -777,7 +955,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 self.gpa.free(conns);
                 self.txFlush();
-                self.group.cancel(self.io);
                 return;
             }
             const live = self.liveConns();
@@ -798,14 +975,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 } }) catch continue;
                 self.onDatagram(&dg, now(self.io));
             }
-            // Whatever is left is closed now.
+            // Whatever is left is closed now; the driver frees it.
             const left = self.liveConns();
             for (left) |conn| {
                 conn.abort();
                 conn.unref();
             }
             self.gpa.free(left);
-            self.group.cancel(self.io);
         }
 
         /// No endpoint of the listener has a connection left.
@@ -943,7 +1119,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return;
             };
             // From here the connection is reached through the map; the
-            // driver holds the first reference.
+            // driver holds the first reference once it is handed over.
             conn.lock();
             const pi: c.ngtcp2_pkt_info = .{ .ecn = ecn };
             const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), &pi, data, now(self.io));
@@ -964,11 +1140,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = c.ngtcp2_conn_get_scid2(conn.q, &scids);
             for (scids[0..@min(n, scids.len)]) |*cid| self.associate(.ofCid(cid), conn) catch {};
 
-            placement.concurrent(&self.group, self.io, .local, Conn.drive, .{conn}) catch {
-                conn.forget();
-                conn.destroy();
-                return;
-            };
+            // To the driver, which sends the handshake's packets and owns
+            // the connection from now on.
+            conn.driven = true;
+            self.queue(conn);
             _ = self.stats.accepted.fetchAdd(1, .monotonic);
         }
 
@@ -1039,9 +1214,23 @@ pub fn Endpoint(comptime Ctx: type) type {
             local: Addr,
             remote: Addr,
             mutex: std.Io.Mutex = .init,
-            /// Bumped to wake the driver (and stream tasks waiting on it).
+            /// Bumped to wake the stream tasks waiting on the connection
+            /// (`kick`, which also queues it for the driver).
             gen: std.atomic.Value(u32) = .init(0),
             refs: std.atomic.Value(u32) = .init(1),
+            /// Handed to the driver (`accept`): kicks queue it from then on.
+            driven: bool = false,
+            /// In the endpoint's `dirty` list, linked through `next_dirty`.
+            queued: std.atomic.Value(bool) = .init(false),
+            next_dirty: ?*Conn = null,
+            /// Its place in the endpoint's timer heap and when it is due;
+            /// the driver's alone.
+            heap_index: u32 = no_timer,
+            timer_at: u64 = 0,
+            /// Over: out of the heap, and finishing (`Endpoint.retire`).
+            retired: bool = false,
+            /// Request tasks running.
+            tasks: std.atomic.Value(u32) = .init(0),
             state: State = .open,
             last_error: c.ngtcp2_ccerr = undefined,
             /// The CONNECTION_CLOSE to repeat in the closing period.
@@ -1079,6 +1268,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             wt: ?*webtransport.Core = null,
 
             const State = enum { open, closing, draining, closed };
+            const no_timer = std.math.maxInt(u32);
 
             fn create(ep: *Self, remote: Addr, local: ?std.Io.net.IpAddress, hd: *const c.ngtcp2_pkt_hd, ocid: ?*const c.ngtcp2_cid, token_type: c.ngtcp2_token_type) !*Conn {
                 const gpa = ep.gpa;
@@ -1184,9 +1374,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.mutex.unlock(conn.ep.io);
             }
 
+            /// Something changed: the stream tasks waiting look again, and
+            /// the driver services the connection in its next round.
             fn kick(conn: *Conn) void {
                 _ = conn.gen.fetchAdd(1, .release);
                 conn.ep.io.futexWake(u32, &conn.gen.raw, std.math.maxInt(u32));
+                if (conn.driven) conn.ep.queue(conn);
             }
 
             /// How WebTransport's sessions and streams reach the
@@ -1298,48 +1491,28 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.kick();
             }
 
-            // -- Out: the driver task -----------------------------------
+            // -- Out: on the endpoint's driver --------------------------
 
-            fn drive(conn: *Conn) std.Io.Cancelable!void {
-                const io = conn.ep.io;
-                const on_zio = placement.executorCount(io) != null;
-                defer conn.finish();
+            /// Writes what the connection has to send, runs its timers
+            /// that are due, and its closing and draining periods, then
+            /// sets when it next needs the driver. On the driver only.
+            fn service(conn: *Conn) void {
+                const ep = conn.ep;
+                const io = ep.io;
+                if (conn.retired) return;
                 while (true) {
-                    // Let the tasks already queued on this executor run
-                    // first: a batch of datagrams starts many requests, and
-                    // their responses then go out together, in as few
-                    // packets and sends as they fit, instead of one flush
-                    // for the first response and more for the rest.
-                    if (on_zio) zio.yield() catch {
-                        conn.lock();
-                        conn.abortLocked();
-                        conn.unlock();
-                        return;
-                    };
-                    const gen = conn.gen.load(.acquire);
                     if (conn.wake_pending.load(.monotonic)) {
                         conn.lock();
                         if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
                         conn.unlock();
                     }
-                    if (conn.holding.load(.monotonic) > 0) {
+                    if (conn.holding.load(.monotonic) > 0 and now(io) < conn.hold_until) {
                         // Requests of the latest batch are still on their
                         // way to an answer: their packets, and the ACK
                         // that would otherwise leave alone, wait a little
                         // for them. Each answer kicks.
-                        const t = now(io);
-                        if (t < conn.hold_until) {
-                            io.futexWaitTimeout(u32, &conn.gen.raw, gen, .{ .duration = .{
-                                .raw = .fromNanoseconds(@intCast(conn.hold_until - t)),
-                                .clock = .awake,
-                            } }) catch {
-                                conn.lock();
-                                conn.abortLocked();
-                                conn.unlock();
-                                return;
-                            };
-                            continue;
-                        }
+                        ep.setTimer(conn, conn.hold_until) catch return conn.lost();
+                        return;
                     }
                     const flushed_at = conn.flush();
 
@@ -1367,7 +1540,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     }
                     if (state == .closed) {
                         conn.unlock();
-                        return;
+                        return ep.retire(conn);
                     }
                     if (deadline <= t) {
                         switch (state) {
@@ -1378,23 +1551,21 @@ pub fn Endpoint(comptime Ctx: type) type {
                         continue;
                     }
                     conn.unlock();
-                    const wait: std.Io.Timeout = if (deadline == std.math.maxInt(u64)) .none else .{ .duration = .{
-                        .raw = .fromNanoseconds(@intCast(deadline - t)),
-                        .clock = .awake,
-                    } };
-                    io.futexWaitTimeout(u32, &conn.gen.raw, gen, wait) catch {
-                        // Canceled: the endpoint is shutting down.
-                        conn.lock();
-                        conn.abortLocked();
-                        conn.unlock();
-                        return;
-                    };
+                    ep.setTimer(conn, deadline) catch return conn.lost();
+                    return;
                 }
             }
 
+            /// No room to keep the connection's timer: it closes now.
+            fn lost(conn: *Conn) void {
+                log.err("HTTP/3: no memory for a connection's timer; closing it", .{});
+                conn.abort();
+                conn.ep.retire(conn);
+            }
+
             /// Writes whatever the connection has to send into the
-            /// endpoint's outbox, which the sender task sends with every
-            /// other connection's. Returns a clock reading no earlier than
+            /// endpoint's outbox, which the driver sends with every other
+            /// connection's. Returns a clock reading no earlier than
             /// any time ngtcp2 was given.
             fn flush(conn: *Conn) u64 {
                 const ep = conn.ep;
@@ -1432,10 +1603,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return ts;
                     }
                     c.ngtcp2_conn_update_pkt_tx_time(conn.q, ts);
-                    const first = out.count == 0;
                     out.commit(&ep.udp, Addr.fromNgtcp2(ps.path.remote).ip(), Addr.fromNgtcp2(ps.path.local).ip(), pi.ecn, @intCast(n), gso);
+                    ep.tx_lock.unlock();
                     conn.unlock();
-                    ep.txCommitted(first);
                 }
             }
 
@@ -1565,8 +1735,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (conn.wt) |w| w.connectionClosed();
             }
 
-            /// The driver's end: requests finish, the IDs go, the driver's
-            /// reference goes.
+            /// The end: requests finish, the IDs go, the driver's reference
+            /// goes. Waits for the request tasks.
             fn finish(conn: *Conn) void {
                 const io = conn.ep.io;
                 const protection = io.swapCancelProtection(.blocked);
@@ -1577,6 +1747,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.group.cancel(io);
                 conn.forget();
                 conn.unref();
+            }
+
+            fn finishTask(conn: *Conn) std.Io.Cancelable!void {
+                conn.finish();
             }
 
             // -- The HTTP/3 layer ---------------------------------------
@@ -1727,7 +1901,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 stream.round = conn.round.load(.monotonic);
                 stream.holds = true;
                 _ = conn.holding.fetchAdd(1, .monotonic);
+                _ = conn.tasks.fetchAdd(1, .acq_rel);
                 placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
+                    _ = conn.tasks.fetchSub(1, .acq_rel);
                     log.err("HTTP/3: no task for stream {d}", .{stream.id});
                     stream.refs.handler = false;
                     stream.unhold();
@@ -1870,6 +2046,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn run(s: *Stream) std.Io.Cancelable!void {
                 const conn = s.conn;
+                // Last: the driver may free the connection once none run.
+                defer _ = conn.tasks.fetchSub(1, .acq_rel);
                 defer {
                     s.unhold();
                     conn.lock();
