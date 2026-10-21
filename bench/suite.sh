@@ -7,6 +7,7 @@
 #   bench/suite.sh -profile full                     # the overnight run
 #   bench/suite.sh -only raw -servers anole,fiber -tiers 1
 #   NO_BUILD=1 bench/suite.sh ...                    # reuse the images as built
+#   SUT_URING=1 bench/suite.sh ...                   # servers get seccomp=unconfined (io_uring)
 #   RESULTS=<id> bench/suite.sh -only grpc ...       # add cases to an earlier run
 #
 # Results go to bench/results/<UTC date>-<commit>[-<RUN_TAG>]/: cases.jsonl
@@ -81,4 +82,5 @@ exec docker run --rm --name anole-bench-loadgen --network host \
   -e BENCH_HOST_DIR="$bench" -e HOST_CGROUP=/host/cgroup \
   -e SUT_CPUS_1="$SUT_CPUS_1" -e SUT_CPUS_4="$SUT_CPUS_4" -e LOAD_CPUS="$LOAD_CPUS" \
   -e PG_CPUS="$PG_CPUS" -e PG_CPUS_TWELVE="$PG_CPUS_TWELVE" \
+  -e SUT_URING="${SUT_URING:-}" \
   anole-bench/loadgen suite "$@" -out "/bench/results/$id"

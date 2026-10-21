@@ -122,6 +122,10 @@ func Start(cfg Config, name, mode string, tier Tier, env map[string]string, memM
 	for k, v := range env {
 		args = append(args, "-e", k+"="+v)
 	}
+	if os.Getenv("SUT_URING") != "" {
+		// io_uring for the server, as HttpArena runs every framework.
+		args = append(args, "--security-opt", "seccomp=unconfined", "--ulimit", "memlock=-1:-1")
+	}
 	args = append(args, Image(name))
 	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
