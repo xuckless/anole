@@ -181,14 +181,16 @@ Aro (C front end used by translate-c at build time; not linked)
   Licence:  MIT. Copyright (c) 2021 Veikka Tuominen
   Source:   https://codeberg.org/ziglang/arocc (fetched by translate-c)
 
-MongoDB specifications, source/bson-corpus/tests (BSON test data; tests
-only, not linked, not vendored)
+MongoDB specifications, source/bson-corpus, connection-string,
+uri-options, auth and server-discovery-and-monitoring tests (test data;
+tests only, not linked, not vendored)
   Licence:  Creative Commons Attribution-NonCommercial-ShareAlike 3.0 United
             States (LICENSE.md in that repository). Copyright MongoDB, Inc.
   Source:   https://github.com/mongodb/specifications (archive of commit
             7235b61bde1bc75e51f28d8f67dd935198969c02)
   Used:     fetched by `zig build test` only when Anole is the root build,
-            and read by tests/bson/corpus_test.zig; nothing from it is in
+            and read by tests/bson/corpus_test.zig and
+            src/mongodb/spec_test.zig; nothing from it is in
             this repository, its package or any binary
 
 
