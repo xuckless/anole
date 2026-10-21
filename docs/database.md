@@ -6,6 +6,23 @@ back as your structs in the request's arena (nothing to free), and a
 database error becomes an HTTP status. The SQL stays yours: there is no
 query builder.
 
+Each connector is a build flag, downloaded and compiled only when it is on:
+
+| Connector | Flag | Profiles | Handle |
+| --- | --- | --- | --- |
+| [PostgreSQL](#postgresql) | `-Dpostgres` | `web`, `full` | `anole.pg.Db`, from `app.postgres(.{})` |
+| [SQLite](#sqlite) | `-Dsqlite` | `web`, `full` | `anole.sqlite.Db`, from `app.sqlite("app.db")` |
+| [MongoDB](#mongodb) | `-Dmongodb` | `full` | `anole.mongodb.Client`, from `app.mongodb(.{})` |
+| [Redis and Valkey](#redis-and-valkey) | `-Dredis` | `full` | `anole.redis.Client`, from `app.redis(.{})` |
+
+A flag overrides the profile: `-Dprofile=web -Dmongodb=true` adds MongoDB,
+`-Dpostgres=false` drops PostgreSQL. Calling `app.mongodb` (or another
+connector's) in a build without it is a compile error that names the flag.
+Choose them where you add the dependency, as for the other
+[build flags](server.md#build-flags).
+
+The calls:
+
 | Call | Returns |
 | --- | --- |
 | `exec(req, sql, args)` | rows changed (`u64`) |
@@ -17,6 +34,17 @@ query builder.
 | `transaction(req, opts, func, args)` | `func(&tx, args...)`, committed, retried after a serialization failure |
 | `acquire(req)` | the driver's own connection, given back with `release()` |
 | `with(.{ .timeout, .prepare, .coalesce, .cache })` | the same calls with options; see [Caching](#caching) |
+
+Each connector has the calls its database can do:
+
+| | PostgreSQL | SQLite | MongoDB | Redis |
+| --- | --- | --- | --- | --- |
+| `exec` | yes | yes | `db(name).exec(req, command)` | `command(req, args)` |
+| `one`, `optional`, `all` | yes | yes | yes, on a collection | yes |
+| `iterate` | yes | yes | yes, a cursor | no |
+| `begin`, `transaction` | yes | yes | not yet | no; MULTI in a `pipeline` |
+| `acquire` | yes | yes, the writer | no | yes |
+| `with` | yes | yes | on a collection or `db(name)` | yes |
 
 `args` is a tuple: `.{ id, name }`. Outside a handler (startup, a
 background task) pass an `anole.db.Ctx` instead of the request:
@@ -157,7 +185,7 @@ state.db = try app.postgres(.{ .errors = .{ .foreign_key = .unprocessable_entity
 Or catch one case in the handler:
 
 ```zig
-app.db.exec(req, "INSERT INTO users (email) VALUES ($1)", .{email}) catch |err| {
+_ = app.db.exec(req, "INSERT INTO users (email) VALUES ($1)", .{email}) catch |err| {
     if (err == error.Conflict) return res.fail(.conflict, "that email is taken");
     return err;
 };
@@ -209,6 +237,9 @@ try tx.commit();
   it); `TxOptions.timeout` a whole transaction. The server's own
   `statement_timeout` (`?options=-c%20statement_timeout%3D5s`) is a 504
   as well.
+- **Shared and cached reads.** `with(.{ .coalesce = true })` and
+  `with(.{ .cache = .{ .ttl = ... } })`, off by default: see
+  [Caching](#caching).
 - **Handlers that wait.** A database call suspends the handler's
   coroutine, never the thread. Don't mark such routes `anole.noWait`.
 - **Raw access.** `app.db.acquire(req)` hands over pg.zig's connection
@@ -245,8 +276,10 @@ zig build test-postgres -Dpostgres-test-url='postgres://postgres:pw@127.0.0.1:54
 
 ## SQLite
 
-SQLite is compiled into your program (the amalgamation, 3.54.1): no server,
-no install, one file.
+Built in with `-Dsqlite` (on in the `web` and `full` profiles). SQLite is
+compiled into your program (the amalgamation, 3.54.1, through Anole's fork
+of [zig-sqlite](https://github.com/vrischmann/zig-sqlite)): no server, no
+install, one file.
 
 ```zig
 const App = struct { db: *anole.sqlite.Db = undefined };
@@ -315,7 +348,9 @@ no statement runs on an executor:
 Each connection runs with `journal_mode=WAL`, `synchronous=NORMAL`,
 `busy_timeout=5000` and `foreign_keys=ON`. Prepared statements are kept per
 connection, by SQL text (64 by default; `.prepare = false` for SQL built at
-run time).
+run time). `with(.{ .timeout })` bounds a call, interrupting the statement
+past it; `.coalesce` and `.cache` share and keep reads, as for every
+connector ([Caching](#caching)).
 
 ### Transactions
 
@@ -334,7 +369,14 @@ write on the `Db` would wait for the transaction's own writer. `transaction`
 runs again after `SQLITE_BUSY` (another process held the file past
 `busy_timeout_ms`, as during a restart), up to `retries` more times.
 `begin(req, .{ .read_only = true })` is a snapshot on a reader that writes
-do not disturb.
+do not disturb. By hand, `commit` and `rollback` take the request too:
+
+```zig
+var tx = try app.db.begin(req, .{});
+defer tx.deinit(); // rolls back unless committed
+_ = try tx.exec(req, "DELETE FROM notes WHERE done = 1", .{});
+try tx.commit(req);
+```
 
 ### Options
 
@@ -397,8 +439,10 @@ Built in with `-Dmongodb` (in the `full` profile): Anole's own client on
 handshake, SCRAM, the connection string, server discovery and monitoring,
 connection pooling, sessions, retryable reads and writes), with documents
 in BSON (`anole.bson`). TLS goes through the same BoringSSL as the rest of
-Anole. MongoDB 4.2 and later; CI runs 7.0, 8.0 and 9.0. `examples/mongodb` is
-a small users API:
+Anole. MongoDB 4.2 and later. CI tests 7.0 on ubuntu-latest, and 8.0 and
+9.0 only on ubuntu-22.04: they do not run on newer Linux kernels yet (see
+[below](#testing-against-mongodb)). `examples/mongodb` is a small users
+API:
 
 ```sh
 docker run --rm -d --name mongo -p 27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
@@ -415,7 +459,7 @@ pub fn main(init: std.process.Init) !void {
     var state: App = undefined;
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
-    state.mongo = try app.mongodb(.{ .environ = init.minimal.environ }); // MONGODB_URI
+    state.mongo = try app.mongodb(.{}); // MONGODB_URI
     _ = app.metrics(.{}); // pool and command metrics
     _ = app.health(.{}); // /readyz pings the primary
     app.get("/users/:id", get);
@@ -484,7 +528,7 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
 
 | Call | Returns |
 | --- | --- |
-| `find(T, req, filter, opts)` | every match (`[]T`); options `sort`, `projection`, `skip`, `limit`, `batch_size`, `hint`, `collation`, `comment`, `allow_disk_use`, `let` |
+| `find(T, req, filter, opts)` | every match (`[]T`); options `sort`, `projection`, `skip`, `limit`, `batch_size`, `hint`, `collation`, `comment`, `allow_disk_use`, `let`, `max`, `min`, `return_key`, `show_record_id` |
 | `findOne(T, req, filter, opts)` | the first match; none is `error.NotFound` (404) |
 | `findOptional(T, req, filter, opts)` | the first match, or null |
 | `iterate(T, req, filter, opts)` | a cursor: `while (try cur.next()) \|doc\|`, then `deinit()` |
@@ -497,9 +541,13 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
 | `deleteOne`, `deleteMany(req, filter, opts)` | `deleted_count` |
 | `findOneAndUpdate`, `findOneAndReplace`, `findOneAndDelete(T, req, ...)` | the document before (or, with `.return_document = .after`, after), or null |
 | `createIndex(req, keys, opts)`, `dropIndex(req, name)`, `drop(req)` | indexes and the collection |
-| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document` |
+| `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document`; `db(name).exec` is the same call under the shared verb's name |
 | `one`, `optional`, `all` | the shared verbs: `findOne`, `findOptional`, `find` without options |
-| `with(.{ .timeout })` | the same calls with a timeout of their own |
+| `with(.{ .timeout })` | the same calls with a timeout of their own (on a collection or a `db(name)`) |
+| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
+
+There are no transactions yet: each call stands alone, and is retried on
+its own.
 
 `client.collection(name)` is in the connection string's database (else
 `"test"`, as the drivers do); `client.db(name).collection(name)` names
@@ -550,18 +598,23 @@ command's name as the operation, the collection as the target), and a
 `/readyz` check that fails when the primary does not answer a `ping`
 (checked at most once a second).
 
-### Testing against a server
+### Testing against MongoDB
 
 `tests/mongodb/run.sh [image]` starts MongoDB in Docker (`mongo:8.0` by
-default; CI runs 7.0, 8.0 and 9.0) as a replica set of one with
-authentication and test commands on, with a CA and certificate made for
-the run, and runs `zig build test-mongodb` three times: SCRAM-SHA-256,
-SCRAM-SHA-1, and over TLS. MongoDB 8.0.21 and later and 9.x refuse to
-start on Linux kernels 6.19 to 7.0.13 (a TCMalloc incompatibility,
+default) as a replica set of one with authentication and test commands on,
+with a CA and certificate made for the run, and runs `zig build
+test-mongodb` three times: SCRAM-SHA-256, SCRAM-SHA-1, and over TLS.
+
+MongoDB 8.x and 9.x are tested only on `ubuntu-22.04` (kernel 6.8). They do
+not run on Linux kernels from 6.19 to 7.0.13, which newer runners and
+distributions ship: 8.0.21 and later and every 9.x refuse to start there
+(TCMalloc and rseq,
+[SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912),
 [SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742)), and
-earlier 8.0 releases crash there; the script says so when it sees it.
-On such a host use `mongo:7.0` or a kernel from 7.0.14 (CI runs 8.0 and
-9.0 on `ubuntu-22.04`, kernel 6.8). Against a server of your own:
+earlier 8.0 releases start but crash within minutes. The script says so
+when it sees it. On such a host test with `mongo:7.0`, which CI runs on
+`ubuntu-latest`, or use a kernel before 6.19 or from 7.0.14. Against a
+server of your own:
 
 ```sh
 zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?replicaSet=rs0&authSource=admin'

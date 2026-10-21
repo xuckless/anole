@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
 `addApp` makes the executable, gives it the `anole` module, installs it and
 adds `zig build run`. `-Doptimize` and `-Dtarget` work as usual, and
-`.profile = .web` leaves out HTTP/3, gRPC and Redis (the
+`.profile = .web` leaves out HTTP/3, gRPC, MongoDB and Redis (the
 [build flags](../README.md#build-flags)).
 
 And `src/main.zig`:
@@ -428,7 +428,8 @@ package) cannot make outbound HTTPS calls.
   restarts.
 - [websocket.md](websocket.md), [webtransport.md](webtransport.md), [grpc.md](grpc.md),
   [clients.md](clients.md) (outbound HTTP from a handler with
-  `anole.client(req)`), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,
+  `anole.client(req)`), [database.md](database.md) (PostgreSQL, SQLite,
+  MongoDB, Redis), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,
   rate limits), [observability.md](observability.md) (metrics, tracing,
   health checks).
 - [from-fiber.md](from-fiber.md): Fiber's API next to Anole's.

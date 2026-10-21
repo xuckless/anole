@@ -323,6 +323,9 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dauth=bool` | false | true | true | JWT, OIDC, CSRF, passwords, API keys, RBAC |
 | `-Djson=bool` | false | true | true | yyjson |
 | `-Dredis=bool` | false | false | true | hiredis (Redis/Valkey client, stores) |
+| `-Dpostgres=bool` | false | true | true | PostgreSQL client (pg.zig fork) |
+| `-Dsqlite=bool` | false | true | true | SQLite (amalgamation, zig-sqlite fork) |
+| `-Dmongodb=bool` | false | false | true | MongoDB client and BSON |
 
 Constraints:
 - gRPC needs HTTP/2, so `-Dhttp2=false` turns gRPC off. Asking for both
