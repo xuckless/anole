@@ -20,7 +20,7 @@ image=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab
 # zlib-ng picks its x86 code paths (AVX2, AVX-512, VNNI, VPCLMULQDQ) at run
 # time, and the client's memory peaks at a few GiB.
 cpu=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)
-flags=$(grep -m1 -o -w 'avx2\|avx512f\|avx512bw\|avx512vl\|avx512vnni\|vpclmulqdq' /proc/cpuinfo 2>/dev/null | tr '\n' ' ' || true)
+flags=$(grep -m1 -o -w 'avx2\|avx512f\|avx512bw\|avx512vl\|avx512_vnni\|vpclmulqdq' /proc/cpuinfo 2>/dev/null | tr '\n' ' ' || true)
 mem=$(awk '/MemTotal/{print $2 " kB"}' /proc/meminfo 2>/dev/null || echo unknown)
 echo "machine: $(nproc 2>/dev/null || echo ?) CPUs, $cpu; $flags; MemTotal $mem"
 attempt=1
