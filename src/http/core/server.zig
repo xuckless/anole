@@ -25,6 +25,7 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
+const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
@@ -37,6 +38,7 @@ const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
+const park = @import("server/park.zig");
 const cgroup = @import("cgroup.zig");
 const somaxconn = @import("somaxconn.zig").somaxconn;
 const fd_limit = @import("fd_limit.zig");
@@ -219,9 +221,10 @@ const TlsMaterial = struct {
     }
 };
 
-/// Primed into each pooled request arena, so an ordinary request is served
-/// without growing it. A request that needs more grows it once, and the
-/// arena keeps what it grew to.
+/// The part of each pooled request arena that lives in the set, so an
+/// ordinary request is served without the arena allocating. What a request
+/// takes beyond it goes back when the request ends
+/// (`RequestBuffers.resetArena`).
 const request_arena_reserve = 8 * 1024;
 
 /// How often each executor frees the request buffer sets that no request
@@ -239,9 +242,10 @@ const idle_read_buffer_len = 1024;
 
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer) and their buffers for one accepted connection. The buffer a
-/// request is read into and its arena are not the connection's: they come
-/// from the server's pool once its first request arrives, and go back when
-/// it closes.
+/// request is read into, its arena and the buffer its response is written
+/// through are not the connection's: they come from the server's pool once
+/// a request arrives (the write buffer once it writes), and go back when it
+/// is done.
 ///
 /// Initialized in place: `tls_conn` stores pointers into
 /// `tcp_reader`/`tcp_writer`, and `tls_reader`/`tls_writer` store a pointer
@@ -274,6 +278,17 @@ pub const Connection = struct {
     /// the proxy.
     proxied_peer: ?std.Io.net.IpAddress = null,
     proxied_secure: bool = false,
+    /// What took the connection over after an upgrade (`Response.adopt`).
+    adopter: ?*Adopter = null,
+    /// Where the writer takes a buffer from when a response first writes
+    /// (`prepareWrite`), and gives it back to once that is out
+    /// (`releaseWriteBuffer`). Without one, the writer's buffer is what
+    /// `useWriteBuffer` gave it.
+    write_pool: ?*RequestBuffersPool = null,
+    /// The buffer the writer took from `write_pool`, while it has it.
+    write_held: ?*WriteBuffer = null,
+    /// A request upgraded it (`finishUpgrade`): no more responses.
+    upgraded: bool = false,
     tls_rng: std.Random.IoSource = undefined,
     tls_reader: tls.Connection.Reader = undefined,
     tls_writer: tls.Connection.Writer = undefined,
@@ -383,12 +398,25 @@ pub const Connection = struct {
         self.writer.buffer = buffer;
     }
 
-    /// Takes the write buffer back, throwing away what it holds. Every
-    /// response is flushed as it ends, so only a failed write leaves
-    /// anything, on a connection that is closing.
+    /// Before a response writes: gives the writer a buffer from
+    /// `write_pool` if it has none, so a request that is still waiting to
+    /// answer holds none. Without memory for one, the writes go out
+    /// unbuffered, one each.
+    pub fn prepareWrite(self: *Connection) void {
+        if (self.upgraded) return;
+        lendWriteBuffer(self);
+    }
+
+    /// Takes the write buffer back, throwing away what it holds, and gives
+    /// it back to `write_pool` if it came from there. Every response is
+    /// flushed as it ends, so only a failed write leaves anything, on a
+    /// connection that is closing.
     pub fn releaseWriteBuffer(self: *Connection) void {
         self.writer.buffer = &.{};
         self.writer.end = 0;
+        const w = self.write_held orelse return;
+        self.write_held = null;
+        self.write_pool.?.giveWriteBuffer(w);
     }
 
     /// Reads into `buffer` from now on, throwing away what the reader holds.
@@ -417,30 +445,31 @@ pub const Connection = struct {
         r.rebase(r.buffer.len) catch unreachable;
     }
 
-    /// Smallest reader and writer windows `shrinkForUpgrade` leaves. A frame
-    /// bigger than its window still goes through in one call: a read that
-    /// big lands straight in the caller's slice, and a write goes out with
-    /// what the window holds in one vectored write.
+    /// Smallest reader window `shrinkForUpgrade` leaves. A frame bigger
+    /// than it still goes through in one call: a read that big lands
+    /// straight in the caller's slice.
     pub const upgrade_window_min = 1024;
 
     /// For a connection the request upgraded (a WebSocket): it lives on as
     /// long as the peer keeps it open, mostly idle, with the request's
     /// buffers still under it, because the head the handler may still read
-    /// (its URL, headers and parameters) is in them. So the reader and the
-    /// writer move to small windows just past the head, and the rest of the
-    /// buffers' pages go back to the OS (Linux, `MADV_DONTNEED`): the socket
-    /// keeps the pages the head and the windows touch, rather than every
-    /// page of the set a bigger request, here or earlier, dirtied. The
-    /// windows reach to the end of the page the minimums end in, so that
-    /// page is used whole. What the peer already sent past the head stays
-    /// buffered. Before anything is written to the connection after the
-    /// head was read, so the 101 goes through the new window.
+    /// (its URL, headers and parameters) is in them, and the arena too. So
+    /// the reader moves to a small window just past the head, to the end of
+    /// the page the head ends on (or of the next, when that leaves less
+    /// than `upgrade_window_min`), and the rest of the read buffer's pages
+    /// go back to the OS (Linux, `MADV_DONTNEED`): the socket keeps the
+    /// page the head shares with the arena's first chunk, rather than every
+    /// page of the buffer a bigger request, here or earlier, dirtied. What
+    /// the peer already sent past the head stays buffered. The writer gets
+    /// no window: the 101 goes out through a pooled buffer, and the
+    /// upgraded protocol's writes borrow one while they have something to
+    /// send (`transport`, `Transport.write_buffers`). Before anything is
+    /// written to the connection after the head was read.
     pub fn shrinkForUpgrade(self: *Connection) void {
         const r = self.reader;
-        const w = self.writer;
         // Not reading from the pooled buffer (a test's fixed reader), or
         // the writer holds something already.
-        if (self.read_buffer.len == 0 or w.end != 0) return;
+        if (self.read_buffer.len == 0 or self.writer.end != 0) return;
         const read_end = @intFromPtr(self.read_buffer.ptr) + self.read_buffer.len;
         if (@intFromPtr(r.buffer.ptr) < @intFromPtr(self.read_buffer.ptr) or @intFromPtr(r.buffer.ptr) + r.buffer.len != read_end) return;
 
@@ -453,30 +482,45 @@ pub const Connection = struct {
 
         const start = @intFromPtr(room.ptr);
         const page = std.heap.pageSize();
-        const min_read = @max(buffered_len, upgrade_window_min);
-        const end = std.mem.alignForward(usize, start + min_read + upgrade_window_min, page);
-        const span = end - start;
-        if (span > room.len) {
-            // No room for both: the reader keeps its view, the writer a
-            // window of its own buffer.
-            w.buffer = w.buffer[0..@min(w.buffer.len, @max(upgrade_window_min, page))];
-            return;
-        }
-        const read_len = @max(min_read, span / 2);
-        r.buffer = room[0..read_len];
-        const old_write = w.buffer;
-        w.buffer = room[read_len..span];
+        const end = std.mem.alignForward(usize, start + @max(buffered_len, upgrade_window_min), page);
+        // No room past the window: the reader keeps its view.
+        if (end - start >= room.len) return;
+        r.buffer = room[0 .. end - start];
 
-        // Give back the pages past the windows: the rest of the read buffer
-        // and, where it follows it in the same allocation (the pool's
-        // sets), the write buffer.
+        // Give back the pages of the read buffer past the window.
         if (comptime builtin.os.tag != .linux) return;
-        var release_end = read_end;
-        if (@intFromPtr(old_write.ptr) == read_end) release_end += old_write.len;
-        const from = std.mem.alignForward(usize, end, page);
-        const to = std.mem.alignBackward(usize, release_end, page);
-        if (to <= from) return;
-        _ = std.os.linux.madvise(@ptrFromInt(from), to - from, std.os.linux.MADV.DONTNEED);
+        const to = std.mem.alignBackward(usize, read_end, page);
+        if (to <= end) return;
+        _ = std.os.linux.madvise(@ptrFromInt(end), to - end, std.os.linux.MADV.DONTNEED);
+    }
+
+    /// Once the 101 of an upgrade is out: the connection is the upgraded
+    /// protocol's, and its writer gives back the buffer the 101 went
+    /// through. From here it borrows one only while it has something to
+    /// send (`transport`), rather than holding one for as long as the
+    /// connection is open.
+    pub fn finishUpgrade(self: *Connection) void {
+        self.releaseWriteBuffer();
+        self.upgraded = true;
+    }
+
+    /// `Transport.WriteBuffers.take`: a buffer from `write_pool`, upgraded
+    /// or not.
+    fn lendWriteBuffer(context: *anyopaque) void {
+        const self: *Connection = @ptrCast(@alignCast(context));
+        if (self.writer.buffer.len != 0) return;
+        const pool = self.write_pool orelse return;
+        const w = pool.takeWriteBuffer(@intFromPtr(self)) catch return;
+        self.write_held = w;
+        self.writer.buffer = pool.writeBytes(w);
+    }
+
+    /// `Transport.WriteBuffers.give`: back to `write_pool`, with nothing
+    /// left in it. A buffer that is not the pool's stays.
+    fn takeBackWriteBuffer(context: *anyopaque) void {
+        const self: *Connection = @ptrCast(@alignCast(context));
+        if (self.write_held == null or self.writer.end != 0) return;
+        self.releaseWriteBuffer();
     }
 
     /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
@@ -556,6 +600,11 @@ pub const Connection = struct {
             .tcp_writer = &self.tcp_writer,
             .tls_reader = if (has_tls) &self.tls_reader else null,
             .tls_writer = if (has_tls) &self.tls_writer else null,
+            .write_buffers = if (self.write_pool != null) .{
+                .context = self,
+                .take = lendWriteBuffer,
+                .give = takeBackWriteBuffer,
+            } else null,
         };
     }
 
@@ -589,6 +638,25 @@ pub const Connection = struct {
         if (self.getWriteError()) |e| if (isPeerGone(e)) return true;
         if (self.getReadError()) |e| if (isPeerGone(e)) return true;
         return false;
+    }
+
+    /// Forgets a read failure the caller dealt with (a wait cut short on
+    /// purpose), so a later one is not told apart by a stale cause.
+    pub fn clearReadError(self: *Connection) void {
+        self.tcp_reader.err = null;
+        if (build_options.use_tls and self.tls_conn != null) self.tls_reader.err = null;
+    }
+
+    /// Whether the connection can be put aside with no task reading it:
+    /// nothing buffered for the next read, and on TLS nothing in flight
+    /// inside the TLS layer either (see `tls.Connection.parkable`). Only
+    /// between requests, with nothing written since the last flush.
+    pub fn parkable(self: *Connection) bool {
+        if (self.reader.bufferedLen() != 0 or self.writer.end != 0) return false;
+        if (!build_options.use_tls) return true;
+        const c = if (self.tls_conn) |*c| c else return true;
+        if (comptime !@hasDecl(tls.Connection, "parkable")) return false;
+        return c.parkable();
     }
 };
 
@@ -706,6 +774,102 @@ fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) v
     timer.set(io, timeout);
 }
 
+/// A protocol that takes an HTTP/1.1 connection over once a request
+/// upgraded it (`Response.adopt`), such as a WebSocket served through
+/// callbacks. The server runs `serve` on the request's task once the
+/// handler has returned, and then again each time the connection, parked
+/// in between (`timeout.idle_park`), has input, on a task started for it on
+/// the same executor. So an idle connection holds no task.
+pub const Adopter = struct {
+    /// Serves the connection on the calling task until it is done
+    /// (`.close`), or idle with nothing in flight (`.park`, after
+    /// `Burst.waitInput` said `.idle`). Before it returns, either way,
+    /// nothing is left in the reader or unwritten in the writer, and
+    /// neither has a buffer in this task's frame or in the request's (the
+    /// first run's); after `.close` (or an error) no other task writes to
+    /// the connection.
+    serve: *const fn (*Adopter, *Burst) anyerror!Burst.End,
+    /// The connection is closing: the last call, before its socket is
+    /// closed. On a task on the connection's executor.
+    release: *const fn (*Adopter) void,
+    /// When the server closes the connection whatever it is doing, if ever:
+    /// armed during each run of `serve`, and kept while parked.
+    deadline: ?std.Io.Clock.Timestamp = null,
+};
+
+/// One run of an `Adopter`'s `serve`.
+pub const Burst = struct {
+    connection: *Connection,
+    io: std.Io,
+    timer: *Timer,
+    /// How long `waitInput` waits before it reports `.idle`; null when the
+    /// connection cannot park.
+    park_after: ?std.Io.Duration,
+    /// What tells `waitInput` that the park delay passed, while the run is
+    /// registered with its shelf (with `park_after`).
+    watch: park.Watch = .{},
+    deadline: ?std.Io.Clock.Timestamp,
+    /// The connection woke after a long park (`park.Shelf.long_park`):
+    /// once it has had input, `waitInput` reports `.idle` as soon as
+    /// nothing is buffered, rather than after the park delay.
+    repark: bool = false,
+    had_input: bool = false,
+
+    /// How a run of `Adopter.serve` ends: the connection closes, or parks
+    /// until it has input again.
+    pub const End = enum { close, park };
+    /// What `waitInput` found.
+    pub const Input = enum {
+        /// Something to read.
+        ready,
+        /// Nothing arrived for the park delay, and nothing is in flight:
+        /// park, unless the adopter is in the middle of something.
+        idle,
+    };
+
+    /// Waits for input with nothing buffered (the reader needs a buffer),
+    /// up to the park delay. Fails as a read would, and with
+    /// `error.EndOfStream` when the peer ended the stream: with nothing
+    /// buffered, the adopter would find nothing to read and wait again, at
+    /// once and forever, holding the connection after its peer is gone.
+    pub fn waitInput(self: *Burst) !Input {
+        const r = self.connection.reader;
+        if (r.bufferedLen() > 0) return .ready;
+        if (self.park_after == null) {
+            r.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => return self.connection.getReadError() orelse error.Unexpected,
+            };
+            return .ready;
+        }
+        if (self.repark and self.had_input and self.connection.parkable()) return .idle;
+        self.had_input = true;
+        // No timer per wait: the shelf's driver ends a wait that lasts the
+        // park delay (`park.Watch`).
+        self.watch.begin();
+        r.fillMore() catch |err| switch (err) {
+            error.EndOfStream => {
+                _ = self.watch.end(false);
+                return error.EndOfStream;
+            },
+            error.ReadFailed => {
+                const e = self.connection.getReadError() orelse error.Unexpected;
+                if (!self.watch.end(e == error.Canceled)) return e;
+                self.connection.clearReadError();
+                // Mid-record on TLS, say: the reads that follow wait.
+                return if (self.connection.parkable()) .idle else .ready;
+            },
+        };
+        _ = self.watch.end(false);
+        return .ready;
+    }
+
+    /// The deadline, or no timer, for what the run does next.
+    pub fn armDeadline(self: *Burst) void {
+        if (self.deadline) |d| self.timer.set(self.io, .{ .deadline = d }) else self.timer.clear(self.io);
+    }
+};
+
 /// The core server for state `Ctx` (`void` for none), on a `std.Io` the
 /// caller runs. Most applications use `anole.Server`, which owns the
 /// runtime, signals and TLS listeners and wraps this one (`app.server`).
@@ -767,6 +931,12 @@ pub fn Server(comptime Ctx: type) type {
         /// `tls_material`.
         active_listeners: []ActiveListener = &.{},
         tls_lock: std.atomic.Mutex = .unlocked,
+        /// Each executor's parked connections (`timeout.idle_park`) while
+        /// `run` serves with parking; empty otherwise.
+        shelves: []park.Shelf = &.{},
+        /// The group of every connection task while `run` serves: a task
+        /// started for a parked connection joins it.
+        connections_group: ?*std.Io.Group = null,
 
         /// A listener while `run` serves it: the socket, and the TLS
         /// material every connection accepted on it shares.
@@ -823,6 +993,58 @@ pub fn Server(comptime Ctx: type) type {
         const Busy = packed struct(u32) {
             count: u31 = 0,
             draining: bool = false,
+        };
+
+        /// One accepted connection, on the heap so that it can outlive its
+        /// task: an idle one parks (`timeout.idle_park`), with no task, and
+        /// a new task serves it once it has input again. Owns the socket,
+        /// the connection slot and a reference to its TLS material until
+        /// `closeConn`.
+        const Conn = struct {
+            server: *Self,
+            listener: *ActiveListener,
+            /// Initialized in place and never moved (see `Connection`).
+            connection: Connection,
+            material: ?*TlsMaterial = null,
+            /// The first request's deadlines run from here.
+            accepted_at: std.Io.Clock.Timestamp,
+            /// Requests whose head was read, on every task so far.
+            request_count: usize = 0,
+            /// In flight for the drain while no task holds the count: from
+            /// the upgrade that handed the connection to an `Adopter` until
+            /// it closes, as a handler looping over the socket would be.
+            counted: bool = false,
+            parked: park.Parked = .{ .vtable = &park_vtable },
+
+            const park_vtable: park.VTable = .{ .wake = wake, .expire = expire, .close = close };
+
+            fn wake(p: *park.Parked) anyerror!void {
+                const conn: *Conn = @fieldParentPtr("parked", p);
+                const group = conn.server.connections_group orelse return error.RuntimeShutdown;
+                try park.spawnLocal(group, resumeConnection, .{ conn.server, conn });
+            }
+
+            fn close(p: *park.Parked) void {
+                const conn: *Conn = @fieldParentPtr("parked", p);
+                conn.server.closeConn(conn);
+            }
+
+            fn expire(p: *park.Parked) anyerror!void {
+                const conn: *Conn = @fieldParentPtr("parked", p);
+                // Over TLS, a close_notify first, which takes a task.
+                if (!build_options.use_tls or conn.connection.tls_conn == null) return p.expireDone();
+                const group = conn.server.connections_group orelse return error.RuntimeShutdown;
+                try park.spawnLocal(group, expireConnection, .{ conn.server, conn });
+            }
+        };
+
+        /// How a connection's task leaves it.
+        const Outcome = enum {
+            /// Done with: closed by `closeConn`.
+            close,
+            /// Idle, with nothing in flight: parked for a new task to take
+            /// up (`settle`).
+            park,
         };
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
@@ -988,11 +1210,31 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             var connections: std.Io.Group = .init;
+            // Parked connections: a shelf per executor, each with a driver
+            // task there that closes them all when the shelf stops. That
+            // comes before the connections' cancel, so no task is started
+            // for a parked connection after it; a connection that would
+            // park from then on closes instead.
+            var sweepers: std.Io.Group = .init;
+            const shelves = self.openShelves(&sweepers, executors);
+            self.connections_group = &connections;
             defer {
                 _ = self.busy.fetchOr(.{ .draining = true }, .release);
                 self.draining.set(self.io);
                 self.drain_hooks.fire(self.io);
+                for (shelves) |*shelf| shelf.stop();
+                {
+                    // Brief: each driver shuts its connections' sockets down
+                    // and closes them as their polls come back.
+                    const protection = self.io.swapCancelProtection(.blocked);
+                    defer _ = self.io.swapCancelProtection(protection);
+                    for (shelves) |*shelf| shelf.done.waitUncancelable(self.io);
+                }
+                sweepers.cancel(self.io);
                 connections.cancel(self.io);
+                self.connections_group = null;
+                self.shelves = &.{};
+                self.allocator.free(shelves);
             }
 
             // Set by the first accept loop to give up; a cancel arrives
@@ -1051,6 +1293,52 @@ pub fn Server(comptime Ctx: type) type {
             // Cannot happen: `stopped` is only set by an accept loop that
             // stored its error first, and every loop was joined above.
             unreachable;
+        }
+
+        /// A shelf for each executor and its driver task, when connections can
+        /// park: `timeout.idle_park` is set, and the `Io` is zio with pinned
+        /// executors. Empty otherwise.
+        fn openShelves(self: *Self, sweepers: *std.Io.Group, executors: ?usize) []park.Shelf {
+            const idle_park = self.config.timeout.idle_park orelse return &.{};
+            if (idle_park.nanoseconds <= 0 or !park.usable(self.io)) return &.{};
+            const n = executors orelse return &.{};
+            const shelves = self.allocator.alloc(park.Shelf, n) catch return &.{};
+            @memset(shelves, .{ .io = self.io, .long_park = idle_park });
+            for (shelves, 0..) |*shelf, i| {
+                park.spawnOn(sweepers, i, park.drive, .{ shelf, self.io }) catch |err| {
+                    log.debug("Idle connections keep their tasks: {}", .{err});
+                    sweepers.cancel(self.io);
+                    self.allocator.free(shelves);
+                    return &.{};
+                };
+            }
+            self.shelves = shelves;
+            return shelves;
+        }
+
+        /// How many connections are parked right now (`timeout.idle_park`).
+        pub fn parkedConnections(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.shelves) |*shelf| n += shelf.count.load(.monotonic);
+            return n;
+        }
+
+        /// The calling task's executor's shelf, when connections park.
+        fn shelfHere(self: *Self) ?*park.Shelf {
+            if (self.shelves.len == 0) return null;
+            const i = placement.currentExecutor(self.io) orelse return null;
+            if (i >= self.shelves.len) return null;
+            return &self.shelves[i];
+        }
+
+        /// How long a connection waits for its next request before it
+        /// parks, or null when it does not: parking is off, or the wait's
+        /// own limit (`wait_timeout`) comes first.
+        fn parkAfter(self: *const Self, wait_timeout: ?std.Io.Duration) ?std.Io.Duration {
+            if (self.shelves.len == 0) return null;
+            const after = self.config.timeout.idle_park orelse return null;
+            if (wait_timeout) |w| if (after.nanoseconds >= w.nanoseconds) return null;
+            return after;
         }
 
         fn lockTls(self: *Self) void {
@@ -1483,14 +1771,21 @@ pub fn Server(comptime Ctx: type) type {
             /// The drain is on. The peer was told so, with a 503, and the
             /// connection is done.
             refused,
+            /// The park delay passed with nothing to read (only with
+            /// `park_timer`).
+            idle,
         };
 
         /// Waits for the first byte of a request, with nothing in flight:
         /// the drain does not wait for a connection here, and the cancel
-        /// that follows it closes the socket cleanly.
-        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool) !RequestWait {
-            busy.* = false;
-            self.finishRequest();
+        /// that follows it closes the socket cleanly. With `park_timer`,
+        /// that timer firing is the park delay passing, reported as `.idle`.
+        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool, park_timer: ?*Timer) !RequestWait {
+            // A task started for a parked connection is not counted yet.
+            if (busy.*) {
+                busy.* = false;
+                self.finishRequest();
+            }
 
             connection.reader.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return .peer_gone,
@@ -1499,6 +1794,10 @@ pub fn Server(comptime Ctx: type) type {
                     // Nothing is in flight between requests, so a peer that
                     // went away here has cost us nothing.
                     if (Connection.isPeerGone(e)) return .peer_gone;
+                    if (e == error.Canceled) if (park_timer) |t| if (t.fired()) {
+                        connection.clearReadError();
+                        return .idle;
+                    };
                     return e;
                 },
             };
@@ -1548,26 +1847,27 @@ pub fn Server(comptime Ctx: type) type {
         /// Runs on this task under zio, on a task of its own otherwise.
         fn runConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) void {
             defer if (watch) |w| w.finish(self.io);
+            handleConnection(self, l, stream, watch) catch |err| logConnectionError(err);
+        }
 
-            handleConnection(self, l, stream, watch) catch |err| {
-                if (err == error.Canceled) {
-                    log.debug("Connection canceled", .{});
-                    return;
-                }
-                // A peer disappearing mid-request is ordinary and would drown
-                // out the failures worth looking at.
-                if (Connection.isPeerGone(err)) {
-                    log.debug("Connection closed by peer: {}", .{err});
-                } else if (isMalformedRequest(err)) {
-                    // Anyone who can reach the port can send bytes that are
-                    // not HTTP, so this is not the server's error and must
-                    // not flood the error log (nginx logs these at info, as
-                    // the TLS handshake failures above are).
-                    log.info("Malformed request: {}", .{err});
-                } else {
-                    log.err("Connection error: {}", .{err});
-                }
-            };
+        fn logConnectionError(err: anyerror) void {
+            if (err == error.Canceled) {
+                log.debug("Connection canceled", .{});
+                return;
+            }
+            // A peer disappearing mid-request is ordinary and would drown
+            // out the failures worth looking at.
+            if (Connection.isPeerGone(err)) {
+                log.debug("Connection closed by peer: {}", .{err});
+            } else if (isMalformedRequest(err)) {
+                // Anyone who can reach the port can send bytes that are not
+                // HTTP, so this is not the server's error and must not flood
+                // the error log (nginx logs these at info, as the TLS
+                // handshake failures are).
+                log.info("Malformed request: {}", .{err});
+            } else {
+                log.err("Connection error: {}", .{err});
+            }
         }
 
         /// A request head the peer got wrong: llhttp refused it, or the
@@ -1659,51 +1959,70 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
-            defer self.releaseConnectionSlot();
-            // The first request's deadlines run from here, handshake included.
-            const accepted_at: std.Io.Clock.Timestamp = .now(self.io, .awake);
-
             // Counted since accept, so a handshake in progress is waited for
             // like a request. Handed back and taken again in `waitForRequest`.
             var busy = true;
             defer if (busy) self.finishRequest();
 
-            defer stream.close(self.io);
+            const conn = self.allocator.create(Conn) catch |err| {
+                self.releaseConnectionSlot();
+                stream.close(self.io);
+                return err;
+            };
+            conn.* = .{
+                .server = self,
+                .listener = l,
+                // Whole, so `closeConn` is safe before `initPlain`/`initTls`.
+                .connection = .{ .io = self.io, .stream = stream, .allocator = self.allocator, .buffers = &.{}, .read_buffer = &.{} },
+                // The first request's deadlines run from here, handshake
+                // included.
+                .accepted_at = .now(self.io, .awake),
+            };
 
             var timer: Timer = .init(watch);
-            defer timer.clear(self.io);
+            const outcome = self.startConnection(conn, &timer, &busy) catch |err| {
+                timer.clear(self.io);
+                self.closeConn(conn);
+                return err;
+            };
+            timer.clear(self.io);
+            self.settle(conn, outcome);
+        }
+
+        /// Takes `conn` from accept through the PROXY protocol header and the
+        /// TLS handshake to the protocol it speaks, and serves it until it
+        /// closes or parks.
+        fn startConnection(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+            const l = conn.listener;
+            const stream = conn.connection.stream;
 
             // The PROXY protocol header comes first, ahead of TLS.
             var proxied: proxy_protocol.Header = .{};
             if (l.config.proxy_protocol) {
                 defer timer.clear(self.io);
-                self.armDeadline(&timer, earlier(
-                    deadlineAfter(accepted_at, self.config.timeout.read_header),
-                    deadlineAfter(accepted_at, self.config.timeout.request),
+                self.armDeadline(timer, earlier(
+                    deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
+                    deadlineAfter(conn.accepted_at, self.config.timeout.request),
                 ));
                 proxied = proxy_protocol.read(self.io, stream) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
                     else => {
                         log.info("PROXY protocol header refused: {}", .{err});
-                        return;
+                        return .close;
                     },
                 };
             }
 
-            // What this connection handshakes with, held until it closes
-            // (after `connection.deinit`), whatever `reloadTls` swaps in
-            // meanwhile.
-            const material: ?*TlsMaterial = if (build_options.use_tls) self.acquireTls(l) else null;
-            defer if (material) |m| m.release(self.allocator);
-
-            var connection: Connection = undefined;
-            defer connection.deinit();
+            // What this connection handshakes with, held until it closes,
+            // whatever `reloadTls` swaps in meanwhile.
+            conn.material = if (build_options.use_tls) self.acquireTls(l) else null;
+            const connection = &conn.connection;
 
             // When the listener is TLS, upgrade the accepted stream and run
             // the request loop over the cleartext reader/writer. Otherwise
             // run it directly over the raw stream.
             if (build_options.use_tls) {
-                if (material) |m| {
+                if (conn.material) |m| {
                     // The handshake is the one part of a connection's life
                     // the request loop's timeout cannot cover, since that
                     // loop does not exist yet. A peer that opens a socket
@@ -1713,7 +2032,7 @@ pub fn Server(comptime Ctx: type) type {
                     // slow request, which is bounded.
                     {
                         defer timer.clear(self.io);
-                        self.armTimer(&timer, self.config.timeout.request);
+                        self.armTimer(timer, self.config.timeout.request);
 
                         connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
                             // tls.zig only saw the ciphertext reader or
@@ -1741,36 +2060,132 @@ pub fn Server(comptime Ctx: type) type {
                                 // flood the error log (nginx logs these at
                                 // info too).
                                 log.info("TLS handshake failed: {}", .{cause});
-                                try self.lingerAfterRefusal(stream, &timer);
+                                try self.lingerAfterRefusal(stream, timer);
                             }
-                            return;
+                            return .close;
                         };
                     }
 
                     connection.proxied_peer = proxied.source;
                     connection.proxied_secure = proxied.ssl;
+                    connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
                             // The engine's tasks have all ended when it
                             // returns, so this is the only writer left.
-                            try h2.Engine(Ctx).serve(self, l.config, true, &connection, &busy);
-                            return self.closeNotify(&connection, &timer);
+                            try h2.Engine(Ctx).serve(self, l.config, true, connection, busy);
+                            try self.closeNotify(connection, timer);
+                            return .close;
                         };
                     }
                     // An HTTP/2-only listener, and ALPN did not agree on it.
                     if (!l.config.http1) {
                         log.debug("closing a TLS connection that did not choose h2 on an HTTP/2-only listener", .{});
-                        return self.closeNotify(&connection, &timer);
+                        try self.closeNotify(connection, timer);
+                        return .close;
                     }
-                    try self.handleRequests(l, &connection, &timer, &busy, accepted_at);
-                    return self.closeNotify(&connection, &timer);
+                    return self.serveRequests(conn, timer, busy);
                 }
             }
 
             try connection.initPlain(self.allocator, self.io, stream);
             connection.proxied_peer = proxied.source;
             connection.proxied_secure = proxied.ssl;
-            return self.handleRequests(l, &connection, &timer, &busy, accepted_at);
+            connection.write_pool = &self.request_buffers;
+            return self.serveRequests(conn, timer, busy);
+        }
+
+        /// HTTP/1.x on `conn` until it closes or parks. A TLS connection that
+        /// ends without failing sends close_notify.
+        fn serveRequests(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+            const outcome = if (conn.connection.adopter != null)
+                try self.serveAdopted(conn, timer)
+            else
+                try self.handleRequests(conn, timer, busy);
+            if (outcome == .close) try self.closeNotify(&conn.connection, timer);
+            return outcome;
+        }
+
+        /// A run of what took `conn` over (`Adopter`).
+        fn serveAdopted(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
+            const a = conn.connection.adopter.?;
+            var burst: Burst = .{
+                .connection = &conn.connection,
+                .io = self.io,
+                .timer = timer,
+                .park_after = self.parkAfter(null),
+                .deadline = a.deadline,
+                .repark = conn.parked.woke_from_long,
+            };
+            burst.armDeadline();
+            const shelf = if (burst.park_after == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null;
+            if (shelf) |s| s.watch(&burst.watch) else burst.park_after = null;
+            defer if (shelf) |s| s.unwatch(&burst.watch);
+            return switch (try a.serve(a, &burst)) {
+                .close => .close,
+                .park => {
+                    conn.parked.deadline = if (a.deadline) |d| d.raw else null;
+                    return .park;
+                },
+            };
+        }
+
+        /// The task started for a parked connection whose socket became
+        /// readable, on the executor it parked on: serves it until it
+        /// closes or parks again.
+        fn resumeConnection(self: *Self, conn: *Conn) void {
+            // Not counted while parked: `waitForRequest` counts it again
+            // once a request arrives.
+            var busy = false;
+            defer if (busy) self.finishRequest();
+
+            var timer: Timer = .init(null);
+            const outcome = self.serveRequests(conn, &timer, &busy) catch |err| {
+                timer.clear(self.io);
+                self.closeConn(conn);
+                logConnectionError(err);
+                return;
+            };
+            timer.clear(self.io);
+            self.settle(conn, outcome);
+        }
+
+        /// The task that ends a parked TLS connection whose deadline passed
+        /// or whose server is stopping: a close_notify, as a connection
+        /// closed by its own task gets, and then its shelf closes it.
+        fn expireConnection(self: *Self, conn: *Conn) void {
+            var timer: Timer = .init(null);
+            // Stopped meanwhile: the shelf closes it all the same.
+            self.closeNotify(&conn.connection, &timer) catch self.io.recancel();
+            timer.clear(self.io);
+            conn.parked.expireDone();
+        }
+
+        /// The last thing a connection's task does with it: parks it, or
+        /// closes it (also when it cannot park after all). Once it is
+        /// parked a task may be serving it already, so nothing touches it
+        /// after this.
+        fn settle(self: *Self, conn: *Conn, outcome: Outcome) void {
+            if (outcome == .park) if (self.shelfHere()) |shelf| {
+                if (shelf.park(&conn.parked, conn.connection.stream.socket.handle)) return;
+            };
+            self.closeConn(conn);
+        }
+
+        /// Closes `conn`'s socket, frees it and gives back its slot. On a
+        /// task on its executor, with no other task serving it.
+        fn closeConn(self: *Self, conn: *Conn) void {
+            if (conn.connection.adopter) |a| a.release(a);
+            // A buffer an upgraded writer borrowed and never gave back (its
+            // last flush failed).
+            if (conn.connection.write_held != null) conn.connection.releaseWriteBuffer();
+            conn.connection.deinit();
+            conn.connection.stream.close(self.io);
+            if (conn.material) |m| m.release(self.allocator);
+            const counted = conn.counted;
+            self.allocator.destroy(conn);
+            self.releaseConnectionSlot();
+            if (counted) self.finishRequest();
         }
 
         /// Whether the peer sent, or may still send, input that was not
@@ -1894,20 +2309,37 @@ pub fn Server(comptime Ctx: type) type {
         /// parsed, served and answered before the next is looked at, so
         /// pipelined requests are answered in order without any more
         /// machinery than a keepalive connection needs.
-        fn handleRequests(
-            self: *Self,
-            l: *ActiveListener,
-            connection: *Connection,
-            timer: *Timer,
-            busy: *bool,
-            accepted_at: std.Io.Clock.Timestamp,
-        ) !void {
+        ///
+        /// Returns `.park` when the connection waited `timeout.idle_park`
+        /// for its next request with nothing in flight, ready to park: its
+        /// deadline set, its request buffers given back.
+        fn handleRequests(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
+            const l = conn.listener;
+            const connection = &conn.connection;
+            const accepted_at = conn.accepted_at;
+            // A connection woken after a long park parks again once it has
+            // served a request (`park.Shelf.long_park`).
+            var repark_after: ?usize = if (conn.parked.woke_from_long) conn.request_count + 1 else null;
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
+            // Last: the reader must not point into this frame once it is
+            // gone, as a connection that parks outlives it.
+            defer connection.replaceReadBuffer(&.{});
             var buffers: ?*RequestBuffers = null;
             defer if (buffers) |b| {
-                connection.releaseWriteBuffer();
+                // An adopter's writer is its own, under its lock: it took
+                // it out of the buffers before it returned.
+                if (connection.adopter == null) connection.releaseWriteBuffer();
                 self.request_buffers.release(b);
+            };
+            // A handler that handed the connection over (`Response.adopt`)
+            // but whose request did not get as far as the first run, which
+            // takes the adopter's windows out of the buffers: the adopter is
+            // done with before they go back.
+            var adopter_ran = false;
+            defer if (connection.adopter) |a| if (!adopter_ran) {
+                connection.adopter = null;
+                a.release(a);
             };
 
             var request: Request = .{
@@ -1933,15 +2365,13 @@ pub fn Server(comptime Ctx: type) type {
 
             request.parser = &parser;
 
-            var request_count: usize = 0;
-
             while (true) {
                 // Nothing buffered means the next request has not begun.
                 // The first is waited for under the request deadline, which
                 // runs from accept; a later one under the keepalive
                 // deadline, and its request deadline runs from arrival. A
                 // request pipelined behind the last one is already here.
-                const first = request_count == 0;
+                const first = conn.request_count == 0;
                 // Whether the wait below left a timer armed that the request
                 // itself must replace or clear.
                 var wait_armed = false;
@@ -1955,13 +2385,55 @@ pub fn Server(comptime Ctx: type) type {
                         }
                     }
                     const wait_timeout = if (first) self.config.timeout.request else self.config.timeout.keepalive;
-                    self.armTimer(timer, wait_timeout);
+                    // Parking: the wait goes on for `idle_park` first, and a
+                    // connection with nothing by then parks. One woken after
+                    // a long park parks again as soon as it has answered
+                    // what woke it, as if the delay had passed.
+                    const park_after = self.parkAfter(wait_timeout);
+                    const repark_now = if (repark_after) |n| conn.request_count >= n else false;
+                    if (repark_now) repark_after = null;
                     wait_armed = wait_timeout != null;
-                    switch (try self.waitForRequest(connection, busy)) {
+                    var arrival: RequestWait = if (repark_now and park_after != null) .idle else arrival: {
+                        self.armTimer(timer, park_after orelse wait_timeout);
+                        break :arrival try self.waitForRequest(connection, busy, if (park_after != null) timer else null);
+                    };
+                    if (arrival == .idle) {
+                        const shelf = self.shelfHere();
+                        if (shelf != null and !shelf.?.closed and connection.parkable()) {
+                            if (buffers) |b| {
+                                connection.useReadBuffer(&idle_read_buffer);
+                                connection.releaseWriteBuffer();
+                                self.request_buffers.release(b);
+                                buffers = null;
+                            }
+                            // The wait's own deadline, which a parked
+                            // connection keeps to the shelf's sweep.
+                            conn.parked.deadline = if (wait_timeout) |w|
+                                std.Io.Timestamp.now(self.io, .awake).addDuration(.fromNanoseconds(w.nanoseconds - park_after.?.nanoseconds))
+                            else
+                                null;
+                            return .park;
+                        }
+                        // Something is in flight after all (a partial TLS
+                        // record): the rest of the wait, on this task.
+                        self.armTimer(timer, if (wait_timeout) |w| .fromNanoseconds(w.nanoseconds - park_after.?.nanoseconds) else null);
+                        arrival = try self.waitForRequest(connection, busy, null);
+                    } else if (park_after != null) {
+                        // The park timer, gone before anything else can wait:
+                        // had it fired just as the request arrived, its
+                        // cancel would hit the next wait.
+                        timer.clear(self.io);
+                        wait_armed = false;
+                    }
+                    switch (arrival) {
                         .arrived => {},
-                        .peer_gone => return,
+                        .peer_gone => return .close,
                         // The request it refused was not read.
-                        .refused => return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers),
+                        .refused => {
+                            try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                            return .close;
+                        },
+                        .idle => unreachable,
                     }
                 }
                 // Cleartext HTTP/2 with prior knowledge: the first bytes are
@@ -1971,13 +2443,14 @@ pub fn Server(comptime Ctx: type) type {
                         return connection.getReadError() orelse error.Unexpected;
                     if (is_h2) {
                         timer.clear(self.io);
-                        return h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
+                        try h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
+                        return .close;
                     }
                 }
                 // An HTTP/2-only cleartext listener: no preface, no service.
                 if (!l.config.http1 and !(build_options.use_tls and l.config.tls != null)) {
                     log.debug("closing a connection that did not open with the HTTP/2 preface on an HTTP/2-only listener", .{});
-                    return;
+                    return .close;
                 }
                 // A request runs to `timeout.request` from its arrival (the
                 // first from accept), and its head must arrive within
@@ -1997,30 +2470,32 @@ pub fn Server(comptime Ctx: type) type {
                 const request_deadline = if (needs_clock) deadlineAfter(started_at, self.config.timeout.request) else null;
                 const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline);
                 if (!head_buffered) self.armDeadline(timer, header_deadline);
-                request_count += 1;
+                conn.request_count += 1;
 
                 if (buffers == null) {
                     const b = try self.request_buffers.acquire(@intFromPtr(connection));
                     buffers = b;
+                    // The write buffer once the response writes.
                     connection.useReadBuffer(b.read_buffer);
-                    connection.useWriteBuffer(b.write_buffer);
                     request.arena = b.arena.allocator();
                 }
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
-                    error.EndOfStream => return,
+                    error.EndOfStream => return .close,
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.HeadersTooLarge => {
                         log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        return .close;
                     },
                     error.TooManyHeaders => {
                         log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        return .close;
                     },
                     // A head that is not HTTP/1.x: 400, and a lingering
                     // close, so the peer reads the answer and a FIN rather
@@ -2056,7 +2531,8 @@ pub fn Server(comptime Ctx: type) type {
                             sendBadRequest(connection.writer) catch
                                 return connection.getWriteError() orelse error.Unexpected;
                         }
-                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        return .close;
                     },
                     else => |e| return e,
                 };
@@ -2094,7 +2570,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.keepalive = false;
                         try response.write();
                         if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return;
+                        return .close;
                     };
                 }
 
@@ -2109,7 +2585,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.keepalive = false;
                         try response.write();
                         if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return;
+                        return .close;
                     }
                 }
 
@@ -2121,7 +2597,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 // Check if we've reached the request count limit
                 if (self.config.timeout.request_count) |max_count| {
-                    if (request_count >= max_count) {
+                    if (conn.request_count >= max_count) {
                         response.keepalive = false;
                     }
                 }
@@ -2133,7 +2609,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.keepalive = false;
                         try response.write();
                         if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                        return;
+                        return .close;
                     },
                     else => |e| return e,
                 };
@@ -2154,7 +2630,7 @@ pub fn Server(comptime Ctx: type) type {
                     // unfinished response, which is the abort.
                     error.ResponseAborted => {
                         log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
-                        return;
+                        return .close;
                     },
                     else => |e| return e,
                 };
@@ -2192,14 +2668,39 @@ pub fn Server(comptime Ctx: type) type {
                     if (response.status != .switching_protocols and hasUnreadInput(connection, &parser)) {
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     }
+                    if (connection.adopter != null) {
+                        // In flight until it closes, the connection's count
+                        // rather than a task's.
+                        conn.counted = busy.*;
+                        busy.* = false;
+                        // The adopter keeps nothing of the request's
+                        // (`Response.adopt`), so its buffers go back before
+                        // the first run, rather than when the socket first
+                        // parks: a burst of upgrades does not hold a set
+                        // each meanwhile. Unless the peer sent something
+                        // behind the handshake already, which the first run
+                        // reads from the window the upgrade left in them,
+                        // and they go back after it.
+                        if (connection.reader.bufferedLen() == 0) if (buffers) |b| {
+                            connection.replaceReadBuffer(&.{});
+                            self.request_buffers.release(b);
+                            buffers = null;
+                        };
+                        adopter_ran = true;
+                        return self.serveAdopted(conn, timer);
+                    }
                     break;
                 }
 
+                // The write buffer goes back between requests, so the next
+                // holds none while it waits to answer.
+                connection.releaseWriteBuffer();
                 parser.reset();
                 request.reset();
-                _ = buffers.?.arena.reset(.retain_capacity);
+                buffers.?.resetArena();
                 connection.rewindReader();
             }
+            return .close;
         }
     };
 }

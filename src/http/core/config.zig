@@ -290,12 +290,15 @@ pub const ServerConfig = struct {
     /// `fd_limit.maxConnections`): past that limit `accept` fails anyway.
     /// 10,000 on Windows, which has no such limit.
     ///
-    /// An open connection costs about 2K, 33K more under TLS, and
-    /// `request.buffer_size + response.write_buffer_size + 9K` more while a
-    /// request is being served, or for as long as it is open with
-    /// `request.keep_buffers_between_requests` on. A request with a body
-    /// with a `Content-Encoding` takes 70K more while `request.decompress`
-    /// is on.
+    /// An idle connection costs a few kilobytes, about 9K under TLS on Linux
+    /// once parked (`timeout.idle_park`; about 20K while it keeps its task),
+    /// and
+    /// `request.buffer_size + 12K` more while a request is being served, or
+    /// for as long as it is open with `request.keep_buffers_between_requests`
+    /// on, of which an ordinary request touches one page; and
+    /// `response.write_buffer_size` more while its response is being
+    /// written. A request with a body with a `Content-Encoding` takes 70K
+    /// more while `request.decompress` is on.
     max_connections: ?u32 = max_connections_from_fd_limit,
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
@@ -425,6 +428,21 @@ pub const ServerConfig = struct {
         keepalive: ?std.Io.Duration = .fromSeconds(60),
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
+        /// How long an HTTP/1.1 connection waits for its next request on a
+        /// task of its own before it parks: the task ends, and the
+        /// connection waits as a small heap object until its socket is
+        /// readable, when a new task is started on the same executor to
+        /// serve it. A connection that sends again sooner keeps its task,
+        /// so a busy one never pays for parking. One that was parked this
+        /// long or longer parks again as soon as it has answered what woke
+        /// it, so that waking many mostly idle connections at once needs
+        /// tasks for about as many as are being served at a time. Only with something to
+        /// park: nothing buffered, and on TLS nothing pending in either
+        /// direction. A parked connection's `keepalive` (or first
+        /// `request`) deadline is kept to about a second. Null or zero
+        /// keeps idle connections on their task. Only on zio with pinned
+        /// executors; elsewhere connections never park.
+        idle_park: ?std.Io.Duration = .fromSeconds(1),
         /// Maximum time a graceful shutdown waits for the connections still
         /// in flight. Null waits for all of them, however long they take --
         /// which for a connection that never closes on its own, such as a
@@ -492,8 +510,9 @@ pub const ServerConfig = struct {
         /// Buffer size (bytes) for writing to the connection while a request
         /// is served. A response head and a body that fits behind it go out
         /// in one write; a streamed chunk, an event or a WebSocket frame is
-        /// assembled in it and sent as it is finished. Taken with the
-        /// request's read buffer, and given back with it. Must not be 0.
+        /// assembled in it and sent as it is finished. Taken from a pool at
+        /// the response's first write, and given back once it is out, so a
+        /// request still waiting to answer holds none. Must not be 0.
         ///
         /// 16K is the most a TLS record carries, so under TLS a smaller
         /// buffer sends what passes through it, a file or a body written in

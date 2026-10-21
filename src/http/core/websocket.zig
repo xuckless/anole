@@ -146,7 +146,11 @@ pub const WebSocket = struct {
     /// receiveMany() or tryReceive().
     pub fn receive(self: *WebSocket) !Message {
         self.resetMessages();
-        return self.nextMessage();
+        // Inlined down to the frame, so a loop that reads gets one function
+        // however many other paths share the parts (`receiveStarted`,
+        // `tryReceive`, the pongs): a call for each layer costs an echo
+        // about a tenth of its CPU.
+        return @call(.always_inline, nextMessage, .{self});
     }
 
     /// Like `receive`, but also returns every further message already
@@ -177,6 +181,46 @@ pub const WebSocket = struct {
         return try self.nextMessage();
     }
 
+    /// For a reading task that waits for the peer in its own way (a parked
+    /// connection, `atRest`): the next message, read to its end, when one
+    /// has begun in the read buffer; null once the buffer is empty, after
+    /// answering the control frames in it (a ping gets its pong), so a peer
+    /// that only pings does not hold the task. Part of a control frame is
+    /// read to its end first. The message as `receive` returns it.
+    pub fn receiveStarted(self: *WebSocket) !?Message {
+        const r = self.transport.reader;
+        while (true) {
+            const bytes = r.buffered();
+            if (bytes.len == 0) return null;
+            const opcode = bytes[0] & 0x0F;
+            if (opcode != @backingInt(MessageType.ping) and opcode != @backingInt(MessageType.pong)) return try self.receive();
+            if (bufferedFrame(bytes) == null) {
+                r.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => return error.EndOfStream,
+                    error.ReadFailed => return self.transport.getReadError() orelse error.Unexpected,
+                };
+                continue;
+            }
+            self.resetMessages();
+            self.takeControlFrame() catch |err| switch (err) {
+                error.ReadFailed => return self.transport.getReadError() orelse error.Unexpected,
+                else => |e| {
+                    if (failureCloseCode(e)) |code| self.writeClose(code, "") catch {};
+                    return e;
+                },
+            };
+        }
+    }
+
+    /// One ping or pong, whole in the read buffer.
+    fn takeControlFrame(self: *WebSocket) !void {
+        const frame = try self.readFrame();
+        if (frame.rsv1) return Error.ReservedFlags;
+        if (frame.opcode != .ping) return;
+        const after: Flush = if (self.autoflush and bufferedFrame(self.transport.reader.buffered()) != null) .batch else .now;
+        try self.writeFrame(.pong, frame.payload, true, after);
+    }
+
     /// Reading a close answers it, which ends sending, so a close is left
     /// for the next batch.
     fn nextBufferedMessage(self: *WebSocket) !?Message {
@@ -185,7 +229,7 @@ pub const WebSocket = struct {
     }
 
     fn nextMessage(self: *WebSocket) !Message {
-        const msg = self.readMessageOrFail() catch |err| {
+        const msg = @call(.always_inline, readMessageOrFail, .{self}) catch |err| {
             self.batch.endRound();
             return err;
         };
@@ -195,7 +239,7 @@ pub const WebSocket = struct {
     }
 
     fn readMessageOrFail(self: *WebSocket) !Message {
-        return self.readMessage() catch |err| switch (err) {
+        return @call(.always_inline, readMessage, .{self}) catch |err| switch (err) {
             // The reads inside can only report the sentinel; the transport
             // knows what actually happened.
             error.ReadFailed => self.transport.getReadError() orelse error.Unexpected,
@@ -282,7 +326,7 @@ pub const WebSocket = struct {
             if (self.batch.deferred.load(.monotonic) and bufferedFrame(self.transport.reader.buffered()) == null) {
                 try self.flushDeferred();
             }
-            const frame = try self.readFrame();
+            const frame = try @call(.always_inline, readFrame, .{self});
             // RSV1 marks a compressed message on its first frame only.
             if (frame.rsv1 and (frame.opcode != .text and frame.opcode != .binary)) return Error.ReservedFlags;
 
@@ -416,6 +460,7 @@ pub const WebSocket = struct {
         errdefer self.closed = true;
         self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
+        self.giveBackWriteBuffer();
     }
 
     /// Writes out what a batch held, if anything still holds it.
@@ -426,6 +471,94 @@ pub const WebSocket = struct {
         errdefer self.closed = true;
         self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
+        self.giveBackWriteBuffer();
+    }
+
+    /// Borrows a buffer for the writer from the connection, when it lends
+    /// them (`Transport.write_buffers`) and the writer has none: the frames
+    /// about to be sent are built in it. Under `write_mutex`.
+    fn borrowWriteBuffer(self: *WebSocket) void {
+        const lender = self.transport.write_buffers orelse return;
+        lender.take(lender.context);
+    }
+
+    /// Gives a borrowed write buffer back once a flush left nothing in it,
+    /// so a quiet socket holds none. Under `write_mutex`.
+    fn giveBackWriteBuffer(self: *WebSocket) void {
+        const lender = self.transport.write_buffers orelse return;
+        lender.give(lender.context);
+    }
+
+    /// Writes out what a batch held, now: before the reading task waits
+    /// for the peer some way other than through `receive`, which does this
+    /// itself.
+    pub fn flushBatch(self: *WebSocket) !void {
+        return self.flushDeferred();
+    }
+
+    /// Whether the reading task holds nothing of the socket's: no byte of
+    /// the next frame is buffered and no message is half assembled. Where it
+    /// can stop reading (`detachBuffers`) until the peer sends again.
+    pub fn atRest(self: *const WebSocket) bool {
+        return self.fragmented_type == null and self.transport.reader.bufferedLen() == 0;
+    }
+
+    /// For a socket that waits with no task reading it (a parked
+    /// connection): its batch's flusher task ends, anything left in the
+    /// write buffer goes out, and the reader and the writer give up their
+    /// buffers, so frames other tasks send meanwhile go out through a
+    /// borrowed buffer (`Transport.write_buffers`), or unbuffered, one write
+    /// each. The messages' memory goes back. By the reading task, at rest
+    /// (`atRest`), with what a batch held flushed (`flushBatch`);
+    /// `attachBuffers` undoes it.
+    pub fn detachBuffers(self: *WebSocket) void {
+        self.dropBuffers(false);
+    }
+
+    /// `detachBuffers` as the socket closes, from the reading side: sending
+    /// is over too, so frames from other tasks fail (`error.EndOfStream`)
+    /// without touching the connection.
+    pub fn shut(self: *WebSocket) void {
+        self.dropBuffers(true);
+    }
+
+    fn dropBuffers(self: *WebSocket, close_sending: bool) void {
+        self.batch.stopFlusher(self.io);
+        {
+            self.write_mutex.lockUncancelable(self.io);
+            defer self.write_mutex.unlock(self.io);
+            const w = self.transport.writer;
+            if (w.end != 0 and !self.closed) {
+                self.batch.flushing();
+                w.flush() catch {
+                    self.closed = true;
+                };
+            }
+            // A borrowed one back to the connection; what a failed flush
+            // left in it, the connection takes back as it closes.
+            self.giveBackWriteBuffer();
+            if (w.end == 0) w.buffer = &.{};
+            if (close_sending) self.closed = true;
+        }
+        const r = self.transport.reader;
+        r.buffer = &.{};
+        r.seek = 0;
+        r.end = 0;
+        self.fragmented_data = .empty;
+        self.fragmented_type = null;
+        _ = self.msg_arena.reset(.free_all);
+    }
+
+    /// The reader takes `read` as its buffer: a task reads the socket again
+    /// after `detachBuffers`. It must outlive the reading until the next
+    /// `detachBuffers` or `shut`. The writer borrows a buffer from the
+    /// connection as it sends (`Transport.write_buffers`).
+    pub fn attachBuffers(self: *WebSocket, read: []u8) void {
+        const r = self.transport.reader;
+        std.debug.assert(r.bufferedLen() == 0);
+        r.buffer = read;
+        r.seek = 0;
+        r.end = 0;
     }
 
     /// The batch's flush, for its backstop (`Batch.hold`).
@@ -554,6 +687,17 @@ pub const WebSocket = struct {
         // boundary.
         errdefer self.closed = true;
 
+        // No buffer to build the frame in. A small one that goes out now
+        // is built on the stack, so the socket holds no buffer across the
+        // write (which parks the task, even one that completes at once);
+        // otherwise one is borrowed from the connection while there is
+        // something to send, or, without one, there is no buffer at all.
+        if (self.transport.writer.buffer.len == 0 and !self.is_client) {
+            if (after == .now and data.len <= unbuffered_payload_max) return self.writeUnbuffered(opcode, data, fin, rsv);
+            self.borrowWriteBuffer();
+            if (self.transport.writer.buffer.len == 0) return self.writeUnbuffered(opcode, data, fin, rsv);
+        }
+
         // First byte: FIN + RSV + opcode
         const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | rsv | @backingInt(opcode);
         try self.transport.writer.writeByte(byte0);
@@ -597,14 +741,51 @@ pub const WebSocket = struct {
             .now => {
                 self.batch.flushing();
                 try self.transport.writer.flush();
+                self.giveBackWriteBuffer();
             },
             .batch => if (!self.batch.hold(self.io, flushHeld)) {
                 // No backstop to be had: out now, as without a batch.
                 self.batch.flushing();
                 try self.transport.writer.flush();
+                self.giveBackWriteBuffer();
             },
             .manual => {},
         }
+    }
+
+    /// The biggest payload `writeUnbuffered` builds its frame around on the
+    /// stack, in one write; a bigger one goes out as a vectored write of
+    /// the header and the payload, which a TLS layer may send as two
+    /// records.
+    const unbuffered_payload_max = 512;
+
+    /// A server's frame through a writer with no buffer: one write for a
+    /// small frame, built here, or the header and the payload in one
+    /// vectored write. Out of line, so the scratch stays off the frames of
+    /// the ordinary path.
+    noinline fn writeUnbuffered(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, rsv: u8) std.Io.Writer.Error!void {
+        var frame: [unbuffered_payload_max + 10]u8 = undefined;
+        frame[0] = (@as(u8, if (fin) 0x80 else 0x00)) | rsv | @backingInt(opcode);
+        var head_len: usize = 2;
+        if (data.len < 126) {
+            frame[1] = @intCast(data.len);
+        } else if (data.len <= 65535) {
+            frame[1] = 126;
+            std.mem.writeInt(u16, frame[2..4], @intCast(data.len), .big);
+            head_len = 4;
+        } else {
+            frame[1] = 127;
+            std.mem.writeInt(u64, frame[2..10], @intCast(data.len), .big);
+            head_len = 10;
+        }
+        const w = self.transport.writer;
+        self.batch.flushing();
+        if (head_len + data.len <= frame.len) {
+            @memcpy(frame[head_len..][0..data.len], data);
+            return w.writeAll(frame[0 .. head_len + data.len]);
+        }
+        var parts = [_][]const u8{ frame[0..head_len], data };
+        return w.writeVecAll(&parts);
     }
 
     fn writeClose(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
@@ -760,6 +941,20 @@ pub const Batch = struct {
     /// for frames still held.
     pub fn flushing(self: *Batch) void {
         self.deferred.store(false, .monotonic);
+    }
+
+    /// Ends the socket's flusher task, if it has one: for a socket that
+    /// waits with no task reading it. With nothing held (`deferred` clear),
+    /// so no backstop starts it again meanwhile; started again with the
+    /// next batch that needs it.
+    pub fn stopFlusher(self: *Batch, io: std.Io) void {
+        if (!self.started) return;
+        self.flusher.cancel(io);
+        if (self.home) |home| {
+            home.mutex.lockUncancelable(io);
+            defer home.mutex.unlock(io);
+            self.started = false;
+        } else self.started = false;
     }
 
     /// Takes the batch off its executor's backstop and stops its flusher.

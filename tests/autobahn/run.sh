@@ -11,10 +11,11 @@
 # the client container's exit code and State (OOMKilled), whether the echo
 # peer was still alive and how it exited, the memory samples taken every
 # 5 s (echo peer RSS, client container, host), and the kernel log's tail.
-#   tests/autobahn/run.sh [path-to-echo-binary]
+#   tests/autobahn/run.sh [path-to-echo-binary [loop|callbacks]]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-zig-out/bin/autobahn-echo}
+mode=${2:-loop}
 image=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
 # The machine, since a failure once followed the runner, not the commit:
 # zlib-ng picks its x86 code paths (AVX2, AVX-512, VNNI, VPCLMULQDQ) at run
@@ -29,7 +30,7 @@ attempt=1
 while :; do
   reports=$(mktemp -d)
   echo "reports: $reports (attempt $attempt)"
-  "$bin" 9001 >"$reports/server.log" 2>&1 &
+  "$bin" 9001 "$mode" >"$reports/server.log" 2>&1 &
   pid=$!
   sleep 1
   client=autobahn-client-$$-$attempt

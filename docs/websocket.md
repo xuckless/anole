@@ -63,6 +63,51 @@ The handler takes `(ws, req)`, `(ws)` alone, or on a `Server(App)`
 [upgrade options](#upgrade-options) (at compile time); groups have `ws` and
 `wsWith` too.
 
+## Callbacks
+
+A socket that is idle most of the time (chat, notifications, live updates)
+can be served through callbacks instead of a handler that loops:
+
+```zig
+const Chat = struct {
+    pub fn open(ws: *anole.websocket.Socket, req: *anole.Request) !void {
+        _ = req; // the request is at hand for the last time here
+        try ws.send(.text, "welcome");
+    }
+    pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void {
+        try ws.send(msg.type, msg.data);
+    }
+    pub fn close(ws: *anole.websocket.Socket) void {
+        _ = ws; // leave rooms, free ws.context
+    }
+};
+
+app.wsCallbacks("/chat", Chat);
+```
+
+`message` is required; `open` and `close` are optional, and each may take
+the app state first on a `Server(App)`. `open` runs right after the
+handshake; `message` for each text or binary message, its data valid
+during the call; `close` once, when the socket is done, whoever ended it
+(`ws.close_code` holds the client's close code, `ws.end_error` another
+cause). A failing `open` or `message` closes the socket with 1011. Keep
+per-socket state behind `ws.context` (`ws.contextAs(T)` reads it back),
+set in `open` and freed in `close`.
+
+Over HTTP/1.1 a callback socket holds no coroutine while it waits: when
+nothing has arrived for `timeout.idle_park` (1 s), it gives up its buffers
+and parks, a few kilobytes on the heap, and the next message starts a
+coroutine for it on the same executor. The callbacks run there one at a
+time and may wait (a database call, a lock); messages that arrive meanwhile
+wait their turn. Pings are answered and replies batched as with
+`ws.next()`. `ws.send` and `ws.close` work from any task at any time; to a
+parked socket each frame goes out in one write of its own. Over HTTP/2 and
+HTTP/3 the callbacks run on the stream's task as a loop would.
+
+`app.wsCallbacksWith(path, Callbacks, options)` takes the
+[upgrade options](#upgrade-options); with `timeout` set the socket is
+closed at that deadline, parked or not. Groups have both too.
+
 ## Accepting a connection
 
 Register a normal `GET` route and call `upgrade` in the handler. It returns
@@ -90,8 +135,8 @@ The socket lives as long as the handler. It is held in the request's arena,
 so do not keep a pointer to it after the handler returns. Always
 `defer ws.deinit()`; on HTTP/2 and HTTP/3 that also ends the stream.
 
-Over HTTP/2, call `anole.websocket.upgrade`, not dusty's
-`res.upgradeWebSocket`. The dusty call handles HTTP/1.1 only and returns null
+Over HTTP/2, call `anole.websocket.upgrade`, not the HTTP core's
+`res.upgradeWebSocket`. That call handles HTTP/1.1 only and returns null
 for an HTTP/2 request. If you must keep code that uses it, turn RFC 8441 off
 in the server options (keep the stream limit, which this field replaces):
 
@@ -100,7 +145,7 @@ in the server options (keep the stream limit, which this field replaces):
 ```
 
 Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
-(the dusty call never handled HTTP/3 anyway). A plain CONNECT, without
+(`res.upgradeWebSocket` never handled HTTP/3 anyway). A plain CONNECT, without
 `:protocol`, gets 501 over HTTP/3: Anole is no proxy.
 
 ### Upgrade options

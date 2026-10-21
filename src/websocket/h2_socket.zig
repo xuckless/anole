@@ -20,8 +20,8 @@ pub const H2Socket = struct {
     arena: std.mem.Allocator,
     body: dusty.RequestBodyReader,
     out: dusty.StreamingBodyWriter,
-    in_buf: [16 * 1024]u8,
-    out_buf: [16 * 1024]u8,
+    in_buf: [buffer_len]u8,
+    out_buf: [buffer_len]u8,
     frames: codec.FrameHandler,
     message: std.ArrayList(u8) = .empty,
     max_message_size: usize,
@@ -32,6 +32,13 @@ pub const H2Socket = struct {
     /// the reading task sends while the peer's next message is already
     /// buffered goes out with the batch.
     batch: dusty.WebSocketBatch = .{},
+
+    /// Each of the socket's buffers, for frames coming in and going out.
+    /// Reads walk through the whole of one before they start over at its
+    /// front, so all of it stays resident while the socket lives: a page,
+    /// rather than four. A bigger message goes through in pieces, a frame
+    /// with a bigger payload straight to the stream.
+    pub const buffer_len = 4 * 1024;
 
     /// Answers the extended CONNECT and starts the socket on the request's
     /// body and a streamed response.

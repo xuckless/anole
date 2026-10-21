@@ -476,11 +476,26 @@ To allow more, raise the hard limit where the process starts:
 `LimitNOFILE=1048576` in a systemd unit, `--ulimit nofile=1048576:1048576`
 for `docker run`, `ulimit -Hn` in a shell (as root).
 
-Each open connection also has a coroutine, and each coroutine's stack is two
-memory mappings. Linux caps mappings per process with `vm.max_map_count`,
+An HTTP/1.1 connection that has waited `timeout.idle_park` (1 s) for its
+next request, with nothing buffered, ends its coroutine and parks: it is
+then a small heap object whose socket the executor watches, and the next
+request starts a coroutine for it again on the same executor; a
+connection that had been parked that long or longer parks again as soon
+as it has answered, so waking thousands of idle connections at once costs
+coroutines only for those being served at that moment. Keep-alive
+and first-request timeouts still apply to parked connections, to about a
+second, and the drain and the stop close them. A WebSocket served through
+callbacks ([`app.wsCallbacks`](websocket.md#callbacks)) parks the same
+way between messages. HTTP/2 connections, and WebSockets served by a
+handler that loops on `ws.next()`, keep their coroutines. Set
+`server.timeout.idle_park` to null to keep every connection's coroutine
+(parking needs zio's pinned executors, which `run` uses).
+
+Each connection with a coroutine has a stack, which is two memory mappings.
+Linux caps mappings per process with `vm.max_map_count`,
 which is 65,530 by default on Debian, RHEL and their derivatives (Ubuntu
 22.10 and later default to 1,048,576), so a server there stops taking new
-connections at about 30,000 open at once, whatever the cap. Raise it on
+connections at about 30,000 busy at once, whatever the cap. Raise it on
 hosts that hold more:
 
 ```sh
@@ -526,7 +541,7 @@ same for it, and `http3` holds the settings; one HTTP/3 port per server.
 
 `http3` fields: `address` and `port` (the TLS listener's when null), `alt_svc`
 (true), `max_streams_bidi` (100 concurrent requests per connection),
-`idle_timeout_ms` (30 000), `validate_address` (false), `early_data`
+`idle_timeout` (30 s, a `std.Io.Duration`), `validate_address` (false), `early_data`
 (false), `sockets` (null: one per executor on Linux, see
 [Cores](#cores)), `enable_connect_protocol` (true: extended CONNECT, for RFC 9220
 WebSockets) and `webtransport` (false; `app.webtransport` turns it on). With `validate_address`, every new client must prove its address

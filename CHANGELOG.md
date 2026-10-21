@@ -36,6 +36,37 @@ for macOS and Linux.
   connections left unused, and a WebSocket's reply batching shares one
   backstop task per executor instead of one per socket: a busy pipelining
   WebSocket holds about 34 KB instead of 43.
+- Idle connections park: an HTTP/1.1 connection that has had nothing to
+  read for `timeout.idle_park` (1 s, null turns it off) ends its coroutine
+  and waits as a heap object whose socket its executor watches (a readiness
+  poll in a zio `CompletionQueue` that one driver task per executor owns);
+  its next request starts a coroutine on the same executor. Keep-alive deadlines, the drain and the stop cover parked
+  connections. `app.wsCallbacks(path, Callbacks)` serves a WebSocket
+  through `open`/`message`/`close` callbacks, and over HTTP/1.1 such a
+  socket parks the same way between messages (`Response.adopt` in the
+  HTTP core hands the connection over to it after the handshake).
+- A request waiting in its handler holds about 6 KB instead of 14: its
+  head, its arena's first chunk and the set's header share one page (sets
+  are carved page-aligned from slabs; a trimmed one gives its pages back
+  and is reused), the request's and the response's header tables start at
+  16 entries and grow to their limits, a buffered body's first segment is
+  taken when the body is written, and the write buffer comes from a pool of
+  its own at the response's first write and goes back once it is out. What
+  a request takes from its arena beyond the set's 10 KB goes back when it
+  ends rather than staying with the set. `res.addHeader` adds a header
+  that may repeat (`Vary`); adding to `res.headers` directly is limited to
+  its current room.
+- A WebSocket holds less (cgroup per socket, 10k sockets, Linux): an
+  upgraded HTTP/1.1 connection keeps one page of its request (the head the
+  handler can still read, beside the arena's first chunk) and reads frames
+  into the rest of that page; its writer borrows a pooled buffer only
+  while it has frames waiting (a small frame sent at once is built on the
+  stack), so a quiet or echoing socket holds none. A callback socket gives
+  its request buffers back right after the handshake instead of when it
+  first parks. A `ws.next()` socket 32 to 22 KB idle or busy (TLS 37 to
+  27); a callback socket 36 to 18.5 KB during a connect burst, 22 to 15 KB
+  busy, 7.8 to 3.9 KB parked. Over HTTP/2 and HTTP/3 a socket's two frame
+  buffers are 4 KB each instead of 16.
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with
@@ -194,6 +225,9 @@ for macOS and Linux.
 - `Options.error_handler`, a plain function that answers handler errors
   without a `Ctx`, and `anole.defaultError(req, res, err)`, the default
   answer, for it or an `uncaughtError` to fall back on.
+- `req.param(name)` and `req.queryParam(name)`: a path parameter and a
+  query-string value by name (short for `req.params.get` and
+  `req.query.get`).
 - `req.bind(T)`: the JSON body as a `T` in the request's arena, unknown
   fields ignored, 400 when it is missing (`error.MissingBody`) or does not
   fit (`error.InvalidJsonBody`); `req.bindWith(T, options)` takes

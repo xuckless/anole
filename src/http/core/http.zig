@@ -410,6 +410,22 @@ pub const Headers = struct {
         return .{ .keys = keys, .values = values, .hashes = buf[hashes_offset..] };
     }
 
+    /// Room for more in a full table, up to `max` entries: a table twice
+    /// the size from `allocator`, the entries copied over. For a table in
+    /// an arena, which keeps the old one: it starts small, so an ordinary
+    /// message's headers take little of the arena, and grows to its limit
+    /// for one with more. False at `max`, or without the memory.
+    pub fn grow(self: *Headers, allocator: std.mem.Allocator, max: usize) bool {
+        if (self.keys.len >= max) return false;
+        var bigger = Headers.init(allocator, @min(max, @max(8, self.keys.len * 2))) catch return false;
+        @memcpy(bigger.keys[0..self.len], self.keys[0..self.len]);
+        @memcpy(bigger.values[0..self.len], self.values[0..self.len]);
+        @memcpy(bigger.hashes[0..self.len], self.hashes[0..self.len]);
+        bigger.len = self.len;
+        self.* = bigger;
+        return true;
+    }
+
     pub fn deinit(self: *Headers, allocator: std.mem.Allocator) void {
         const max = self.keys.len;
         if (max == 0) return;

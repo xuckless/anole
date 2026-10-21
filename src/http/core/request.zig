@@ -325,6 +325,20 @@ pub const Request = struct {
         return result;
     }
 
+    /// A path parameter by name, null when the route has none of that name:
+    /// `req.param("id")` for "/users/:id". The same as `req.params.get`;
+    /// `req.params.getInt(u64, "id")` parses one.
+    pub fn param(self: *const Request, name: []const u8) ?[]const u8 {
+        return self.params.get(name);
+    }
+
+    /// A query-string value by name, percent-decoded, null when absent:
+    /// `req.queryParam("page")` for "?page=2". The same as `req.query.get`;
+    /// `req.query.getInt(u32, "page")` parses one.
+    pub fn queryParam(self: *const Request, name: []const u8) ?[]const u8 {
+        return self.query.get(name);
+    }
+
     /// The JSON body as a `T` (`std.json`), allocated in the request's
     /// arena: `const in = try req.bind(NewUser);`. Fields the body has and
     /// `T` does not are ignored. A request without a body fails with
@@ -757,6 +771,10 @@ const MultipartForm = struct {
     // End of chunk.
 };
 
+/// How many headers `parseHeaders` makes room for before it has to grow the
+/// table.
+const initial_header_room = 16;
+
 const ParseHeadersError = std.Io.Reader.Error || ParseError ||
     error{ IncompleteRequest, HeadersTooLarge, OutOfMemory };
 
@@ -772,8 +790,10 @@ const ParseHeadersError = std.Io.Reader.Error || ParseError ||
 /// Returns error.HeadersTooLarge if the head does not fit.
 pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeadersError!void {
     // The arena is reset between requests, and may be another pooled set's
-    // by the next one, so the headers are allocated for each.
-    parser.request.headers = try http.Headers.init(parser.request.arena, parser.request.config.max_header_count);
+    // by the next one, so the headers are allocated for each: room for
+    // most heads, grown to `max_header_count` for one with more, so that an
+    // ordinary request takes little of its arena.
+    parser.request.headers = try http.Headers.init(parser.request.arena, @min(parser.request.config.max_header_count, initial_header_room));
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {
         const buffered = reader.buffered();

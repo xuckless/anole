@@ -89,6 +89,22 @@ pub const Transport = struct {
     tls_reader: ?*tls.Connection.Reader = null,
     tls_writer: ?*tls.Connection.Writer = null,
 
+    /// Where `writer` gets a buffer while it has something to send, on a
+    /// connection that lends them (the server's): null when the writer's
+    /// buffer is its own.
+    write_buffers: ?WriteBuffers = null,
+
+    /// A lender of write buffers, for a writer that is idle most of the
+    /// time (a WebSocket's): `take` gives `writer` a buffer if it has none,
+    /// `give` takes it back once nothing is left in it. Called under the
+    /// lock the writes are made under. A writer without a buffer still
+    /// works, one write at a time.
+    pub const WriteBuffers = struct {
+        context: *anyopaque,
+        take: *const fn (context: *anyopaque) void,
+        give: *const fn (context: *anyopaque) void,
+    };
+
     // tls.zig records `ReadFailed`/`WriteFailed` when the layer below it
     // failed, because all it saw was the ciphertext reader/writer's generic
     // error; the real cause is on the TCP layer. So those two mean "keep

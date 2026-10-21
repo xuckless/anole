@@ -238,8 +238,13 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
-        // Headers point directly into the read buffer, no copy needed
-        self.request.headers.add(self.state.header_field, self.state.header_value) catch return -1;
+        // Headers point directly into the read buffer, no copy needed. The
+        // table starts small (`parseHeaders`) and grows to the limit.
+        const headers = &self.request.headers;
+        headers.add(self.state.header_field, self.state.header_value) catch {
+            if (!headers.grow(self.request.arena, self.request.config.max_header_count)) return -1;
+            headers.add(self.state.header_field, self.state.header_value) catch return -1;
+        };
 
         self.state.header_value = "";
         self.state.header_field = "";

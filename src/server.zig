@@ -209,7 +209,7 @@ pub const Options = struct {
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
         /// How long a connection may sit idle before it is closed.
-        idle_timeout_ms: u32 = 30_000,
+        idle_timeout: std.Io.Duration = .fromSeconds(30),
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
         /// 0-RTT run at once, with `Early-Data: 1` among their headers
@@ -617,6 +617,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .stack_pool = .{
                     .maximum_size = opts.max_stack_size,
                     .committed_size = @min(opts.max_stack_size, 256 * 1024),
+                    // The stacks of tasks that ended, such as those of
+                    // connections that parked (`timeout.idle_park`), go back
+                    // to the system within seconds rather than minutes: the
+                    // pool keeps what was in use at once during the last
+                    // interval, and half of what it kept before.
+                    .shrink_interval = .fromSeconds(2),
                 },
             });
             errdefer rt.deinit();
@@ -904,7 +910,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .key_pem = cs.pem.key,
                     .max_streams_bidi = q.max_streams_bidi,
                     .validate_address = q.validate_address,
-                    .idle_timeout_ms = q.idle_timeout_ms,
+                    .idle_timeout = q.idle_timeout,
                     .hq_interop_root = q.hq_interop_root,
                     .early_data = q.early_data,
                     .enable_connect_protocol = q.enable_connect_protocol,
@@ -1231,6 +1237,28 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.router.get(path, websocket.route(Ctx, handler, upgrade));
         }
 
+        /// A WebSocket endpoint at `path` served through callbacks:
+        /// `Handlers`'s `message` for each message, and `open` and `close`
+        /// if it declares them (see `anole.websocket.callbacks`). Over
+        /// HTTP/1.1 an idle socket holds no task, only a small heap object,
+        /// which suits many mostly idle sockets better than `ws`:
+        ///
+        ///     const Echo = struct {
+        ///         pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void {
+        ///             try ws.send(msg.type, msg.data);
+        ///         }
+        ///     };
+        ///     app.wsCallbacks("/echo", Echo);
+        pub fn wsCallbacks(self: *Self, path: []const u8, comptime Handlers: type) void {
+            self.wsCallbacksWith(path, Handlers, .{});
+        }
+
+        /// `wsCallbacks` with upgrade options.
+        pub fn wsCallbacksWith(self: *Self, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+            if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+            self.router.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
+        }
+
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
         /// Firefox speak), on the HTTP/3 listener, which this turns
         /// WebTransport on for: `handler` gets the open session, which is
@@ -1398,6 +1426,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
+            }
+            /// `Server.wsCallbacks` under this group.
+            pub fn wsCallbacks(g: Group, path: []const u8, comptime Handlers: type) void {
+                g.wsCallbacksWith(path, Handlers, .{});
+            }
+            /// `Server.wsCallbacksWith` under this group.
+            pub fn wsCallbacksWith(g: Group, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+                if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                g.inner.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
             }
             /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
