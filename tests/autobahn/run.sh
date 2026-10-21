@@ -16,6 +16,13 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-zig-out/bin/autobahn-echo}
 image=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
+# The machine, since a failure has followed the runner, not the commit:
+# zlib-ng picks its x86 code paths (AVX2, AVX-512, VNNI, VPCLMULQDQ) at run
+# time, and the client's memory peaks at a few GiB.
+cpu=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)
+flags=$(grep -m1 -o -w 'avx2\|avx512f\|avx512bw\|avx512vl\|avx512vnni\|vpclmulqdq' /proc/cpuinfo 2>/dev/null | tr '\n' ' ' || true)
+mem=$(awk '/MemTotal/{print $2 " kB"}' /proc/meminfo 2>/dev/null || echo unknown)
+echo "machine: $(nproc 2>/dev/null || echo ?) CPUs, $cpu; $flags; MemTotal $mem"
 attempt=1
 while :; do
   reports=$(mktemp -d)
@@ -57,6 +64,7 @@ while :; do
   echo "client: exit $client_exit; state $client_state"
   echo "echo peer: $echo_state when the client ended; exit status $echo_exit"
   echo "peak client container memory: $(sed -n 's/.*client=\([^ ]*\) .*/\1/p' "$reports/mem.log" | sort -h | tail -1)"
+  echo "lowest host MemAvailable: $(sed -n 's/.*host_avail_kb=\([0-9]*\).*/\1/p' "$reports/mem.log" | sort -n | head -1) kB"
   if [ ! -f "$reports/index.json" ]; then
     echo "no report from the fuzzing client"
     echo "--- fuzzing client log (tail)"
