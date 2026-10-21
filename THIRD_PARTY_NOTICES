@@ -28,8 +28,8 @@ zio (async runtime)
             recvmmsg/sendmmsg patches; some are open upstream as
             lalinsky/zio #836-#838)
   Pinned:   commit dcaf6fe009093f123791e088cb89daf16fb26327 of the fork
-            (branch fix/accept-pending-cancel: ebb7014 plus the accept
-            cancel fix, to be merged into anole)
+            (ebb7014 plus the accept cancel fix, merged into the fork's
+            anole branch as 504ceab)
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)
