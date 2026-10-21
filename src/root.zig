@@ -8,7 +8,8 @@
 const std = @import("std");
 
 /// The feature flags this build was configured with (`-Dprofile`, `-Dtls`,
-/// `-Dhttp2`, `-Dhttp3`, `-Dgrpc`, `-Dwebsocket`, `-Dauth`).
+/// `-Dhttp2`, `-Dhttp3`, `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`,
+/// `-Dsqlite`, `-Dmongodb`...).
 pub const features = @import("build_options");
 
 /// The async runtime (lalinsky/zio). Executables pick the scheduling mode with
@@ -100,6 +101,19 @@ pub const json = if (features.json) @import("json/root.zig") else struct {};
 /// A Redis/Valkey client on std.Io (-Dredis), with hiredis's RESP parser.
 pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 
+/// What the database connectors share: calls that take the request, a
+/// pool per executor, errors that are statuses (`NotFound` 404, `Conflict`
+/// 409...), `Time`, connection URLs from the environment, and the health,
+/// metrics and tracing hooks.
+pub const db = @import("db/root.zig");
+
+/// Outbound connections for the database clients: `ClientStream`, TCP or
+/// a Unix socket, plain or TLS on BoringSSL.
+pub const net = struct {
+    pub const ClientStream = @import("net/client_stream.zig").ClientStream;
+    pub const ConnectOptions = @import("net/client_stream.zig").ConnectOptions;
+};
+
 /// Sessions: server-side stores (memory, Redis) or an encrypted cookie.
 pub const session = @import("session/root.zig");
 
@@ -144,6 +158,8 @@ test {
     _ = grpc;
     _ = json;
     _ = redis;
+    _ = db;
+    _ = @import("net/client_stream.zig");
     _ = session;
     _ = early_data;
     _ = ratelimit;
