@@ -114,6 +114,9 @@ pub const Options = struct {
     /// kernel steers datagrams among them by connection ID (`Endpoint`).
     /// Elsewhere always one. At most 255.
     sockets: u16 = 1,
+    /// The name requests report in `Request.listener.name`: the TCP
+    /// listener's whose port this one serves HTTP/3 for.
+    listener_name: []const u8 = "",
     /// Serve this UDP socket, opened elsewhere (systemd, or the process
     /// this one replaces), instead of binding `address`.
     fd: ?std.posix.fd_t = null,
@@ -448,7 +451,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .index = index,
                 .shared = shared,
                 .secret = secret,
-                .listener = .{ .address = .{ .ip = socket.address } },
+                .listener = .{ .address = .{ .ip = socket.address }, .name = options.listener_name },
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },

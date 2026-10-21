@@ -15,8 +15,10 @@ const builtin = @import("builtin");
 const c = std.c;
 
 pub const Fd = std.posix.fd_t;
-/// Room for a few TCP listeners and an HTTP/3 socket per core.
-pub const max_listeners = 8 + 255;
+/// Room for `max_tcp_listeners` TCP listeners and an HTTP/3 socket per
+/// core.
+pub const max_listeners = max_tcp_listeners + 255;
+pub const max_tcp_listeners = 64;
 
 /// The listening sockets handed to this process, with their names.
 pub const Inherited = struct {

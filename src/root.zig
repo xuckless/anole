@@ -28,6 +28,12 @@ pub const ServerOptions = @import("server.zig").Options;
 /// `.fromFiles("cert.pem", "key.pem")`, `.fromPem(cert, key)` or
 /// `.dev_self_signed`.
 pub const Cert = ServerOptions.Cert;
+/// A listener in `ServerOptions.listeners`: address or unix socket, TLS,
+/// protocols, name.
+pub const Listener = ServerOptions.Listener;
+/// Middleware that serves a group's routes on one listener alone (by
+/// name), 404 on the others: `app.group("/admin", .{anole.onlyOn("admin")})`.
+pub const onlyOn = @import("server.zig").onlyOn;
 /// Middleware as a function, `fn (req, res, next: anole.Next) !void`;
 /// `use`, `group` and `with` also take the bare function.
 pub const func = @import("handlers.zig").func;
