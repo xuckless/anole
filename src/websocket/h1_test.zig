@@ -222,3 +222,54 @@ test "WebSocket over HTTP/1.1: an answer held for a batch goes out while the han
     try std.testing.expectEqualStrings("wait", (try a.next(&buf)).payload);
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
+
+test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one whose handler waits holds up no other" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+    var buf: [16]u8 = undefined;
+
+    // One socket at a time: the backstop ends with the last socket on the
+    // executor and starts again with the next one's first batch.
+    for (0..2) |_| {
+        var a: Raw = undefined;
+        try a.open(io, server.address.ip);
+        defer a.stream.close(io);
+        for (0..3) |_| try a.queue(0x1, "m");
+        try a.writer.interface.flush();
+        for (0..3) |_| try std.testing.expectEqualStrings("m", (try a.next(&buf)).payload);
+        try a.send(0x8, &.{ 0x03, 0xe8 });
+        _ = try a.expectClose(1000, &buf);
+    }
+
+    // "wait" with "x" behind it: its handler sleeps with the echo held, and
+    // the backstop has that socket's flusher send it.
+    var w: Raw = undefined;
+    try w.open(io, server.address.ip);
+    defer w.stream.close(io);
+    try w.queue(0x1, "wait");
+    try w.queue(0x1, "x");
+    try w.writer.interface.flush();
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    try std.testing.expectEqualStrings("wait", (try w.next(&buf)).payload);
+
+    // Meanwhile the others on the executor are answered as ever.
+    var others: [4]Raw = undefined;
+    for (&others) |*o| try o.open(io, server.address.ip);
+    defer for (&others) |*o| o.stream.close(io);
+    for (0..3) |_| {
+        for (&others) |*o| {
+            for (0..4) |_| try o.queue(0x1, "y");
+            try o.writer.interface.flush();
+        }
+        for (&others) |*o| {
+            for (0..4) |_| try std.testing.expectEqualStrings("y", (try o.next(&buf)).payload);
+        }
+    }
+    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+}

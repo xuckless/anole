@@ -751,7 +751,7 @@ pub const H2Socket = struct {
         self.batch.flushed();
     }
 
-    /// The batch's backstop (`dusty.WebSocketBatch.hold`).
+    /// The batch's flush, for its backstop (`dusty.WebSocketBatch.hold`).
     fn flushHeld(batch: *dusty.WebSocketBatch) std.Io.Cancelable!void {
         const self: *H2Socket = @alignCast(@fieldParentPtr("batch", batch));
         self.flushDeferred() catch |err| switch (err) {
