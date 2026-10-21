@@ -27,7 +27,9 @@ zio (async runtime)
             plus Anole's scheduler, accept, spawn-cache, idle-stack and
             recvmmsg/sendmmsg patches; some are open upstream as
             lalinsky/zio #836-#838)
-  Pinned:   commit ebb701426b4431a1e04ab1efb1d1cb43fc7f0c12 of the fork
+  Pinned:   commit dcaf6fe009093f123791e088cb89daf16fb26327 of the fork
+            (branch fix/accept-pending-cancel: ebb7014 plus the accept
+            cancel fix, to be merged into anole)
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)
