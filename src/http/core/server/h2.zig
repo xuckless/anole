@@ -253,6 +253,15 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.server.finishRequest();
             }
 
+            /// SETTINGS_INITIAL_WINDOW_SIZE as the peer has acknowledged
+            /// it. Until its ACK, streams open with the default window
+            /// (65535), and the ACK then moves every open stream's window
+            /// by the difference to `stream_window` (RFC 9113 §6.9.2), a
+            /// raised one too. Under the mutex.
+            fn ackedStreamWindow(conn: *Conn) u31 {
+                return @intCast(c.nghttp2_session_get_local_settings(conn.session, c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE));
+            }
+
             fn kickWriter(conn: *Conn) void {
                 _ = conn.write_gen.fetchAdd(1, .release);
                 conn.io.futexWake(u32, &conn.write_gen.raw, 1);
@@ -404,7 +413,10 @@ pub fn Engine(comptime Ctx: type) type {
                 if (stream.recv_window != 0 or want <= conn.config.stream_window) return;
                 stream.recv_window = conn.config.stream_window;
                 if (stream.body_done or stream.reset or stream.discarding) return;
-                const buf = stream.arena.allocator().alloc(u8, want) catch return;
+                // Until the peer's ACK of SETTINGS, what is queued may be up
+                // to the default window, and the ACK still moves this one.
+                const acked = conn.ackedStreamWindow();
+                const buf = stream.arena.allocator().alloc(u8, @max(want, acked)) catch return;
                 var bigger: std.Io.Queue(u8) = .init(buf);
                 if (stream.body) |*q| {
                     // What is queued moves over, in order; nobody else gets
@@ -417,7 +429,10 @@ pub fn Engine(comptime Ctx: type) type {
                         _ = bigger.putUncancelable(conn.io, scratch[0..n], 0) catch unreachable;
                     }
                 }
-                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want) != 0) return;
+                // Less by what that ACK will add, so the window lands on
+                // `want` and never holds more than the queue.
+                const pending = if (conn.config.stream_window > acked) conn.config.stream_window - acked else 0;
+                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want - pending) != 0) return;
                 stream.body = bigger;
                 stream.recv_window = want;
                 conn.kickWriter();
@@ -1736,7 +1751,10 @@ pub fn Engine(comptime Ctx: type) type {
                 return 0;
             }
             if (stream.body == null) {
-                const buf = stream.arena.allocator().alloc(u8, stream.window()) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                // A whole window: before the peer's ACK of SETTINGS that is
+                // still the default one, which may be the larger.
+                const size = @max(stream.window(), conn.ackedStreamWindow());
+                const buf = stream.arena.allocator().alloc(u8, size) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 stream.body = .init(buf);
             }
             // Cannot block: the queue holds a whole window, and the peer may

@@ -39,6 +39,8 @@ const TestClient = struct {
     /// could have gone on the frame before it.
     empty_ends: usize = 0,
     closes: usize = 0,
+    /// WINDOW_UPDATE frames received for a stream (not the connection).
+    stream_window_updates: usize = 0,
 
     const Resp = struct {
         status: u16 = 0,
@@ -222,11 +224,23 @@ const TestClient = struct {
     fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
+        if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
             self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
             self.goaway_count += 1;
         }
         return 0;
+    }
+
+    /// Receives, sending nothing (the SETTINGS ACK the session owes stays
+    /// queued), until a WINDOW_UPDATE for a stream has come.
+    fn recvUntilStreamWindowUpdate(self: *TestClient) !void {
+        while (self.stream_window_updates == 0) {
+            const bytes = try self.r.peekGreedy(1);
+            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
+            if (rv < 0) return error.Http2Recv;
+            self.r.toss(@intCast(rv));
+        }
     }
 
     /// Keeps the connection going (answering PINGs and SETTINGS) until the
@@ -323,6 +337,32 @@ const Handlers = struct {
         try req.io.sleep(.fromMilliseconds(100), .awake);
         return sum(req, res);
     }
+    /// `sum`, as a handler starved of CPU at the worst moment: it reads
+    /// exactly `stall_credit` bytes, half the window its first read raised
+    /// it to, which returns credit for all of them, then stops while the
+    /// peer fills the whole window again, then reads the rest.
+    fn stall(req: *dusty.Request, res: *dusty.Response) !void {
+        const raw = req.body_source.?.reader;
+        var hash: std.hash.Wyhash = .init(0);
+        var n: usize = 0;
+        while (n < stall_credit) n += try takeBody(raw, &hash, stall_credit - n);
+        try req.io.sleep(.fromMilliseconds(300), .awake);
+        while (true) n += takeBody(raw, &hash, 4096) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        try res.print(.text, "{d} {x}", .{ n, hash.final() });
+    }
+    const stall_credit = 512 * 1024;
+    /// At most `limit` body bytes, straight from the stream: each read is
+    /// what the engine credits back.
+    fn takeBody(raw: *std.Io.Reader, hash: *std.hash.Wyhash, limit: usize) !usize {
+        var scratch: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&scratch);
+        const n = try raw.stream(&w, .limited(@min(limit, scratch.len)));
+        hash.update(scratch[0..n]);
+        return n;
+    }
     /// The body's length and checksum.
     fn sum(req: *dusty.Request, res: *dusty.Response) !void {
         var in_buf: [4096]u8 = undefined;
@@ -357,6 +397,7 @@ const Fixture = struct {
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
         self.server.router.post("/late", Handlers.late);
+        self.server.router.post("/stall", Handlers.stall);
         // The same handlers on routes that promise not to wait, which run
         // on the connection's reader when their request comes whole.
         self.server.router.addRouteWith(.get, "/nw/hello", Handlers.hello, .{ .no_wait = true });
@@ -502,6 +543,31 @@ test "HTTP/2: a no_wait request with a body runs inline when it came whole, else
     const after = try client.request("POST", "/nw/sum", body[0..10]);
     try client.run();
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ 10, std.hash.Wyhash.hash(0, body[0..10]) }), client.get(after).body.items);
+}
+
+test "HTTP/2: a body window raised before the client acknowledged SETTINGS never outgrows its buffer" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    const body = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024 + 5);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 31 +% (i >> 11));
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("POST", "/stall", body);
+    // The preface, SETTINGS, the head and a default window of the body,
+    // then nothing until the handler's first read has raised the stream's
+    // window: the client's ACK of the server's SETTINGS (whose initial
+    // window differs from the default) arrives after the raise.
+    try client.sendPending();
+    try client.recvUntilStreamWindowUpdate();
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
 }
 
 test "HTTP/2: a no_wait handler that waits anyway still answers, holding up its connection" {
@@ -748,14 +814,29 @@ test "HTTP/2: a warm connection serves requests without allocating" {
     for (0..5) |_| {
         _ = try client.request("GET", "/users/1", null);
         try client.run();
+        try awaitStreamsFreed(&server, io);
     }
     const before = counting.count.load(.monotonic);
     for (0..20) |_| {
         const id = try client.request("GET", "/users/2", null);
         try client.run();
         try std.testing.expectEqualStrings("user 2", client.get(id).body.items);
+        try awaitStreamsFreed(&server, io);
     }
     try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
+
+/// Waits until the server has freed every stream. The response can reach
+/// the client before its handler's task has let go of the stream (each
+/// task is a thread of its own under std.testing.io), and a request sent
+/// meanwhile rightly takes a second stream, which the pool then keeps:
+/// one request at a time is what the warm-path test measures.
+fn awaitStreamsFreed(server: *dusty.Server(void), io: std.Io) !void {
+    for (0..5000) |_| {
+        if (server.busy.load(.acquire).count == 0) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.Timeout;
 }
 
 fn stopFixture(f: *Fixture, io: std.Io) void {
