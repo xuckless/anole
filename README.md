@@ -8,15 +8,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/xuckless/anole/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xuckless/anole/ci.yml?branch=main&logo=github&label=CI"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/xuckless/anole?color=green"></a>
   <a href="https://ziglang.org/download/"><img alt="Zig 0.17" src="https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white"></a>
   <img alt="Platforms: Linux, macOS" src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey">
   <img alt="Protocols: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket" src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%C2%B7%20h2%20%C2%B7%20h3%20%C2%B7%20gRPC%20%C2%B7%20WS-blue">
-  <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-orange">
+  <img alt="WebTransport" src="https://img.shields.io/badge/WebTransport-draft--02-8A4FFF">
+  <img alt="Auth: JWT, OIDC, sessions" src="https://img.shields.io/badge/auth-JWT%20%C2%B7%20OIDC%20%C2%B7%20sessions-D8407F">
+  <img alt="TLS: BoringSSL" src="https://img.shields.io/badge/TLS-BoringSSL-2E7D32">
+  <img alt="Observability: Prometheus, OpenTelemetry" src="https://img.shields.io/badge/observability-Prometheus%20%C2%B7%20OpenTelemetry-E6522C">
+  <img alt="Database: SQLite, PostgreSQL, MongoDB, in progress" src="https://img.shields.io/badge/database-SQLite%20%C2%B7%20PostgreSQL%20%C2%B7%20MongoDB%20(in%20progress)-336791">
   <a href="https://github.com/xuckless/anole/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/xuckless/anole?style=flat&logo=github"></a>
-  <a href="https://github.com/xuckless/anole/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/xuckless/anole"></a>
-  <a href="https://github.com/xuckless/anole/issues"><img alt="Issues" src="https://img.shields.io/github/issues/xuckless/anole"></a>
 </p>
 
 <p align="center">
@@ -258,11 +259,24 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   - the PROXY protocol and `X-Forwarded-*`.
 - **Clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients, plus Redis/Valkey, all
   on the same TLS stack.
+- **Databases (in development, milestone 15):** built-in connectors, so a
+  handler can query without a third-party driver and without blocking its
+  core:
+  - PostgreSQL, on a fork of pg.zig moved to `std.Io`, over the same
+    BoringSSL stack;
+  - SQLite, the amalgamation built by Zig, with one writer thread per
+    database and reads on the blocking pool;
+  - MongoDB, Anole's own OP_MSG client with a Zig BSON codec;
+  - one shared shape: a pool per core, calls take the request first
+    (`app.db.all(Post, req, sql, .{args})`), request deadlines cancel
+    queries, and rows land in the request's arena;
+  - opt-in request coalescing and short-lived result caches, off unless
+    asked for;
+  - behind `-Dpostgres`, `-Dsqlite` and `-Dmongodb`.
 
 **Status: pre-alpha, heading for 0.1.0** ([CHANGELOG.md](CHANGELOG.md)).
-Nothing is stable before 1.0. Built-in Postgres, SQLite and MongoDB
-connectors are next on the roadmap, then Python (ASGI) and JavaScript
-bindings.
+Nothing is stable before 1.0. The Postgres, SQLite and MongoDB connectors
+are being built now, then Python (ASGI) and JavaScript bindings.
 
 ## Requirements
 
