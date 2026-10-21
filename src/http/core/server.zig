@@ -222,6 +222,11 @@ const TlsMaterial = struct {
 /// arena keeps what it grew to.
 const request_arena_reserve = 8 * 1024;
 
+/// How often each executor frees the request buffer sets that no request
+/// took since the last time, past a few (`RequestBuffersPool.trimLocal`):
+/// what a burst of connections needed at once goes back after it.
+const request_buffers_trim_interval: std.Io.Duration = .fromSeconds(5);
+
 /// What a connection reads into while it waits for a request without a set
 /// of request buffers -- its first, or any with
 /// `request.keep_buffers_between_requests` off -- in place of the pooled
@@ -1004,6 +1009,13 @@ pub fn Server(comptime Ctx: type) type {
                 };
             }
 
+            // One per executor, so that each trims its own free list.
+            for (0..executors orelse 1) |i| {
+                placement.concurrent(&accepting, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
+                    log.debug("No task to trim the request buffers on executor {d}: {}", .{ i, err });
+                };
+            }
+
             stopped.wait(self.io) catch |err| switch (err) {
                 error.Canceled => {
                     accepting.cancel(self.io);
@@ -1212,6 +1224,18 @@ pub fn Server(comptime Ctx: type) type {
                     stopped.set(self.io);
                 },
             };
+        }
+
+        /// Gives back, every `request_buffers_trim_interval`, the request
+        /// buffer sets this executor's connections left unused since the
+        /// last time, and the first executor's the shared ones too
+        /// (`RequestBuffersPool.trimLocal`, `trimShards`).
+        fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
+            while (true) {
+                try self.io.sleep(request_buffers_trim_interval, .awake);
+                self.request_buffers.trimLocal();
+                if (shards) self.request_buffers.trimShards();
+            }
         }
 
         fn acceptConnections(self: *Self, l: *ActiveListener, socket: *std.Io.net.Server, connections: *std.Io.Group) !void {
