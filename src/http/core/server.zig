@@ -758,6 +758,11 @@ pub const Burst = struct {
     /// connection cannot park.
     park_after: ?std.Io.Duration,
     deadline: ?std.Io.Clock.Timestamp,
+    /// The connection woke after a long park (`park.Shelf.long_park`):
+    /// once it has had input, `waitInput` reports `.idle` as soon as
+    /// nothing is buffered, rather than after the park delay.
+    repark: bool = false,
+    had_input: bool = false,
 
     pub const End = enum { close, park };
     pub const Input = enum {
@@ -775,6 +780,8 @@ pub const Burst = struct {
         const r = self.connection.reader;
         if (r.bufferedLen() > 0) return .ready;
         const after = self.park_after orelse return .ready;
+        if (self.repark and self.had_input and self.connection.parkable()) return .idle;
+        self.had_input = true;
         self.timer.set(self.io, .{ .duration = .{ .raw = after, .clock = .awake } });
         defer self.armDeadline();
         r.fillMore() catch |err| switch (err) {
@@ -1226,7 +1233,7 @@ pub fn Server(comptime Ctx: type) type {
             if (idle_park.nanoseconds <= 0 or !park.usable(self.io)) return &.{};
             const n = executors orelse return &.{};
             const shelves = self.allocator.alloc(park.Shelf, n) catch return &.{};
-            @memset(shelves, .{});
+            @memset(shelves, .{ .io = self.io, .long_park = idle_park });
             for (shelves, 0..) |*shelf, i| {
                 park.spawnOn(sweepers, i, park.drive, .{ shelf, self.io }) catch |err| {
                     log.debug("Idle connections keep their tasks: {}", .{err});
@@ -2030,6 +2037,7 @@ pub fn Server(comptime Ctx: type) type {
                 .timer = timer,
                 .park_after = self.parkAfter(null),
                 .deadline = a.deadline,
+                .repark = conn.parked.woke_from_long,
             };
             burst.armDeadline();
             return switch (try a.serve(a, &burst)) {
@@ -2224,6 +2232,9 @@ pub fn Server(comptime Ctx: type) type {
             const l = conn.listener;
             const connection = &conn.connection;
             const accepted_at = conn.accepted_at;
+            // A connection woken after a long park parks again once it has
+            // served a request (`park.Shelf.long_park`).
+            var repark_after: ?usize = if (conn.parked.woke_from_long) conn.request_count + 1 else null;
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
             // Last: the reader must not point into this frame once it is
@@ -2290,11 +2301,17 @@ pub fn Server(comptime Ctx: type) type {
                     }
                     const wait_timeout = if (first) self.config.timeout.request else self.config.timeout.keepalive;
                     // Parking: the wait goes on for `idle_park` first, and a
-                    // connection with nothing by then parks.
+                    // connection with nothing by then parks. One woken after
+                    // a long park parks again as soon as it has answered
+                    // what woke it, as if the delay had passed.
                     const park_after = self.parkAfter(wait_timeout);
-                    self.armTimer(timer, park_after orelse wait_timeout);
+                    const repark_now = if (repark_after) |n| conn.request_count >= n else false;
+                    if (repark_now) repark_after = null;
                     wait_armed = wait_timeout != null;
-                    var arrival = try self.waitForRequest(connection, busy, if (park_after != null) timer else null);
+                    var arrival: RequestWait = if (repark_now and park_after != null) .idle else arrival: {
+                        self.armTimer(timer, park_after orelse wait_timeout);
+                        break :arrival try self.waitForRequest(connection, busy, if (park_after != null) timer else null);
+                    };
                     if (arrival == .idle) {
                         const shelf = self.shelfHere();
                         if (shelf != null and !shelf.?.closed and connection.parkable()) {

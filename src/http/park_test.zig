@@ -221,6 +221,41 @@ test "idle park: a connection busier than the park delay keeps its task" {
     }
 }
 
+/// A connection that was parked for the park delay or longer parks again
+/// as soon as it has answered what woke it; one that comes back sooner keeps
+/// its task for the delay, as a busy connection does.
+fn reparkAfterLongPark(secure: bool) !void {
+    if (secure and !have_tls) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, 1, secure, .{ .idle_park = .fromMilliseconds(200) });
+    defer f.stop(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.addr(), secure);
+    defer c.close(f.io);
+    try std.testing.expectEqual(200, try c.get("/"));
+    try f.waitParked(1);
+    try f.io.sleep(.fromMilliseconds(250), .awake);
+    // Parked long: answered, and parked again well within the delay.
+    try std.testing.expectEqual(200, try c.get("/"));
+    const parked_again = for (0..20) |_| {
+        if (f.server.parkedConnections() == 1) break true;
+        try f.io.sleep(.fromMilliseconds(5), .awake);
+    } else false;
+    try std.testing.expect(parked_again);
+    // Back after a short park: the task stays for the delay.
+    try std.testing.expectEqual(200, try c.get("/"));
+    try f.io.sleep(.fromMilliseconds(60), .awake);
+    try std.testing.expectEqual(0, f.server.parkedConnections());
+    try f.waitParked(1);
+}
+
+test "idle park: a connection woken after a long park parks again once answered" {
+    try reparkAfterLongPark(false);
+    try reparkAfterLongPark(true);
+}
+
 /// Requests sent as close to the park delay as the timing allows, some in
 /// two pieces with the second after it, so that bytes arrive while the
 /// connection is parking.

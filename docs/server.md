@@ -478,7 +478,10 @@ for `docker run`, `ulimit -Hn` in a shell (as root).
 An HTTP/1.1 connection that has waited `timeout.idle_park` (1 s) for its
 next request, with nothing buffered, ends its coroutine and parks: it is
 then a small heap object whose socket the executor watches, and the next
-request starts a coroutine for it again on the same executor. Keep-alive
+request starts a coroutine for it again on the same executor; a
+connection that had been parked that long or longer parks again as soon
+as it has answered, so waking thousands of idle connections at once costs
+coroutines only for those being served at that moment. Keep-alive
 and first-request timeouts still apply to parked connections, to about a
 second, and the drain and the stop close them. A WebSocket served through
 callbacks ([`app.wsCallbacks`](websocket.md#callbacks)) parks the same

@@ -308,6 +308,34 @@ test "WebSocket callbacks: messages, ping and close across parking, over TLS" {
     try messagesAcrossParking(true);
 }
 
+test "WebSocket callbacks: a busy socket keeps its task; one woken after a long park parks again once answered" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, .{ .timeout = .{ .idle_park = .fromMilliseconds(200) } });
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/ws");
+    defer c.close(f.io);
+    try c.expectText("hello");
+    // A message every 50 ms for longer than the park delay: never parked.
+    for (0..10) |_| {
+        try c.send(0x1, "busy");
+        try c.expectText("busy");
+        try f.io.sleep(.fromMilliseconds(50), .awake);
+        try std.testing.expectEqual(0, f.server.parkedConnections());
+    }
+    try f.waitParked(1);
+    try f.io.sleep(.fromMilliseconds(250), .awake);
+    try c.send(0x1, "late");
+    try c.expectText("late");
+    const parked_again = for (0..20) |_| {
+        if (f.server.parkedConnections() == 1) break true;
+        try f.io.sleep(.fromMilliseconds(5), .awake);
+    } else false;
+    try std.testing.expect(parked_again);
+}
+
 test "WebSocket callbacks: another task sends to a parked socket" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;

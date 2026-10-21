@@ -409,7 +409,10 @@ pub const ServerConfig = struct {
         /// connection waits as a small heap object until its socket is
         /// readable, when a new task is started on the same executor to
         /// serve it. A connection that sends again sooner keeps its task,
-        /// so a busy one never pays for parking. Only with something to
+        /// so a busy one never pays for parking. One that was parked this
+        /// long or longer parks again as soon as it has answered what woke
+        /// it, so that waking many mostly idle connections at once needs
+        /// tasks for about as many as are being served at a time. Only with something to
         /// park: nothing buffered, and on TLS nothing pending in either
         /// direction. A parked connection's `keepalive` (or first
         /// `request`) deadline is kept to about a second. Null or zero

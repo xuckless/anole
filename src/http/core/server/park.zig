@@ -6,7 +6,8 @@
 //! next message) with nothing buffered ends its task and waits here as a heap
 //! object. When its socket becomes readable, a task is started on the same
 //! executor to serve it, and that task parks it again when it goes idle once
-//! more.
+//! more: at once if it had been parked for the park delay or longer
+//! (`Shelf.long_park`), after the delay otherwise.
 //!
 //! Each executor has a `Shelf` and a driver task (`drive`) that owns the
 //! shelf's zio `CompletionQueue`. A connection parks from its own task by
@@ -60,6 +61,12 @@ pub const Parked = struct {
     expiring: bool = false,
     /// Its poll came back while `expiring`: `expireDone` closes it.
     back: bool = false,
+    /// When it parked (awake clock).
+    parked_at: std.Io.Timestamp = .zero,
+    /// It woke after being parked for `Shelf.long_park` or more: the task
+    /// started for it parks it again once it has served what woke it (see
+    /// `Shelf.long_park`).
+    woke_from_long: bool = false,
 
     pub fn isParked(self: *const Parked) bool {
         return self.shelf != null;
@@ -111,6 +118,19 @@ pub const Shelf = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     /// The driver has ended, every connection parked here closed.
     done: std.Io.Event = .unset,
+    /// For the clock.
+    io: std.Io,
+    /// A connection that was parked this long or longer when its socket
+    /// became readable is woken with `Parked.woke_from_long` set: it is
+    /// mostly idle, so it parks again as soon as it has served what woke it,
+    /// rather than holding a task for the whole park delay. That keeps the
+    /// tasks (and stacks) a burst of such wakes needs to about the burst's
+    /// concurrency, where holding each task for the delay would need one for
+    /// every connection woken within it, on stacks that the stack pool has
+    /// given back to the system meanwhile, each costing an mprotect and page
+    /// faults to make again. One that comes back sooner keeps its task, so
+    /// a connection that turns busy pays for one extra park at most.
+    long_park: std.Io.Duration,
 
     /// Parks `p`, its socket `handle` watched for input. False when it
     /// cannot be (the shelf is closed, or its queue refuses): the caller
@@ -124,6 +144,7 @@ pub const Shelf = struct {
         p.expired = false;
         p.expiring = false;
         p.back = false;
+        p.parked_at = std.Io.Timestamp.now(self.io, .awake);
         self.cq.submit(&p.poll.c) catch return false;
         self.insert(p);
         _ = self.count.fetchAdd(1, .monotonic);
@@ -189,6 +210,8 @@ pub const Shelf = struct {
             return;
         }
         self.remove(p);
+        const parked_for = p.parked_at.durationTo(std.Io.Timestamp.now(self.io, .awake));
+        p.woke_from_long = parked_for.nanoseconds >= self.long_park.nanoseconds;
         p.vtable.wake(p) catch p.vtable.close(p);
     }
 };
