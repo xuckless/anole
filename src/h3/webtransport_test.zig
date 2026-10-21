@@ -500,8 +500,8 @@ test "WebSocket over HTTP/3 (RFC 9220): echo, ping, close" {
     try std.testing.expect((try conn.waitSettings()).connect_protocol);
 
     const s = try conn.request(&.{
-        .{ .name = ":method", .value = "CONNECT" },   .{ .name = ":protocol", .value = "websocket" },
-        .{ .name = ":scheme", .value = "https" },     .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":method", .value = "CONNECT" },      .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },        .{ .name = ":path", .value = "/ws" },
         .{ .name = ":authority", .value = "localhost" }, .{ .name = "sec-websocket-version", .value = "13" },
     }, .{ .body = true, .timeout = .none });
     defer s.release();
@@ -539,8 +539,8 @@ test "WebSocket over HTTP/3: the drain closes an open socket with 1001" {
     const conn = try f.connect(gpa, io);
     defer conn.close();
     const s = try conn.request(&.{
-        .{ .name = ":method", .value = "CONNECT" },   .{ .name = ":protocol", .value = "websocket" },
-        .{ .name = ":scheme", .value = "https" },     .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":method", .value = "CONNECT" },      .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },        .{ .name = ":path", .value = "/ws" },
         .{ .name = ":authority", .value = "localhost" }, .{ .name = "sec-websocket-version", .value = "13" },
     }, .{ .body = true, .timeout = .none });
     defer s.release();
