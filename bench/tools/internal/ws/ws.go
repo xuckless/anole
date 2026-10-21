@@ -309,3 +309,67 @@ func (r FeedResult) String() string {
 	return fmt.Sprintf("%d/%d subs, %.0f of %.0f msgs/s, lag p99 %.2f ms, orders %.0f/s rtt p99 %.2f ms",
 		r.Connected, r.Subscribers, r.Delivered, r.Expected, r.Lag.P99MS, r.OrdersPS, r.OrderRTT.P99MS)
 }
+
+// OpenQuiet is OpenIdle without a reader on each socket, so a socket can
+// be woken later with WakeEcho; whatever the server sends meanwhile (pings)
+// waits in the kernel.
+func OpenQuiet(ctx context.Context, url string, n, rate, sourceIPs int) ([]*websocket.Conn, int) {
+	conns := make([]*websocket.Conn, n)
+	var failed atomic.Int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 256)
+	gap := time.Second / time.Duration(max(1, rate))
+	for i := 0; i < n; i++ {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(i int) {
+			defer func() { <-sem; wg.Done() }()
+			c, err := dial(ctx, url, i, sourceIPs)
+			if err != nil {
+				failed.Add(1)
+				return
+			}
+			conns[i] = c
+		}(i)
+		time.Sleep(gap)
+	}
+	wg.Wait()
+	var open []*websocket.Conn
+	for _, c := range conns {
+		if c != nil {
+			open = append(open, c)
+		}
+	}
+	return open, int(failed.Load())
+}
+
+// WakeEcho sends one message on each socket, conc at a time, and times
+// the echo. Failures are counted.
+func WakeEcho(conns []*websocket.Conn, conc int) (Lat, int) {
+	var lat samples
+	var failed atomic.Int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, max(1, conc))
+	msg := []byte("hello")
+	for _, c := range conns {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(c *websocket.Conn) {
+			defer func() { <-sem; wg.Done() }()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			t0 := time.Now()
+			if err := c.Write(ctx, websocket.MessageText, msg); err != nil {
+				failed.Add(1)
+				return
+			}
+			if _, _, err := c.Read(ctx); err != nil {
+				failed.Add(1)
+				return
+			}
+			lat.add(time.Since(t0).Microseconds())
+		}(c)
+	}
+	wg.Wait()
+	return lat.summary(), int(failed.Load())
+}

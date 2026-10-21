@@ -344,6 +344,16 @@ func (s *Server) MemNowMB() float64 {
 	return float64(st["anon"]+st["kernel"]) / (1 << 20)
 }
 
+// MemStat: the cgroup's memory right now, in MB: anon (the process's own
+// memory, its RSS less files), kernel (slab, stacks, page tables),
+// sock (socket buffers, part of kernel) and current (all of it, page
+// cache included).
+func (s *Server) MemStat() (anon, kernel, sock, current float64) {
+	st := readKV(filepath.Join(s.cgroup, "memory.stat"))
+	mb := func(v int64) float64 { return float64(v) / (1 << 20) }
+	return mb(st["anon"]), mb(st["kernel"]), mb(st["sock"]), mb(readInt(filepath.Join(s.cgroup, "memory.current")))
+}
+
 func cpuUsec(dir string) int64 {
 	return readKV(filepath.Join(dir, "cpu.stat"))["usage_usec"]
 }

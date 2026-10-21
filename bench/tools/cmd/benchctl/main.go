@@ -145,6 +145,8 @@ func runSuite(args []string) {
 			s.Twelve(env("PG_CPUS_TWELVE", "16-27"), env("PG_CPUS", "16-19"))
 		case "wspipe":
 			s.WsPipe()
+		case "park":
+			s.Park()
 		case "grpc":
 			s.GRPC()
 		case "wt":

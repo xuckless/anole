@@ -131,6 +131,15 @@ fn wsEcho(ws: *websocket.Socket, _: *anole.Request) !void {
     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
 }
 
+/// /ws/echo-cb: the echo through WebSocket callbacks (docs/websocket.md),
+/// where the library has them; between messages the socket parks without
+/// a task.
+const EchoCallbacks = struct {
+    pub fn message(ws: *websocket.Socket, msg: websocket.Message) !void {
+        try ws.send(msg.type, msg.data);
+    }
+};
+
 fn wsFeed(app: *App, ws: *websocket.Socket, _: *anole.Request) !void {
     try app.feed.join("feed", ws);
     defer app.feed.leave("feed", ws);
@@ -242,6 +251,8 @@ pub fn main(init: std.process.Init) !void {
     app.wsWith("/ws/echo", wsEcho, .{ .max_message_size = 1 << 20 });
     app.ws("/ws/feed", wsFeed);
     app.ws("/ws/trade", wsTrade);
+    if (comptime @hasDecl(@TypeOf(app), "wsCallbacksWith"))
+        app.wsCallbacksWith("/ws/echo-cb", EchoCallbacks, .{ .max_message_size = 1 << 20 });
     if (mode == .h3) app.webtransport("/wt/echo", wtEcho);
 
     const database_url = env("DATABASE_URL", "");
