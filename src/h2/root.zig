@@ -1,6 +1,15 @@
-//! HTTP/2: nghttp2 1.70.0 (MIT) bindings from the official translate-c
-//! package, and the client connection. The server engine lives in the dusty
-//! fork.
+//! HTTP/2 (-Dhttp2): the client connection, and nghttp2 1.70.0 (MIT)
+//! bindings from the official translate-c package. The server side needs
+//! nothing from here: `anole.App` serves HTTP/2 over TLS (ALPN "h2") and
+//! cleartext (h2c) through the HTTP core's engine
+//! (src/http/core/server/h2.zig).
+//!
+//!     const conn = try anole.h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = 8080 });
+//!     defer conn.close();
+//!
+//! `anole.h3` has the same client names, so code can be written over
+//! either. For plain HTTPS requests `anole.client(req).fetch` is simpler;
+//! it speaks HTTP/2 when the server picks it.
 const std = @import("std");
 
 const client = @import("anole_h2_client");
@@ -12,8 +21,11 @@ pub const ClientConnection = client.ClientConnection;
 pub const Stream = client.Stream;
 /// `Stream`, by the name it once had in `anole.h3`.
 pub const ClientStream = client.Stream;
+/// A header field, name and value.
 pub const Header = client.Header;
+/// Host, port, TLS, windows and timeouts for `ClientConnection.connect`.
 pub const ConnectOptions = client.ConnectOptions;
+/// Per request: `body`, `body_bytes`, `timeout`.
 pub const RequestOptions = client.ClientConnection.RequestOptions;
 /// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
 pub const StreamError = client.StreamError;

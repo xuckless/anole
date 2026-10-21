@@ -82,7 +82,10 @@ const stateless_reset_burst = 100;
 /// QUIC v2 first when the client offers both.
 const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
 
+/// An `Endpoint`'s settings (`anole.h3.EndpointOptions`). A server sets
+/// them from `ServerOptions.Http3` and its TLS listener.
 pub const Options = struct {
+    /// The UDP address to bind.
     address: std.Io.net.IpAddress,
     /// PEM: the certificate chain (leaf first) and its key. Read by
     /// `init` only; a reload passes its own (`Endpoint.loadTls`).
@@ -566,18 +569,18 @@ pub fn Endpoint(comptime Ctx: type) type {
             return newTlsContext(options);
         }
 
-        /// A certificate reload, second step: connections that start from
-        /// now on, on every endpoint of the listener, handshake with `tls`,
-        /// which takes over the session ticket keys, so tickets issued
-        /// before still resume. Connections already open keep the context
-        /// they started with (each `SSL` holds a reference to it). Safe from
-        /// any task or thread.
         /// Turns WebTransport on for every endpoint of the listener, for
         /// connections that start from now on.
         pub fn enableWebTransport(self: *Self) void {
             for (self.shared.endpoints) |e| e.options.webtransport = true;
         }
 
+        /// A certificate reload, second step: connections that start from
+        /// now on, on every endpoint of the listener, handshake with `tls`,
+        /// which takes over the session ticket keys, so tickets issued
+        /// before still resume. Connections already open keep the context
+        /// they started with (each `SSL` holds a reference to it). Safe from
+        /// any task or thread.
         pub fn useTls(self: *Self, tls: quic_tls.Context) void {
             const shared = self.shared;
             lockTls(shared);

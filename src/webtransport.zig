@@ -45,9 +45,14 @@ pub const Session = engine.Session;
 /// One stream: `reader`, `writer`, `closeSend`, `reset`, `stopSending`,
 /// `release`.
 pub const Stream = engine.Stream;
+/// How a session ended: the application code, the reason, and which side
+/// (`Session.closeInfo`).
 pub const CloseInfo = engine.CloseInfo;
+/// What session and stream calls fail with: `SessionClosed`,
+/// `StreamReset`, `StreamStopped`, `ConnectionClosed`, `Canceled`.
 pub const Error = engine.Error;
 
+/// How `accept` (and `app.webtransportWith`) opens a session.
 pub const AcceptOptions = struct {
     /// Replaces the request's timeout once the session is open: a session
     /// outlives `timeout.request`.
@@ -57,6 +62,7 @@ pub const AcceptOptions = struct {
     /// Off: the session stays open until the handler ends it
     /// (`Session.draining` tells it to) or `timeout.shutdown` cuts it.
     close_on_drain: bool = true,
+    /// The reason sent with the drain's close.
     drain_reason: []const u8 = "server shutting down",
 };
 

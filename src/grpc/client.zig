@@ -24,18 +24,26 @@ const deadline = @import("deadline.zig");
 const Compression = @import("compression.zig").Compression;
 const server = @import("server.zig");
 
+/// A call's outcome: code and message.
 pub const Status = status_mod.Status;
+/// A gRPC status code.
 pub const Code = status_mod.Code;
 
+/// Where calls go: an HTTP/2 connection and the authority to name. Calls
+/// on one channel share the connection, as concurrent streams.
 pub const Channel = struct {
+    /// The connection, which the caller opens and closes.
     conn: *h2.ClientConnection,
     /// `:authority` for every call.
     authority: []const u8,
     /// "https" over TLS.
     scheme: []const u8 = "http",
+    /// The largest response message taken; a larger one ends the call
+    /// with RESOURCE_EXHAUSTED.
     max_message_size: usize = 4 * 1024 * 1024,
 };
 
+/// Per call: deadline, metadata, compression.
 pub const CallOptions = struct {
     /// Sent as grpc-timeout; the server ends the call past it, and the
     /// client resets the stream past it (DEADLINE_EXCEEDED either way).
@@ -46,6 +54,9 @@ pub const CallOptions = struct {
     compression: Compression = .identity,
 };
 
+/// What `Client.unary` returns: the status, and the response message when
+/// the status is OK. A failed call is a status, not an error; errors are
+/// for the call not being made at all.
 pub fn UnaryResult(comptime Resp: type) type {
     return struct {
         status: Status,
@@ -85,6 +96,8 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
             return fallback;
         }
 
+        /// Sends one request message. Fails with `error.StreamClosed`
+        /// once the call has ended (read the status with `receive`).
         pub fn send(self: *Self, message: Req) !void {
             var encoded: std.Io.Writer.Allocating = .init(self.arena);
             try message.encode(&encoded.writer, self.arena);
@@ -144,6 +157,7 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
             self.stream.release();
         }
 
+        /// Cancels the call (RST_STREAM CANCEL); `deinit` still frees it.
         pub fn cancel(self: *Self) void {
             self.stream.cancel();
         }

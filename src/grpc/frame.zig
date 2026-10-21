@@ -7,12 +7,16 @@ const Compression = @import("compression.zig").Compression;
 const features = @import("build_options");
 const zlib = if (features.compression) @import("anole_zlib") else struct {};
 
+/// The message prefix: a compressed flag and a 4-byte big-endian length.
 pub const header_size = 5;
 
+/// `payload` with its prefix, uncompressed, allocated with `allocator`.
 pub fn encode(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     return encodeWithCompression(allocator, payload, .identity);
 }
 
+/// `payload` with its prefix, gzipped first when `compression` says so
+/// (`error.CompressionUnsupported` without `-Dcompression`).
 pub fn encodeWithCompression(
     allocator: std.mem.Allocator,
     payload: []const u8,
@@ -55,7 +59,10 @@ fn encodePayload(allocator: std.mem.Allocator, payload: []const u8, compressed: 
     return frame;
 }
 
+/// Splits a byte stream into messages: `feed` it bytes as they come, take
+/// messages with `next`, and `finish` at the end to catch a truncated one.
 pub const Decoder = struct {
+    /// One message and what it took on the wire.
     pub const DecodedMessage = struct {
         /// Allocated by the decoder allocator and owned by the caller.
         payload: []u8,
@@ -70,10 +77,13 @@ pub const Decoder = struct {
     buffer: std.ArrayList(u8) = .empty,
     offset: usize = 0,
 
+    /// A decoder for uncompressed messages of at most `max_message_size`.
     pub fn init(allocator: std.mem.Allocator, max_message_size: usize) Decoder {
         return initWithCompression(allocator, max_message_size, .identity);
     }
 
+    /// A decoder that inflates messages flagged compressed with
+    /// `compression`.
     pub fn initWithCompression(
         allocator: std.mem.Allocator,
         max_message_size: usize,
@@ -86,11 +96,13 @@ pub const Decoder = struct {
         };
     }
 
+    /// Frees the buffered bytes (not the messages handed out).
     pub fn deinit(self: *Decoder) void {
         self.buffer.deinit(self.allocator);
         self.* = undefined;
     }
 
+    /// Buffers `bytes`.
     pub fn feed(self: *Decoder, bytes: []const u8) !void {
         return self.feedBounded(bytes, std.math.maxInt(usize));
     }
@@ -119,6 +131,10 @@ pub const Decoder = struct {
         return self.buffer.items.len - self.offset;
     }
 
+    /// The next whole message, or null until more bytes arrive. Fails with
+    /// `error.MessageTooLarge` past the limit, and with
+    /// `error.CompressionMismatch` for a compressed message the decoder
+    /// was not told how to inflate.
     pub fn nextMessage(self: *Decoder) !?DecodedMessage {
         const available = self.buffer.items[self.offset..];
         if (available.len < header_size) return null;
@@ -151,16 +167,20 @@ pub const Decoder = struct {
         };
     }
 
+    /// `nextMessage`'s payload alone, owned by the caller.
     pub fn next(self: *Decoder) !?[]u8 {
         const message = try self.nextMessage() orelse return null;
         return message.payload;
     }
 
+    /// Fails with `error.TruncatedFrame` when bytes of an unfinished
+    /// message are left.
     pub fn finish(self: *const Decoder) !void {
         if (self.bufferedBytes() != 0) return error.TruncatedFrame;
     }
 };
 
+/// The one message in `bytes`, which must hold exactly one.
 pub fn decodeUnary(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -169,6 +189,7 @@ pub fn decodeUnary(
     return decodeUnaryWithCompression(allocator, bytes, max_message_size, .identity);
 }
 
+/// `decodeUnary`, inflating with `compression`.
 pub fn decodeUnaryWithCompression(
     allocator: std.mem.Allocator,
     bytes: []const u8,

@@ -1,20 +1,27 @@
 //! Copied from fanyang89/grpc-lite (MIT, Copyright (c) 2026 grpc-lite contributors),
 //! src/deadline.zig at commit db3c400bf70419742ebcb42fe316ba8b754b4975; see THIRD_PARTY_NOTICES.
+//!
+//! The `grpc-timeout` header's format, and a deadline over a pluggable
+//! clock. Handlers read their call's deadline from `Call.deadline`.
 const std = @import("std");
 
+/// A source of monotonic nanoseconds.
 pub const Clock = struct {
     context: ?*anyopaque = null,
     now_fn: *const fn (?*anyopaque) u64,
 
+    /// The clock's current time, in nanoseconds.
     pub fn now(self: Clock) u64 {
         return self.now_fn(self.context);
     }
 };
 
+/// A point in time on `clock`.
 pub const Deadline = struct {
     expires_at_ns: u64,
     clock: Clock,
 
+    /// The deadline `timeout_ns` from now.
     pub fn initAfter(clock: Clock, timeout_ns: u64) Deadline {
         return .{
             .expires_at_ns = clock.now() +| timeout_ns,
@@ -22,15 +29,19 @@ pub const Deadline = struct {
         };
     }
 
+    /// Nanoseconds left, 0 once passed.
     pub fn remainingNs(self: Deadline) u64 {
         return self.expires_at_ns -| self.clock.now();
     }
 
+    /// Whether the deadline has passed.
     pub fn isExceeded(self: Deadline) bool {
         return self.expires_at_ns <= self.clock.now();
     }
 };
 
+/// `timeout_ns` as a `grpc-timeout` value ("250m", "30S"), rounded up to
+/// the finest unit that fits eight digits, written into `buffer`.
 pub fn formatTimeout(buffer: []u8, timeout_ns: u64) []const u8 {
     const units = [_]struct { divisor: u64, suffix: u8 }{
         .{ .divisor = 1, .suffix = 'n' },
@@ -49,6 +60,9 @@ pub fn formatTimeout(buffer: []u8, timeout_ns: u64) []const u8 {
     unreachable;
 }
 
+/// A `grpc-timeout` value in nanoseconds (saturating). Fails with
+/// `error.InvalidTimeout` for anything but 1-8 digits and a unit (n, u,
+/// m, S, M, H).
 pub fn parseTimeout(value: []const u8) error{InvalidTimeout}!u64 {
     if (value.len < 2 or value.len > 9) return error.InvalidTimeout;
     const digits = value[0 .. value.len - 1];

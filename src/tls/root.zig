@@ -1,14 +1,17 @@
-//! TLS: BoringSSL (Apache-2.0) at 22a0079b, built by build/boringssl.zig, with
-//! bindings from the official translate-c package over src/tls/bssl.h.
+//! TLS on BoringSSL (-Dtls=boringssl). Most programs need nothing here:
+//! listeners take a certificate through `anole.Cert` (`.fromFiles`,
+//! `.fromPem`, `.dev_self_signed`) and the clients verify against the
+//! system store by default. What this namespace adds:
 //!
-//! `dusty_tls` is the module dusty uses for every HTTPS listener and every
-//! HTTPS/WSS client connection; `selfSigned` makes a development certificate
-//! in memory.
+//! - `selfSigned`: a fresh key and certificate in memory, for development
+//!   and tests;
+//! - `dusty_tls`: the TLS module every HTTPS/WSS listener and client
+//!   connection runs on;
+//! - `c`: the raw BoringSSL bindings, for anything else.
 //!
-//! The smoke test below is the M1 BoringSSL proof: an in-memory TLS handshake
-//! between a client SSL and a server SSL over a BIO pair, with an ALPN select
-//! callback that prefers "h2" then "http/1.1". The server key and self-signed
-//! certificate are generated at run time and never touch the filesystem.
+//! BoringSSL (Apache-2.0) is pinned at 22a0079b and built by
+//! build/boringssl.zig, with bindings from the official translate-c package
+//! over src/tls/bssl.h.
 const std = @import("std");
 
 /// The translated BoringSSL headers listed in bssl.h.
@@ -59,9 +62,12 @@ test "TLS: an idle connection keeps no ciphertext buffer beyond its stash" {
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {
+    /// The certificate, PEM.
     cert: []u8,
+    /// The private key, PEM (PKCS#8).
     key: []u8,
 
+    /// Frees both, zeroing the key first.
     pub fn deinit(self: *Pem, gpa: std.mem.Allocator) void {
         gpa.free(self.cert);
         std.crypto.secureZero(u8, self.key);
@@ -70,11 +76,14 @@ pub const Pem = struct {
     }
 };
 
+/// What `selfSigned` makes. The defaults suit a server on this machine:
+/// localhost, 127.0.0.1 and ::1, valid for a week, a P-256 key.
 pub const SelfSignedOptions = struct {
     /// Subject CN, also the first DNS subjectAltName.
     common_name: []const u8 = "localhost",
     /// subjectAltName entries, in OpenSSL config syntax.
     alt_names: []const u8 = "DNS:localhost,IP:127.0.0.1,IP:::1",
+    /// How long the certificate is valid from now.
     valid_for_seconds: i64 = 7 * 24 * 3600,
     /// P-256 is fast to make and to use; RSA-4096 is the heaviest key a
     /// handshake meets in practice (and takes a second or more to make).
@@ -83,7 +92,13 @@ pub const SelfSignedOptions = struct {
 
 /// A fresh key and a self-signed certificate for it, for development
 /// and tests: nothing touches the disk. The certificate is its own CA
-/// (`CA:TRUE`), so a client can trust it directly.
+/// (`CA:TRUE`), so a client can trust it directly. Free it with
+/// `Pem.deinit`. A listener that only needs one can name
+/// `.dev_self_signed` instead.
+///
+///     var pem = try anole.tls.selfSigned(gpa, .{});
+///     defer pem.deinit(gpa);
+///     // .https = .{ .cert = .fromPem(pem.cert, pem.key) }
 pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
     c.ERR_clear_error();
     defer c.ERR_clear_error();
@@ -282,6 +297,10 @@ fn step(ssl: *c.SSL, side: Side) !bool {
     return sslFail("SSL_do_handshake");
 }
 
+// The M1 BoringSSL proof: an in-memory TLS handshake between a client SSL
+// and a server SSL over a BIO pair, with an ALPN select callback that
+// prefers "h2" then "http/1.1". The server key and self-signed certificate
+// are generated at run time and never touch the filesystem.
 test "BoringSSL smoke: in-memory TLS 1.3/1.2 handshakes negotiate ALPN h2; TLS 1.1 refused" {
     const kc = try makeKeyAndCert();
     defer c.X509_free(kc.cert);

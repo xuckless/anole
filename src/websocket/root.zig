@@ -58,14 +58,27 @@ const placement = dusty.placement;
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec").server;
 
-/// dusty's WebSocket over an HTTP/1.1 connection.
+/// The HTTP core's WebSocket over an HTTP/1.1 connection (`Socket.conn.h1`).
 pub const WebSocket = dusty.WebSocket;
+/// A message from `Socket.receive` or `Socket.next`: its `type`, its
+/// `data`, and for a close its `close_code`. `data` is valid until the
+/// next `receive` or `next`; copy what must outlive it.
 pub const Message = WebSocket.Message;
+/// `.text`, `.binary`, `.close`, `.ping` or `.pong` (and `.continuation`,
+/// which `receive` never returns).
 pub const MessageType = WebSocket.MessageType;
+/// A close status code: `.normal` (1000), `.going_away` (1001),
+/// `.policy_violation` (1008), `.too_large` (1009), `.internal_error`
+/// (1011) and the rest of RFC 6455's; any other number fits too.
 pub const CloseCode = WebSocket.CloseCode;
-/// dusty's client for `ws://` URLs.
+/// A client-side WebSocket, from
+/// `anole.client(req).http.connectWebSocket(url, .{})` for a `ws://` or
+/// `wss://` URL.
 pub const Client = dusty.WebSocketClient;
 
+/// How `upgrade` (and `app.wsWith`) accepts a socket. The defaults suit
+/// most handlers: dusty's message limit, no timeout, compression when
+/// built in, close 1001 on drain.
 pub const UpgradeOptions = struct {
     /// The largest message `receive` assembles (after inflating). A bigger
     /// one fails `receive` with `error.MessageTooLarge`, and the peer gets
@@ -78,15 +91,20 @@ pub const UpgradeOptions = struct {
     /// Accept permessage-deflate (RFC 7692) when the client offers it.
     /// Needs `-Dcompression`.
     compression: bool = features.compression,
+    /// The compressor's settings when permessage-deflate is in use.
     deflate: DeflateOptions = .{},
     /// When the server starts to drain, send close 1001 (going away) with
     /// `drain_reason`, so the peer answers and `receive` returns its
     /// `.close`. Off: the socket stays open until the handler ends it
     /// (`Socket.draining` tells it to) or `timeout.shutdown` cuts it.
     close_on_drain: bool = true,
+    /// The reason sent with the drain's close 1001.
     drain_reason: []const u8 = "server shutting down",
 };
 
+/// permessage-deflate settings: window size, memory level, level, and the
+/// shortest message worth compressing (64 bytes). Empty without
+/// `-Dcompression`.
 pub const DeflateOptions = if (features.compression) deflate_impl.Options else struct {};
 const deflate_impl = if (features.compression) @import("deflate.zig") else struct {
     pub const Deflate = void;
@@ -94,12 +112,16 @@ const deflate_impl = if (features.compression) @import("deflate.zig") else struc
 
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
 pub const Socket = struct {
+    /// The protocol underneath: dusty's HTTP/1.1 WebSocket, or a stream.
     conn: Conn,
     /// permessage-deflate, when negotiated.
     deflate: if (features.compression) ?*deflate_impl.Deflate else void =
         if (features.compression) null else {},
+    /// The request's arena.
     allocator: std.mem.Allocator,
+    /// The request's `std.Io`.
     io: std.Io,
+    /// `UpgradeOptions.max_message_size`.
     max_message_size: usize,
     /// Held across compressing and sending a message, so tasks sending on
     /// one socket (a `Rooms.broadcast` beside the socket's own handler) do
@@ -155,6 +177,10 @@ pub const Socket = struct {
         return msg;
     }
 
+    /// Sends one message (`.text` or `.binary`, usually), compressed when
+    /// permessage-deflate is in use and `data` is long enough. Safe beside
+    /// the socket's own handler from other tasks (`Rooms.broadcast`).
+    /// A text message must be valid UTF-8; that is the caller's to keep.
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
         try self.send_mutex.lock(self.io);
         defer self.send_mutex.unlock(self.io);
@@ -172,6 +198,8 @@ pub const Socket = struct {
         };
     }
 
+    /// Sends a ping with `data`: at most 125 bytes, else
+    /// `error.LargeControlFrame`. The pong is dropped inside `receive`.
     pub fn ping(self: *Socket, data: []const u8) !void {
         return switch (self.conn) {
             inline else => |ws| ws.ping(data),
@@ -211,6 +239,9 @@ pub const Socket = struct {
         };
     }
 
+    /// Releases the socket: the drain watch, the compressor, and the
+    /// stream or connection's WebSocket state. It sends no close; `close`
+    /// first for a clean end. `app.ws` routes do both for you.
     pub fn deinit(self: *Socket) void {
         // First, so nothing sends on the socket once it is gone.
         if (self.drain_watch) |w| w.stop();
@@ -405,6 +436,8 @@ pub const Rooms = struct {
     /// from the allocator.
     const stack_snapshot = 64;
 
+    /// No rooms yet. `allocator` holds the room names and members; it must
+    /// be thread-safe when sockets on several executors join.
     pub fn init(allocator: std.mem.Allocator) Rooms {
         return .{ .allocator = allocator };
     }
@@ -428,6 +461,7 @@ pub const Rooms = struct {
         return if (self.io_set.load(.acquire)) self.io else null;
     }
 
+    /// Frees every room. Call it once no socket is a member any more.
     pub fn deinit(self: *Rooms) void {
         var it = self.rooms.iterator();
         while (it.next()) |entry| {
@@ -582,11 +616,14 @@ pub const H2Socket = struct {
         return self;
     }
 
+    /// Ends the response stream. `Socket.deinit` calls it.
     pub fn deinit(self: *H2Socket) void {
         self.batch.deinit(self.io);
         self.out.end() catch {};
     }
 
+    /// The next message, as `Socket.receive` returns it, but not yet
+    /// inflated: use `Socket.receive`.
     pub fn receive(self: *H2Socket) !Message {
         const msg = self.receiveMessage() catch |err| {
             self.batch.endRound();
@@ -672,6 +709,7 @@ pub const H2Socket = struct {
         }
     }
 
+    /// Sends one uncompressed message. `Socket.send` compresses.
     pub fn send(self: *H2Socket, msg_type: MessageType, data: []const u8) !void {
         return self.sendMessage(msg_type, data, false);
     }
@@ -693,12 +731,14 @@ pub const H2Socket = struct {
         return if (self.batch.holds(self.io)) .batch else .now;
     }
 
+    /// Sends a ping. Fails with `error.LargeControlFrame` past 125 bytes.
     pub fn ping(self: *H2Socket, data: []const u8) !void {
         // As over HTTP/1.1; the codec asserts it rather than failing.
         if (data.len > codec.max_control_payload_len) return error.LargeControlFrame;
         try self.writeFrameOpts(.{ .opcode = .ping }, data, self.sendFlush());
     }
 
+    /// Sends a close frame, once; the reason is cut to fit 125 bytes.
     pub fn close(self: *H2Socket, code: CloseCode, reason: []const u8) !void {
         try self.sendClose(code, reason);
     }

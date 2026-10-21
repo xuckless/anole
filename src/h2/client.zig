@@ -30,8 +30,12 @@ const dusty = @import("dusty");
 const placement = dusty.placement;
 const Deadline = dusty.Deadline;
 
+/// A header field: request fields (pseudo-headers first, lower-case
+/// names) and the response's `headers` and `trailers`.
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+/// Where and how `ClientConnection.connect` connects. `host` and `port`
+/// are required; the rest has defaults.
 pub const ConnectOptions = struct {
     /// The server's name (for TLS: SNI and certificate checks) or address.
     host: []const u8,
@@ -64,11 +68,15 @@ pub const ConnectOptions = struct {
         /// Accept any certificate, for any name. For tests only.
         insecure_skip_verify: bool = false,
 
+        /// The system store, a file, a directory, PEM in memory, or none.
         pub const Ca = dusty.TlsCa;
+        /// A certificate and key, as files or PEM.
         pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
+/// Connection-level failures. `NoH2`: the TLS server did not pick "h2"
+/// by ALPN.
 pub const Error = error{ ConnectionClosed, StreamReset, NoH2, OutOfMemory, Unexpected };
 
 /// Why a stream ended early: what `waitHead` returns, and what `readError`
@@ -89,6 +97,9 @@ fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     return .{ .duration = .{ .raw = d, .clock = .awake } };
 }
 
+/// An HTTP/2 client connection: `connect`, then `request` once per
+/// request (concurrent ones share the connection, and several tasks may
+/// make them at once), and `close`. See the file's example.
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -312,6 +323,7 @@ pub const ClientConnection = struct {
         self.io.futexWake(u32, &self.write_gen.raw, std.math.maxInt(u32));
     }
 
+    /// Per request: a body (streamed or given whole) and the timeout.
     pub const RequestOptions = struct {
         /// The request has a body, written through `Stream.writer` and
         /// ended with `Stream.closeSend`.
@@ -662,11 +674,15 @@ pub const Stream = struct {
         try self.head_event.wait(self.conn.io);
     }
 
+    /// The first response header named `name` (any case), once `waitHead`
+    /// has returned; null when absent.
     pub fn header(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.headers.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;
     }
 
+    /// The first trailer named `name` (any case), once the body has been
+    /// read to its end; null when absent.
     pub fn trailer(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.trailers.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;

@@ -1,7 +1,11 @@
 //! Copied from fanyang89/grpc-lite (MIT, Copyright (c) 2026 grpc-lite contributors),
 //! src/status.zig at commit db3c400bf70419742ebcb42fe316ba8b754b4975; see THIRD_PARTY_NOTICES.
+//!
+//! gRPC status codes, and a status: a code with a message.
 const std = @import("std");
 
+/// A gRPC status code, as sent in `grpc-status`. A handler ends a call
+/// with one through `Call.fail`.
 pub const Code = enum(u8) {
     ok = 0,
     cancelled = 1,
@@ -21,21 +25,27 @@ pub const Code = enum(u8) {
     data_loss = 15,
     unauthenticated = 16,
 
+    /// The code for `value`, or `.unknown` for a number outside 0-16.
     pub fn fromInt(value: u32) Code {
         return std.enums.fromInt(Code, value) orelse .unknown;
     }
 };
 
+/// A call's outcome: a code and its message (`grpc-message`). The message
+/// is borrowed, not copied.
 pub const Status = struct {
     code: Code,
     message: []const u8 = "",
 
+    /// OK, with no message.
     pub const ok: Status = .{ .code = .ok };
 
+    /// A status with `code` and `message` (borrowed).
     pub fn init(code: Code, message: []const u8) Status {
         return .{ .code = code, .message = message };
     }
 
+    /// Whether the code is OK.
     pub fn isOk(self: Status) bool {
         return self.code == .ok;
     }

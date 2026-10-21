@@ -21,6 +21,7 @@ const std = @import("std");
 const c = @import("anole_yyjson_c");
 const dusty = @import("dusty");
 
+/// How `parse` (and `readBody`) maps a document onto a type.
 pub const ParseOptions = struct {
     /// Object keys with no field are skipped; false makes them an error.
     ignore_unknown_fields: bool = true,
@@ -28,18 +29,28 @@ pub const ParseOptions = struct {
     flags: u32 = 0,
 };
 
+/// How `stringify` (and `respond`) writes a value.
 pub const StringifyOptions = struct {
+    /// Indent the output; compact by default.
     pretty: bool = false,
     /// Optional fields that are null are left out instead of written as null.
     omit_null_fields: bool = false,
 };
 
+/// What `parse` fails with.
 pub const Error = error{
+    /// Not JSON.
     SyntaxError,
+    /// A value of another kind than the field's type (a string for a
+    /// number, say).
     UnexpectedType,
+    /// An object lacks a field that has no default and is not optional.
     MissingField,
+    /// An object key with no field, under `ignore_unknown_fields = false`.
     UnknownField,
+    /// A number out of the integer type's range.
     Overflow,
+    /// A string that names no tag of the enum.
     InvalidEnumTag,
     OutOfMemory,
 };
