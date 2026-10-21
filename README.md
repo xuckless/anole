@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>One Zig server for your whole backend.</b><br>
-  REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3.
+  REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3. TLS, auth and observability are built in, on one listener and one router.
 </p>
 
 <p align="center">
@@ -27,7 +27,6 @@
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
-TLS, auth and observability are built in, on one listener and one router.
 
 An anole is a small lizard that changes colour to fit wherever it lands, and
 that's the idea: one server core that speaks whatever protocol the client
