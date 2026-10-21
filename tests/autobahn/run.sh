@@ -17,13 +17,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-zig-out/bin/autobahn-echo}
 mode=${2:-loop}
 image=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
-# The machine, since a failure has followed the runner, not the commit:
+# The machine, since a failure once followed the runner, not the commit:
 # zlib-ng picks its x86 code paths (AVX2, AVX-512, VNNI, VPCLMULQDQ) at run
-# time, and the client's memory peaks at a few GiB.
+# time, and PyPy sizes the client's GC nursery from /proc/cpuinfo's "cache
+# size" (see the client's PYPY_GC_NURSERY below).
 cpu=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)
+cache=$(awk -F': ' '/^cache size/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)
 flags=$(grep -m1 -o -w 'avx2\|avx512f\|avx512bw\|avx512vl\|avx512_vnni\|vpclmulqdq' /proc/cpuinfo 2>/dev/null | tr '\n' ' ' || true)
 mem=$(awk '/MemTotal/{print $2 " kB"}' /proc/meminfo 2>/dev/null || echo unknown)
-echo "machine: $(nproc 2>/dev/null || echo ?) CPUs, $cpu; $flags; MemTotal $mem"
+echo "machine: $(nproc 2>/dev/null || echo ?) CPUs, $cpu; cache size $cache; $flags; MemTotal $mem"
 attempt=1
 while :; do
   reports=$(mktemp -d)
@@ -44,7 +46,18 @@ while :; do
   ) >"$reports/mem.log" 2>&1 &
   sampler=$!
   client_exit=0
+  # The client is PyPy, whose GC sizes its nursery at half of /proc/cpuinfo's
+  # "cache size" when that is over 8 MiB, else 4 MiB. x86 Linux reports L2
+  # there on AMD (512 KB-1 MB: 4 MiB nursery) but L3 on Intel (260-480 MB:
+  # a 130-240 MB nursery). Nursery objects that own C memory (zlib streams
+  # in the 12.x/13.x permessage-deflate cases) then pile up between minor
+  # collections and the client grew to 15 GiB and was OOM-killed on Intel
+  # Xeon runners, against 3.5-3.8 GiB elsewhere. So pin the nursery to the
+  # 4 MiB it gets everywhere else; the server side is untouched. The memory
+  # cap makes a runaway client die in its own cgroup (reported below as
+  # OOMKilled) instead of taking the runner down with it.
   docker run --name "$client" --add-host=host.docker.internal:host-gateway \
+    --memory 8g -e PYPY_GC_NURSERY=4MB \
     -e PYTHONUNBUFFERED=1 \
     -v "$here/fuzzingclient.json:/config/fuzzingclient.json:ro" \
     -v "$reports:/reports" \
