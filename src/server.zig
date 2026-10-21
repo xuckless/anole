@@ -45,6 +45,10 @@ const websocket = if (features.websocket) @import("websocket/root.zig") else str
 const webtransport_mod = if (features.http3) @import("webtransport.zig") else struct {
     pub const AcceptOptions = struct {};
 };
+const pg_mod = if (features.postgres) @import("pg/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Db = void;
+};
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
     pub const RegisterOptions = struct {};
@@ -287,6 +291,33 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             dirs: std.ArrayList(std.Io.Dir) = .empty,
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
+            /// The database connectors made here (`postgres`), in order.
+            connectors: std.ArrayList(Connector) = .empty,
+            connectors_started: bool = false,
+        };
+
+        /// A database connector the server made: when serving starts it
+        /// gets the app's metrics, tracer and health checks (whichever
+        /// exist by then, so the helpers may come in any order), and it is
+        /// closed with the server, after the drain.
+        const Connector = struct {
+            context: *anyopaque,
+            start: *const fn (context: *anyopaque, metrics: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) anyerror!void,
+            deinit: *const fn (context: *anyopaque) void,
+
+            fn of(comptime T: type, value: *T) Connector {
+                const Hooks = struct {
+                    fn start(context: *anyopaque, metrics_: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health_: ?*observe.Health) anyerror!void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        return v.start(metrics_, tracer, health_);
+                    }
+                    fn deinit(context: *anyopaque) void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        v.deinit();
+                    }
+                };
+                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit };
+            }
         };
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
@@ -649,6 +680,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.exporter) |e| e.deinit();
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
+            // The databases, once nothing uses them: last made, first closed.
+            var c = extras.connectors.items.len;
+            while (c > 0) {
+                c -= 1;
+                extras.connectors.items[c].deinit(extras.connectors.items[c].context);
+            }
             // Last added, first freed.
             var i = self.owned_middleware.items.len;
             while (i > 0) {
@@ -1071,6 +1108,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return out;
         }
 
+        /// Hands the databases what the app observes with, once.
+        fn startConnectors(self: *Self) !void {
+            const extras = self.extras;
+            if (extras.connectors_started) return;
+            extras.connectors_started = true;
+            for (extras.connectors.items) |c| try c.start(c.context, extras.metrics, extras.exporter, extras.health);
+        }
+
         /// The routes `metrics` and `health` left for when serving starts.
         fn addHelperRoutes(self: *Self) void {
             const extras = self.extras;
@@ -1176,6 +1221,26 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return e;
         }
 
+        /// A PostgreSQL database for the handlers, owned by the server:
+        /// `state.db = try app.postgres(.{});` reads `DATABASE_URL` (or
+        /// `options.url`, or libpq's `PG*` variables). No connection opens
+        /// before a handler needs one (unless `connect_at_start`). Once
+        /// serving, it reports to `app.metrics`, `app.tracing` and
+        /// `app.health` (a ping behind `/readyz`) when the app has them,
+        /// and it is closed with the server, after the drain. See
+        /// `anole.pg`.
+        pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Db {
+            if (comptime !features.postgres) @compileError("app.postgres needs PostgreSQL (-Dpostgres, on in the web and full profiles)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const d = try pg_mod.Db.init(self.gpa, self.rt.io(), opts);
+            errdefer d.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Db, d));
+            return d;
+        }
+
         /// Loads the TLS certificate and key again (from their files, for
         /// `.files`) and the client CAs of `https.client_auth` (from theirs),
         /// and switches the HTTPS listener and HTTP/3 to them. Connections
@@ -1272,6 +1337,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
             self.addHelperRoutes();
+            self.startConnectors() catch |err| return self.failStart(err);
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,
