@@ -17,7 +17,7 @@ const anole = @import("anole");
 /// Keeps the runtime's per-thread lines out of a Debug build.
 pub const std_options = anole.std_options;
 
-const App = struct { db: *anole.pg.Db };
+const App = struct { db: *anole.pg.Client };
 
 const Post = struct { id: i64, body: []const u8, likes: i32, created_at: anole.db.Time };
 const NewPost = struct { body: []const u8 };

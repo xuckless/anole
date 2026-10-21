@@ -554,6 +554,7 @@ pub const CloseInfo = struct {
     },
 };
 
+/// What session and stream calls fail with.
 pub const Error = error{
     /// The session is closed (by either side, or the connection went).
     SessionClosed,
@@ -562,7 +563,9 @@ pub const Error = error{
     StreamReset,
     /// The peer asked for no more data on the stream (`Stream.stopCode`).
     StreamStopped,
+    /// The QUIC connection closed.
     ConnectionClosed,
+    /// The waiting task was canceled (the server stopping).
     Canceled,
 };
 
@@ -595,6 +598,8 @@ pub const Session = struct {
     /// The capsule reader and the drain watch.
     tasks: std.Io.Group = .init,
 
+    /// For `start`: `anole.webtransport.accept` fills it from its
+    /// `AcceptOptions`.
     pub const Options = struct {
         /// The server's drain signal: on it, a DRAIN_WEBTRANSPORT_SESSION
         /// capsule goes out, and with `close_on_drain` the session closes.
@@ -711,6 +716,7 @@ pub const Session = struct {
         core.host.kick();
     }
 
+    /// Whether neither side has closed the session yet.
     pub fn isOpen(self: *Session) bool {
         const host = self.core.host;
         host.lock();
@@ -1071,6 +1077,7 @@ pub const Stream = struct {
     user_done: bool,
     protocol_done: bool = false,
 
+    /// Bidirectional, or one-way in (accepted) or out (opened).
     pub const Kind = enum { bidi, uni_in, uni_out };
 
     fn create(core: *Core, id: i64, kind: Kind, local: bool) !*Stream {
@@ -1217,10 +1224,12 @@ pub const Stream = struct {
         return &s.writer_iface;
     }
 
+    /// Why reading failed (`StreamReset`, `SessionClosed`...), or null.
     pub fn readError(s: *const Stream) ?Error {
         return s.read_err;
     }
 
+    /// Why writing failed (`StreamStopped`, `SessionClosed`...), or null.
     pub fn writeError(s: *const Stream) ?Error {
         return s.write_err;
     }

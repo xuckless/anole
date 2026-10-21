@@ -79,7 +79,7 @@ listed in two groups is two copies. To share one, take a handle with
 `app.middleware(value)` (one copy, owned by the server) and list the handle:
 
 ```zig
-const sessions = app.middleware(anole.session.Middleware.init(.{ .key = key }));
+const sessions = app.middleware(try anole.session.Middleware.init(.{ .key = key }));
 app.group("", .{sessions}).get("/me", me);
 app.group("", .{ sessions, anole.auth.csrf.Middleware.init(.{}) }).post("/notes", addNote);
 ```
@@ -155,7 +155,9 @@ app.use(Timing{});
 
 ### Built-in middleware
 
-`anole.middleware` holds the HTTP core's, and `ResponseCache`:
+`anole.middleware` holds the HTTP core's, and `ResponseCache`. Sessions,
+CSRF, auth and rate limits have their own namespaces (`anole.session`,
+`anole.auth`, `anole.ratelimit`); see [auth.md](auth.md).
 
 | Middleware | What it does |
 | --- | --- |
@@ -163,7 +165,6 @@ app.use(Timing{});
 | `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path, status or error, time, client, request ID. |
 | `Compress.init()` | Sets `res.compress` on every response; see [Compression](#compression). |
 | `Cors.init(.{})` | CORS for browsers: any origin by default, preflights answered with 204; see [CORS](#cors). |
-| `Session.init(.{ .secret_key = ... })` | `req.session` in a signed, not encrypted, cookie. Returns an error union. |
 | `ResponseCache` | Whole responses kept per executor and answered from memory; see [Response cache](#response-cache). |
 
 ```zig
@@ -220,7 +221,7 @@ One cache for several routes is `app.responseCache`, used through `with`,
 `group` or `use`, and invalidated when what it serves changes:
 
 ```zig
-const App = struct { db: *anole.pg.Db, pages: *anole.middleware.ResponseCache };
+const App = struct { db: *anole.pg.Client, pages: *anole.middleware.ResponseCache };
 
 state.pages = app.responseCache(.{ .ttl = .fromSeconds(60), .name = "pages" });
 app.with(.{state.pages}).get("/posts/:id", showPost);

@@ -888,7 +888,7 @@ listener that is not built fails with `error.TlsNotBuilt` or
 
 `app.router` and `app.server` are the HTTP core's router and server
 (src/http/core, adapted from dusty), and `anole.http` is that core, with TLS
-already on BoringSSL (`anole.http.dusty_module` has whatever it does not
+already on BoringSSL (`anole.http.core` has whatever it does not
 re-export). You can skip `Server` and drive the core yourself:
 
 ```zig

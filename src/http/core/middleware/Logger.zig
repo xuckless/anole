@@ -14,6 +14,8 @@ const log = std.log.scoped(.access);
 
 const Logger = @This();
 
+/// The middleware: `app.use(anole.middleware.Logger.init())`. See also
+/// `anole.observe.AccessLog`.
 pub fn init() Logger {
     return .{};
 }

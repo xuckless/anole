@@ -7,6 +7,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const http = @import("../http/root.zig");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const pg = @import("root.zig");
 const server_mod = @import("../server.zig");
 const client_mod = @import("../client.zig");
@@ -19,11 +20,11 @@ fn testUrl() ![]const u8 {
 }
 
 /// A database on `io` for the test URL, unaffected by the environment.
-fn open(io: std.Io, opts: pg.Options) !*pg.Db {
+fn open(io: std.Io, opts: pg.Options) !*pg.Client {
     var o = opts;
     if (o.url == null) o.url = try testUrl();
     o.environ = .empty;
-    return pg.Db.init(gpa, io, o);
+    return pg.Client.init(gpa, io, o);
 }
 
 /// Quiets the warnings that failing calls log (5xx classes), for tests
@@ -192,7 +193,7 @@ test "pg: live transactions: commit, roll back, retry a serialization failure" {
         defer tx.deinit();
         _ = try tx.exec(&c, "UPDATE anole_pg_accounts SET cents = cents - 10 WHERE id = 1", .{});
         try testing.expectEqual(@as(i64, 90), try tx.one(i64, &c, balance, .{@as(i32, 1)}));
-        try tx.commit();
+        try tx.commit(&c);
     }
     try testing.expectEqual(@as(i64, 90), try d.one(i64, &c, balance, .{@as(i32, 1)}));
     {
@@ -211,7 +212,7 @@ test "pg: live transactions: commit, roll back, retry a serialization failure" {
         defer tx.deinit();
         _ = try tx.exec(&c, "UPDATE anole_pg_accounts SET cents = 1 WHERE id = 2", .{});
         try testing.expectError(error.Database, tx.exec(&c, "SELEKT", .{}));
-        try testing.expectError(error.Database, tx.commit());
+        try testing.expectError(error.Database, tx.commit(&c));
         try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "rolled back") != null);
     }
     try testing.expectEqual(@as(i64, 0), try d.one(i64, &c, balance, .{@as(i32, 2)}));
@@ -240,12 +241,12 @@ test "pg: live transactions: commit, roll back, retry a serialization failure" {
 }
 
 /// Statements of `app` running `pg_sleep` on the server.
-fn sleeping(d: *pg.Db, c: *db.Ctx, app: []const u8) !i64 {
+fn sleeping(d: *pg.Client, c: *db.Ctx, app: []const u8) !i64 {
     return d.one(i64, c, "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND state = 'active' AND query LIKE '%pg_sleep%' AND pid <> pg_backend_pid()", .{app});
 }
 
 /// Waits up to 3 s for `app`'s sleeping statements to stop.
-fn expectStopped(io: std.Io, d: *pg.Db, c: *db.Ctx, app: []const u8) !void {
+fn expectStopped(io: std.Io, d: *pg.Client, c: *db.Ctx, app: []const u8) !void {
     for (0..60) |_| {
         if (try sleeping(d, c, app) == 0) return;
         try io.sleep(.fromMilliseconds(50), .awake);
@@ -278,7 +279,7 @@ test "pg: live a timeout or a cancel stops the statement on the server" {
 
     // The task canceled (a request's deadline, an HTTP/2 reset).
     const Sleeper = struct {
-        fn run(db_: *pg.Db, io_: std.Io) !void {
+        fn run(db_: *pg.Client, io_: std.Io) !void {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
@@ -322,17 +323,17 @@ test "pg: live a pool per executor" {
     for (d.pools.pools) |*s| try testing.expectEqual(@as(usize, 1), s.pool._conns.len);
 
     const Worker = struct {
-        fn run(db_: *pg.Db, io_: std.Io, pids: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
+        fn run(db_: *pg.Client, io_: std.Io, pids: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
             queries(db_, io_, pids, wrong) catch {
                 _ = wrong.fetchAdd(1, .monotonic);
             };
         }
 
-        fn queries(db_: *pg.Db, io_: std.Io, pids: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) !void {
+        fn queries(db_: *pg.Client, io_: std.Io, pids: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) !void {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
-            const here = db.executorIndex(io_).?;
+            const here = internal.executorIndex(io_).?;
             for (0..10) |_| {
                 const pid = try db_.one(i64, &ctx, "SELECT pg_backend_pid()::int8", .{});
                 // Each executor keeps to its one connection.
@@ -375,7 +376,7 @@ test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
     const next = "SELECT nextval('anole_pg_seq') AS n FROM pg_sleep($1::float8)";
     const Got = struct { n: i64 };
     const Worker = struct {
-        fn run(db_: *pg.Db, io_: std.Io, opts: db.QueryOptions, delay: f64, seen: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
+        fn run(db_: *pg.Client, io_: std.Io, opts: db.QueryOptions, delay: f64, seen: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
@@ -383,7 +384,7 @@ test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
                 _ = wrong.fetchAdd(1, .monotonic);
                 return;
             };
-            const here = db.executorIndex(io_).?;
+            const here = internal.executorIndex(io_).?;
             if (seen[here].cmpxchgStrong(0, got.n, .monotonic, .monotonic)) |prev| {
                 if (prev != got.n) _ = wrong.fetchAdd(1, .monotonic);
             }
@@ -479,7 +480,7 @@ test "pg: live TLS as the URL asks, and a refused login" {
     });
     const level = quiet();
     defer testing.log_level = level;
-    const refused = try pg.Db.init(gpa, io, .{ .url = bad_url, .environ = .empty });
+    const refused = try pg.Client.init(gpa, io, .{ .url = bad_url, .environ = .empty });
     defer refused.deinit();
     try testing.expectError(error.ServiceUnavailable, refused.exec(&c, "SELECT 1", .{}));
     const detail = db.lastError(&c).?;
@@ -488,7 +489,7 @@ test "pg: live TLS as the URL asks, and a refused login" {
 }
 
 const AppState = struct {
-    db: *pg.Db,
+    db: *pg.Client,
 };
 
 const AppRoutes = struct {

@@ -171,7 +171,7 @@ test "anole.App: listen, function middleware, with, staticDir, metrics, health, 
                 try std.testing.expectEqualStrings("ping me back", (try ws.receive()).data);
                 try ws.close(.normal, "");
                 const answer = try ws.receive();
-                try std.testing.expectEqual(http.dusty_module.WebSocket.MessageType.close, answer.type);
+                try std.testing.expectEqual(http.core.WebSocket.MessageType.close, answer.type);
             }
 
             if (features.grpc) {

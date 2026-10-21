@@ -867,6 +867,9 @@ pub const Burst = struct {
     }
 };
 
+/// The core server for state `Ctx` (`void` for none), on a `std.Io` the
+/// caller runs. Most applications use `anole.Server`, which owns the
+/// runtime, signals and TLS listeners and wraps this one (`app.server`).
 pub fn Server(comptime Ctx: type) type {
     const MiddlewareItem = struct {
         middleware: Middleware(Ctx),

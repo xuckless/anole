@@ -9,6 +9,7 @@ const dusty = @import("dusty");
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec");
 const websocket = @import("root.zig");
+const H2Socket = @import("h2_socket.zig").H2Socket;
 const deflate = if (features.compression) @import("deflate.zig") else struct {};
 
 /// The body reader's source. One check runs at a time, so it is global: the
@@ -36,7 +37,7 @@ const Transcript = struct {
 
 fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize, compressed: bool) !Transcript {
     source = .{ .data = input, .step = step };
-    const sock = try arena.create(websocket.H2Socket);
+    const sock = try arena.create(H2Socket);
     const out = try arena.alloc(u8, 64 * 1024);
     sock.* = .{
         .io = std.testing.io,
@@ -118,9 +119,9 @@ test "fuzz: WebSocket over HTTP/2, whole and in pieces" {
             const frames = input[1..];
             const compressed = features.compression and knobs & 0x80 != 0;
             const step = 1 + (knobs & 0x1f);
-            const buf_len: usize = if (knobs & 0x40 != 0) 300 else websocket.H2Socket.buffer_len;
+            const buf_len: usize = if (knobs & 0x40 != 0) 300 else H2Socket.buffer_len;
 
-            const whole = try run(arena, frames, frames.len + 1, websocket.H2Socket.buffer_len, compressed);
+            const whole = try run(arena, frames, frames.len + 1, H2Socket.buffer_len, compressed);
             const pieces = try run(arena, frames, step, buf_len, compressed);
             try std.testing.expectEqualStrings(whole.messages.items, pieces.messages.items);
             try std.testing.expectEqual(whole.end, pieces.end);
@@ -154,7 +155,7 @@ test "H2Socket: a message, a ping and a close, whole and a byte at a time" {
         "\x89\x82\x00\x00\x00\x00hi" ++
         "\x88\x82\x00\x00\x00\x00\x03\xe8";
     for ([_]usize{ frames.len, 1 }) |step| {
-        const t = try run(arena, frames, step, websocket.H2Socket.buffer_len, false);
+        const t = try run(arena, frames, step, H2Socket.buffer_len, false);
         try std.testing.expectEqualStrings("text 5 null:Helloclose 0 1000:", t.messages.items);
         try std.testing.expectEqual(error.ConnectionClosed, t.end);
         // The pong, then the close echoed.

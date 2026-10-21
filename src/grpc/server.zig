@@ -60,6 +60,8 @@ pub const RegisterOptions = struct {
     no_wait: bool = false,
 };
 
+/// When a registration gzips its response messages
+/// (`RegisterOptions.response_compression`).
 pub const ResponseCompression = enum {
     /// When the request came gzipped too, as grpc-go does by default.
     mirror,
@@ -68,6 +70,7 @@ pub const ResponseCompression = enum {
     /// costs more CPU than the call itself (zlib-ng zeroes a 128 KiB hash
     /// table per message).
     accepted,
+    /// Never: response messages go out uncompressed.
     never,
 };
 
@@ -80,12 +83,27 @@ pub const unknown_error_message = "Application error processing RPC";
 
 /// One call, as its handler sees it: the request's metadata, its deadline,
 /// an arena for the call, and the status and trailing metadata to send.
+///
+/// A handler takes it first and returns the response message, or
+/// `call.fail(code, message)` to end the call with another status:
+///
+///     fn sayHello(call: *anole.grpc.Call, req: pb.HelloRequest) !pb.HelloReply {
+///         if (req.name.len == 0) return call.fail(.invalid_argument, "name is required");
+///         return .{ .message = try std.fmt.allocPrint(call.arena, "Hello, {s}", .{req.name}) };
+///     }
+///
+/// Any other error ends the call with UNKNOWN; its name is logged, not
+/// sent. `impl` is the server's own.
 pub const Call = struct {
+    /// The HTTP request the call came in as.
     req: *dusty.Request,
+    /// The HTTP response the call goes out on. Use `addHeader` and
+    /// `addTrailer` rather than writing to it.
     res: *dusty.Response,
     /// The call's arena (the request's): messages decoded for the handler
     /// live here, and what the handler returns may too. Thread-safe.
     arena: std.mem.Allocator,
+    /// The server's runtime, for the handler's own I/O.
     io: std.Io,
     /// The application state of a `Server(Ctx)`, or null.
     ctx: ?*anyopaque,
@@ -95,29 +113,45 @@ pub const Call = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Set by `fail`, or left at OK.
     status: Code = .ok,
+    /// Set by `fail`: sent as grpc-message.
     status_message: []const u8 = "",
-    trailers: std.ArrayList(metadata_mod.Entry) = .empty,
-    max_message_size: usize,
-    request_compression: Compression = .identity,
-    response_compression: Compression = .identity,
-    /// The response body, started by the first message (so initial
-    /// metadata can be added until then).
-    out: ?dusty.StreamingBodyWriter = null,
-    out_buf: [16 * 1024]u8 = undefined,
-    write_mutex: std.Io.Mutex = .init,
-    /// The wire protocol and message encoding, from the request's
-    /// content type.
-    protocol: Protocol = .grpc,
-    codec: Codec = .proto,
-    /// Connect unary: the request was read; the response waits here for
-    /// `finish`.
-    unary_read: bool = false,
-    unary_response: ?[]const u8 = null,
-    /// gRPC-Web text: the request body, base64-decoded.
-    text_input: ?std.Io.Reader = null,
-    /// Connect GET: the request message, from the query.
-    get_message: ?[]const u8 = null,
+    /// The server's own state for the call (framing, compression, the
+    /// response writer). Internal: read and change the call through the
+    /// fields above and the methods below.
+    impl: Impl,
 
+    /// What `impl` holds. Internal to Anole; not part of the API.
+    const Impl = struct {
+        /// Trailing metadata to send with the status (`addTrailer`).
+        trailers: std.ArrayList(metadata_mod.Entry) = .empty,
+        /// The largest request message this call accepts
+        /// (`RegisterOptions.max_message_size`).
+        max_message_size: usize,
+        /// How the client compressed its messages (grpc-encoding).
+        request_compression: Compression = .identity,
+        /// How the response messages are compressed
+        /// (`RegisterOptions.response_compression`).
+        response_compression: Compression = .identity,
+        /// The response body, started by the first message (so initial
+        /// metadata can be added until then).
+        out: ?dusty.StreamingBodyWriter = null,
+        out_buf: [16 * 1024]u8 = undefined,
+        write_mutex: std.Io.Mutex = .init,
+        /// The wire protocol and message encoding, from the request's
+        /// content type.
+        protocol: Protocol = .grpc,
+        codec: Codec = .proto,
+        /// Connect unary: the request was read; the response waits here for
+        /// `finish`.
+        unary_read: bool = false,
+        unary_response: ?[]const u8 = null,
+        /// gRPC-Web text: the request body, base64-decoded.
+        text_input: ?std.Io.Reader = null,
+        /// Connect GET: the request message, from the query.
+        get_message: ?[]const u8 = null,
+    };
+
+    /// What `fail` returns: the status is on the call.
     pub const Error = error{GrpcStatus};
 
     /// Request metadata (a header), by lower-case name.
@@ -144,15 +178,15 @@ pub const Call = struct {
     /// `putOne`.
     pub fn addHeader(self: *Call, name: []const u8, value: []const u8) !void {
         // The writer starts the head under the same lock (`writeBytes`).
-        try self.write_mutex.lock(self.io);
-        defer self.write_mutex.unlock(self.io);
-        if (self.out != null) return error.HeadersSent;
+        try self.impl.write_mutex.lock(self.io);
+        defer self.impl.write_mutex.unlock(self.io);
+        if (self.impl.out != null) return error.HeadersSent;
         try self.res.header(name, value);
     }
 
     /// Adds trailing metadata, sent with the status.
     pub fn addTrailer(self: *Call, name: []const u8, value: []const u8) !void {
-        try self.trailers.append(self.arena, .{ .key = name, .value = value });
+        try self.impl.trailers.append(self.arena, .{ .key = name, .value = value });
     }
 
     /// The client went away (reset the stream or closed the connection),
@@ -163,12 +197,32 @@ pub const Call = struct {
         return self.res.peerGone() or self.deadlineExceeded();
     }
 
+    /// How the client compressed its request messages (grpc-encoding):
+    /// `.identity` or `.gzip`.
+    pub fn requestCompression(self: *const Call) Compression {
+        return self.impl.request_compression;
+    }
+
+    /// The wire protocol the call came in on: gRPC, gRPC-Web, Connect or
+    /// JSON transcoding.
+    pub fn protocol(self: *const Call) Protocol {
+        return self.impl.protocol;
+    }
+
+    /// How its messages are encoded: protobuf binary or JSON.
+    pub fn codec(self: *const Call) Codec {
+        return self.impl.codec;
+    }
+
+    /// Whether the client's grpc-timeout has run out. False without one.
     pub fn deadlineExceeded(self: *const Call) bool {
         const d = self.deadline orelse return false;
         return std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d);
     }
 };
 
+/// The four gRPC call shapes, told apart by a generated method's
+/// signature: one request or a queue of them, one response or a queue.
 pub const MethodKind = enum { unary, server_streaming, client_streaming, bidi_streaming };
 
 /// The protocols one route serves, told apart by the content type.
@@ -189,6 +243,8 @@ pub const Protocol = enum {
     http_json,
 };
 
+/// How messages are encoded: protobuf binary, or JSON (Connect's and
+/// gRPC-Web's `+json` content types, and transcoding).
 pub const Codec = enum { proto, json };
 
 /// The element type of a `*std.Io.Queue(T)` parameter.
@@ -197,7 +253,8 @@ fn QueueElem(comptime P: type) type {
     return @typeInfo(@typeInfo(@TypeOf(Q.init)).@"fn".param_types[0].?).pointer.child;
 }
 
-/// The kind and message types of a generated method's function pointer type.
+/// The kind and message types of a generated method's function pointer type:
+/// `kind`, `Request` and `Response`.
 pub const MethodOf = Method;
 
 fn Method(comptime F: type) type {
@@ -206,10 +263,13 @@ fn Method(comptime F: type) type {
     const ret = @typeInfo(info.return_type.?).error_union.payload;
     const second_is_queue = @typeInfo(params[1].?) == .pointer;
     return struct {
+        /// Which of the four call shapes the method is.
         pub const kind: MethodKind = if (params.len == 2)
             (if (second_is_queue) .client_streaming else .unary)
         else if (second_is_queue) .bidi_streaming else .server_streaming;
+        /// The request message type.
         pub const Request = if (second_is_queue) QueueElem(params[1].?) else params[1].?;
+        /// The response message type.
         pub const Response = if (params.len == 3) QueueElem(params[2].?) else ret;
     };
 }
@@ -299,36 +359,38 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         .io = req.io,
         .ctx = ctx,
         .data = options.data,
-        .max_message_size = options.max_message_size,
-        .protocol = kind.protocol,
-        .codec = kind.codec,
+        .impl = .{
+            .max_message_size = options.max_message_size,
+            .protocol = kind.protocol,
+            .codec = kind.codec,
+        },
     };
     res.status = .ok;
     try res.header("content-type", kind.response_type);
 
-    switch (call.protocol) {
+    switch (call.impl.protocol) {
         .grpc, .grpc_web, .grpc_web_text, .connect_stream => {
-            const prefix = if (call.protocol == .connect_stream) "connect-" else "grpc-";
+            const prefix = if (call.impl.protocol == .connect_stream) "connect-" else "grpc-";
             var name_buf: [32]u8 = undefined;
             if (req.headers.get(concat(&name_buf, prefix, "content-encoding", "encoding"))) |enc| {
-                call.request_compression = Compression.parse(enc) orelse {
+                call.impl.request_compression = Compression.parse(enc) orelse {
                     // Not `concat`: the response keeps the name past this frame.
-                    try res.header(if (call.protocol == .connect_stream) "connect-accept-encoding" else "grpc-accept-encoding", acceptEncoding());
+                    try res.header(if (call.impl.protocol == .connect_stream) "connect-accept-encoding" else "grpc-accept-encoding", acceptEncoding());
                     return finish(&call, call.fail(.unimplemented, "unsupported message encoding"));
                 };
-                if (call.request_compression == .gzip and !features.compression)
+                if (call.impl.request_compression == .gzip and !features.compression)
                     return finish(&call, call.fail(.unimplemented, "gzip is not built in"));
             }
             const compress = switch (options.response_compression) {
-                .mirror => call.request_compression == .gzip,
+                .mirror => call.impl.request_compression == .gzip,
                 .accepted => true,
                 .never => false,
             };
             if (features.compression and compress) if (req.headers.get(concat(&name_buf, prefix, "accept-encoding", "accept-encoding"))) |accepted| {
-                if (std.mem.indexOf(u8, accepted, "gzip") != null) call.response_compression = .gzip;
+                if (std.mem.indexOf(u8, accepted, "gzip") != null) call.impl.response_compression = .gzip;
             };
-            if (call.response_compression == .gzip) try res.header(if (call.protocol == .connect_stream) "connect-content-encoding" else "grpc-encoding", "gzip");
-            try res.header(if (call.protocol == .connect_stream) "connect-accept-encoding" else "grpc-accept-encoding", acceptEncoding());
+            if (call.impl.response_compression == .gzip) try res.header(if (call.impl.protocol == .connect_stream) "connect-content-encoding" else "grpc-encoding", "gzip");
+            try res.header(if (call.impl.protocol == .connect_stream) "connect-accept-encoding" else "grpc-accept-encoding", acceptEncoding());
         },
         // HTTP's own Content-Encoding: dusty decodes the request body and
         // compresses the response (JSON; protobuf is not on its list).
@@ -338,7 +400,7 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
     }
 
     var timeout_ns: ?u64 = null;
-    if (call.protocol == .connect or call.protocol == .connect_stream) {
+    if (call.impl.protocol == .connect or call.impl.protocol == .connect_stream) {
         if (req.headers.get("connect-timeout-ms")) |value| {
             const ms = std.fmt.parseInt(u64, value, 10) catch
                 return finish(&call, call.fail(.invalid_argument, "malformed connect-timeout-ms"));
@@ -358,7 +420,7 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         req.setTimeout(.none);
     }
 
-    if (is_get) call.get_message = getMessage(&call) catch |err| return finish(&call, err);
+    if (is_get) call.impl.get_message = getMessage(&call) catch |err| return finish(&call, err);
 
     var in_buf: [16 * 1024]u8 = undefined;
     var body = try req.reader(&in_buf);
@@ -428,7 +490,7 @@ fn getMessage(call: *Call) ![]const u8 {
         .identity;
     if (compression == .gzip and !features.compression) return call.fail(.unimplemented, "gzip is not built in");
     const base64 = if (query.get("base64")) |flag| std.mem.eql(u8, flag, "1") else false;
-    return decodeGetMessage(call.arena, query.get("message") orelse "", base64, compression, call.max_message_size) catch |err| switch (err) {
+    return decodeGetMessage(call.arena, query.get("message") orelse "", base64, compression, call.impl.max_message_size) catch |err| switch (err) {
         error.InvalidBase64 => call.fail(.invalid_argument, "message is not URL-safe base64"),
         else => |e| e,
     };
@@ -511,14 +573,14 @@ fn finish(call: *Call, result: anyerror!void) !void {
             call.status_message = unknown_error_message;
         },
     }
-    switch (call.protocol) {
+    switch (call.impl.protocol) {
         .grpc => {
             // Static text: the response keeps the slice, and HTTP/2 sends the
             // trailers from its writer task after this frame has returned.
             try call.res.trailer("grpc-status", statusText(call.status));
             if (call.status_message.len > 0) try call.res.trailer("grpc-message", try percentEncode(call.arena, call.status_message));
-            for (call.trailers.items) |t| try call.res.trailer(t.key, t.value);
-            if (call.out) |*o| {
+            for (call.impl.trailers.items) |t| try call.res.trailer(t.key, t.value);
+            if (call.impl.out) |*o| {
                 o.end() catch {};
             } else {
                 // Nothing streamed yet: the status goes out with an empty body.
@@ -531,9 +593,9 @@ fn finish(call: *Call, result: anyerror!void) !void {
             var block: std.ArrayList(u8) = .empty;
             try block.print(call.arena, "grpc-status:{d}\r\n", .{@backingInt(call.status)});
             if (call.status_message.len > 0) try block.print(call.arena, "grpc-message:{s}\r\n", .{try percentEncode(call.arena, call.status_message)});
-            for (call.trailers.items) |t| try block.print(call.arena, "{s}:{s}\r\n", .{ t.key, t.value });
+            for (call.impl.trailers.items) |t| try block.print(call.arena, "{s}:{s}\r\n", .{ t.key, t.value });
             try writeFrame(call, 0x80, block.items);
-            if (call.out) |*o| o.end() catch {};
+            if (call.impl.out) |*o| o.end() catch {};
         },
         .connect_stream => {
             var json: std.ArrayList(u8) = .empty;
@@ -541,10 +603,10 @@ fn finish(call: *Call, result: anyerror!void) !void {
             if (call.status != .ok) {
                 try json.print(call.arena, "\"error\":{{\"code\":\"{s}\",\"message\":{f}}}", .{ connectCode(call.status), std.json.fmt(call.status_message, .{}) });
             }
-            if (call.trailers.items.len > 0) {
+            if (call.impl.trailers.items.len > 0) {
                 if (call.status != .ok) try json.appendSlice(call.arena, ",");
                 try json.appendSlice(call.arena, "\"metadata\":{");
-                for (call.trailers.items, 0..) |t, i| {
+                for (call.impl.trailers.items, 0..) |t, i| {
                     if (i > 0) try json.appendSlice(call.arena, ",");
                     try json.print(call.arena, "{f}:[{f}]", .{ std.json.fmt(t.key, .{}), std.json.fmt(t.value, .{}) });
                 }
@@ -553,14 +615,14 @@ fn finish(call: *Call, result: anyerror!void) !void {
             try json.appendSlice(call.arena, "}");
             // End-of-stream message: flag 0x02, never compressed.
             try writeFrame(call, 0x02, json.items);
-            if (call.out) |*o| o.end() catch {};
+            if (call.impl.out) |*o| o.end() catch {};
         },
         .connect => {
-            for (call.trailers.items) |t| {
+            for (call.impl.trailers.items) |t| {
                 try call.res.header(try std.fmt.allocPrint(call.arena, "trailer-{s}", .{t.key}), t.value);
             }
             if (call.status == .ok) {
-                call.res.body = call.unary_response orelse "";
+                call.res.body = call.impl.unary_response orelse "";
             } else {
                 call.res.status = connectHttpStatus(call.status);
                 call.res.header("content-type", "application/json") catch {};
@@ -568,7 +630,7 @@ fn finish(call: *Call, result: anyerror!void) !void {
             }
         },
         .http_json => {
-            if (call.out) |*o| {
+            if (call.impl.out) |*o| {
                 // A server stream's array has started, under a 200: an error
                 // now can only cut it short, which the client sees as a
                 // reset stream (HTTP/2) or a body without its last chunk
@@ -579,17 +641,17 @@ fn finish(call: *Call, result: anyerror!void) !void {
                     log.warn("{s}: JSON stream cut short by {t}: {s}", .{ path, call.status, call.status_message });
                     return call.res.abort();
                 }
-                for (call.trailers.items) |t| try call.res.trailer(t.key, t.value);
+                for (call.impl.trailers.items) |t| try call.res.trailer(t.key, t.value);
                 try writeBytes(call, "]");
                 o.end() catch {};
             } else {
                 // Trailing metadata as headers, as grpc-gateway sends it.
-                for (call.trailers.items) |t| {
+                for (call.impl.trailers.items) |t| {
                     try call.res.header(try std.fmt.allocPrint(call.arena, "grpc-trailer-{s}", .{t.key}), t.value);
                 }
                 if (call.status == .ok) {
                     // A server stream that sent nothing is an empty array.
-                    call.res.body = call.unary_response orelse "[]";
+                    call.res.body = call.impl.unary_response orelse "[]";
                 } else {
                     call.res.status = connectHttpStatus(call.status);
                     call.res.body = try transcode.errorBody(call.arena, @backingInt(call.status), call.status_message);
@@ -622,9 +684,11 @@ pub fn serveTranscoded(
         .io = req.io,
         .ctx = ctx,
         .data = options.data,
-        .max_message_size = options.max_message_size,
-        .protocol = .http_json,
-        .codec = .json,
+        .impl = .{
+            .max_message_size = options.max_message_size,
+            .protocol = .http_json,
+            .codec = .json,
+        },
     };
     res.status = .ok;
     try res.header("content-type", "application/json");
@@ -661,11 +725,11 @@ fn transcodedRequest(comptime Req: type, comptime body: []const u8, call: *Call,
     if (body.len > 0) {
         var in_buf: [16 * 1024]u8 = undefined;
         var reader = try call.req.reader(&in_buf);
-        body_text = reader.interface.allocRemaining(call.arena, .limited(call.max_message_size + 1)) catch |err| switch (err) {
+        body_text = reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size + 1)) catch |err| switch (err) {
             error.StreamTooLong => return error.MessageTooLarge,
             else => |e| return e,
         };
-        if (body_text.len > call.max_message_size) return error.MessageTooLarge;
+        if (body_text.len > call.impl.max_message_size) return error.MessageTooLarge;
     }
     const query = if (std.mem.indexOfScalar(u8, call.req.url, '?')) |q| call.req.url[q + 1 ..] else "";
     var diag: transcode.Diagnostic = .{};
@@ -677,7 +741,7 @@ fn transcodedRequest(comptime Req: type, comptime body: []const u8, call: *Call,
 
 fn runTranscodedUnary(comptime M: type, comptime handler: anytype, comptime response_body: []const u8, call: *Call, request: M.Request) !void {
     const response = try handler(call, request);
-    call.unary_response = try transcode.encodeResponse(M.Response, call.arena, response, response_body);
+    call.impl.unary_response = try transcode.encodeResponse(M.Response, call.arena, response, response_body);
 }
 
 /// A server stream as one JSON array, sent element by element: `[` with
@@ -695,7 +759,7 @@ fn runTranscodedStream(comptime M: type, comptime handler: anytype, comptime res
             error.Canceled => return error.Canceled,
         };
         const json = try transcode.encodeResponse(M.Response, call.arena, message, response_body);
-        try writeBytes(call, try std.mem.concat(call.arena, u8, &.{ if (call.out == null) "[" else ",", json }));
+        try writeBytes(call, try std.mem.concat(call.arena, u8, &.{ if (call.impl.out == null) "[" else ",", json }));
     }
     try group.await(call.io);
     return handler_result;
@@ -738,35 +802,35 @@ fn percentEncode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader) !?Req {
-    const payload = switch (call.protocol) {
+    const payload = switch (call.impl.protocol) {
         .connect => blk: {
             // The whole body is the one message (Connect GET: the query's).
-            if (call.unary_read) return null;
-            call.unary_read = true;
-            if (call.get_message) |message| break :blk message;
-            break :blk body.interface.allocRemaining(call.arena, .limited(call.max_message_size + 1)) catch |err| switch (err) {
+            if (call.impl.unary_read) return null;
+            call.impl.unary_read = true;
+            if (call.impl.get_message) |message| break :blk message;
+            break :blk body.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size + 1)) catch |err| switch (err) {
                 error.StreamTooLong => return error.MessageTooLarge,
                 else => |e| return e,
             };
         },
         .grpc_web_text => blk: {
-            if (call.text_input == null) {
-                const text = body.interface.allocRemaining(call.arena, .limited(call.max_message_size *| 2 +| 4096)) catch |err| switch (err) {
+            if (call.impl.text_input == null) {
+                const text = body.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size *| 2 +| 4096)) catch |err| switch (err) {
                     error.StreamTooLong => return error.MessageTooLarge,
                     else => |e| return e,
                 };
-                call.text_input = .fixed(try decodeBase64Chunks(call.arena, text));
+                call.impl.text_input = .fixed(try decodeBase64Chunks(call.arena, text));
             }
-            const msg = (try frame.readMessage(&call.text_input.?, call.arena, call.max_message_size, call.request_compression)) orelse return null;
+            const msg = (try frame.readMessage(&call.impl.text_input.?, call.arena, call.impl.max_message_size, call.impl.request_compression)) orelse return null;
             break :blk msg.payload;
         },
         else => blk: {
-            const msg = (try frame.readMessage(&body.interface, call.arena, call.max_message_size, call.request_compression)) orelse return null;
+            const msg = (try frame.readMessage(&body.interface, call.arena, call.impl.max_message_size, call.impl.request_compression)) orelse return null;
             break :blk msg.payload;
         },
     };
-    if (payload.len > call.max_message_size) return error.MessageTooLarge;
-    switch (call.codec) {
+    if (payload.len > call.impl.max_message_size) return error.MessageTooLarge;
+    switch (call.impl.codec) {
         .proto => {
             var reader: std.Io.Reader = .fixed(payload);
             return Req.decode(&reader, call.arena) catch error.DecodeFailed;
@@ -806,7 +870,7 @@ fn decodeBase64Chunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
 pub const json_options: @import("protobuf").json.Options = .{ .emit_oneof_field_name = false };
 
 fn encodeMessage(comptime Msg: type, call: *Call, message: Msg) ![]const u8 {
-    switch (call.codec) {
+    switch (call.impl.codec) {
         .proto => {
             var encoded: std.Io.Writer.Allocating = .init(call.arena);
             try message.encode(&encoded.writer, call.arena);
@@ -818,11 +882,11 @@ fn encodeMessage(comptime Msg: type, call: *Call, message: Msg) ![]const u8 {
 
 fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
     const payload = try encodeMessage(Resp, call, message);
-    if (call.protocol == .connect) {
-        call.unary_response = payload;
+    if (call.impl.protocol == .connect) {
+        call.impl.unary_response = payload;
         return;
     }
-    const framed = try frame.encodeWithCompression(call.arena, payload, call.response_compression);
+    const framed = try frame.encodeWithCompression(call.arena, payload, call.impl.response_compression);
     try writeBytes(call, framed);
 }
 
@@ -852,14 +916,14 @@ fn writeFrame(call: *Call, flags: u8, payload: []const u8) !void {
 /// Response body bytes, base64-encoded for gRPC-Web text, starting the
 /// response with the first.
 fn writeBytes(call: *Call, bytes: []const u8) !void {
-    const data = if (call.protocol == .grpc_web_text) blk: {
+    const data = if (call.impl.protocol == .grpc_web_text) blk: {
         const enc = try call.arena.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
         break :blk std.base64.standard.Encoder.encode(enc, bytes);
     } else bytes;
-    try call.write_mutex.lock(call.io);
-    defer call.write_mutex.unlock(call.io);
-    if (call.out == null) call.out = try call.res.stream(&call.out_buf);
-    const out = &call.out.?;
+    try call.impl.write_mutex.lock(call.io);
+    defer call.impl.write_mutex.unlock(call.io);
+    if (call.impl.out == null) call.impl.out = try call.res.stream(&call.impl.out_buf);
+    const out = &call.impl.out.?;
     out.interface.writeAll(data) catch return out.err orelse error.WriteFailed;
     out.interface.flush() catch return out.err orelse error.WriteFailed;
 }

@@ -50,6 +50,9 @@ These defaults are enforced, not optional:
 - `nbf` and `iat` are checked when present. `iss`, `aud` (a string or an
   array) and `max_age_seconds` are checked when you set them in the policy.
 - An HMAC comparison runs in constant time.
+- An HMAC secret shorter than its hash (32 bytes for HS256, 48 for HS384,
+  64 for HS512, as RFC 7518 requires) verifies nothing: `verify` fails with
+  `error.WeakKey`, and `RequireJwt` answers 500 and logs the fix.
 
 The result, `Verified`, gives you the header and claims as JSON objects,
 plus `string("sub")` and `integer("exp")`. They live in the arena you pass,
@@ -69,6 +72,7 @@ go there), and refuses the request as RFC 6750 says:
 | A token that does not verify, or misses a required claim | 401, `error="invalid_token"` (expired ones also get an `error_description`) |
 | A token without the required scopes | 403, `error="insufficient_scope"` |
 | The keyring could not fetch the keys | 503, so the client keeps its token |
+| The HMAC key is shorter than its hash (`error.WeakKey`) | 500, and an error in the log |
 
 ```zig
 const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
@@ -92,13 +96,10 @@ without `RequireJwt`. For claims that are arrays or objects, or checks of
 your own, set `.hook = .{ .ptr = ..., .func = ... }`: it gets the whole
 `Verified` before the handler, and an error from it refuses the token.
 
-`.claims` lists string claims that must be present (`.required = true`
-refuses a token without one; by default `sub` is required). Each is also
-copied into `req.session` under its `key` (by default `sub` as `"jwt_sub"`)
-for this request only, and taken out again when the handler returns, so a
-session middleware in front never saves it into a cookie. Reading claims
-from the session is deprecated: use `claims` and `subject`. The copy into
-the session goes after 0.1.
+`.required_claims` lists string claims a token must carry; one without
+them gets 401 `invalid_token`. It is `&.{"sub"}` by default, so
+`anole.auth.subject(req)` is never null behind the middleware; `&.{}`
+requires none. Nothing from the token goes into `req.session`.
 
 ### Signing
 
@@ -124,15 +125,15 @@ services hold only a public key.
 `use: enc` keys. A key without `alg` gets the one its type implies: RSA gets
 RS256, P-256 gets ES256, P-384 gets ES384 and Ed25519 gets EdDSA.
 
-For a provider's `jwks_uri`, use `anole.auth.Keyring`. It fetches the set on
-first use, fetches it again after `ttl_seconds` (3600), and fetches it once
-more when a token names an unknown `kid`. Providers rotate keys, but those
+For a provider's `jwks_uri`, use `anole.auth.Keyring`. Give it the
+server's client, `app.client()` (or `anole.client(io)`), and the URL. It
+fetches the set on first use, fetches it again after `ttl_seconds` (3600),
+and fetches it once more when a token names an unknown `kid`. Providers rotate keys, but those
 extra fetches are at least `min_refresh_seconds` (60) apart, so bogus tokens
 can't make you hammer the provider.
 
 ```zig
-var client = anole.http.Client.init(gpa, io, .{});
-var keyring = anole.auth.Keyring.init(gpa, io, &client, "https://issuer.example/jwks.json");
+var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client(), "https://issuer.example/jwks.json");
 defer keyring.deinit();
 const v = try keyring.verify(req.arena, token, .{ .issuer = "https://issuer.example", .audience = "api" });
 ```
@@ -153,9 +154,8 @@ the ID-token checks of OIDC Core 3.1.3.7: signature, `iss`, `aud`, `exp`,
 You need a `Provider`, a `Keyring` on its `jwks_uri`, and a `RelyingParty`:
 
 ```zig
-var client = anole.http.Client.init(gpa, io, .{});
-const provider = anole.auth.oidc.Provider.google; // or: try Provider.discover(&client, gpa, issuer_url)
-var keyring = anole.auth.Keyring.init(gpa, io, &client, provider.jwks_uri);
+const provider = anole.auth.oidc.Provider.google; // or: try Provider.discover(gpa, app.client(), issuer_url)
+var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client(), provider.jwks_uri);
 const rp: anole.auth.oidc.RelyingParty = .{
     .provider = &provider,
     .client_id = google_client_id,         // from your configuration, never from source
@@ -190,7 +190,7 @@ const callback: anole.auth.oidc.Callback = .{
     .code = req.query.get("code") orelse return refuse(res),
     .state = req.query.get("state") orelse return refuse(res),
 };
-const id = rp.finish(req.arena, req.io, &app.client, callback, saved) catch |err| {
+const id = rp.finish(req.arena, req.io, anole.client(req), callback, saved) catch |err| {
     std.log.info("sign-in refused: {t}", .{err}); // StateMismatch, NonceMismatch, TokenRequestFailed, ...
     return refuse(res);
 };
@@ -253,7 +253,10 @@ expires the cookie when the handler cleared the session. In a handler, use
 16 entries, with no NUL bytes in keys or values.
 
 Pass `.key` for a sealed cookie, or `.store` for server-side sessions.
-`Config` also has `cookie_name` (`anole_session`), `ttl_seconds` (24 h,
+`init` returns an error union: in cookie mode it refuses to start without
+a key (`error.SessionKeyMissing`, with the fix in the log), so a forgotten
+key never gives cookies anyone could forge or read. `Config` also has
+`cookie_name` (`anole_session`), `ttl_seconds` (24 h,
 renewed by each response that carries the session) and `cookie_opts`
 (`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`). Chrome, Firefox and curl
 keep `Secure` cookies on `http://localhost`; anywhere else, serve over HTTPS.
@@ -270,13 +273,23 @@ There are three ways to keep sessions:
 
 A sealed cookie that was changed, renamed or has expired is no session.
 Make its key from 32 random bytes, keep it in your secret store, and give
-every node the same one.
+every node the same one. `anole.session.keyFromBase64` reads it from
+configuration (`openssl rand -base64 32` makes one); a missing key, or
+one of all zeros, is refused. For local development only,
+`anole.session.devKey(io)` makes a random key and logs a warning: sessions
+then end on every restart and differ between nodes.
+
+```zig
+const key = try anole.session.keyFromBase64(init.environ_map.get("SESSION_KEY") orelse return error.NoSessionKey);
+app.use(try anole.session.Middleware.init(.{ .key = key }));
+// local development: .{ .key = anole.session.devKey(app.io()) }
+```
 
 ```zig
 var mem = anole.session.MemoryStore.init(gpa, app.io()); // then .store = mem.store()
 const redis = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379 (docs/database.md)
 var rs: anole.session.RedisStore = .{ .client = redis, .gpa = gpa }; // keys "anole:session:<id>" with the TTL
-var sessions = anole.session.Middleware.init(.{ .store = rs.store() });
+var sessions = try anole.session.Middleware.init(.{ .store = rs.store() });
 ```
 
 A store is a vtable of `load`, `save` and `destroy` (`anole.session.Store`),
@@ -360,14 +373,20 @@ is `ak_` plus 256 random bits in base64url, 46 characters. Show the key to
 its owner once. Store only the digest, a SHA-256: the key is random, so a
 slow hash adds nothing.
 
-`apikey.Middleware` takes the key from `Authorization: Bearer ak_...` or
-`X-API-Key`, hashes it, and asks your lookup function for the owner. It
-answers 401 with `WWW-Authenticate: Bearer` when there is no owner. The
-handler reads the owner with `anole.auth.apikey.owner(req)` (from the
-request's locals). It is also in `req.session` as `"api_key_owner"` for that
-request only (taken out again when the handler returns, so a session
-middleware in front never saves it); that copy is deprecated and goes after
-0.1.
+`apikey.Middleware` takes the key from the request (`apikey.fromRequest`),
+hashes it, and asks your lookup function for the owner. It answers 401 with
+`WWW-Authenticate: Bearer` when there is no owner. The handler reads the
+owner with `anole.auth.apikey.owner(req)` (from the request's locals).
+
+The key can come in two headers:
+
+- `X-API-Key: <key>`, with any value: the header means nothing else, so
+  keys without the prefix (imported from another system) work there.
+- `Authorization: Bearer ak_...`, only with the `ak_` prefix. JWTs use the
+  same header (`RequireJwt`), and the prefix is what tells the two apart:
+  a bearer token without it is not an API key.
+
+When both are sent, the bearer form wins.
 
 ```zig
 fn lookup(ptr: ?*anyopaque, arena: std.mem.Allocator, digest: anole.auth.apikey.Digest) anyerror!?[]const u8 {
@@ -428,6 +447,7 @@ answers 429 with `Retry-After`.
 var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle_ms 300_000
 defer limiter.deinit();
 var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
+var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKey, .on_error = .deny });
 ```
 
 - `MemoryLimiter` is for one process. It holds at most `max_entries` keys,
@@ -445,11 +465,20 @@ Behind a proxy, set `.server = .{ .trusted_proxy_hops = 1 }` in the server
 options so that the address comes from `X-Forwarded-For`, or turn on the
 listener's `proxy_protocol`.
 Otherwise every client shares the proxy's bucket. To limit by something
-else, such as an account or an API key, set the middleware's
-`key: fn (req, buf: []u8) []const u8` field. `buf` is 128 bytes.
+else, such as an account or an API key, pass `.key`, a
+`fn (req: *anole.Request, buf: []u8) []const u8` that returns the key,
+written into `buf` (128 bytes) or pointing into the request:
 
-If the limiter fails, for example because Redis is down, the request is let
-through and a warning is logged.
+```zig
+fn byApiKey(req: *anole.Request, _: []u8) []const u8 {
+    return anole.auth.apikey.fromRequest(req) orelse "anonymous";
+}
+```
+
+If the limiter fails, for example because Redis is down, `.on_error`
+decides: `.allow` (the default) lets the request through, `.deny` answers
+503 Service Unavailable. A warning is logged either way. Deny where an
+unlimited burst costs more than an outage, such as a login.
 
 ## Try the example
 

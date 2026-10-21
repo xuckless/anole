@@ -29,14 +29,20 @@ pub const Url = struct {
     /// The text it was parsed from.
     raw: []const u8,
 
+    /// One host of `hosts`.
     pub const Host = struct {
         /// Percent-decoded, without IPv6 brackets.
         name: []const u8,
+        /// Null when the URL gives none: the connector's default port.
         port: ?u16 = null,
     };
 
+    /// One query parameter of `params`.
     pub const Param = struct { name: []const u8, value: []const u8 };
 
+    /// What `parse` fails with: text that is no URL (no scheme, a bad
+    /// percent escape, an unclosed IPv6 bracket), or a port that is not a
+    /// number up to 65535.
     pub const ParseError = error{ InvalidUrl, InvalidPort, OutOfMemory };
 
     /// Parses `text`; the result points into `text` and `arena`.
@@ -141,9 +147,11 @@ pub fn redacted(text: []const u8) Redacted {
     return .{ .text = text };
 }
 
+/// What `redacted` returns: print it with `{f}`.
 pub const Redacted = struct {
     text: []const u8,
 
+    /// Writes `text` with its password and password parameters as `***`.
     pub fn format(self: Redacted, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var text = self.text;
         var query: ?[]const u8 = null;

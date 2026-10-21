@@ -51,8 +51,11 @@ pub const WebSocket = struct {
     /// are buffered.
     batch: Batch = .{},
 
+    /// The largest message a socket accepts unless told otherwise: 16 MiB.
     pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
 
+    /// A frame's opcode. Handlers see `.text` and `.binary` messages, and
+    /// `.close` when the peer closes; pings are answered for them.
     pub const MessageType = enum(u4) {
         continuation = 0x0,
         text = 0x1,
@@ -63,15 +66,20 @@ pub const WebSocket = struct {
         _, // Allow unknown opcodes
     };
 
+    /// One whole message, reassembled from its fragments.
     pub const Message = struct {
         type: MessageType,
+        /// The payload, valid until the next receive.
         data: []const u8,
+        /// The peer's close code, for a `.close` message that has one.
         close_code: ?CloseCode = null,
         /// RSV1 was set (only with `rsv1_allowed`): `data` is still
         /// compressed, and a text message is not yet checked for UTF-8.
         compressed: bool = false,
     };
 
+    /// A close frame's status code (RFC 6455 §7.4); codes 3000-4999 are
+    /// free for applications.
     pub const CloseCode = enum(u16) {
         normal = 1000,
         going_away = 1001,
@@ -96,6 +104,8 @@ pub const WebSocket = struct {
         }
     };
 
+    /// Protocol violations a peer's frames can cause; the socket is
+    /// closed with the matching code.
     pub const Error = error{
         ReservedFlags,
         LargeControlFrame,
@@ -112,6 +122,8 @@ pub const WebSocket = struct {
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+    /// A socket over `transport`. Made by the server or the client on an
+    /// upgrade; not for handlers.
     pub fn init(io: std.Io, transport: Transport, gpa: std.mem.Allocator, seed: u64) WebSocket {
         return .{
             .io = io,

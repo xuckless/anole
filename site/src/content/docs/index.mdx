@@ -1,0 +1,104 @@
+---
+title: Backends in Zig, made easy
+description: A Zig library for building backends. REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3 from one server, with TLS, auth, databases and observability built in.
+template: splash
+editUrl: false
+hero:
+  title: Anole
+  tagline: Anole aims to make building a backend in Zig as easy as in Express, Fiber or Bun. One library for the whole backend, with sane defaults and one-line setup, so a solo developer can launch an app without assembling a stack first.
+  image:
+    file: ../../assets/icon.svg
+    alt: The Anole logo, a green lizard on an orange square
+  actions:
+    - text: Get started
+      link: /anole/getting-started/
+      icon: right-arrow
+    - text: API reference
+      link: /anole/api/
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/xuckless/anole
+      icon: github
+      variant: minimal
+---
+
+import { Aside, Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Pre-1.0">
+Anole is young and has no stable API yet: anything may change before 1.0. It
+needs Zig 0.17 and runs on Linux and macOS. See the
+[changelog](https://github.com/xuckless/anole/blob/main/CHANGELOG.md) for
+what has landed.
+</Aside>
+
+## Hello, World
+
+```zig title="src/main.zig"
+const std = @import("std");
+const anole = @import("anole");
+
+fn hello(_: *anole.Request, res: *anole.Response) !void {
+    res.body = "Hello, World!";
+}
+
+pub fn main(init: std.process.Init) !void {
+    var app = try anole.App.init(init.gpa, .{});
+    defer app.deinit();
+    app.get("/", hello);
+    try app.listen(":3000"); // HTTP/1.1 and HTTP/2; Ctrl-C drains and stops
+}
+```
+
+Add Anole with `zig fetch --save`, make `build.zig` one `addApp` call, then
+`zig build run`. Zig compiles every C library Anole uses, so there is nothing
+else to install. [Getting started](/anole/getting-started/) walks through it,
+then on to a JSON API, WebSockets, TLS, gRPC and deploying.
+
+## What's in the box
+
+<CardGrid>
+	<Card title="HTTP/1.1, HTTP/2 and HTTP/3" icon="rocket">
+		One router and one handler signature for every protocol. HTTP/2 on
+		nghttp2 (TLS and cleartext), HTTP/3 on ngtcp2 and nghttp3, with
+		graceful drain and zero-downtime restarts.
+	</Card>
+	<Card title="WebSocket and WebTransport" icon="random">
+		WebSocket over HTTP/1.1, HTTP/2 and HTTP/3 with one `Socket` type.
+		WebTransport sessions over HTTP/3, with streams and datagrams.
+	</Card>
+	<Card title="gRPC" icon="puzzle">
+		Services generated from `.proto` files, on the same router as REST.
+		Also answers gRPC-Web, Connect and JSON transcoding
+		(`google.api.http`). `protoc` is fetched by the build.
+	</Card>
+	<Card title="TLS on BoringSSL" icon="approve-check">
+		Bundled and compiled by Zig: ALPN, mutual TLS, hot certificate reload,
+		and the same TLS stack for the server and every client.
+	</Card>
+	<Card title="Auth" icon="seti:lock">
+		JWT with JWKS, OIDC sign-in, sessions, CSRF tokens, API keys, roles and
+		rate limits, as middleware you put on the routes that need it.
+	</Card>
+	<Card title="Databases" icon="seti:db">
+		PostgreSQL, SQLite, MongoDB and Redis behind one shape: rows as your
+		structs, request deadlines, pools per core, and opt-in request
+		coalescing and result caching.
+	</Card>
+	<Card title="Observability" icon="information">
+		Request IDs, access logs, Prometheus metrics, OpenTelemetry tracing
+		and health checks, one line each.
+	</Card>
+	<Card title="Only what you use" icon="setting">
+		Every bundled library sits behind a build flag. Turn a feature off and
+		it is never downloaded or compiled into your binary.
+	</Card>
+</CardGrid>
+
+## Read next
+
+<CardGrid>
+	<LinkCard title="Getting started" href="/anole/getting-started/" description="From zig init to a running JSON API and a deployment." />
+	<LinkCard title="From Fiber" href="/anole/from-fiber/" description="Fiber's API next to Anole's, for Go developers." />
+	<LinkCard title="The server" href="/anole/server/" description="Listeners, TLS, HTTP/2, HTTP/3, draining and restarts." />
+	<LinkCard title="API reference" href="/anole/api/" description="Every public declaration, generated from the source by Zig." />
+</CardGrid>

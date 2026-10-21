@@ -23,14 +23,15 @@
 //!     ...
 //!     try app.run();
 //!
-//! Everything dusty offers stays reachable: `app.router` is dusty's router,
-//! `app.server` dusty's server, and `anole.http` the whole of dusty.
+//! Everything the HTTP core offers stays reachable: `app.router` is its
+//! router, `app.server` its server, and `anole.http` the whole of it.
 const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
+const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
@@ -48,11 +49,11 @@ const webtransport_mod = if (features.http3) @import("webtransport.zig") else st
     pub const AcceptOptions = struct {};
 };
 const sqlite_mod = if (features.sqlite) @import("sqlite/root.zig") else struct {
-    pub const Db = void;
+    pub const Client = void;
 };
 const pg_mod = if (features.postgres) @import("pg/root.zig") else struct {
     pub const Options = struct {};
-    pub const Db = void;
+    pub const Client = void;
 };
 const mongodb_mod = if (features.mongodb) @import("mongodb/root.zig") else struct {
     pub const Options = struct {};
@@ -94,6 +95,9 @@ pub const ExecutorCount = @FieldType(@typeInfo(@TypeOf(zio.Runtime.init)).@"fn".
 /// over.
 threadlocal var server_on_thread: bool = false;
 
+/// `anole.ServerOptions`: everything `App.init` and `Server(Ctx).init`
+/// take. Every field has a default, so `.{}` is a working server (its
+/// listener named later by `listen` or `listenTls`).
 pub const Options = struct {
     /// The cleartext listener. When neither this nor `https` is set,
     /// 127.0.0.1:8080; with `https` set and this null, none: an HTTPS-only
@@ -173,19 +177,28 @@ pub const Options = struct {
     /// replaced by the fields above.
     server: http.ServerConfig = .{},
 
+    /// `Options.http`: a cleartext listener.
     pub const Http = struct {
+        /// The interface to bind: "127.0.0.1" (this machine), "0.0.0.0"
+        /// (every IPv4 interface), "::" (every IPv6 one).
         address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (see `addresses`).
         port: u16 = 8080,
         /// Cleartext HTTP/2 for clients that open with its preface, beside
         /// HTTP/1.1 on the same port.
         h2c: bool = features.http2,
+        /// Every connection starts with a PROXY protocol header (v1 or v2)
+        /// from a load balancer in front, which gives the client's real
+        /// address. Only for a port nothing else can reach.
         proxy_protocol: bool = false,
     };
 
+    /// `Options.http3`: HTTP/3 over QUIC beside the TLS listener.
     pub const Http3 = struct {
         /// The UDP address and port; `https`'s when null (the usual setup:
         /// one port number, over TCP and UDP).
         address: ?[]const u8 = null,
+        /// The UDP port; null for the TLS listener's.
         port: ?u16 = null,
         /// Advertise HTTP/3 to HTTP/1.1 and HTTP/2 clients (`Alt-Svc`), so
         /// browsers switch to it.
@@ -195,6 +208,7 @@ pub const Options = struct {
         /// Make every new client prove its address with a Retry first (one
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
+        /// How long a connection may sit idle before it is closed.
         idle_timeout_ms: u32 = 30_000,
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
@@ -223,13 +237,20 @@ pub const Options = struct {
         inline_no_wait: bool = true,
     };
 
+    /// `Options.https`: a TLS listener with HTTP/2 and HTTP/1.1 by ALPN.
     pub const Https = struct {
+        /// As `Http.address`.
         address: []const u8 = "127.0.0.1",
         port: u16 = 8443,
+        /// The certificate and key: `.fromFiles(...)`, `.fromPem(...)` or
+        /// `.dev_self_signed`.
         cert: Cert,
         /// "h2" and "http/1.1" when HTTP/2 is built in, else "http/1.1".
         alpn_protocols: ?[]const []const u8 = null,
+        /// Mutual TLS: ask clients for a certificate signed by these CAs
+        /// (`req.peerCertificate()` has it). Null: none asked for.
         client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+        /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
     };
 
@@ -242,7 +263,9 @@ pub const Options = struct {
         /// and `https`'s), at most 255 bytes, no ':'. Null: "http-<port>",
         /// "https-<port>", or "unix-<path>".
         name: ?[]const u8 = null,
+        /// As `Http.address`.
         address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (see `addresses`).
         port: u16 = 8080,
         /// A unix domain socket at this path instead of `address` and
         /// `port`. A socket file left behind by a server that is gone is
@@ -261,8 +284,10 @@ pub const Options = struct {
         /// advertised with `Alt-Svc` on this listener's responses. TLS
         /// listeners only, and one per server. Needs `-Dhttp3`.
         http3: bool = false,
+        /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
 
+        /// `Listener.tls`.
         pub const Tls = struct {
             /// Listeners that name the same certificate (the same files,
             /// the same PEM, `dev_self_signed`) share one copy of it.
@@ -270,10 +295,12 @@ pub const Options = struct {
             /// Offered by ALPN, in order. Null: "h2" and "http/1.1", those
             /// of the two the listener speaks.
             alpn_protocols: ?[]const []const u8 = null,
+            /// As `Https.client_auth`.
             client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
         };
     };
 
+    /// `anole.Cert`: where a TLS listener's certificate and key come from.
     pub const Cert = union(enum) {
         /// PEM text in memory, copied by `init`.
         pem: struct { cert: []const u8, key: []const u8 },
@@ -311,6 +338,7 @@ pub fn onlyOn(name: []const u8) OnlyOn {
     return .{ .name = name };
 }
 
+/// The middleware `onlyOn` returns.
 pub const OnlyOn = struct {
     name: []const u8,
 
@@ -320,6 +348,19 @@ pub const OnlyOn = struct {
     }
 };
 
+/// A server whose handlers share the state `Ctx`: `init(gpa, options,
+/// &state)`, and handlers `fn (state: *Ctx, req, res) !void` (or plain
+/// `(req, res)`). For no state, `App`.
+///
+///     var store: Store = .{ .gpa = init.gpa };
+///     var app = try anole.Server(Store).init(init.gpa, .{}, &store);
+///     defer app.deinit();
+///     app.get("/users/:id", getUser); // fn getUser(store: *Store, req, res) !void
+///     try app.listen(":3000");
+///
+/// A `Ctx` may also declare `notFound(self, req, res)`,
+/// `uncaughtError(self, req, res, err)` and `dispatch(self, action, req,
+/// res)` to take over those steps.
 pub fn Server(comptime Ctx: type) type {
     return ServerOf(Ctx, false);
 }
@@ -330,15 +371,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     comptime checkZioOptions();
     return struct {
         const Self = @This();
+        /// A handler as the router stores it: `fn (*Request, *Response)
+        /// anyerror!void`, with `*Ctx` first on a server with state.
         pub const Handler = http.Router(Ctx).Handler;
 
+        /// The allocator given to `init`.
         gpa: std.mem.Allocator,
+        /// The zio runtime the server owns; `io()` is its `std.Io`.
         rt: *zio.Runtime,
         /// Holds what the server points into for its whole life: the
         /// listeners, certificates and middleware copies. So `Self` can
         /// move after `init`.
         arena: *std.heap.ArenaAllocator,
+        /// The HTTP core's server underneath.
         server: *http.Server(Ctx),
+        /// The router the route methods add to, for what they do not
+        /// cover (`app.router.addRouteWith`).
         router: *http.Router(Ctx),
         stopped: *std.Io.Event,
         /// For hand-off: the process (args, environment), and the
@@ -955,6 +1003,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
+        /// Frees the server and everything it owns: the runtime, the
+        /// listeners, the middleware and helpers it made, and the database
+        /// connectors (closed last made, first). Call it after `run` (or
+        /// `listen`) has returned.
         pub fn deinit(self: *Self) void {
             const extras = self.extras;
             // First: it sends what is queued through the client, on the
@@ -1116,24 +1168,39 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return cache;
         }
 
+        /// Routes GET requests for `path` to `handler`; HEAD too, unless
+        /// `head` registers its own. `path` may have `:name` segments
+        /// (`req.params`) and end in `*name` (the rest of the path).
+        /// `handler` is `fn (req, res) !void` (`*Ctx` first on a server with
+        /// state), or wrapped in `anole.noWait` or `anole.cached`. Panics
+        /// when the route is already registered or conflicts with another.
+        ///
+        ///     app.get("/users/:id", getUser);
         pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .get, path, handler);
         }
+        /// As `get`, for HEAD.
         pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .head, path, handler);
         }
+        /// As `get`, for POST.
         pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .post, path, handler);
         }
+        /// As `get`, for PUT.
         pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .put, path, handler);
         }
+        /// As `get`, for PATCH.
         pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .patch, path, handler);
         }
+        /// As `get`, for DELETE.
         pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .delete, path, handler);
         }
+        /// As `get`, for OPTIONS. (`middleware.Cors` answers preflights
+        /// without one.)
         pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .options, path, handler);
         }
@@ -1141,6 +1208,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .query, path, handler);
         }
+        /// As `get`, for every method; a route for a specific method at a
+        /// path wins over it.
         pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, null, path, handler);
         }
@@ -1301,8 +1370,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// middleware come after its parent's.
         pub const Group = struct {
             server: *Self,
+            /// The core router's group underneath.
             inner: http.Router(Ctx).Group,
 
+            /// `Server.group`, nested: `prefix` after this group's, and
+            /// `middlewares` after its own.
             pub fn group(g: Group, prefix: []const u8, middlewares: anytype) Group {
                 return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
             }
@@ -1310,61 +1382,79 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn with(g: Group, middlewares: anytype) Group {
                 return g.group("", middlewares);
             }
+            /// `Server.get` under this group.
             pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .get, path, handler);
             }
+            /// `Server.head` under this group.
             pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .head, path, handler);
             }
+            /// `Server.post` under this group.
             pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .post, path, handler);
             }
+            /// `Server.put` under this group.
             pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .put, path, handler);
             }
+            /// `Server.patch` under this group.
             pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .patch, path, handler);
             }
+            /// `Server.delete` under this group.
             pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .delete, path, handler);
             }
+            /// `Server.options` under this group.
             pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .options, path, handler);
             }
+            /// `Server.query` under this group.
             pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .query, path, handler);
             }
+            /// `Server.any` under this group.
             pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, null, path, handler);
             }
+            /// `Server.ws` under this group.
             pub fn ws(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.wsWith(path, handler, .{});
             }
+            /// `Server.wsWith` under this group.
             pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
             }
+            /// `Server.wsCallbacks` under this group.
             pub fn wsCallbacks(g: Group, path: []const u8, comptime Handlers: type) void {
                 g.wsCallbacksWith(path, Handlers, .{});
             }
+            /// `Server.wsCallbacksWith` under this group.
             pub fn wsCallbacksWith(g: Group, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
             }
+            /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.webtransportWith(path, handler, .{});
             }
+            /// `Server.webtransportWith` under this group.
             pub fn webtransportWith(g: Group, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
                 if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
+            /// `Server.static` under this group.
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
                 g.inner.static(prefix, dir, opts);
             }
+            /// `Server.staticDir` under this group.
             pub fn staticDir(g: Group, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
                 g.inner.static(prefix, try g.server.openDir(path), opts);
             }
+            /// `Server.embedded` under this group.
             pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
                 g.inner.embedded(path, data, opts);
             }
@@ -1488,6 +1578,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return h;
         }
 
+        /// `metrics`' settings.
         pub const MetricsOptions = struct {
             /// Where Prometheus scrapes.
             path: []const u8 = "/metrics",
@@ -1526,6 +1617,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return h;
         }
 
+        /// `tracing`'s settings.
         pub const TracingOptions = struct {
             /// The collector's OTLP/HTTP base URL. Null: the
             /// `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (read
@@ -1537,8 +1629,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             sample_all: bool = true,
             /// Paths not traced.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Spans per export request.
             batch_size: usize = 256,
+            /// How often finished spans are sent, at the latest.
             interval_ms: u32 = 2000,
+            /// Spans held while waiting to be sent; past it, new ones are
+            /// dropped.
             queue_len: usize = 4096,
         };
 
@@ -1552,7 +1648,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.router.has_routes) @panic("app.tracing() adds a middleware, so it goes before the routes, with app.use()");
             const env = if (self.process) |p| p.environ else null;
             const e = try self.arena.allocator().create(observe.trace.Exporter);
-            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), &self.extras.client, .{
+            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), self.client(), .{
                 .endpoint = opts.endpoint orelse (if (env) |v| v.getPosix("OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
                 .service_name = opts.service_name orelse (if (env) |v| v.getPosix("OTEL_SERVICE_NAME") else null) orelse "anole",
                 .sample_all = opts.sample_all,
@@ -1578,15 +1674,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `app.health` (a ping behind `/readyz`) when the app has them,
         /// and it is closed with the server, after the drain. See
         /// `anole.pg`.
-        pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Db {
+        pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Client {
             if (comptime !features.postgres) @compileError("app.postgres needs PostgreSQL (-Dpostgres, on in the web and full profiles)");
             var opts = config;
             if (opts.environ == null) if (self.process) |p| {
                 opts.environ = p.environ;
             };
-            const d = try pg_mod.Db.init(self.gpa, self.rt.io(), opts);
+            const d = try pg_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer d.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Db, d));
+            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Client, d));
             return d;
         }
 
@@ -1600,7 +1696,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     state.db = try app.sqlite("app.db");
         ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout_ms = 10_000 });
-        pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Db {
+        pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
             if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
             const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {
                 .pointer => .{ .path = config },
@@ -1611,14 +1707,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 try p.init(self.rt, .{});
                 self.blocking_pool = p;
             }
-            const d = try sqlite_mod.Db.init(self.gpa, self.rt.io(), opts);
+            const d = try sqlite_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer d.deinit();
-            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Db, d));
+            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Client, d));
             return d;
         }
 
         /// A MongoDB client for the handlers, owned by the server:
-        /// `state.mongo = try app.mongodb(.{});` reads `MONGODB_URI` (or
+        /// `state.db = try app.mongodb(.{});` reads `MONGODB_URI` (or
         /// `options.url`), else mongodb://localhost:27017. It starts
         /// monitoring the servers at once; connections for calls open when
         /// a handler needs one. Once serving, it reports to `app.metrics`,
@@ -1631,14 +1727,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (opts.environ == null) if (self.process) |p| {
                 opts.environ = p.environ;
             };
-            const mongo = try mongodb_mod.Client.connect(self.gpa, self.rt.io(), opts);
+            const mongo = try mongodb_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer mongo.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(mongodb_mod.Client, mongo));
             return mongo;
         }
 
         /// A Redis or Valkey client for the handlers, owned by the server:
-        /// `state.cache = try app.redis(.{});` reads `REDIS_URL` (or
+        /// `state.redis = try app.redis(.{});` reads `REDIS_URL` (or
         /// `options.url`), else uses `redis://127.0.0.1:6379`. No
         /// connection opens before a handler needs one (unless
         /// `connect_at_start`). Once serving, it reports to `app.metrics`,
@@ -2018,7 +2114,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             const io_ = a.io();
             const alloc = std.testing.allocator;
             try a.waitReady();
-            var bundle = try tls.testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
+            var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
             defer bundle.deinit(alloc);
             // The certificate's DER: the bundle holds exactly it.
             const der = bundle.bytes.items;
@@ -2027,7 +2123,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             // HTTP/1.1, without a certificate and with one.
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/peer", .{port});
-            const ca: http.dusty_module.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
+            const ca: http.core.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
             {
                 var anon = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
                 defer anon.deinit();
@@ -2582,7 +2678,7 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
 
             // TLS, HTTP/1.1 only: a client that offers h2 alone does not
             // get it; one that offers both gets HTTP/1.1. No Alt-Svc.
-            const ca: http.dusty_module.TlsCa = .{ .pem = p.cert };
+            const ca: http.core.TlsCa = .{ .pem = p.cert };
             try std.testing.expect(std.meta.isError(h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h1tls,

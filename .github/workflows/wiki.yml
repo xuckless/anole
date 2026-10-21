@@ -1,0 +1,37 @@
+name: Wiki
+
+# The wiki is a copy of docs/: every push to main that changes a guide
+# regenerates the pages (tools/docs2wiki.py) and pushes them. Edits made in
+# the wiki itself are overwritten; change docs/ instead.
+on:
+  push:
+    branches: [main]
+    paths: [docs/**, tools/docs2wiki.py, .github/workflows/wiki.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Copy docs/ to the wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Regenerate and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" "$RUNNER_TEMP/wiki"
+          python3 -I tools/docs2wiki.py docs "$RUNNER_TEMP/wiki" "$GITHUB_SHA"
+          cd "$RUNNER_TEMP/wiki"
+          git add -A
+          if git diff --cached --quiet; then echo "wiki already current"; exit 0; fi
+          git -c user.name=xuckless -c user.email=xuckless@users.noreply.github.com \
+            commit -q -m "Guides from docs/ at ${GITHUB_SHA::7}"
+          git push -q origin HEAD

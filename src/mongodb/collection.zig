@@ -26,7 +26,7 @@ const Client = client_mod.Client;
 const Context = client_mod.Context;
 const Exchange = client_mod.Exchange;
 const Operation = client_mod.Operation;
-pub const CallError = client_mod.CallError;
+pub const Error = client_mod.Error;
 
 /// A database of a client: `client.db("app")`.
 pub const Database = struct {
@@ -34,11 +34,13 @@ pub const Database = struct {
     name: []const u8,
     options: db.QueryOptions = .{},
 
+    /// The collection `name` of this database, with the same options.
     pub fn collection(self: Database, name: []const u8) Collection {
         return .{ .client = self.client, .database = self.name, .name = name, .options = self.options };
     }
 
-    /// The calls with `opts` (a timeout of their own).
+    /// The calls with `opts`: a timeout of their own, and for reads
+    /// `coalesce` and `cache` (`anole.db.QueryOptions`).
     pub fn with(self: Database, opts: db.QueryOptions) Database {
         var out = self;
         out.options = opts;
@@ -48,19 +50,14 @@ pub const Database = struct {
     /// Runs `command` (a document: `.{ .ping = 1 }`, `.{ .collMod = "users", ... }`)
     /// on this database and returns the server's reply, in `c`'s arena. A
     /// reply with `ok: 0` fails as any call does.
-    pub fn runCommand(self: Database, c: anytype, command: anytype) CallError!bson.Document {
+    pub fn runCommand(self: Database, c: anytype, command: anytype) Error!bson.Document {
         var cx = client_mod.erase(c);
         var ctx: RunCommand(@TypeOf(command)) = .{ .command = command, .arena = cx.arena };
-        return self.client.execute(&cx, .{ .name = "command", .database = self.name, .kind = .command, .options = self.options }, &ctx);
-    }
-
-    /// `runCommand`, under the shared verb's name.
-    pub fn exec(self: Database, c: anytype, command: anytype) CallError!bson.Document {
-        return self.runCommand(c, command);
+        return client_mod.execute(self.client, &cx, .{ .name = "command", .database = self.name, .kind = .command, .options = self.options }, &ctx);
     }
 
     /// Drops the database.
-    pub fn drop(self: Database, c: anytype) CallError!void {
+    pub fn drop(self: Database, c: anytype) Error!void {
         _ = try self.runCommand(c, .{ .dropDatabase = 1 });
     }
 };
@@ -75,7 +72,8 @@ pub const Collection = struct {
 
     /// The calls with `opts`: `users.with(.{ .timeout = .fromSeconds(2) }).find(...)`.
     /// The timeout bounds the call (server selection, the pool, the round
-    /// trips) and goes to the server as `maxTimeMS`.
+    /// trips) and goes to the server as `maxTimeMS`; `coalesce` and
+    /// `cache` share or keep the reads (`anole.db.QueryOptions`).
     pub fn with(self: Collection, opts: db.QueryOptions) Collection {
         var out = self;
         out.options = opts;
@@ -89,22 +87,14 @@ pub const Collection = struct {
     // -----------------------------------------------------------------------
     // Reads
 
-    pub const find_options = .{
-        .{ "sort", "sort" },            .{ "projection", "projection" },       .{ "skip", "skip" },
-        .{ "limit", "limit" },          .{ "batch_size", "batchSize" },        .{ "hint", "hint" },
-        .{ "collation", "collation" },  .{ "comment", "comment" },             .{ "allow_disk_use", "allowDiskUse" },
-        .{ "let", "let" },              .{ "max", "max" },                     .{ "min", "min" },
-        .{ "return_key", "returnKey" }, .{ "show_record_id", "showRecordId" },
-    };
-
     /// Every document matching `filter`, as `T`s in `c`'s arena.
     /// Options: sort, projection, skip, limit, batch_size, hint, collation,
     /// comment, allow_disk_use, let, max, min, return_key, show_record_id.
-    pub fn find(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError![]T {
+    pub fn find(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error![]T {
         return self.client.cache.read([]T, c, self.options, "find", .{ self.database, self.name, filter, opts }, Shared(.find, T){ .collection = self });
     }
 
-    fn findNow(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError![]T {
+    fn findNow(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error![]T {
         var cx = client_mod.erase(c);
         var out: std.ArrayList(T) = .empty;
         var sink: AllSink(T) = .{ .arena = cx.arena, .out = &out };
@@ -114,16 +104,16 @@ pub const Collection = struct {
     }
 
     /// The first document matching `filter`; none: `error.NotFound` (a 404).
-    pub fn findOne(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!T {
+    pub fn findOne(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!T {
         return try self.findOptional(T, c, filter, opts) orelse error.NotFound;
     }
 
     /// The first document matching `filter`, or null.
-    pub fn findOptional(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!?T {
+    pub fn findOptional(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!?T {
         return self.client.cache.read(?T, c, self.options, "findOne", .{ self.database, self.name, filter, opts }, Shared(.find_optional, T){ .collection = self });
     }
 
-    fn findOptionalNow(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!?T {
+    fn findOptionalNow(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!?T {
         var cx = client_mod.erase(c);
         var out: std.ArrayList(T) = .empty;
         var sink: AllSink(T) = .{ .arena = cx.arena, .out = &out };
@@ -135,29 +125,23 @@ pub const Collection = struct {
     /// The matching documents one batch at a time, for results too large
     /// to hold at once: `while (try cursor.next()) |doc|`, then `deinit`.
     /// Each document is decoded into `c`'s arena.
-    pub fn iterate(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!Cursor(T) {
+    pub fn iterate(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!Cursor(T) {
         const cx = client_mod.erase(c);
         const body: FindBody(@TypeOf(filter), @TypeOf(opts)) = .{ .collection = self.name, .filter = filter, .opts = opts };
         return self.open(T, cx, "find", body, batchSizeOf(opts), .read);
     }
 
-    pub const aggregate_options = .{
-        .{ "allow_disk_use", "allowDiskUse" },                         .{ "batch_size", "batchSize" }, .{ "hint", "hint" },
-        .{ "collation", "collation" },                                 .{ "comment", "comment" },      .{ "let", "let" },
-        .{ "bypass_document_validation", "bypassDocumentValidation" },
-    };
-
     /// Runs the aggregation `pipeline` (a tuple of stages) and returns its
     /// documents as `T`s. A pipeline ending in `$out` or `$merge` writes,
     /// and is sent as a write (with the write concern, not retried).
-    pub fn aggregate(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) CallError![]T {
+    pub fn aggregate(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) Error![]T {
         // Shared only when the pipeline is known to read: a tuple of
         // stages whose last is neither `$out` nor `$merge`.
         if (comptime !readsOnly(@TypeOf(pipeline))) return self.aggregateNow(T, c, pipeline, opts);
         return self.client.cache.read([]T, c, self.options, "aggregate", .{ self.database, self.name, pipeline, opts }, Shared(.aggregate, T){ .collection = self });
     }
 
-    fn aggregateNow(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) CallError![]T {
+    fn aggregateNow(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) Error![]T {
         var cx = client_mod.erase(c);
         var out: std.ArrayList(T) = .empty;
         var sink: AllSink(T) = .{ .arena = cx.arena, .out = &out };
@@ -168,7 +152,7 @@ pub const Collection = struct {
     }
 
     /// `aggregate`, one document at a time (see `iterate`).
-    pub fn aggregateIterate(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) CallError!Cursor(T) {
+    pub fn aggregateIterate(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) Error!Cursor(T) {
         var cx = client_mod.erase(c);
         const stages = try encodePipeline(&cx, self.client, pipeline, self.name);
         const body: AggregateBody(@TypeOf(opts)) = .{ .collection = self.name, .pipeline = stages, .opts = opts };
@@ -177,7 +161,7 @@ pub const Collection = struct {
 
     /// How many documents match `filter` (an aggregation, as the drivers
     /// count). Options: skip, limit, hint, collation, comment.
-    pub fn countDocuments(self: Collection, c: anytype, filter: anytype, opts: anytype) CallError!u64 {
+    pub fn countDocuments(self: Collection, c: anytype, filter: anytype, opts: anytype) Error!u64 {
         comptime checkOptions(@TypeOf(opts), .{ .{ "skip", "" }, .{ "limit", "" }, .{ "hint", "hint" }, .{ "collation", "collation" }, .{ "comment", "comment" } });
         const Count = struct { n: i64 = 0 };
         const skip: ?i64 = if (@hasField(@TypeOf(opts), "skip")) opts.skip else null;
@@ -197,26 +181,26 @@ pub const Collection = struct {
 
     /// The collection's size from its metadata: fast, but it may be off
     /// after an unclean shutdown, and it ignores no filter.
-    pub fn estimatedDocumentCount(self: Collection, c: anytype) CallError!u64 {
+    pub fn estimatedDocumentCount(self: Collection, c: anytype) Error!u64 {
         return self.client.cache.read(u64, c, self.options, "count", .{ self.database, self.name }, Shared(.estimated_count, void){ .collection = self });
     }
 
-    fn estimatedDocumentCountNow(self: Collection, c: anytype) CallError!u64 {
+    fn estimatedDocumentCountNow(self: Collection, c: anytype) Error!u64 {
         var cx = client_mod.erase(c);
         var ctx: CountCmd = .{ .collection = self.name };
-        return self.client.execute(&cx, self.op("count", .read, .read), &ctx);
+        return client_mod.execute(self.client, &cx, self.op("count", .read, .read), &ctx);
     }
 
     /// The distinct values of `field` among the documents matching
     /// `filter`, as `T`s.
-    pub fn distinct(self: Collection, comptime T: type, c: anytype, field: []const u8, filter: anytype) CallError![]T {
+    pub fn distinct(self: Collection, comptime T: type, c: anytype, field: []const u8, filter: anytype) Error![]T {
         return self.client.cache.read([]T, c, self.options, "distinct", .{ self.database, self.name, field, filter }, Shared(.distinct, T){ .collection = self });
     }
 
-    fn distinctNow(self: Collection, comptime T: type, c: anytype, field: []const u8, filter: anytype) CallError![]T {
+    fn distinctNow(self: Collection, comptime T: type, c: anytype, field: []const u8, filter: anytype) Error![]T {
         var cx = client_mod.erase(c);
         var ctx: Distinct(T, @TypeOf(filter)) = .{ .collection = self.name, .key = field, .filter = filter, .arena = cx.arena };
-        return self.client.execute(&cx, self.op("distinct", .read, .read), &ctx);
+        return client_mod.execute(self.client, &cx, self.op("distinct", .read, .read), &ctx);
     }
 
     /// A read as `anole.db.QueryCache` makes it: the plain call, on the
@@ -227,7 +211,7 @@ pub const Collection = struct {
         return struct {
             collection: Collection,
 
-            pub fn run(r: @This(), c: anytype, _: []const u8, args: anytype) CallError!switch (verb) {
+            pub fn run(r: @This(), c: anytype, _: []const u8, args: anytype) Error!switch (verb) {
                 .find, .aggregate, .distinct => []T,
                 .find_optional => ?T,
                 .estimated_count => u64,
@@ -247,21 +231,24 @@ pub const Collection = struct {
     }
 
     // -----------------------------------------------------------------------
-    // The shared verbs (`anole.db`): `one`, `optional`, `all`, `iterate`.
+    // The shared verbs (`anole.db`): `one`, `optional`, `all`, and
+    // `iterate` above. The filter takes the place of the SQL, and `opts`
+    // that of its arguments.
 
-    /// `findOne`.
-    pub fn one(self: Collection, comptime T: type, c: anytype, filter: anytype) CallError!T {
-        return self.findOne(T, c, filter, .{});
+    /// `findOne`: the first document matching `filter`; none:
+    /// `error.NotFound` (a 404).
+    pub fn one(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!T {
+        return self.findOne(T, c, filter, opts);
     }
 
-    /// `findOptional`.
-    pub fn optional(self: Collection, comptime T: type, c: anytype, filter: anytype) CallError!?T {
-        return self.findOptional(T, c, filter, .{});
+    /// `findOptional`: the first document matching `filter`, or null.
+    pub fn optional(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!?T {
+        return self.findOptional(T, c, filter, opts);
     }
 
-    /// `find`.
-    pub fn all(self: Collection, comptime T: type, c: anytype, filter: anytype) CallError![]T {
-        return self.find(T, c, filter, .{});
+    /// `find`: every document matching `filter`.
+    pub fn all(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error![]T {
+        return self.find(T, c, filter, opts);
     }
 
     // -----------------------------------------------------------------------
@@ -271,21 +258,19 @@ pub const Collection = struct {
     /// A document without an `_id` (no such field, or a null one) gets a
     /// new ObjectId, which the result carries. A duplicate key fails with
     /// `error.Conflict` (a 409).
-    pub fn insertOne(self: Collection, c: anytype, doc: anytype) CallError!InsertOneResult {
+    pub fn insertOne(self: Collection, c: anytype, doc: anytype) Error!InsertOneResult {
         var cx = client_mod.erase(c);
         const ids = try cx.arena.alloc(?bson.ObjectId, 1);
         ids[0] = if (hasId(doc)) null else bson.ObjectId.generate(cx.io);
         var ctx: Insert(@TypeOf(doc)) = .{ .collection = self.name, .docs = (&doc)[0..1], .ids = ids, .ordered = true, .arena = cx.arena };
-        try self.client.execute(&cx, self.op("insert", .write, .write), &ctx);
+        try client_mod.execute(self.client, &cx, self.op("insert", .write, .write), &ctx);
         return .{ .inserted_id = ctx.first_id orelse .null };
     }
-
-    pub const insert_many_options = .{ .{ "ordered", "ordered" }, .{ "bypass_document_validation", "bypassDocumentValidation" }, .{ "comment", "comment" } };
 
     /// Inserts `docs` (a slice), in batches the server takes. Ordered by
     /// default: the first failure stops the rest. Options: ordered,
     /// bypass_document_validation, comment.
-    pub fn insertMany(self: Collection, c: anytype, docs: anytype, opts: anytype) CallError!InsertManyResult {
+    pub fn insertMany(self: Collection, c: anytype, docs: anytype, opts: anytype) Error!InsertManyResult {
         comptime checkOptions(@TypeOf(opts), insert_many_options);
         var cx = client_mod.erase(c);
         const ids = try cx.arena.alloc(?bson.ObjectId, docs.len);
@@ -304,35 +289,33 @@ pub const Collection = struct {
                 .out_ids = inserted_ids[start..],
                 .extra = encodeOptionsAlloc(cx.arena, opts, insert_many_options) catch return error.OutOfMemory,
             };
-            try self.client.execute(&cx, self.op("insert", .write, .write), &ctx);
+            try client_mod.execute(self.client, &cx, self.op("insert", .write, .write), &ctx);
             inserted += ctx.n;
             start += ctx.sent;
         }
         return .{ .inserted_count = inserted, .inserted_ids = inserted_ids };
     }
 
-    pub const update_options = .{ .{ "upsert", "upsert" }, .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" }, .{ "collation", "collation" } };
-
     /// Applies `update` (`.{ .@"$set" = .{ ... } }`, or a pipeline tuple) to
     /// the first document matching `filter`. Options: upsert,
     /// array_filters, hint, collation.
-    pub fn updateOne(self: Collection, c: anytype, filter: anytype, update: anytype, opts: anytype) CallError!UpdateResult {
+    pub fn updateOne(self: Collection, c: anytype, filter: anytype, update: anytype, opts: anytype) Error!UpdateResult {
         return self.updateImpl(c, filter, update, opts, false, .update);
     }
 
     /// `updateOne` for every matching document (not retried: a multi
     /// update is not a retryable write).
-    pub fn updateMany(self: Collection, c: anytype, filter: anytype, update: anytype, opts: anytype) CallError!UpdateResult {
+    pub fn updateMany(self: Collection, c: anytype, filter: anytype, update: anytype, opts: anytype) Error!UpdateResult {
         return self.updateImpl(c, filter, update, opts, true, .update);
     }
 
     /// Replaces the first document matching `filter` with `replacement`
     /// (which has no update operators). Options: upsert, hint, collation.
-    pub fn replaceOne(self: Collection, c: anytype, filter: anytype, replacement: anytype, opts: anytype) CallError!UpdateResult {
+    pub fn replaceOne(self: Collection, c: anytype, filter: anytype, replacement: anytype, opts: anytype) Error!UpdateResult {
         return self.updateImpl(c, filter, replacement, opts, false, .replace);
     }
 
-    fn updateImpl(self: Collection, c: anytype, filter: anytype, update: anytype, opts: anytype, multi: bool, kind: UpdateKind) CallError!UpdateResult {
+    fn updateImpl(self: Collection, c: anytype, filter: anytype, update: anytype, opts: anytype, multi: bool, kind: UpdateKind) Error!UpdateResult {
         comptime checkOptions(@TypeOf(opts), update_options);
         var cx = client_mod.erase(c);
         var ctx: Update(@TypeOf(filter), @TypeOf(update), @TypeOf(opts)) = .{
@@ -344,52 +327,44 @@ pub const Collection = struct {
             .kind = kind,
             .arena = cx.arena,
         };
-        return self.client.execute(&cx, self.op("update", .write, if (multi) .none else .write), &ctx);
+        return client_mod.execute(self.client, &cx, self.op("update", .write, if (multi) .none else .write), &ctx);
     }
 
-    pub const delete_options = .{ .{ "hint", "hint" }, .{ "collation", "collation" } };
-
     /// Deletes the first document matching `filter`. Options: hint, collation.
-    pub fn deleteOne(self: Collection, c: anytype, filter: anytype, opts: anytype) CallError!DeleteResult {
+    pub fn deleteOne(self: Collection, c: anytype, filter: anytype, opts: anytype) Error!DeleteResult {
         return self.deleteImpl(c, filter, opts, false);
     }
 
     /// Deletes every document matching `filter` (not retried).
-    pub fn deleteMany(self: Collection, c: anytype, filter: anytype, opts: anytype) CallError!DeleteResult {
+    pub fn deleteMany(self: Collection, c: anytype, filter: anytype, opts: anytype) Error!DeleteResult {
         return self.deleteImpl(c, filter, opts, true);
     }
 
-    fn deleteImpl(self: Collection, c: anytype, filter: anytype, opts: anytype, multi: bool) CallError!DeleteResult {
+    fn deleteImpl(self: Collection, c: anytype, filter: anytype, opts: anytype, multi: bool) Error!DeleteResult {
         comptime checkOptions(@TypeOf(opts), delete_options);
         var cx = client_mod.erase(c);
         var ctx: Delete(@TypeOf(filter), @TypeOf(opts)) = .{ .collection = self.name, .filter = filter, .opts = opts, .multi = multi };
-        return self.client.execute(&cx, self.op("delete", .write, if (multi) .none else .write), &ctx);
+        return client_mod.execute(self.client, &cx, self.op("delete", .write, if (multi) .none else .write), &ctx);
     }
-
-    pub const find_and_modify_options = .{
-        .{ "sort", "sort" },                  .{ "projection", "fields" }, .{ "upsert", "upsert" },
-        .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" },         .{ "collation", "collation" },
-        .{ "return_document", "" },           .{ "comment", "comment" },   .{ "let", "let" },
-    };
 
     /// Applies `update` to the first document matching `filter` and
     /// returns it, as it was (the default) or, with
     /// `.return_document = .after`, as it became; null when none matched.
-    pub fn findOneAndUpdate(self: Collection, comptime T: type, c: anytype, filter: anytype, update: anytype, opts: anytype) CallError!?T {
+    pub fn findOneAndUpdate(self: Collection, comptime T: type, c: anytype, filter: anytype, update: anytype, opts: anytype) Error!?T {
         return self.findAndModify(T, c, filter, update, opts, .update);
     }
 
     /// `findOneAndUpdate` with a whole replacement document.
-    pub fn findOneAndReplace(self: Collection, comptime T: type, c: anytype, filter: anytype, replacement: anytype, opts: anytype) CallError!?T {
+    pub fn findOneAndReplace(self: Collection, comptime T: type, c: anytype, filter: anytype, replacement: anytype, opts: anytype) Error!?T {
         return self.findAndModify(T, c, filter, replacement, opts, .replace);
     }
 
     /// Deletes the first document matching `filter` and returns it, or null.
-    pub fn findOneAndDelete(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!?T {
+    pub fn findOneAndDelete(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) Error!?T {
         return self.findAndModify(T, c, filter, {}, opts, .delete);
     }
 
-    fn findAndModify(self: Collection, comptime T: type, c: anytype, filter: anytype, update: anytype, opts: anytype, kind: ModifyKind) CallError!?T {
+    fn findAndModify(self: Collection, comptime T: type, c: anytype, filter: anytype, update: anytype, opts: anytype, kind: ModifyKind) Error!?T {
         comptime checkOptions(@TypeOf(opts), find_and_modify_options);
         var cx = client_mod.erase(c);
         var ctx: FindAndModify(T, @TypeOf(filter), @TypeOf(update), @TypeOf(opts)) = .{
@@ -400,43 +375,37 @@ pub const Collection = struct {
             .kind = kind,
             .arena = cx.arena,
         };
-        return self.client.execute(&cx, self.op("findAndModify", .write, .write), &ctx);
+        return client_mod.execute(self.client, &cx, self.op("findAndModify", .write, .write), &ctx);
     }
 
     // -----------------------------------------------------------------------
     // Indexes and the collection itself
-
-    pub const index_options = .{
-        .{ "name", "name" },                               .{ "unique", "unique" },                                     .{ "sparse", "sparse" },
-        .{ "expire_after_seconds", "expireAfterSeconds" }, .{ "partial_filter_expression", "partialFilterExpression" }, .{ "collation", "collation" },
-        .{ "hidden", "hidden" },                           .{ "weights", "weights" },                                   .{ "default_language", "default_language" },
-    };
 
     /// Creates an index on `keys` (`.{ .email = 1 }`, `.{ .created = -1 }`,
     /// `.{ .body = "text" }`) unless it exists, and returns its name (by
     /// default as the server would name it: "email_1"). Options: name,
     /// unique, sparse, expire_after_seconds, partial_filter_expression,
     /// collation, hidden, weights, default_language.
-    pub fn createIndex(self: Collection, c: anytype, keys: anytype, opts: anytype) CallError![]const u8 {
+    pub fn createIndex(self: Collection, c: anytype, keys: anytype, opts: anytype) Error![]const u8 {
         comptime checkOptions(@TypeOf(opts), index_options);
         var cx = client_mod.erase(c);
         const key_doc = try encodeDoc(&cx, self.client, keys, self.name);
         const name: []const u8 = if (@hasField(@TypeOf(opts), "name")) opts.name else try indexName(cx.arena, key_doc);
         var ctx: CreateIndex(@TypeOf(opts)) = .{ .collection = self.name, .keys = key_doc, .name = name, .opts = opts };
-        try self.client.execute(&cx, self.op("createIndexes", .write, .none), &ctx);
+        try client_mod.execute(self.client, &cx, self.op("createIndexes", .write, .none), &ctx);
         return name;
     }
 
     /// Drops the index named `name`.
-    pub fn dropIndex(self: Collection, c: anytype, name: []const u8) CallError!void {
+    pub fn dropIndex(self: Collection, c: anytype, name: []const u8) Error!void {
         _ = try self.dbHandle().runCommand(c, .{ .dropIndexes = self.name, .index = name });
     }
 
     /// Drops the collection; one that does not exist is no error.
-    pub fn drop(self: Collection, c: anytype) CallError!void {
+    pub fn drop(self: Collection, c: anytype) Error!void {
         var cx = client_mod.erase(c);
         var ctx: Drop = .{ .collection = self.name };
-        try self.client.execute(&cx, self.op("drop", .write, .none), &ctx);
+        try client_mod.execute(self.client, &cx, self.op("drop", .write, .none), &ctx);
     }
 
     fn dbHandle(self: Collection) Database {
@@ -447,36 +416,86 @@ pub const Collection = struct {
     // Cursors
 
     /// Runs a cursor command and reads every batch into `sink`.
-    fn drain(self: Collection, cx: *const Context, comptime name: []const u8, body: anytype, sink: anytype, batch_size: ?i64) CallError!void {
+    fn drain(self: Collection, cx: *const Context, comptime name: []const u8, body: anytype, sink: anytype, batch_size: ?i64) Error!void {
         return self.drainKind(cx, name, body, sink, batch_size, .read);
     }
 
-    fn drainKind(self: Collection, cx: *const Context, comptime name: []const u8, body: anytype, sink: anytype, batch_size: ?i64, kind: Operation.Retry) CallError!void {
+    fn drainKind(self: Collection, cx: *const Context, comptime name: []const u8, body: anytype, sink: anytype, batch_size: ?i64, kind: Operation.Retry) Error!void {
         var first: FirstBatch(@TypeOf(body), @TypeOf(sink)) = .{ .cmd = body, .sink = sink };
-        try self.client.execute(cx, self.op(name, if (kind == .write) .write else .read, kind), &first);
+        try client_mod.execute(self.client, cx, self.op(name, if (kind == .write) .write else .read, kind), &first);
         var state: CursorState = .{ .client = self.client, .database = self.database, .collection = self.name, .id = first.id, .server = first.server, .session = first.session, .batch_size = batch_size, .options = self.options };
         defer state.finish(cx);
         while (state.id != 0) {
             var more: GetMore(@TypeOf(sink)) = .{ .state = &state, .sink = sink };
-            try self.client.execute(cx, state.getMoreOp(), &more);
+            try client_mod.execute(self.client, cx, state.getMoreOp(), &more);
         }
     }
 
-    fn open(self: Collection, comptime T: type, cx: Context, comptime name: []const u8, body: anytype, batch_size: ?i64, kind: Operation.Retry) CallError!Cursor(T) {
+    fn open(self: Collection, comptime T: type, cx: Context, comptime name: []const u8, body: anytype, batch_size: ?i64, kind: Operation.Retry) Error!Cursor(T) {
         var cursor: Cursor(T) = .{ .cx = cx, .state = undefined };
         errdefer cursor.buf.deinit(self.client.gpa);
         var sink: RawSink = .{ .gpa = self.client.gpa, .buf = &cursor.buf };
         var first: FirstBatch(@TypeOf(body), *RawSink) = .{ .cmd = body, .sink = &sink };
-        try self.client.execute(&cursor.cx, self.op(name, if (kind == .write) .write else .read, kind), &first);
+        try client_mod.execute(self.client, &cursor.cx, self.op(name, if (kind == .write) .write else .read, kind), &first);
         cursor.state = .{ .client = self.client, .database = self.database, .collection = self.name, .id = first.id, .server = first.server, .session = first.session, .batch_size = batch_size, .options = self.options };
         cursor.it = (bson.Array{ .doc = .{ .bytes = cursor.buf.items } }).iterator();
         return cursor;
     }
 };
 
+// The options each call takes, as pairs of the Zig field name and the
+// command's: `opts` takes any of them (`.{ .sort = .{ .created = -1 },
+// .limit = 20 }`), or `.{}` for none; another field is a compile error
+// that lists these. An empty command name is handled by the call itself.
+
+/// The options `find`, `findOne`, `findOptional` and `iterate` take, and
+/// `all`, `one` and `optional`, which are the same calls.
+const find_options = .{
+    .{ "sort", "sort" },            .{ "projection", "projection" },       .{ "skip", "skip" },
+    .{ "limit", "limit" },          .{ "batch_size", "batchSize" },        .{ "hint", "hint" },
+    .{ "collation", "collation" },  .{ "comment", "comment" },             .{ "allow_disk_use", "allowDiskUse" },
+    .{ "let", "let" },              .{ "max", "max" },                     .{ "min", "min" },
+    .{ "return_key", "returnKey" }, .{ "show_record_id", "showRecordId" },
+};
+
+/// The options `aggregate` and `aggregateIterate` take (see
+/// `find_options`).
+const aggregate_options = .{
+    .{ "allow_disk_use", "allowDiskUse" },                         .{ "batch_size", "batchSize" }, .{ "hint", "hint" },
+    .{ "collation", "collation" },                                 .{ "comment", "comment" },      .{ "let", "let" },
+    .{ "bypass_document_validation", "bypassDocumentValidation" },
+};
+
+/// The options `insertMany` takes (see `find_options`).
+const insert_many_options = .{ .{ "ordered", "ordered" }, .{ "bypass_document_validation", "bypassDocumentValidation" }, .{ "comment", "comment" } };
+
+/// The options `updateOne`, `updateMany` and `replaceOne` take (see
+/// `find_options`).
+const update_options = .{ .{ "upsert", "upsert" }, .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" }, .{ "collation", "collation" } };
+
+/// The options `deleteOne` and `deleteMany` take (see `find_options`).
+const delete_options = .{ .{ "hint", "hint" }, .{ "collation", "collation" } };
+
+/// The options `findOneAndUpdate`, `findOneAndReplace` and
+/// `findOneAndDelete` take (see `find_options`); `return_document` is
+/// a `ReturnDocument`.
+const find_and_modify_options = .{
+    .{ "sort", "sort" },                  .{ "projection", "fields" }, .{ "upsert", "upsert" },
+    .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" },         .{ "collation", "collation" },
+    .{ "return_document", "" },           .{ "comment", "comment" },   .{ "let", "let" },
+};
+
+/// The options `createIndex` takes (see `find_options`).
+const index_options = .{
+    .{ "name", "name" },                               .{ "unique", "unique" },                                     .{ "sparse", "sparse" },
+    .{ "expire_after_seconds", "expireAfterSeconds" }, .{ "partial_filter_expression", "partialFilterExpression" }, .{ "collation", "collation" },
+    .{ "hidden", "hidden" },                           .{ "weights", "weights" },                                   .{ "default_language", "default_language" },
+};
+
 /// What `insertOne` returns: the inserted document's `_id` (an ObjectId
 /// unless the document brought its own), in the call's arena.
 pub const InsertOneResult = struct {
+    /// The document's `_id`.
     inserted_id: bson.Value,
 
     /// The id as an ObjectId, when it is one.
@@ -485,20 +504,28 @@ pub const InsertOneResult = struct {
     }
 };
 
+/// What `insertMany` returns, in the call's arena.
 pub const InsertManyResult = struct {
+    /// How many documents went in.
     inserted_count: u64,
     /// By the index of `docs`; `.null` for documents not inserted.
     inserted_ids: []bson.Value,
 };
 
+/// What `updateOne`, `updateMany` and `replaceOne` return.
 pub const UpdateResult = struct {
+    /// Documents that matched the filter.
     matched_count: u64,
+    /// Documents that changed (a match the update left as it was is not
+    /// counted).
     modified_count: u64,
     /// The new document's `_id` when an upsert inserted one.
     upserted_id: ?bson.Value = null,
 };
 
+/// What `deleteOne` and `deleteMany` return.
 pub const DeleteResult = struct {
+    /// Documents deleted.
     deleted_count: u64,
 };
 
@@ -516,11 +543,11 @@ pub fn Cursor(comptime T: type) type {
         it: @TypeOf(bson.Array.empty.iterator()) = (bson.Array.empty).iterator(),
 
         /// The next document, or null after the last.
-        pub fn next(self: *Self) CallError!?T {
+        pub fn next(self: *Self) Error!?T {
             while (true) {
                 if (self.it.next()) |v| {
                     if (v != .document) continue;
-                    return bson.decodeDocument(T, self.cx.arena, v.document, .{}) catch |err| self.cx.fail(self.state.client.error_map, .{
+                    return bson.decodeDocument(T, self.cx.arena, v.document, .{}) catch |err| self.cx.fail(self.state.client.errors, .{
                         .system = .mongodb,
                         .class = .other,
                         .message = if (err == error.MissingField) "a document lacks a field the struct has no default for" else "a document does not fit the struct it is read into",
@@ -530,7 +557,7 @@ pub fn Cursor(comptime T: type) type {
                 if (self.state.id == 0) return null;
                 var sink: RawSink = .{ .gpa = self.state.client.gpa, .buf = &self.buf };
                 var more: GetMore(*RawSink) = .{ .state = &self.state, .sink = &sink };
-                try self.state.client.execute(&self.cx, self.state.getMoreOp(), &more);
+                try client_mod.execute(self.state.client, &self.cx, self.state.getMoreOp(), &more);
                 self.it = (bson.Array{ .doc = .{ .bytes = self.buf.items } }).iterator();
             }
         }
@@ -586,19 +613,19 @@ const CursorState = struct {
             var fba: std.heap.FixedBufferAllocator = .init(&buf);
             var quiet: db.Ctx = .{ .io = cx.io, .arena = fba.allocator() };
             const quiet_cx = client_mod.erase(&quiet);
-            s.client.execute(&quiet_cx, op, &ctx) catch {};
+            client_mod.execute(s.client, &quiet_cx, op, &ctx) catch {};
             s.id = 0;
         }
-        if (s.session) |sess| s.client.giveSession(sess, cx.io);
+        if (s.session) |sess| client_mod.giveSession(s.client, sess, cx.io);
         s.session = null;
     }
 };
 
 // ---------------------------------------------------------------------------
-// The commands: each a context for `Client.execute` (`body`, `result`).
+// The commands: each a context for `client_mod.execute` (`body`, `result`).
 
 fn FindBody(comptime F: type, comptime O: type) type {
-    comptime checkOptions(O, Collection.find_options);
+    comptime checkOptions(O, find_options);
     return struct {
         collection: []const u8,
         filter: F,
@@ -608,7 +635,7 @@ fn FindBody(comptime F: type, comptime O: type) type {
         fn write(self: @This(), b: *bson.Builder) !void {
             try b.append("find", .{ .string = self.collection });
             try appendDocument(b, "filter", self.filter);
-            try appendOptions(b, self.opts, Collection.find_options);
+            try appendOptions(b, self.opts, find_options);
             if (self.one) {
                 if (!@hasField(O, "limit")) try b.append("limit", .{ .int32 = 1 });
                 try b.append("singleBatch", .{ .boolean = true });
@@ -618,7 +645,7 @@ fn FindBody(comptime F: type, comptime O: type) type {
 }
 
 fn AggregateBody(comptime O: type) type {
-    comptime checkOptions(O, Collection.aggregate_options);
+    comptime checkOptions(O, aggregate_options);
     return struct {
         collection: []const u8,
         pipeline: bson.Array,
@@ -630,7 +657,7 @@ fn AggregateBody(comptime O: type) type {
             try b.beginDocument("cursor");
             if (@hasField(O, "batch_size")) try bson.appendField(b, "batchSize", self.opts.batch_size, .{});
             try b.end();
-            try appendOptions(b, pickOptions(self.opts, .{ "allow_disk_use", "hint", "collation", "comment", "let", "bypass_document_validation" }), Collection.aggregate_options);
+            try appendOptions(b, pickOptions(self.opts, .{ "allow_disk_use", "hint", "collation", "comment", "let", "bypass_document_validation" }), aggregate_options);
         }
     };
 }
@@ -883,7 +910,7 @@ fn Update(comptime F: type, comptime U: type, comptime O: type) type {
             try appendDocument(b, "q", self.filter);
             try bson.appendField(b, "u", self.update, .{});
             if (self.multi) try b.append("multi", .{ .boolean = true });
-            try appendOptions(b, self.opts, Collection.update_options);
+            try appendOptions(b, self.opts, update_options);
             try b.end();
             try m.endSequence();
         }
@@ -922,7 +949,7 @@ fn Delete(comptime F: type, comptime O: type) type {
             try b.begin();
             try appendDocument(b, "q", self.filter);
             try b.append("limit", .{ .int32 = if (self.multi) 0 else 1 });
-            try appendOptions(b, self.opts, Collection.delete_options);
+            try appendOptions(b, self.opts, delete_options);
             try b.end();
             try m.endSequence();
         }
@@ -960,7 +987,7 @@ fn FindAndModify(comptime T: type, comptime F: type, comptime U: type, comptime 
                     try b.append("new", .{ .boolean = rd == .after });
                 }
             }
-            try appendOptions(b, self.opts, Collection.find_and_modify_options);
+            try appendOptions(b, self.opts, find_and_modify_options);
         }
 
         pub fn result(self: *@This(), _: *Exchange, reply: bson.Document) !?T {
@@ -987,7 +1014,7 @@ fn CreateIndex(comptime O: type) type {
             try b.beginDocument("");
             try b.append("key", .{ .document = self.keys });
             try b.append("name", .{ .string = self.name });
-            try appendOptions(b, pickOptions(self.opts, .{ "unique", "sparse", "expire_after_seconds", "partial_filter_expression", "collation", "hidden", "weights", "default_language" }), Collection.index_options);
+            try appendOptions(b, pickOptions(self.opts, .{ "unique", "sparse", "expire_after_seconds", "partial_filter_expression", "collation", "hidden", "weights", "default_language" }), index_options);
             try b.end();
             try b.end();
         }
@@ -1089,20 +1116,20 @@ fn batchSizeOf(opts: anytype) ?i64 {
 
 /// `pipeline` (a tuple of stages, or a `bson.Array`) as a BSON array in
 /// the arena, encoded once for every attempt.
-fn encodePipeline(cx: *const Context, client: *Client, pipeline: anytype, collection: []const u8) CallError!bson.Array {
+fn encodePipeline(cx: *const Context, client: *Client, pipeline: anytype, collection: []const u8) Error!bson.Array {
     if (@TypeOf(pipeline) == bson.Array) return pipeline;
     const doc = try encodeDoc(cx, client, .{ .p = pipeline }, collection);
     return switch (doc.get("p").?) {
         .array => |a| a,
-        else => cx.fail(client.error_map, .{ .system = .mongodb, .class = .other, .message = "a pipeline is a tuple of stages", .table = collection }),
+        else => cx.fail(client.errors, .{ .system = .mongodb, .class = .other, .message = "a pipeline is a tuple of stages", .table = collection }),
     };
 }
 
-fn encodeDoc(cx: *const Context, client: *Client, v: anytype, collection: []const u8) CallError!bson.Document {
+fn encodeDoc(cx: *const Context, client: *Client, v: anytype, collection: []const u8) Error!bson.Document {
     if (@TypeOf(v) == bson.Document) return v;
     const bytes = bson.encode(cx.arena, v, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => cx.fail(client.error_map, .{ .system = .mongodb, .class = .other, .message = "a value could not be encoded as BSON", .table = collection }),
+        else => cx.fail(client.errors, .{ .system = .mongodb, .class = .other, .message = "a value could not be encoded as BSON", .table = collection }),
     };
     return .{ .bytes = bytes };
 }
@@ -1211,7 +1238,7 @@ test "options: picked and appended under the command's names" {
     var b: bson.Builder = .init(testing.allocator);
     defer b.deinit();
     try b.begin();
-    try appendOptions(&b, .{ .batch_size = 5, .allow_disk_use = true }, Collection.find_options);
+    try appendOptions(&b, .{ .batch_size = 5, .allow_disk_use = true }, find_options);
     try b.end();
     const doc: bson.Document = .{ .bytes = b.bytes() };
     try testing.expectEqual(@as(i32, 5), doc.get("batchSize").?.int32);

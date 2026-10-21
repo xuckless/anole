@@ -14,8 +14,8 @@ for macOS and Linux.
 - The HTTP/1.1 server, router, middleware, client, WebSocket and HTTP/2
   engine, which came from lalinsky/dusty through Anole's fork, now live in
   `src/http/core` (MIT, attributed in every file and in THIRD_PARTY_NOTICES).
-  Anole no longer fetches a `dusty` package. The public API is unchanged:
-  `anole.http` is the core, `anole.http.dusty_module` still names it.
+  Anole no longer fetches a `dusty` package. `anole.http` is the core, and
+  `anole.http.core` the whole core module for what it does not re-export.
 - Its tests run in `zig build test` (`zig build dusty-test` is gone; `zig
   build core-test` runs them alone), on a certificate made at build time
   instead of a committed key, and its fuzz targets run with Anole's under
@@ -278,11 +278,6 @@ for macOS and Linux.
   that carry credentials unless `.authenticated`. `Cache-Control`'s
   `s-maxage` or `max-age` sets how long, `Vary` is honoured, and
   `invalidate(.all)` or `.{ .path }` reaches every executor at once.
-- Deprecated, removed after 0.1: reading `RequireJwt`'s claims from
-  `req.session` (`"jwt_sub"` and the `.claims` mapping's keys) and the API
-  key owner from `req.session.get("api_key_owner")`. Both are still set,
-  for the request only; use `anole.auth.claims`/`subject` and
-  `anole.auth.apikey.owner`.
 
 ### WebSockets
 
@@ -320,6 +315,9 @@ for macOS and Linux.
   A handler's own error reaches the client as UNKNOWN "Application error
   processing RPC" and is logged on the server, rather than sent by name.
   `Call.addHeader` returns `error.HeadersSent` once the response has started.
+  `Call.requestCompression()`, `protocol()` and `codec()` say how a call
+  came in; the server's own state is in `call.impl`, not part of the API.
+  `anole.grpc.Status` and `Code` are the one place for statuses.
 - gRPC-Web and Buf's Connect protocol on the same routes, including Connect's
   GET form for methods marked `NO_SIDE_EFFECTS`, and the `grpc.health.v1`
   service (`anole.grpc.Health`, one registry per instance).
@@ -352,10 +350,16 @@ for macOS and Linux.
   for mutual TLS from files or memory, and
   `insecure_skip_verify` for tests.
 - The HTTP/2 and HTTP/3 clients share their names (`ClientConnection`,
-  `Stream`, `Header`, `ConnectOptions`, `RequestOptions`, `StreamError`), a
-  `connect_timeout` and a per-request `timeout` that ends in
-  `error.Timeout`; `Stream.readError()` and `writeError()` say what a
-  `ReadFailed` or `WriteFailed` was.
+  `Stream`, `Header`, `ConnectOptions`, `RequestOptions`, `StreamError`,
+  `version()`), a `connect_timeout` and a per-request `timeout` that ends in
+  `error.Timeout`, and options of one name and type where they mean the
+  same (`stream_window` and `max_data`, both `u31`; the stream window's
+  default is 64 KiB over HTTP/2, which allocates it per stream, and 256 KiB
+  over HTTP/3). Options only one protocol has say so: HTTP/2's optional
+  `tls` (h2c without it) and `body_bytes`, HTTP/3's `idle_timeout` (a
+  `std.Io.Duration`), `session_cache`, `early_data`, `webtransport` and
+  `early`. `Stream.readError()` and `writeError()` say what a `ReadFailed`
+  or `WriteFailed` was.
 - Breaking: their `tls.root_ca` bundle is now `tls.ca` (an
   `anole.http.TlsCa`, the system store by default, where it trusted nothing
   before); `tls.certificate = .{ .cert_pem, .key_pem }` is
@@ -368,16 +372,37 @@ for macOS and Linux.
 
 ### Auth, state and limits
 
-- JWS/JWT verification with one pinned algorithm per key and JWKS keyrings
-  that fetch outside their lock, one fetch at a time; a bearer-token
+- JWS/JWT verification with one pinned algorithm per key (an HMAC secret
+  shorter than its hash verifies nothing, `error.WeakKey`) and JWKS
+  keyrings that fetch outside their lock, one fetch at a time; a bearer-token
   middleware (`anole.auth.RequireJwt`) with RFC 6750 errors, scopes and
-  claims handed to the handler; OIDC sign-in as a relying party (PKCE,
-  Google and Apple presets); CSRF tokens; Argon2id passwords, hashed on the
-  blocking pool when there is one; API keys; RBAC with roles from the
+  required claims (`required_claims`, `sub` by default), the verified token
+  handed to the handler through the request's locals (`claims`, `subject`),
+  never through the session; OIDC sign-in as a relying party (PKCE, Google
+  and Apple presets); CSRF tokens; Argon2id passwords, hashed on the
+  blocking pool when there is one; API keys from `X-API-Key` or
+  `Authorization: Bearer ak_...` (the prefix tells them from JWTs), their
+  owner in the locals (`apikey.owner`); RBAC with roles from the
   application's state.
-- Sessions in memory or Redis/Valkey, and sealed cookie sessions;
-  `anole.session.regenerate` issues a new session ID at sign-in.
-- Rate limiting with token buckets in memory or Redis and a 429 middleware.
+- The clients these use are the server's: `Keyring.init(gpa, io, client,
+  url)`, `oidc.Provider.discover(gpa, client, issuer)`,
+  `RelyingParty.finish(arena, io, client, ...)` and
+  `observe.trace.Exporter.init(gpa, io, client, options)` take the
+  `anole.Client` that `app.client()` and `anole.client(req)` return.
+- Sessions in memory or Redis/Valkey, and sealed cookie sessions
+  (`anole.session.Middleware`, the one session middleware;
+  `anole.middleware` has none); `anole.session.regenerate` issues a new
+  session ID at sign-in. A cookie session needs a key: `Middleware.init`
+  returns `error.SessionKeyMissing` for none or all zeros, there is no
+  default. `anole.session.keyFromBase64` reads one from configuration, and
+  `devKey(io)` makes a random one for development, with a warning. The
+  HTTP core's signed-cookie session (`anole.http.middleware.Session`)
+  refuses keys shorter than 32 bytes (`error.WeakSessionKey`).
+- Rate limiting with token buckets in memory or Redis and a 429 middleware:
+  `ratelimit.Middleware.init(limiter, .{ .limit, .window_ms, .burst, .key,
+  .on_error })`, counting by client address unless `.key` says otherwise,
+  and letting requests through (`.allow`, the default) or answering 503
+  (`.deny`) when the limiter's store fails.
 - `RedisStore` and `RedisLimiter` run on the Redis connector's pools
   (`app.redis`), with their options as before.
 - JSON on yyjson.
@@ -385,12 +410,17 @@ for macOS and Linux.
 ### Databases
 
 - One shape for every connector (`anole.db`, docs/database.md): the
-  handle lives in the App state, every call takes the request first (an
-  `anole.db.Ctx` outside a handler), and rows come back as your structs in
-  the request's arena, nothing to free. The verbs are shared: `exec`,
-  `one`, `optional`, `all`, `iterate`, `begin`, `transaction`, `acquire`,
-  and `with(.{ .timeout, .prepare, .coalesce, .cache })` for options per
-  call; each connector has the ones its database can do. A pool per
+  handle is each connector's `Client` (`anole.pg.Client`,
+  `anole.sqlite.Client`, `anole.mongodb.Client`, `anole.redis.Client`) and
+  lives in the App state, every call takes the request first (an
+  `anole.db.Ctx` outside a handler), rows come back as your structs in the
+  request's arena, nothing to free, and calls fail with the connector's
+  `Error`. The verbs are shared, and a verb means the same thing in every
+  connector: `exec` (rows changed), `one`, `optional`, `all`, `iterate`,
+  `begin` (a `Tx` whose `commit(req)` and `rollback(req)` take the request
+  like every other call), `transaction`, `acquire`, and
+  `with(.{ .timeout, .prepare, .coalesce, .cache })` for options per call;
+  each connector has the ones its database can do. A pool per
   executor, the connection limit split between them, so no lock is shared
   between threads. A request's deadline, a client gone or an HTTP/2 reset
   cancels its query (PostgreSQL is sent a CancelRequest, SQLite's statement
@@ -434,7 +464,9 @@ for macOS and Linux.
   are the official drivers', with the request first (`find`, `findOne`,
   `insertOne`, `updateMany`, `findOneAndUpdate`, `aggregate`, cursors,
   counts, `distinct`, indexes, `runCommand`), with filters, updates and
-  pipelines as Zig literals. MongoDB 4.2 and later. CI runs 7.0 on
+  pipelines as Zig literals; `one`, `optional` and `all` are `findOne`,
+  `findOptional` and `find` under the shared names, and `with` takes the
+  shared options on the client, a database or a collection. MongoDB 4.2 and later. CI runs 7.0 on
   ubuntu-latest, and 8.0 and 9.0 on ubuntu-22.04 only: they do not run on
   Linux kernels from 6.19 to 7.0.13 (SERVER-121912, SERVER-125742).
 - BSON (`anole.bson`, with `-Dmongodb`): documents checked once and then
@@ -463,12 +495,6 @@ for macOS and Linux.
   called when the waiting caller is canceled while its job runs (SQLite
   interrupts the statement there); a job whose caller was canceled before
   it started no longer starts.
-- Breaking: `anole.redis.Client.connect(gpa, io, .{ .host, .port })` is
-  `app.redis(.{ .url = ... })` (or `anole.redis.Client.init`), `close` is
-  `deinit`, and `command` takes the request (or an `anole.db.Ctx`) and a
-  tuple, `.{ "SET", key, value }`, instead of an allocator and a slice of
-  strings. `-Dredis-test-url` joins `-Dredis-test-port` for the live
-  tests.
 
 ### Observability
 
@@ -500,6 +526,14 @@ for macOS and Linux.
   everything, 1.1 MB minimal. Brotli adds about 0.8 MB (its encoder and the
   122 KB dictionary with its lookup tables), so `-Dbrotli=false` is the
   first flag to drop for a smaller binary that still compresses.
+- The public surface (what Zig's autodoc shows from `anole`) is the API
+  alone: the raw C bindings (nghttp2, ngtcp2, nghttp3, BoringSSL), the TLS
+  module the HTTP core runs on, test helpers, gRPC's wire modules
+  (`frame`, `status`, `metadata`, `deadline`) and the WebSocket layer over
+  HTTP/2 and HTTP/3 streams stay inside. `anole.compression` keeps its
+  zlib-ng, zstd and Brotli bindings, which are what it is for.
+  `anole.h2.version()`, `anole.h3.version()` and `anole.tls.version()` say
+  what a build links.
 
 ### Docs and examples
 

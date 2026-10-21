@@ -26,18 +26,28 @@ pub const Header = [2][]const u8;
 /// `Headers`.
 pub const max_inline_headers = 32;
 
+/// What `Client.fetch` sends: method, headers, body, and limits.
 pub const FetchOptions = struct {
+    /// GET by default.
     method: http.Method = .get,
+    /// Request headers as pairs, at most `max_inline_headers`.
     headers: []const Header = &.{},
+    /// The request body, sent as it is; null for none.
     body: ?[]const u8 = null,
     /// The whole exchange, redirects included; null takes the client's
     /// (none by default).
     timeout: ?std.Io.Timeout = null,
+    /// Redirects to follow; null takes the client's setting.
     max_redirects: ?u8 = null,
     /// Undo gzip, deflate or zstd on the response body.
     decompress: bool = true,
 };
 
+/// A handle on a server's outbound client (`anole.client(req)`,
+/// `app.client()`): cheap to copy, valid while the server lives. What the
+/// APIs that make requests take (`auth.Keyring`, `auth.oidc`,
+/// `observe.trace.Exporter`); a core client of your own fits as
+/// `.{ .http = &my_client }`.
 pub const Client = struct {
     /// dusty's client, for everything `fetch` does not cover (streamed
     /// bodies, WebSocket, Unix sockets).
@@ -63,14 +73,19 @@ pub const Client = struct {
     }
 };
 
+/// A response from `Client.fetch`: status and headers at once, the body
+/// read on demand. `deinit` it to hand the connection back.
 pub const Response = struct {
     /// dusty's response, for streaming the body (`reader`) and the rest.
-    inner: http.dusty_module.ClientResponse,
+    inner: http.core.ClientResponse,
 
+    /// The response's status.
     pub fn status(self: *const Response) http.Status {
         return self.inner.status();
     }
 
+    /// The first value of response header `name` (case-insensitive), or
+    /// null.
     pub fn header(self: *const Response, name: []const u8) ?[]const u8 {
         return self.inner.headers().get(name);
     }
@@ -121,6 +136,7 @@ pub fn register(entry: *const Entry) bool {
     return false;
 }
 
+/// Undoes `register`.
 pub fn unregister(entry: *const Entry) void {
     for (&registry) |*slot| {
         if (slot.cmpxchgStrong(entry, null, .acq_rel, .acquire) == null) return;

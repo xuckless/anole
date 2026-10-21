@@ -6,6 +6,7 @@ const dusty = @import("dusty");
 const c = @import("anole_nghttp2_c");
 const pb = @import("anole_test_pb");
 const grpc = @import("root.zig");
+const frame = @import("frame.zig");
 const features = @import("build_options");
 
 const Echo = pb.Echo(grpc.Call, anyerror);
@@ -121,7 +122,7 @@ const Client = struct {
             var enc: std.Io.Writer.Allocating = .init(gpa);
             defer enc.deinit();
             try m.encode(&enc.writer, gpa);
-            const framed = try grpc.frame.encodeWithCompression(gpa, enc.written(), compression);
+            const framed = try frame.encodeWithCompression(gpa, enc.written(), compression);
             defer gpa.free(framed);
             try body.writer.writeAll(framed);
         }
@@ -174,7 +175,7 @@ const Client = struct {
     fn responses(self: *Client, arena: std.mem.Allocator) ![]pb.EchoResponse {
         var list: std.ArrayList(pb.EchoResponse) = .empty;
         var r: std.Io.Reader = .fixed(self.data.items);
-        while (try grpc.frame.readMessage(&r, arena, 1 << 20, .gzip)) |m| {
+        while (try frame.readMessage(&r, arena, 1 << 20, .gzip)) |m| {
             var mr: std.Io.Reader = .fixed(m.payload);
             try list.append(arena, try pb.EchoResponse.decode(&mr, arena));
         }
@@ -365,7 +366,7 @@ fn http1(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, port: u16
 fn encodeReq(arena: std.mem.Allocator, req: pb.EchoRequest) ![]const u8 {
     var enc: std.Io.Writer.Allocating = .init(arena);
     try req.encode(&enc.writer, arena);
-    return grpc.frame.encode(arena, enc.written());
+    return frame.encode(arena, enc.written());
 }
 
 test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1.1" {
@@ -399,7 +400,7 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         try std.testing.expectEqual(@as(u16, 200), r.status);
         try std.testing.expectEqualStrings("application/grpc-web+proto", r.content_type);
         var reader: std.Io.Reader = .fixed(r.body);
-        const msg = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        const msg = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
         var mr: std.Io.Reader = .fixed(msg.payload);
         try std.testing.expectEqualStrings("web", (try pb.EchoResponse.decode(&mr, arena)).message);
         const rest = reader.buffered();
@@ -416,7 +417,7 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         var reader: std.Io.Reader = .fixed(try decodeChunks(arena, r.body));
         var count: usize = 0;
         while (reader.buffered().len > 0 and reader.buffered()[0] != 0x80) {
-            _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+            _ = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
             count += 1;
         }
         try std.testing.expectEqual(@as(usize, 3), count);
@@ -441,8 +442,8 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         const r = try http1(gpa, arena, io, port, "/anole.test.Echo/ServerStream", "application/connect+proto", try encodeReq(arena, .{ .message = "s", .repeat = 2 }));
         try std.testing.expectEqual(@as(u16, 200), r.status);
         var reader: std.Io.Reader = .fixed(r.body);
-        _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
-        _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        _ = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
+        _ = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
         const end = reader.buffered();
         try std.testing.expectEqual(@as(u8, 0x02), end[0]);
         try std.testing.expectEqualStrings("{}", end[5..]);
@@ -669,8 +670,8 @@ test "gRPC: generic UNKNOWN, initial metadata after the head, per-registration l
         // gzip, then base64.
         var enc: std.Io.Writer.Allocating = .init(arena);
         try (pb.EchoRequest{ .message = "squeezed" }).encode(&enc.writer, arena);
-        const framed = try grpc.frame.encodeWithCompression(arena, enc.written(), .gzip);
-        const gz = framed[grpc.frame.header_size..];
+        const framed = try frame.encodeWithCompression(arena, enc.written(), .gzip);
+        const gz = framed[frame.header_size..];
         const b64 = try arena.alloc(u8, std.base64.url_safe.Encoder.calcSize(gz.len));
         _ = std.base64.url_safe.Encoder.encode(b64, gz);
         // Padding, if any, percent-encoded.

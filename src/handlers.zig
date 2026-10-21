@@ -1,6 +1,6 @@
-//! Handler and middleware shapes `Server` takes beside dusty's own: a plain
-//! `(req, res)` handler on a server with state (adapted at comptime), and
-//! middleware written as a function rather than a struct.
+//! Handler and middleware shapes `Server` takes beside the HTTP core's own:
+//! a plain `(req, res)` handler on a server with state (adapted at
+//! comptime), and middleware written as a function rather than a struct.
 //!
 //!     fn requireKey(req: *anole.Request, _: *anole.Response, next: anole.Next) !void {
 //!         if (req.headers.get("X-Api-Key") == null) return error.Unauthorized;
@@ -55,6 +55,7 @@ pub fn noWait(comptime handler: anytype) NoWait(handler) {
     return .{};
 }
 
+/// The type `noWait` returns: a marker the route methods recognise.
 pub fn NoWait(comptime handler: anytype) type {
     if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function, not " ++ @typeName(@TypeOf(handler)));
     return struct {
@@ -79,6 +80,7 @@ pub fn cached(comptime options: ResponseCache.Options, comptime handler: anytype
     return .{};
 }
 
+/// The type `cached` returns: a marker the route methods recognise.
 pub fn Cached(comptime options: ResponseCache.Options, comptime handler: anytype) type {
     return struct {
         pub const cached_handler = handler;
@@ -86,6 +88,7 @@ pub fn Cached(comptime options: ResponseCache.Options, comptime handler: anytype
     };
 }
 
+/// Whether `T` is the type `cached` returns.
 pub fn isCached(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "cached_handler");
 }
@@ -105,6 +108,7 @@ pub const Next = struct {
     executor: *anyopaque,
     next_fn: *const fn (executor: *anyopaque) anyerror!void,
 
+    /// Runs the rest of the chain and returns its error, if any.
     pub fn call(self: Next) anyerror!void {
         return self.next_fn(self.executor);
     }
@@ -117,6 +121,8 @@ pub fn func(comptime f: anytype) Func(f) {
     return .{};
 }
 
+/// The middleware type `func` returns for `f`. A compile error when `f`
+/// does not take `anole.Next` last.
 pub fn Func(comptime f: anytype) type {
     const params = @typeInfo(@TypeOf(f)).@"fn".param_types;
     if (params.len != 3 and params.len != 4 or params[params.len - 1] != Next)

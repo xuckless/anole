@@ -52,7 +52,7 @@ const http_metrics = try anole.observe.metrics.HttpMetrics.init(&registry, .{
     .exclude = &anole.observe.probe_paths,
 });
 
-var exporter = try anole.observe.trace.Exporter.init(gpa, app.io(), &client, .{
+var exporter = try anole.observe.trace.Exporter.init(gpa, app.io(), app.client(), .{
     .endpoint = "http://127.0.0.1:4318",
     .service_name = "api",
 });

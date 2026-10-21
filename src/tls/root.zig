@@ -1,53 +1,55 @@
-//! TLS: BoringSSL (Apache-2.0) at 22a0079b, built by build/boringssl.zig, with
-//! bindings from the official translate-c package over src/tls/bssl.h.
+//! TLS on BoringSSL (-Dtls=boringssl). Most programs need nothing here:
+//! listeners take a certificate through `anole.Cert` (`.fromFiles`,
+//! `.fromPem`, `.dev_self_signed`) and the clients verify against the
+//! system store by default. What this namespace adds:
 //!
-//! `dusty_tls` is the module dusty uses for every HTTPS listener and every
-//! HTTPS/WSS client connection; `selfSigned` makes a development certificate
-//! in memory.
+//! - `selfSigned`: a fresh key and certificate in memory, for development
+//!   and tests;
+//! - `version` and `api_version`: what the build links.
 //!
-//! The smoke test below is the M1 BoringSSL proof: an in-memory TLS handshake
-//! between a client SSL and a server SSL over a BIO pair, with an ALPN select
-//! callback that prefers "h2" then "http/1.1". The server key and self-signed
-//! certificate are generated at run time and never touch the filesystem.
+//! Underneath, src/tls/dusty_tls.zig is the TLS module every HTTPS/WSS
+//! listener and client connection runs on.
+//!
+//! BoringSSL (Apache-2.0) is pinned at 22a0079b and built by
+//! build/boringssl.zig, with bindings from the official translate-c package
+//! over src/tls/bssl.h.
 const std = @import("std");
 
-/// The translated BoringSSL headers listed in bssl.h.
-pub const c = @import("anole_boringssl_c");
-
-/// dusty's `tls` module, on BoringSSL (src/tls/dusty_tls.zig).
-pub const dusty_tls = @import("anole_dusty_tls");
-
-/// Test helpers that other test binaries reuse.
-pub const testing = struct {
-    /// Full-duplex check of `dusty_tls` (also run multi-threaded by tests/tls_duplex.zig).
-    pub const duplex = @import("duplex_check.zig");
-
-    /// A CA bundle holding the first PEM certificate in `pem` (for a client
-    /// to trust a `selfSigned` server).
-    pub fn bundleFromPem(gpa: std.mem.Allocator, now_sec: i64, pem: []const u8) !std.crypto.Certificate.Bundle {
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        errdefer bundle.deinit(gpa);
-        const begin = "-----BEGIN CERTIFICATE-----";
-        const end = "-----END CERTIFICATE-----";
-        const start = (std.mem.indexOf(u8, pem, begin) orelse return error.NoCertificate) + begin.len;
-        const stop = std.mem.indexOfPos(u8, pem, start, end) orelse return error.NoCertificate;
-        var text: std.ArrayList(u8) = .empty;
-        defer text.deinit(gpa);
-        for (pem[start..stop]) |ch| if (ch != '\n' and ch != '\r') try text.append(gpa, ch);
-        const len = try std.base64.standard.Decoder.calcSizeForSlice(text.items);
-        const decoded_start: u32 = @intCast(bundle.bytes.items.len);
-        try bundle.bytes.ensureUnusedCapacity(gpa, len);
-        try std.base64.standard.Decoder.decode(bundle.bytes.unusedCapacitySlice()[0..len], text.items);
-        bundle.bytes.items.len += len;
-        try bundle.parseCert(gpa, decoded_start, now_sec);
-        return bundle;
-    }
-};
+// The translated BoringSSL headers listed in bssl.h, and the TLS module
+// the HTTP core runs on (src/tls/dusty_tls.zig); internal.
+const c = @import("anole_boringssl_c");
+const dusty_tls = @import("anole_dusty_tls");
+const testing = @import("testing.zig");
 
 test "TLS: one connection read and written at once (one executor, tasks interleaved)" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     try testing.duplex.run(std.testing.allocator, rt.io(), .{ .bytes_per_direction = 2 * 1024 * 1024 });
+}
+
+test "TLS: one connection read and written at once from different threads (4 pinned executors)" {
+    // A lost or reordered record shows up as a wrong byte, but a corrupted
+    // TLS state can also leave both sides waiting forever: fail instead.
+    const Watchdog = struct {
+        var done: std.atomic.Value(bool) = .init(false);
+        fn watch() void {
+            for (0..600) |_| {
+                if (done.load(.acquire)) return;
+                std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            }
+            std.debug.print("TLS full-duplex check: no progress after 60 s\n", .{});
+            std.process.exit(1);
+        }
+    };
+    Watchdog.done.store(false, .release);
+    const dog = try std.Thread.spawn(.{}, Watchdog.watch, .{});
+    defer {
+        Watchdog.done.store(true, .release);
+        dog.join();
+    }
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    for (0..3) |_| try testing.duplex.run(std.testing.allocator, rt.io(), .{});
 }
 
 test "TLS: an idle connection keeps no ciphertext buffer beyond its stash" {
@@ -59,9 +61,12 @@ test "TLS: an idle connection keeps no ciphertext buffer beyond its stash" {
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {
+    /// The certificate, PEM.
     cert: []u8,
+    /// The private key, PEM (PKCS#8).
     key: []u8,
 
+    /// Frees both, zeroing the key first.
     pub fn deinit(self: *Pem, gpa: std.mem.Allocator) void {
         gpa.free(self.cert);
         std.crypto.secureZero(u8, self.key);
@@ -70,11 +75,14 @@ pub const Pem = struct {
     }
 };
 
+/// What `selfSigned` makes. The defaults suit a server on this machine:
+/// localhost, 127.0.0.1 and ::1, valid for a week, a P-256 key.
 pub const SelfSignedOptions = struct {
     /// Subject CN, also the first DNS subjectAltName.
     common_name: []const u8 = "localhost",
     /// subjectAltName entries, in OpenSSL config syntax.
     alt_names: []const u8 = "DNS:localhost,IP:127.0.0.1,IP:::1",
+    /// How long the certificate is valid from now.
     valid_for_seconds: i64 = 7 * 24 * 3600,
     /// P-256 is fast to make and to use; RSA-4096 is the heaviest key a
     /// handshake meets in practice (and takes a second or more to make).
@@ -83,7 +91,13 @@ pub const SelfSignedOptions = struct {
 
 /// A fresh key and a self-signed certificate for it, for development
 /// and tests: nothing touches the disk. The certificate is its own CA
-/// (`CA:TRUE`), so a client can trust it directly.
+/// (`CA:TRUE`), so a client can trust it directly. Free it with
+/// `Pem.deinit`. A listener that only needs one can name
+/// `.dev_self_signed` instead.
+///
+///     var pem = try anole.tls.selfSigned(gpa, .{});
+///     defer pem.deinit(gpa);
+///     // .https = .{ .cert = .fromPem(pem.cert, pem.key) }
 pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
     c.ERR_clear_error();
     defer c.ERR_clear_error();
@@ -174,13 +188,14 @@ fn toPem(gpa: std.mem.Allocator, x: ?*c.X509, pkey: ?*c.EVP_PKEY) ![]u8 {
 /// BORINGSSL_API_VERSION from base.h of the pinned tree.
 pub const api_version: c_int = c.BORINGSSL_API_VERSION;
 
-/// OpenSSL_version(OPENSSL_VERSION): "BoringSSL".
-pub fn versionText() []const u8 {
+/// The TLS library this build links: "BoringSSL" (it has no version
+/// numbers; `api_version` tells builds apart).
+pub fn version() []const u8 {
     return std.mem.span(c.OpenSSL_version(c.OPENSSL_VERSION));
 }
 
 test "BoringSSL identifies itself" {
-    try std.testing.expectEqualStrings("BoringSSL", versionText());
+    try std.testing.expectEqualStrings("BoringSSL", version());
     try std.testing.expect(api_version > 0);
 }
 
@@ -282,6 +297,10 @@ fn step(ssl: *c.SSL, side: Side) !bool {
     return sslFail("SSL_do_handshake");
 }
 
+// The M1 BoringSSL proof: an in-memory TLS handshake between a client SSL
+// and a server SSL over a BIO pair, with an ALPN select callback that
+// prefers "h2" then "http/1.1". The server key and self-signed certificate
+// are generated at run time and never touch the filesystem.
 test "BoringSSL smoke: in-memory TLS 1.3/1.2 handshakes negotiate ALPN h2; TLS 1.1 refused" {
     const kc = try makeKeyAndCert();
     defer c.X509_free(kc.cert);
@@ -358,7 +377,7 @@ fn handshake(client_ctx: *c.SSL_CTX, server_ctx: *c.SSL_CTX, client_max: ?u16) !
     const server_alpn_got = if (proto_len == 0) "" else proto[0..proto_len];
 
     const verify = c.SSL_get_verify_result(client);
-    const version = std.mem.span(c.SSL_get_version(client));
+    const tls_version = std.mem.span(c.SSL_get_version(client));
     const cipher = std.mem.span(c.SSL_CIPHER_get_name(c.SSL_get_current_cipher(client)));
 
     // Round-trip application data in both directions.
@@ -376,7 +395,7 @@ fn handshake(client_ctx: *c.SSL_CTX, server_ctx: *c.SSL_CTX, client_max: ?u16) !
         \\handshake ok in {d} rounds: {s} {s}
         \\  alpn client={s} server={s}
         \\  verify_result={d} (0 = X509_V_OK), app data ping/pong ok
-    , .{ rounds, version, cipher, client_alpn_got, server_alpn_got, verify });
+    , .{ rounds, tls_version, cipher, client_alpn_got, server_alpn_got, verify });
 
     if (!std.mem.eql(u8, client_alpn_got, "h2") or !std.mem.eql(u8, server_alpn_got, "h2")) return error.AlpnNotH2;
     if (verify != c.X509_V_OK) return error.VerifyFailed;
@@ -775,11 +794,11 @@ test "TLS hello: a returning client resumes its session with a ticket" {
             return 1; // keeps the reference
         }
 
-        fn run(port: u16, version: u16) !void {
+        fn run(port: u16, tls_version: u16) !void {
             const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
             defer c.SSL_CTX_free(ctx);
-            _ = c.SSL_CTX_set_min_proto_version(ctx, version);
-            _ = c.SSL_CTX_set_max_proto_version(ctx, version);
+            _ = c.SSL_CTX_set_min_proto_version(ctx, tls_version);
+            _ = c.SSL_CTX_set_max_proto_version(ctx, tls_version);
             // Client sessions reach the callback only with a client cache
             // mode set.
             _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
@@ -848,11 +867,11 @@ test "TLS hello: a certificate reload serves the new certificate, and tickets fr
         }
     };
 
-    for ([_]u16{ c.TLS1_3_VERSION, c.TLS1_2_VERSION }) |version| {
+    for ([_]u16{ c.TLS1_3_VERSION, c.TLS1_2_VERSION }) |tls_version| {
         const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
         defer c.SSL_CTX_free(ctx);
-        _ = c.SSL_CTX_set_min_proto_version(ctx, version);
-        _ = c.SSL_CTX_set_max_proto_version(ctx, version);
+        _ = c.SSL_CTX_set_min_proto_version(ctx, tls_version);
+        _ = c.SSL_CTX_set_max_proto_version(ctx, tls_version);
         _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
         c.SSL_CTX_sess_set_new_cb(ctx, Client.onNewSession);
         defer if (Client.latest) |sess| {

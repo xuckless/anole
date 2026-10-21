@@ -225,7 +225,7 @@ lives until the call ends.
 | `call.cancelled()` | The client went away, or the deadline passed. |
 | `call.state(T)` | The `Server(T)` application state. |
 | `call.data` | `RegisterOptions.data` of the registration, or null. |
-| `call.request_compression`, `call.protocol`, `call.codec` | How the request came in. |
+| `call.requestCompression()`, `call.protocol()`, `call.codec()` | How the request came in: `.identity` or `.gzip`; an `anole.grpc.Protocol` (`.grpc`, `.grpc_web`, `.grpc_web_text`, `.connect`, `.connect_stream`, `.http_json`); `.proto` or `.json`. |
 
 In a streaming handler, add headers before the first `putOne`: the writer
 task sends the response head with the first message, and once it has,
@@ -391,7 +391,7 @@ curl -d '{"title":"Dune"}' 'http://localhost:8083/v1/shelves/s1/books?bookId=dun
 `register` adds these routes beside the gRPC one, for HTTP/1.1 and HTTP/2,
 from the annotations zig-protobuf keeps in the generated code: there is no
 protoc plugin to run. `registerWith(..., .{ .transcode = false })` leaves
-them out. The handlers are the same; `call.protocol` is `.http_json`.
+them out. The handlers are the same; `call.protocol()` is `.http_json`.
 
 The rules are checked at compile time: the template's syntax, that each path
 variable names a single field of a primitive type (a string, number, bool,

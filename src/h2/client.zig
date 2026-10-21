@@ -30,8 +30,13 @@ const dusty = @import("dusty");
 const placement = dusty.placement;
 const Deadline = dusty.Deadline;
 
+/// A header field: request fields (pseudo-headers first, lower-case
+/// names) and the response's `headers` and `trailers`.
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+/// Where and how `ClientConnection.connect` connects. `host` and `port`
+/// are required; the rest has defaults. The fields mean the same as in
+/// `anole.h3.ConnectOptions`, except where a field says it is HTTP/2's own.
 pub const ConnectOptions = struct {
     /// The server's name (for TLS: SNI and certificate checks) or address.
     host: []const u8,
@@ -39,10 +44,16 @@ pub const ConnectOptions = struct {
     /// Connect here instead of resolving `host`.
     address: ?std.Io.net.IpAddress = null,
     /// TLS with ALPN "h2"; null for cleartext HTTP/2 (prior knowledge).
+    /// HTTP/2 only: HTTP/3 always runs over TLS, so its `tls` is not
+    /// optional.
     tls: ?Tls = null,
-    /// Bytes a stream may receive before the reader takes them; also the
-    /// size of each stream's receive queue.
+    /// Bytes the server may send on a stream before its reader takes them.
+    /// 64 KiB here (256 KiB over HTTP/3) because each HTTP/2 stream
+    /// allocates a receive queue of this size up front, where HTTP/3's
+    /// grows as data arrives.
     stream_window: u31 = 64 * 1024,
+    /// The same for the whole connection.
+    max_data: u31 = 16 * 1024 * 1024,
     /// For `connect`: the TCP connection and the TLS handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -64,11 +75,15 @@ pub const ConnectOptions = struct {
         /// Accept any certificate, for any name. For tests only.
         insecure_skip_verify: bool = false,
 
+        /// The system store, a file, a directory, PEM in memory, or none.
         pub const Ca = dusty.TlsCa;
+        /// A certificate and key, as files or PEM.
         pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
+/// Connection-level failures. `NoH2`: the TLS server did not pick "h2"
+/// by ALPN.
 pub const Error = error{ ConnectionClosed, StreamReset, NoH2, OutOfMemory, Unexpected };
 
 /// Why a stream ended early: what `waitHead` returns, and what `readError`
@@ -89,6 +104,9 @@ fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     return .{ .duration = .{ .raw = d, .clock = .awake } };
 }
 
+/// An HTTP/2 client connection: `connect`, then `request` once per
+/// request (concurrent ones share the connection, and several tasks may
+/// make them at once), and `close`. See the file's example.
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -100,6 +118,8 @@ pub const ClientConnection = struct {
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     stream_window: u31,
+    /// The connection's receive window (`ConnectOptions.max_data`).
+    max_data: u31,
     /// The default for `RequestOptions.timeout`.
     timeout: std.Io.Timeout,
 
@@ -152,7 +172,7 @@ pub const ClientConnection = struct {
             r = &owned.tls_reader.interface;
             w = &owned.tls_writer.interface;
         }
-        return start(gpa, io, socket, owned, r, w, opts.stream_window, timeoutFrom(opts.timeout));
+        return start(gpa, io, socket, owned, r, w, opts.stream_window, opts.max_data, timeoutFrom(opts.timeout));
     }
 
     /// Takes over a connection on which the TLS handshake picked "h2", as
@@ -162,7 +182,8 @@ pub const ClientConnection = struct {
     /// closed; the caller closes it, and frees the TLS state, after
     /// `close`. Requests have no timeout unless they ask for one.
     pub fn adopt(gpa: std.mem.Allocator, io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer, socket: std.Io.net.Stream) !*ClientConnection {
-        return start(gpa, io, socket, null, reader, writer, 64 * 1024, .none);
+        const defaults: ConnectOptions = .{ .host = "", .port = 0 };
+        return start(gpa, io, socket, null, reader, writer, defaults.stream_window, defaults.max_data, .none);
     }
 
     fn dial(io: std.Io, opts: ConnectOptions) !std.Io.net.Stream {
@@ -206,6 +227,7 @@ pub const ClientConnection = struct {
         r: *std.Io.Reader,
         w: *std.Io.Writer,
         stream_window: u31,
+        max_data: u31,
         timeout: std.Io.Timeout,
     ) !*ClientConnection {
         const self = try gpa.create(ClientConnection);
@@ -218,6 +240,7 @@ pub const ClientConnection = struct {
             .r = r,
             .w = w,
             .stream_window = stream_window,
+            .max_data = max_data,
             .timeout = timeout,
         };
         try self.initSession();
@@ -250,7 +273,7 @@ pub const ClientConnection = struct {
         };
         if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, &iv, iv.len) != 0) return error.OutOfMemory;
         // A connection window big enough for several busy streams.
-        _ = c.nghttp2_session_set_local_window_size(self.session, c.NGHTTP2_FLAG_NONE, 0, 1 << 24);
+        _ = c.nghttp2_session_set_local_window_size(self.session, c.NGHTTP2_FLAG_NONE, 0, self.max_data);
     }
 
     /// Sends GOAWAY, waits for the reader and writer, and frees everything
@@ -312,6 +335,7 @@ pub const ClientConnection = struct {
         self.io.futexWake(u32, &self.write_gen.raw, std.math.maxInt(u32));
     }
 
+    /// Per request: a body (streamed or given whole) and the timeout.
     pub const RequestOptions = struct {
         /// The request has a body, written through `Stream.writer` and
         /// ended with `Stream.closeSend`.
@@ -319,7 +343,7 @@ pub const ClientConnection = struct {
         /// The whole request body at once, in place of `body` and the
         /// writer: copied, and sent as the server's flow control allows
         /// while the caller goes on to `waitHead`, so a server that answers
-        /// while it reads (an echo) cannot stall the call.
+        /// while it reads (an echo) cannot stall the call. HTTP/2 only.
         body_bytes: ?[]const u8 = null,
         /// Replaces `ConnectOptions.timeout` for this request. Null inherits
         /// it; `.none` lifts it. A duration runs from the call to `request`.
@@ -662,11 +686,15 @@ pub const Stream = struct {
         try self.head_event.wait(self.conn.io);
     }
 
+    /// The first response header named `name` (any case), once `waitHead`
+    /// has returned; null when absent.
     pub fn header(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.headers.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;
     }
 
+    /// The first trailer named `name` (any case), once the body has been
+    /// read to its end; null when absent.
     pub fn trailer(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.trailers.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;

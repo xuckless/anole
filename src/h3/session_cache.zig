@@ -18,6 +18,7 @@
 const std = @import("std");
 const c = @import("ngtcp2.zig").c;
 
+/// Tickets by server, for `ConnectOptions.session_cache`.
 pub const SessionCache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -26,11 +27,13 @@ pub const SessionCache = struct {
     /// Servers remembered at most; tickets for more are not kept.
     max_entries: u32 = 256,
 
+    /// One server's newest ticket.
     pub const Entry = struct {
         session: *c.SSL_SESSION,
         /// `ngtcp2_conn_encode_0rtt_transport_params2`'s output.
         params: []u8,
 
+        /// Frees the session and the parameters.
         pub fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
             c.SSL_SESSION_free(e.session);
             gpa.free(e.params);
@@ -38,10 +41,12 @@ pub const SessionCache = struct {
         }
     };
 
+    /// An empty cache. It must outlive every connection that uses it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) SessionCache {
         return .{ .gpa = gpa, .io = io };
     }
 
+    /// Frees every ticket.
     pub fn deinit(self: *SessionCache) void {
         var it = self.entries.iterator();
         while (it.next()) |e| {

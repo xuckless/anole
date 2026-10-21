@@ -25,18 +25,23 @@ pub const ClientAuth = struct {
     mode: enum { request, require } = .require,
 };
 
+/// What a listener's QUIC TLS context is built from.
 pub const ServerOptions = struct {
     /// The leaf certificate followed by any intermediates.
     cert_pem: []const u8,
+    /// The private key, PEM.
     key_pem: []const u8,
     /// Also accept ALPN "hq-interop" (after "h3").
     hq_interop: bool = false,
+    /// Ask clients for a certificate (mutual TLS).
     client_auth: ?ClientAuth = null,
     /// Accept 0-RTT (early data) from clients resuming a session. Each
     /// connection must then also get `setEarlyDataContext`.
     early_data: bool = false,
 };
 
+/// A listener's TLS context for QUIC (TLS 1.3 only, ALPN "h3"), shared by
+/// its connections.
 pub const Context = struct {
     ctx: *c.SSL_CTX,
 
@@ -63,6 +68,8 @@ pub const Context = struct {
         return .{ .ctx = ctx };
     }
 
+    /// Drops this reference to the context; connections still using it
+    /// keep theirs.
     pub fn deinit(self: *Context) void {
         c.SSL_CTX_free(self.ctx);
         self.* = undefined;

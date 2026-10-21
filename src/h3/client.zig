@@ -53,20 +53,33 @@ const burst = 10;
 /// Largest UDP payload read.
 const max_datagram = 65527;
 
+/// A header field: request fields (pseudo-headers first, lower-case
+/// names) and the response's `headers` and `trailers`.
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+/// Where and how `ClientConnection.connect` connects. `host` and `port`
+/// are required; the rest has defaults. Always TLS: QUIC has no
+/// cleartext.
 pub const ConnectOptions = struct {
     /// The server's name (SNI and the certificate check) or address.
     host: []const u8,
     port: u16,
     /// Send here instead of resolving `host`.
     address: ?std.Io.net.IpAddress = null,
+    /// How the server's certificate is checked, and the client's own.
+    /// Always TLS: QUIC has no cleartext form (HTTP/2's `tls` is optional).
     tls: Tls = .{},
-    /// Bytes the server may send on a stream before its reader takes them.
-    stream_window: u32 = 256 * 1024,
+    /// Bytes the server may send on a stream before its reader takes them,
+    /// as in `anole.h2`. 256 KiB here (64 KiB over HTTP/2): an HTTP/3
+    /// stream's receive buffer grows as data arrives rather than being
+    /// allocated whole, and ngtcp2 widens the window (up to 6x) on a fast
+    /// path.
+    stream_window: u31 = 256 * 1024,
     /// The same for the whole connection.
-    max_data: u32 = 16 * 1024 * 1024,
-    idle_timeout_ms: u32 = 30_000,
+    max_data: u31 = 16 * 1024 * 1024,
+    /// HTTP/3 only: QUIC closes the connection after this long with
+    /// nothing received (its idle timeout). HTTP/2 over TCP has none.
+    idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// For `connect`: resolving `host` and the QUIC handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -74,20 +87,22 @@ pub const ConnectOptions = struct {
     /// body, unless its `RequestOptions.timeout` says otherwise. Null for
     /// no limit, which a long-lived stream wants.
     timeout: ?std.Io.Duration = .fromSeconds(30),
-    /// Where tickets are kept, to resume sessions (one round trip less, no
-    /// certificate) and for `early_data`. Shared by any connections.
+    /// HTTP/3 only: where tickets are kept, to resume sessions (one round
+    /// trip less, no certificate) and for `early_data`. Shared by any
+    /// connections.
     session_cache: ?*SessionCache = null,
-    /// With a ticket for this server that allows it: send requests in
-    /// 0-RTT, before the handshake completes. `connect` then returns at
+    /// HTTP/3 only: with a ticket for this server that allows it, send
+    /// requests in 0-RTT, before the handshake completes. `connect` then returns at
     /// once, and `request` sends GET, HEAD and OPTIONS (or any request, with
     /// `RequestOptions.early`) right away; others wait for the handshake.
     /// Early data can be replayed by anyone who records it, so send in it
     /// only what is harmless to repeat.
     early_data: bool = false,
-    /// Speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
+    /// HTTP/3 only: speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
     /// HTTP datagrams, and streams the server may open.
     webtransport: bool = false,
 
+    /// The fields of `anole.h2.ConnectOptions.Tls`, with the same defaults.
     pub const Tls = struct {
         /// The certificate authorities the server's certificate must chain
         /// to, as for `anole.h2`: the system store by default, loaded on the
@@ -100,11 +115,14 @@ pub const ConnectOptions = struct {
         /// TLS): files or PEM in memory, read on every `connect`.
         client_certificate: ?ClientCertificate = null,
 
+        /// The system store, a file, a directory, PEM in memory, or none.
         pub const Ca = dusty.TlsCa;
+        /// A certificate and key, as files or PEM.
         pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
+/// Connection-level failures.
 pub const Error = error{ ConnectionClosed, StreamReset, OutOfMemory, Unexpected };
 
 /// `Tls.client_certificate` as PEM for `quic_tls`: read from its files, or
@@ -173,6 +191,9 @@ pub const Rebind = enum {
     /// ends: the server notices the new address and validates it.
     nat,
 };
+/// An HTTP/3 client connection: `connect`, then `request` once per
+/// request (concurrent ones share the connection, and several tasks may
+/// make them at once), and `close`. See the file's example.
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -305,7 +326,7 @@ pub const ClientConnection = struct {
         params.initial_max_streams_bidi = if (options.webtransport) 100 else 0;
         params.initial_max_streams_uni = if (options.webtransport) 103 else 3;
         if (options.webtransport) params.max_datagram_frame_size = 65535;
-        params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+        params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
         params.active_connection_id_limit = 7;
         params.grease_quic_bit = 1;
 
@@ -633,9 +654,11 @@ pub const ClientConnection = struct {
         }
     }
 
+    /// The CONNECT request `openWebTransport` sends.
     pub const WebTransportOptions = struct {
         /// `:authority`, the server's name (and port, if not 443).
         authority: []const u8,
+        /// `:path`, the WebTransport endpoint's route.
         path: []const u8 = "/",
         /// The `Origin` a browser would send, if any.
         origin: ?[]const u8 = null,
@@ -701,6 +724,7 @@ pub const ClientConnection = struct {
         }
     };
 
+    /// Per request: a body, the timeout, and 0-RTT.
     pub const RequestOptions = struct {
         /// The request has a body, written through `Stream.writer` and
         /// ended with `Stream.closeSend`.
@@ -709,7 +733,7 @@ pub const ClientConnection = struct {
         /// `anole.h2`: null inherits it, `.none` lifts it, and past it the
         /// stream is reset and its waits fail with `error.Timeout`.
         timeout: ?std.Io.Timeout = null,
-        /// While a 0-RTT handshake is going (`ConnectOptions.early_data`):
+        /// HTTP/3 only. While a 0-RTT handshake is going (`ConnectOptions.early_data`):
         /// true sends this request in early data, false waits for the
         /// handshake, null decides by method (GET, HEAD and OPTIONS go).
         /// Only what is harmless to repeat belongs in early data.
@@ -1465,11 +1489,15 @@ pub const Stream = struct {
         };
     }
 
+    /// The first response header named `name` (any case), once `waitHead`
+    /// has returned; null when absent.
     pub fn header(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.headers.items) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
         return null;
     }
 
+    /// The first trailer named `name` (any case), once the body has been
+    /// read to its end; null when absent.
     pub fn trailer(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.trailers.items) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
         return null;

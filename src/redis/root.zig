@@ -4,13 +4,13 @@
 //! `anole.net.ClientStream` (plain or TLS on BoringSSL), so waiting for the
 //! server suspends the calling coroutine, never its thread.
 //!
-//!     const App = struct { cache: *anole.redis.Client };
+//!     const App = struct { redis: *anole.redis.Client };
 //!     var state: App = undefined;
 //!     var app = try anole.Server(App).init(gpa, .{}, &state);
-//!     state.cache = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379
+//!     state.redis = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379
 //!
 //!     fn hit(app: *App, req: *anole.Request, res: *anole.Response) !void {
-//!         const hits = try app.cache.incr(req, "hits");
+//!         const hits = try app.redis.incr(req, "hits");
 //!         try res.json(.{ .hits = hits });
 //!     }
 //!
@@ -81,6 +81,7 @@ const features = @import("build_options");
 const dusty = @import("dusty");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
@@ -117,6 +118,8 @@ pub const Reply = union(enum) {
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
 
+/// `app.redis(options)` and `Client.init`. Every field has a default, so
+/// `.{}` connects from `REDIS_URL`.
 pub const Options = struct {
     /// A `redis://`, `rediss://` (TLS) or `unix://` URL. Null: `REDIS_URL`,
     /// else `redis://127.0.0.1:6379`. Parameters: `db` (or the path), and
@@ -140,6 +143,7 @@ pub const Options = struct {
     idle_timeout: ?Duration = .fromSeconds(5 * 60),
     /// What each class of error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
+    /// Certificates for `rediss://`, beyond what the URL names.
     tls: Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
@@ -154,6 +158,7 @@ pub const Options = struct {
     /// (`anole.db.QueryOptions`).
     cache: db.CacheOptions = .{},
 
+    /// `Options.tls`.
     pub const Tls = struct {
         /// What the server's certificate must chain to; null: the URL's
         /// `ssl_ca_certs`, else the system's store.
@@ -170,7 +175,7 @@ pub const Options = struct {
 
 /// A connection's settings: the URL, the environment and `Options`,
 /// resolved. Strings point into the arena `resolve` was given.
-pub const Settings = struct {
+const Settings = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 6379,
     unix_path: ?[]const u8 = null,
@@ -397,7 +402,7 @@ pub const Client = struct {
     /// AUTH and SELECT, sent as a connection opens; empty when neither is
     /// needed.
     login: Batch,
-    pools: db.PerExecutor(Pool),
+    pools: internal.PerExecutor(Pool),
     errors: db.ErrorMap,
     observer: db.Observer,
     readiness: db.Readiness,
@@ -407,7 +412,7 @@ pub const Client = struct {
     ping_timeout: Duration,
     connect_at_start: bool,
     /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
-    /// kept replies: `app.cache.cache.invalidate(.{ .tag = "profiles" })`.
+    /// kept replies: `app.redis.cache.invalidate(.{ .tag = "profiles" })`.
     cache: db.QueryCache,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
@@ -467,7 +472,7 @@ pub const Client = struct {
         if (s.database != 0) try login.add(.{ "SELECT", s.database });
         self.login = login.finish();
 
-        const executors = db.executorCount(io);
+        const executors = internal.executorCount(io);
         const total: usize = opts.max_connections orelse 10 * executors;
         self.pools = try .init(gpa, io);
         var made: usize = 0;
@@ -525,7 +530,7 @@ pub const Client = struct {
 
     /// The calls with `opts` (of which Redis takes `timeout`, `coalesce`
     /// and `cache`, the last two for reads only; see the top of this file):
-    /// `app.cache.with(.{ .timeout = .fromMilliseconds(200) }).get(req, key)`.
+    /// `app.redis.with(.{ .timeout = .fromMilliseconds(200) }).get(req, key)`.
     pub fn with(self: *Client, opts: db.QueryOptions) Query {
         return .{ .client = self, .opts = opts };
     }
@@ -533,7 +538,7 @@ pub const Client = struct {
     /// Sends one command and returns its reply; an error reply fails the
     /// call (see the top of this file).
     ///
-    ///     const n = try app.cache.command(req, .{ "INCR", "hits" }); // .int
+    ///     const n = try app.redis.command(req, .{ "INCR", "hits" }); // .int
     pub fn command(self: *Client, c: anytype, args: anytype) Error!Reply {
         return self.with(.{}).command(c, args);
     }
@@ -541,7 +546,7 @@ pub const Client = struct {
     /// The reply as a `T`; nil (or a hash without fields, for a struct):
     /// `error.NotFound`, a 404.
     ///
-    ///     const name = try app.cache.one([]const u8, req, .{ "HGET", key, "name" });
+    ///     const name = try app.redis.one([]const u8, req, .{ "HGET", key, "name" });
     pub fn one(self: *Client, comptime T: type, c: anytype, args: anytype) Error!T {
         return self.with(.{}).one(T, c, args);
     }
@@ -553,7 +558,7 @@ pub const Client = struct {
 
     /// An array reply as a `[]T` (nil: empty).
     ///
-    ///     const names = try app.cache.all(?[]const u8, req, .{ "MGET", keys });
+    ///     const names = try app.redis.all(?[]const u8, req, .{ "MGET", keys });
     pub fn all(self: *Client, comptime T: type, c: anytype, args: anytype) Error![]T {
         return self.with(.{}).all(T, c, args);
     }
@@ -561,7 +566,7 @@ pub const Client = struct {
     /// Several commands in one round trip, on one connection; their replies
     /// in order. A tuple of commands, or a slice of `[]const []const u8`:
     ///
-    ///     const r = try app.cache.pipeline(req, .{ .{ "INCR", key }, .{ "EXPIRE", key, 60 } });
+    ///     const r = try app.redis.pipeline(req, .{ .{ "INCR", key }, .{ "EXPIRE", key, 60 } });
     ///     const n = r[0].int;
     ///
     /// When one of them fails, every reply is still read, and the call
@@ -586,7 +591,7 @@ pub const Client = struct {
     /// drain, so an event stream or a WebSocket that forwards it winds down
     /// in time.
     ///
-    ///     const sub = try app.cache.subscribe(req, "chat");
+    ///     const sub = try app.redis.subscribe(req, "chat");
     ///     defer sub.close();
     ///     while (try sub.next(req)) |msg| try events.send(msg.payload, .{});
     pub fn subscribe(self: *Client, c: anytype, channels: anytype) Error!*Subscriber {
@@ -628,7 +633,7 @@ pub const Client = struct {
 
     /// True when the server answers PING within `ping_timeout`: `/readyz`'s
     /// check. Its failures are not logged.
-    pub fn ping(context: *anyopaque, io: std.Io) bool {
+    fn ping(context: *anyopaque, io: std.Io) bool {
         const self: *Client = @ptrCast(@alignCast(context));
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
@@ -646,30 +651,62 @@ pub const Client = struct {
         return map.errorFor(detail.class);
     }
 
+    /// GET `key`: its value, or null when it does not exist.
     pub const get = Commands(*Client).get;
+    /// SET `key` to `value` (a string, a number...), with `opts` (a TTL,
+    /// NX, XX, KEEPTTL). False when NX or XX kept it from being set.
     pub const set = Commands(*Client).set;
+    /// DEL one key or several (a tuple or slice); how many existed.
     pub const del = Commands(*Client).del;
+    /// INCR: the new value (a missing key counts from 0).
     pub const incr = Commands(*Client).incr;
+    /// INCRBY `by`: the new value.
     pub const incrBy = Commands(*Client).incrBy;
+    /// EXPIRE (PEXPIRE below whole seconds); false when the key does not
+    /// exist.
     pub const expire = Commands(*Client).expire;
+    /// HGET one field of a hash, or null.
     pub const hget = Commands(*Client).hget;
+    /// HSET from a struct's fields (null ones left out), or from a tuple of
+    /// field, value...; how many fields were new.
     pub const hset = Commands(*Client).hset;
+    /// HGETALL into a `T`, a struct by field name. A hash without fields:
+    /// `error.NotFound`.
     pub const hgetAll = Commands(*Client).hgetAll;
+    /// HDEL one field or several; how many existed.
     pub const hdel = Commands(*Client).hdel;
+    /// HINCRBY one field of a hash by `by`: its new value.
     pub const hincrBy = Commands(*Client).hincrBy;
+    /// LPUSH one value or several; the list's length after.
     pub const lpush = Commands(*Client).lpush;
+    /// RPUSH one value or several; the list's length after.
     pub const rpush = Commands(*Client).rpush;
+    /// LRANGE from `start` to `stop`, both included (`-1` is the last item).
     pub const lrange = Commands(*Client).lrange;
+    /// SADD one member or several; how many were new.
     pub const sadd = Commands(*Client).sadd;
+    /// SREM one member or several; how many were there.
     pub const srem = Commands(*Client).srem;
+    /// SMEMBERS: every member of the set.
     pub const smembers = Commands(*Client).smembers;
+    /// SISMEMBER: whether `member` is in the set.
     pub const sismember = Commands(*Client).sismember;
+    /// ZADD one member with `score`; true when it is new (else its score
+    /// changed).
     pub const zadd = Commands(*Client).zadd;
+    /// ZINCRBY: the member's new score.
     pub const zincrBy = Commands(*Client).zincrBy;
+    /// ZSCORE: the member's score, or null when it is not in the set.
     pub const zscore = Commands(*Client).zscore;
+    /// ZREM one member or several; how many were there.
     pub const zrem = Commands(*Client).zrem;
+    /// ZRANGE by rank, `start` to `stop` included (`.rev` for the highest
+    /// scores first).
     pub const zrange = Commands(*Client).zrange;
+    /// `zrange` with the scores: a leaderboard's top ten is
+    /// `zrangeWithScores(req, "board", 0, 9, .{ .rev = true })`.
     pub const zrangeWithScores = Commands(*Client).zrangeWithScores;
+    /// PUBLISH `message` on `channel`: how many subscribers received it.
     pub const publish = Commands(*Client).publish;
 
     // -----------------------------------------------------------------------
@@ -888,6 +925,7 @@ pub const Query = struct {
     client: *Client,
     opts: db.QueryOptions,
 
+    /// `Client.command`, with the options.
     pub fn command(self: Query, c: anytype, args: anytype) Error!Reply {
         return self.client.call(c, self.opts.timeout, null, Reply, .reply, args);
     }
@@ -895,18 +933,22 @@ pub const Query = struct {
     // The reads go through the cache, which shares them when `opts` asks
     // (`coalesce`, `cache`) and the command only reads.
 
+    /// `Client.one`, with the options (`coalesce` and `cache` apply to read commands).
     pub fn one(self: Query, comptime T: type, c: anytype, args: anytype) Error!T {
         return self.read(T, .one, c, args);
     }
 
+    /// `Client.optional`, with the options (`coalesce` and `cache` apply to read commands).
     pub fn optional(self: Query, comptime T: type, c: anytype, args: anytype) Error!?T {
         return self.read(T, .optional, c, args);
     }
 
+    /// `Client.all`, with the options (`coalesce` and `cache` apply to read commands).
     pub fn all(self: Query, comptime T: type, c: anytype, args: anytype) Error![]T {
         return self.read(T, .all, c, args);
     }
 
+    /// `Client.pipeline`, with the options.
     pub fn pipeline(self: Query, c: anytype, commands: anytype) Error![]Reply {
         return self.client.call(c, self.opts.timeout, null, Reply, .replies, commands);
     }
@@ -927,30 +969,55 @@ pub const Query = struct {
         return self.client.call(c, self.opts.timeout, null, T, mode, args);
     }
 
+    /// `Client.get`, with the options.
     pub const get = Commands(Query).get;
+    /// `Client.set`, with the options.
     pub const set = Commands(Query).set;
+    /// `Client.del`, with the options.
     pub const del = Commands(Query).del;
+    /// `Client.incr`, with the options.
     pub const incr = Commands(Query).incr;
+    /// `Client.incrBy`, with the options.
     pub const incrBy = Commands(Query).incrBy;
+    /// `Client.expire`, with the options.
     pub const expire = Commands(Query).expire;
+    /// `Client.hget`, with the options.
     pub const hget = Commands(Query).hget;
+    /// `Client.hset`, with the options.
     pub const hset = Commands(Query).hset;
+    /// `Client.hgetAll`, with the options.
     pub const hgetAll = Commands(Query).hgetAll;
+    /// `Client.hdel`, with the options.
     pub const hdel = Commands(Query).hdel;
+    /// `Client.hincrBy`, with the options.
     pub const hincrBy = Commands(Query).hincrBy;
+    /// `Client.lpush`, with the options.
     pub const lpush = Commands(Query).lpush;
+    /// `Client.rpush`, with the options.
     pub const rpush = Commands(Query).rpush;
+    /// `Client.lrange`, with the options.
     pub const lrange = Commands(Query).lrange;
+    /// `Client.sadd`, with the options.
     pub const sadd = Commands(Query).sadd;
+    /// `Client.srem`, with the options.
     pub const srem = Commands(Query).srem;
+    /// `Client.smembers`, with the options.
     pub const smembers = Commands(Query).smembers;
+    /// `Client.sismember`, with the options.
     pub const sismember = Commands(Query).sismember;
+    /// `Client.zadd`, with the options.
     pub const zadd = Commands(Query).zadd;
+    /// `Client.zincrBy`, with the options.
     pub const zincrBy = Commands(Query).zincrBy;
+    /// `Client.zscore`, with the options.
     pub const zscore = Commands(Query).zscore;
+    /// `Client.zrem`, with the options.
     pub const zrem = Commands(Query).zrem;
+    /// `Client.zrange`, with the options.
     pub const zrange = Commands(Query).zrange;
+    /// `Client.zrangeWithScores`, with the options.
     pub const zrangeWithScores = Commands(Query).zrangeWithScores;
+    /// `Client.publish`, with the options.
     pub const publish = Commands(Query).publish;
 };
 
@@ -1049,7 +1116,7 @@ fn rest(args: anytype) Rest(@TypeOf(args)) {
 /// A connection taken with `Client.acquire`: the same calls, all on it,
 /// until `release`.
 ///
-///     var conn = try app.cache.acquire(req);
+///     var conn = try app.redis.acquire(req);
 ///     defer conn.release();
 ///     _ = try conn.command(req, .{ "WATCH", key });
 ///     const stock = try conn.one(i64, req, .{ "GET", key });
@@ -1066,50 +1133,80 @@ pub const Conn = struct {
         self.* = undefined;
     }
 
+    /// `Client.command`, on this connection.
     pub fn command(self: *Conn, c: anytype, args: anytype) Error!Reply {
         return self.client.call(c, null, self.conn, Reply, .reply, args);
     }
 
+    /// `Client.one`, on this connection.
     pub fn one(self: *Conn, comptime T: type, c: anytype, args: anytype) Error!T {
         return self.client.call(c, null, self.conn, T, .one, args);
     }
 
+    /// `Client.optional`, on this connection.
     pub fn optional(self: *Conn, comptime T: type, c: anytype, args: anytype) Error!?T {
         return self.client.call(c, null, self.conn, T, .optional, args);
     }
 
+    /// `Client.all`, on this connection.
     pub fn all(self: *Conn, comptime T: type, c: anytype, args: anytype) Error![]T {
         return self.client.call(c, null, self.conn, T, .all, args);
     }
 
+    /// `Client.pipeline`, on this connection.
     pub fn pipeline(self: *Conn, c: anytype, commands: anytype) Error![]Reply {
         return self.client.call(c, null, self.conn, Reply, .replies, commands);
     }
 
+    /// `Client.get`, on this connection.
     pub const get = Commands(*Conn).get;
+    /// `Client.set`, on this connection.
     pub const set = Commands(*Conn).set;
+    /// `Client.del`, on this connection.
     pub const del = Commands(*Conn).del;
+    /// `Client.incr`, on this connection.
     pub const incr = Commands(*Conn).incr;
+    /// `Client.incrBy`, on this connection.
     pub const incrBy = Commands(*Conn).incrBy;
+    /// `Client.expire`, on this connection.
     pub const expire = Commands(*Conn).expire;
+    /// `Client.hget`, on this connection.
     pub const hget = Commands(*Conn).hget;
+    /// `Client.hset`, on this connection.
     pub const hset = Commands(*Conn).hset;
+    /// `Client.hgetAll`, on this connection.
     pub const hgetAll = Commands(*Conn).hgetAll;
+    /// `Client.hdel`, on this connection.
     pub const hdel = Commands(*Conn).hdel;
+    /// `Client.hincrBy`, on this connection.
     pub const hincrBy = Commands(*Conn).hincrBy;
+    /// `Client.lpush`, on this connection.
     pub const lpush = Commands(*Conn).lpush;
+    /// `Client.rpush`, on this connection.
     pub const rpush = Commands(*Conn).rpush;
+    /// `Client.lrange`, on this connection.
     pub const lrange = Commands(*Conn).lrange;
+    /// `Client.sadd`, on this connection.
     pub const sadd = Commands(*Conn).sadd;
+    /// `Client.srem`, on this connection.
     pub const srem = Commands(*Conn).srem;
+    /// `Client.smembers`, on this connection.
     pub const smembers = Commands(*Conn).smembers;
+    /// `Client.sismember`, on this connection.
     pub const sismember = Commands(*Conn).sismember;
+    /// `Client.zadd`, on this connection.
     pub const zadd = Commands(*Conn).zadd;
+    /// `Client.zincrBy`, on this connection.
     pub const zincrBy = Commands(*Conn).zincrBy;
+    /// `Client.zscore`, on this connection.
     pub const zscore = Commands(*Conn).zscore;
+    /// `Client.zrem`, on this connection.
     pub const zrem = Commands(*Conn).zrem;
+    /// `Client.zrange`, on this connection.
     pub const zrange = Commands(*Conn).zrange;
+    /// `Client.zrangeWithScores`, on this connection.
     pub const zrangeWithScores = Commands(*Conn).zrangeWithScores;
+    /// `Client.publish`, on this connection.
     pub const publish = Commands(*Conn).publish;
 };
 
@@ -1172,6 +1269,8 @@ pub const Subscriber = struct {
         return self.send(c, "SUBSCRIBE", channels);
     }
 
+    /// Adds patterns (`news.*`), as `subscribe` adds channels; their
+    /// messages carry the `pattern` they matched.
     pub fn psubscribe(self: *Subscriber, c: anytype, patterns: anytype) Error!void {
         return self.send(c, "PSUBSCRIBE", patterns);
     }
@@ -1182,6 +1281,7 @@ pub const Subscriber = struct {
         return self.send(c, "UNSUBSCRIBE", channels);
     }
 
+    /// Drops patterns, as `unsubscribe` drops channels.
     pub fn punsubscribe(self: *Subscriber, c: anytype, patterns: anytype) Error!void {
         return self.send(c, "PUNSUBSCRIBE", patterns);
     }
@@ -1235,8 +1335,8 @@ fn Commands(comptime Self: type) type {
         /// SET `value` (any argument: a string, a number...). False when
         /// `nx` or `xx` kept it from being set.
         ///
-        ///     _ = try app.cache.set(req, "page:/", html, .{ .ttl = .fromSeconds(30) });
-        ///     const mine = try app.cache.set(req, "lock:job", "1", .{ .nx = true, .ttl = .fromSeconds(30) });
+        ///     _ = try app.redis.set(req, "page:/", html, .{ .ttl = .fromSeconds(30) });
+        ///     const mine = try app.redis.set(req, "lock:job", "1", .{ .nx = true, .ttl = .fromSeconds(30) });
         pub fn set(self: Self, c: anytype, key: []const u8, value: anytype, opts: SetOptions) Error!bool {
             const Word = ?[]const u8;
             const ttl = opts.ttl;
@@ -1260,6 +1360,7 @@ fn Commands(comptime Self: type) type {
             return self.one(i64, c, .{ "INCR", key });
         }
 
+        /// INCRBY `by`: the new value.
         pub fn incrBy(self: Self, c: anytype, key: []const u8, by: i64) Error!i64 {
             return self.one(i64, c, .{ "INCRBY", key, by });
         }
@@ -1271,6 +1372,7 @@ fn Commands(comptime Self: type) type {
             return self.one(bool, c, .{ "PEXPIRE", key, @max(1, ttl.toMilliseconds()) });
         }
 
+        /// HGET one field, or null.
         pub fn hget(self: Self, c: anytype, key: []const u8, field: []const u8) Error!?[]const u8 {
             return self.optional([]const u8, c, .{ "HGET", key, field });
         }
@@ -1278,7 +1380,7 @@ fn Commands(comptime Self: type) type {
         /// HSET from a struct's fields (null ones left out), or from a
         /// tuple of field, value...; how many fields were new.
         ///
-        ///     _ = try app.cache.hset(req, "user:42", .{ .name = "Ada", .visits = 1 });
+        ///     _ = try app.redis.hset(req, "user:42", .{ .name = "Ada", .visits = 1 });
         pub fn hset(self: Self, c: anytype, key: []const u8, fields: anytype) Error!u64 {
             return self.one(u64, c, .{ "HSET", key, fields });
         }
@@ -1289,10 +1391,12 @@ fn Commands(comptime Self: type) type {
             return self.one(T, c, .{ "HGETALL", key });
         }
 
+        /// HDEL one field or several; how many existed.
         pub fn hdel(self: Self, c: anytype, key: []const u8, fields: anytype) Error!u64 {
             return self.one(u64, c, .{ "HDEL", key, fields });
         }
 
+        /// HINCRBY: the field's new value.
         pub fn hincrBy(self: Self, c: anytype, key: []const u8, field: []const u8, by: i64) Error!i64 {
             return self.one(i64, c, .{ "HINCRBY", key, field, by });
         }
@@ -1302,6 +1406,7 @@ fn Commands(comptime Self: type) type {
             return self.one(u64, c, .{ "LPUSH", key, values });
         }
 
+        /// RPUSH one value or several; the list's length after.
         pub fn rpush(self: Self, c: anytype, key: []const u8, values: anytype) Error!u64 {
             return self.one(u64, c, .{ "RPUSH", key, values });
         }
@@ -1316,14 +1421,17 @@ fn Commands(comptime Self: type) type {
             return self.one(u64, c, .{ "SADD", key, members });
         }
 
+        /// SREM one member or several; how many were there.
         pub fn srem(self: Self, c: anytype, key: []const u8, members: anytype) Error!u64 {
             return self.one(u64, c, .{ "SREM", key, members });
         }
 
+        /// SMEMBERS: every member.
         pub fn smembers(self: Self, c: anytype, key: []const u8) Error![][]const u8 {
             return self.all([]const u8, c, .{ "SMEMBERS", key });
         }
 
+        /// SISMEMBER: whether `member` is in the set.
         pub fn sismember(self: Self, c: anytype, key: []const u8, member: anytype) Error!bool {
             return self.one(bool, c, .{ "SISMEMBER", key, member });
         }
@@ -1338,10 +1446,12 @@ fn Commands(comptime Self: type) type {
             return self.one(f64, c, .{ "ZINCRBY", key, by, member });
         }
 
+        /// ZSCORE: the member's score, or null.
         pub fn zscore(self: Self, c: anytype, key: []const u8, member: anytype) Error!?f64 {
             return self.optional(f64, c, .{ "ZSCORE", key, member });
         }
 
+        /// ZREM one member or several; how many were there.
         pub fn zrem(self: Self, c: anytype, key: []const u8, members: anytype) Error!u64 {
             return self.one(u64, c, .{ "ZREM", key, members });
         }
@@ -1734,14 +1844,14 @@ fn decode(comptime T: type, r: Reply, d: *const Decoder) Error!T {
 }
 
 /// An error reply's code: its first word ("WRONGTYPE", "ERR").
-pub fn errorCode(message: []const u8) []const u8 {
+fn errorCode(message: []const u8) []const u8 {
     return message[0 .. std.mem.indexOfScalar(u8, message, ' ') orelse message.len];
 }
 
 /// The class of an error reply (`anole.db.Class`): `unavailable` when the
 /// server cannot serve now (loading, a replica, out of memory, a script
 /// running, a login refused), else `other`.
-pub fn classify(message: []const u8) db.Class {
+fn classify(message: []const u8) db.Class {
     const code = errorCode(message);
     for ([_][]const u8{ "LOADING", "MASTERDOWN", "BUSY", "TRYAGAIN", "CLUSTERDOWN", "READONLY", "NOREPLICAS", "MISCONF", "OOM", "NOAUTH", "WRONGPASS" }) |u| {
         if (std.mem.eql(u8, code, u)) return .unavailable;
@@ -1757,7 +1867,7 @@ const Ctx = struct {
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
 
-    /// `anole.db.fail` on the context it stands for.
+    /// `internal.fail` on the context it stands for.
     fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
@@ -1773,10 +1883,10 @@ fn erase(c: anytype) Ctx {
     if (C == *Ctx or C == *const Ctx) return c.*;
     const R = struct {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return db.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = db.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------

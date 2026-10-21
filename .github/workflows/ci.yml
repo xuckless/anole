@@ -1,9 +1,28 @@
 name: CI
 
+# Changes to docs alone (guides, README, CHANGELOG, the site, issue
+# templates) skip this suite: the Docs site workflow builds and link-checks
+# them.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "site/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/dependabot.yml"
+      - "LICENSE*"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "site/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/dependabot.yml"
+      - "LICENSE*"
 
 permissions:
   contents: read
@@ -29,6 +48,11 @@ jobs:
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.17.0
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Unit and smoke tests (default profile, every feature on)
         timeout-minutes: 35
         run: zig build test --summary all
@@ -69,6 +93,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: cross-aarch64-linux-gnu
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build every test binary and the full example
         run: zig build test-flags full -Dtarget=aarch64-linux-gnu --summary all
 
@@ -81,6 +110,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: h2spec
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build examples/full
         run: zig build full -Doptimize=ReleaseSafe --summary all
       - name: Fetch h2spec 2.6.0, pinned by SHA-256
@@ -102,6 +136,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: autobahn
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build the echo peer
         run: zig build autobahn-echo -Doptimize=ReleaseSafe --summary all
       # The fuzzing client in Docker (image pinned by digest); fails on any
@@ -122,6 +161,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: h3
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # Debug, so the debug allocator reports any leak at exit.
       - name: Build the HTTP/3 test server and client
         run: zig build h3-test-server h3-test-client --summary all
@@ -141,6 +185,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: quic-interop
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # The runner reads its traces with pyshark; it needs a current tshark
       # (its own CI uses this PPA).
       # Retried: the PPA answers 503 now and then; Ubuntu's own tshark is
@@ -176,6 +225,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: webtransport-interop
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # Retried: the PPA answers 503 now and then; Ubuntu's own tshark is
       # too old for the runner, so there is no fallback.
       - name: Install tshark
@@ -236,6 +290,11 @@ jobs:
         with:
           version: 0.17.0
           cache-key: fuzz
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # The fuzz targets are the "fuzz:" tests (src/fuzz.zig, and the HTTP
       # core's: the PROXY protocol, requests through llhttp whole and in
       # pieces, a connection's bytes over HTTP/1.1 and HTTP/2); a plain
@@ -253,7 +312,12 @@ jobs:
         with:
           version: 0.17.0
           cache-key: grpc-interop
-      - uses: actions/setup-go@v6
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - name: Build the interop server

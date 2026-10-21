@@ -296,6 +296,7 @@ zig build run-hello     # Hello, World! on http://localhost:3000
 zig build run-rest      # examples/rest, a JSON API on port 3000
 zig build run-full      # every listener: 8080 (HTTP/1.1, h2c), 8443 (HTTPS, HTTP/3)
 zig build run-io        # handlers waiting on timers, files and outbound requests (port 8081)
+zig build docs          # the API reference (Zig autodoc) in zig-out/docs
 ```
 
 `examples/full` speaks HTTP/1.1 and HTTP/2 on both ports and HTTP/3 on 8443

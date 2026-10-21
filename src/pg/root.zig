@@ -3,7 +3,7 @@
 //! rows decoded into the request's arena, prepared statements kept per
 //! connection, and server errors turned into statuses.
 //!
-//!     const App = struct { db: *anole.pg.Db };
+//!     const App = struct { db: *anole.pg.Client };
 //!     var state: App = undefined;
 //!     var app = try anole.Server(App).init(gpa, .{}, &state);
 //!     state.db = try app.postgres(.{}); // DATABASE_URL, else PG* variables, else localhost
@@ -54,6 +54,7 @@ const std = @import("std");
 const features = @import("build_options");
 const dusty = @import("dusty");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 
 /// pg.zig itself (xuckless/pg.zig), for `acquire`'s connection, its
@@ -70,6 +71,9 @@ const Duration = std.Io.Duration;
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
 
+/// `app.postgres(options)` and `Client.init`: where the database is, the
+/// pool's bounds and timeouts, TLS, and how errors map to statuses. Every
+/// field has a default, so `.{}` connects from the environment.
 pub const Options = struct {
     /// A `postgres://` or `postgresql://` URL. Null: `DATABASE_URL`, else
     /// libpq's variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
@@ -98,6 +102,7 @@ pub const Options = struct {
     idle_timeout: ?Duration = .fromSeconds(30 * 60),
     /// What each class of server error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
+    /// Certificates for TLS; whether TLS is used is the URL's `sslmode`.
     tls: Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
@@ -114,6 +119,7 @@ pub const Options = struct {
     /// process's environment (`app.postgres` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
 
+    /// Certificates beyond what the URL names (`Options.tls`).
     pub const Tls = struct {
         /// What `sslmode=verify-ca`/`verify-full` trust; null: the URL's
         /// `sslrootcert`, else the system's store.
@@ -125,7 +131,7 @@ pub const Options = struct {
 };
 
 /// libpq's `sslmode`.
-pub const SslMode = enum {
+const SslMode = enum {
     disable,
     /// As `prefer` here (libpq tries plain text first).
     allow,
@@ -148,7 +154,7 @@ pub const SslMode = enum {
 
 /// A connection's settings: the URL, the environment and `Options`,
 /// resolved. Strings point into the arena `resolve` was given.
-pub const Settings = struct {
+const Settings = struct {
     /// For TLS and logs; the socket's directory for a Unix socket.
     host: []const u8 = "127.0.0.1",
     port: u16 = 5432,
@@ -324,14 +330,14 @@ const Lease = struct {
 
 /// A PostgreSQL database: the handle in the App state. Its calls take the
 /// request (or an `anole.db.Ctx`) first; see `anole.db`.
-pub const Db = struct {
+pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// The settings' strings and the startup parameters.
     arena: std.heap.ArenaAllocator,
     name: []const u8,
     settings: Settings,
-    pools: db.PerExecutor(Shard),
+    pools: internal.PerExecutor(Shard),
     errors: db.ErrorMap,
     observer: db.Observer,
     readiness: db.Readiness,
@@ -349,8 +355,8 @@ pub const Db = struct {
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Db {
-        const self = try gpa.create(Db);
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
+        const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
@@ -421,7 +427,7 @@ pub const Db = struct {
             startup = .init(a);
             for (s.parameters) |p| try startup.?.put(p.name, p.value);
         }
-        const executors = db.executorCount(io);
+        const executors = internal.executorCount(io);
         const total: usize = s.max_connections orelse opts.max_connections orelse @max(4, 2 * executors);
         const pool_opts: pg.Pool.Opts = .{
             .size = 1,
@@ -471,7 +477,7 @@ pub const Db = struct {
 
     /// Closes every connection: after the server has drained (`app`'s
     /// `deinit` does it then).
-    pub fn deinit(self: *Db) void {
+    pub fn deinit(self: *Client) void {
         const gpa = self.gpa;
         // First: a statement still running for the cache holds a connection.
         self.cache.deinit();
@@ -482,7 +488,7 @@ pub const Db = struct {
         gpa.destroy(self);
     }
 
-    fn freeTls(self: *Db) void {
+    fn freeTls(self: *Client) void {
         if (self.store) |s| dusty_tls.releaseStore(s);
         self.store = null;
         if (self.cert) |pair| {
@@ -497,7 +503,7 @@ pub const Db = struct {
     /// `app.postgres` may come before or after `app.metrics`,
     /// `app.tracing` and `app.health`. With `connect_at_start`, it opens
     /// a connection per executor and fails if one cannot.
-    pub fn start(self: *Db, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
+    pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.postgresql, self.name, registry, tracer);
         try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
@@ -516,45 +522,45 @@ pub const Db = struct {
     }
 
     /// The verbs with `opts`: `app.db.with(.{ .timeout = .fromSeconds(2) }).all(...)`.
-    pub fn with(self: *Db, opts: db.QueryOptions) Query {
+    pub fn with(self: *Client, opts: db.QueryOptions) Query {
         return .{ .db = self, .opts = opts };
     }
 
     /// Runs `sql`; the rows it changed (inserted, updated, deleted). Without
     /// `args`, several statements may go in one call (a migration).
-    pub fn exec(self: *Db, c: anytype, sql: []const u8, args: anytype) Error!u64 {
+    pub fn exec(self: *Client, c: anytype, sql: []const u8, args: anytype) Error!u64 {
         return self.with(.{}).exec(c, sql, args);
     }
 
     /// The first row as a `T`; none: `error.NotFound` (a 404).
-    pub fn one(self: *Db, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
+    pub fn one(self: *Client, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         return self.with(.{}).one(T, c, sql, args);
     }
 
     /// The first row as a `T`, or null.
-    pub fn optional(self: *Db, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
+    pub fn optional(self: *Client, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
         return self.with(.{}).optional(T, c, sql, args);
     }
 
     /// Every row, in `c`'s arena.
-    pub fn all(self: *Db, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
+    pub fn all(self: *Client, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
         return self.with(.{}).all(T, c, sql, args);
     }
 
     /// The rows one at a time, for results too large to hold at once; the
     /// connection is the caller's until `deinit`.
-    pub fn iterate(self: *Db, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
+    pub fn iterate(self: *Client, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         return self.with(.{}).iterate(T, c, sql, args);
     }
 
     /// A transaction on one connection: `defer tx.deinit()` (it rolls
-    /// back unless committed), the verbs on `tx`, then `tx.commit()`.
-    pub fn begin(self: *Db, c: anytype, opts: db.TxOptions) Error!Tx {
+    /// back unless committed), the verbs on `tx`, then `tx.commit(c)`.
+    pub fn begin(self: *Client, c: anytype, opts: db.TxOptions) Error!Tx {
         return self.beginWith(c, opts, if (opts.timeout) |t| dusty.Deadline.init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } }) else null);
     }
 
-    fn beginWith(self: *Db, c: anytype, opts: db.TxOptions, deadline: ?dusty.Deadline) Error!Tx {
-        var tx: Tx = .{ .db = self, .ctx = erase(c), .lease = undefined, .deadline = deadline };
+    fn beginWith(self: *Client, c: anytype, opts: db.TxOptions, deadline: ?dusty.Deadline) Error!Tx {
+        var tx: Tx = .{ .db = self, .io = c.io, .lease = undefined, .deadline = deadline };
         var buf: [96]u8 = undefined;
         const sql = beginSql(&buf, opts);
         tx.lease = try self.call(c, null, &tx, sql, Begin{});
@@ -563,7 +569,7 @@ pub const Db = struct {
 
     const Begin = struct {
         const Out = Lease;
-        fn run(_: *Begin, d: *Db, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!Lease {
+        fn run(_: *Begin, d: *Client, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!Lease {
             const lease = try d.take(ctx);
             _ = lease.conn.execOpts(sql, .{}, .{}) catch |err| {
                 const e = d.failed(ctx, lease, err, null);
@@ -586,8 +592,8 @@ pub const Db = struct {
     ///         _ = try tx.exec(req, "UPDATE accounts SET cents = cents - $1 WHERE id = $2", .{ cents, from });
     ///         _ = try tx.exec(req, "UPDATE accounts SET cents = cents + $1 WHERE id = $2", .{ cents, to });
     ///     }
-    pub fn transaction(self: *Db, c: anytype, opts: db.TxOptions, comptime func: anytype, args: anytype) db.Bounded(Retry(func, @TypeOf(c), @TypeOf(args)).run) {
-        return db.bounded(c, .postgresql, opts.timeout, Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
+    pub fn transaction(self: *Client, c: anytype, opts: db.TxOptions, comptime func: anytype, args: anytype) internal.Bounded(Retry(func, @TypeOf(c), @TypeOf(args)).run) {
+        return internal.bounded(c, .postgresql, opts.timeout, Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
     }
 
     fn Retry(comptime func: anytype, comptime C: type, comptime Args: type) type {
@@ -597,7 +603,7 @@ pub const Db = struct {
             else => Error!R,
         };
         return struct {
-            fn run(d: *Db, c: C, opts: db.TxOptions, args: Args) Out {
+            fn run(d: *Client, c: C, opts: db.TxOptions, args: Args) Out {
                 var inner = opts;
                 inner.timeout = null;
                 var attempt: u8 = 0;
@@ -608,7 +614,7 @@ pub const Db = struct {
                         if (attempt < opts.retries and db.retryable(c, err)) continue;
                         return err;
                     };
-                    tx.commit() catch |err| {
+                    tx.commit(c) catch |err| {
                         if (attempt < opts.retries and db.retryable(c, err)) continue;
                         return err;
                     };
@@ -621,7 +627,7 @@ pub const Db = struct {
     /// A connection of pg.zig's own, for what the verbs do not cover
     /// (COPY, a cursor, `LISTEN` on the pool's connection...); give it
     /// back with `release`. Failures of its calls are pg.zig's errors.
-    pub fn acquire(self: *Db, c: anytype) Error!Conn {
+    pub fn acquire(self: *Client, c: anytype) Error!Conn {
         var ctx = erase(c);
         const lease = try self.take(&ctx);
         return .{ .db = self, .io = c.io, .lease = lease, .raw = lease.conn };
@@ -629,19 +635,19 @@ pub const Db = struct {
 
     /// A connection for `LISTEN`/`NOTIFY`, outside the pools (pg.zig's
     /// `Listener`): it waits for notifications as long as it is open.
-    pub fn listener(self: *Db) !pg.Listener {
+    pub fn listener(self: *Client) !pg.Listener {
         return self.pools.pools[0].pool.newListener();
     }
 
     /// True when the database answers `SELECT 1` within `ping_timeout`:
     /// `/readyz`'s check.
-    pub fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Db = @ptrCast(@alignCast(context));
+    fn ping(context: *anyopaque, io: std.Io) bool {
+        const self: *Client = @ptrCast(@alignCast(context));
         const deadline: dusty.Deadline = .init(io, .{ .duration = .{ .raw = self.ping_timeout, .clock = .awake } });
         return deadline.run(pingOnce, .{ self, io }) catch false;
     }
 
-    fn pingOnce(self: *Db, io: std.Io) !bool {
+    fn pingOnce(self: *Client, io: std.Io) !bool {
         const shard = self.pools.get(io);
         const conn = try shard.pool.acquire();
         defer {
@@ -658,7 +664,7 @@ pub const Db = struct {
     /// Runs `job` (a struct with `Out` and `run`) as one database call:
     /// observed (metrics, a span), bounded by `timeout` or the
     /// transaction's deadline, its error narrowed to `Error`.
-    fn call(self: *Db, c: anytype, timeout: ?Duration, tx: ?*Tx, sql: []const u8, job: anytype) Error!@TypeOf(job).Out {
+    fn call(self: *Client, c: anytype, timeout: ?Duration, tx: ?*Tx, sql: []const u8, job: anytype) Error!@TypeOf(job).Out {
         var ctx = erase(c);
         var j = job;
         const J = @TypeOf(j);
@@ -677,11 +683,11 @@ pub const Db = struct {
         return result catch |err| self.narrow(&ctx, err);
     }
 
-    /// `func(args...)` before `deadline`, as `anole.db.bounded` (whose
+    /// `func(args...)` before `deadline`, as `internal.bounded` (whose
     /// timeout, `QueryOptions.timeout`, a call's deadline is), or a
     /// transaction's: past it, the call is canceled where it waits and
     /// fails with the `timeout` class (`GatewayTimeout`).
-    fn guarded(self: *Db, ctx: *const Ctx, deadline: ?dusty.Deadline, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) db.Bounded(func) {
+    fn guarded(self: *Client, ctx: *const Ctx, deadline: ?dusty.Deadline, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) internal.Bounded(func) {
         const d = deadline orelse return @call(.auto, func, args);
         return d.run(func, args) catch |err| switch (err) {
             error.Timeout => ctx.fail(self.errors, .{ .system = .postgresql, .class = .timeout, .message = "the call ran past its timeout" }),
@@ -690,7 +696,7 @@ pub const Db = struct {
     }
 
     /// `err` as one of `Error`; anything else is recorded as a 500.
-    fn narrow(self: *Db, ctx: *const Ctx, err: anyerror) Error {
+    fn narrow(self: *Client, ctx: *const Ctx, err: anyerror) Error {
         inline for (@typeInfo(Error).error_set.error_names.?) |name| {
             if (err == @field(Error, name)) return @field(Error, name);
         }
@@ -698,11 +704,11 @@ pub const Db = struct {
     }
 
     /// A connection from the calling executor's pool.
-    fn take(self: *Db, ctx: *Ctx) Error!Lease {
+    fn take(self: *Client, ctx: *Ctx) Error!Lease {
         return self.takeFrom(ctx, self.pools.get(ctx.io));
     }
 
-    fn takeFrom(self: *Db, ctx: *Ctx, shard: *Shard) Error!Lease {
+    fn takeFrom(self: *Client, ctx: *Ctx, shard: *Shard) Error!Lease {
         const io = ctx.io;
         var refused: pg.Pool.ConnectError = .{ .allocator = ctx.arena };
         const timeout: std.Io.Timeout = if (self.connect_timeout) |ct|
@@ -720,7 +726,7 @@ pub const Db = struct {
     }
 
     /// Why no connection could be had, as `ServiceUnavailable`.
-    fn unavailable(self: *Db, ctx: *const Ctx, shard: *Shard, err: anyerror, refused: ?pg.Error) Error {
+    fn unavailable(self: *Client, ctx: *const Ctx, shard: *Shard, err: anyerror, refused: ?pg.Error) Error {
         const s = &self.settings;
         switch (err) {
             error.Canceled => return error.Canceled,
@@ -735,13 +741,13 @@ pub const Db = struct {
         }
     }
 
-    fn give(self: *Db, lease: Lease) void {
+    fn give(self: *Client, lease: Lease) void {
         lease.shard.pool.release(lease.conn);
         self.report(lease.shard);
     }
 
     /// Brings the pool gauges up to date with `shard`.
-    fn report(self: *Db, shard: *Shard) void {
+    fn report(self: *Client, shard: *Shard) void {
         if (self.observer.metrics == null) return;
         const stats = shard.pool.stats();
         const idle: i64 = @intCast(stats.available);
@@ -753,7 +759,7 @@ pub const Db = struct {
     /// SQLSTATE, a cancel (after telling the server to stop), or a broken
     /// connection. The lease is still the caller's to give back; one left
     /// mid-protocol is closed then.
-    fn failed(self: *Db, ctx: *const Ctx, lease: Lease, err: anyerror, tx: ?*Tx) Error {
+    fn failed(self: *Client, ctx: *const Ctx, lease: Lease, err: anyerror, tx: ?*Tx) Error {
         const conn = lease.conn;
         switch (err) {
             error.PG => {
@@ -781,7 +787,7 @@ pub const Db = struct {
         }
     }
 
-    fn canceled(_: *Db, ctx: *const Ctx, conn: *pg.Conn, tx: ?*Tx) Error {
+    fn canceled(_: *Client, ctx: *const Ctx, conn: *pg.Conn, tx: ?*Tx) Error {
         stopBackend(ctx.io, conn);
         if (tx) |t| t.state = .broken;
         return error.Canceled;
@@ -814,7 +820,7 @@ fn brokenConnection(err: anyerror) bool {
 }
 
 /// The class of a SQLSTATE (`anole.db.Class`).
-pub fn classify(code: []const u8) db.Class {
+fn classify(code: []const u8) db.Class {
     const Entry = struct { []const u8, db.Class };
     for ([_]Entry{
         .{ "23505", .unique },
@@ -863,11 +869,12 @@ fn millis(d: Duration) u32 {
     return @intCast(std.math.clamp(d.toMilliseconds(), 0, std.math.maxInt(u32)));
 }
 
-/// The verbs, with `QueryOptions` (`Db.with`).
+/// The verbs, with `QueryOptions` (`Client.with`).
 pub const Query = struct {
-    db: *Db,
+    db: *Client,
     opts: db.QueryOptions,
 
+    /// `Client.exec`, with the options' `timeout` and `prepare`.
     pub fn exec(self: Query, c: anytype, sql: []const u8, args: anytype) Error!u64 {
         return self.db.call(c, self.opts.timeout, null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
@@ -875,14 +882,17 @@ pub const Query = struct {
     // The reads go through the cache, which shares them when `opts`
     // asks (`coalesce`, `cache`) and makes the plain call otherwise.
 
+    /// `Client.one`, with the options (`coalesce` and `cache` apply).
     pub fn one(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         return self.db.cache.read(T, c, self.opts, sql, args, Read(T, .one){ .query = self });
     }
 
+    /// `Client.optional`, with the options (`coalesce` and `cache` apply).
     pub fn optional(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
         return self.db.cache.read(?T, c, self.opts, sql, args, Read(T, .optional){ .query = self });
     }
 
+    /// `Client.all`, with the options (`coalesce` and `cache` apply).
     pub fn all(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
         return self.db.cache.read([]T, c, self.opts, sql, args, Read(T, .all){ .query = self });
     }
@@ -907,32 +917,36 @@ fn Read(comptime T: type, comptime mode: Mode) type {
     };
 }
 
-/// A transaction (`Db.begin`): the verbs on its one connection, then
+/// A transaction (`Client.begin`): the verbs on its one connection, then
 /// `commit`, or `rollback`; `deinit` rolls back unless one of them ran,
 /// and gives the connection back.
 pub const Tx = struct {
-    db: *Db,
-    /// The context `begin` was given: commit and rollback report to it.
-    ctx: Ctx,
+    db: *Client,
+    /// For the rollback of `deinit`.
+    io: std.Io,
     lease: Lease,
     deadline: ?dusty.Deadline,
     state: enum { open, done, broken } = .open,
 
+    /// `Client.exec` on the transaction's connection.
     pub fn exec(self: *Tx, c: anytype, sql: []const u8, args: anytype) Error!u64 {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Exec(@TypeOf(args)){ .args = args, .prepare = true });
     }
 
+    /// `Client.one` on the transaction's connection.
     pub fn one(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = true });
     }
 
+    /// `Client.optional` on the transaction's connection.
     pub fn optional(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = true });
     }
 
+    /// `Client.all` on the transaction's connection.
     pub fn all(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = true });
@@ -947,22 +961,25 @@ pub const Tx = struct {
 
     /// Commits. A transaction that already failed (a statement of it
     /// errored) cannot: it is rolled back and this fails, as does a commit
-    /// the server refuses (a serialization failure: `Conflict`).
-    pub fn commit(self: *Tx) Error!void {
-        var c = self.ctx;
-        try self.usable(&c);
+    /// the server refuses (a serialization failure: `Conflict`). `c` is the
+    /// request (or `anole.db.Ctx`) the commit waits for, under its
+    /// deadline and the transaction's `TxOptions.timeout`.
+    pub fn commit(self: *Tx, c: anytype) Error!void {
+        try self.usable(c);
         if (self.lease.conn._state == .fail) {
             self.rollbackQuietly();
-            return c.failf(self.db.errors, .other, "the transaction had failed, so it was rolled back instead of committed", .{});
+            var ctx = erase(c);
+            return ctx.failf(self.db.errors, .other, "the transaction had failed, so it was rolled back instead of committed", .{});
         }
-        _ = try self.db.call(&c, null, self, "COMMIT", Exec(@TypeOf(.{})){ .args = .{}, .prepare = false });
+        _ = try self.db.call(c, null, self, "COMMIT", Exec(@TypeOf(.{})){ .args = .{}, .prepare = false });
         self.state = .done;
     }
 
-    pub fn rollback(self: *Tx) Error!void {
-        var c = self.ctx;
-        try self.usable(&c);
-        _ = try self.db.call(&c, null, self, "ROLLBACK", Rollback{});
+    /// Rolls back. `deinit` does it too when neither this nor `commit`
+    /// ran; call it for the error a failed rollback returns.
+    pub fn rollback(self: *Tx, c: anytype) Error!void {
+        try self.usable(c);
+        _ = try self.db.call(c, null, self, "ROLLBACK", Rollback{});
         self.state = .done;
     }
 
@@ -976,7 +993,7 @@ pub const Tx = struct {
 
     fn rollbackQuietly(self: *Tx) void {
         self.state = .done;
-        const io = self.ctx.io;
+        const io = self.io;
         // A canceled request still rolls back what it started.
         const prev = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(prev);
@@ -993,16 +1010,16 @@ pub const Tx = struct {
 
     const Rollback = struct {
         const Out = void;
-        fn run(_: *Rollback, d: *Db, ctx: *Ctx, tx: ?*Tx, _: []const u8) Error!void {
+        fn run(_: *Rollback, d: *Client, ctx: *Ctx, tx: ?*Tx, _: []const u8) Error!void {
             const t = tx.?;
             t.lease.conn.rollback() catch |err| return d.failed(ctx, t.lease, err, t);
         }
     };
 };
 
-/// A connection of pg.zig's own (`Db.acquire`).
+/// A connection of pg.zig's own (`Client.acquire`).
 pub const Conn = struct {
-    db: *Db,
+    db: *Client,
     io: std.Io,
     lease: Lease,
     /// pg.zig's connection: `query`, `row`, `exec`, `prepare`...
@@ -1021,7 +1038,7 @@ pub fn Rows(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        db: *Db,
+        db: *Client,
         ctx: Ctx,
         /// Null in a transaction (the transaction's connection).
         lease: ?Lease,
@@ -1071,7 +1088,7 @@ pub fn Rows(comptime T: type) type {
 }
 
 // ---------------------------------------------------------------------------
-// The calls' jobs: what runs under `Db.call`.
+// The calls' jobs: what runs under `Client.call`.
 
 fn Exec(comptime Args: type) type {
     return struct {
@@ -1080,7 +1097,7 @@ fn Exec(comptime Args: type) type {
 
         const Out = u64;
 
-        fn run(job: *@This(), d: *Db, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!u64 {
+        fn run(job: *@This(), d: *Client, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!u64 {
             const lease = if (tx) |t| t.lease else try d.take(ctx);
             defer if (tx == null) d.give(lease);
             const n = lease.conn.execOpts(sql, params(job.args), .{ .statement_cache = job.prepare }) catch |err| return d.failed(ctx, lease, err, tx);
@@ -1103,7 +1120,7 @@ fn Fetch(comptime T: type, comptime mode: Mode, comptime Args: type) type {
             .iterate => Rows(T),
         };
 
-        fn run(job: *@This(), d: *Db, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!Out {
+        fn run(job: *@This(), d: *Client, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!Out {
             const lease = if (tx) |t| t.lease else try d.take(ctx);
             var given = false;
             defer if (tx == null and !given) d.give(lease);
@@ -1419,7 +1436,7 @@ const Ctx = struct {
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
 
-    /// `anole.db.fail` on the context it stands for.
+    /// `internal.fail` on the context it stands for.
     fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
@@ -1435,10 +1452,10 @@ fn erase(c: anytype) Ctx {
     if (C == *Ctx or C == *const Ctx) return c.*;
     const R = struct {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return db.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = db.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,7 +1680,7 @@ test "pg: no connection before a call, and a refused one is a 503 with its reaso
     defer testing.log_level = level;
 
     // Port 1: nothing listens there.
-    const d = try Db.init(gpa, io, .{ .url = "postgres://u@127.0.0.1:1/x?sslmode=disable", .environ = .empty, .max_connections = 3 });
+    const d = try Client.init(gpa, io, .{ .url = "postgres://u@127.0.0.1:1/x?sslmode=disable", .environ = .empty, .max_connections = 3 });
     defer d.deinit();
     try testing.expectEqual(@as(usize, 2), d.pools.pools.len);
     try testing.expectEqual(@as(usize, 2), d.pools.pools[0].pool._conns.len);
@@ -1680,7 +1697,7 @@ test "pg: no connection before a call, and a refused one is a 503 with its reaso
     try testing.expectError(error.ServiceUnavailable, d.one(i64, &c, "SELECT $1::int8", .{@as(i64, 1)}));
     // The slots the failed connects reserved were given back.
     for (d.pools.pools) |*s| try testing.expectEqual(@as(usize, 0), s.pool.stats().in_use);
-    try testing.expect(!Db.ping(d, io));
+    try testing.expect(!Client.ping(d, io));
 
     // Without TLS built in, `init` refuses these (and logs why).
     try testing.expect(!SslMode.prefer.needsTls() and SslMode.require.needsTls() and SslMode.verify_full.needsTls());

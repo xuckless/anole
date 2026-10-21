@@ -19,10 +19,10 @@ const anole = @import("anole");
 /// Keeps the runtime's per-thread lines out of a Debug build.
 pub const std_options = anole.std_options;
 
-const App = struct { cache: *anole.redis.Client };
+const App = struct { redis: *anole.redis.Client };
 
 fn hits(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    try res.json(.{ .hits = try app.cache.incr(req, "example:hits") });
+    try res.json(.{ .hits = try app.redis.incr(req, "example:hits") });
 }
 
 /// Cache-aside: the answer from Redis when it is there, else made (slowly)
@@ -30,7 +30,7 @@ fn hits(app: *App, req: *anole.Request, res: *anole.Response) !void {
 fn quote(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const id = req.params.getInt(u32, "id") orelse return error.NotFound;
     const key = try std.fmt.allocPrint(req.arena, "example:quote:{d}", .{id});
-    if (try app.cache.get(req, key)) |cached| {
+    if (try app.redis.get(req, key)) |cached| {
         try res.header("X-Cache", "hit");
         res.content_type = .json;
         res.body = cached;
@@ -38,7 +38,7 @@ fn quote(app: *App, req: *anole.Request, res: *anole.Response) !void {
     }
     try req.io.sleep(.fromMilliseconds(500), .awake); // the slow part
     const body = try std.fmt.allocPrint(req.arena, "{{\"id\":{d},\"quote\":\"Simplicity is prerequisite for reliability.\"}}", .{id});
-    _ = try app.cache.set(req, key, body, .{ .ttl = .fromSeconds(30) });
+    _ = try app.redis.set(req, key, body, .{ .ttl = .fromSeconds(30) });
     try res.header("X-Cache", "miss");
     res.content_type = .json;
     res.body = body;
@@ -47,18 +47,18 @@ fn quote(app: *App, req: *anole.Request, res: *anole.Response) !void {
 fn score(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const name = req.params.get("name") orelse return error.NotFound;
     const points = req.query.getInt(i32, "points") orelse 1;
-    try res.json(.{ .name = name, .score = try app.cache.zincrBy(req, "example:board", @floatFromInt(points), name) });
+    try res.json(.{ .name = name, .score = try app.redis.zincrBy(req, "example:board", @floatFromInt(points), name) });
 }
 
 fn leaderboard(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    try res.json(try app.cache.zrangeWithScores(req, "example:board", 0, 9, .{ .rev = true }));
+    try res.json(try app.redis.zrangeWithScores(req, "example:board", 0, 9, .{ .rev = true }));
 }
 
 fn publish(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const room = req.params.get("room") orelse return error.NotFound;
     const text = try req.body() orelse return error.BadRequest;
     const channel = try std.fmt.allocPrint(req.arena, "example:room:{s}", .{room});
-    try res.json(.{ .receivers = try app.cache.publish(req, channel, text) });
+    try res.json(.{ .receivers = try app.redis.publish(req, channel, text) });
 }
 
 /// Every message published to the room, as an event. The subscription has
@@ -68,7 +68,7 @@ fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const room = req.params.get("room") orelse return error.NotFound;
     req.setTimeout(.none); // a stream, not a request with a deadline
     const channel = try std.fmt.allocPrint(req.arena, "example:room:{s}", .{room});
-    const sub = try app.cache.subscribe(req, channel);
+    const sub = try app.redis.subscribe(req, channel);
     defer sub.close();
     var buf: [1024]u8 = undefined;
     var stream = try res.startEventStream(&buf);
@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
     // REDIS_URL (redis://, rediss:// for TLS), else redis://127.0.0.1:6379.
-    state.cache = try app.redis(.{});
+    state.redis = try app.redis(.{});
     _ = app.metrics(.{}); // the pool and command times too
     _ = app.health(.{}); // /readyz sends PING
     app.use(anole.observe.AccessLog.init(.{}));

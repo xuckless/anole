@@ -2,6 +2,10 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
+//! The HTTP core (adapted from lalinsky/dusty): server, HTTP/2 engine,
+//! router, middleware, static files and client. Applications reach it as
+//! `anole.http`, and through `anole.Server`.
+
 const std = @import("std");
 
 pub const Server = @import("server.zig").Server;
@@ -22,13 +26,13 @@ pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 /// Where a response goes when a protocol engine (HTTP/2) frames it; see `Response.initSink`.
 pub const Sink = @import("sink.zig").Sink;
-/// Task placement on zio's executors, for protocol engines outside dusty
-/// (HTTP/3) that keep a connection's tasks on one executor.
+/// Task placement on zio's executors, for protocol engines outside the
+/// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
 pub const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// One time budget shared by several blocking calls (a request, then the
 /// reads of its body), as the client's `timeout` is; for protocol clients
-/// outside dusty (HTTP/2, HTTP/3).
+/// outside the core (HTTP/2, HTTP/3).
 pub const Deadline = @import("deadline.zig").Deadline;
 /// A request body delivered unframed by a protocol engine; see `Request.body_source`.
 pub const BodySource = @import("request.zig").BodySource;

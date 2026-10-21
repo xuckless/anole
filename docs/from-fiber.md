@@ -51,9 +51,9 @@ builds a whole API step by step.
 | `logger.New()` | `app.use(anole.observe.AccessLog.init(.{}));` |
 | `requestid.New()` | `app.use(anole.middleware.RequestId.init(.{}));` |
 | `compress.New()` | `app.use(anole.middleware.Compress.init());` |
-| `recover.New()` | nothing to add, and nothing like it ([below](#panics-and-recover)) |
+| `recover.New()` | nothing to add, and nothing like it ([below](#what-is-different)) |
 | `limiter.New(limiter.Config{Max: 100, Expiration: time.Minute})` | `anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window_ms = 60_000 })` ([below](#rate-limits-sessions-and-jwt)) |
-| `session.New()` and `session.FromContext(c)` | `anole.session.Middleware.init(.{ .key = key })` and `req.session` |
+| `session.New()` and `session.FromContext(c)` | `try anole.session.Middleware.init(.{ .key = key })` and `req.session` |
 | `jwtware.New(jwtware.Config{...})` (contrib/jwt) | `anole.auth.RequireJwt.init(keys, policy, .{})` and `anole.auth.claims(req)` |
 | `healthcheck.New()` | `_ = app.health(.{});` (`/healthz`, `/readyz`) |
 | `client.Get(url)` | `anole.client(req).fetch(url, .{})` |
@@ -201,13 +201,16 @@ These hold state, so they are values that live in `main` beside the app,
 rather than calls that return a handler:
 
 ```zig
-// limiter.New(): 100 requests a minute per client address.
+// limiter.New(): 100 requests a minute per client address (`.key` to count
+// by something else, `.on_error = .deny` to refuse when the limiter fails).
 var limiter = anole.ratelimit.MemoryLimiter.init(init.gpa, app.io(), .{});
 defer limiter.deinit();
 app.use(anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window_ms = 60_000 }));
 
-// session.New(): an encrypted cookie; 32 random bytes from your secret store.
-app.use(anole.session.Middleware.init(.{ .key = session_key }));
+// session.New(): an encrypted cookie; 32 random bytes from your secret store
+// (anole.session.keyFromBase64 reads one). No key is an error, not a default.
+const session_key = try anole.session.keyFromBase64(init.environ_map.get("SESSION_KEY") orelse return error.NoSessionKey);
+app.use(try anole.session.Middleware.init(.{ .key = session_key }));
 
 // contrib/jwt: Authorization: Bearer <token>, HS256 with one shared secret.
 const keys = [_]anole.auth.Key{.{ .alg = .HS256, .material = .{ .hmac = jwt_secret } }};

@@ -36,6 +36,7 @@ pub const Type = enum(u8) {
     min_key = 0xFF,
     max_key = 0x7F,
 
+    /// The type a byte names, or null for one BSON does not define.
     pub fn fromByte(b: u8) ?Type {
         return switch (b) {
             0x01...0x13, 0x7F, 0xFF => @fromBackingInt(b),
@@ -44,12 +45,14 @@ pub const Type = enum(u8) {
     }
 };
 
+/// Binary data with its subtype (a UUID is `.uuid`, 16 bytes).
 pub const Binary = struct {
     subtype: Subtype = .generic,
     /// For the old binary subtype (0x02) this is the payload without its
     /// inner length; the encoder writes the length back.
     data: []const u8,
 
+    /// The binary subtype byte; 0x80 and up are the application's.
     pub const Subtype = enum(u8) {
         generic = 0x00,
         function = 0x01,
@@ -66,6 +69,8 @@ pub const Binary = struct {
     };
 };
 
+/// A regular expression value (`{ "$regex": ..., "$options": ... }` in
+/// Extended JSON).
 pub const Regex = struct {
     pattern: []const u8,
     /// Flags such as "imsx"; the encoder writes them sorted, as the spec asks.
@@ -78,6 +83,8 @@ pub const DbPointer = struct {
     id: ObjectId,
 };
 
+/// JavaScript code with a scope document (deprecated by MongoDB, still
+/// readable).
 pub const CodeWithScope = struct {
     code: []const u8,
     scope: Document,
@@ -106,15 +113,19 @@ pub const Datetime = struct {
         try jw.writer.writeByte('"');
     }
 
+    /// The datetime `s` seconds after the epoch.
     pub fn fromSeconds(s: i64) Datetime {
         return .{ .ms = s * std.time.ms_per_s };
     }
 
+    /// A `std.Io.Timestamp`, cut to milliseconds: `.fromTimestamp(std.Io.Clock.real.now(io))`.
     pub fn fromTimestamp(t: std.Io.Timestamp) Datetime {
         return .{ .ms = t.toMilliseconds() };
     }
 };
 
+/// One BSON value, tagged by its `Type`. Strings, binary data and
+/// sub-documents point into the document they were read from.
 pub const Value = union(Type) {
     double: f64,
     string: []const u8,
@@ -167,11 +178,13 @@ pub const Value = union(Type) {
     }
 };
 
+/// A document's element: its key and value (what `Iterator.next` returns).
 pub const Element = struct {
     name: []const u8,
     value: Value,
 };
 
+/// Why `Document.init` refused the bytes.
 pub const DecodeError = error{
     /// A length prefix that is negative, too small, or runs past its
     /// container, or a document shorter than its stated length.
@@ -182,7 +195,9 @@ pub const DecodeError = error{
     /// A string without its trailing 0x00, or a key, regex or other
     /// C string without a terminator.
     InvalidString,
+    /// A string or key that is not valid UTF-8.
     InvalidUtf8,
+    /// An element type byte BSON does not define.
     UnknownType,
     /// A boolean byte other than 0 or 1.
     InvalidBoolean,
@@ -213,6 +228,7 @@ pub const Document = struct {
         return initDepth(bytes, default_max_depth);
     }
 
+    /// `init` with a nesting limit other than `default_max_depth`.
     pub fn initDepth(bytes: []const u8, max_depth: u32) DecodeError!Document {
         try validate(bytes, 0, max_depth);
         return .{ .bytes = bytes };
@@ -227,6 +243,7 @@ pub const Document = struct {
         return init(bytes[0..@intCast(len)]);
     }
 
+    /// The elements in order: `while (it.next()) |e|`.
     pub fn iterator(d: Document) Iterator {
         return .{ .bytes = d.bytes, .pos = 4 };
     }
@@ -258,6 +275,7 @@ pub const Document = struct {
         return null;
     }
 
+    /// How many elements it has (it walks them).
     pub fn count(d: Document) usize {
         var n: usize = 0;
         var it = d.iterator();
@@ -265,10 +283,13 @@ pub const Document = struct {
         return n;
     }
 
+    /// Whether it has no elements.
     pub fn isEmpty(d: Document) bool {
         return d.bytes.len == 5;
     }
 
+    /// A copy of its bytes in `arena`, to keep past the buffer it was read
+    /// from.
     pub fn dupe(d: Document, arena: std.mem.Allocator) error{OutOfMemory}!Document {
         return .{ .bytes = try arena.dupe(u8, d.bytes) };
     }
@@ -291,16 +312,20 @@ pub const Document = struct {
 pub const Array = struct {
     doc: Document,
 
+    /// `[]`.
     pub const empty: Array = .{ .doc = .empty };
 
+    /// The values in order: `while (it.next()) |v|`.
     pub fn iterator(a: Array) ValueIterator {
         return .{ .inner = a.doc.iterator() };
     }
 
+    /// How many values it has (it walks them).
     pub fn count(a: Array) usize {
         return a.doc.count();
     }
 
+    /// The value at `index`, or null past the end (it walks to it).
     pub fn at(a: Array, index: usize) ?Value {
         var it = a.iterator();
         var i: usize = 0;
@@ -310,6 +335,7 @@ pub const Array = struct {
         return null;
     }
 
+    /// Relaxed Extended JSON, for logs: `{f}`.
     pub fn format(a: Array, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return @import("extjson.zig").writeValue(w, .{ .array = a }, .relaxed);
     }
@@ -322,9 +348,11 @@ pub const Array = struct {
     }
 };
 
+/// Walks an array's values in order (`Array.iterator`).
 pub const ValueIterator = struct {
     inner: Iterator,
 
+    /// The next value, or null after the last.
     pub fn next(it: *ValueIterator) ?Value {
         return if (it.inner.next()) |e| e.value else null;
     }
@@ -335,6 +363,7 @@ pub const Iterator = struct {
     bytes: []const u8,
     pos: usize,
 
+    /// The next element, or null after the last.
     pub fn next(it: *Iterator) ?Element {
         if (it.pos + 1 >= it.bytes.len) return null;
         const t: Type = @fromBackingInt(it.bytes[it.pos]);

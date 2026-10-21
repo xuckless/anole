@@ -2,7 +2,7 @@
 //! a blocking C library) run on a pool thread while the calling coroutine
 //! waits, so the executor goes on serving everything else.
 //!
-//!     var app = try anole.Server(App).init(gpa, .{ .blocking = .{} }, &app_state);
+//!     var app = try anole.App.init(gpa, .{ .blocking = .{} });
 //!     // in a handler:
 //!     const n = try anole.blocking.run(req.io, expensive, .{ input });
 //!
@@ -23,6 +23,7 @@
 const std = @import("std");
 const zio = @import("zio");
 
+/// The pool's settings: `ServerOptions.blocking`, or `Pool.init`.
 pub const Options = struct {
     /// Jobs that run at once; more wait for a free slot. Null: half the
     /// CPUs, at least 2.
@@ -42,6 +43,7 @@ pub const RunOptions = struct {
     on_cancel: ?OnCancel = null,
 };
 
+/// A callback and its context: `call(context)`.
 pub const OnCancel = struct {
     context: ?*anyopaque,
     call: *const fn (context: ?*anyopaque) void,
@@ -57,6 +59,9 @@ pub fn Result(comptime Func: type) type {
     };
 }
 
+/// A cap on how many jobs run at once on the runtime's blocking threads.
+/// `ServerOptions.blocking` makes one for the server; `anole.blocking.run`
+/// finds it from a request's `std.Io`.
 pub const Pool = struct {
     rt: *zio.Runtime,
     threads: usize,
