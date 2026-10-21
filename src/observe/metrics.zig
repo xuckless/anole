@@ -244,12 +244,20 @@ pub const Registry = struct {
         return self.add(Histogram, &self.histograms, name, help, labels, buckets);
     }
 
+    /// A second metric of a name returns the first one (its labels must
+    /// be the same), so two users of one metric (two databases, say)
+    /// share it rather than render it twice.
     fn add(self: *Registry, comptime T: type, list: *std.ArrayList(*Family(T)), name: []const u8, help: []const u8, labels: []const []const u8, buckets: []const f64) !*Family(T) {
-        const f = try self.gpa.create(Family(T));
-        f.* = .{ .registry = self, .name = name, .help = help, .labels = labels };
-        if (T == Histogram) f.buckets = buckets;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        for (list.items) |f| if (std.mem.eql(u8, f.name, name)) {
+            std.debug.assert(f.labels.len == labels.len);
+            return f;
+        };
+        const f = try self.gpa.create(Family(T));
+        errdefer self.gpa.destroy(f);
+        f.* = .{ .registry = self, .name = name, .help = help, .labels = labels };
+        if (T == Histogram) f.buckets = buckets;
         try list.append(self.gpa, f);
         return f;
     }

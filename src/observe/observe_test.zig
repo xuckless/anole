@@ -291,6 +291,7 @@ test "observe: the exporter stops at once, not after its interval" {
     var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval_ms = 60_000 });
     try exporter.start();
     var span: observe.trace.Span = undefined;
+    span.db = null;
     span.name_len = 0;
     span.method_len = 0;
     span.route_len = 0;

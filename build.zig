@@ -2,8 +2,9 @@
 //!
 //! Features are chosen with `-Dprofile=minimal|web|full` (default `full`) and
 //! overridden one by one with `-Dtls=boringssl|none`, `-Dhttp2`, `-Dhttp3`,
-//! `-Dgrpc`, `-Dwebsocket` and `-Dauth`. The result is exposed to Zig code as
-//! the `build_options` module (re-exported as `anole.features`).
+//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and
+//! the rest below. The result is exposed to Zig code as the `build_options`
+//! module (re-exported as `anole.features`).
 //!
 //! Every C library is a lazy dependency in build.zig.zon and is requested only
 //! when a feature that needs it is on, so `-Dprofile=minimal` fetches and
@@ -65,13 +66,19 @@ pub const Features = struct {
     /// Redis/Valkey on hiredis (`anole.redis`): session and rate-limit
     /// stores.
     redis: bool,
+    /// The PostgreSQL client (`anole.pg`).
+    postgres: bool,
+    /// SQLite, the library built in (`anole.sqlite`).
+    sqlite: bool,
+    /// The MongoDB client (`anole.mongo`).
+    mongodb: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .json = false, .redis = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .json = true, .redis = false },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .json = true, .redis = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true },
         };
     }
 
@@ -92,7 +99,8 @@ pub const Features = struct {
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
             (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
-            (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth);
+            (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth) and
+            (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb);
     }
 };
 
@@ -115,6 +123,23 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
     .{ .name = "http2-no-grpc", .features = blk: {
         var f = Features.preset(.full);
         f.grpc = false;
+        break :blk f;
+    } },
+    // Everything but the database connectors.
+    .{ .name = "db-none", .features = blk: {
+        var f = Features.preset(.full);
+        f.postgres = false;
+        f.sqlite = false;
+        f.mongodb = false;
+        break :blk f;
+    } },
+    // The connectors on HTTP/1.1 alone: no TLS (plain connections only),
+    // no JSON, no compression.
+    .{ .name = "db-only", .features = blk: {
+        var f = Features.preset(.minimal);
+        f.postgres = true;
+        f.sqlite = true;
+        f.mongodb = true;
         break :blk f;
     } },
 };
@@ -350,6 +375,8 @@ pub fn build(b: *std.Build) void {
     // Options are declared before the lazy-dependency return below: one
     // first declared after it is "invalid" on a fresh cache's first pass.
     const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
+    const postgres_test_url = b.option([]const u8, "postgres-test-url", "Run the PostgreSQL tests against a live server at this URL (postgres://...)");
+    const mongodb_test_url = b.option([]const u8, "mongodb-test-url", "Run the MongoDB tests against a live server at this URL (mongodb://...)");
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
@@ -385,7 +412,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
@@ -817,6 +844,9 @@ fn resolveFeatures(b: *std.Build) Features {
     const compression = b.option(bool, "compression", "gzip/deflate (zlib-ng) and zstd (overrides the profile)");
     const json = b.option(bool, "json", "JSON on yyjson (overrides the profile)");
     const redis = b.option(bool, "redis", "Redis/Valkey client on hiredis (overrides the profile)");
+    const postgres = b.option(bool, "postgres", "PostgreSQL client (overrides the profile)");
+    const sqlite = b.option(bool, "sqlite", "SQLite, built in (overrides the profile)");
+    const mongodb = b.option(bool, "mongodb", "MongoDB client (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -828,6 +858,9 @@ fn resolveFeatures(b: *std.Build) Features {
     if (compression) |v| f.compression = v;
     if (json) |v| f.json = v;
     if (redis) |v| f.redis = v;
+    if (postgres) |v| f.postgres = v;
+    if (sqlite) |v| f.sqlite = v;
+    if (mongodb) |v| f.mongodb = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
@@ -1158,6 +1191,8 @@ const AnoleModuleOptions = struct {
     /// Add test-only imports (the h3 layout probe).
     for_test: bool = false,
     redis_test_port: ?u16 = null,
+    postgres_test_url: ?[]const u8 = null,
+    mongodb_test_url: ?[]const u8 = null,
 };
 
 /// src/root.zig with its own build_options and only the binding modules its
@@ -1174,9 +1209,15 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "compression", f.compression);
     options.addOption(bool, "json", f.json);
     options.addOption(bool, "redis", f.redis);
-    // A live Redis/Valkey for tests (`-Dredis-test-port=6379`), else those
-    // tests skip.
+    options.addOption(bool, "postgres", f.postgres);
+    options.addOption(bool, "sqlite", f.sqlite);
+    options.addOption(bool, "mongodb", f.mongodb);
+    // Live servers for tests (`-Dredis-test-port=6379`,
+    // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
+    // else those tests skip.
     options.addOption(?u16, "redis_test_port", o.redis_test_port);
+    options.addOption(?[]const u8, "postgres_test_url", o.postgres_test_url);
+    options.addOption(?[]const u8, "mongodb_test_url", o.mongodb_test_url);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
