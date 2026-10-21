@@ -101,6 +101,10 @@ pub const Collection = struct {
     /// Options: sort, projection, skip, limit, batch_size, hint, collation,
     /// comment, allow_disk_use, let, max, min, return_key, show_record_id.
     pub fn find(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError![]T {
+        return self.client.cache.read([]T, c, self.options, "find", .{ self.database, self.name, filter, opts }, Shared(.find, T){ .collection = self });
+    }
+
+    fn findNow(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError![]T {
         var cx = client_mod.erase(c);
         var out: std.ArrayList(T) = .empty;
         var sink: AllSink(T) = .{ .arena = cx.arena, .out = &out };
@@ -116,6 +120,10 @@ pub const Collection = struct {
 
     /// The first document matching `filter`, or null.
     pub fn findOptional(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!?T {
+        return self.client.cache.read(?T, c, self.options, "findOne", .{ self.database, self.name, filter, opts }, Shared(.find_optional, T){ .collection = self });
+    }
+
+    fn findOptionalNow(self: Collection, comptime T: type, c: anytype, filter: anytype, opts: anytype) CallError!?T {
         var cx = client_mod.erase(c);
         var out: std.ArrayList(T) = .empty;
         var sink: AllSink(T) = .{ .arena = cx.arena, .out = &out };
@@ -143,6 +151,13 @@ pub const Collection = struct {
     /// documents as `T`s. A pipeline ending in `$out` or `$merge` writes,
     /// and is sent as a write (with the write concern, not retried).
     pub fn aggregate(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) CallError![]T {
+        // Shared only when the pipeline is known to read: a tuple of
+        // stages whose last is neither `$out` nor `$merge`.
+        if (comptime !readsOnly(@TypeOf(pipeline))) return self.aggregateNow(T, c, pipeline, opts);
+        return self.client.cache.read([]T, c, self.options, "aggregate", .{ self.database, self.name, pipeline, opts }, Shared(.aggregate, T){ .collection = self });
+    }
+
+    fn aggregateNow(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) CallError![]T {
         var cx = client_mod.erase(c);
         var out: std.ArrayList(T) = .empty;
         var sink: AllSink(T) = .{ .arena = cx.arena, .out = &out };
@@ -183,6 +198,10 @@ pub const Collection = struct {
     /// The collection's size from its metadata: fast, but it may be off
     /// after an unclean shutdown, and it ignores no filter.
     pub fn estimatedDocumentCount(self: Collection, c: anytype) CallError!u64 {
+        return self.client.cache.read(u64, c, self.options, "count", .{ self.database, self.name }, Shared(.estimated_count, void){ .collection = self });
+    }
+
+    fn estimatedDocumentCountNow(self: Collection, c: anytype) CallError!u64 {
         var cx = client_mod.erase(c);
         var ctx: CountCmd = .{ .collection = self.name };
         return self.client.execute(&cx, self.op("count", .read, .read), &ctx);
@@ -191,9 +210,40 @@ pub const Collection = struct {
     /// The distinct values of `field` among the documents matching
     /// `filter`, as `T`s.
     pub fn distinct(self: Collection, comptime T: type, c: anytype, field: []const u8, filter: anytype) CallError![]T {
+        return self.client.cache.read([]T, c, self.options, "distinct", .{ self.database, self.name, field, filter }, Shared(.distinct, T){ .collection = self });
+    }
+
+    fn distinctNow(self: Collection, comptime T: type, c: anytype, field: []const u8, filter: anytype) CallError![]T {
         var cx = client_mod.erase(c);
         var ctx: Distinct(T, @TypeOf(filter)) = .{ .collection = self.name, .key = field, .filter = filter, .arena = cx.arena };
         return self.client.execute(&cx, self.op("distinct", .read, .read), &ctx);
+    }
+
+    /// A read as `anole.db.QueryCache` makes it: the plain call, on the
+    /// database and collection named in `args` (the cache's own copies
+    /// when the call is shared), with the caller's context or a shared
+    /// call's own.
+    fn Shared(comptime verb: enum { find, find_optional, aggregate, estimated_count, distinct }, comptime T: type) type {
+        return struct {
+            collection: Collection,
+
+            pub fn run(r: @This(), c: anytype, _: []const u8, args: anytype) CallError!switch (verb) {
+                .find, .aggregate, .distinct => []T,
+                .find_optional => ?T,
+                .estimated_count => u64,
+            } {
+                var self = r.collection;
+                self.database = args[0];
+                self.name = args[1];
+                return switch (verb) {
+                    .find => self.findNow(T, c, args[2], args[3]),
+                    .find_optional => self.findOptionalNow(T, c, args[2], args[3]),
+                    .aggregate => self.aggregateNow(T, c, args[2], args[3]),
+                    .estimated_count => self.estimatedDocumentCountNow(c),
+                    .distinct => self.distinctNow(T, c, args[2], args[3]),
+                };
+            }
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -1058,6 +1108,19 @@ fn encodeDoc(cx: *const Context, client: *Client, v: anytype, collection: []cons
 }
 
 /// The pipeline's last stage is `$out` or `$merge`.
+/// Whether a pipeline of type `P` is known at compile time to only read:
+/// a tuple of stages (structs) whose last is neither `$out` nor `$merge`.
+fn readsOnly(comptime P: type) bool {
+    const info = @typeInfo(P);
+    if (info != .@"struct" or !info.@"struct".is_tuple) return false;
+    const stages = info.@"struct".field_types;
+    for (stages) |S| if (@typeInfo(S) != .@"struct") return false;
+    if (stages.len == 0) return true;
+    const last = @typeInfo(stages[stages.len - 1]).@"struct".field_names;
+    for (last) |name| if (std.mem.eql(u8, name, "$out") or std.mem.eql(u8, name, "$merge")) return false;
+    return true;
+}
+
 fn writes(pipeline: bson.Array) bool {
     var last: ?bson.Value = null;
     var it = pipeline.iterator();

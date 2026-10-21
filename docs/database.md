@@ -570,7 +570,10 @@ zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?re
 ## Caching
 
 Two opt-in options on the reads (`one`, `optional`, `all`) of every
-connector. Nothing is shared or cached unless a call asks: a call without
+connector, and on MongoDB's `find`, `findOne`, `findOptional`, `distinct`,
+`estimatedDocumentCount`, `countDocuments` and `aggregate` (a pipeline
+written as a tuple of stages that ends in neither `$out` nor `$merge`;
+any other runs unshared). Nothing is shared or cached unless a call asks: a call without
 them is the plain call, with nothing added (no key, no lookup, no
 allocation).
 
@@ -593,7 +596,7 @@ under its own deadline and cancellation and gets its own copy of the rows
 in its own arena. A caller that is canceled or runs out of time leaves on
 its own; the others still get the rows. When every caller has left, the
 statement is canceled as a plain call's would be (a CancelRequest for
-PostgreSQL, an interrupt for SQLite). Errors reach every caller, with the
+PostgreSQL, an interrupt for SQLite, a closed connection for MongoDB). Errors reach every caller, with the
 detail in `lastError(req)`.
 
 **Result cache** (`.cache = .{ .ttl, .tag }`): the result is kept per
@@ -604,7 +607,8 @@ result from `optional` or `all` is a result and is kept.
 
 **Invalidation**: `app.db.cache.invalidate(.all)`, `.invalidate(.{ .tag =
 "posts" })` for the results cached with that tag, or
-`.invalidateQuery(sql, .{args})` for one statement's results. It reaches
+`.invalidateQuery(sql, .{args})` for one statement's results (for
+MongoDB, invalidate by tag: `app.mongo.cache.invalidate(.{ .tag = "users" })`). It reaches
 every executor at once, including a statement still running: a result read
 before the invalidation is not kept, and a caller arriving after it does
 not join that statement.
@@ -620,7 +624,7 @@ unless that write invalidated.
 Bounds are per connector, split between the executors, and least recently
 used results go first: `.cache = .{ .max_entries = 4096, .max_bytes = 32 << 20 }`
 in the connector's options (`app.postgres(.{ .cache = ... })`,
-`app.sqlite(.{ .path = ..., .cache = ... })`). A result larger than an
+`app.sqlite(.{ .path = ..., .cache = ... })`, `app.mongodb(.{ .cache = ... })`). A result larger than an
 executor's share is not kept. With `app.metrics`, each cache reports
 `anole_cache_hits_total`, `anole_cache_misses_total`,
 `anole_cache_coalesced_total`, `anole_cache_stores_total`,
@@ -633,7 +637,8 @@ optionals, arrays, structs, tagged unions and slices of these (strings
 included). A row type with another kind of pointer (`std.json.Value`, a
 pointer to a single value) runs its calls unshared, with a warning logged
 once. Arguments are compared by value: `5` as a `u8` and as an `i64` are
-the same key, the string `"5"` is not.
+the same key, the string `"5"` is not; a MongoDB filter `.{ .age = 18 }`
+is not `.{ .score = 18 }`.
 
 When not to use them:
 

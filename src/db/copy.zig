@@ -185,7 +185,12 @@ pub fn encode(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
         .@"struct" => |s| {
             try w.writeByte('r');
             try w.writeInt(u32, s.field_names.len, .little);
-            inline for (s.field_names) |name| try encode(w, @field(value, name));
+            inline for (s.field_names) |name| {
+                // By name, unless a tuple: a document filter `.{ .age = 18 }`
+                // is not `.{ .score = 18 }`.
+                if (!s.is_tuple) try str(w, 'k', name);
+                try encode(w, @field(value, name));
+            }
         },
         .@"union" => switch (value) {
             inline else => |v, tag| {
@@ -293,4 +298,7 @@ test "encode: equal when bound alike, different otherwise" {
     try testing.expect(!std.mem.eql(u8, encoded(&b1, .{ "ab", "c" }), encoded(&b2, .{ "a", "bc" })));
     try testing.expect(!std.mem.eql(u8, encoded(&b1, .{@as(?i32, null)}), encoded(&b2, .{0})));
     try testing.expectEqualStrings(encoded(&b1, .{Kind.note}), encoded(&b2, .{.note}));
+    // Documents differ by their field names.
+    try testing.expect(!std.mem.eql(u8, encoded(&b1, .{.{ .age = 18 }}), encoded(&b2, .{.{ .score = 18 }})));
+    try testing.expectEqualStrings(encoded(&b1, .{.{ .age = 18 }}), encoded(&b2, .{.{ .age = @as(u8, 18) }}));
 }
