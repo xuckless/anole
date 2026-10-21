@@ -17,8 +17,9 @@ that happens promptly.
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
 | zlib-ng, zstd, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
 | zig-protobuf | build.zig.zon | upstream commit; it pins protoc per platform |
-| websocket-zig, zig-jwt | build.zig.zon | commits of the xuckless forks, branch `anole` |
+| websocket-zig, zig-jwt, zig-sqlite | build.zig.zon | commits of the xuckless forks, branch `anole` |
 | pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
+| SQLite 3.54.1 | build.zig.zon | sqlite.org amalgamation zip, compiled by `build/sqlite.zig` |
 | translate-c | build.zig.zon | commit on its `zig-0.17.x` branch |
 
 `tools/advisories.py` holds a second copy of the C libraries' versions, so it
@@ -29,8 +30,10 @@ updating that table makes the script exit 2.
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
 whenever build.zig.zon changes. It checks nghttp2, ngtcp2, nghttp3, zlib-ng,
-zstd, yyjson and hiredis against their GitHub security advisories and the
-BoringSSL commit against OSV. A failure means a pinned version is affected:
+zstd, yyjson and hiredis against their GitHub security advisories, the
+BoringSSL commit against OSV, and SQLite against NVD's CVE list (SQLite
+publishes no GitHub advisories; `NVD_IGNORE` lists CVEs NVD matches to every
+SQLite version only because SQLite is the platform of the vulnerable product). A failure means a pinned version is affected:
 bump that library (below) and release.
 
 Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
@@ -81,6 +84,15 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      merge into `anole`, and pin the merge commit. Then run
      `tests/h3/run.sh` (WebTransport and RFC 9220 included) and
      `tests/interop/webtransport/run.sh`.
+   - **SQLite** is the amalgamation zip from sqlite.org (the URL carries
+     the year and the version as `3XXYYZZ`); check the zip's SHA3-256
+     against the download page. Its compile-time options are
+     `build/sqlite.zig`'s `config` header, which the zig-sqlite fork's
+     bindings read too; the build test (`sqlite-build-test`, part of
+     `zig build test`) checks the version number and that the options
+     reached the library. Bump the version it expects, and the zig-sqlite
+     fork's own lazy amalgamation (used only when it builds alone) with it.
+     Then run `zig build test` with `-Dsqlite` on Linux and macOS.
    - **nghttp2 and nghttp3 both ship sfparse** with the same exported
      symbols, and the linker keeps one copy. `build/nghttp3.zig`
      (`checkSharedSfparse`) stops the build when the two copies differ; then
@@ -122,6 +134,17 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   run the fork's `tests/run.sh` (a throwaway postgres:17, on std's
   Threaded Io and on zio, with and without TLS), re-pin, and run Anole's
   `tests/postgres/run.sh` (plain and verify-full TLS).
+- **zig-sqlite**: upstream's open Zig 0.17 port (vrischmann/zig-sqlite PR
+  #215) plus the fork's build changes: bindings through the translate-c
+  package, `sqlite3_initialize` in `Db.init` (Anole builds SQLite with
+  `SQLITE_OMIT_AUTOINIT`), SQLite and its options header taken from the
+  caller (`sqlite_include`, `sqlite_config`), the bundled SQLite lazy, the
+  loadable-extension path dropped. Upstream PRs are allowed for this one
+  (generic fixes only); the translate-c and build changes are offered into
+  #215's branch as Greebling/zig-sqlite#1. When #215 merges upstream, rebase
+  `anole` onto it. Run its tests (`zig build test` in the fork) after a
+  change. Anole uses it to open connections and for `Conn.run`; statements,
+  binding and rows are Anole's own (src/sqlite/root.zig).
 
 ## The HTTP core
 
@@ -152,7 +175,7 @@ build.zig.zon's `minimum_zig_version` says the same (it is only advisory).
 Moving to the next minor version (0.18):
 
 1. Move every Zig dependency to a commit that supports it: zio, zig-protobuf, the
-   websocket-zig and zig-jwt forks, and translate-c's matching branch.
+   websocket-zig, zig-jwt and zig-sqlite forks, and translate-c's matching branch.
 2. Change the version check in `build.zig`, `minimum_zig_version`, the
    README's requirements, and the CI workflows' `version:`.
 3. Re-run the `@bitCast`, `@cImport`/translate-c and `std.Io` audits the 0.17

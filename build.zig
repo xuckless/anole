@@ -15,7 +15,7 @@
 //!   test-flags  the test binary for every preset and edge combination, sharing
 //!               one build of each C library (run when the target is native)
 //!   <example>   install examples/<example> (hello, rest, websocket, grpc, auth,
-//!               clients, observe, full)
+//!               clients, observe, sqlite, full)
 //!   run-<example>  run it (`zig build run-rest -- 127.0.0.1:4000`)
 //!   full        examples/full, every listener spelled out (also part of the
 //!               default install step; the h2spec and restart scripts drive it)
@@ -94,7 +94,7 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis;
+        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
@@ -386,9 +386,6 @@ pub fn build(b: *std.Build) void {
     // fetches it with the C libraries, and never for a project depending on
     // Anole.
     const mongodb_specs = if (b.isRoot()) b.lazyDependency("mongodb_specs", .{}) else null;
-    // Temporary (db/sqlite, until -Dsqlite lands with db/shared): SQLite and
-    // zig-sqlite are fetched and built only with this on.
-    const sqlite_build_test = b.option(bool, "sqlite-build-test", "Build SQLite and zig-sqlite and add their build test to `test` (temporary)") orelse false;
 
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
@@ -438,17 +435,13 @@ pub fn build(b: *std.Build) void {
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
     }
-    // Temporary hook (db/sqlite): -Dsqlite-build-test adds build/sqlite.zig's
-    // test to `test` and as `test-sqlite`. CModules takes this over with -Dsqlite.
-    if (sqlite_build_test) if (b.lazyDependency("sqlite_amalgamation", .{})) |up| {
-        const config = sqlite_build.configHeader(b);
-        if (b.lazyDependency("zig_sqlite", sqlite_build.zigSqliteArgs(up, config, target, optimize))) |zig_sqlite| {
-            const lib = sqlite_build.library(b, up, config, target, optimize);
-            const run = sqlite_build.buildTest(b, sqlite_build.module(zig_sqlite, lib), target, optimize);
-            test_step.dependOn(&run.step);
-            b.step("test-sqlite", "SQLite and zig-sqlite build test (with -Dsqlite-build-test)").dependOn(&run.step);
-        }
-    };
+    // That the options header reached the compiled SQLite (build/sqlite.zig).
+    if (c_mods.sqlite_build_test) |run| test_step.dependOn(&run.step);
+    // test-sqlite: the SQLite tests alone ("sqlite: ...").
+    if (features.sqlite) {
+        const sqlite_tests = b.addTest(.{ .name = "anole-test-sqlite", .root_module = tests.root_module, .filters = &.{"sqlite:"}, .use_llvm = use_llvm });
+        b.step("test-sqlite", "Run the SQLite tests").dependOn(&b.addRunArtifact(sqlite_tests).step);
+    }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
@@ -598,6 +591,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },
         .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
         .{ .name = "postgres", .needs = features.postgres, .about = "a posts API on PostgreSQL (DATABASE_URL), on port 3000" },
+        .{ .name = "sqlite", .needs = features.sqlite, .about = "a to-do API on SQLite (todos.db, or a path after --), on port 3000" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;
@@ -631,6 +625,20 @@ pub fn build(b: *std.Build) void {
             const run_rest_test = b.addRunArtifact(rest_test);
             run_rest_test.skip_foreign_checks = true;
             test_step.dependOn(&run_rest_test.step);
+        }
+        if (std.mem.eql(u8, ex.name, "sqlite")) {
+            const sqlite_test = b.addTest(.{
+                .name = "sqlite-example-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/sqlite_example_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "sqlite_example", .module = ex_mod } },
+                }),
+            });
+            const run_sqlite_test = b.addRunArtifact(sqlite_test);
+            run_sqlite_test.skip_foreign_checks = true;
+            test_step.dependOn(&run_sqlite_test.step);
         }
         const run_ex = b.addRunArtifact(ex_exe);
         run_ex.addPassthruArgs();
@@ -1109,6 +1117,10 @@ const CModules = struct {
     /// without TLS, for builds that leave it out.
     pg_tls: ?*std.Build.Module = null,
     pg_plain: ?*std.Build.Module = null,
+    /// xuckless/zig-sqlite's `sqlite` module over the SQLite amalgamation
+    /// (sqlite), and the build test of the two (tests only).
+    sqlite: ?*std.Build.Module = null,
+    sqlite_build_test: ?*std.Build.Step.Run = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -1131,6 +1143,12 @@ const CModules = struct {
         const jwt_dep = if (f.auth) b.lazyDependency("zig_jwt", .{ .target = target, .optimize = optimize }) else null;
         const pg_tls_dep = if (f.postgres and f.needsTls()) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .injected }) else null;
         const pg_plain_dep = if (f.postgres) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .none }) else null;
+        // zig-sqlite translates the amalgamation's sqlite3.h, so its
+        // arguments need the amalgamation first: one more configure pass on
+        // a fresh cache.
+        const sqlite_dep = if (f.sqlite) b.lazyDependency("sqlite_amalgamation", .{}) else null;
+        const sqlite_config = if (sqlite_dep != null) sqlite_build.configHeader(b) else null;
+        const zig_sqlite_dep = if (sqlite_dep) |up| b.lazyDependency("zig_sqlite", sqlite_build.zigSqliteArgs(up, sqlite_config.?, target, optimize)) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
@@ -1143,6 +1161,7 @@ const CModules = struct {
         if (f.redis and hiredis_dep == null) return null;
         if (f.auth and jwt_dep == null) return null;
         if (f.postgres and (pg_plain_dep == null or (f.needsTls() and pg_tls_dep == null))) return null;
+        if (f.sqlite and (sqlite_dep == null or zig_sqlite_dep == null)) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
@@ -1153,6 +1172,11 @@ const CModules = struct {
         if (jwt_dep) |dep| m.jwt = dep.module("zig-jwt");
         if (pg_tls_dep) |dep| m.pg_tls = dep.module("pg");
         if (pg_plain_dep) |dep| m.pg_plain = dep.module("pg");
+        if (zig_sqlite_dep) |dep| {
+            const lib = sqlite_build.library(b, sqlite_dep.?, sqlite_config.?, target, optimize);
+            m.sqlite = sqlite_build.module(dep, lib);
+            m.sqlite_build_test = sqlite_build.buildTest(b, m.sqlite.?, target, optimize);
+        }
         if (!f.needsTranslateC()) return m;
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
@@ -1282,6 +1306,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
     if (f.auth) mod.addImport("anole_jwt", o.c.jwt.?);
     if (f.postgres) mod.addImport("anole_pg", if (f.needsTls()) o.c.pg_tls.? else o.c.pg_plain.?);
+    if (f.sqlite) mod.addImport("anole_sqlite", o.c.sqlite.?);
     // The generated test service (tests/grpc/gen), outside src/.
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),

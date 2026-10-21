@@ -13,7 +13,8 @@ attribution header and are listed in part B; that includes the HTTP core
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
 `-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
-ngtcp2 and nghttp3; `-Dpostgres` adds pg.zig and buffer.zig.
+ngtcp2 and nghttp3; `-Dpostgres` adds pg.zig and buffer.zig; `-Dsqlite`
+adds SQLite and zig-sqlite.
 
 
 A. Fetched packages
@@ -130,6 +131,24 @@ buffer.zig (byte buffers; a dependency of pg.zig)
   Pinned:   commit a0de50267550666dc126051f672a8f0b55c44083 (pinned by
             pg.zig's build.zig.zon)
   Linked:   -Dpostgres=true
+
+SQLite 3.54.1 (the amalgamation: sqlite3.c, sqlite3.h)
+  Licence:  Public domain (the dedication at the top of sqlite3.c; no
+            licence text to carry). Authors: D. Richard Hipp and the SQLite
+            developers
+  Source:   https://sqlite.org/2026/sqlite-amalgamation-3540100.zip
+            (SHA3-256 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30)
+  Linked:   -Dsqlite=true
+
+zig-sqlite (Zig bindings and driver for SQLite)
+  Licence:  MIT. Copyright (c) 2020 Vincent Rischmann <vincent@rischmann.fr>
+  Source:   https://github.com/vrischmann/zig-sqlite, used through Anole's
+            fork https://github.com/xuckless/zig-sqlite (branch anole:
+            upstream PR #215's Zig 0.17 port, bindings through the
+            translate-c package, sqlite3_initialize in Db.init, SQLite and
+            its options header taken from the caller)
+  Pinned:   commit 80742c3ce2b1917b44248371e02633cc942a1867
+  Linked:   -Dsqlite=true
 
 zig-protobuf (protobuf runtime and protoc-gen-zig; protoc release zips)
   Licence:  MIT. Copyright (c) 2021 Arwalk

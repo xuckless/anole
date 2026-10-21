@@ -45,6 +45,9 @@ const websocket = if (features.websocket) @import("websocket/root.zig") else str
 const webtransport_mod = if (features.http3) @import("webtransport.zig") else struct {
     pub const AcceptOptions = struct {};
 };
+const sqlite_mod = if (features.sqlite) @import("sqlite/root.zig") else struct {
+    pub const Db = void;
+};
 const pg_mod = if (features.postgres) @import("pg/root.zig") else struct {
     pub const Options = struct {};
     pub const Db = void;
@@ -291,7 +294,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             dirs: std.ArrayList(std.Io.Dir) = .empty,
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
-            /// The database connectors made here (`postgres`), in order.
+            /// The database connectors made here (`postgres`, `sqlite`), in order.
             connectors: std.ArrayList(Connector) = .empty,
             connectors_started: bool = false,
         };
@@ -1238,6 +1241,33 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const d = try pg_mod.Db.init(self.gpa, self.rt.io(), opts);
             errdefer d.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Db, d));
+            return d;
+        }
+
+        /// Opens a SQLite database (`anole.sqlite`), closed with the server:
+        /// a file, created when missing, or `":memory:"`, one in-memory
+        /// database for the whole app; or `anole.sqlite.Options`. Writes
+        /// run on its writer thread and reads on the blocking pool, which
+        /// this starts when `Options.blocking` did not. When serving starts
+        /// it reports to `metrics`, `tracing` and `/readyz`, whichever the
+        /// app has, and it is closed with the server, after the drain.
+        ///
+        ///     state.db = try app.sqlite("app.db");
+        ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout_ms = 10_000 });
+        pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Db {
+            if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
+            const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {
+                .pointer => .{ .path = config },
+                else => config,
+            };
+            if (self.blocking_pool == null) {
+                const p = try self.arena.allocator().create(blocking.Pool);
+                try p.init(self.rt, .{});
+                self.blocking_pool = p;
+            }
+            const d = try sqlite_mod.Db.init(self.gpa, self.rt.io(), opts);
+            errdefer d.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Db, d));
             return d;
         }
 

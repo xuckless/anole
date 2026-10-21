@@ -242,3 +242,150 @@ scram-sha-256. Against a server of your own:
 ```sh
 zig build test-postgres -Dpostgres-test-url='postgres://postgres:pw@127.0.0.1:5433/postgres'
 ```
+
+## SQLite
+
+SQLite is compiled into your program (the amalgamation, 3.54.1): no server,
+no install, one file.
+
+```zig
+const App = struct { db: *anole.sqlite.Db = undefined };
+
+pub fn main(init: std.process.Init) !void {
+    var state: App = .{};
+    var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
+    defer app.deinit();
+    state.db = try app.sqlite("app.db"); // created when missing; ":memory:" for one in memory
+    try state.db.execScript(
+        \\CREATE TABLE IF NOT EXISTS notes (
+        \\    id INTEGER PRIMARY KEY,
+        \\    title TEXT NOT NULL UNIQUE,
+        \\    done INTEGER NOT NULL DEFAULT 0
+        \\);
+    );
+    app.get("/notes", list);
+    app.get("/notes/:id", show);
+    app.post("/notes", create);
+    try app.listen(":3000");
+}
+
+const Note = struct { id: i64, title: []const u8, done: bool };
+
+fn list(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    try res.json(try app.db.all(Note, req, "SELECT id, title, done FROM notes ORDER BY id LIMIT ?", .{50}));
+}
+
+fn show(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const id = req.params.getInt(i64, "id") orelse return error.NotFound;
+    try res.json(try app.db.one(Note, req, "SELECT id, title, done FROM notes WHERE id = ?", .{id})); // none: 404
+}
+
+fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const in = try req.bind(struct { title: []const u8 });
+    // The same title twice: error.Conflict, a 409.
+    const note = try app.db.one(Note, req, "INSERT INTO notes (title) VALUES (?) RETURNING id, title, done", .{in.title});
+    res.status = .created;
+    try res.json(note);
+}
+```
+
+`examples/sqlite` is a complete to-do API: `zig build run-sqlite`.
+
+### Where the work runs
+
+SQLite reads and writes its file on the thread that runs a statement, so
+no statement runs on an executor:
+
+- **Writes** go to the database's writer thread, which owns the one
+  read-write connection: `exec`, any statement that changes something
+  (`INSERT ... RETURNING` through `one` included), and transactions.
+  Writers take turns in arrival order, so they never get `SQLITE_BUSY`
+  from each other.
+- **Reads** (`SELECT`, `WITH`, `VALUES`, `PRAGMA`, `EXPLAIN`) run on the
+  server's blocking pool over read-only connections, one per executor (at
+  most 8). The database is in WAL mode, so reads run beside a write and
+  never wait for it. A read that turns out to write (`WITH ... INSERT`)
+  moves to the writer by itself; `with(.{ .write = true })` sends one
+  there directly (a `SELECT` of a function with side effects).
+- **`:memory:`** is one database for the whole app, on the writer's
+  connection: every executor sees the same tables.
+
+`app.sqlite` starts the blocking pool when `Options.blocking` did not.
+
+Each connection runs with `journal_mode=WAL`, `synchronous=NORMAL`,
+`busy_timeout=5000` and `foreign_keys=ON`. Prepared statements are kept per
+connection, by SQL text (64 by default; `.prepare = false` for SQL built at
+run time).
+
+### Transactions
+
+```zig
+fn move(tx: *anole.sqlite.Tx, req: *anole.Request, from: i64, to: i64, amount: i64) !void {
+    _ = try tx.exec(req, "UPDATE accounts SET balance = balance - ? WHERE id = ?", .{ amount, from });
+    _ = try tx.exec(req, "UPDATE accounts SET balance = balance + ? WHERE id = ?", .{ amount, to });
+}
+
+try app.db.transaction(req, .{ .retries = 3 }, move, .{ req, from, to, amount });
+```
+
+A transaction holds the writer (`BEGIN IMMEDIATE`) until it commits or
+rolls back, so make it short, and inside it use the `Tx`, not the `Db`: a
+write on the `Db` would wait for the transaction's own writer. `transaction`
+runs again after `SQLITE_BUSY` (another process held the file past
+`busy_timeout_ms`, as during a restart), up to `retries` more times.
+`begin(req, .{ .read_only = true })` is a snapshot on a reader that writes
+do not disturb.
+
+### Options
+
+```zig
+state.db = try app.sqlite(.{
+    .path = "data/app.db",       // or "sqlite:data/app.db", ":memory:"
+    .readers = 4,                // read-only connections; 0: everything on the writer
+    .busy_timeout_ms = 5000,     // waiting for a lock another process holds
+    .statement_cache = 64,       // per connection
+    .pragmas = &.{"PRAGMA cache_size = -20000"}, // run on every connection
+});
+```
+
+### Values
+
+| Zig | SQLite |
+| --- | --- |
+| integers, `bool` | INTEGER |
+| floats | REAL |
+| `[]const u8` | TEXT (a BLOB column reads as its bytes) |
+| `anole.sqlite.Blob` | BLOB |
+| enums | TEXT, their name (an INTEGER column reads by value) |
+| `anole.db.Time` | TEXT as SQLite writes times (`2026-10-21 09:30:00.25`, UTC); reads `unixepoch()` integers and `julianday()` reals too |
+| optionals | NULL for null |
+| other structs and slices | JSON text |
+
+### Errors
+
+| SQLite | Error | Status |
+| --- | --- | --- |
+| `CONSTRAINT_UNIQUE`, `CONSTRAINT_PRIMARYKEY` | `error.Conflict` | 409 |
+| `BUSY` past `busy_timeout_ms`, `LOCKED` | `error.ServiceUnavailable` | 503 |
+| interrupted by `with(.{ .timeout })` | `error.GatewayTimeout` | 504 |
+| `CONSTRAINT_FOREIGNKEY`, `_NOTNULL`, `_CHECK`, the rest | `error.Database` | 500 |
+
+`anole.db.lastError(req)` has SQLite's extended result code (`2067`), its
+message, and for a constraint its name and table (`users.email`, `users`).
+`errors` moves the classes, as for PostgreSQL:
+`app.sqlite(.{ .path = "app.db", .errors = .{ .foreign_key = .unprocessable_entity } })`.
+
+### What it reports
+
+When serving starts, `app.sqlite`'s database reports through what the app
+has, whatever the order of the calls: `anole_db_*` metrics with
+`system="sqlite"` and `db` the file's name (`app.metrics`), a span per call
+(`app.tracing`), and a readiness check that runs `SELECT 1` within a second
+(`/readyz`, `app.health`).
+
+### Driver calls
+
+`acquire(req)` holds the writer connection for SQLite's own API through
+zig-sqlite (user functions, blobs, backups): `conn.run(func, args)` runs
+`func(driver_db, args...)` on the writer thread; `conn.release()` gives it
+back. `anole.sqlite.c` is the C API.

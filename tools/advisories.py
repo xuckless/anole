@@ -4,7 +4,8 @@
     tools/advisories.py [path/to/build.zig.zon]
 
 Versioned upstreams are checked against their GitHub security advisories,
-BoringSSL (pinned by commit, no releases) against OSV. Exits 1 when a pin is
+BoringSSL (pinned by commit, no releases) against OSV, SQLite (no GitHub
+advisories) against NVD's CVE list. Exits 1 when a pin is
 affected, 2 when a pin moved and the table below needs updating. Set
 GH_TOKEN (or GITHUB_TOKEN) to avoid GitHub's anonymous rate limit.
 """
@@ -28,6 +29,13 @@ VERSIONED = {
     "hiredis": ("redis/hiredis", "1.5.0", r"hiredis/archive/refs/tags/v1\.5\.0\.tar"),
 }
 BORINGSSL = re.compile(r"google/boringssl/archive/([0-9a-f]{40})\.tar")
+# SQLite: (version, pattern that must match the amalgamation's pin).
+SQLITE = ("3.54.1", r"sqlite\.org/2026/sqlite-amalgamation-3540100\.zip")
+# CVEs NVD matches to every SQLite version because SQLite is only the
+# platform in their configurations, not the vulnerable product.
+NVD_IGNORE = {
+    "CVE-2022-31631": "PHP's PDO::quote(), SQLite as its platform",
+}
 
 
 def fetch(url, body=None):
@@ -98,6 +106,18 @@ def main():
             print(f"    {x['id']}: {x.get('summary', '')}")
         if vulns:
             affected.append("boringssl")
+
+    pinned, pattern = SQLITE
+    if not re.search(pattern, zon):
+        stale.append("sqlite")
+    else:
+        cves = fetch(f"https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:a:sqlite:sqlite:{pinned}").get("vulnerabilities", [])
+        hits = [x["cve"]["id"] for x in cves if x["cve"]["id"] not in NVD_IGNORE]
+        print(f"sqlite {pinned}: NVD " + ("AFFECTED" if hits else f"none apply ({len(cves)} matched, ignored: {', '.join(NVD_IGNORE)})"))
+        for h in hits:
+            print("    " + h)
+        if hits:
+            affected.append("sqlite")
 
     if stale:
         print("pin changed, update tools/advisories.py: " + ", ".join(stale))
