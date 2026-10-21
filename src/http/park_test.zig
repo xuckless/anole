@@ -38,6 +38,10 @@ const Client = struct {
 
     fn open(self: *Client, io: std.Io, addr: std.Io.net.IpAddress, secure: bool) !void {
         self.stream = try addr.connect(io, .{ .mode = .stream });
+        // Callers start from `undefined`, so the field's default never
+        // applies: a plain connection must say it has no TLS, or `reader`
+        // and `writer` take whatever the bytes happen to hold for one.
+        self.tls_conn = if (have_tls) null else {};
         if (comptime have_tls) if (secure) {
             self.tcp_reader = self.stream.reader(io, &self.plain_in);
             self.tcp_writer = self.stream.writer(io, &self.plain_out);
