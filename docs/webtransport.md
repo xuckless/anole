@@ -174,7 +174,9 @@ stream; every stream of the session is reset. When the peer closes, or the
 CONNECT stream or the connection goes, every wait on the session fails with
 `error.SessionClosed` (or `error.ConnectionClosed`), and
 `session.closeInfo()` says how it ended: the code, the message, and `by`
-(`.local`, `.peer` or `.connection`).
+(`.local`, `.peer` or `.connection`). What the CONNECT stream received
+before the connection went is read first, so a peer that closes its session
+and then its connection right away counts as `.peer`, with its code.
 
 A handler usually loops on `acceptStream` or `receiveDatagram` and returns
 when they fail.

@@ -250,11 +250,17 @@ pub const Core = struct {
     }
 
     /// The connection is gone: every waiter wakes to it. Locked.
+    ///
+    /// Sessions are not ended here but by their capsule readers, which
+    /// first read what their CONNECT streams had already received and
+    /// then see those streams fail (`.connection`) or end (`.peer`). A
+    /// peer's close capsule that arrived just before its CONNECTION_CLOSE,
+    /// possibly in the same batch of datagrams with no task run in
+    /// between, so still counts as the peer's close, whichever task runs
+    /// first.
     pub fn connectionClosed(core: *Core) void {
         if (core.closed) return;
         core.closed = true;
-        var sessions = core.sessions.valueIterator();
-        while (sessions.next()) |s| s.*.endLocked(.{ .code = 0, .reason = "", .by = .connection });
         var it = core.streams.valueIterator();
         while (it.next()) |s| {
             const stream = s.*;
@@ -773,9 +779,9 @@ pub const Session = struct {
         while (true) {
             const gen = core.host.gen.load(.acquire);
             core.host.lock();
-            if (self.state != .open) {
+            if (self.state != .open or core.closed) {
                 core.host.unlock();
-                return error.SessionClosed;
+                return if (self.state != .open) error.SessionClosed else error.ConnectionClosed;
             }
             var id: i64 = -1;
             const rv = if (kind == .bidi)
@@ -886,9 +892,9 @@ pub const Session = struct {
         while (true) {
             const gen = core.host.gen.load(.acquire);
             core.host.lock();
-            if (self.state != .open) {
+            if (self.state != .open or core.closed) {
                 core.host.unlock();
-                return error.SessionClosed;
+                return if (self.state != .open) error.SessionClosed else error.ConnectionClosed;
             }
             if (data.len > self.maxDatagramLocked()) {
                 core.host.unlock();
@@ -921,7 +927,11 @@ pub const Session = struct {
             return;
         }
         self.endLocked(.{ .code = code, .reason = message, .by = .local });
+        // The connection is gone (the session's capsule reader has not
+        // ended it yet): no capsule can go out.
+        const gone = core.closed;
         core.host.unlock();
+        if (gone) return self.endChannel();
         var capsule: [8 + 8 + 4 + max_close_message]u8 = undefined;
         var n = putVarint(&capsule, capsule_close);
         n += putVarint(capsule[n..], 4 + message.len);
