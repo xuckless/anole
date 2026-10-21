@@ -124,7 +124,7 @@ test "adapt: a (req, res) handler on a server with state" {
             res.status = .accepted;
         }
         fn stateful(s: *State, _: *dusty.Request, res: *dusty.Response) !void {
-            res.status = @enumFromInt(s.n);
+            res.status = @fromBackingInt(@intCast(s.n));
         }
     };
     const a: dusty.Router(State).Handler = adapt(State, H.plain);

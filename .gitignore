@@ -35,3 +35,7 @@ research/
 
 # Zig 0.17 unpacks fetched packages into the project
 zig-pkg/
+
+# Python bytecode
+__pycache__/
+*.pyc

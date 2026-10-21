@@ -820,7 +820,7 @@ pub const Relay = struct {
 
 fn request(conn: *client.ClientConnection, method: []const u8, path: []const u8, options: client.ClientConnection.RequestOptions) !*client.Stream {
     return conn.request(&.{
-        .{ .name = ":method", .value = method }, .{ .name = ":path", .value = path },
+        .{ .name = ":method", .value = method },  .{ .name = ":path", .value = path },
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     }, options);
 }

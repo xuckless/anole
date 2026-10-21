@@ -372,7 +372,7 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
                 try early.put("Early-Data", "1");
                 var too_early = try dc.fetch(try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/hello", .{port}), .{ .method = .post, .headers = &early, .body = "" });
                 defer too_early.deinit();
-                try std.testing.expectEqual(@as(u16, 425), @intFromEnum(too_early.status()));
+                try std.testing.expectEqual(@as(u16, 425), @backingInt(too_early.status()));
             }
             const q = a.http3Address().?;
             var alt_buf: [64]u8 = undefined;

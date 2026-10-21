@@ -71,7 +71,6 @@ pub const ConnectOptions = struct {
     };
 };
 
-
 pub const ClientStream = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
