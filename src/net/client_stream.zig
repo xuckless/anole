@@ -230,6 +230,9 @@ pub const ClientStream = struct {
     /// waiting in `reader` (a monitor, say) wakes with an error. `close`
     /// still follows.
     pub fn shutdown(self: *ClientStream) void {
+        // Done even for a caller being canceled, whose cancel stays pending.
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
         self.socket.shutdown(self.io, .both) catch {};
     }
 

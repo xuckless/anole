@@ -657,16 +657,14 @@ pub fn Engine(comptime Ctx: type) type {
                 var timer: Timer = .init(null);
                 if (timer.canBound()) timer.set(conn.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
                 defer timer.clear(conn.io);
-                conn.connection.closeNotify();
+                // A cancel in close_notify's write (the teardown's, or the
+                // bound here for a peer that stopped reading): end both
+                // directions, so the reader stops too, and pass it on.
+                conn.connection.closeNotify() catch |err| {
+                    conn.connection.stream.shutdown(conn.io, .both) catch {};
+                    return err;
+                };
             }
-            // close_notify's write took a cancel (the teardown's, or the
-            // bound above for a peer that stopped reading), which the TLS
-            // layer does not report: end both directions, so the reader
-            // stops too, and pass the cancel on.
-            if (conn.connection.getWriteError()) |err| if (err == error.Canceled) {
-                conn.connection.stream.shutdown(conn.io, .both) catch {};
-                return error.Canceled;
-            };
             conn.connection.stream.shutdown(conn.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return false,
