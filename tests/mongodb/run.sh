@@ -3,7 +3,8 @@
 # MongoDB in Docker: a replica set of one, with authentication (a keyfile
 # made in the container), test commands on (failCommand), and TLS on the
 # same port (allowTLS) with a CA and server certificate made here, in a
-# temporary directory, never committed.
+# temporary directory, never committed. On a failure the server's log is
+# printed before the container goes.
 #
 #   tests/mongodb/run.sh                 # mongo:8.0
 #   tests/mongodb/run.sh mongo:7.0       # another image
@@ -21,43 +22,65 @@ work="$(mktemp -d)"
 password="anole-$(head -c 9 /dev/urandom | base64 | tr -d '/+=')"
 
 cleanup() {
+    status=$?
+    if [ "$status" -ne 0 ] && docker inspect "$name" >/dev/null 2>&1; then
+        echo "-- $image log (last 60 lines) --" >&2
+        docker logs --tail 60 "$name" >&2 2>&1 || true
+    fi
     if [ -z "${KEEP:-}" ]; then docker rm -f "$name" >/dev/null 2>&1 || true; fi
     rm -rf "$work"
+    exit "$status"
 }
 trap cleanup EXIT
 
 # A CA and a certificate for localhost and 127.0.0.1, valid for a day.
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=anole test CA" \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
     -keyout "$work/ca.key" -out "$work/ca.pem" 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
     -keyout "$work/server.key" -out "$work/server.csr" 2>/dev/null
-printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n' >"$work/ext.cnf"
+printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' >"$work/ext.cnf"
 openssl x509 -req -in "$work/server.csr" -CA "$work/ca.pem" -CAkey "$work/ca.key" -CAcreateserial \
     -days 1 -extfile "$work/ext.cnf" -out "$work/server.crt" 2>/dev/null
 cat "$work/server.crt" "$work/server.key" >"$work/server.pem"
-chmod 644 "$work"/*.pem
+rm -f "$work/server.crt" "$work/server.key" "$work/server.csr" "$work/ext.cnf"
 
 # The member's name is localhost:$port, the port published as itself, so
 # the client reaches what the replica set configuration names.
-docker run -d --rm --name "$name" -p "127.0.0.1:$port:$port" \
+#
+# mongod runs as the image's mongodb user, which cannot read the mounted
+# directory on a Linux host (mktemp's 0700, the runner's uid), so root
+# copies the files into the container and hands them over first, as
+# tests/postgres/run.sh does with its key.
+docker run -d --name "$name" -p "127.0.0.1:$port:$port" \
     -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD="$password" \
-    -v "$work:/certs:ro" --entrypoint bash "$image" -c "
-        head -c 756 /dev/urandom | base64 > /tmp/keyfile && chmod 400 /tmp/keyfile && chown mongodb /tmp/keyfile &&
-        exec docker-entrypoint.sh mongod --port $port --bind_ip_all --replSet rs0 --keyFile /tmp/keyfile \
+    -v "$work:/certs.host:ro" --entrypoint bash "$image" -ec "
+        mkdir -p /etc/anole-tls && cp /certs.host/server.pem /certs.host/ca.pem /etc/anole-tls/
+        chown -R mongodb:mongodb /etc/anole-tls && chmod 600 /etc/anole-tls/server.pem && chmod 644 /etc/anole-tls/ca.pem
+        head -c 756 /dev/urandom | base64 > /etc/anole-tls/keyfile
+        chown mongodb:mongodb /etc/anole-tls/keyfile && chmod 400 /etc/anole-tls/keyfile
+        exec docker-entrypoint.sh mongod --port $port --bind_ip_all --replSet rs0 --keyFile /etc/anole-tls/keyfile \
             --setParameter enableTestCommands=1 \
-            --tlsMode allowTLS --tlsCertificateKeyFile /certs/server.pem --tlsCAFile /certs/ca.pem \
+            --tlsMode allowTLS --tlsCertificateKeyFile /etc/anole-tls/server.pem --tlsCAFile /etc/anole-tls/ca.pem \
             --tlsAllowConnectionsWithoutCertificates" >/dev/null
 
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]; }
 mongosh() { docker exec "$name" mongosh --quiet --port "$port" -u root -p "$password" --authenticationDatabase admin "$@"; }
-for _ in $(seq 1 60); do
-    if mongosh --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then break; fi
+# The entrypoint starts mongod once to create the user, then again for good.
+ready=""
+for _ in $(seq 1 90); do
+    running || { echo "mongod exited during startup" >&2; exit 1; }
+    if mongosh --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
 done
+[ -n "$ready" ] || { echo "mongod did not answer within 90 s" >&2; exit 1; }
 mongosh --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:$port'}]})" >/dev/null
+ready=""
 for _ in $(seq 1 60); do
-    if [ "$(mongosh --eval 'db.hello().isWritablePrimary' 2>/dev/null)" = "true" ]; then break; fi
+    if [ "$(mongosh --eval 'db.hello().isWritablePrimary' 2>/dev/null)" = "true" ]; then ready=1; break; fi
     sleep 1
 done
+[ -n "$ready" ] || { echo "the replica set has no primary after 60 s" >&2; exit 1; }
 mongosh --eval "db.getSiblingDB('admin').createUser({user: 'sha1', pwd: '$password', roles: ['root'], mechanisms: ['SCRAM-SHA-1']})" >/dev/null
 echo "$image ready on localhost:$port (replica set rs0)"
 
