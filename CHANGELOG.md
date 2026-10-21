@@ -56,6 +56,17 @@ for macOS and Linux.
   ends rather than staying with the set. `res.addHeader` adds a header
   that may repeat (`Vary`); adding to `res.headers` directly is limited to
   its current room.
+- A WebSocket holds less (cgroup per socket, 10k sockets, Linux): an
+  upgraded HTTP/1.1 connection keeps one page of its request (the head the
+  handler can still read, beside the arena's first chunk) and reads frames
+  into the rest of that page; its writer borrows a pooled buffer only
+  while it has frames waiting (a small frame sent at once is built on the
+  stack), so a quiet or echoing socket holds none. A callback socket gives
+  its request buffers back right after the handshake instead of when it
+  first parks. A `ws.next()` socket 32 to 22 KB idle or busy (TLS 37 to
+  27); a callback socket 36 to 18.5 KB during a connect burst, 22 to 15 KB
+  busy, 7.8 to 3.9 KB parked. Over HTTP/2 and HTTP/3 a socket's two frame
+  buffers are 4 KB each instead of 16.
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with

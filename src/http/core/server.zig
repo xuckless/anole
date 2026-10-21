@@ -403,11 +403,8 @@ pub const Connection = struct {
     /// answer holds none. Without memory for one, the writes go out
     /// unbuffered, one each.
     pub fn prepareWrite(self: *Connection) void {
-        if (self.writer.buffer.len != 0 or self.upgraded) return;
-        const pool = self.write_pool orelse return;
-        const w = pool.takeWriteBuffer(@intFromPtr(self)) catch return;
-        self.write_held = w;
-        self.writer.buffer = pool.writeBytes(w);
+        if (self.upgraded) return;
+        lendWriteBuffer(self);
     }
 
     /// Takes the write buffer back, throwing away what it holds, and gives
@@ -448,30 +445,31 @@ pub const Connection = struct {
         r.rebase(r.buffer.len) catch unreachable;
     }
 
-    /// Smallest reader and writer windows `shrinkForUpgrade` leaves. A frame
-    /// bigger than its window still goes through in one call: a read that
-    /// big lands straight in the caller's slice, and a write goes out with
-    /// what the window holds in one vectored write.
+    /// Smallest reader window `shrinkForUpgrade` leaves. A frame bigger
+    /// than it still goes through in one call: a read that big lands
+    /// straight in the caller's slice.
     pub const upgrade_window_min = 1024;
 
     /// For a connection the request upgraded (a WebSocket): it lives on as
     /// long as the peer keeps it open, mostly idle, with the request's
     /// buffers still under it, because the head the handler may still read
-    /// (its URL, headers and parameters) is in them. So the reader and the
-    /// writer move to small windows just past the head, and the rest of the
-    /// buffers' pages go back to the OS (Linux, `MADV_DONTNEED`): the socket
-    /// keeps the pages the head and the windows touch, rather than every
-    /// page of the set a bigger request, here or earlier, dirtied. The
-    /// windows reach to the end of the page the minimums end in, so that
-    /// page is used whole. What the peer already sent past the head stays
-    /// buffered. Before anything is written to the connection after the
-    /// head was read, so the 101 goes through the new window.
+    /// (its URL, headers and parameters) is in them, and the arena too. So
+    /// the reader moves to a small window just past the head, to the end of
+    /// the page the head ends on (or of the next, when that leaves less
+    /// than `upgrade_window_min`), and the rest of the read buffer's pages
+    /// go back to the OS (Linux, `MADV_DONTNEED`): the socket keeps the
+    /// page the head shares with the arena's first chunk, rather than every
+    /// page of the buffer a bigger request, here or earlier, dirtied. What
+    /// the peer already sent past the head stays buffered. The writer gets
+    /// no window: the 101 goes out through a pooled buffer, and the
+    /// upgraded protocol's writes borrow one while they have something to
+    /// send (`transport`, `Transport.write_buffers`). Before anything is
+    /// written to the connection after the head was read.
     pub fn shrinkForUpgrade(self: *Connection) void {
         const r = self.reader;
-        const w = self.writer;
         // Not reading from the pooled buffer (a test's fixed reader), or
         // the writer holds something already.
-        if (self.read_buffer.len == 0 or w.end != 0) return;
+        if (self.read_buffer.len == 0 or self.writer.end != 0) return;
         const read_end = @intFromPtr(self.read_buffer.ptr) + self.read_buffer.len;
         if (@intFromPtr(r.buffer.ptr) < @intFromPtr(self.read_buffer.ptr) or @intFromPtr(r.buffer.ptr) + r.buffer.len != read_end) return;
 
@@ -484,40 +482,45 @@ pub const Connection = struct {
 
         const start = @intFromPtr(room.ptr);
         const page = std.heap.pageSize();
-        const min_read = @max(buffered_len, upgrade_window_min);
-        const end = std.mem.alignForward(usize, start + min_read + upgrade_window_min, page);
-        const span = end - start;
-        if (span > room.len) {
-            // No room for both: the reader keeps its view, the writer a
-            // window of its own buffer.
-            w.buffer = w.buffer[0..@min(w.buffer.len, @max(upgrade_window_min, page))];
-            return;
-        }
-        const read_len = @max(min_read, span / 2);
-        r.buffer = room[0..read_len];
-        const old_write = w.buffer;
-        w.buffer = room[read_len..span];
+        const end = std.mem.alignForward(usize, start + @max(buffered_len, upgrade_window_min), page);
+        // No room past the window: the reader keeps its view.
+        if (end - start >= room.len) return;
+        r.buffer = room[0 .. end - start];
 
-        // Give back the pages past the windows: the rest of the read buffer
-        // and, where it follows it in the same allocation (the pool's
-        // sets), the write buffer.
+        // Give back the pages of the read buffer past the window.
         if (comptime builtin.os.tag != .linux) return;
-        var release_end = read_end;
-        if (@intFromPtr(old_write.ptr) == read_end) release_end += old_write.len;
-        const from = std.mem.alignForward(usize, end, page);
-        const to = std.mem.alignBackward(usize, release_end, page);
-        if (to <= from) return;
-        _ = std.os.linux.madvise(@ptrFromInt(from), to - from, std.os.linux.MADV.DONTNEED);
+        const to = std.mem.alignBackward(usize, read_end, page);
+        if (to <= end) return;
+        _ = std.os.linux.madvise(@ptrFromInt(end), to - end, std.os.linux.MADV.DONTNEED);
     }
 
     /// Once the 101 of an upgrade is out: the connection is the upgraded
-    /// protocol's, and its writer keeps the window `shrinkForUpgrade` gave
-    /// it, or none, rather than a buffer from `write_pool` that it would
-    /// hold for as long as it is open (and an adopter, past the request
-    /// that would give it back).
+    /// protocol's, and its writer gives back the buffer the 101 went
+    /// through. From here it borrows one only while it has something to
+    /// send (`transport`), rather than holding one for as long as the
+    /// connection is open.
     pub fn finishUpgrade(self: *Connection) void {
-        if (self.write_held != null) self.releaseWriteBuffer();
+        self.releaseWriteBuffer();
         self.upgraded = true;
+    }
+
+    /// `Transport.WriteBuffers.take`: a buffer from `write_pool`, upgraded
+    /// or not.
+    fn lendWriteBuffer(context: *anyopaque) void {
+        const self: *Connection = @ptrCast(@alignCast(context));
+        if (self.writer.buffer.len != 0) return;
+        const pool = self.write_pool orelse return;
+        const w = pool.takeWriteBuffer(@intFromPtr(self)) catch return;
+        self.write_held = w;
+        self.writer.buffer = pool.writeBytes(w);
+    }
+
+    /// `Transport.WriteBuffers.give`: back to `write_pool`, with nothing
+    /// left in it. A buffer that is not the pool's stays.
+    fn takeBackWriteBuffer(context: *anyopaque) void {
+        const self: *Connection = @ptrCast(@alignCast(context));
+        if (self.write_held == null or self.writer.end != 0) return;
+        self.releaseWriteBuffer();
     }
 
     /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
@@ -595,6 +598,11 @@ pub const Connection = struct {
             .tcp_writer = &self.tcp_writer,
             .tls_reader = if (has_tls) &self.tls_reader else null,
             .tls_writer = if (has_tls) &self.tls_writer else null,
+            .write_buffers = if (self.write_pool != null) .{
+                .context = self,
+                .take = lendWriteBuffer,
+                .give = takeBackWriteBuffer,
+            } else null,
         };
     }
 
@@ -2151,6 +2159,9 @@ pub fn Server(comptime Ctx: type) type {
         /// task on its executor, with no other task serving it.
         fn closeConn(self: *Self, conn: *Conn) void {
             if (conn.connection.adopter) |a| a.release(a);
+            // A buffer an upgraded writer borrowed and never gave back (its
+            // last flush failed).
+            if (conn.connection.write_held != null) conn.connection.releaseWriteBuffer();
             conn.connection.deinit();
             conn.connection.stream.close(self.io);
             if (conn.material) |m| m.release(self.allocator);
@@ -2645,8 +2656,19 @@ pub fn Server(comptime Ctx: type) type {
                         // rather than a task's.
                         conn.counted = busy.*;
                         busy.* = false;
-                        // The first run, on this task, with the request's
-                        // buffers still under the windows the upgrade left.
+                        // The adopter keeps nothing of the request's
+                        // (`Response.adopt`), so its buffers go back before
+                        // the first run, rather than when the socket first
+                        // parks: a burst of upgrades does not hold a set
+                        // each meanwhile. Unless the peer sent something
+                        // behind the handshake already, which the first run
+                        // reads from the window the upgrade left in them,
+                        // and they go back after it.
+                        if (connection.reader.bufferedLen() == 0) if (buffers) |b| {
+                            connection.replaceReadBuffer(&.{});
+                            self.request_buffers.release(b);
+                            buffers = null;
+                        };
                         adopter_ran = true;
                         return self.serveAdopted(conn, timer);
                     }

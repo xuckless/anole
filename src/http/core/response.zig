@@ -1628,6 +1628,12 @@ pub const Response = struct {
         if (self.written) {
             return;
         }
+        // An upgrade's 101 went out with it, and the connection is the
+        // upgraded protocol's: its writer is not this response's to flush.
+        if (self.status == .switching_protocols and self.sink == null and self.conn.upgraded) {
+            self.written = true;
+            return;
+        }
         // A handler that failed part way through may never have called
         // `end`. Its buffer is gone, so whatever it held is lost either
         // way; recover rather than take the process down, and make sure a

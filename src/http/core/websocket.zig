@@ -444,6 +444,7 @@ pub const WebSocket = struct {
         errdefer self.closed = true;
         self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
+        self.giveBackWriteBuffer();
     }
 
     /// Writes out what a batch held, if anything still holds it.
@@ -454,6 +455,22 @@ pub const WebSocket = struct {
         errdefer self.closed = true;
         self.batch.flushing();
         try self.resolveWrite(self.transport.writer.flush());
+        self.giveBackWriteBuffer();
+    }
+
+    /// Borrows a buffer for the writer from the connection, when it lends
+    /// them (`Transport.write_buffers`) and the writer has none: the frames
+    /// about to be sent are built in it. Under `write_mutex`.
+    fn borrowWriteBuffer(self: *WebSocket) void {
+        const lender = self.transport.write_buffers orelse return;
+        lender.take(lender.context);
+    }
+
+    /// Gives a borrowed write buffer back once a flush left nothing in it,
+    /// so a quiet socket holds none. Under `write_mutex`.
+    fn giveBackWriteBuffer(self: *WebSocket) void {
+        const lender = self.transport.write_buffers orelse return;
+        lender.give(lender.context);
     }
 
     /// Writes out what a batch held, now: before the reading task waits
@@ -473,9 +490,10 @@ pub const WebSocket = struct {
     /// For a socket that waits with no task reading it (a parked
     /// connection): its batch's flusher task ends, anything left in the
     /// write buffer goes out, and the reader and the writer give up their
-    /// buffers, so frames other tasks send meanwhile go out unbuffered, one
-    /// write each. The messages' memory goes back. By the reading task, at
-    /// rest (`atRest`), with what a batch held flushed (`flushBatch`);
+    /// buffers, so frames other tasks send meanwhile go out through a
+    /// borrowed buffer (`Transport.write_buffers`), or unbuffered, one write
+    /// each. The messages' memory goes back. By the reading task, at rest
+    /// (`atRest`), with what a batch held flushed (`flushBatch`);
     /// `attachBuffers` undoes it.
     pub fn detachBuffers(self: *WebSocket) void {
         self.dropBuffers(false);
@@ -500,8 +518,10 @@ pub const WebSocket = struct {
                     self.closed = true;
                 };
             }
-            w.buffer = &.{};
-            w.end = 0;
+            // A borrowed one back to the connection; what a failed flush
+            // left in it, the connection takes back as it closes.
+            self.giveBackWriteBuffer();
+            if (w.end == 0) w.buffer = &.{};
             if (close_sending) self.closed = true;
         }
         const r = self.transport.reader;
@@ -513,19 +533,16 @@ pub const WebSocket = struct {
         _ = self.msg_arena.reset(.free_all);
     }
 
-    /// The reader and the writer take `read` and `write` as their buffers:
-    /// a task reads the socket again after `detachBuffers`. Both must
-    /// outlive the reading until the next `detachBuffers` or `shut`.
-    pub fn attachBuffers(self: *WebSocket, read: []u8, write: []u8) void {
+    /// The reader takes `read` as its buffer: a task reads the socket again
+    /// after `detachBuffers`. It must outlive the reading until the next
+    /// `detachBuffers` or `shut`. The writer borrows a buffer from the
+    /// connection as it sends (`Transport.write_buffers`).
+    pub fn attachBuffers(self: *WebSocket, read: []u8) void {
         const r = self.transport.reader;
         std.debug.assert(r.bufferedLen() == 0);
         r.buffer = read;
         r.seek = 0;
         r.end = 0;
-        self.write_mutex.lockUncancelable(self.io);
-        defer self.write_mutex.unlock(self.io);
-        std.debug.assert(self.transport.writer.end == 0);
-        self.transport.writer.buffer = write;
     }
 
     /// The batch's flush, for its backstop (`Batch.hold`).
@@ -654,8 +671,16 @@ pub const WebSocket = struct {
         // boundary.
         errdefer self.closed = true;
 
-        // No buffer to build the frame in (`detachBuffers`).
-        if (self.transport.writer.buffer.len == 0 and !self.is_client) return self.writeUnbuffered(opcode, data, fin, rsv);
+        // No buffer to build the frame in. A small one that goes out now
+        // is built on the stack, so the socket holds no buffer across the
+        // write (which parks the task, even one that completes at once);
+        // otherwise one is borrowed from the connection while there is
+        // something to send, or, without one, there is no buffer at all.
+        if (self.transport.writer.buffer.len == 0 and !self.is_client) {
+            if (after == .now and data.len <= unbuffered_payload_max) return self.writeUnbuffered(opcode, data, fin, rsv);
+            self.borrowWriteBuffer();
+            if (self.transport.writer.buffer.len == 0) return self.writeUnbuffered(opcode, data, fin, rsv);
+        }
 
         // First byte: FIN + RSV + opcode
         const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | rsv | @backingInt(opcode);
@@ -700,22 +725,30 @@ pub const WebSocket = struct {
             .now => {
                 self.batch.flushing();
                 try self.transport.writer.flush();
+                self.giveBackWriteBuffer();
             },
             .batch => if (!self.batch.hold(self.io, flushHeld)) {
                 // No backstop to be had: out now, as without a batch.
                 self.batch.flushing();
                 try self.transport.writer.flush();
+                self.giveBackWriteBuffer();
             },
             .manual => {},
         }
     }
+
+    /// The biggest payload `writeUnbuffered` builds its frame around on the
+    /// stack, in one write; a bigger one goes out as a vectored write of
+    /// the header and the payload, which a TLS layer may send as two
+    /// records.
+    const unbuffered_payload_max = 512;
 
     /// A server's frame through a writer with no buffer: one write for a
     /// small frame, built here, or the header and the payload in one
     /// vectored write. Out of line, so the scratch stays off the frames of
     /// the ordinary path.
     noinline fn writeUnbuffered(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, rsv: u8) std.Io.Writer.Error!void {
-        var frame: [256]u8 = undefined;
+        var frame: [unbuffered_payload_max + 10]u8 = undefined;
         frame[0] = (@as(u8, if (fin) 0x80 else 0x00)) | rsv | @backingInt(opcode);
         var head_len: usize = 2;
         if (data.len < 126) {

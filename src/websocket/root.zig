@@ -562,8 +562,9 @@ const H1Callbacks = struct {
     /// `open` failed: the socket ends at once, as a `route` handler's would.
     ending: bool = false,
 
-    /// Each run's reader and writer windows, on its task's stack. A frame
-    /// bigger than the read window is read straight into its message.
+    /// Each run's reader window, on its task's stack. A frame bigger than
+    /// it is read straight into its message. The writer borrows a buffer
+    /// from the connection while it has something to send.
     const window_len = 2048;
 
     fn open(req: *dusty.Request, res: *dusty.Response, comptime options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
@@ -605,11 +606,12 @@ const H1Callbacks = struct {
         const self: *H1Callbacks = @fieldParentPtr("adopter", a);
         const ws = self.socket.conn.h1;
         if (self.ending) return self.finish(null);
-        // The first run keeps the windows the upgrade left, in the request's
-        // buffers; the core gives those back once this returns.
+        // The core gives the request's buffers back before the first run,
+        // unless the peer sent something behind the handshake already: then
+        // that run keeps the window the upgrade left, in those buffers, and
+        // the core gives them back once it returns.
         var read_window: [window_len]u8 = undefined;
-        var write_window: [window_len]u8 = undefined;
-        if (ws.transport.reader.buffer.len == 0) ws.attachBuffers(&read_window, &write_window);
+        if (ws.transport.reader.buffer.len == 0) ws.attachBuffers(&read_window);
         while (true) {
             const started = self.socket.receiveStarted() catch |err| return self.finish(err);
             const msg = started orelse {
@@ -839,8 +841,8 @@ pub const H2Socket = struct {
     arena: std.mem.Allocator,
     body: dusty.RequestBodyReader,
     out: dusty.StreamingBodyWriter,
-    in_buf: [16 * 1024]u8,
-    out_buf: [16 * 1024]u8,
+    in_buf: [buffer_len]u8,
+    out_buf: [buffer_len]u8,
     frames: codec.FrameHandler,
     message: std.ArrayList(u8) = .empty,
     max_message_size: usize,
@@ -851,6 +853,13 @@ pub const H2Socket = struct {
     /// the reading task sends while the peer's next message is already
     /// buffered goes out with the batch.
     batch: dusty.WebSocketBatch = .{},
+
+    /// Each of the socket's buffers, for frames coming in and going out.
+    /// Reads walk through the whole of one before they start over at its
+    /// front, so all of it stays resident while the socket lives: a page,
+    /// rather than four. A bigger message goes through in pieces, a frame
+    /// with a bigger payload straight to the stream.
+    pub const buffer_len = 4 * 1024;
 
     fn accept(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, deflate: bool) !*H2Socket {
         const self = try req.arena.create(H2Socket);

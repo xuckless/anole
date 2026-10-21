@@ -444,7 +444,10 @@ req.setTimeout(.none); // a WebSocket or event stream
 
 `response.max_header_count` (64) caps the headers a response can carry,
 those the server adds included; past it `res.header` fails with
-`TooManyHeaders`. HTTP/2's limits are in `ServerOptions.http2`
+`TooManyHeaders`. `res.addHeader` adds one that may repeat (`Vary`,
+`Link`). Both tables start with room for 16 and grow to their limits, so
+add response headers through `res.header` and `res.addHeader` rather than
+to `res.headers` directly, which only has the room it has grown to. HTTP/2's limits are in `ServerOptions.http2`
 ([server.md](server.md#http2)).
 
 ## Error handling
