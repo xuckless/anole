@@ -271,6 +271,16 @@ const Fixture = struct {
     }
 };
 
+/// Keeps the warnings a test expects out of the output, until the caller
+/// restores the level this returns (after the server has stopped). A test
+/// step that passes but wrote to stderr is printed by `zig build` with the
+/// command under "failed command:", which reads as a failure.
+fn quietWarnings() std.log.Level {
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    return level;
+}
+
 const quick: dusty.ServerConfig = .{ .timeout = .{ .idle_park = .fromMilliseconds(30) } };
 
 fn messagesAcrossParking(secure: bool) !void {
@@ -405,6 +415,9 @@ test "WebSocket callbacks: another task sends to a parked socket" {
 }
 
 test "WebSocket callbacks: a failing callback closes with 1011" {
+    // The server's warnings about both failures are expected.
+    const level = quietWarnings();
+    defer std.testing.log_level = level;
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(gpa, false, quick);
@@ -459,6 +472,9 @@ test "WebSocket callbacks: the drain closes parked sockets with 1001" {
 }
 
 test "WebSocket callbacks: stopping the server closes parked sockets" {
+    // The drain's warning that it timed out is expected.
+    const level = quietWarnings();
+    defer std.testing.log_level = level;
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(gpa, false, .{ .timeout = .{ .idle_park = .fromMilliseconds(30), .shutdown = .fromMilliseconds(200) } });
