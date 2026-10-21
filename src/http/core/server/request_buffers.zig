@@ -9,8 +9,15 @@
 //! executor, so the set it gives back is the one it takes for its next
 //! request. Elsewhere the free sets are sharded, so that connections
 //! opening and closing at once mostly take different locks.
+//!
+//! A free list keeps what a burst left it only for a while: `trimLocal`
+//! and `trimShards`, run on a timer, free the sets that no request took
+//! from it since the last trim, past a few kept for the next arrivals. So the sets a burst of
+//! connections needed at once go back once the burst is over, not when
+//! the server stops.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const placement = @import("../placement.zig");
 
 /// A request's read and write buffers and arena, in one allocation with
@@ -43,16 +50,60 @@ pub const RequestBuffersPool = struct {
     /// `RequestBuffers.shard` for a set from an executor's list.
     const local_shard = shard_count;
 
+    /// Sets a free list keeps through a trim however long they sat
+    /// unused.
+    pub const trim_keep = 4;
+
     const Local = struct {
-        free: std.SinglyLinkedList = .{},
+        free: FreeList = .{},
         _: void align(std.atomic.cache_line) = {},
     };
 
     const Shard = struct {
         mutex: std.Io.Mutex = .init,
-        free: std.SinglyLinkedList = .{},
+        free: FreeList = .{},
         // Each shard's lock on its own cache line.
         _: void align(std.atomic.cache_line) = {},
+    };
+
+    /// The free sets, and the fewest there were since the last trim:
+    /// that many sat unused all the while.
+    const FreeList = struct {
+        list: std.SinglyLinkedList = .{},
+        len: usize = 0,
+        low: usize = 0,
+
+        fn push(self: *FreeList, buffers: *RequestBuffers) void {
+            self.list.prepend(&buffers.node);
+            self.len += 1;
+        }
+
+        fn pop(self: *FreeList) ?*RequestBuffers {
+            const node = self.list.popFirst() orelse return null;
+            self.len -= 1;
+            self.low = @min(self.low, self.len);
+            return @fieldParentPtr("node", node);
+        }
+
+        /// Takes off the sets unused since the last call, past `trim_keep`:
+        /// the ones at the end, given back longest ago.
+        fn takeIdle(self: *FreeList) std.SinglyLinkedList {
+            const n = self.low -| trim_keep;
+            self.low = self.len - n;
+            if (n == 0) return .{};
+            var kept = self.len - n;
+            self.len = kept;
+            if (kept == 0) {
+                const all = self.list;
+                self.list = .{};
+                return all;
+            }
+            var last = self.list.first.?;
+            while (kept > 1) : (kept -= 1) last = last.next.?;
+            const rest: std.SinglyLinkedList = .{ .first = last.next };
+            last.next = null;
+            return rest;
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, read_buffer_len: usize, write_buffer_len: usize, arena_reserve: usize) RequestBuffersPool {
@@ -68,10 +119,10 @@ pub const RequestBuffersPool = struct {
     /// Only once every set is back.
     pub fn deinit(self: *RequestBuffersPool) void {
         for (&self.shards) |*shard| {
-            while (shard.free.popFirst()) |node| self.destroy(@fieldParentPtr("node", node));
+            while (shard.free.pop()) |buffers| self.destroy(buffers);
         }
         for (&self.locals) |*list| {
-            while (list.free.popFirst()) |node| self.destroy(@fieldParentPtr("node", node));
+            while (list.free.pop()) |buffers| self.destroy(buffers);
         }
         self.* = undefined;
     }
@@ -81,18 +132,18 @@ pub const RequestBuffersPool = struct {
     /// say, so the sets it gives back are the ones it takes again.
     pub fn acquire(self: *RequestBuffersPool, key: usize) std.mem.Allocator.Error!*RequestBuffers {
         if (self.local()) |list| {
-            const buffers: *RequestBuffers = if (list.free.popFirst()) |n| @fieldParentPtr("node", n) else try self.create();
+            const buffers = list.free.pop() orelse try self.create();
             buffers.shard = local_shard;
             return buffers;
         }
         const index: u8 = @intCast(std.hash.int(key) % shard_count);
         const shard = &self.shards[index];
-        const node = blk: {
+        const free = blk: {
             shard.mutex.lockUncancelable(self.io);
             defer shard.mutex.unlock(self.io);
-            break :blk shard.free.popFirst();
+            break :blk shard.free.pop();
         };
-        const buffers: *RequestBuffers = if (node) |n| @fieldParentPtr("node", n) else try self.create();
+        const buffers = free orelse try self.create();
         buffers.shard = index;
         return buffers;
     }
@@ -101,7 +152,7 @@ pub const RequestBuffersPool = struct {
     pub fn release(self: *RequestBuffersPool, buffers: *RequestBuffers) void {
         _ = buffers.arena.reset(.retain_capacity);
         if (self.local()) |list| {
-            list.free.prepend(&buffers.node);
+            list.free.push(buffers);
             return;
         }
         // Taken from an executor's list, given back off one: any shard.
@@ -109,7 +160,48 @@ pub const RequestBuffersPool = struct {
         const shard = &self.shards[buffers.shard];
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
-        shard.free.prepend(&buffers.node);
+        shard.free.push(buffers);
+    }
+
+    /// Frees the sets no request took from the calling executor's list
+    /// (under zio) since the last call, past `trim_keep`. Each executor
+    /// calls it now and then (`Server`'s trim task), on itself.
+    pub fn trimLocal(self: *RequestBuffersPool) void {
+        if (self.local()) |list| self.destroyAll(list.free.takeIdle());
+    }
+
+    /// `trimLocal` for the shards, which `release` fills off zio's
+    /// executors: from one task, so that each shard's interval is that
+    /// task's.
+    pub fn trimShards(self: *RequestBuffersPool) void {
+        for (&self.shards) |*shard| {
+            const idle = blk: {
+                shard.mutex.lockUncancelable(self.io);
+                defer shard.mutex.unlock(self.io);
+                break :blk shard.free.takeIdle();
+            };
+            self.destroyAll(idle);
+        }
+    }
+
+    fn destroyAll(self: *RequestBuffersPool, list: std.SinglyLinkedList) void {
+        var it = list.first;
+        while (it) |node| {
+            it = node.next;
+            const buffers: *RequestBuffers = @fieldParentPtr("node", node);
+            // The pages go back to the OS too: an allocator that keeps
+            // freed memory for its next allocations (a heap, a size class)
+            // would keep them resident. Only whole pages inside the
+            // buffers, clear of any bookkeeping the allocator writes into
+            // freed memory at either end.
+            if (comptime builtin.os.tag == .linux) {
+                const page = std.heap.pageSize();
+                const start = std.mem.alignForward(usize, @intFromPtr(buffers.read_buffer.ptr) + 64, page);
+                const end = std.mem.alignBackward(usize, @intFromPtr(buffers.write_buffer.ptr) + buffers.write_buffer.len - 64, page);
+                if (end > start) _ = std.os.linux.madvise(@ptrFromInt(start), end - start, std.os.linux.MADV.DONTNEED);
+            }
+            self.destroy(buffers);
+        }
     }
 
     /// The calling executor's free list, under zio.
@@ -186,4 +278,36 @@ test "RequestBuffersPool: a set goes back to the shard it came from" {
     pool.release(b);
     try std.testing.expectEqual(a, try pool.acquire(1));
     pool.release(a);
+}
+
+test "RequestBuffersPool: trim frees the sets unused since the last trim, past a few" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256);
+    defer pool.deinit();
+    const shard = &pool.shards[std.hash.int(@as(usize, 1)) % RequestBuffersPool.shard_count];
+
+    // A burst of ten at once, all given back.
+    var burst: [10]*RequestBuffers = undefined;
+    for (&burst) |*b| b.* = try pool.acquire(1);
+    for (burst) |b| pool.release(b);
+    try std.testing.expectEqual(@as(usize, 10), shard.free.len);
+
+    // None of them has sat idle a whole interval yet.
+    pool.trimShards();
+    try std.testing.expectEqual(@as(usize, 10), shard.free.len);
+    // Two are taken and given back in the next one: the other eight sat
+    // idle all of it, and go but for the four kept.
+    const x = try pool.acquire(1);
+    const y = try pool.acquire(1);
+    pool.release(y);
+    pool.release(x);
+    pool.trimShards();
+    try std.testing.expectEqual(@as(usize, 6), shard.free.len);
+    // The ones given back last are what stays.
+    try std.testing.expectEqual(&x.node, shard.free.list.first.?);
+
+    // Idle from here on: down to the four kept, and no further.
+    pool.trimShards();
+    try std.testing.expectEqual(@as(usize, 4), shard.free.len);
+    pool.trimShards();
+    try std.testing.expectEqual(@as(usize, 4), shard.free.len);
 }
