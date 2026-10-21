@@ -127,6 +127,23 @@
             .hash = "N-V-__8AAHq03wFyL3GDg1B5WQRqK98uTOOjLUIriuv5DdbW",
             .lazy = true,
         },
+        // SQLite 3.54.1 (public domain), the amalgamation, built by
+        // build/sqlite.zig. Published 2026-10-16; sqlite.org's SHA3-256 of the
+        // zip: 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30.
+        .sqlite_amalgamation = .{
+            .url = "https://sqlite.org/2026/sqlite-amalgamation-3540100.zip",
+            .hash = "N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9",
+            .lazy = true,
+        },
+        // vrischmann/zig-sqlite from Anole's fork xuckless/zig-sqlite, branch
+        // `anole`: upstream's open Zig 0.17 port (PR #215), bindings through
+        // the translate-c package, SQLite taken from the caller (Anole's
+        // amalgamation and options header) with no SQLite fetched of its own.
+        .zig_sqlite = .{
+            .url = "git+https://github.com/xuckless/zig-sqlite#80742c3ce2b1917b44248371e02633cc942a1867",
+            .hash = "sqlite-3.54.1-F2R_a_YmBADq3G8bA-jCBgWFcQEaVlxVql4mEN2SbliG",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

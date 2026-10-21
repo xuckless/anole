@@ -33,6 +33,7 @@ const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
 const yyjson_build = @import("build/yyjson.zig");
 const hiredis_build = @import("build/hiredis.zig");
+const sqlite_build = @import("build/sqlite.zig");
 
 /// This file's struct, for `b.lazyImport` (which must name the build.zig that declares the dependency).
 const build_zig = @This();
@@ -385,6 +386,9 @@ pub fn build(b: *std.Build) void {
     // fetches it with the C libraries, and never for a project depending on
     // Anole.
     const mongodb_specs = if (b.isRoot()) b.lazyDependency("mongodb_specs", .{}) else null;
+    // Temporary (db/sqlite, until -Dsqlite lands with db/shared): SQLite and
+    // zig-sqlite are fetched and built only with this on.
+    const sqlite_build_test = b.option(bool, "sqlite-build-test", "Build SQLite and zig-sqlite and add their build test to `test` (temporary)") orelse false;
 
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
@@ -434,6 +438,17 @@ pub fn build(b: *std.Build) void {
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
     }
+    // Temporary hook (db/sqlite): -Dsqlite-build-test adds build/sqlite.zig's
+    // test to `test` and as `test-sqlite`. CModules takes this over with -Dsqlite.
+    if (sqlite_build_test) if (b.lazyDependency("sqlite_amalgamation", .{})) |up| {
+        const config = sqlite_build.configHeader(b);
+        if (b.lazyDependency("zig_sqlite", sqlite_build.zigSqliteArgs(up, config, target, optimize))) |zig_sqlite| {
+            const lib = sqlite_build.library(b, up, config, target, optimize);
+            const run = sqlite_build.buildTest(b, sqlite_build.module(zig_sqlite, lib), target, optimize);
+            test_step.dependOn(&run.step);
+            b.step("test-sqlite", "SQLite and zig-sqlite build test (with -Dsqlite-build-test)").dependOn(&run.step);
+        }
+    };
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
