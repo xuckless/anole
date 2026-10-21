@@ -58,6 +58,10 @@ const mongodb_mod = if (features.mongodb) @import("mongodb/root.zig") else struc
     pub const Options = struct {};
     pub const Client = void;
 };
+const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = void;
+};
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
     pub const RegisterOptions = struct {};
@@ -379,7 +383,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
             /// The database connectors and response caches made here
-            /// (`postgres`, `sqlite`, `responseCache`), in order.
+            /// (`postgres`, `sqlite`, `mongodb`, `redis`, `responseCache`),
+            /// in order.
             connectors: std.ArrayList(Connector) = .empty,
             connectors_started: bool = false,
             /// One certificate reload at a time.
@@ -1595,6 +1600,26 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer mongo.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(mongodb_mod.Client, mongo));
             return mongo;
+        }
+
+        /// A Redis or Valkey client for the handlers, owned by the server:
+        /// `state.cache = try app.redis(.{});` reads `REDIS_URL` (or
+        /// `options.url`), else uses `redis://127.0.0.1:6379`. No
+        /// connection opens before a handler needs one (unless
+        /// `connect_at_start`). Once serving, it reports to `app.metrics`,
+        /// `app.tracing` and `app.health` (a PING behind `/readyz`) when
+        /// the app has them, and it is closed with the server, after the
+        /// drain. See `anole.redis`.
+        pub fn redis(self: *Self, config: redis_mod.Options) !*redis_mod.Client {
+            if (comptime !features.redis) @compileError("app.redis needs Redis (-Dredis, on in the full profile)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const r = try redis_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer r.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(redis_mod.Client, r));
+            return r;
         }
 
         /// Loads every TLS listener's certificate and key again (from their

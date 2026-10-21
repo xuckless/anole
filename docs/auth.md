@@ -274,7 +274,7 @@ every node the same one.
 
 ```zig
 var mem = anole.session.MemoryStore.init(gpa, app.io()); // then .store = mem.store()
-var redis = try anole.redis.Client.connect(gpa, app.io(), .{ .host = "127.0.0.1", .port = 6379 });
+const redis = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379 (docs/database.md)
 var rs: anole.session.RedisStore = .{ .client = redis, .gpa = gpa }; // keys "anole:session:<id>" with the TTL
 var sessions = anole.session.Middleware.init(.{ .store = rs.store() });
 ```
@@ -433,7 +433,8 @@ var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit =
 - `MemoryLimiter` is for one process. It holds at most `max_entries` keys,
   dropping the least recently used one first, and forgets keys idle for
   `idle_ms`.
-- `RedisLimiter` (`.{ .client = redis, .gpa = gpa }`, keys `anole:rl:<key>`)
+- `RedisLimiter` (`.{ .client = redis, .gpa = gpa }` with `redis` from
+  `app.redis(.{})`, keys `anole:rl:<key>`)
   is shared by every node. One Lua script refills and takes atomically, on
   the Redis server's clock.
 - Your own limiter implements `anole.ratelimit.Limiter`: a vtable with
