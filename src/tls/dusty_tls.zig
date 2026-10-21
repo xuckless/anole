@@ -56,6 +56,7 @@ const max_plaintext_len = 16 * 1024;
 /// borrows a block.
 const stash_len = 1024;
 
+/// The handshake settings `server` and `client` take, in tls.zig's shapes.
 pub const config = struct {
     /// A certificate chain and private key. On a server listener it also owns
     /// the SSL_CTX that every connection accepted on that listener shares;
@@ -67,6 +68,7 @@ pub const config = struct {
         chain: []*c.X509,
         key: *c.EVP_PKEY,
 
+        /// Loads the chain and key from PEM files under `dir`.
         pub fn fromFilePath(
             gpa: Allocator,
             io: std.Io,
@@ -142,6 +144,7 @@ pub const config = struct {
             carryTicketKeys(self.server_ctx, old.server_ctx);
         }
 
+        /// Frees the certificates, the key and the SSL_CTX.
         pub fn deinit(self: *CertKeyPair, gpa: Allocator) void {
             c.SSL_CTX_free(self.server_ctx);
             c.X509_free(self.cert);
@@ -165,6 +168,8 @@ pub const config = struct {
         alpn_protocols: []const []const u8 = &.{},
     };
 
+    /// Mutual TLS on a server: the CAs a client certificate must chain to,
+    /// and whether one is required or only asked for.
     pub const ClientAuth = struct {
         root_ca: std.crypto.Certificate.Bundle,
         auth_type: enum { request, require } = .require,
@@ -314,6 +319,8 @@ fn inSet(comptime Set: type, comptime err: anyerror) bool {
     return false;
 }
 
+/// Runs the server side of a handshake over `input` and `output` (the
+/// socket's reader and writer) and returns the connection.
 pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server) HandshakeError!Connection {
     const auth = opt.auth orelse return error.TlsFailure;
     c.ERR_clear_error();
@@ -365,6 +372,8 @@ pub fn peerLeaf(ssl: *const c.SSL) ?[]const u8 {
     return c.CRYPTO_BUFFER_data(leaf)[0..c.CRYPTO_BUFFER_len(leaf)];
 }
 
+/// Runs the client side of a handshake over `input` and `output`,
+/// verifying the server as `opt` says, and returns the connection.
 pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client) HandshakeError!Connection {
     const ctx = try clientCtx();
     c.ERR_clear_error();
@@ -446,12 +455,15 @@ pub const Connection = struct {
     output: *std.Io.Writer = undefined,
     cipher: ?*anyopaque = null,
 
+    /// What reading plaintext can fail with: the socket, or TLS itself (an
+    /// alert from the peer among them).
     pub const ReadError = error{
         ReadFailed,
         TlsConnectionTruncated,
         TlsBadRecordMac,
         TlsFailure,
     } || AlertError;
+    /// What writing plaintext can fail with.
     pub const WriteError = error{ WriteFailed, TlsFailure };
 
     /// The client's certificate (the leaf, DER) on a server connection
@@ -608,6 +620,7 @@ pub const Connection = struct {
         }
     };
 
+    /// A plaintext reader over the connection, buffering into `buffer`.
     pub fn reader(self: *Connection, buffer: []u8) Reader {
         return .{
             .conn = self,
@@ -615,6 +628,7 @@ pub const Connection = struct {
         };
     }
 
+    /// A plaintext writer over the connection (`writer`).
     pub const Writer = struct {
         conn: *Connection,
         interface: std.Io.Writer,
@@ -679,6 +693,7 @@ pub const Connection = struct {
         }
     };
 
+    /// A plaintext writer over the connection, buffering into `buffer`.
     pub fn writer(self: *Connection, buffer: []u8) Writer {
         return .{
             .conn = self,
@@ -1048,10 +1063,12 @@ pub const TrustStore = struct {
     /// The certificates' subject names (DER), for a server's client CA list.
     names: *c.struct_stack_st_CRYPTO_BUFFER,
 
+    /// A store holding every certificate in `bundle`.
     pub fn init(bundle: std.crypto.Certificate.Bundle) error{OutOfMemory}!TrustStore {
         return fromDer(bundle.bytes.items);
     }
 
+    /// Frees the store.
     pub fn deinit(self: *TrustStore) void {
         c.X509_STORE_free(self.store);
         c.sk_CRYPTO_BUFFER_pop_free(self.names, c.CRYPTO_BUFFER_free);

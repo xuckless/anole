@@ -1,28 +1,60 @@
-//! HTTP/1.1: re-exports lalinsky/dusty (MIT), wired to the real zio runtime.
-//! Handlers have the shape `fn (*Request, *Response) !void`, or
-//! `fn (*Ctx, *Request, *Response) !void` for a `Server(Ctx)`.
+//! The HTTP core under `anole.Server`: the HTTP/1.1 server and its HTTP/2
+//! engine, the router, middleware, static files, and the outbound client.
+//! Adapted from lalinsky/dusty (MIT) and now part of Anole (src/http/core);
+//! the module is still imported as `dusty`.
+//!
+//! Most applications need only `anole.App` or `anole.Server`, which wrap
+//! this; reach here for settings and types they pass through
+//! (`ServerConfig`, `StaticOptions`, `Status`, `Headers`) or to drive the
+//! core directly. Handlers have the shape `fn (*Request, *Response) !void`,
+//! or `fn (*Ctx, *Request, *Response) !void` for a `Server(Ctx)`.
 const std = @import("std");
 const dusty = @import("dusty");
 
+/// The core server on a `std.Io` you run yourself: no runtime, signals or
+/// TLS setup of its own. `anole.Server` builds on it and exposes it as
+/// `app.server`.
 pub const Server = dusty.Server;
+/// The core server's settings: timeouts, limits, listeners, HTTP/2.
+/// `anole.ServerOptions.server` takes it.
 pub const ServerConfig = dusty.ServerConfig;
+/// An IP address and port, or a Unix socket path.
 pub const Address = dusty.Address;
+/// One socket the core server accepts on (`ServerConfig.listeners`);
+/// `req.listener` points at the one a request came in on.
 pub const Listener = dusty.Listener;
+/// The radix-tree router with `:param` and `*wildcard` segments;
+/// `app.router` is one.
 pub const Router = dusty.Router;
+/// `anole.Request`.
 pub const Request = dusty.Request;
+/// `anole.Response`.
 pub const Response = dusty.Response;
+/// A request method (`req.method`).
 pub const Method = dusty.Method;
+/// A response status (`res.status`).
 pub const Status = dusty.Status;
+/// Request and response headers, looked up case-insensitively.
 pub const Headers = dusty.Headers;
+/// Path and query parameters (`req.params`, `req.query`).
 pub const Params = dusty.Params;
+/// The media types known by name (`res.content_type`).
 pub const ContentType = dusty.ContentType;
+/// A request's cookies (`req.cookies()`).
 pub const Cookie = dusty.Cookie;
+/// The core's middleware; `anole.middleware` re-exports them.
 pub const middleware = dusty.middleware;
+/// A type-erased middleware handle for a `Server(Ctx)`:
+/// `anole.Middleware(Ctx).init(&value)` for a middleware value you keep.
 pub const Middleware = dusty.Middleware;
+/// The outbound HTTP/1.1 client (HTTP/2 by ALPN), with a connection pool.
+/// Inside a server use `anole.client(req)`, which shares one.
 pub const Client = dusty.Client;
+/// `Client.init`'s settings.
 pub const ClientConfig = dusty.ClientConfig;
 /// Options for `Server.static` / `Router.static` and `Server.embedded`.
 pub const StaticOptions = dusty.StaticOptions;
+/// Options for `Server.embedded`.
 pub const EmbeddedOptions = dusty.EmbeddedOptions;
 /// `ClientConfig.tls`; `anole.h2` and `anole.h3` take the same fields.
 pub const TlsConfig = dusty.TlsConfig;
@@ -47,7 +79,7 @@ pub const checkAddressFree = dusty.checkAddressFree;
 /// out from it.
 pub const fd_limit = dusty.fd_limit;
 
-/// The whole dusty module, for anything not re-exported above.
+/// The whole HTTP core module, for anything not re-exported above.
 pub const dusty_module = dusty;
 
 // Loopback smoke test: a dusty server and a raw TCP client as two tasks of a

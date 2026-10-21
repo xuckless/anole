@@ -30,8 +30,11 @@ const Value = document.Value;
 const Document = document.Document;
 const Array = document.Array;
 
+/// How an enum is written: its tag name (`string`) or its value (`int`).
+/// Decoding takes either.
 pub const EnumRepr = enum { string, int };
 
+/// How `encode`, `appendFields` and `appendField` write.
 pub const EncodeOptions = struct {
     /// Null optionals in a document: left out, or written as BSON null.
     /// Inside an array a null is always written, so indexes stay put.
@@ -40,6 +43,7 @@ pub const EncodeOptions = struct {
     enums: EnumRepr = .string,
 };
 
+/// How `decode`, `decodeDocument` and `decodeValue` read.
 pub const DecodeOptions = struct {
     /// Copy strings, binary data and raw documents into the arena (the
     /// default), or point into the input, which must then outlive the result.
@@ -48,14 +52,19 @@ pub const DecodeOptions = struct {
     ignore_unknown_fields: bool = true,
 };
 
+/// What encoding fails with: the builder's errors, or a number BSON
+/// cannot hold.
 pub const EncodeError = Builder.Error || error{
     /// An unsigned integer above the int64 range.
     Overflow,
 };
 
+/// Why a document does not map onto the Zig type.
 pub const MappingError = error{
     OutOfMemory,
+    /// A field without a default or optional type has no element.
     MissingField,
+    /// An element no field maps to, with `ignore_unknown_fields` off.
     UnknownField,
     /// A BSON type the Zig type cannot take.
     UnexpectedType,
@@ -204,10 +213,12 @@ pub fn decode(comptime T: type, arena: std.mem.Allocator, bytes: []const u8, opt
     return decodeDocument(T, arena, try Document.init(bytes), options);
 }
 
+/// `decode` from a document already validated.
 pub fn decodeDocument(comptime T: type, arena: std.mem.Allocator, doc: Document, options: DecodeOptions) MappingError!T {
     return decodeValue(T, arena, .{ .document = doc }, options);
 }
 
+/// One value as a `T`: a field's, an array item's, or a whole document's.
 pub fn decodeValue(comptime T: type, arena: std.mem.Allocator, v: Value, options: DecodeOptions) MappingError!T {
     switch (T) {
         Value => return if (options.copy) v.dupe(arena) else v,

@@ -16,9 +16,12 @@ const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
 const db = @import("../db/root.zig");
 
+/// How fast a key may go: `limit` requests per `window_ms`, refilled
+/// smoothly, with up to `burst` at once. 100 a minute by default.
 pub const Policy = struct {
     /// Requests allowed per window.
     limit: u32 = 100,
+    /// The window `limit` is counted over, in milliseconds.
     window_ms: i64 = 60_000,
     /// Bucket size: how many may come at once. 0 means `limit`.
     burst: u32 = 0,
@@ -32,8 +35,11 @@ pub const Policy = struct {
     }
 };
 
+/// What a `take` decided, with the numbers for the `RateLimit-*` headers.
 pub const Result = struct {
+    /// Whether the tokens were there (and taken).
     allowed: bool,
+    /// The policy's `limit`.
     limit: u32,
     /// Requests left now.
     remaining: u32,
@@ -48,6 +54,7 @@ pub const Limiter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// What a limiter implements: refill `key`'s bucket, then take `cost`.
     pub const VTable = struct {
         take: *const fn (ptr: *anyopaque, key: []const u8, cost: u32, policy: Policy) anyerror!Result,
     };
@@ -107,26 +114,32 @@ pub const MemoryLimiter = struct {
         node: std.DoublyLinkedList.Node = .{},
     };
 
+    /// `MemoryLimiter` settings.
     pub const Options = struct {
+        /// At most this many keys; past it, the least recently used is dropped.
         max_entries: usize = 10_000,
         /// A key unseen this long is forgotten (its bucket would be full).
         idle_ms: i64 = 300_000,
     };
 
+    /// An empty limiter. `io` reads the clock.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) MemoryLimiter {
         return .{ .gpa = gpa, .io = io, .max_entries = @max(1, options.max_entries), .idle_ms = options.idle_ms };
     }
 
+    /// Frees every bucket.
     pub fn deinit(self: *MemoryLimiter) void {
         var it = self.buckets.valueIterator();
         while (it.next()) |b| self.freeBucket(b.*);
         self.buckets.deinit(self.gpa);
     }
 
+    /// The `Limiter` interface for `Middleware.init`; `self` must outlive it.
     pub fn limiter(self: *MemoryLimiter) Limiter {
         return .{ .ptr = self, .vtable = &.{ .take = takeFn } };
     }
 
+    /// How many keys have a bucket now.
     pub fn count(self: *MemoryLimiter) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -182,8 +195,11 @@ pub const MemoryLimiter = struct {
 /// refills and takes atomically, on the server's clock. On the client's
 /// pools (`app.redis`).
 pub const RedisLimiter = if (features.redis) struct {
+    /// The client buckets go through (`app.redis(.{})`).
     client: *redis.Client,
+    /// For the scratch memory of each take.
     gpa: std.mem.Allocator,
+    /// Prepended to each key to make the bucket's Redis key.
     prefix: []const u8 = "anole:rl:",
 
     /// KEYS[1] the bucket; ARGV capacity, rate per ms, cost, window ms.
@@ -205,6 +221,8 @@ pub const RedisLimiter = if (features.redis) struct {
         \\return {allowed, math.floor(tokens * 1000), wait}
     ;
 
+    /// The `Limiter` interface for `Middleware.init`; `self` must outlive
+    /// it.
     pub fn limiter(self: *@This()) Limiter {
         return .{ .ptr = self, .vtable = &.{ .take = takeFn } };
     }
@@ -231,7 +249,8 @@ pub const RedisLimiter = if (features.redis) struct {
     }
 } else struct {};
 
-/// The key a request is limited by.
+/// The key a request is limited by, written into `buf` (128 bytes) or
+/// pointing into the request.
 pub const KeyFn = *const fn (req: *dusty.Request, buf: []u8) []const u8;
 
 /// The client's address (as trusted proxies report it), without the port.
@@ -251,8 +270,11 @@ pub fn clientAddress(req: *dusty.Request, buf: []u8) []const u8 {
 pub const Middleware = struct {
     limiter: Limiter,
     policy: Policy,
+    /// What requests are counted by: the client's address by default.
     key: KeyFn = clientAddress,
 
+    /// A middleware that limits by client address. To limit by something
+    /// else (an API key, a user), set `key` on the result.
     pub fn init(limiter: Limiter, policy: Policy) Middleware {
         return .{ .limiter = limiter, .policy = policy };
     }

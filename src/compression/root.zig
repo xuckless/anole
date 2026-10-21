@@ -3,6 +3,11 @@
 //! lalinsky/zlib.zig's `std.Io` wrapper, and zstd 1.5.7 (build/zstd.zig) as
 //! translated C bindings. With -Dbrotli, Brotli 1.2.0 (build/brotli.zig) the
 //! same way.
+//!
+//! Responses are compressed by `anole.middleware.Compress` (or
+//! `res.compress = true`), and request bodies inflated by the server, with
+//! nothing from here. This namespace is for compressing or inflating data
+//! of your own.
 const std = @import("std");
 const features = @import("build_options");
 

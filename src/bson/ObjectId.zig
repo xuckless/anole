@@ -51,6 +51,7 @@ pub fn toHex(id: ObjectId) [24]u8 {
     return std.fmt.bytesToHex(id.bytes, .lower);
 }
 
+/// The 24 hex digits, for `{f}`.
 pub fn format(id: ObjectId, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(&id.toHex());
 }
@@ -61,6 +62,7 @@ pub fn jsonStringify(id: ObjectId, jw: anytype) !void {
     try jw.write(@as([]const u8, &hex));
 }
 
+/// Whether the two are the same id.
 pub fn eql(a: ObjectId, b: ObjectId) bool {
     return std.mem.eql(u8, &a.bytes, &b.bytes);
 }

@@ -1,10 +1,14 @@
-//! HTTP/3: ngtcp2 1.25.0 (QUIC transport, from Anole's xuckless/ngtcp2 fork)
-//! with its BoringSSL crypto helper, and nghttp3 1.18.0 (HTTP/3 + QPACK, from
-//! Anole's xuckless/nghttp3 fork), all MIT. WebTransport's streams and
-//! datagrams sit beside nghttp3 (`webtransport.zig`).
-//! `Endpoint` is the server: a QUIC endpoint whose requests reach the same
-//! router as HTTP/1.1 and HTTP/2. `ClientConnection` is the client, with the
-//! HTTP/2 client's API.
+//! HTTP/3 over QUIC (-Dhttp3). A server needs nothing from here:
+//! `app.listenTls` serves HTTP/3 on the same port by default, and
+//! `ServerOptions.http3` sets it up for `https`. This namespace has the
+//! client, `ClientConnection`, with the HTTP/2 client's API (the same
+//! names as `anole.h2`), and `Endpoint`, the QUIC server endpoint the
+//! server runs, for full control.
+//!
+//! Underneath: ngtcp2 1.25.0 (QUIC transport, from Anole's xuckless/ngtcp2
+//! fork) with its BoringSSL crypto helper, and nghttp3 1.18.0 (HTTP/3 +
+//! QPACK, from Anole's xuckless/nghttp3 fork), all MIT. WebTransport's
+//! streams and datagrams sit beside nghttp3 (`anole.webtransport`).
 const std = @import("std");
 
 /// ngtcp2 bindings (`ngtcp2.c`) plus typed wrappers for its `*_versioned` macros.
@@ -13,6 +17,7 @@ pub const ngtcp2 = @import("ngtcp2.zig");
 pub const nghttp3 = @import("nghttp3.zig");
 /// The HTTP/3 server endpoint for a dusty server's router.
 pub const Endpoint = @import("server.zig").Endpoint;
+/// An `Endpoint`'s settings; `ServerOptions.Http3` is the usual way in.
 pub const EndpointOptions = @import("server.zig").Options;
 /// An endpoint's counters (`Endpoint.stats`): packets handled, passed on
 /// between endpoints, connections accepted.
@@ -28,8 +33,12 @@ pub const ClientConnection = @import("client.zig").ClientConnection;
 pub const Stream = @import("client.zig").Stream;
 /// `Stream`, by its earlier name.
 pub const ClientStream = @import("client.zig").Stream;
+/// A header field, name and value.
 pub const Header = @import("client.zig").Header;
+/// Host, port, TLS, windows, timeouts, session cache, 0-RTT and
+/// WebTransport for `ClientConnection.connect`.
 pub const ConnectOptions = @import("client.zig").ConnectOptions;
+/// Per request: `body`, `timeout`, `early`.
 pub const RequestOptions = @import("client.zig").ClientConnection.RequestOptions;
 /// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
 pub const StreamError = @import("client.zig").StreamError;
@@ -44,6 +53,7 @@ pub const Rebind = @import("client.zig").Rebind;
 pub fn ngtcp2Version() []const u8 {
     return std.mem.span(ngtcp2.c.ngtcp2_version(0).*.version_str);
 }
+/// The linked nghttp3's version, e.g. "1.18.0".
 pub fn nghttp3Version() []const u8 {
     return std.mem.span(nghttp3.c.nghttp3_version(0).*.version_str);
 }

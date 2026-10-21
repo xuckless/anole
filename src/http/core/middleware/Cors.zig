@@ -19,6 +19,7 @@ const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
+/// `Cors.init`'s settings.
 pub const Config = struct {
     /// The origins allowed, each as the browser sends it: scheme and host,
     /// and the port when it is not the default (`https://app.example`).

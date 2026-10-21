@@ -116,6 +116,9 @@ pub const Stats = struct {
 };
 
 /// Every executor's `Stats`, added up.
+/// A cache's counters, added up over its executors (`stats`): hits,
+/// misses, requests that waited on another's fill (`coalesced`), entries
+/// stored and evicted, and what it holds now (`entries`, `bytes`).
 pub const Totals = struct {
     hits: u64 = 0,
     misses: u64 = 0,
@@ -125,6 +128,7 @@ pub const Totals = struct {
     entries: u64 = 0,
     bytes: u64 = 0,
 
+    /// Adds one executor's counters.
     pub fn add(self: *Totals, s: *const Stats) void {
         inline for (@typeInfo(Totals).@"struct".field_names) |name| @field(self, name) += @field(s, name).load(.monotonic);
     }

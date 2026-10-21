@@ -5,7 +5,10 @@
 const std = @import("std");
 const dusty = @import("dusty");
 
+/// What every generated key starts with. `fromRequest` takes a bearer
+/// token as a key only when it has this prefix.
 pub const prefix = "ak_";
+/// A key's SHA-256: what the application stores and looks keys up by.
 pub const Digest = [32]u8;
 
 /// A new key (to show the user once) and its digest (to store).
@@ -18,6 +21,7 @@ pub fn generate(arena: std.mem.Allocator, io: std.Io) !struct { key: []const u8,
     return .{ .key = key, .digest = digest(key) };
 }
 
+/// The digest of `key`, to store at creation and to look it up by.
 pub fn digest(key: []const u8) Digest {
     var d: Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &d, .{});
@@ -60,6 +64,7 @@ pub fn owner(req: *const dusty.Request) ?[]const u8 {
 pub const Middleware = struct {
     lookup: Lookup,
 
+    /// A middleware that asks `lookup` for the owner of each request's key.
     pub fn init(lookup: Lookup) Middleware {
         return .{ .lookup = lookup };
     }

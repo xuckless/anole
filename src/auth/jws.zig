@@ -10,6 +10,8 @@
 //!   `iat`, `iss` and `aud` are checked, with leeway for clock skew.
 const std = @import("std");
 
+/// The JWS algorithms `verify` accepts, by their `alg` names. `none` is not
+/// among them.
 pub const Alg = enum {
     HS256,
     HS384,
@@ -29,6 +31,9 @@ pub const Alg = enum {
     }
 };
 
+/// A verification key pinned to one algorithm. Build one by hand
+/// (`.{ .alg = .HS256, .material = .{ .hmac = secret } }`) or get a list
+/// from a JWK Set with `parseJwks`.
 pub const Key = struct {
     /// Matched against the token's `kid` when both have one.
     kid: ?[]const u8 = null,
@@ -36,7 +41,9 @@ pub const Key = struct {
     alg: Alg,
     material: Material,
 
+    /// The key itself, in the form its algorithm needs.
     pub const Material = union(enum) {
+        /// The shared secret, for the HS algorithms.
         hmac: []const u8,
         /// Big-endian modulus and exponent.
         rsa: struct { n: []const u8, e: []const u8 },
@@ -47,17 +54,24 @@ pub const Key = struct {
     };
 };
 
+/// What a token's claims must satisfy beyond a good signature. The
+/// default requires `exp` and allows 60 seconds of clock skew.
 pub const Policy = struct {
     /// Required `iss`.
     issuer: ?[]const u8 = null,
     /// Required in `aud` (a string or an array).
     audience: ?[]const u8 = null,
+    /// Clock skew allowed on `exp`, `nbf` and `iat`.
     leeway_seconds: i64 = 60,
+    /// Refuse a token without `exp` (`error.MissingExpiry`).
     require_exp: bool = true,
     /// A token older than this (by `iat`) is refused.
     max_age_seconds: ?i64 = null,
 };
 
+/// Why `verify` refused a token. `NoMatchingKey`: no key has the token's
+/// `alg` (and `kid`); `BadSignature`: one did, and the signature does not
+/// match it.
 pub const Error = error{
     Malformed,
     UnsupportedAlgorithm,
@@ -80,11 +94,14 @@ pub const Verified = struct {
     alg: Alg,
     kid: ?[]const u8,
 
+    /// The claim `name` when it is a string, else null.
     pub fn string(self: Verified, name: []const u8) ?[]const u8 {
         const v = self.claims.get(name) orelse return null;
         return if (v == .string) v.string else null;
     }
 
+    /// The claim `name` when it is a whole number that fits an `i64` (such as
+    /// `exp`), else null.
     pub fn integer(self: Verified, name: []const u8) ?i64 {
         const v = self.claims.get(name) orelse return null;
         return switch (v) {

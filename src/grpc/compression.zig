@@ -2,14 +2,18 @@
 //! src/compression.zig at commit db3c400bf70419742ebcb42fe316ba8b754b4975; see THIRD_PARTY_NOTICES.
 const std = @import("std");
 
+/// A message compression gRPC names in `grpc-encoding`.
 pub const Compression = enum {
     identity,
     gzip,
 
+    /// The name on the wire.
     pub fn name(self: Compression) []const u8 {
         return @tagName(self);
     }
 
+    /// The compression `value` names, or null for one Anole does not
+    /// speak.
     pub fn parse(value: []const u8) ?Compression {
         if (std.mem.eql(u8, value, "identity")) return .identity;
         if (std.mem.eql(u8, value, "gzip")) return .gzip;

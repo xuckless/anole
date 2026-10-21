@@ -60,6 +60,8 @@ pub const RegisterOptions = struct {
     no_wait: bool = false,
 };
 
+/// When a registration gzips its response messages
+/// (`RegisterOptions.response_compression`).
 pub const ResponseCompression = enum {
     /// When the request came gzipped too, as grpc-go does by default.
     mirror,
@@ -68,6 +70,7 @@ pub const ResponseCompression = enum {
     /// costs more CPU than the call itself (zlib-ng zeroes a 128 KiB hash
     /// table per message).
     accepted,
+    /// Never: response messages go out uncompressed.
     never,
 };
 
@@ -80,12 +83,27 @@ pub const unknown_error_message = "Application error processing RPC";
 
 /// One call, as its handler sees it: the request's metadata, its deadline,
 /// an arena for the call, and the status and trailing metadata to send.
+///
+/// A handler takes it first and returns the response message, or
+/// `call.fail(code, message)` to end the call with another status:
+///
+///     fn sayHello(call: *anole.grpc.Call, req: pb.HelloRequest) !pb.HelloReply {
+///         if (req.name.len == 0) return call.fail(.invalid_argument, "name is required");
+///         return .{ .message = try std.fmt.allocPrint(call.arena, "Hello, {s}", .{req.name}) };
+///     }
+///
+/// Any other error ends the call with UNKNOWN; its name is logged, not
+/// sent. Fields not documented here are the server's own.
 pub const Call = struct {
+    /// The HTTP request the call came in as.
     req: *dusty.Request,
+    /// The HTTP response the call goes out on. Use `addHeader` and
+    /// `addTrailer` rather than writing to it.
     res: *dusty.Response,
     /// The call's arena (the request's): messages decoded for the handler
     /// live here, and what the handler returns may too. Thread-safe.
     arena: std.mem.Allocator,
+    /// The server's runtime, for the handler's own I/O.
     io: std.Io,
     /// The application state of a `Server(Ctx)`, or null.
     ctx: ?*anyopaque,
@@ -95,10 +113,17 @@ pub const Call = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Set by `fail`, or left at OK.
     status: Code = .ok,
+    /// Set by `fail`: sent as grpc-message.
     status_message: []const u8 = "",
+    /// Trailing metadata to send with the status; see `addTrailer`.
     trailers: std.ArrayList(metadata_mod.Entry) = .empty,
+    /// The largest request message this call accepts
+    /// (`RegisterOptions.max_message_size`).
     max_message_size: usize,
+    /// How the client compressed its messages (grpc-encoding).
     request_compression: Compression = .identity,
+    /// How the response messages are compressed
+    /// (`RegisterOptions.response_compression`).
     response_compression: Compression = .identity,
     /// The response body, started by the first message (so initial
     /// metadata can be added until then).
@@ -118,6 +143,7 @@ pub const Call = struct {
     /// Connect GET: the request message, from the query.
     get_message: ?[]const u8 = null,
 
+    /// What `fail` returns: the status is on the call.
     pub const Error = error{GrpcStatus};
 
     /// Request metadata (a header), by lower-case name.
@@ -163,12 +189,15 @@ pub const Call = struct {
         return self.res.peerGone() or self.deadlineExceeded();
     }
 
+    /// Whether the client's grpc-timeout has run out. False without one.
     pub fn deadlineExceeded(self: *const Call) bool {
         const d = self.deadline orelse return false;
         return std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d);
     }
 };
 
+/// The four gRPC call shapes, told apart by a generated method's
+/// signature: one request or a queue of them, one response or a queue.
 pub const MethodKind = enum { unary, server_streaming, client_streaming, bidi_streaming };
 
 /// The protocols one route serves, told apart by the content type.
@@ -189,6 +218,8 @@ pub const Protocol = enum {
     http_json,
 };
 
+/// How messages are encoded: protobuf binary, or JSON (Connect's and
+/// gRPC-Web's `+json` content types, and transcoding).
 pub const Codec = enum { proto, json };
 
 /// The element type of a `*std.Io.Queue(T)` parameter.
@@ -197,7 +228,8 @@ fn QueueElem(comptime P: type) type {
     return @typeInfo(@typeInfo(@TypeOf(Q.init)).@"fn".param_types[0].?).pointer.child;
 }
 
-/// The kind and message types of a generated method's function pointer type.
+/// The kind and message types of a generated method's function pointer type:
+/// `kind`, `Request` and `Response`.
 pub const MethodOf = Method;
 
 fn Method(comptime F: type) type {
@@ -206,10 +238,13 @@ fn Method(comptime F: type) type {
     const ret = @typeInfo(info.return_type.?).error_union.payload;
     const second_is_queue = @typeInfo(params[1].?) == .pointer;
     return struct {
+        /// Which of the four call shapes the method is.
         pub const kind: MethodKind = if (params.len == 2)
             (if (second_is_queue) .client_streaming else .unary)
         else if (second_is_queue) .bidi_streaming else .server_streaming;
+        /// The request message type.
         pub const Request = if (second_is_queue) QueueElem(params[1].?) else params[1].?;
+        /// The response message type.
         pub const Response = if (params.len == 3) QueueElem(params[2].?) else ret;
     };
 }

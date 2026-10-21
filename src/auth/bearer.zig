@@ -53,6 +53,7 @@ pub const Hook = struct {
     func: *const fn (ptr: ?*anyopaque, req: *dusty.Request, token: *const jws.Verified) anyerror!void,
 };
 
+/// The keys `RequireJwt` verifies with.
 pub const Keys = union(enum) {
     /// Keys held by the application (each pinned to one algorithm).
     static: []const jws.Key,
@@ -60,6 +61,7 @@ pub const Keys = union(enum) {
     keyring: *Keyring,
 };
 
+/// `RequireJwt` settings beyond the claims policy.
 pub const Options = struct {
     /// Claims copied into `req.session` (string claims only); a `required`
     /// one also refuses a token without it. The entries are there for the
@@ -74,6 +76,7 @@ pub const Options = struct {
     scopes: []const []const u8 = &.{},
     /// `realm` in `WWW-Authenticate`.
     realm: ?[]const u8 = null,
+    /// Extra checks on the verified token; see `Hook`.
     hook: ?Hook = null,
 };
 
@@ -85,6 +88,8 @@ pub const RequireJwt = struct {
     policy: jws.Policy,
     options: Options = .{},
 
+    /// The middleware, verifying with `keys` (which must outlive it) against
+    /// `policy`.
     pub fn init(keys: Keys, policy: jws.Policy, options: Options) RequireJwt {
         return .{ .keys = keys, .policy = policy, .options = options };
     }

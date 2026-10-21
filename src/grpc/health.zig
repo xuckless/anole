@@ -12,11 +12,15 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const server = @import("server.zig");
+/// The generated grpc.health.v1 messages and service.
 pub const pb = @import("gen/grpc/health/v1.pb.zig");
 
+/// SERVING, NOT_SERVING, UNKNOWN or SERVICE_UNKNOWN.
 pub const ServingStatus = pb.HealthCheckResponse.ServingStatus;
 const Call = server.Call;
 
+/// A registry of service statuses, served as grpc.health.v1.Health.
+/// `app.grpcHealth()` makes one owned by the server and registers it.
 pub const Health = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -30,6 +34,7 @@ pub const Health = struct {
         return .{ .allocator = allocator, .io = io };
     }
 
+    /// Frees the registry. Unregister it first: the routes point at it.
     pub fn deinit(self: *Health) void {
         for (self.statuses.keys()) |k| self.allocator.free(k);
         self.statuses.deinit(self.allocator);
@@ -51,6 +56,9 @@ pub const Health = struct {
         return @ptrCast(@alignCast(call.data.?));
     }
 
+    /// Sets `service`'s status (the full name, "package.Service"; "" for
+    /// the server as a whole), waking every Watch on it. Fails only with
+    /// `error.OutOfMemory`.
     pub fn set(self: *Health, service: []const u8, status: ServingStatus) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -74,6 +74,8 @@ pub const driver = sqlite;
 
 const log = std.log.scoped(.anole);
 
+/// `app.sqlite(options)` and `Db.init`: the file, its connections and
+/// statement cache. `app.sqlite("app.db")` is `.{ .path = "app.db" }`.
 pub const Options = struct {
     /// A file (created when missing), `":memory:"` for one in-memory
     /// database shared by the whole app, or a `sqlite:` URL of either
@@ -105,8 +107,10 @@ pub const Options = struct {
 
 /// A BLOB parameter or column: bytes that are not text.
 pub const Blob = struct {
+    /// The bytes; in a row, copied into the arena.
     data: []const u8,
 
+    /// For `std.json`: the bytes as a base64 string.
     pub fn jsonStringify(self: Blob, jw: anytype) !void {
         try jw.print("\"{b64}\"", .{self.data});
     }
@@ -479,6 +483,7 @@ pub const Query = struct {
     db: *Db,
     options: db.QueryOptions,
 
+    /// `Db.exec`, with the options.
     pub fn exec(q: Query, cx: anytype, sql: []const u8, args: anytype) CallError!u64 {
         return q.call(.exec, void, cx, sql, args);
     }
@@ -486,14 +491,17 @@ pub const Query = struct {
     // The reads go through the cache, which shares them when the options
     // ask (`coalesce`, `cache`) and makes the plain call otherwise.
 
+    /// `Db.one`, with the options (`coalesce` and `cache` apply).
     pub fn one(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!T {
         return q.db.cache.read(T, cx, q.options, sql, args, Read(.one, T){ .q = q });
     }
 
+    /// `Db.optional`, with the options (`coalesce` and `cache` apply).
     pub fn optional(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!?T {
         return q.db.cache.read(?T, cx, q.options, sql, args, Read(.optional, T){ .q = q });
     }
 
+    /// `Db.all`, with the options (`coalesce` and `cache` apply).
     pub fn all(q: Query, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError![]T {
         return q.db.cache.read([]T, cx, q.options, sql, args, Read(.all, T){ .q = q });
     }
@@ -592,18 +600,22 @@ pub const Tx = struct {
     /// Committed or rolled back.
     finished: bool = false,
 
+    /// `Db.exec` inside the transaction.
     pub fn exec(tx: *Tx, cx: anytype, sql: []const u8, args: anytype) CallError!u64 {
         return tx.run(cx, .exec, void, sql, args, .{});
     }
 
+    /// `Db.one` inside the transaction.
     pub fn one(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!T {
         return tx.run(cx, .one, T, sql, args, .{});
     }
 
+    /// `Db.optional` inside the transaction.
     pub fn optional(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError!?T {
         return tx.run(cx, .optional, T, sql, args, .{});
     }
 
+    /// `Db.all` inside the transaction.
     pub fn all(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) CallError![]T {
         return tx.run(cx, .all, T, sql, args, .{});
     }
@@ -618,12 +630,16 @@ pub const Tx = struct {
         };
     }
 
+    /// Commits and gives the connection back; `deinit` after it does
+    /// nothing. When it fails, `deinit` rolls back.
     pub fn commit(tx: *Tx, cx: anytype) CallError!void {
         std.debug.assert(!tx.finished);
         _ = try tx.run(cx, .exec, void, "COMMIT", .{}, .{ .prepare = false });
         tx.release();
     }
 
+    /// Rolls back and gives the connection back, failed or not. `deinit`
+    /// does it too when neither this nor `commit` ran.
     pub fn rollback(tx: *Tx, cx: anytype) CallError!void {
         std.debug.assert(!tx.finished);
         defer tx.release();
@@ -679,6 +695,7 @@ pub const Conn = struct {
         return self.db.onWriter(self.io, Wrap.call, .{ self.db, args });
     }
 
+    /// Gives the writer back, for the next call or transaction.
     pub fn release(self: Conn) void {
         self.db.unlockWriter(self.io);
     }

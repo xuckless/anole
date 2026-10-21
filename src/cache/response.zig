@@ -42,6 +42,9 @@ const Request = dusty.Request;
 const Response = dusty.Response;
 const Generations = store.Generations;
 
+/// A response cache: a middleware (`execute`) that answers from memory
+/// what it kept, and keeps what the routes behind it answer. Make one with
+/// `app.responseCache(options)`, or `anole.cached` for one route.
 pub const ResponseCache = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -50,6 +53,7 @@ pub const ResponseCache = struct {
     gens: Generations = .{},
     metrics: ?store.Metrics = null,
 
+    /// Limits and policy. Nothing is cached until a cache is put on a route.
     pub const Options = struct {
         /// How long a response is kept when its `Cache-Control` does not
         /// say (`s-maxage`, else `max-age`, win).
@@ -66,6 +70,7 @@ pub const ResponseCache = struct {
         /// depend on who asks: the credentials are not part of the key,
         /// so one caller's answer is every caller's.
         authenticated: bool = false,
+        /// The request headers that count as credentials.
         credential_headers: []const []const u8 = &.{ "Authorization", "Cookie", "X-API-Key" },
         /// The cache's name in metrics (`name` label), one per cache.
         /// Null: the route's path for `anole.cached`, else "http".
@@ -103,6 +108,9 @@ pub const ResponseCache = struct {
         body_len: usize,
     };
 
+    /// A cache with a store per executor of `io`'s runtime (the server's).
+    /// `app.responseCache` calls it and frees the cache with the server;
+    /// one made here is the caller's to `deinit`, after the server stops.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*ResponseCache {
         const self = try gpa.create(ResponseCache);
         errdefer gpa.destroy(self);
@@ -115,6 +123,7 @@ pub const ResponseCache = struct {
         return self;
     }
 
+    /// Frees every kept response and the cache.
     pub fn deinit(self: *ResponseCache) void {
         for (self.locals.items) |*l| {
             l.store.deinit();
@@ -149,6 +158,9 @@ pub const ResponseCache = struct {
         }
     }
 
+    /// The middleware: a GET or HEAD with a fresh kept response gets it
+    /// without going further; any other request runs on, and a GET's
+    /// answer is kept when it may be.
     pub fn execute(self: *ResponseCache, req: *Request, res: *Response, executor: anytype) !void {
         if (req.method != .get and req.method != .head) return executor.next();
         if (!self.options.authenticated and self.credentials(req)) return executor.next();

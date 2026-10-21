@@ -104,6 +104,7 @@ pub fn addCertsFromPem(
 /// rather than a hope.
 pub const body_read_reserve = 1024;
 
+/// A file named by path, optionally relative to an open directory.
 pub const TlsPath = struct {
     path: []const u8,
     /// Directory `path` is resolved against. Defaults to the current working
@@ -111,6 +112,8 @@ pub const TlsPath = struct {
     dir: ?std.Io.Dir = null,
 };
 
+/// Where a listener binds, or a server's bound address: an IP address
+/// and port, or a Unix socket path.
 pub const Address = union(enum) {
     ip: std.Io.net.IpAddress,
     unix: std.Io.net.UnixAddress,
@@ -242,9 +245,22 @@ test "Listener.acceptorCount: log2 of the CPUs, at least two, unless given" {
     try std.testing.expectEqual(1, zero.acceptorCount(128));
 }
 
+/// The HTTP core's settings; through Anole, `anole.ServerOptions.server`
+/// (whose `listeners`, `http2`, `errors` and `error_handler` Anole sets
+/// from its own fields):
+///
+///     var app = try anole.App.init(gpa, .{ .server = .{
+///         .timeout = .{ .request = .fromSeconds(60) },
+///         .request = .{ .max_body_size = 8 * 1024 * 1024 },
+///     } });
 pub const ServerConfig = struct {
+    /// Request, header, keep-alive and shutdown time limits.
     timeout: Timeout = .{},
+    /// Limits on what a request may bring: body size, header and
+    /// parameter counts, the head's buffer.
     request: Request = .{},
+    /// How responses are written: buffer size, `Date`, the default
+    /// content type, header count, Brotli quality.
     response: Response = .{},
     /// HTTP/2 connections (with the `use_http2` build option): reached
     /// through ALPN "h2" on a TLS listener or `Listener.http2_prior_knowledge`.
@@ -320,11 +336,14 @@ pub const ServerConfig = struct {
         /// TLS module (tls.zig refuses it).
         alpn_protocols: []const []const u8 = &.{},
 
+        /// A certificate chain and private key as PEM text.
         pub const Pem = struct {
             cert: []const u8,
             key: []const u8,
         };
 
+        /// Mutual TLS: which CAs a client certificate must chain to, and
+        /// whether one is required.
         pub const ClientAuth = struct {
             /// Certificate authorities used to verify client certificates.
             /// `.none` is rejected by listen().
@@ -337,6 +356,7 @@ pub const ServerConfig = struct {
         };
     };
 
+    /// HTTP/2 limits and windows (`anole.ServerOptions.http2`).
     pub const Http2 = struct {
         /// SETTINGS_MAX_CONCURRENT_STREAMS: streams a client may have open
         /// at once. Each costs a task and, once it sends a body, a buffer
@@ -382,6 +402,7 @@ pub const ServerConfig = struct {
         inline_no_wait: bool = true,
     };
 
+    /// `ServerConfig.timeout`.
     pub const Timeout = struct {
         /// Maximum time to complete a request, including handler work and the
         /// response. TLS handshakes use the same timeout as a separate phase.
@@ -411,6 +432,7 @@ pub const ServerConfig = struct {
         shutdown: ?std.Io.Duration = .fromSeconds(30),
     };
 
+    /// `ServerConfig.request`.
     pub const Request = struct {
         /// Maximum size (bytes) for request body. Applies to the body a
         /// handler sees, so for a compressed request it bounds what was
@@ -465,6 +487,7 @@ pub const ServerConfig = struct {
         max_multiform_count: usize = 32,
     };
 
+    /// `ServerConfig.response`.
     pub const Response = struct {
         /// Buffer size (bytes) for writing to the connection while a request
         /// is served. A response head and a body that fits behind it go out

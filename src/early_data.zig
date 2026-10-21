@@ -11,9 +11,9 @@
 //! `Guard` answers 425 Too Early to unsafe requests that carry the mark,
 //! as RFC 8470 §5.1 requires: waiting cannot make them safe, since the
 //! early part happened on an earlier hop. `anole.Server` runs it on every
-//! route when HTTP/3 is on. `TooEarly` answers 425 to any marked request, for a route whose
-//! GET has effects that must not repeat; the client retries once its
-//! handshake is done (RFC 8470 §5.2).
+//! route when HTTP/3 is on. `TooEarly` answers 425 to any marked request,
+//! for a route whose GET has effects that must not repeat; the client
+//! retries once its handshake is done (RFC 8470 §5.2).
 const std = @import("std");
 const dusty = @import("dusty");
 

@@ -19,24 +19,48 @@
 //! are `anole.db` errors that become statuses. See docs/database.md.
 const std = @import("std");
 
+/// The handle in the App state: `app.mongodb(.{})`, or `Client.connect`
+/// outside `anole.Server`. `client.collection("users")` and
+/// `client.db("app")` lead to the calls.
 pub const Client = @import("client.zig").Client;
+/// `app.mongodb(options)` and `Client.connect`: the connection string,
+/// pool bounds, timeouts, TLS, retries, and how errors map to statuses.
 pub const Options = @import("client.zig").Options;
+/// What every call fails with: `anole.db.Error`, a cancel, or memory.
 pub const CallError = @import("client.zig").CallError;
+/// A database of the client (`client.db("app")`): `collection`,
+/// `runCommand`, `drop`.
 pub const Database = @import("collection.zig").Database;
+/// A collection (`client.collection("users")`): find, aggregate, count,
+/// insert, update, replace, delete, find-and-modify, indexes.
 pub const Collection = @import("collection.zig").Collection;
+/// The documents of `Collection.iterate` and `aggregateIterate`, a batch
+/// at a time: `next` until null, then `deinit`.
 pub const Cursor = @import("collection.zig").Cursor;
+/// What `Collection.insertOne` returns.
 pub const InsertOneResult = @import("collection.zig").InsertOneResult;
+/// What `Collection.insertMany` returns.
 pub const InsertManyResult = @import("collection.zig").InsertManyResult;
+/// What `updateOne`, `updateMany` and `replaceOne` return.
 pub const UpdateResult = @import("collection.zig").UpdateResult;
+/// What `deleteOne` and `deleteMany` return.
 pub const DeleteResult = @import("collection.zig").DeleteResult;
+/// `findOneAndUpdate`'s and `findOneAndReplace`'s `return_document`
+/// option: the document as it was (`before`, the default) or became.
 pub const ReturnDocument = @import("collection.zig").ReturnDocument;
+/// `anole.bson.ObjectId`, the usual `_id`.
 pub const ObjectId = @import("bson").ObjectId;
 
-/// The pieces, for tests and tools.
+/// The pieces, for tests and tools: the connection string parser.
 pub const uri = @import("uri.zig");
+/// SCRAM-SHA-1 and SCRAM-SHA-256 authentication.
 pub const scram = @import("scram.zig");
+/// OP_MSG messages on the wire.
 pub const wire = @import("wire.zig");
+/// Server discovery and monitoring: the topology and server selection.
 pub const sdam = @import("sdam.zig");
+/// One connection to one server: the handshake, authentication and
+/// command round trips.
 pub const connection = @import("connection.zig");
 
 test {

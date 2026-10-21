@@ -30,6 +30,8 @@ pub const Collection = coll_mod.Collection;
 const placement = dusty.placement;
 const log = std.log.scoped(.anole);
 
+/// `app.mongodb(options)` and `Client.connect`. Every field has a
+/// default, so `.{}` connects from `MONGODB_URI`.
 pub const Options = struct {
     /// The connection string. Null: `MONGODB_URI` from the environment,
     /// else mongodb://localhost:27017. Options in it win over the fields
@@ -64,7 +66,11 @@ pub const Options = struct {
     timeout: ?std.Io.Duration = null,
     /// Idle connections older than this are closed (`maxIdleTimeMS`).
     max_idle: ?std.Io.Duration = null,
+    /// Retry a read once after a network error or a primary change
+    /// (`retryReads`).
     retry_reads: bool = true,
+    /// Retry a single-document write once, likewise, on a replica set or
+    /// sharded cluster (`retryWrites`).
     retry_writes: bool = true,
     /// Which error classes become which statuses.
     errors: shared.ErrorMap = .{},
@@ -73,6 +79,8 @@ pub const Options = struct {
     cache: shared.CacheOptions = .{},
 };
 
+/// The connection string when neither `Options.url` nor `MONGODB_URI`
+/// gives one.
 pub const default_url = "mongodb://localhost:27017";
 
 /// A connection pool for one server on one executor (CMAP, without the
@@ -123,6 +131,12 @@ const SessionPool = struct {
     list: std.ArrayList(*Session) = .empty,
 };
 
+/// A MongoDB client: the handle in the App state. It monitors the
+/// deployment's servers, keeps a connection pool per server and executor,
+/// and runs every call on the primary. Safe to use from any task.
+///
+///     const users = app.mongo.collection("users");
+///     const user = try users.findOne(User, req, .{ .email = email }, .{});
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -695,6 +709,8 @@ pub const Client = struct {
         return age >= limit;
     }
 
+    /// Gives a server session back to the client's pool (a cursor's, when
+    /// it ends); one that saw a network error is dropped instead.
     pub fn giveSession(self: *Client, sess: *Session, io: std.Io) void {
         if (sess.dirty) {
             self.gpa.destroy(sess);

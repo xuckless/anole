@@ -2,6 +2,10 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
+//! The HTTP core (adapted from lalinsky/dusty): server, HTTP/2 engine,
+//! router, middleware, static files and client. Applications reach it as
+//! `anole.http`, and through `anole.Server`.
+
 const std = @import("std");
 
 pub const Server = @import("server.zig").Server;

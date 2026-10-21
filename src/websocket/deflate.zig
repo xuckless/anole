@@ -9,6 +9,8 @@
 const std = @import("std");
 const c = @import("anole_zlib_c");
 
+/// What one socket's negotiation settled: context takeover each way, and
+/// the server's window.
 pub const Config = struct {
     /// The server (we) resets its compressor after every message.
     server_no_context_takeover: bool = false,
@@ -22,11 +24,14 @@ pub const Config = struct {
     server_window_bits_sent: bool = false,
 };
 
+/// The server's compressor settings (`UpgradeOptions.deflate`).
 pub const Options = struct {
     /// Our compressor's window when the client leaves it to us. Smaller is
     /// less memory per socket: about 2^(bits+2) + 2^(mem_level+9) bytes.
     window_bits: u4 = 13,
+    /// zlib's memLevel, 1-9: the compressor's hash table size.
     mem_level: u4 = 6,
+    /// Compression level, 1 (fastest) to 9 (smallest).
     level: c_int = 6,
     /// Messages shorter than this go out uncompressed.
     min_length: usize = 64,

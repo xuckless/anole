@@ -42,6 +42,8 @@ pub const ConnectOptions = struct {
     /// limit.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
 
+    /// TLS settings, as for Anole's other clients plus a few the database
+    /// protocols need.
     pub const Tls = struct {
         /// The certificate authorities the server's certificate must chain to.
         /// The system store (the default) is loaded once for the process; a
@@ -66,11 +68,15 @@ pub const ConnectOptions = struct {
         /// direct TLS; empty for none. See `alpnProtocol`.
         alpn: []const []const u8 = &.{},
 
+        /// The system store, a file, a directory, PEM in memory, or none.
         pub const Ca = dusty.TlsCa;
+        /// A certificate and key, as files or PEM.
         pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
+/// One outbound connection: `connect`, then `reader` and `writer`, then
+/// `close`. See the file's example.
 pub const ClientStream = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -207,6 +213,7 @@ pub const ClientStream = struct {
         return null;
     }
 
+    /// Whether the stream is encrypted (from `connect` or `startTls`).
     pub fn isTls(self: *const ClientStream) bool {
         if (comptime has_tls) return self.secure != null;
         return false;

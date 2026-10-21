@@ -1,4 +1,4 @@
-//! Sessions: `req.session` (dusty's SessionData) loaded before the handler
+//! Sessions: `req.session` (a `SessionData`, up to 16 entries) loaded before the handler
 //! and saved after it, either
 //!
 //! - server-side, in a `Store` (`MemoryStore`, `RedisStore`), the cookie
@@ -26,6 +26,7 @@ const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;
 const log = std.log.scoped(.anole_session);
 
+/// The cookie encryption key's length in bytes (32), for `Config.key`.
 pub const key_length = Cipher.key_length;
 
 /// Where server-side sessions live.
@@ -33,20 +34,26 @@ pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    /// What a store implements.
     pub const VTable = struct {
         /// The session's serialized data, copied into `arena`; null when
         /// there is none (or it expired).
         load: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!?[]const u8,
+        /// Stores `data` under `id` for `ttl_seconds`, replacing what was there.
         save: *const fn (ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!void,
+        /// Removes the session `id`; one that is not there is no error.
         destroy: *const fn (ptr: *anyopaque, id: []const u8) anyerror!void,
     };
 
+    /// The data stored under `id`, copied into `arena`, or null.
     pub fn load(s: Store, arena: std.mem.Allocator, id: []const u8) !?[]const u8 {
         return s.vtable.load(s.ptr, arena, id);
     }
+    /// Stores `data` under `id` for `ttl_seconds`.
     pub fn save(s: Store, id: []const u8, data: []const u8, ttl_seconds: u32) !void {
         return s.vtable.save(s.ptr, id, data, ttl_seconds);
     }
+    /// Removes the session `id`.
     pub fn destroy(s: Store, id: []const u8) !void {
         return s.vtable.destroy(s.ptr, id);
     }
@@ -61,10 +68,12 @@ pub const MemoryStore = struct {
 
     const Entry = struct { data: []u8, expires: i64 };
 
+    /// An empty store. Expired sessions are dropped when next looked up.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) MemoryStore {
         return .{ .gpa = gpa, .io = io };
     }
 
+    /// Frees every session.
     pub fn deinit(self: *MemoryStore) void {
         var it = self.entries.iterator();
         while (it.next()) |e| {
@@ -74,6 +83,8 @@ pub const MemoryStore = struct {
         self.entries.deinit(self.gpa);
     }
 
+    /// The store interface for `Config.store`; `self` must outlive the
+    /// middleware.
     pub fn store(self: *MemoryStore) Store {
         return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy } };
     }
@@ -129,10 +140,15 @@ pub const MemoryStore = struct {
 /// Sessions in Redis/Valkey (-Dredis), keys `prefix ++ id` with the
 /// session's TTL, on the client's pools (`app.redis`).
 pub const RedisStore = if (features.redis) struct {
+    /// The client sessions go through (`app.redis(.{})`).
     client: *redis.Client,
+    /// Prepended to each session id to make its key.
     prefix: []const u8 = "anole:session:",
+    /// For the scratch memory of a save or destroy.
     gpa: std.mem.Allocator,
 
+    /// The store interface for `Config.store`; `self` must outlive the
+    /// middleware.
     pub fn store(self: *@This()) Store {
         return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy } };
     }
@@ -167,16 +183,23 @@ pub const RedisStore = if (features.redis) struct {
     }
 } else struct {};
 
+/// `Middleware` settings. Cookie mode needs `key`; with `store`, `key` is
+/// unused.
 pub const Config = struct {
     /// Server-side store; null keeps the session in an encrypted cookie.
     store: ?Store = null,
     /// The cookie encryption key (cookie mode). Random, secret, and the
-    /// same on every node.
+    /// same on every node: 32 bytes from a secret store, not the all-zero
+    /// default.
     key: [key_length]u8 = @splat(0),
+    /// The cookie's name; also bound into the sealed cookie, so renaming
+    /// it ends every cookie-mode session.
     cookie_name: []const u8 = "anole_session",
     /// How long a session lives without being touched; each response that
     /// carries it renews it.
     ttl_seconds: u32 = 24 * 3600,
+    /// The cookie's attributes: path `/`, `HttpOnly`, `Secure` and
+    /// `SameSite=Lax` by default. `max_age` is set from `ttl_seconds`.
     cookie_opts: dusty.CookieOpts = .{ .path = "/", .http_only = true, .secure = true, .same_site = .lax },
 };
 
@@ -201,6 +224,10 @@ pub fn regenerate(req: *dusty.Request) error{ SessionFull, InvalidSessionData }!
 pub const Middleware = struct {
     config: Config,
 
+    /// The middleware for `config`. Before the handler it loads
+    /// `req.session` from the cookie (a missing, expired or forged one
+    /// leaves it empty); after, it saves the session when it changed or
+    /// holds anything, and clears the cookie when it was emptied.
     pub fn init(config: Config) Middleware {
         return .{ .config = config };
     }

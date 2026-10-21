@@ -34,6 +34,7 @@ pub const Database = struct {
     name: []const u8,
     options: db.QueryOptions = .{},
 
+    /// The collection `name` of this database, with the same options.
     pub fn collection(self: Database, name: []const u8) Collection {
         return .{ .client = self.client, .database = self.name, .name = name, .options = self.options };
     }
@@ -89,6 +90,10 @@ pub const Collection = struct {
     // -----------------------------------------------------------------------
     // Reads
 
+    /// The options `find`, `findOne`, `findOptional` and `iterate` take,
+    /// as pairs of the Zig field name and the command's: pass any of
+    /// them in `opts` (`.{ .sort = .{ .created = -1 }, .limit = 20 }`), or
+    /// `.{}` for none. Another field is a compile error.
     pub const find_options = .{
         .{ "sort", "sort" },            .{ "projection", "projection" },       .{ "skip", "skip" },
         .{ "limit", "limit" },          .{ "batch_size", "batchSize" },        .{ "hint", "hint" },
@@ -141,6 +146,8 @@ pub const Collection = struct {
         return self.open(T, cx, "find", body, batchSizeOf(opts), .read);
     }
 
+    /// The options `aggregate` and `aggregateIterate` take (see
+    /// `find_options`).
     pub const aggregate_options = .{
         .{ "allow_disk_use", "allowDiskUse" },                         .{ "batch_size", "batchSize" }, .{ "hint", "hint" },
         .{ "collation", "collation" },                                 .{ "comment", "comment" },      .{ "let", "let" },
@@ -280,6 +287,7 @@ pub const Collection = struct {
         return .{ .inserted_id = ctx.first_id orelse .null };
     }
 
+    /// The options `insertMany` takes (see `find_options`).
     pub const insert_many_options = .{ .{ "ordered", "ordered" }, .{ "bypass_document_validation", "bypassDocumentValidation" }, .{ "comment", "comment" } };
 
     /// Inserts `docs` (a slice), in batches the server takes. Ordered by
@@ -311,6 +319,8 @@ pub const Collection = struct {
         return .{ .inserted_count = inserted, .inserted_ids = inserted_ids };
     }
 
+    /// The options `updateOne`, `updateMany` and `replaceOne` take (see
+    /// `find_options`).
     pub const update_options = .{ .{ "upsert", "upsert" }, .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" }, .{ "collation", "collation" } };
 
     /// Applies `update` (`.{ .@"$set" = .{ ... } }`, or a pipeline tuple) to
@@ -347,6 +357,7 @@ pub const Collection = struct {
         return self.client.execute(&cx, self.op("update", .write, if (multi) .none else .write), &ctx);
     }
 
+    /// The options `deleteOne` and `deleteMany` take (see `find_options`).
     pub const delete_options = .{ .{ "hint", "hint" }, .{ "collation", "collation" } };
 
     /// Deletes the first document matching `filter`. Options: hint, collation.
@@ -366,6 +377,9 @@ pub const Collection = struct {
         return self.client.execute(&cx, self.op("delete", .write, if (multi) .none else .write), &ctx);
     }
 
+    /// The options `findOneAndUpdate`, `findOneAndReplace` and
+    /// `findOneAndDelete` take (see `find_options`); `return_document` is
+    /// a `ReturnDocument`.
     pub const find_and_modify_options = .{
         .{ "sort", "sort" },                  .{ "projection", "fields" }, .{ "upsert", "upsert" },
         .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" },         .{ "collation", "collation" },
@@ -406,6 +420,7 @@ pub const Collection = struct {
     // -----------------------------------------------------------------------
     // Indexes and the collection itself
 
+    /// The options `createIndex` takes (see `find_options`).
     pub const index_options = .{
         .{ "name", "name" },                               .{ "unique", "unique" },                                     .{ "sparse", "sparse" },
         .{ "expire_after_seconds", "expireAfterSeconds" }, .{ "partial_filter_expression", "partialFilterExpression" }, .{ "collation", "collation" },
@@ -477,6 +492,7 @@ pub const Collection = struct {
 /// What `insertOne` returns: the inserted document's `_id` (an ObjectId
 /// unless the document brought its own), in the call's arena.
 pub const InsertOneResult = struct {
+    /// The document's `_id`.
     inserted_id: bson.Value,
 
     /// The id as an ObjectId, when it is one.
@@ -485,20 +501,28 @@ pub const InsertOneResult = struct {
     }
 };
 
+/// What `insertMany` returns, in the call's arena.
 pub const InsertManyResult = struct {
+    /// How many documents went in.
     inserted_count: u64,
     /// By the index of `docs`; `.null` for documents not inserted.
     inserted_ids: []bson.Value,
 };
 
+/// What `updateOne`, `updateMany` and `replaceOne` return.
 pub const UpdateResult = struct {
+    /// Documents that matched the filter.
     matched_count: u64,
+    /// Documents that changed (a match the update left as it was is not
+    /// counted).
     modified_count: u64,
     /// The new document's `_id` when an upsert inserted one.
     upserted_id: ?bson.Value = null,
 };
 
+/// What `deleteOne` and `deleteMany` return.
 pub const DeleteResult = struct {
+    /// Documents deleted.
     deleted_count: u64,
 };
 

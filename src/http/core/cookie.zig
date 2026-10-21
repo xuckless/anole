@@ -13,6 +13,7 @@ const std = @import("std");
 pub const Cookie = struct {
     header: []const u8,
 
+    /// The value of cookie `name`, as sent (not decoded), or null.
     pub fn get(self: Cookie, name: []const u8) ?[]const u8 {
         var it = std.mem.splitScalar(u8, self.header, ';');
         while (it.next()) |kv| {
@@ -33,6 +34,7 @@ pub const Cookie = struct {
         return null;
     }
 
+    /// Every cookie, in the order sent.
     pub fn iterator(self: Cookie) Iterator {
         return .{ .rest = self.header };
     }
@@ -82,12 +84,20 @@ pub const Cookie = struct {
 
 /// Options for setting a cookie in a response.
 pub const CookieOpts = struct {
+    /// `Path`; empty for none (the browser uses the request's directory).
     path: []const u8 = "",
+    /// `Domain`; empty for this host only.
     domain: []const u8 = "",
+    /// `Max-Age`; null for a cookie that ends with the browser session,
+    /// zero to delete one.
     max_age: ?std.Io.Duration = null,
+    /// `Secure`: sent over HTTPS only.
     secure: bool = false,
+    /// `HttpOnly`: hidden from the page's scripts.
     http_only: bool = false,
+    /// `Partitioned` (CHIPS): kept per top-level site.
     partitioned: bool = false,
+    /// `SameSite`; null sends none.
     same_site: ?SameSite = null,
 
     pub const SameSite = enum {
