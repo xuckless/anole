@@ -60,7 +60,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
     defer client.deinit();
     var endpoint_buf: [64]u8 = undefined;
     const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = endpoint, .service_name = "test-api", .interval_ms = 50 });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "test-api", .interval_ms = 50 });
     var exporter_live = true;
     defer if (exporter_live) exporter.deinit();
     try exporter.start();
@@ -145,7 +145,7 @@ test "observe: an unsampled caller's context is passed on; error statuses as sen
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
     // Never started: nothing here is recorded, or sent anywhere.
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .sample_all = false });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .sample_all = false });
     defer exporter.deinit();
     var registry = observe.metrics.Registry.init(gpa, io);
     defer registry.deinit();
@@ -288,7 +288,7 @@ test "observe: the exporter stops at once, not after its interval" {
     defer client.deinit();
     // Nothing listens there: the one span is dropped, then the task pauses
     // for its (long) interval until deinit wakes it.
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval_ms = 60_000 });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval_ms = 60_000 });
     try exporter.start();
     var span: observe.trace.Span = undefined;
     span.db = null;
@@ -317,7 +317,7 @@ test "observe: exclude keeps probes out of metrics and traces" {
 
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .exclude = &observe.probe_paths });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .exclude = &observe.probe_paths });
     defer exporter.deinit();
     var registry = observe.metrics.Registry.init(gpa, io);
     defer registry.deinit();

@@ -67,13 +67,19 @@ pub const ConnectOptions = struct {
     /// Send here instead of resolving `host`.
     address: ?std.Io.net.IpAddress = null,
     /// How the server's certificate is checked, and the client's own.
+    /// Always TLS: QUIC has no cleartext form (HTTP/2's `tls` is optional).
     tls: Tls = .{},
-    /// Bytes the server may send on a stream before its reader takes them.
-    stream_window: u32 = 256 * 1024,
+    /// Bytes the server may send on a stream before its reader takes them,
+    /// as in `anole.h2`. 256 KiB here (64 KiB over HTTP/2): an HTTP/3
+    /// stream's receive buffer grows as data arrives rather than being
+    /// allocated whole, and ngtcp2 widens the window (up to 6x) on a fast
+    /// path.
+    stream_window: u31 = 256 * 1024,
     /// The same for the whole connection.
-    max_data: u32 = 16 * 1024 * 1024,
-    /// Closes the connection after this long with nothing received.
-    idle_timeout_ms: u32 = 30_000,
+    max_data: u31 = 16 * 1024 * 1024,
+    /// HTTP/3 only: QUIC closes the connection after this long with
+    /// nothing received (its idle timeout). HTTP/2 over TCP has none.
+    idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// For `connect`: resolving `host` and the QUIC handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -81,17 +87,18 @@ pub const ConnectOptions = struct {
     /// body, unless its `RequestOptions.timeout` says otherwise. Null for
     /// no limit, which a long-lived stream wants.
     timeout: ?std.Io.Duration = .fromSeconds(30),
-    /// Where tickets are kept, to resume sessions (one round trip less, no
-    /// certificate) and for `early_data`. Shared by any connections.
+    /// HTTP/3 only: where tickets are kept, to resume sessions (one round
+    /// trip less, no certificate) and for `early_data`. Shared by any
+    /// connections.
     session_cache: ?*SessionCache = null,
-    /// With a ticket for this server that allows it: send requests in
-    /// 0-RTT, before the handshake completes. `connect` then returns at
+    /// HTTP/3 only: with a ticket for this server that allows it, send
+    /// requests in 0-RTT, before the handshake completes. `connect` then returns at
     /// once, and `request` sends GET, HEAD and OPTIONS (or any request, with
     /// `RequestOptions.early`) right away; others wait for the handshake.
     /// Early data can be replayed by anyone who records it, so send in it
     /// only what is harmless to repeat.
     early_data: bool = false,
-    /// Speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
+    /// HTTP/3 only: speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
     /// HTTP datagrams, and streams the server may open.
     webtransport: bool = false,
 
@@ -319,7 +326,7 @@ pub const ClientConnection = struct {
         params.initial_max_streams_bidi = if (options.webtransport) 100 else 0;
         params.initial_max_streams_uni = if (options.webtransport) 103 else 3;
         if (options.webtransport) params.max_datagram_frame_size = 65535;
-        params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+        params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
         params.active_connection_id_limit = 7;
         params.grease_quic_bit = 1;
 
@@ -726,7 +733,7 @@ pub const ClientConnection = struct {
         /// `anole.h2`: null inherits it, `.none` lifts it, and past it the
         /// stream is reset and its waits fail with `error.Timeout`.
         timeout: ?std.Io.Timeout = null,
-        /// While a 0-RTT handshake is going (`ConnectOptions.early_data`):
+        /// HTTP/3 only. While a 0-RTT handshake is going (`ConnectOptions.early_data`):
         /// true sends this request in early data, false waits for the
         /// handshake, null decides by method (GET, HEAD and OPTIONS go).
         /// Only what is harmless to repeat belongs in early data.

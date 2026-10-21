@@ -89,9 +89,9 @@ test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
     var buf: [64]u8 = undefined;
-    var provider = try oidc.Provider.discover(&client, gpa, issuer(&buf));
+    var provider = try oidc.Provider.discover(gpa, .{ .http = &client }, issuer(&buf));
     defer provider.deinit(gpa);
-    var keyring = Keyring.init(gpa, io, &client, provider.jwks_uri);
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, provider.jwks_uri);
     defer keyring.deinit();
     const rp: oidc.RelyingParty = .{
         .provider = &provider,
@@ -110,19 +110,19 @@ test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
     @memcpy(next_nonce[0..start.nonce.len], start.nonce);
     next_nonce_len = start.nonce.len;
 
-    const id = try rp.finish(arena, io, &client, .{ .code = "the-code", .state = start.state }, start);
+    const id = try rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = start.state }, start);
     try std.testing.expectEqualStrings("user-7", id.subject);
     try std.testing.expectEqualStrings("u7@example.com", id.email.?);
     try std.testing.expect(id.email_verified);
 
     // A forged state never reaches the provider.
     const before = token_requests;
-    try std.testing.expectError(error.StateMismatch, rp.finish(arena, io, &client, .{ .code = "the-code", .state = "forged-state-forged-state-forged-state-1234" }, start));
+    try std.testing.expectError(error.StateMismatch, rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = "forged-state-forged-state-forged-state-1234" }, start));
     try std.testing.expectEqual(before, token_requests);
 
     // An ID token with another sign-in's nonce is refused (replay).
     const second = try rp.begin(arena, io);
-    try std.testing.expectError(error.NonceMismatch, rp.finish(arena, io, &client, .{ .code = "the-code", .state = second.state }, second));
+    try std.testing.expectError(error.NonceMismatch, rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = second.state }, second));
 }
 
 test "Sign in with Apple: the client secret is an ES256 JWT our verifier accepts" {

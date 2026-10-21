@@ -7,18 +7,18 @@
 //! verifying while it runs. Verification runs outside the lock too, on a
 //! reference-counted set, so a rotation never frees keys in use.
 const std = @import("std");
-const dusty = @import("dusty");
 const jws = @import("jws.zig");
+const Client = @import("../client.zig").Client;
 
 /// A provider's JWK Set behind a URL, fetched on first use and kept. Give it
-/// the server's client (`app.client().http`) and the provider's `jwks_uri`:
+/// the server's client (`app.client()`) and the provider's `jwks_uri`:
 ///
-///     var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client().http, provider.jwks_uri);
+///     var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client(), provider.jwks_uri);
 ///     defer keyring.deinit();
 pub const Keyring = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    client: *dusty.Client,
+    client: Client,
     url: []const u8,
     /// Keys are refetched this long after the last fetch.
     ttl_seconds: i64 = 3600,
@@ -47,9 +47,10 @@ pub const Keyring = struct {
         refs: usize = 1,
     };
 
-    /// A keyring for the JWK Set at `url`, fetched through `client`. Nothing is
-    /// fetched until the first `verify`. `client` and `url` must outlive it.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *dusty.Client, url: []const u8) Keyring {
+    /// A keyring for the JWK Set at `url`, fetched through `client` (the
+    /// server's, `app.client()` or `anole.client(io)`). Nothing is fetched
+    /// until the first `verify`. `client`'s server and `url` must outlive it.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: Client, url: []const u8) Keyring {
         return .{ .gpa = gpa, .io = io, .client = client, .url = url };
     }
 
@@ -148,7 +149,7 @@ pub const Keyring = struct {
         const set = try self.gpa.create(Set);
         set.* = .{ .arena = .init(self.gpa), .keys = &.{}, .fetched_at = 0 };
         errdefer self.free(set);
-        var response = try self.client.fetch(self.url, .{});
+        var response = try self.client.http.fetch(self.url, .{});
         defer response.deinit();
         if (response.status() != .ok) return error.JwksFetchFailed;
         const body = (try response.body()) orelse return error.JwksFetchFailed;

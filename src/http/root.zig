@@ -1,7 +1,7 @@
-//! The HTTP core under `anole.Server`: the HTTP/1.1 server and its HTTP/2
-//! engine, the router, middleware, static files, and the outbound client.
-//! Adapted from lalinsky/dusty (MIT) and now part of Anole (src/http/core);
-//! the module is still imported as `dusty`.
+//! `anole.http`, the HTTP core under `anole.Server`: the HTTP/1.1 server
+//! and its HTTP/2 engine, the router, middleware, static files, and the
+//! outbound client. Adapted from lalinsky/dusty (MIT); part of Anole, in
+//! src/http/core.
 //!
 //! Most applications need only `anole.App` or `anole.Server`, which wrap
 //! this; reach here for settings and types they pass through
@@ -79,8 +79,9 @@ pub const checkAddressFree = dusty.checkAddressFree;
 /// out from it.
 pub const fd_limit = dusty.fd_limit;
 
-/// The whole HTTP core module, for anything not re-exported above.
-pub const dusty_module = dusty;
+/// The whole HTTP core module (src/http/core), for anything not
+/// re-exported above.
+pub const core = dusty;
 
 // Loopback smoke test: a dusty server and a raw TCP client as two tasks of a
 // zio runtime. The harness shape is adapted from dusty's src/server_test.zig

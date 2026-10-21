@@ -31,6 +31,7 @@ const features = @import("build_options");
 const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
+const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
@@ -1610,7 +1611,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.router.has_routes) @panic("app.tracing() adds a middleware, so it goes before the routes, with app.use()");
             const env = if (self.process) |p| p.environ else null;
             const e = try self.arena.allocator().create(observe.trace.Exporter);
-            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), &self.extras.client, .{
+            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), self.client(), .{
                 .endpoint = opts.endpoint orelse (if (env) |v| v.getPosix("OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
                 .service_name = opts.service_name orelse (if (env) |v| v.getPosix("OTEL_SERVICE_NAME") else null) orelse "anole",
                 .sample_all = opts.sample_all,
@@ -2076,7 +2077,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             const io_ = a.io();
             const alloc = std.testing.allocator;
             try a.waitReady();
-            var bundle = try tls.testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
+            var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
             defer bundle.deinit(alloc);
             // The certificate's DER: the bundle holds exactly it.
             const der = bundle.bytes.items;
@@ -2085,7 +2086,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             // HTTP/1.1, without a certificate and with one.
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/peer", .{port});
-            const ca: http.dusty_module.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
+            const ca: http.core.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
             {
                 var anon = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
                 defer anon.deinit();
@@ -2640,7 +2641,7 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
 
             // TLS, HTTP/1.1 only: a client that offers h2 alone does not
             // get it; one that offers both gets HTTP/1.1. No Alt-Svc.
-            const ca: http.dusty_module.TlsCa = .{ .pem = p.cert };
+            const ca: http.core.TlsCa = .{ .pem = p.cert };
             try std.testing.expect(std.meta.isError(h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h1tls,

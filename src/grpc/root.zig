@@ -12,20 +12,18 @@
 const std = @import("std");
 const features = @import("build_options");
 
-/// The gRPC message framing (a 5-byte prefix per message), with gzip.
-pub const frame = @import("frame.zig");
-/// Status codes and `Status`.
-pub const status = @import("status.zig");
+// The wire pieces; the server, client and tests import them directly.
+const frame = @import("frame.zig");
+const status = @import("status.zig");
+const metadata = @import("metadata.zig");
+const deadline = @import("deadline.zig");
+
 /// A call's outcome: a code and a message.
 pub const Status = status.Status;
 /// A gRPC status code (`.not_found`, `.invalid_argument`...).
 pub const Code = status.Code;
-/// Metadata keys and values, and `Metadata`.
-pub const metadata = @import("metadata.zig");
 /// A list of metadata pairs.
 pub const Metadata = metadata.Metadata;
-/// The grpc-timeout header format.
-pub const deadline = @import("deadline.zig");
 /// identity or gzip, as grpc-encoding names them.
 pub const Compression = @import("compression.zig").Compression;
 
@@ -47,6 +45,10 @@ pub const ResponseCompression = server.ResponseCompression;
 pub const default_max_message_size = server.default_max_message_size;
 /// unary, server_streaming, client_streaming or bidi_streaming.
 pub const MethodKind = server.MethodKind;
+/// The wire protocol a call came in on (`Call.protocol()`).
+pub const Protocol = server.Protocol;
+/// How a call's messages are encoded (`Call.codec()`): proto or json.
+pub const Codec = server.Codec;
 
 /// The client: `Channel` over an `anole.h2.ClientConnection`, and
 /// `Client(Service)` for typed calls.

@@ -134,8 +134,12 @@ pub const ResponseCache = struct {
     }
 
     /// Reports to `registry` (`anole_cache_*{kind="http",name}`). The
-    /// server calls it when serving starts, with the app's registry.
-    pub fn start(self: *ResponseCache, registry: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, _: ?*observe.Health) !void {
+    /// server calls it when serving starts, with the app's registry, tracer
+    /// and health checks, as it starts every connector; a response cache
+    /// has no spans or health check of its own, so it uses only `registry`.
+    pub fn start(self: *ResponseCache, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
+        _ = tracer;
+        _ = health;
         const r = registry orelse return;
         if (self.metrics != null) return;
         self.metrics = try .init(r, "http", self.options.name orelse "http");

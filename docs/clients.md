@@ -52,17 +52,20 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
   `""` when there is none) and `json(T, allocator)`, which parses the body
   into `T`, skipping fields `T` does not have, with memory from `allocator`
   that outlives the response. It does not check the status.
-- `deinit` hands the connection back to the pool. `.inner` is dusty's
-  response, `.http` (on the client) dusty's client, for the rest of what
-  `anole.http.Client` below offers.
+- `deinit` hands the connection back to the pool. `.inner` is the HTTP
+  core's response, `.http` (on the client) the core's client, for the rest
+  of what `anole.http.Client` below offers.
 
 It trusts the system's CA store and has the defaults below. A client with
 other settings (CAs, a client certificate, HTTP/2) is an
-`anole.http.Client` of your own.
+`anole.http.Client` of your own. The APIs that make requests for you
+(`anole.auth.Keyring`, `anole.auth.oidc`, `anole.observe.trace.Exporter`)
+take the `anole.Client` that `app.client()` and `anole.client(req)` return;
+wrap one of your own as `.{ .http = &my_client }`.
 
 ## HTTP/1.1 and HTTPS
 
-`anole.http.Client` is dusty's client. Create one, share it, and call `fetch`:
+`anole.http.Client` is the HTTP core's client. Create one, share it, and call `fetch`:
 
 ```zig
 var client = anole.http.Client.init(gpa, io, .{});
@@ -148,6 +151,12 @@ defer gpa.free(body);
   `s.readError()` and `s.writeError()` say which of those four it was.
 - A stream's `status`, `headers` and `trailers` live until `release`; copy
   what you keep.
+- `stream_window` (64 KiB) is what the server may send on a stream before
+  its reader takes it, and `max_data` (16 MiB) the same for the
+  connection. Each stream allocates a receive queue of `stream_window` up
+  front, hence the smaller default than HTTP/3's.
+- `RequestOptions.body_bytes` (HTTP/2 only) sends a whole body at once, in
+  place of `body = true` and the writer.
 
 ## HTTP/3
 
@@ -167,10 +176,15 @@ Each connection binds its own UDP socket. `connect` returns after the
 handshake, and fails with `error.HandshakeFailed` (a certificate it does not
 trust among other causes), `error.Timeout` (past `connect_timeout`, 10 s by
 default) or `error.NoH3`. `timeout` is each request's budget, as for
-HTTP/2. The other `ConnectOptions` are `stream_window` (256 KiB), `max_data`
-(16 MiB) and `idle_timeout_ms` (30 s). `anole.h3` exports the names
-`anole.h2` does: `ClientConnection`, `Stream` (also as `ClientStream`),
-`Header`, `ConnectOptions`, `RequestOptions` and `StreamError`.
+HTTP/2. `stream_window` (256 KiB) and `max_data` (16 MiB) mean what they
+do for HTTP/2, with the same types; the stream window's default is larger
+because an HTTP/3 stream's buffer grows as data arrives. Only HTTP/3 has
+`idle_timeout` (30 s, QUIC's idle timeout), `session_cache`, `early_data`
+and `webtransport` (below), and `RequestOptions.early`; `tls` is not
+optional. `anole.h3` exports the names `anole.h2` does:
+`ClientConnection`, `Stream`, `Header`, `ConnectOptions`, `RequestOptions`,
+`StreamError` and `version()` ("ngtcp2/1.25.0 nghttp3/1.18.0", against
+`anole.h2.version()`'s "nghttp2/1.70.0").
 
 The client does not discover HTTP/3 from `Alt-Svc` or retry over TCP.
 Connect to it when you know the server speaks it.

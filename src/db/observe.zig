@@ -199,7 +199,7 @@ test "Observer: metrics shared by two databases, and a child span in a traced re
     var client = dusty.Client.init(gpa, testing.io, .{});
     defer client.deinit();
     // Never started: what is submitted stays in its queue.
-    var exporter = try observe.trace.Exporter.init(gpa, testing.io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t" });
+    var exporter = try observe.trace.Exporter.init(gpa, testing.io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t" });
     defer exporter.deinit();
 
     const main_db = try Observer.init(.postgresql, "main", &registry, &exporter);

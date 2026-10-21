@@ -6,9 +6,8 @@
 //! - in the cookie itself, encrypted and authenticated with
 //!   XChaCha20-Poly1305 (no store).
 //!
-//!     var sessions = anole.session.Middleware.init(.{ .key = key });            // cookie
-//!     var sessions = anole.session.Middleware.init(.{ .key = key, .store = mem.store() });
-//!     app.use(sessions);
+//!     app.use(try anole.session.Middleware.init(.{ .key = key }));         // cookie
+//!     app.use(try anole.session.Middleware.init(.{ .store = mem.store() })); // store
 //!     // in a handler: try req.session.set("user", "42"); req.session.get("user")
 //!     // at sign-in:   try anole.session.regenerate(req);  (a new session id)
 //!
@@ -183,15 +182,18 @@ pub const RedisStore = if (features.redis) struct {
     }
 } else struct {};
 
-/// `Middleware` settings. Cookie mode needs `key`; with `store`, `key` is
+/// `Middleware` settings. Cookie mode (no `store`) needs `key`, and
+/// `Middleware.init` refuses to start without one; with `store`, `key` is
 /// unused.
 pub const Config = struct {
     /// Server-side store; null keeps the session in an encrypted cookie.
     store: ?Store = null,
-    /// The cookie encryption key (cookie mode). Random, secret, and the
-    /// same on every node: 32 bytes from a secret store, not the all-zero
-    /// default.
-    key: [key_length]u8 = @splat(0),
+    /// The cookie encryption key, required in cookie mode: 32 random bytes
+    /// from your secret store, the same on every node (`keyFromBase64`
+    /// reads one from configuration). There is no default: `init` fails
+    /// with `error.SessionKeyMissing` for null or all zeros. For local
+    /// development only, `devKey(io)` makes a random one.
+    key: ?[key_length]u8 = null,
     /// The cookie's name; also bound into the sealed cookie, so renaming
     /// it ends every cookie-mode session.
     cookie_name: []const u8 = "anole_session",
@@ -220,16 +222,34 @@ pub fn regenerate(req: *dusty.Request) error{ SessionFull, InvalidSessionData }!
     try req.session.set(regenerate_key, "1");
 }
 
-/// The session middleware: `app.use(anole.session.Middleware.init(config))`.
+/// What `Middleware.init` refuses: cookie mode without a usable key.
+pub const ConfigError = error{
+    /// Cookie mode (no `Config.store`) with `Config.key` null or all
+    /// zeros: such cookies could be forged and read by anyone.
+    SessionKeyMissing,
+};
+
+/// The session middleware: `app.use(try anole.session.Middleware.init(config))`.
 pub const Middleware = struct {
     config: Config,
+    /// The cookie key, checked by `init` (cookie mode only).
+    key: [key_length]u8,
 
     /// The middleware for `config`. Before the handler it loads
     /// `req.session` from the cookie (a missing, expired or forged one
     /// leaves it empty); after, it saves the session when it changed or
     /// holds anything, and clears the cookie when it was emptied.
-    pub fn init(config: Config) Middleware {
-        return .{ .config = config };
+    ///
+    /// In cookie mode it fails with `error.SessionKeyMissing` (and logs
+    /// how to fix it) when `config.key` is null or all zeros.
+    pub fn init(config: Config) ConfigError!Middleware {
+        if (config.store != null) return .{ .config = config, .key = @splat(0) };
+        const key = cookieKey(config.key) orelse {
+            log.err("anole.session: cookie sessions need Config.key, 32 random bytes (not all zeros) from your secret store and the same on every node " ++
+                "(anole.session.keyFromBase64 reads one), or a Config.store; anole.session.devKey(io) makes one for local development", .{});
+            return error.SessionKeyMissing;
+        };
+        return .{ .config = config, .key = key };
     }
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
@@ -262,7 +282,7 @@ pub const Middleware = struct {
             try deserialize(&req.session, data);
         } else {
             const sealed = try decodeBase64(req.arena, raw);
-            const plain = try open(req.arena, self.config.key, self.config.cookie_name, sealed);
+            const plain = try open(req.arena, self.key, self.config.cookie_name, sealed);
             if (plain.len < 8) return error.InvalidSession;
             const expires = std.mem.readInt(i64, plain[0..8], .little);
             if (expires <= std.Io.Clock.real.now(req.io).toSeconds()) return error.SessionExpired;
@@ -293,11 +313,53 @@ pub const Middleware = struct {
         const plain = try req.arena.alloc(u8, 8 + data.len);
         std.mem.writeInt(i64, plain[0..8], std.Io.Clock.real.now(req.io).toSeconds() + self.config.ttl_seconds, .little);
         @memcpy(plain[8..], data);
-        const sealed = try seal(req.arena, req.io, self.config.key, self.config.cookie_name, plain);
+        const sealed = try seal(req.arena, req.io, self.key, self.config.cookie_name, plain);
         const encoded = try req.arena.alloc(u8, base64url.Encoder.calcSize(sealed.len));
         return res.setCookie(self.config.cookie_name, base64url.Encoder.encode(encoded, sealed), opts);
     }
 };
+
+/// `key` when it can seal cookies: set, and not all zeros.
+fn cookieKey(key: ?[key_length]u8) ?[key_length]u8 {
+    const k = key orelse return null;
+    return if (std.mem.allEqual(u8, &k, 0)) null else k;
+}
+
+/// A random cookie key for local development, with a warning in the log:
+/// sessions end when the process does, and every node has its own key, so
+/// a cookie sealed on one is no session on another. Never in production:
+///
+///     app.use(try anole.session.Middleware.init(.{ .key = anole.session.devKey(app.io()) }));
+pub fn devKey(io: std.Io) [key_length]u8 {
+    log.warn("anole.session: using a random development key; sessions end on restart and differ between nodes. Set Config.key from your secret store in production", .{});
+    var key: [key_length]u8 = undefined;
+    io.random(&key);
+    return key;
+}
+
+/// A cookie key from configuration: 32 bytes as standard or URL-safe
+/// base64, padded or not (`openssl rand -base64 32` makes one). Anything
+/// else is `error.InvalidSessionKey`, and so is all zeros:
+///
+///     const key = try anole.session.keyFromBase64(env.get("SESSION_KEY") orelse return error.NoSessionKey);
+pub fn keyFromBase64(text: []const u8) error{InvalidSessionKey}![key_length]u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    var key: [key_length]u8 = undefined;
+    const decoders = [_]std.base64.Base64Decoder{
+        std.base64.standard.Decoder,
+        std.base64.standard_no_pad.Decoder,
+        std.base64.url_safe.Decoder,
+        std.base64.url_safe_no_pad.Decoder,
+    };
+    for (decoders) |d| {
+        const len = d.calcSizeForSlice(trimmed) catch continue;
+        if (len != key_length) continue;
+        d.decode(&key, trimmed) catch continue;
+        if (std.mem.allEqual(u8, &key, 0)) return error.InvalidSessionKey;
+        return key;
+    }
+    return error.InvalidSessionKey;
+}
 
 /// 128 random bits, base64url (22 characters).
 fn newId(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
@@ -365,6 +427,47 @@ test "seal/open: round trip, wrong key, and a cookie name it was not sealed for"
     try std.testing.expectEqualStrings("secret data", try open(arena, key, "s", sealed));
     try std.testing.expectError(error.InvalidSession, open(arena, @splat(8), "s", sealed));
     try std.testing.expectError(error.InvalidSession, open(arena, key, "other", sealed));
+}
+
+test "Middleware.init: cookie mode needs a key that is not all zeros" {
+    try std.testing.expect(cookieKey(null) == null);
+    try std.testing.expect(cookieKey(@splat(0)) == null);
+    var almost: [key_length]u8 = @splat(0);
+    almost[31] = 1;
+    try std.testing.expect(cookieKey(almost) != null);
+    // A key is enough for cookie mode, and a store needs none.
+    _ = try Middleware.init(.{ .key = almost });
+    var mem = MemoryStore.init(std.testing.allocator, std.testing.io);
+    defer mem.deinit();
+    _ = try Middleware.init(.{ .store = mem.store() });
+}
+
+test "keyFromBase64: 32 bytes in any base64 alphabet, nothing else" {
+    var raw: [key_length]u8 = undefined;
+    for (&raw, 0..) |*b, i| b.* = @truncate(i * 9 + 250);
+    var buf: [64]u8 = undefined;
+    for ([_]std.base64.Base64Encoder{ std.base64.standard.Encoder, std.base64.standard_no_pad.Encoder, std.base64.url_safe.Encoder, std.base64.url_safe_no_pad.Encoder }) |e| {
+        const text = e.encode(&buf, &raw);
+        try std.testing.expectEqualSlices(u8, &raw, &(try keyFromBase64(text)));
+    }
+    var padded: [70]u8 = undefined;
+    const spaced = try std.fmt.bufPrint(&padded, " {s}\n", .{std.base64.standard.Encoder.encode(&buf, &raw)});
+    try std.testing.expectEqualSlices(u8, &raw, &(try keyFromBase64(spaced)));
+    try std.testing.expectError(error.InvalidSessionKey, keyFromBase64(""));
+    try std.testing.expectError(error.InvalidSessionKey, keyFromBase64("c2hvcnQ="));
+    try std.testing.expectError(error.InvalidSessionKey, keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    try std.testing.expectError(error.InvalidSessionKey, keyFromBase64("not base64 at all, not base64 at all!!!!!!!"));
+}
+
+test "devKey: random, never all zeros in practice, and different each time" {
+    // Its warning is expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+    const a = devKey(std.testing.io);
+    const b = devKey(std.testing.io);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+    try std.testing.expect(cookieKey(a) != null);
 }
 
 test {

@@ -11,10 +11,10 @@
 //! streams and datagrams sit beside nghttp3 (`anole.webtransport`).
 const std = @import("std");
 
-/// ngtcp2 bindings (`ngtcp2.c`) plus typed wrappers for its `*_versioned` macros.
-pub const ngtcp2 = @import("ngtcp2.zig");
-/// nghttp3 bindings (`nghttp3.c`) plus typed wrappers for its `*_versioned` macros.
-pub const nghttp3 = @import("nghttp3.zig");
+// The ngtcp2 and nghttp3 bindings, for this file's tests; the engine and
+// the client import them directly.
+const ngtcp2 = @import("ngtcp2.zig");
+const nghttp3 = @import("nghttp3.zig");
 /// The HTTP/3 server endpoint for a dusty server's router.
 pub const Endpoint = @import("server.zig").Endpoint;
 /// An `Endpoint`'s settings; `ServerOptions.Http3` is the usual way in.
@@ -31,14 +31,12 @@ pub const TlsContext = @import("quic_tls.zig").Context;
 pub const ClientConnection = @import("client.zig").ClientConnection;
 /// One request and its response.
 pub const Stream = @import("client.zig").Stream;
-/// `Stream`, by its earlier name.
-pub const ClientStream = @import("client.zig").Stream;
 /// A header field, name and value.
 pub const Header = @import("client.zig").Header;
 /// Host, port, TLS, windows, timeouts, session cache, 0-RTT and
 /// WebTransport for `ClientConnection.connect`.
 pub const ConnectOptions = @import("client.zig").ConnectOptions;
-/// Per request: `body`, `timeout`, `early`.
+/// Per request: `body`, `timeout`, and HTTP/3's own `early`.
 pub const RequestOptions = @import("client.zig").ClientConnection.RequestOptions;
 /// Why a stream ended early (`Stream.waitHead`, `readError`, `writeError`).
 pub const StreamError = @import("client.zig").StreamError;
@@ -49,12 +47,16 @@ pub const EarlyData = @import("client.zig").EarlyData;
 /// How `ClientConnection.rebind` moves a connection to a new socket.
 pub const Rebind = @import("client.zig").Rebind;
 
-/// Runtime version strings of the linked libraries.
-pub fn ngtcp2Version() []const u8 {
+/// The libraries under HTTP/3 in this build, as
+/// "ngtcp2/1.25.0 nghttp3/1.18.0". `anole.h2.version()` has the same shape.
+pub fn version() []const u8 {
+    return "ngtcp2/" ++ ngtcp2.c.NGTCP2_VERSION ++ " nghttp3/" ++ nghttp3.c.NGHTTP3_VERSION;
+}
+
+fn ngtcp2Version() []const u8 {
     return std.mem.span(ngtcp2.c.ngtcp2_version(0).*.version_str);
 }
-/// The linked nghttp3's version, e.g. "1.18.0".
-pub fn nghttp3Version() []const u8 {
+fn nghttp3Version() []const u8 {
     return std.mem.span(nghttp3.c.nghttp3_version(0).*.version_str);
 }
 
@@ -65,6 +67,7 @@ pub fn nghttp3Version() []const u8 {
 test "HTTP/3 smoke: ngtcp2 + BoringSSL helper + nghttp3 server conns" {
     try std.testing.expectEqualStrings("1.25.0", ngtcp2Version());
     try std.testing.expectEqualStrings("1.18.0", nghttp3Version());
+    try std.testing.expectEqualStrings("ngtcp2/1.25.0 nghttp3/1.18.0", version());
     try smoke();
 }
 

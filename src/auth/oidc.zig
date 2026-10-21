@@ -4,13 +4,14 @@
 //! relying-party code (OpenIDC/liboauth2, Apache-2.0), rewritten on dusty's
 //! HTTP client, the JWS verifier and std.crypto.
 //!
-//!     var provider = try oidc.Provider.discover(client, gpa, "https://accounts.google.com");
+//!     var provider = try oidc.Provider.discover(gpa, app.client(), "https://accounts.google.com");
 //!     var rp: oidc.RelyingParty = .{ .provider = &provider, .client_id = id, .client_secret = secret,
 //!                                    .redirect_uri = "https://app.example/callback", .keyring = &keyring };
 //!     // /login:    const start = try rp.begin(arena, io);  keep start.state/nonce/verifier (session), redirect to start.url
-//!     // /callback: const id = try rp.finish(arena, io, client, .{ .code = code, .state = state }, saved);
+//!     // /callback: const id = try rp.finish(req.arena, req.io, anole.client(req), .{ .code = code, .state = state }, saved);
 const std = @import("std");
 const dusty = @import("dusty");
+const Client = @import("../client.zig").Client;
 const jws = @import("jws.zig");
 const Keyring = @import("keyring.zig").Keyring;
 const zig_jwt = @import("anole_jwt");
@@ -28,11 +29,11 @@ pub const Provider = struct {
     arena: ?*std.heap.ArenaAllocator = null,
 
     /// Fetches `issuer/.well-known/openid-configuration` with `client`
-    /// (`app.client().http`); its `issuer` must be `issuer` exactly (OIDC
+    /// (`app.client()`); its `issuer` must be `issuer` exactly (OIDC
     /// Discovery 4.3), else `error.IssuerMismatch`. A document that cannot
     /// be fetched or lacks an endpoint is `error.DiscoveryFailed`. Free the
     /// result with `deinit(gpa)`.
-    pub fn discover(client: *dusty.Client, gpa: std.mem.Allocator, issuer: []const u8) !Provider {
+    pub fn discover(gpa: std.mem.Allocator, client: Client, issuer: []const u8) !Provider {
         const arena = try gpa.create(std.heap.ArenaAllocator);
         arena.* = .init(gpa);
         errdefer {
@@ -41,7 +42,7 @@ pub const Provider = struct {
         }
         const a = arena.allocator();
         const url = try std.fmt.allocPrint(a, "{s}/.well-known/openid-configuration", .{std.mem.trimEnd(u8, issuer, "/")});
-        var response = try client.fetch(url, .{});
+        var response = try client.http.fetch(url, .{});
         defer response.deinit();
         if (response.status() != .ok) return error.DiscoveryFailed;
         const body = try a.dupe(u8, (try response.body()) orelse return error.DiscoveryFailed);
@@ -214,7 +215,7 @@ pub const RelyingParty = struct {
     /// `error.StateMismatch` (a forged or stale callback),
     /// `error.TokenRequestFailed`, `error.NoIdToken`, a `jws.Error` from the ID
     /// token, `error.NonceMismatch`, `error.AzpMismatch` or `error.NoSubject`.
-    pub fn finish(self: *const RelyingParty, arena: std.mem.Allocator, io: std.Io, client: *dusty.Client, callback: Callback, saved: Start) !Identity {
+    pub fn finish(self: *const RelyingParty, arena: std.mem.Allocator, io: std.Io, client: Client, callback: Callback, saved: Start) !Identity {
         // state: the response is to our request (CSRF, RFC 6749 10.12).
         if (callback.state.len != saved.state.len or !constTimeEql(callback.state, saved.state)) return error.StateMismatch;
 
@@ -233,7 +234,7 @@ pub const RelyingParty = struct {
         var headers = try dusty.Headers.init(arena, 4);
         try headers.put("Content-Type", "application/x-www-form-urlencoded");
         try headers.put("Accept", "application/json");
-        var response = try client.fetch(self.provider.token_endpoint, .{ .method = .post, .headers = &headers, .body = form.written() });
+        var response = try client.http.fetch(self.provider.token_endpoint, .{ .method = .post, .headers = &headers, .body = form.written() });
         defer response.deinit();
         const body = try arena.dupe(u8, (try response.body()) orelse "");
         if (response.status() != .ok) {
@@ -320,7 +321,7 @@ fn param(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
 test "fuzz: OIDC discovery documents, token responses and ID token claims" {
     try @import("../fuzz.zig").bytes(struct {
         const issuer = "https://issuer.example";
-        const secret = "fuzz-secret";
+        const secret = "fuzz-secret-fuzz-secret-fuzz-sec";
         const now = 1700000000;
 
         fn encode(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {

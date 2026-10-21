@@ -80,7 +80,7 @@ fn run(kind: Kind) !void {
     defer if (comptime features.redis) if (kind == .redis) redis_store.client.deinit();
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
     defer server.deinit();
-    var mw = session.Middleware.init(.{ .store = store, .key = @splat(3) });
+    var mw = try session.Middleware.init(if (store) |st| .{ .store = st } else .{ .key = @splat(3) });
     server.router.use(dusty.Middleware(void).init(&mw));
     server.router.get("/set", setUser);
     server.router.get("/get", getUser);

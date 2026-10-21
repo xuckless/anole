@@ -192,7 +192,7 @@ const Fixture = struct {
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/slow", slowNoWait, .{ .no_wait = true });
-        var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
+        var bundle = try @import("../tls/testing.zig").bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
         const ep = try Endpoint.init(gpa, io, http, .{
             .address = .{ .ip4 = .loopback(0) },

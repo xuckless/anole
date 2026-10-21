@@ -6,7 +6,7 @@
 //! In an app, `_ = try app.tracing(.{ .service_name = "api" });` does all
 //! of this (see `TracingOptions` for the endpoint). By hand:
 //!
-//!     var exporter = try anole.observe.trace.Exporter.init(gpa, io, &client, .{
+//!     var exporter = try anole.observe.trace.Exporter.init(gpa, app.io(), app.client(), .{
 //!         .endpoint = "http://otel-collector:4318", .service_name = "api" });
 //!     defer exporter.deinit();
 //!     try exporter.start();  // the batching task
@@ -17,6 +17,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const common = @import("common.zig");
+const Client = @import("../client.zig").Client;
 
 /// A parsed `traceparent` (version 00).
 pub const Context = struct {
@@ -173,7 +174,7 @@ pub const Options = struct {
 pub const Exporter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    client: *dusty.Client,
+    client: Client,
     options: Options,
     queue: std.Io.Queue(Span),
     buffer: []Span,
@@ -186,9 +187,10 @@ pub const Exporter = struct {
     /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
 
-    /// An exporter with its queue allocated. Nothing is sent until `start`.
-    /// `client` must outlive it.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *dusty.Client, options: Options) !Exporter {
+    /// An exporter with its queue allocated, sending through `client` (the
+    /// server's, `app.client()`). Nothing is sent until `start`. `client`'s
+    /// server must outlive it.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: Client, options: Options) !Exporter {
         const buffer = try gpa.alloc(Span, options.queue_len);
         return .{ .gpa = gpa, .io = io, .client = client, .options = options, .queue = .init(buffer), .buffer = buffer };
     }
@@ -267,7 +269,7 @@ pub const Exporter = struct {
         const url = std.fmt.allocPrint(arena, "{s}/v1/traces", .{std.mem.trimEnd(u8, self.options.endpoint, "/")}) catch return;
         var headers = dusty.Headers.init(arena, 2) catch return;
         headers.put("Content-Type", "application/json") catch return;
-        var response = self.client.fetch(url, .{ .method = .post, .headers = &headers, .body = body }) catch {
+        var response = self.client.http.fetch(url, .{ .method = .post, .headers = &headers, .body = body }) catch {
             _ = self.dropped.fetchAdd(spans.len, .monotonic);
             return;
         };
