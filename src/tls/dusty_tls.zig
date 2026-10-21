@@ -23,16 +23,25 @@
 //!   appends to a pending buffer that only the writer side sends, so ciphertext
 //!   leaves in the order BoringSSL produced it. Output that `SSL_read` itself
 //!   produces (alerts, KeyUpdate) goes out with the next write.
+//!
+//! Memory: an idle connection holds no ciphertext buffer. The socket is read
+//! into a small stash inside the connection's state, and only a read that
+//! fills it moves the next reads to a block borrowed from a per-thread pool,
+//! given back as soon as BoringSSL has taken every byte of it. Records to
+//! send go into blocks from the same pool, given back once on the socket.
+//! The handshake configuration is shed once the handshake is done
+//! (`SSL_set_shed_handshake_config`).
 const std = @import("std");
 const c = @import("anole_boringssl_c");
 
 const log = std.log.scoped(.anole_tls);
 const Allocator = std.mem.Allocator;
 
-/// Ciphertext read buffer dusty gives the TCP reader. BoringSSL reassembles
-/// records itself, so this only batches socket reads (tls.zig needs a whole
-/// 16 KiB record here).
-pub const input_buffer_len: usize = 8 * 1024;
+/// Ciphertext read buffer dusty gives the TCP reader: none. This module
+/// points the reader at buffers of its own (`Shared.stash`, pool blocks),
+/// so an idle connection keeps only the stash. A reader that already holds
+/// bytes when the handshake starts is read to the end of them first.
+pub const input_buffer_len: usize = 0;
 /// Ciphertext write buffer dusty gives the TCP writer: none. Records reach
 /// the socket from `Shared.sending` in one write each flush, so a buffer
 /// here would only copy them once more, and keep pages per connection that
@@ -41,6 +50,11 @@ pub const output_buffer_len: usize = 0;
 
 /// Largest TLS record payload; SSL_write is called with at most this much.
 const max_plaintext_len = 16 * 1024;
+
+/// What the socket is read into while nothing is buffered: an ordinary
+/// request's records fit, so a connection serving small requests never
+/// borrows a block.
+const stash_len = 1024;
 
 pub const config = struct {
     /// A certificate chain and private key. On a server listener it also owns
@@ -303,6 +317,10 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     errdefer c.SSL_free(ssl);
     const shared = try attachShared(ssl, input, output);
     c.SSL_set_accept_state(ssl);
+    // Frees the SSL's copy of the listener's configuration (certificate
+    // and key references, verify parameters, client CA list) after the
+    // handshake: about 1 KB per connection that nothing reads again.
+    c.SSL_set_shed_handshake_config(ssl, 1);
 
     if (opt.client_auth) |ca| {
         // The CertificateRequest also names the acceptable CAs, so a client
@@ -319,10 +337,10 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     }
 
     // alpnSelect (set on the server SSL_CTX) reads the list from here. It
-    // runs only inside SSL_do_handshake below, while `alpn` is alive.
-    var alpn: []const []const u8 = opt.alpn_protocols;
-    _ = c.SSL_set_ex_data(ssl, alpn_ex_index, @ptrCast(&alpn));
-    defer _ = c.SSL_set_ex_data(ssl, alpn_ex_index, null);
+    // runs only inside SSL_do_handshake below. (Not SSL ex_data: its first
+    // use allocates a stack that each connection would keep.)
+    shared.alpn = opt.alpn_protocols;
+    defer shared.alpn = &.{};
 
     try handshake(shared);
     return .{
@@ -350,6 +368,8 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
     errdefer c.SSL_free(ssl);
     const shared = try attachShared(ssl, input, output);
     c.SSL_set_connect_state(ssl);
+    // As on the server; renegotiation stays off, so nothing needs it after.
+    c.SSL_set_shed_handshake_config(ssl, 1);
 
     var host_buf: [256]u8 = undefined;
     if (opt.host.len >= host_buf.len or std.mem.indexOfScalar(u8, opt.host, 0) != null) return error.TlsInvalidHostname;
@@ -401,8 +421,10 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
 /// state). dusty stores it in place after the handshake and frees it with
 /// `deinit` (dusty fork patch: TLS state teardown).
 ///
-/// After the handshake, one task may read while another writes. `deinit`
-/// and `close` must not overlap either of them: join both first.
+/// After the handshake, one task may read while another writes. `close`
+/// is a write: the writing side may call it while the reading side reads
+/// (HTTP/2's writer does, when the session ends). `deinit` must not
+/// overlap either of them: join both first.
 pub const Connection = struct {
     shared: ?*Shared = null,
     /// The negotiated ALPN protocol: one of the strings the caller passed in
@@ -431,6 +453,16 @@ pub const Connection = struct {
     /// it in `Request.peer_certificate`. Valid until `deinit`.
     pub fn peerCertificate(self: *const Connection) ?[]const u8 {
         return self.peer_certificate;
+    }
+
+    /// Bytes of ciphertext buffers the connection holds beyond its stash:
+    /// a borrowed read block and the queued-record buffers. 0 for a
+    /// connection waiting for its peer with nothing to send. For tests and
+    /// diagnostics; only while neither side is using the connection.
+    pub fn heldCiphertext(self: *const Connection) usize {
+        const sh = self.shared orelse return 0;
+        const block = if (sh.block) |b| b.len else 0;
+        return block + sh.pending.mem.len + sh.sending.mem.len;
     }
 
     /// Frees the SSL, which frees the BIO and the shared state with it.
@@ -695,13 +727,9 @@ fn selectedAlpn(ssl: *c.SSL, offered: []const []const u8) ?[]const u8 {
     return null;
 }
 
-/// Index 0 is BoringSSL's reserved "app data" slot, which nothing else uses
-/// on these SSL objects.
-const alpn_ex_index = 0;
-
-/// Walks the server's list (from the SSL's ex data) in preference order and
-/// picks the first protocol the client offered. No overlap, or no list, is
-/// NOACK: the handshake continues without ALPN.
+/// Walks the server's list (`Shared.alpn`) in preference order and picks
+/// the first protocol the client offered. No overlap, or no list, is NOACK:
+/// the handshake continues without ALPN.
 fn alpnSelect(
     ssl: ?*c.SSL,
     out: [*c][*c]const u8,
@@ -711,10 +739,10 @@ fn alpnSelect(
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
     _ = arg;
-    const list_ptr = c.SSL_get_ex_data(ssl, alpn_ex_index) orelse return c.SSL_TLSEXT_ERR_NOACK;
-    const prefs: *const []const []const u8 = @ptrCast(@alignCast(list_ptr));
+    const bio = c.SSL_get_rbio(ssl) orelse return c.SSL_TLSEXT_ERR_NOACK;
+    const prefs = bioShared(bio).alpn;
     const offered = in[0..in_len];
-    for (prefs.*) |want| {
+    for (prefs) |want| {
         var i: usize = 0;
         while (i < offered.len) {
             const n = offered[i];
@@ -1139,8 +1167,10 @@ fn trustFrom(e: StoreEntry, want_names: bool) HandshakeError!Trust {
 /// the BIO's destroy callback when SSL_free releases the BIO.
 const Shared = struct {
     ssl: *c.SSL,
-    /// dusty's ciphertext reader. Only the reading side touches it: `fill`
-    /// with the lock released, the BIO read callback with it held.
+    /// dusty's ciphertext reader, pointed at `stash` or `block` (see
+    /// `prepareInput`). Only the reading side touches it: `fill` with the
+    /// lock released and `filling` set, the BIO read callback with the lock
+    /// held.
     input: *std.Io.Reader,
     /// dusty's ciphertext writer. Only the writing side touches it.
     output: *std.Io.Writer,
@@ -1153,15 +1183,31 @@ const Shared = struct {
     /// Set while `fill` reads into `input`, so the BIO leaves it alone.
     filling: bool = false,
     /// Records BoringSSL produced, not yet handed to `output`.
-    pending: std.ArrayList(u8) = .empty,
+    pending: Buf = .{},
     /// SSL_read has run since the last SSL_write that sent a record, so
     /// BoringSSL may hold handshake messages (a KeyUpdate reply) that only
     /// a write sends; `Connection.flush` then writes zero bytes to send
     /// them. Set from the start, for anything the handshake left queued.
     write_owed: bool = true,
 
+    // The reading side's, under the same rules as `input`.
+    /// The pool block `input` reads into, if it borrowed one.
+    block: ?[]u8 = null,
+    /// `input` still reads into the buffer the caller handed over, which
+    /// held bytes when the handshake started; left once they are taken.
+    foreign: bool = false,
+    /// The last socket read filled the buffer, so more is probably waiting
+    /// and the next read goes into a block.
+    read_full: bool = false,
+
     /// Owned by the writing side: the other half of the double buffer.
-    sending: std.ArrayList(u8) = .empty,
+    sending: Buf = .{},
+
+    /// The server's ALPN preference list, during the handshake only
+    /// (`alpnSelect`).
+    alpn: []const []const u8 = &.{},
+
+    stash: [stash_len]u8 = undefined,
 
     fn lock(sh: *Shared) void {
         while (!sh.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1178,9 +1224,11 @@ const Shared = struct {
         sh.lock();
         sh.filling = true;
         sh.unlock();
-        const result = sh.input.fillMore();
+        const result: std.Io.Reader.Error!void = if (sh.prepareInput()) |_| sh.input.fillMore() else |err| err;
+        const full = sh.input.end == sh.input.buffer.len;
         sh.lock();
         sh.filling = false;
+        sh.read_full = full;
         if (result) |_| {} else |err| switch (err) {
             error.EndOfStream => sh.input_eof = true,
             error.ReadFailed => {},
@@ -1192,18 +1240,146 @@ const Shared = struct {
         };
     }
 
+    /// Picks the buffer the next socket read goes into, with `filling` set.
+    /// With nothing buffered (always, after WANT_READ: the BIO hands
+    /// BoringSSL every byte it asks for), that is a block if the last read
+    /// filled its buffer and the stash otherwise, so a connection waiting
+    /// for its peer holds no block. Unconsumed bytes are kept, moved to a
+    /// block when there is no room left behind them.
+    fn prepareInput(sh: *Shared) error{ReadFailed}!void {
+        const r = sh.input;
+        const buffered = r.end - r.seek;
+        if (buffered == 0) {
+            r.seek = 0;
+            r.end = 0;
+            if (!sh.read_full) {
+                sh.useStash();
+            } else if (sh.block == null) {
+                // Out of memory: the stash still works, a little slower.
+                const b = takeBlock() orelse return;
+                sh.foreign = false;
+                sh.block = b;
+                r.buffer = b;
+            }
+            return;
+        }
+        if (r.buffer.len - buffered > 0) return; // fillMore rebases
+        // A full buffer BoringSSL did not drain: never expected, but read
+        // on into a block rather than fail.
+        if (sh.block != null or buffered > block_len) return error.ReadFailed;
+        const b = takeBlock() orelse return error.ReadFailed;
+        @memcpy(b[0..buffered], r.buffer[r.seek..r.end]);
+        sh.foreign = false;
+        sh.block = b;
+        r.buffer = b;
+        r.seek = 0;
+        r.end = buffered;
+    }
+
+    /// Points an empty `input` at the stash, giving back any block. The
+    /// reading side, with `filling` set or the lock held.
+    fn useStash(sh: *Shared) void {
+        const r = sh.input;
+        std.debug.assert(r.end == r.seek);
+        if (sh.block) |b| giveBlock(b);
+        sh.block = null;
+        sh.foreign = false;
+        r.buffer = &sh.stash;
+        r.seek = 0;
+        r.end = 0;
+    }
+
     /// Hands every pending record to `output`. Writing side only: swapping
     /// the buffers under the lock and writing with it released keeps records
-    /// in order, since nothing else takes from `pending`.
+    /// in order, since nothing else takes from `pending`. The records' block
+    /// goes back to the pool once they are on the socket.
     fn sendPending(sh: *Shared) error{WriteFailed}!void {
         sh.lock();
-        std.mem.swap(std.ArrayList(u8), &sh.pending, &sh.sending);
+        std.mem.swap(Buf, &sh.pending, &sh.sending);
         sh.unlock();
-        defer sh.sending.clearRetainingCapacity();
-        if (sh.sending.items.len == 0) return;
-        sh.output.writeAll(sh.sending.items) catch return error.WriteFailed;
-        // An idle connection keeps at most a modest buffer.
-        if (sh.sending.capacity > 64 * 1024) sh.sending.clearAndFree(std.heap.c_allocator);
+        defer sh.sending.release();
+        if (sh.sending.len == 0) return;
+        sh.output.writeAll(sh.sending.items()) catch return error.WriteFailed;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Ciphertext blocks
+
+/// Holds one record of the largest size with room to spare (16 KiB of
+/// payload plus at most 61 bytes of TLS 1.2 CBC overhead, and alerts the
+/// reading side queued ahead of it), and serves as a socket read buffer.
+const block_len = 16 * 1024 + 512;
+
+/// Blocks each thread keeps for reuse; more than this go back to malloc.
+/// Connections hold a block only while bytes are in flight, so a few cover
+/// a busy executor.
+const pool_cap = 16;
+
+threadlocal var pool_blocks: [pool_cap][*]u8 = undefined;
+threadlocal var pool_len: usize = 0;
+
+/// A block from this thread's pool, or a new one; null if out of memory.
+/// Only for short sections: no I/O and nothing that suspends runs between
+/// the pool's reads and writes, so a coroutine that moves to another thread
+/// later just gives the block to that thread's pool.
+fn takeBlock() ?[]u8 {
+    if (pool_len > 0) {
+        pool_len -= 1;
+        return pool_blocks[pool_len][0..block_len];
+    }
+    return std.heap.c_allocator.alloc(u8, block_len) catch null;
+}
+
+fn giveBlock(b: []u8) void {
+    std.debug.assert(b.len == block_len);
+    if (pool_len < pool_cap) {
+        pool_blocks[pool_len] = b.ptr;
+        pool_len += 1;
+        return;
+    }
+    std.heap.c_allocator.free(b);
+}
+
+/// Bytes queued for the socket, in a pool block, or in a bigger allocation
+/// for anything that does not fit one (a large handshake flight).
+const Buf = struct {
+    mem: []u8 = &.{},
+    len: usize = 0,
+
+    fn items(b: *const Buf) []const u8 {
+        return b.mem[0..b.len];
+    }
+
+    fn append(b: *Buf, bytes: []const u8) error{OutOfMemory}!void {
+        const need = b.len + bytes.len;
+        if (need > b.mem.len) try b.grow(need);
+        @memcpy(b.mem[b.len..need], bytes);
+        b.len = need;
+    }
+
+    fn grow(b: *Buf, need: usize) error{OutOfMemory}!void {
+        if (b.mem.len == 0 and need <= block_len) {
+            b.mem = takeBlock() orelse return error.OutOfMemory;
+            return;
+        }
+        // Never `block_len` long, so `release` can tell the two apart.
+        const new = try std.heap.c_allocator.alloc(u8, @max(need, 2 * block_len, 2 * b.mem.len));
+        @memcpy(new[0..b.len], b.mem[0..b.len]);
+        const len = b.len;
+        b.release();
+        b.mem = new;
+        b.len = len;
+    }
+
+    /// Gives the storage back, with whatever it holds.
+    fn release(b: *Buf) void {
+        if (b.mem.len == block_len) {
+            giveBlock(b.mem);
+        } else if (b.mem.len > 0) {
+            std.heap.c_allocator.free(b.mem);
+        }
+        b.* = .{};
     }
 };
 
@@ -1237,6 +1413,7 @@ fn attachShared(ssl: *c.SSL, input: *std.Io.Reader, output: *std.Io.Writer) Hand
     c.BIO_set_init(bio, 1);
     // The SSL takes the one reference for both directions.
     c.SSL_set_bio(ssl, bio, bio);
+    if (input.bufferedLen() == 0) sh.useStash() else sh.foreign = true;
     return sh;
 }
 
@@ -1245,7 +1422,9 @@ fn bioShared(bio: ?*c.BIO) *Shared {
 }
 
 /// Runs inside an SSL call, so with the lock held. Hands over what the
-/// reading side has buffered; never reads the socket.
+/// reading side has buffered; never reads the socket. Once a block or the
+/// caller's buffer is drained, `input` goes back to the stash, unless the
+/// last read filled it.
 fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
     const sh = bioShared(bio);
     c.BIO_clear_retry_flags(bio);
@@ -1258,6 +1437,7 @@ fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
     const n = @min(got.len, @as(usize, @intCast(len)));
     @memcpy(out[0..n], got[0..n]);
     sh.input.toss(n);
+    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full))) sh.useStash();
     return @intCast(n);
 }
 
@@ -1266,7 +1446,7 @@ fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
 fn bioWrite(bio: ?*c.BIO, in: [*c]const u8, len: c_int) callconv(.c) c_int {
     const sh = bioShared(bio);
     c.BIO_clear_retry_flags(bio);
-    sh.pending.appendSlice(std.heap.c_allocator, in[0..@intCast(len)]) catch return -1;
+    sh.pending.append(in[0..@intCast(len)]) catch return -1;
     return len;
 }
 
@@ -1281,11 +1461,19 @@ fn bioCtrl(bio: ?*c.BIO, cmd: c_int, larg: c_long, parg: ?*anyopaque) callconv(.
     };
 }
 
+/// SSL_free, so neither side is using the connection. `input` is left
+/// with no buffer rather than pointing into freed memory.
 fn bioDestroy(bio: ?*c.BIO) callconv(.c) c_int {
     if (c.BIO_get_data(bio)) |data| {
         const sh: *Shared = @ptrCast(@alignCast(data));
-        sh.pending.deinit(std.heap.c_allocator);
-        sh.sending.deinit(std.heap.c_allocator);
+        if (!sh.foreign) {
+            if (sh.block) |b| giveBlock(b);
+            sh.input.buffer = &.{};
+            sh.input.seek = 0;
+            sh.input.end = 0;
+        }
+        sh.pending.release();
+        sh.sending.release();
         std.heap.c_allocator.destroy(sh);
         c.BIO_set_data(bio, null);
     }

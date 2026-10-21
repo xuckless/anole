@@ -9,8 +9,33 @@ The first release: one server core for REST, WebSockets and gRPC over
 HTTP/1.1, HTTP/2 and HTTP/3, with TLS, auth and observability, on Zig 0.17.0
 for macOS and Linux.
 
+### The HTTP core is Anole code
+
+- The HTTP/1.1 server, router, middleware, client, WebSocket and HTTP/2
+  engine, which came from lalinsky/dusty through Anole's fork, now live in
+  `src/http/core` (MIT, attributed in every file and in THIRD_PARTY_NOTICES).
+  Anole no longer fetches a `dusty` package. The public API is unchanged:
+  `anole.http` is the core, `anole.http.dusty_module` still names it.
+- Its tests run in `zig build test` (`zig build dusty-test` is gone; `zig
+  build core-test` runs them alone), on a certificate made at build time
+  instead of a committed key, and its fuzz targets run with Anole's under
+  `zig build test --fuzz`.
+- The fork's vendored nghttp2 1.69.0 copy is dropped (Anole always built its
+  own nghttp2), and llhttp is compiled once instead of once per feature
+  combination.
+
 ### Server
 
+- Memory per connection: each task's stack reserves 1 MiB by default
+  (`Options.max_stack_size`, was zio's 8 MiB), about 2 KiB of page tables
+  per open connection instead of 4. An idle TLS connection holds no
+  ciphertext buffer (a 1 KiB stash, blocks borrowed from a per-thread pool
+  while records are in flight) and BoringSSL sheds its handshake
+  configuration: about 20 KB per idle TLS connection instead of 29 on Linux.
+  The request-buffer pool gives back, every 5 s, the sets a burst of
+  connections left unused, and a WebSocket's reply batching shares one
+  backstop task per executor instead of one per socket: a busy pipelining
+  WebSocket holds about 34 KB instead of 43.
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with
@@ -28,7 +53,8 @@ for macOS and Linux.
   `group` and the new `with` (middleware for some routes, no prefix).
 - `anole.noWait(handler)` marks a handler (and its route's middleware) as
   never waiting: on HTTP/2 its whole requests run on the connection's reader
-  without a task, the responses to one read in one write. gRPC takes it per
+  without a task, the responses to one read in one write; on HTTP/3 on the
+  endpoint task, right after the packet that completes them. gRPC takes it per
   registration: `app.grpcWith(Service, impl, .{ .no_wait = true })` for
   unary methods.
 - `anole.client(req)` / `app.client()`: the server's pooled outbound HTTP

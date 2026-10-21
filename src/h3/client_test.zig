@@ -97,6 +97,39 @@ fn aborted(_: *dusty.Request, res: *dusty.Response) !void {
     return res.abort();
 }
 
+/// POST /nw/sum: the body's length and hash.
+fn sum(req: *dusty.Request, res: *dusty.Response) !void {
+    var in_buf: [4096]u8 = undefined;
+    var body = try req.reader(&in_buf);
+    var hasher: std.hash.Wyhash = .init(0);
+    var n: usize = 0;
+    while (true) {
+        const chunk = body.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return body.err orelse error.Unexpected,
+        };
+        hasher.update(chunk);
+        n += chunk.len;
+        body.interface.toss(chunk.len);
+    }
+    try res.print(.text, "{d} {x}", .{ n, hasher.final() });
+}
+
+/// Far more than a response ring holds, written at once.
+const big_body_len = 300 * 1024 + 7;
+
+fn bigBody(_: *dusty.Request, res: *dusty.Response) !void {
+    const body = try res.arena.alloc(u8, big_body_len);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 13);
+    res.body = body;
+}
+
+/// A `no_wait` handler that waits all the same.
+fn slowNoWait(req: *dusty.Request, res: *dusty.Response) !void {
+    try req.io.sleep(.fromMilliseconds(20), .awake);
+    res.body = "slow but whole";
+}
+
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const s = try conn.request(&.{
         .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
@@ -155,6 +188,10 @@ const Fixture = struct {
         http.router.post("/early-post", earlyPost);
         http.router.get("/port", port);
         http.router.get("/download", download);
+        http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
+        http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
+        http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
+        http.router.addRouteWith(.get, "/nw/slow", slowNoWait, .{ .no_wait = true });
         var bundle = try anole_tls.testing.bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), pem.cert);
         errdefer bundle.deinit(gpa);
         const ep = try Endpoint.init(gpa, io, http, .{
@@ -321,6 +358,88 @@ test "h3 client: certificate checks, and a server that goes away" {
         gpa.free(b);
         try io.sleep(.fromMilliseconds(20), .awake);
     } else return error.TestUnexpectedResult;
+}
+
+/// POSTs `body` to `path` and returns the response body.
+fn post(conn: *client.ClientConnection, io: std.Io, path: []const u8, body: []const u8, gpa: std.mem.Allocator) ![]u8 {
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" },  .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body = true });
+    defer s.release();
+    var sender = try io.concurrent(struct {
+        fn send(st: *client.Stream, data: []const u8) !void {
+            try st.writer().writeAll(data);
+            try st.closeSend();
+        }
+    }.send, .{ s, body });
+    try s.waitHead();
+    const back = try s.reader().allocRemaining(gpa, .unlimited);
+    errdefer gpa.free(back);
+    try sender.await(io);
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    return back;
+}
+
+test "h3 server: no_wait routes run inline, past the ring, beside tasks; one that waits still answers" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var ok: std.atomic.Value(usize) = .init(0);
+    const Check = struct {
+        fn one(cn: *client.ClientConnection, a: std.mem.Allocator, path: []const u8, want: []const u8, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+            const b = get(cn, path, a) catch return;
+            defer a.free(b);
+            if (std.mem.eql(u8, b, want)) _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+    for (0..20) |_| try group.concurrent(io, Check.one, .{ conn, gpa, "/nw/hello?x=1", "hello over h3", &ok });
+    try group.concurrent(io, Check.one, .{ conn, gpa, "/hello", "hello over h3", &ok });
+    try group.concurrent(io, Check.one, .{ conn, gpa, "/nw/slow", "slow but whole", &ok });
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 22), ok.load(.monotonic));
+
+    // Written at once, far past the ring: the rest waits for the peer's
+    // acknowledgments without the endpoint task waiting for them.
+    const b = try get(conn, "/nw/big", gpa);
+    defer gpa.free(b);
+    try std.testing.expectEqual(@as(usize, big_body_len), b.len);
+    for (b, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13)), byte);
+
+    // A body: inline when it came whole with the head, on a task when it
+    // takes many packets.
+    const body = try gpa.alloc(u8, 2 << 20);
+    defer gpa.free(body);
+    for (body, 0..) |*x, i| x.* = @truncate(i *% 77 +% (i >> 13));
+    var expect: [64]u8 = undefined;
+    for ([_]usize{ 0, 10, 1000, body.len }) |n| {
+        const got = try post(conn, io, "/nw/sum", body[0..n], gpa);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ n, std.hash.Wyhash.hash(0, body[0..n]) }), got);
+    }
+
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "HEAD" },  .{ .name = ":path", .value = "/nw/hello" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const none = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    // The twenty, the slow one, the big one and the HEAD at least; most of
+    // the bodies too.
+    try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= 23);
 }
 
 test "h3 server: Response.abort resets the stream, and the connection carries on" {

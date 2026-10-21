@@ -367,6 +367,20 @@ no `TIME_WAIT`), before the first of them binds. On macOS, as on other BSDs, a l
 address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
 allowed: the kernel treats those as different addresses.
 
+### Many connections
+
+Each open connection has a coroutine, and each coroutine's stack is two
+memory mappings. Linux caps mappings per process with `vm.max_map_count`,
+which is 65,530 by default on Debian, RHEL and their derivatives (Ubuntu
+22.10 and later default to 1,048,576), so a server there stops taking new
+connections at about 30,000 open at once. Raise it on hosts that hold
+more, along with the open-file limit (`ulimit -n`, `LimitNOFILE=` in a
+systemd unit):
+
+```sh
+sysctl -w vm.max_map_count=1048576   # or a file in /etc/sysctl.d/
+```
+
 ## HTTP/2
 
 HTTP/2 (`-Dhttp2`, on in `web` and `full`) reaches the same router and
@@ -743,10 +757,10 @@ listener that is not built fails with `error.TlsNotBuilt` or
 
 ## Full control with `anole.http`
 
-`app.router` and `app.server` are dusty's router and server, and
-`anole.http` is the dusty module, with TLS already on BoringSSL
-(`anole.http.dusty_module` has whatever it does not re-export). You can skip
-`Server` and drive dusty yourself:
+`app.router` and `app.server` are the HTTP core's router and server
+(src/http/core, adapted from dusty), and `anole.http` is that core, with TLS
+already on BoringSSL (`anole.http.dusty_module` has whatever it does not
+re-export). You can skip `Server` and drive the core yourself:
 
 ```zig
 const rt = try anole.zio.Runtime.init(init.gpa, .{ .executors = .auto });

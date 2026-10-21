@@ -318,6 +318,46 @@ test "h2 engine: a client's RST_STREAM or a lost connection cancels the stream's
     }
 }
 
+test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sends after draws no reset" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var r = try Running.start(gpa, io, &.{.{ .address = loopback, .http2_prior_knowledge = true }});
+    defer r.stop(gpa, io);
+
+    // h2spec 3.8 and 7: a GOAWAY with no stream open ends the session at
+    // once, and a PING follows. By hand, as a client library sends
+    // nothing after its GOAWAY.
+    const socket = try r.server.address.ip.connect(io, .{ .mode = .stream });
+    defer socket.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = socket.writer(io, &wbuf);
+    try w.interface.writeAll("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try w.interface.writeAll(&.{ 0, 0, 0, 4, 0, 0, 0, 0, 0 }); // SETTINGS
+    // GOAWAY, last stream 0, an unknown error code.
+    try w.interface.writeAll(&.{ 0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff });
+    try w.interface.flush();
+    // The session has ended by now. Read what the server sent (its
+    // SETTINGS frames), so a reset is not hidden behind buffered data.
+    try io.sleep(.fromMilliseconds(100), .awake);
+    var rbuf: [1024]u8 = undefined;
+    var rd = socket.reader(io, &rbuf);
+    rd.interface.fillMore() catch return rd.err orelse error.Unexpected;
+    rd.interface.tossBuffered();
+    // The PING finds the server's side closed: it is thrown away while the
+    // server lingers, and draws a reset if the server closed at once.
+    try w.interface.writeAll(&([_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ "h2spec  ".*)); // PING
+    try w.interface.flush();
+    try io.sleep(.fromMilliseconds(50), .awake);
+
+    // Then the end of the stream, which the server sent without waiting
+    // for the peer; a reset fails the read.
+    const started: std.Io.Clock.Timestamp = .now(io, .awake);
+    _ = rd.interface.discardRemaining() catch return rd.err orelse error.Unexpected;
+    try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 500);
+}
+
 test "h2 client: request timeouts, for the head and for the body, and the connection carries on" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });

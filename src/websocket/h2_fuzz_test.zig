@@ -53,7 +53,7 @@ fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize,
         .frames = .init(.{ .extension = if (compressed) .{ .permessage_deflate = .init } else null }),
         .max_message_size = max_message_size,
     };
-    // A batch's backstop task (`H2Socket.deinit` would also end the
+    // A batch's flusher task (`H2Socket.deinit` would also end the
     // response, which has none here).
     defer sock.batch.deinit(std.testing.io);
     var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}) else {};
