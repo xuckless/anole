@@ -1,8 +1,32 @@
-# Anole
+<p align="center">
+  <img src="assets/banner.png" alt="Anole: a Zig backend server" width="720">
+</p>
 
-**One Zig server for your whole backend.** REST, WebSockets, gRPC and
-WebTransport over HTTP/1.1, HTTP/2 and HTTP/3, with TLS, auth and
-observability built in, on one listener and one router.
+<p align="center">
+  <b>One Zig server for your whole backend.</b><br>
+  REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3.
+</p>
+
+<p align="center">
+  <a href="https://github.com/xuckless/anole/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xuckless/anole/ci.yml?branch=main&logo=github&label=CI"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/xuckless/anole?color=green"></a>
+  <a href="https://ziglang.org/download/"><img alt="Zig 0.17" src="https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white"></a>
+  <img alt="Platforms: Linux, macOS" src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey">
+  <img alt="Protocols: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket" src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%C2%B7%20h2%20%C2%B7%20h3%20%C2%B7%20gRPC%20%C2%B7%20WS-blue">
+  <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-orange">
+  <a href="https://github.com/xuckless/anole/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/xuckless/anole?style=flat&logo=github"></a>
+  <a href="https://github.com/xuckless/anole/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/xuckless/anole"></a>
+  <a href="https://github.com/xuckless/anole/issues"><img alt="Issues" src="https://img.shields.io/github/issues/xuckless/anole"></a>
+</p>
+
+<p align="center">
+  <a href="docs/getting-started.md">Getting started</a> ·
+  <a href="docs/from-fiber.md">From Fiber</a> ·
+  <a href="docs/">Docs</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+TLS, auth and observability are built in, on one listener and one router.
 
 An anole is a small lizard that changes colour to fit wherever it lands, and
 that's the idea: one server core that speaks whatever protocol the client
