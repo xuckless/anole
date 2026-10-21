@@ -1,0 +1,98 @@
+name: Bug report
+description: Something in Anole does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. **A security problem goes through
+        [private reporting](https://github.com/xuckless/anole/security/advisories/new),
+        not here** (see SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: |
+        The smallest program, request or command that shows it: a handler and
+        a `curl`/`h2load`/client call, or a failing test. Leave out anything
+        private (keys, tokens, real hostnames).
+      render: zig
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Anole version
+      description: The release tag, or the commit your `build.zig.zon` pins.
+      placeholder: 0.1.0, or a commit hash
+    validations:
+      required: true
+  - type: input
+    id: zig
+    attributes:
+      label: Zig version
+      description: The output of `zig version`.
+      placeholder: 0.17.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Windows (development target)
+        - Other (say below)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - HTTP/1.1
+        - HTTP/2
+        - HTTP/3 / QUIC
+        - WebSocket
+        - WebTransport
+        - gRPC
+        - TLS
+        - Router / middleware
+        - Database connectors (PostgreSQL, SQLite, MongoDB, Redis)
+        - Caches
+        - Auth (JWT, OIDC, sessions, API keys)
+        - Observability (logs, metrics, tracing, health)
+        - Build / flags / packaging
+        - Docs
+        - Other
+  - type: input
+    id: build
+    attributes:
+      label: Build options
+      description: The profile and any flags you changed, and the optimize mode.
+      placeholder: -Dprofile=web -Dbrotli=true, ReleaseFast
+  - type: textarea
+    id: environment
+    attributes:
+      label: Anything else about where it runs
+      description: |
+        Kernel version (`uname -r`), in a container or not, io_uring or epoll,
+        a proxy in front (Nginx, Caddy, a load balancer), the client and its
+        version.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The server's log around the problem, at debug level if you can, and any stack trace.
+      render: text
