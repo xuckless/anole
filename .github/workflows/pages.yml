@@ -1,0 +1,96 @@
+name: Docs site
+
+# The documentation website (site/, Astro + Starlight) on GitHub Pages at
+# https://xuckless.github.io/anole/: the guides from docs/ and the API
+# reference from `zig build docs`. Pushes to main deploy; pull requests only
+# build it, so a broken link fails the PR. Node is needed here and nowhere
+# else: it is never part of `zig build` or of the Zig package.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "src/**"
+      - "site/**"
+      - "assets/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "src/**"
+      - "site/**"
+      - "assets/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time, and a running deploy is never cancelled. Pull
+# requests get their own group, so they never queue behind (or displace) a
+# deploy, and a newer push to the PR cancels the older build.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: pages
+      # Zig fetches git dependencies itself on a cold cache, and its DNS
+      # lookups fail now and then on the runners (NameServerFailure).
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The default (full) profile, so every namespace is documented.
+      - name: API reference (zig build docs)
+        run: zig build docs --summary all
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Install the site's dependencies
+        working-directory: site
+        run: npm ci --no-audit --no-fund
+      # Copies docs/ and zig-out/docs in, builds, indexes the search and
+      # fails on any broken internal link or anchor.
+      - name: Build the site
+        working-directory: site
+        run: npm run build
+      - name: Check the guides and the API reference are in it
+        working-directory: site/dist
+        run: |
+          for f in index.html api/index.html api/main.wasm api/sources.tar; do test -s "$f" || { echo "missing: $f"; exit 1; }; done
+          for g in ../../docs/*.md; do n=$(basename "$g" .md); test -s "$n/index.html" || { echo "missing guide: $n"; exit 1; }; done
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

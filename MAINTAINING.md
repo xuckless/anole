@@ -173,6 +173,38 @@ attribution header on every file and THIRD_PARTY_NOTICES part B current.
   each release and port the fixes that apply. The PRs open there from the
   fork (#263-#270) are left as they are.
 
+## The docs site
+
+https://xuckless.github.io/anole/ is `site/`, an Astro + Starlight project
+that `.github/workflows/pages.yml` builds and deploys on every push to main
+that touches docs/, src/, site/, assets/ or the build files (pull requests
+build it without deploying). Node is needed only there: `site/` is not in
+build.zig.zon's `.paths`, so it never ships in the Zig package, and
+`zig build` never runs Node.
+
+- Content: the guides are docs/*.md, the same files GitHub shows; nothing is
+  committed twice. `site/scripts/sync-docs.mjs` (run by `npm run dev` and
+  `npm run build`) copies them into `site/src/content/docs/` (gitignored),
+  turns each H1 into the page title, rewrites guide links (`server.md#tls`)
+  to site routes and other relative links (`../README.md`) to GitHub, and
+  fails on a relative link to a missing file. Only the landing page,
+  `site/src/content/docs/index.mdx`, lives in site/.
+- API reference: `zig build docs` writes Zig's autodoc of the `anole` module
+  (default full profile) to zig-out/docs; the sync copies it to /api/ when
+  it exists.
+- Broken internal links and anchors fail the build (starlight-links-validator).
+- Preview locally: `zig build docs` (optional, for the API reference), then
+  `cd site && npm ci && npm run dev` (the dev server shows the API
+  reference only as /anole/api/index.html). `npm run build && npm run
+  preview` serves the production build.
+- A new guide: add `docs/<name>.md` (an H1 title, then the text) and its
+  `<name>` to the sidebar list in `site/astro.config.mjs`, and to the
+  README's documentation list.
+- Versions are pinned exactly in `site/package.json` with a committed
+  `package-lock.json`. Bump them together (`npm install --save-exact
+  astro@x @astrojs/starlight@y starlight-links-validator@z`), then build and
+  preview before merging.
+
 ## The Zig version
 
 Anole targets one Zig minor version at a time. `build.zig` accepts any 0.17.x

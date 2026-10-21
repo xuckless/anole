@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.astro/
+.starlight-links-validator/
+
+# Written by scripts/sync-docs.mjs from ../docs and ../assets
+src/content/docs/*.md
+src/assets/
+public/favicon.svg
+public/banner.png
+
+# Zig's autodoc (zig build docs), copied in by the Pages workflow
+public/api/
