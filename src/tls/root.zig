@@ -50,6 +50,12 @@ test "TLS: one connection read and written at once (one executor, tasks interlea
     try testing.duplex.run(std.testing.allocator, rt.io(), .{ .bytes_per_direction = 2 * 1024 * 1024 });
 }
 
+test "TLS: an idle connection keeps no ciphertext buffer beyond its stash" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.idle(std.testing.allocator, rt.io());
+}
+
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {

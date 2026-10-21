@@ -69,6 +69,76 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opt: Options) !void {
     for (results) |r| try r;
 }
 
+/// Exchanges a few small messages, then a bulk transfer each way, then
+/// one more small message each way, and checks after each phase that both
+/// ends, waiting for their peer, hold no ciphertext buffer beyond their
+/// stash.
+pub fn idle(gpa: std.mem.Allocator, io: std.Io) !void {
+    var pem = try selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var auth = try tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key);
+    defer auth.deinit(gpa);
+
+    const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var server_side: Side = undefined;
+    var client_side: Side = undefined;
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
+    defer _ = accept_future.cancel(io) catch {};
+    try connectAndHandshake(io, listener.socket.address, &client_side);
+    try accept_future.await(io);
+    defer {
+        client_side.conn.deinit();
+        client_side.stream.close(io);
+        server_side.conn.deinit();
+        server_side.stream.close(io);
+    }
+    try std.testing.expectEqual(0, server_side.conn.heldCiphertext());
+    try std.testing.expectEqual(0, client_side.conn.heldCiphertext());
+
+    for (0..3) |_| try pingPong(io, &client_side, &server_side, 100, true);
+    // A bulk reader may keep its block when its last read happened to fill
+    // it exactly (it expects more); the small exchanges after give it back.
+    try pingPong(io, &client_side, &server_side, 300 * 1024, false);
+    try pingPong(io, &server_side, &client_side, 300 * 1024, false);
+    try pingPong(io, &client_side, &server_side, 10, true);
+    try pingPong(io, &server_side, &client_side, 10, true);
+}
+
+/// `from` sends `len` bytes and `to` reads them; then `from`, and if
+/// `check_reader` `to` too, must hold no ciphertext buffer.
+fn pingPong(io: std.Io, from: *Side, to: *Side, len: usize, check_reader: bool) !void {
+    var results: [2]anyerror!void = @splat({});
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, writeAll, .{ from, len, &results[0] });
+    try group.concurrent(io, readExactly, .{ to, len, &results[1] });
+    try group.await(io);
+    for (results) |r| try r;
+    try std.testing.expectEqual(0, from.conn.heldCiphertext());
+    if (check_reader) try std.testing.expectEqual(0, to.conn.heldCiphertext());
+}
+
+fn readExactly(side: *Side, total: usize, result: *anyerror!void) void {
+    result.* = readExactlyInner(side, total);
+}
+
+fn readExactlyInner(side: *Side, total: usize) !void {
+    var plain_buf: [5000]u8 = undefined;
+    var r = side.conn.reader(&plain_buf);
+    var got: usize = 0;
+    while (got < total) {
+        const bytes = try r.interface.peekGreedy(1);
+        const n = @min(bytes.len, total - got);
+        r.interface.toss(n);
+        got += n;
+    }
+    // A reader with its own buffer could have read ahead; this one must not.
+    try std.testing.expectEqual(0, r.interface.bufferedLen());
+}
+
 fn acceptAndHandshake(io: std.Io, listener: *std.Io.net.Server, side: *Side, auth: *tls.config.CertKeyPair) !void {
     const stream = try listener.accept(io);
     side.* = .{ .conn = undefined, .tcp_reader = undefined, .tcp_writer = undefined, .stream = stream, .id = 1 };
