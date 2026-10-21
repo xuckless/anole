@@ -21,13 +21,17 @@ const sign_bit: u64 = 1 << 63;
 const nan_bits: u64 = 0x7C00_0000_0000_0000;
 const infinity_bits: u64 = 0x7800_0000_0000_0000;
 
+/// NaN.
 pub const nan: Decimal128 = .{ .low = 0, .high = nan_bits };
+/// Positive infinity.
 pub const infinity: Decimal128 = .{ .low = 0, .high = infinity_bits };
+/// Negative infinity.
 pub const negative_infinity: Decimal128 = .{ .low = 0, .high = infinity_bits | sign_bit };
 
 /// The longest `toString` result ("-0.000000" and 34 digits).
 pub const max_string_len = 48;
 
+/// Why `parse` refused a string.
 pub const ParseError = error{
     /// Not a numeric string (decimal128.md, "From String Representation").
     InvalidDecimal,
@@ -38,6 +42,7 @@ pub const ParseError = error{
     Overflow,
 };
 
+/// `v` exactly, with exponent 0.
 pub fn fromInt(v: i64) Decimal128 {
     return fromParts(v < 0, @abs(v), 0);
 }
@@ -54,6 +59,8 @@ pub fn fromParts(negative: bool, coefficient: u128, exponent: i32) Decimal128 {
     };
 }
 
+/// From the spec's string forms: "1.23", "-1.5E+3", "Infinity", "NaN".
+/// Rounds only when no non-zero digit is lost (see `ParseError`).
 pub fn parse(s: []const u8) ParseError!Decimal128 {
     var i: usize = 0;
     var negative = false;
@@ -135,22 +142,27 @@ pub fn parse(s: []const u8) ParseError!Decimal128 {
     return fromParts(negative, coefficient, @intCast(exponent));
 }
 
+/// Whether it is NaN.
 pub fn isNan(d: Decimal128) bool {
     return (d.high >> 58) & 0x1F == 0x1F;
 }
 
+/// Whether it is an infinity, either sign.
 pub fn isInfinite(d: Decimal128) bool {
     return (d.high >> 58) & 0x1F == 0x1E;
 }
 
+/// Whether the sign bit is set (negative zero included).
 pub fn isNegative(d: Decimal128) bool {
     return d.high & sign_bit != 0;
 }
 
+/// From the 16 bytes as BSON stores them.
 pub fn fromBytes(b: [16]u8) Decimal128 {
     return .{ .low = std.mem.readInt(u64, b[0..8], .little), .high = std.mem.readInt(u64, b[8..16], .little) };
 }
 
+/// The 16 bytes as BSON stores them.
 pub fn toBytes(d: Decimal128) [16]u8 {
     var b: [16]u8 = undefined;
     std.mem.writeInt(u64, b[0..8], d.low, .little);
@@ -158,6 +170,7 @@ pub fn toBytes(d: Decimal128) [16]u8 {
     return b;
 }
 
+/// Whether the two encodings are the same bits: 1.0 and 1.00 differ.
 pub fn eql(a: Decimal128, b: Decimal128) bool {
     return a.low == b.low and a.high == b.high;
 }
@@ -186,6 +199,7 @@ pub fn toString(d: Decimal128, buf: *[max_string_len]u8) []const u8 {
     return w.buffered();
 }
 
+/// `toString`'s form, for `{f}`.
 pub fn format(d: Decimal128, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (d.isNan()) return w.writeAll("NaN");
     if (d.isNegative()) try w.writeByte('-');

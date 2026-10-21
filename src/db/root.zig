@@ -1,5 +1,5 @@
 //! What the database connectors share (`anole.pg`, `anole.sqlite`,
-//! `anole.mongo`, `anole.redis`): the calling convention, a pool per
+//! `anole.mongodb`, `anole.redis`): the calling convention, a pool per
 //! executor, the error set and its HTTP statuses, timestamps, connection
 //! URLs, and the health, metrics and tracing hooks.
 //!
@@ -70,13 +70,27 @@ const std = @import("std");
 const dusty = @import("dusty");
 const placement = dusty.placement;
 
+/// A point in time, microseconds since the Unix epoch in UTC: what the
+/// connectors read timestamp columns into and bind as parameters. In JSON
+/// it is an RFC 3339 string.
 pub const Time = @import("time.zig").Time;
+/// A connection URL taken apart (`postgres://`, `mongodb://`,
+/// `redis://`): `Url.parse(arena, text)`.
 pub const Url = @import("url.zig").Url;
+/// A connection URL for logs, with its password replaced by `***`:
+/// `log.info("connecting to {f}", .{anole.db.redacted(url)})`.
 pub const redacted = @import("url.zig").redacted;
+/// An environment variable's value (`DATABASE_URL` and the like), or null.
 pub const env = @import("url.zig").env;
+/// A cached ping behind `/readyz`, which a connector registers with
+/// `app.health`.
 pub const Readiness = @import("observe.zig").Readiness;
+/// A connector's Prometheus metrics (calls, durations, errors, pool use).
 pub const Metrics = @import("observe.zig").Metrics;
+/// What a connector reports each call to: its `Metrics`, and a client span
+/// when the request is traced.
 pub const Observer = @import("observe.zig").Observer;
+/// One call in progress, from `Observer.start` to `Call.end`.
 pub const Call = @import("observe.zig").Call;
 
 const log = std.log.scoped(.anole);
@@ -131,7 +145,10 @@ pub const QueryOptions = struct {
     /// connector's `cache.invalidate`. See `QueryCache`.
     cache: ?Cache = null,
 
+    /// `QueryOptions.cache`: how long a result is kept, and a tag to drop
+    /// it by.
     pub const Cache = struct {
+        /// How long a result is served from memory.
         ttl: std.Io.Duration,
         /// A name to drop the result by: `cache.invalidate(.{ .tag = "posts" })`.
         tag: ?[]const u8 = null,
@@ -144,9 +161,11 @@ pub const QueryCache = @import("cache.zig").Cache;
 /// Its bounds (each connector's `Options.cache`).
 pub const CacheOptions = @import("cache.zig").Options;
 
+/// How `begin` and `transaction` open a transaction.
 pub const TxOptions = struct {
     /// Null: the database's default.
     isolation: ?Isolation = null,
+    /// `READ ONLY` (PostgreSQL), or a reader connection (SQLite).
     read_only: bool = false,
     /// `transaction` only: runs again after a serialization failure or a
     /// deadlock (`retryable`), up to this many more times.
@@ -155,6 +174,7 @@ pub const TxOptions = struct {
     timeout: ?std.Io.Duration = null,
 };
 
+/// SQL isolation levels (`TxOptions.isolation`).
 pub const Isolation = enum { read_uncommitted, read_committed, repeatable_read, serializable };
 
 // ---------------------------------------------------------------------------
@@ -182,6 +202,7 @@ pub const Error = error{
     MissingColumn,
     /// Only through an `ErrorMap` that asks for them.
     BadRequest,
+    /// Only through an `ErrorMap` that asks for it.
     UnprocessableEntity,
 };
 
@@ -200,6 +221,7 @@ pub const ErrorMap = struct {
     timeout: Answer = .gateway_timeout,
     other: Answer = .internal_server_error,
 
+    /// The status a class answers with; each one is an `Error`.
     pub const Answer = enum {
         bad_request,
         not_found,
@@ -209,6 +231,8 @@ pub const ErrorMap = struct {
         service_unavailable,
         gateway_timeout,
 
+        /// The `Error` for this status: `.internal_server_error` is
+        /// `error.Database`.
         pub fn err(self: Answer) Error {
             return switch (self) {
                 .bad_request => error.BadRequest,
@@ -222,6 +246,7 @@ pub const ErrorMap = struct {
         }
     };
 
+    /// The `Error` this map gives `class`.
     pub fn errorFor(self: ErrorMap, class: Class) Error {
         return switch (class) {
             inline else => |tag| @field(self, @tagName(tag)).err(),
@@ -271,6 +296,8 @@ pub const ErrorDetail = struct {
     /// The table, or the collection.
     table: ?[]const u8 = null,
 
+    /// Writes it for a log line with `{f}`: `postgresql 23505 (unique):
+    /// duplicate key ... [constraint posts_slug_key] [table posts]`.
     pub fn format(self: ErrorDetail, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{t}", .{self.system});
         if (self.code.len > 0) try w.print(" {s}", .{self.code});

@@ -9,16 +9,20 @@ const std = @import("std");
 /// both ways, so `res.json(row)` and `req.bind(T)` carry it as clients
 /// expect.
 pub const Time = struct {
+    /// Microseconds since 1970-01-01T00:00:00Z.
     us: i64,
 
+    /// The instant `us` microseconds after the epoch.
     pub fn fromMicros(us: i64) Time {
         return .{ .us = us };
     }
 
+    /// The instant `ms` milliseconds after the epoch (MongoDB's date).
     pub fn fromMillis(ms: i64) Time {
         return .{ .us = ms * std.time.us_per_ms };
     }
 
+    /// The instant `s` seconds after the epoch (a Unix timestamp).
     pub fn fromSeconds(s: i64) Time {
         return .{ .us = s * std.time.us_per_s };
     }
@@ -33,10 +37,12 @@ pub const Time = struct {
         return @divFloor(self.us, std.time.us_per_s);
     }
 
+    /// The wall clock's time now (`std.Io.Clock.real`).
     pub fn now(io: std.Io) Time {
         return .{ .us = std.Io.Clock.real.now(io).toMicroseconds() };
     }
 
+    /// Whether `a` is before, at or after `b`.
     pub fn order(a: Time, b: Time) std.math.Order {
         return std.math.order(a.us, b.us);
     }
@@ -122,10 +128,13 @@ pub const Time = struct {
         try w.writeByte('Z');
     }
 
+    /// For `std.json`: an RFC 3339 string, as `format` writes it.
     pub fn jsonStringify(self: Time, jw: anytype) !void {
         try jw.print("\"{f}\"", .{self});
     }
 
+    /// For `std.json`: a string `parse` takes; anything else is
+    /// `error.UnexpectedToken`.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Time {
         const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const text = switch (token) {
@@ -136,6 +145,7 @@ pub const Time = struct {
         return parse(text) catch error.UnexpectedToken;
     }
 
+    /// For `std.json`, from a parsed `std.json.Value`, as `jsonParse`.
     pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !Time {
         return switch (source) {
             .string => |s| parse(s) catch error.UnexpectedToken,

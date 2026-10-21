@@ -31,6 +31,7 @@ const Frame = struct {
     index: ?u32,
 };
 
+/// What writing can fail with: memory, or a value BSON cannot hold.
 pub const Error = error{
     OutOfMemory,
     /// A key with a 0x00 byte (it would end the key early) or invalid UTF-8.
@@ -43,10 +44,12 @@ pub const Error = error{
     DocumentTooLarge,
 };
 
+/// An empty builder that grows its buffer with `gpa`.
 pub fn init(gpa: std.mem.Allocator) Builder {
     return .{ .gpa = gpa };
 }
 
+/// Frees the buffer (unless `toOwnedSlice` took it).
 pub fn deinit(b: *Builder) void {
     b.buf.deinit(b.gpa);
     b.frames.deinit(b.gpa);
@@ -76,11 +79,15 @@ pub fn begin(b: *Builder) Error!void {
     try b.open(null);
 }
 
+/// Opens a sub-document under `name` in the open document or array;
+/// close it with `end`.
 pub fn beginDocument(b: *Builder, name: []const u8) Error!void {
     try b.key(.document, name);
     try b.open(null);
 }
 
+/// Opens an array under `name`; its elements are named by index, and
+/// `end` closes it.
 pub fn beginArray(b: *Builder, name: []const u8) Error!void {
     try b.key(.array, name);
     try b.open(0);

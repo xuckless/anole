@@ -13,6 +13,7 @@ const Decimal128 = @import("Decimal128.zig");
 const Value = document.Value;
 const Document = document.Document;
 
+/// Which form of Extended JSON to write.
 pub const Mode = enum {
     /// Every type in a wrapper (`{"$numberInt": "1"}`): type-preserving.
     canonical,
@@ -22,6 +23,7 @@ pub const Mode = enum {
 
 const Writer = std.Io.Writer;
 
+/// Writes `doc` as Extended JSON in `mode`.
 pub fn write(w: *Writer, doc: Document, mode: Mode) Writer.Error!void {
     try w.writeByte('{');
     var it = doc.iterator();
@@ -41,10 +43,12 @@ pub fn fmt(doc: Document, mode: Mode) Formatter {
     return .{ .doc = doc, .mode = mode };
 }
 
+/// What `fmt` returns: print it with `{f}`.
 pub const Formatter = struct {
     doc: Document,
     mode: Mode,
 
+    /// Writes the document, as `write` does.
     pub fn format(f: Formatter, w: *Writer) Writer.Error!void {
         return write(w, f.doc, f.mode);
     }
@@ -58,6 +62,7 @@ pub fn allocPrint(gpa: std.mem.Allocator, doc: Document, mode: Mode) error{OutOf
     return out.toOwnedSlice();
 }
 
+/// Writes one value as Extended JSON in `mode`.
 pub fn writeValue(w: *Writer, v: Value, mode: Mode) Writer.Error!void {
     switch (v) {
         .double => |f| {
@@ -236,6 +241,9 @@ fn writeDouble(w: *Writer, f: f64) Writer.Error!void {
 /// 9999-12-31T23:59:59.999Z
 const max_iso_ms: i64 = 253402300799999;
 
+/// Writes `ms` (milliseconds since the epoch) as an ISO-8601 date in UTC,
+/// `2026-10-21T09:30:00.250Z` (the milliseconds only when not zero). The
+/// caller keeps `ms` within years 1970 to 9999, as relaxed mode does.
 pub fn writeIsoDate(w: *Writer, ms: i64) Writer.Error!void {
     const days = @divFloor(ms, std.time.ms_per_day);
     const in_day = @mod(ms, std.time.ms_per_day);
@@ -277,6 +285,7 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
 
 // Parsing.
 
+/// Why `parse` refused the text.
 pub const ParseError = Builder.Error || error{
     /// Not JSON, or JSON whose top level is not an object.
     InvalidJson,

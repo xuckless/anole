@@ -70,6 +70,9 @@ const Duration = std.Io.Duration;
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
 
+/// `app.postgres(options)` and `Db.init`: where the database is, the
+/// pool's bounds and timeouts, TLS, and how errors map to statuses. Every
+/// field has a default, so `.{}` connects from the environment.
 pub const Options = struct {
     /// A `postgres://` or `postgresql://` URL. Null: `DATABASE_URL`, else
     /// libpq's variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
@@ -98,6 +101,7 @@ pub const Options = struct {
     idle_timeout: ?Duration = .fromSeconds(30 * 60),
     /// What each class of server error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
+    /// Certificates for TLS; whether TLS is used is the URL's `sslmode`.
     tls: Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
@@ -114,6 +118,7 @@ pub const Options = struct {
     /// process's environment (`app.postgres` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
 
+    /// Certificates beyond what the URL names (`Options.tls`).
     pub const Tls = struct {
         /// What `sslmode=verify-ca`/`verify-full` trust; null: the URL's
         /// `sslrootcert`, else the system's store.
@@ -868,6 +873,7 @@ pub const Query = struct {
     db: *Db,
     opts: db.QueryOptions,
 
+    /// `Db.exec`, with the options' `timeout` and `prepare`.
     pub fn exec(self: Query, c: anytype, sql: []const u8, args: anytype) Error!u64 {
         return self.db.call(c, self.opts.timeout, null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
@@ -875,14 +881,17 @@ pub const Query = struct {
     // The reads go through the cache, which shares them when `opts`
     // asks (`coalesce`, `cache`) and makes the plain call otherwise.
 
+    /// `Db.one`, with the options (`coalesce` and `cache` apply).
     pub fn one(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         return self.db.cache.read(T, c, self.opts, sql, args, Read(T, .one){ .query = self });
     }
 
+    /// `Db.optional`, with the options (`coalesce` and `cache` apply).
     pub fn optional(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
         return self.db.cache.read(?T, c, self.opts, sql, args, Read(T, .optional){ .query = self });
     }
 
+    /// `Db.all`, with the options (`coalesce` and `cache` apply).
     pub fn all(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
         return self.db.cache.read([]T, c, self.opts, sql, args, Read(T, .all){ .query = self });
     }
@@ -918,21 +927,25 @@ pub const Tx = struct {
     deadline: ?dusty.Deadline,
     state: enum { open, done, broken } = .open,
 
+    /// `Db.exec` on the transaction's connection.
     pub fn exec(self: *Tx, c: anytype, sql: []const u8, args: anytype) Error!u64 {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Exec(@TypeOf(args)){ .args = args, .prepare = true });
     }
 
+    /// `Db.one` on the transaction's connection.
     pub fn one(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = true });
     }
 
+    /// `Db.optional` on the transaction's connection.
     pub fn optional(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = true });
     }
 
+    /// `Db.all` on the transaction's connection.
     pub fn all(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
         try self.usable(c);
         return self.db.call(c, null, self, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = true });
@@ -959,6 +972,8 @@ pub const Tx = struct {
         self.state = .done;
     }
 
+    /// Rolls back. `deinit` does it too when neither this nor `commit`
+    /// ran; call it for the error a failed rollback returns.
     pub fn rollback(self: *Tx) Error!void {
         var c = self.ctx;
         try self.usable(&c);
