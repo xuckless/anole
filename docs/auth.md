@@ -443,6 +443,7 @@ answers 429 with `Retry-After`.
 var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle_ms 300_000
 defer limiter.deinit();
 var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
+var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKey, .on_error = .deny });
 ```
 
 - `MemoryLimiter` is for one process. It holds at most `max_entries` keys,
@@ -460,11 +461,20 @@ Behind a proxy, set `.server = .{ .trusted_proxy_hops = 1 }` in the server
 options so that the address comes from `X-Forwarded-For`, or turn on the
 listener's `proxy_protocol`.
 Otherwise every client shares the proxy's bucket. To limit by something
-else, such as an account or an API key, set the middleware's
-`key: fn (req, buf: []u8) []const u8` field. `buf` is 128 bytes.
+else, such as an account or an API key, pass `.key`, a
+`fn (req: *anole.Request, buf: []u8) []const u8` that returns the key,
+written into `buf` (128 bytes) or pointing into the request:
 
-If the limiter fails, for example because Redis is down, the request is let
-through and a warning is logged.
+```zig
+fn byApiKey(req: *anole.Request, _: []u8) []const u8 {
+    return anole.auth.apikey.fromRequest(req) orelse "anonymous";
+}
+```
+
+If the limiter fails, for example because Redis is down, `.on_error`
+decides: `.allow` (the default) lets the request through, `.deny` answers
+503 Service Unavailable. A warning is logged either way. Deny where an
+unlimited burst costs more than an outage, such as a login.
 
 ## Try the example
 
