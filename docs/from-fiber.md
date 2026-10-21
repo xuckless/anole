@@ -51,7 +51,7 @@ builds a whole API step by step.
 | `logger.New()` | `app.use(anole.observe.AccessLog.init(.{}));` |
 | `requestid.New()` | `app.use(anole.middleware.RequestId.init(.{}));` |
 | `compress.New()` | `app.use(anole.middleware.Compress.init());` |
-| `recover.New()` | nothing to add, and nothing like it ([below](#panics-and-recover)) |
+| `recover.New()` | nothing to add, and nothing like it ([below](#what-is-different)) |
 | `limiter.New(limiter.Config{Max: 100, Expiration: time.Minute})` | `anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window_ms = 60_000 })` ([below](#rate-limits-sessions-and-jwt)) |
 | `session.New()` and `session.FromContext(c)` | `anole.session.Middleware.init(.{ .key = key })` and `req.session` |
 | `jwtware.New(jwtware.Config{...})` (contrib/jwt) | `anole.auth.RequireJwt.init(keys, policy, .{})` and `anole.auth.claims(req)` |
