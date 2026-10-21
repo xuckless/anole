@@ -163,7 +163,7 @@ not load or an address that does not parse is returned by `listen`, and by
 | `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
 | `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
-| `server` | `.{}` | The rest of dusty's `ServerConfig`: timeouts, limits, proxies. |
+| `server` | `.{}` | The rest of the HTTP core's `ServerConfig`: timeouts, limits, proxies. |
 
 You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
@@ -208,7 +208,7 @@ var app = try anole.Server(void).init(init.gpa, .{
 `anole.Cert.fromFiles(cert_path, key_path)` and `.fromPem(cert, key)` build
 the first two: `.cert = .fromFiles("cert.pem", "key.pem")`.
 
-`server` goes to dusty as is, except that `listeners` and `http2` are
+`server` goes to the HTTP core as is, except that `listeners` and `http2` are
 replaced by the fields above. Its timeouts and limits are covered in
 [routing.md](routing.md#timeouts-and-limits); `trusted_proxy_hops` below;
 `max_connections` caps open connections, by default at what the open-file
@@ -378,7 +378,7 @@ With a zio runtime of your own, start a pool on it with
 | `client()` | The server's outbound HTTP client (also `anole.client(req)`); see [clients.md](clients.md#the-servers-client). |
 | `middleware(value)` | A server-owned copy of a middleware, as a handle to share between groups. |
 | `reloadCertificates()`, `setCertificate(cert)` | Swap the TLS certificate while serving; see [TLS](#tls). |
-| `router`, `server` | dusty's router and server. |
+| `router`, `server` | The HTTP core's router and server. |
 | `io()` | The runtime's `std.Io`, for work beside the server. |
 | `run()` | Serves until a signal or `stop`, then drains. |
 | `stop()` | Ends `run` as a signal would; safe from any task or thread of the runtime. |
