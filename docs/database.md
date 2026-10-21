@@ -567,6 +567,214 @@ On such a host use `mongo:7.0` or a kernel from 7.0.14 (CI runs 8.0 and
 zig build test-mongodb -Dmongodb-test-url='mongodb://user:pw@localhost:27017/?replicaSet=rs0&authSource=admin'
 ```
 
+## Redis and Valkey
+
+Built in with `-Dredis` (on in the `full` profile). hiredis parses the
+replies; the connections, pools and TLS are Anole's, the same shape as
+the other connectors: a handle in your App state, the request first,
+replies in the request's arena, errors as statuses. `examples/redis` has a
+counter, a cache, a leaderboard and pub/sub streamed as Server-Sent Events:
+
+```sh
+docker run --rm -d -p 6379:6379 redis:7     # or valkey/valkey:8
+zig build run-redis                         # REDIS_URL, else redis://127.0.0.1:6379
+```
+
+### Setup
+
+```zig
+const App = struct { cache: *anole.redis.Client };
+
+pub fn main(init: std.process.Init) !void {
+    var state: App = undefined;
+    var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
+    defer app.deinit();
+    state.cache = try app.redis(.{}); // REDIS_URL
+    _ = app.metrics(.{}); // pool and command metrics
+    _ = app.health(.{}); // /readyz sends PING
+    app.get("/hits", hits);
+    try app.listen(":3000");
+}
+```
+
+`app.redis` reads `.url`, else `REDIS_URL`, else `redis://127.0.0.1:6379`,
+and like `app.postgres` opens nothing before a handler needs it
+(`.connect_at_start = true` to refuse to start without the server). The
+URL is the one go-redis and redis-py take:
+
+| URL | |
+| --- | --- |
+| `redis://host:6379/2` | plain text, database 2 (SELECT); `?db=2` works too |
+| `redis://:password@host` | AUTH with the password (the default user) |
+| `redis://user:password@host` | AUTH as an ACL user (Redis 6+, Valkey) |
+| `rediss://...` | TLS, the certificate checked against the system's store |
+| `rediss://...?ssl_ca_certs=/etc/ca.pem` | ... against this CA instead (or `.tls.ca`) |
+| `rediss://...?ssl_certfile=c.pem&ssl_keyfile=k.pem` | a client certificate (or `.tls.client_certificate`) |
+| `rediss://...?ssl_cert_reqs=none` | any certificate: a managed server with a self-signed one |
+| `unix:///run/redis.sock?db=0` | a Unix socket |
+
+`anole.redis.Options` has the rest: `max_connections` (ten per executor),
+`acquire_timeout` (5 s), `connect_timeout` (10 s), `idle_timeout` (5 min:
+an idle connection older than this is replaced, in case a proxy dropped
+it), `errors`, `name` (the `db` label, `"redis"`). Redis Cluster and
+Sentinel are not supported; a URL with several hosts is refused.
+
+### Handlers
+
+```zig
+fn hits(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    try res.json(.{ .hits = try app.cache.incr(req, "hits") });
+}
+
+const Profile = struct { name: []const u8, visits: u32, plan: enum { free, pro } = .free };
+
+fn profile(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const id = req.params.get("id") orelse return error.NotFound;
+    const key = try std.fmt.allocPrint(req.arena, "user:{s}", .{id});
+    try res.json(try app.cache.hgetAll(Profile, req, key)); // no such hash: 404
+}
+
+fn page(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    if (try app.cache.get(req, "page:/")) |body| {
+        res.body = body;
+        return;
+    }
+    const body = try render(req); // the slow part
+    _ = try app.cache.set(req, "page:/", body, .{ .ttl = .fromSeconds(30) });
+    res.body = body;
+}
+```
+
+Any command goes through `command`, which returns the `Reply`, or through
+the typed calls, which read it into your type:
+
+| Call | Returns |
+| --- | --- |
+| `command(req, .{ "INCR", key })` | the `Reply` (`.int`, `.string`, `.array`, `.nil`...) |
+| `one(T, req, args)` | the reply as a `T`; nil (or an empty hash, for a struct) is `error.NotFound` (404) |
+| `optional(T, req, args)` | the reply as a `T`, or null |
+| `all(T, req, args)` | an array reply as `[]T` |
+| `pipeline(req, .{ cmd1, cmd2 })` | every reply, in one round trip |
+| `acquire(req)` | one connection for several calls, given back with `release()` |
+| `subscribe(req, channels)`, `psubscribe` | a pub/sub connection of its own |
+| `with(.{ .timeout })` | the same calls, bounded |
+
+The arguments are a tuple: strings as they are (binary-safe), numbers in
+decimal, `bool` as 1 or 0, enums by name, null left out, slices and
+nested tuples item by item, and a struct as its field names and values:
+`.{ "HSET", key, profile }`, `.{ "DEL", keys }`, `.{ "SET", key, value, "EX", 60 }`.
+Replies read into integers (from integers or numeric strings), floats,
+`bool` (1/0, OK), `[]const u8`, enums, slices (`all(?[]const u8, req, .{ "MGET", keys })`),
+structs (from a hash, by field name; a missing field keeps its default or
+is `error.MissingColumn`) and optionals.
+
+For what most apps do there are helpers: `get`, `set` (`.ttl`, `.nx`, `.xx`,
+`.keep_ttl`; false when NX/XX kept it from being set), `del`, `incr`,
+`incrBy`, `expire`; `hget`, `hset` (from a struct), `hgetAll` (into one),
+`hdel`, `hincrBy`; `lpush`, `rpush`, `lrange`; `sadd`, `srem`, `smembers`,
+`sismember`; `zadd`, `zincrBy`, `zscore`, `zrem`, `zrange`,
+`zrangeWithScores` (a leaderboard: `zrangeWithScores(req, "board", 0, 9, .{ .rev = true })`);
+`publish`. Everything else is `command` or a typed call.
+
+### Pipelines and transactions
+
+```zig
+// One round trip; MULTI ... EXEC makes it atomic.
+const r = try app.cache.pipeline(req, .{ .{"MULTI"}, .{ "INCR", key }, .{ "EXPIRE", key, 60 }, .{"EXEC"} });
+const count = r[3].array[0].int;
+```
+
+A pipeline fails with its first error reply, after every reply was read,
+so the connection stays usable; errors inside EXEC's reply come back as
+`.err` replies. WATCH needs one connection across round trips:
+
+```zig
+var conn = try app.cache.acquire(req);
+defer conn.release();
+_ = try conn.command(req, .{ "WATCH", key });
+const stock = try conn.one(i64, req, .{ "GET", key });
+const r = try conn.pipeline(req, .{ .{"MULTI"}, .{ "SET", key, stock - 1 }, .{"EXEC"} });
+if (r[2] == .nil) return error.Conflict; // the key changed: nothing was set
+```
+
+A connection that a call leaves inside MULTI or WATCH, on another
+database (SELECT), subscribed, or with other connection state (`CLIENT
+SETNAME`, `CLIENT TRACKING`...) is closed rather than given to the next
+call.
+
+### Pub/sub
+
+```zig
+fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    req.setTimeout(.none); // a stream
+    const sub = try app.cache.subscribe(req, "room:lobby");
+    defer sub.close();
+    var buf: [1024]u8 = undefined;
+    var stream = try res.startEventStream(&buf);
+    while (try sub.next(req)) |msg| try stream.send(msg.payload, .{});
+    try stream.body.end();
+}
+
+fn post(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    try res.json(.{ .receivers = try app.cache.publish(req, "room:lobby", (try req.body()).?) });
+}
+```
+
+A subscriber has a connection of its own, outside the pools, confirmed by
+the server when `subscribe` returns. `next` waits for a message (valid
+until the next `next`) and returns null once nothing is subscribed, after
+`stop()` (from any task), or when the server starts to drain, so a stream
+like the one above ends in time. `subscribe`, `psubscribe`, `unsubscribe`
+and `punsubscribe` on the subscriber change what it listens to without
+waiting, even while another task waits in `next`.
+
+### Errors and timeouts
+
+| Reply or failure | Error | Status |
+| --- | --- | --- |
+| nil from `one` | `NotFound` | 404 |
+| `LOADING`, `MASTERDOWN`, `BUSY`, `READONLY`, `OOM`, `TRYAGAIN`, `CLUSTERDOWN`, `NOREPLICAS`, `MISCONF`; a refused login (`WRONGPASS`, `NOAUTH`); no connection (refused, pool busy past `acquire_timeout`) | `ServiceUnavailable` | 503 |
+| a call past `with(.{ .timeout })` | `GatewayTimeout` | 504 |
+| any other error reply (`WRONGTYPE`, `ERR`, a script's), a reply that does not fit the type asked for | `Database` | 500 |
+
+`anole.db.lastError(req)` has the server's message (`.code` is its first
+word, `WRONGTYPE`), and `.errors` moves a class, as for PostgreSQL. A
+call canceled in flight (the request's deadline, an HTTP/2 reset,
+`with(.{ .timeout })`) closes its connection, since the reply may still
+be on its way; the next call opens another. A blocking command
+(`BLPOP`, `XREAD BLOCK`) holds its pooled connection while it waits, so
+give it a `timeout` of its own or `acquire` one.
+
+### Sessions and rate limits
+
+`anole.session.RedisStore` and `anole.ratelimit.RedisLimiter` take the
+same client and use its pools ([auth.md](auth.md)):
+
+```zig
+var sessions: anole.session.RedisStore = .{ .client = state.cache, .gpa = gpa };
+var limits: anole.ratelimit.RedisLimiter = .{ .client = state.cache, .gpa = gpa };
+```
+
+### Observability
+
+With `app.metrics`, the series of the PostgreSQL section appear with
+`system="redis"` (command times, errors by name, the pools); with
+`app.tracing`, each call in a traced request is a client span named after
+the command (`PIPELINE` for a pipeline); with `app.health`, `/readyz`
+fails while the server does not answer PING (checked at most once a
+second).
+
+### Testing against a server
+
+`tests/redis/run.sh` starts `redis:7` (or `REDIS_IMAGE=valkey/valkey:8`)
+in Docker, with a CA and certificate made for the run, and runs
+`zig build test-redis` twice: in plain text as the default user, and over
+TLS as an ACL user on database 1. Against a server of your own:
+
+```sh
+zig build test-redis -Dredis-test-url='redis://127.0.0.1:6379'
+```
+
 ## Caching
 
 Two opt-in options on the reads (`one`, `optional`, `all`) of every
