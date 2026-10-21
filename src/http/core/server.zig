@@ -815,8 +815,7 @@ pub const Burst = struct {
 
     pub const End = enum { close, park };
     pub const Input = enum {
-        /// Something to read (or the end of the stream, which the next read
-        /// reports).
+        /// Something to read.
         ready,
         /// Nothing arrived for the park delay, and nothing is in flight:
         /// park, unless the adopter is in the middle of something.
@@ -824,13 +823,16 @@ pub const Burst = struct {
     };
 
     /// Waits for input with nothing buffered (the reader needs a buffer),
-    /// up to the park delay. Fails as a read would.
+    /// up to the park delay. Fails as a read would, and with
+    /// `error.EndOfStream` when the peer ended the stream: with nothing
+    /// buffered, the adopter would find nothing to read and wait again, at
+    /// once and forever, holding the connection after its peer is gone.
     pub fn waitInput(self: *Burst) !Input {
         const r = self.connection.reader;
         if (r.bufferedLen() > 0) return .ready;
         if (self.park_after == null) {
             r.fillMore() catch |err| switch (err) {
-                error.EndOfStream => return .ready,
+                error.EndOfStream => return error.EndOfStream,
                 error.ReadFailed => return self.connection.getReadError() orelse error.Unexpected,
             };
             return .ready;
@@ -843,7 +845,7 @@ pub const Burst = struct {
         r.fillMore() catch |err| switch (err) {
             error.EndOfStream => {
                 _ = self.watch.end(false);
-                return .ready;
+                return error.EndOfStream;
             },
             error.ReadFailed => {
                 const e = self.connection.getReadError() orelse error.Unexpected;

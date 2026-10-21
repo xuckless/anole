@@ -175,7 +175,23 @@ const Client = struct {
         _ = self.reader().takeByte() catch return true;
         return false;
     }
+
+    /// Goes away without a close frame: a FIN, or with `reset` a RST (no
+    /// linger), as a client process that exits does.
+    fn hangUp(self: *Client, io: std.Io, reset: bool) void {
+        if (reset) {
+            const linger = extern struct { onoff: c_int, seconds: c_int }{ .onoff = 1, .seconds = 0 };
+            std.posix.setsockopt(self.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
+        }
+        self.close(io);
+    }
 };
+
+/// The loop API's echo, for the same hang-ups.
+fn loopEcho(ws: *websocket.Socket) !void {
+    try ws.send(.text, "hello");
+    while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
+}
 
 const Fixture = struct {
     rt: *zio.Runtime,
@@ -202,6 +218,7 @@ const Fixture = struct {
         self.server = Server.init(gpa, self.io, cfg, {});
         self.server.router.get("/ws", websocket.callbacks(void, Echo, .{}));
         self.server.router.get("/quiet", websocket.callbacks(void, Echo, .{ .close_on_drain = false }));
+        self.server.router.get("/loop", websocket.route(void, loopEcho, .{}));
         self.server.router.get("/brief", websocket.callbacks(void, Echo, .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(400), .clock = .awake } } }));
         self.future = try self.io.concurrent(struct {
             fn run(s: *Server) anyerror!void {
@@ -232,6 +249,16 @@ const Fixture = struct {
             try self.io.sleep(.fromMilliseconds(5), .awake);
         }
         std.debug.print("parked: {d}, want {d}\n", .{ self.server.parkedConnections(), n });
+        return error.TestUnexpectedResult;
+    }
+
+    /// Waits up to two seconds for the server to hold `n` connections.
+    fn waitConnections(self: *Fixture, n: u32) !void {
+        for (0..400) |_| {
+            if (self.server.active_connections.load(.acquire) == n) return;
+            try self.io.sleep(.fromMilliseconds(5), .awake);
+        }
+        std.debug.print("connections: {d}, want {d}\n", .{ self.server.active_connections.load(.acquire), n });
         return error.TestUnexpectedResult;
     }
 
@@ -465,4 +492,48 @@ test "WebSocket callbacks: a callback socket closes at its deadline while parked
     try f.waitParked(1);
     try std.testing.expect(c.hungUp());
     try f.waitClosed(1);
+}
+
+/// Peers that go away without a close frame, each way: a FIN or a RST,
+/// between messages or in the middle of one, waiting on their task or
+/// parked. Every connection must close and free its state at once.
+fn hangUps(path: []const u8, timeout: dusty.ServerConfig.Timeout, parks: bool) !void {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, .{ .timeout = timeout });
+    defer f.deinit(gpa);
+
+    var clients: [8]Client = undefined;
+    for (&clients) |*c| {
+        try c.open(f.io, f.server.address.ip, false, path);
+        try c.expectText("hello");
+        try c.send(0x1, "one");
+        try c.expectText("one");
+    }
+    if (parks) try f.waitParked(clients.len);
+    for (&clients, 0..) |*c, i| {
+        // Half of them in the middle of a frame: a header, no payload.
+        if (i % 4 >= 2) {
+            try c.writer().writeAll(&.{ 0x81, 0x85, 0, 0, 0, 0 });
+            try c.writer().flush();
+        }
+        c.hangUp(f.io, i % 2 == 1);
+    }
+    try f.waitConnections(0);
+    try std.testing.expectEqual(0, f.server.parkedConnections());
+}
+
+test "WebSocket callbacks: peers that hang up or reset are closed, parked or on their task" {
+    // Parked; on their task with parking on; with parking off.
+    try hangUps("/ws", .{ .idle_park = .fromMilliseconds(30) }, true);
+    try std.testing.expectEqual(opened.load(.acquire), closed.load(.acquire));
+    try hangUps("/ws", .{ .idle_park = .fromSeconds(10) }, false);
+    try std.testing.expectEqual(opened.load(.acquire), closed.load(.acquire));
+    try hangUps("/ws", .{ .idle_park = null }, false);
+    try std.testing.expectEqual(opened.load(.acquire), closed.load(.acquire));
+}
+
+test "WebSocket loop: peers that hang up or reset are closed" {
+    try hangUps("/loop", .{ .idle_park = .fromMilliseconds(30) }, false);
+    try hangUps("/loop", .{ .idle_park = null }, false);
 }

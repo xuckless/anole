@@ -432,3 +432,28 @@ test "idle park: off, a connection keeps its task" {
     try std.testing.expectEqual(0, f.server.parkedConnections());
     try std.testing.expectEqual(200, try c.get("/"));
 }
+
+test "idle park: peers that hang up or reset are closed, parked or mid-request" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, 1, false, .{ .idle_park = .fromMilliseconds(30) });
+    defer f.stop(gpa);
+
+    var clients: [8]Client = undefined;
+    for (&clients) |*c| {
+        try c.open(f.io, f.addr(), false);
+        try std.testing.expectEqual(200, try c.get("/"));
+    }
+    try f.waitParked(clients.len);
+    for (&clients, 0..) |*c, i| {
+        // Half of them in the middle of a request head.
+        if (i % 4 >= 2) try c.send("GET / HTTP/1.1\r\nHo");
+        if (i % 2 == 1) {
+            const linger = extern struct { onoff: c_int, seconds: c_int }{ .onoff = 1, .seconds = 0 };
+            std.posix.setsockopt(c.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
+        }
+        c.close(f.io);
+    }
+    try f.waitClosed();
+    try std.testing.expectEqual(0, f.server.parkedConnections());
+}
