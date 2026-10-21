@@ -90,11 +90,11 @@ pub const Collection = struct {
     // Reads
 
     pub const find_options = .{
-        .{ "sort", "sort" },             .{ "projection", "projection" }, .{ "skip", "skip" },
-        .{ "limit", "limit" },           .{ "batch_size", "batchSize" },  .{ "hint", "hint" },
-        .{ "collation", "collation" },   .{ "comment", "comment" },       .{ "allow_disk_use", "allowDiskUse" },
-        .{ "let", "let" },               .{ "max", "max" },               .{ "min", "min" },
-        .{ "return_key", "returnKey" },  .{ "show_record_id", "showRecordId" },
+        .{ "sort", "sort" },            .{ "projection", "projection" },       .{ "skip", "skip" },
+        .{ "limit", "limit" },          .{ "batch_size", "batchSize" },        .{ "hint", "hint" },
+        .{ "collation", "collation" },  .{ "comment", "comment" },             .{ "allow_disk_use", "allowDiskUse" },
+        .{ "let", "let" },              .{ "max", "max" },                     .{ "min", "min" },
+        .{ "return_key", "returnKey" }, .{ "show_record_id", "showRecordId" },
     };
 
     /// Every document matching `filter`, as `T`s in `c`'s arena.
@@ -134,8 +134,8 @@ pub const Collection = struct {
     }
 
     pub const aggregate_options = .{
-        .{ "allow_disk_use", "allowDiskUse" }, .{ "batch_size", "batchSize" }, .{ "hint", "hint" },
-        .{ "collation", "collation" },         .{ "comment", "comment" },       .{ "let", "let" },
+        .{ "allow_disk_use", "allowDiskUse" },                         .{ "batch_size", "batchSize" }, .{ "hint", "hint" },
+        .{ "collation", "collation" },                                 .{ "comment", "comment" },      .{ "let", "let" },
         .{ "bypass_document_validation", "bypassDocumentValidation" },
     };
 
@@ -317,9 +317,9 @@ pub const Collection = struct {
     }
 
     pub const find_and_modify_options = .{
-        .{ "sort", "sort" },           .{ "projection", "fields" }, .{ "upsert", "upsert" },
-        .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" }, .{ "collation", "collation" },
-        .{ "return_document", "" },    .{ "comment", "comment" },   .{ "let", "let" },
+        .{ "sort", "sort" },                  .{ "projection", "fields" }, .{ "upsert", "upsert" },
+        .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" },         .{ "collation", "collation" },
+        .{ "return_document", "" },           .{ "comment", "comment" },   .{ "let", "let" },
     };
 
     /// Applies `update` to the first document matching `filter` and
@@ -357,10 +357,9 @@ pub const Collection = struct {
     // Indexes and the collection itself
 
     pub const index_options = .{
-        .{ "name", "name" },                 .{ "unique", "unique" },     .{ "sparse", "sparse" },
-        .{ "expire_after_seconds", "expireAfterSeconds" }, .{ "partial_filter_expression", "partialFilterExpression" },
-        .{ "collation", "collation" },       .{ "hidden", "hidden" },     .{ "weights", "weights" },
-        .{ "default_language", "default_language" },
+        .{ "name", "name" },                               .{ "unique", "unique" },                                     .{ "sparse", "sparse" },
+        .{ "expire_after_seconds", "expireAfterSeconds" }, .{ "partial_filter_expression", "partialFilterExpression" }, .{ "collation", "collation" },
+        .{ "hidden", "hidden" },                           .{ "weights", "weights" },                                   .{ "default_language", "default_language" },
     };
 
     /// Creates an index on `keys` (`.{ .email = 1 }`, `.{ .created = -1 }`,

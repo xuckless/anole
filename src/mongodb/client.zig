@@ -794,9 +794,9 @@ pub const Client = struct {
                             c.fail(self.error_map, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout waiting for a server", .table = op.collection })
                         else
                             c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = switch (err) {
-                            error.IncompatibleServer => "the server's wire version is outside the client's",
-                            else => "no server to send the command to (server selection timed out)",
-                        }, .table = op.collection }),
+                                error.IncompatibleServer => "the server's wire version is outside the client's",
+                                else => "no server to send the command to (server selection timed out)",
+                            }, .table = op.collection }),
                     };
                     const server = x.server;
                     const connection = self.acquire(server, io, deadline) catch |err| switch (err) {
