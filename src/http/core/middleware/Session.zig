@@ -2,6 +2,16 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
+//! Sessions in a cookie: `req.session` is loaded from it before the
+//! handler and saved to it after, when changed. The cookie is signed with
+//! HMAC-SHA256, so a client cannot forge or alter it, but not encrypted, so
+//! it can read it: keep secrets out, or use `anole.session` (encrypted
+//! cookies, or server-side stores).
+//!
+//!     app.use(try anole.middleware.Session.init(.{ .secret_key = key }));
+//!     ...
+//!     try req.session.set("user", user_id);
+
 const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
@@ -11,11 +21,15 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const base64url = std.base64.url_safe_no_pad;
 const log = std.log.scoped(.anole);
 
+/// The most keys a session holds.
 pub const max_entries = 16;
 
+/// A request's session values (`req.session`): a few string pairs, kept in
+/// a signed cookie between requests.
 pub const SessionData = struct {
     entries: [max_entries]Entry = undefined,
     len: usize = 0,
+    /// Set by `set`, `remove` and `clear`: the cookie is sent again.
     modified: bool = false,
 
     pub const Entry = struct {
@@ -23,6 +37,7 @@ pub const SessionData = struct {
         value: []const u8,
     };
 
+    /// The value under `key`, or null.
     pub fn get(self: *const SessionData, key: []const u8) ?[]const u8 {
         for (self.entries[0..self.len]) |entry| {
             if (std.mem.eql(u8, entry.key, key)) return entry.value;
@@ -30,6 +45,9 @@ pub const SessionData = struct {
         return null;
     }
 
+    /// Sets `key` to `value`, both kept by reference (use the request's
+    /// arena or literals). Fails with `error.SessionFull` past
+    /// `max_entries` keys, and `error.InvalidSessionData` for a zero byte.
     pub fn set(self: *SessionData, key: []const u8, value: []const u8) error{ SessionFull, InvalidSessionData }!void {
         if (std.mem.indexOfScalar(u8, key, 0) != null or
             std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidSessionData;
@@ -46,6 +64,7 @@ pub const SessionData = struct {
         self.modified = true;
     }
 
+    /// Removes `key`, if present.
     pub fn remove(self: *SessionData, key: []const u8) void {
         for (self.entries[0..self.len], 0..) |entry, i| {
             if (std.mem.eql(u8, entry.key, key)) {
@@ -57,20 +76,28 @@ pub const SessionData = struct {
         }
     }
 
+    /// Removes every key (log out).
     pub fn clear(self: *SessionData) void {
         self.len = 0;
         self.modified = true;
     }
 
+    /// Every key and value.
     pub fn items(self: *const SessionData) []const Entry {
         return self.entries[0..self.len];
     }
 };
 
+/// `Session.init`'s settings.
 pub const Config = struct {
+    /// The HMAC-SHA256 key the cookie is signed with; keep it secret and
+    /// at least 32 random bytes.
     secret_key: []const u8,
     cookie_name: []const u8 = "session",
+    /// How long the cookie lasts, renewed on every response while the
+    /// session has data; null for a browser-session cookie.
     max_age: ?std.Io.Duration = null,
+    /// Path "/", HttpOnly, Secure and SameSite=Lax by default.
     cookie_opts: CookieOpts = .{
         .path = "/",
         .http_only = true,
@@ -83,6 +110,7 @@ config: Config,
 
 const Session = @This();
 
+/// The middleware: `app.use(try anole.middleware.Session.init(.{ .secret_key = key }))`.
 pub fn init(config: Config) !Session {
     return .{ .config = config };
 }

@@ -6,6 +6,8 @@ const std = @import("std");
 
 const c = @import("llhttp");
 
+/// A request method: `.get`, `.post`, `.put`, `.delete` and the rest that
+/// llhttp knows. `req.method`.
 pub const Method = enum(c.llhttp_method_t) {
     delete = c.HTTP_DELETE,
     get = c.HTTP_GET,
@@ -55,6 +57,7 @@ pub const Method = enum(c.llhttp_method_t) {
     flush = c.HTTP_FLUSH,
     query = c.HTTP_QUERY,
 
+    /// The method as it goes on the wire: "GET".
     pub fn name(self: Method) [:0]const u8 {
         return std.mem.span(c.llhttp_method_name(@backingInt(self)));
     }
@@ -81,6 +84,9 @@ test "Method: format" {
     try std.testing.expectEqualStrings("GET", result);
 }
 
+/// A response status, named as in the IANA registry: `.ok`, `.created`,
+/// `.not_found`, `.internal_server_error`... `res.status`; `@intFromEnum`
+/// gives the code.
 pub const Status = enum(c.llhttp_status_t) {
     @"continue" = c.HTTP_STATUS_CONTINUE,
     switching_protocols = c.HTTP_STATUS_SWITCHING_PROTOCOLS,
@@ -190,6 +196,7 @@ pub const Status = enum(c.llhttp_status_t) {
         return std.enums.fromInt(Status, code) orelse error.InvalidStatusCode;
     }
 
+    /// The reason phrase: "Not Found".
     pub fn name(self: Status) [:0]const u8 {
         return std.mem.span(c.llhttp_status_name(@backingInt(self)));
     }
@@ -469,6 +476,7 @@ pub const Headers = struct {
         return self.len - kept;
     }
 
+    /// How many entries there are, repeated names counted each time.
     pub fn count(self: *const Headers) usize {
         return self.len;
     }
@@ -507,6 +515,7 @@ pub const Headers = struct {
         try jw.endObject();
     }
 
+    /// Every entry in order, repeated names included.
     pub fn iterator(self: *const Headers) Iterator {
         return .{ .keys = self.keys[0..self.len], .values = self.values[0..self.len], .pos = 0 };
     }
@@ -535,10 +544,13 @@ pub const Headers = struct {
 pub const Params = struct {
     map: std.StringHashMapUnmanaged([]const u8) = .{},
 
+    /// The value of `name`, or null. Query values are already
+    /// percent-decoded.
     pub fn get(self: Params, name: []const u8) ?[]const u8 {
         return self.map.get(name);
     }
 
+    /// How many names there are.
     pub fn count(self: Params) usize {
         return self.map.count();
     }
@@ -557,6 +569,7 @@ pub const Params = struct {
         return if (std.math.isFinite(value)) value else null;
     }
 
+    /// Every name and value, in no particular order.
     pub fn iterator(self: *const Params) Iterator {
         return .{ .inner = self.map.iterator() };
     }
@@ -716,6 +729,9 @@ test "validateHeaderName: rejects empty, whitespace, colon, control" {
     try validateHeaderName("X-Custom-Header");
 }
 
+/// The media types the server knows by name, for `res.content_type` and
+/// `req.content_type`; `.unknown` for anything else (set the
+/// `Content-Type` header yourself for those).
 pub const ContentType = enum(u32) {
     text,
     html,
@@ -760,6 +776,7 @@ pub const ContentType = enum(u32) {
     multipart_form,
     unknown,
 
+    /// The type a `Content-Type` value names, parameters ignored.
     pub fn fromContentType(value: []const u8) ContentType {
         if (value.len == 0) {
             return .unknown;
@@ -819,6 +836,7 @@ pub const ContentType = enum(u32) {
         return .unknown;
     }
 
+    /// The type a file extension stands for (".css" or "css").
     pub fn fromExtension(value: []const u8) ContentType {
         if (value.len == 0) {
             return .unknown;
@@ -878,6 +896,7 @@ pub const ContentType = enum(u32) {
         return .unknown;
     }
 
+    /// The `Content-Type` value it is sent as ("text/plain; charset=UTF-8").
     pub fn toContentType(self: ContentType) []const u8 {
         return switch (self) {
             .text => "text/plain; charset=UTF-8",
@@ -943,6 +962,7 @@ test "ContentType: parse from file extension" {
     try std.testing.expectEqual(ContentType.unknown, ContentType.fromExtension(""));
 }
 
+/// A body's `Content-Encoding`, as the server reads it on a request.
 pub const ContentEncoding = enum {
     identity,
     gzip,

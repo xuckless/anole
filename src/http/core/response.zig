@@ -640,11 +640,36 @@ fn statusHasBody(status: http.Status) bool {
     return code >= 200 and status != .no_content and status != .not_modified;
 }
 
+/// What a handler writes its answer into, over any protocol. Set `status`,
+/// `body` and headers and return; the server sends it after the handler
+/// (and the middleware after it) have run. For a body built in pieces use
+/// `writer`, `print`, `json` or `render`; to send while the handler is
+/// still working, `stream` or `startEventStream`.
+///
+///     fn create(req: *anole.Request, res: *anole.Response) !void {
+///         const in = try req.bind(NewUser);
+///         res.status = .created;
+///         try res.header("Location", "/users/7");
+///         try res.json(.{ .id = 7, .name = in.name });
+///     }
+///
+/// A handler can also answer by returning an error: `error.NotFound` and
+/// the other status-named errors become that status, the rest a 500 (see
+/// `anole.defaultError`), and `fail` writes an error answer directly.
 pub const Response = struct {
+    /// 200 unless set.
     status: http.Status = .ok,
+    /// The body, when it is one slice: a literal, or something in the
+    /// request's arena. It is sent after the handler returns, so it must
+    /// outlive the handler.
     body: []const u8 = "",
+    /// The response headers; set them through `header` and `setCookie`,
+    /// which check names and values.
     headers: http.Headers = .{},
+    /// The `Content-Type` sent, when the handler sets it by name; `json`,
+    /// `print` and the others set it for you.
     content_type: ?http.ContentType = null,
+    /// The request's arena: freed after the response has gone out.
     arena: std.mem.Allocator,
     /// The body, when it is written rather than set with `body`.
     body_buffer: BodyBuffer = .{},
@@ -726,6 +751,7 @@ pub const Response = struct {
     /// by `write`.
     file: ?BodyFile = null,
 
+    /// A file body set up by `sendFile`.
     pub const BodyFile = struct {
         handle: std.Io.File,
         /// Where in the file the body starts, and how much of it there is.
@@ -755,6 +781,8 @@ pub const Response = struct {
     /// `InvalidContentLength` is such a header that is not a number.
     pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
+    /// A response written to an HTTP/1.x connection. Made by the server;
+    /// handlers get theirs.
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
@@ -866,6 +894,11 @@ pub const Response = struct {
         self.file = null;
     }
 
+    /// Sets header `name` to `value`, replacing an earlier value under
+    /// the same name (case-insensitive). Neither is copied: use literals
+    /// or the arena. Fails once the headers have gone out, on a name or
+    /// value that is not valid on the wire, and past
+    /// `ServerConfig.response.max_header_count`.
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
@@ -1182,6 +1215,9 @@ pub const Response = struct {
         return &final;
     }
 
+    /// Adds a `Set-Cookie` header: `try res.setCookie("theme", "dark",
+    /// .{ .path = "/", .max_age = .fromSeconds(86400) })`. Fails once the
+    /// headers have gone out, or on a name or value a cookie cannot carry.
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
         if (self.headers_written) return error.HeadersAlreadySent;
         const serialized = try serializeCookie(self.arena, name, value, opts);
@@ -1209,8 +1245,9 @@ pub const Response = struct {
         return .{ .body = try self.stream(buf) };
     }
 
-    /// Upgrade HTTP connection to WebSocket.
-    /// Returns null if request is not a valid WebSocket upgrade request.
+    /// Upgrades an HTTP/1.1 connection to a WebSocket, or returns null when
+    /// the request is not a valid upgrade. HTTP/1.1 only: `app.ws` and
+    /// `anole.websocket.upgrade` also cover HTTP/2 and HTTP/3.
     pub fn upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
         // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
         // WebSocket (RFC 8441), which a sink does not offer.
@@ -1561,6 +1598,9 @@ pub const Response = struct {
         try w.writeAll("\r\n");
     }
 
+    /// Sends what the handler left: the headers, if they have not gone
+    /// out, and the body. The server calls it after the handler; a
+    /// second call does nothing.
     pub fn write(self: *Response) WriteError!void {
         if (self.written) {
             return;

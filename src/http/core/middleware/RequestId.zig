@@ -11,7 +11,9 @@ const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
+/// `RequestId.init`'s settings.
 pub const Config = struct {
+    /// The header the ID is read from (with `trust_incoming`) and sent in.
     header: []const u8 = "X-Request-Id",
     /// Reuse an incoming ID. Only for a server reachable solely through a
     /// proxy that sets or strips the header, or a client picks its own.
@@ -23,6 +25,7 @@ trust_incoming: bool,
 
 const RequestId = @This();
 
+/// The middleware: `app.use(anole.middleware.RequestId.init(.{}))`.
 pub fn init(config: Config) RequestId {
     return .{ .header = config.header, .trust_incoming = config.trust_incoming };
 }

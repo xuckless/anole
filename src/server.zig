@@ -23,8 +23,8 @@
 //!     ...
 //!     try app.run();
 //!
-//! Everything dusty offers stays reachable: `app.router` is dusty's router,
-//! `app.server` dusty's server, and `anole.http` the whole of dusty.
+//! Everything the HTTP core offers stays reachable: `app.router` is its
+//! router, `app.server` its server, and `anole.http` the whole of it.
 const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
@@ -94,6 +94,9 @@ pub const ExecutorCount = @FieldType(@typeInfo(@TypeOf(zio.Runtime.init)).@"fn".
 /// over.
 threadlocal var server_on_thread: bool = false;
 
+/// `anole.ServerOptions`: everything `App.init` and `Server(Ctx).init`
+/// take. Every field has a default, so `.{}` is a working server (its
+/// listener named later by `listen` or `listenTls`).
 pub const Options = struct {
     /// The cleartext listener. When neither this nor `https` is set,
     /// 127.0.0.1:8080; with `https` set and this null, none: an HTTPS-only
@@ -173,19 +176,28 @@ pub const Options = struct {
     /// replaced by the fields above.
     server: http.ServerConfig = .{},
 
+    /// `Options.http`: a cleartext listener.
     pub const Http = struct {
+        /// The interface to bind: "127.0.0.1" (this machine), "0.0.0.0"
+        /// (every IPv4 interface), "::" (every IPv6 one).
         address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (see `addresses`).
         port: u16 = 8080,
         /// Cleartext HTTP/2 for clients that open with its preface, beside
         /// HTTP/1.1 on the same port.
         h2c: bool = features.http2,
+        /// Every connection starts with a PROXY protocol header (v1 or v2)
+        /// from a load balancer in front, which gives the client's real
+        /// address. Only for a port nothing else can reach.
         proxy_protocol: bool = false,
     };
 
+    /// `Options.http3`: HTTP/3 over QUIC beside the TLS listener.
     pub const Http3 = struct {
         /// The UDP address and port; `https`'s when null (the usual setup:
         /// one port number, over TCP and UDP).
         address: ?[]const u8 = null,
+        /// The UDP port; null for the TLS listener's.
         port: ?u16 = null,
         /// Advertise HTTP/3 to HTTP/1.1 and HTTP/2 clients (`Alt-Svc`), so
         /// browsers switch to it.
@@ -195,6 +207,7 @@ pub const Options = struct {
         /// Make every new client prove its address with a Retry first (one
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
+        /// How long a connection may sit idle before it is closed.
         idle_timeout_ms: u32 = 30_000,
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
@@ -223,13 +236,20 @@ pub const Options = struct {
         inline_no_wait: bool = true,
     };
 
+    /// `Options.https`: a TLS listener with HTTP/2 and HTTP/1.1 by ALPN.
     pub const Https = struct {
+        /// As `Http.address`.
         address: []const u8 = "127.0.0.1",
         port: u16 = 8443,
+        /// The certificate and key: `.fromFiles(...)`, `.fromPem(...)` or
+        /// `.dev_self_signed`.
         cert: Cert,
         /// "h2" and "http/1.1" when HTTP/2 is built in, else "http/1.1".
         alpn_protocols: ?[]const []const u8 = null,
+        /// Mutual TLS: ask clients for a certificate signed by these CAs
+        /// (`req.peerCertificate()` has it). Null: none asked for.
         client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+        /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
     };
 
@@ -242,7 +262,9 @@ pub const Options = struct {
         /// and `https`'s), at most 255 bytes, no ':'. Null: "http-<port>",
         /// "https-<port>", or "unix-<path>".
         name: ?[]const u8 = null,
+        /// As `Http.address`.
         address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (see `addresses`).
         port: u16 = 8080,
         /// A unix domain socket at this path instead of `address` and
         /// `port`. A socket file left behind by a server that is gone is
@@ -261,8 +283,10 @@ pub const Options = struct {
         /// advertised with `Alt-Svc` on this listener's responses. TLS
         /// listeners only, and one per server. Needs `-Dhttp3`.
         http3: bool = false,
+        /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
 
+        /// `Listener.tls`.
         pub const Tls = struct {
             /// Listeners that name the same certificate (the same files,
             /// the same PEM, `dev_self_signed`) share one copy of it.
@@ -270,10 +294,12 @@ pub const Options = struct {
             /// Offered by ALPN, in order. Null: "h2" and "http/1.1", those
             /// of the two the listener speaks.
             alpn_protocols: ?[]const []const u8 = null,
+            /// As `Https.client_auth`.
             client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
         };
     };
 
+    /// `anole.Cert`: where a TLS listener's certificate and key come from.
     pub const Cert = union(enum) {
         /// PEM text in memory, copied by `init`.
         pem: struct { cert: []const u8, key: []const u8 },
@@ -311,6 +337,7 @@ pub fn onlyOn(name: []const u8) OnlyOn {
     return .{ .name = name };
 }
 
+/// The middleware `onlyOn` returns.
 pub const OnlyOn = struct {
     name: []const u8,
 
@@ -320,6 +347,19 @@ pub const OnlyOn = struct {
     }
 };
 
+/// A server whose handlers share the state `Ctx`: `init(gpa, options,
+/// &state)`, and handlers `fn (state: *Ctx, req, res) !void` (or plain
+/// `(req, res)`). For no state, `App`.
+///
+///     var store: Store = .{ .gpa = init.gpa };
+///     var app = try anole.Server(Store).init(init.gpa, .{}, &store);
+///     defer app.deinit();
+///     app.get("/users/:id", getUser); // fn getUser(store: *Store, req, res) !void
+///     try app.listen(":3000");
+///
+/// A `Ctx` may also declare `notFound(self, req, res)`,
+/// `uncaughtError(self, req, res, err)` and `dispatch(self, action, req,
+/// res)` to take over those steps.
 pub fn Server(comptime Ctx: type) type {
     return ServerOf(Ctx, false);
 }
@@ -330,15 +370,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     comptime checkZioOptions();
     return struct {
         const Self = @This();
+        /// A handler as the router stores it: `fn (*Request, *Response)
+        /// anyerror!void`, with `*Ctx` first on a server with state.
         pub const Handler = http.Router(Ctx).Handler;
 
+        /// The allocator given to `init`.
         gpa: std.mem.Allocator,
+        /// The zio runtime the server owns; `io()` is its `std.Io`.
         rt: *zio.Runtime,
         /// Holds what the server points into for its whole life: the
         /// listeners, certificates and middleware copies. So `Self` can
         /// move after `init`.
         arena: *std.heap.ArenaAllocator,
+        /// The HTTP core's server underneath.
         server: *http.Server(Ctx),
+        /// The router the route methods add to, for what they do not
+        /// cover (`app.router.addRouteWith`).
         router: *http.Router(Ctx),
         stopped: *std.Io.Event,
         /// For hand-off: the process (args, environment), and the
@@ -949,6 +996,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
+        /// Frees the server and everything it owns: the runtime, the
+        /// listeners, the middleware and helpers it made, and the database
+        /// connectors (closed last made, first). Call it after `run` (or
+        /// `listen`) has returned.
         pub fn deinit(self: *Self) void {
             const extras = self.extras;
             // First: it sends what is queued through the client, on the
@@ -1110,24 +1161,39 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return cache;
         }
 
+        /// Routes GET requests for `path` to `handler`; HEAD too, unless
+        /// `head` registers its own. `path` may have `:name` segments
+        /// (`req.params`) and end in `*name` (the rest of the path).
+        /// `handler` is `fn (req, res) !void` (`*Ctx` first on a server with
+        /// state), or wrapped in `anole.noWait` or `anole.cached`. Panics
+        /// when the route is already registered or conflicts with another.
+        ///
+        ///     app.get("/users/:id", getUser);
         pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .get, path, handler);
         }
+        /// As `get`, for HEAD.
         pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .head, path, handler);
         }
+        /// As `get`, for POST.
         pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .post, path, handler);
         }
+        /// As `get`, for PUT.
         pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .put, path, handler);
         }
+        /// As `get`, for PATCH.
         pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .patch, path, handler);
         }
+        /// As `get`, for DELETE.
         pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .delete, path, handler);
         }
+        /// As `get`, for OPTIONS. (`middleware.Cors` answers preflights
+        /// without one.)
         pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .options, path, handler);
         }
@@ -1135,6 +1201,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, .query, path, handler);
         }
+        /// As `get`, for every method; a route for a specific method at a
+        /// path wins over it.
         pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
             self.register(self.router, null, path, handler);
         }
@@ -1273,8 +1341,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// middleware come after its parent's.
         pub const Group = struct {
             server: *Self,
+            /// The core router's group underneath.
             inner: http.Router(Ctx).Group,
 
+            /// `Server.group`, nested: `prefix` after this group's, and
+            /// `middlewares` after its own.
             pub fn group(g: Group, prefix: []const u8, middlewares: anytype) Group {
                 return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
             }
@@ -1282,54 +1353,70 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn with(g: Group, middlewares: anytype) Group {
                 return g.group("", middlewares);
             }
+            /// `Server.get` under this group.
             pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .get, path, handler);
             }
+            /// `Server.head` under this group.
             pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .head, path, handler);
             }
+            /// `Server.post` under this group.
             pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .post, path, handler);
             }
+            /// `Server.put` under this group.
             pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .put, path, handler);
             }
+            /// `Server.patch` under this group.
             pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .patch, path, handler);
             }
+            /// `Server.delete` under this group.
             pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .delete, path, handler);
             }
+            /// `Server.options` under this group.
             pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .options, path, handler);
             }
+            /// `Server.query` under this group.
             pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, .query, path, handler);
             }
+            /// `Server.any` under this group.
             pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, null, path, handler);
             }
+            /// `Server.ws` under this group.
             pub fn ws(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.wsWith(path, handler, .{});
             }
+            /// `Server.wsWith` under this group.
             pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
             }
+            /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.webtransportWith(path, handler, .{});
             }
+            /// `Server.webtransportWith` under this group.
             pub fn webtransportWith(g: Group, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
                 if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
+            /// `Server.static` under this group.
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
                 g.inner.static(prefix, dir, opts);
             }
+            /// `Server.staticDir` under this group.
             pub fn staticDir(g: Group, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
                 g.inner.static(prefix, try g.server.openDir(path), opts);
             }
+            /// `Server.embedded` under this group.
             pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
                 g.inner.embedded(path, data, opts);
             }
@@ -1453,6 +1540,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return h;
         }
 
+        /// `metrics`' settings.
         pub const MetricsOptions = struct {
             /// Where Prometheus scrapes.
             path: []const u8 = "/metrics",
@@ -1491,6 +1579,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return h;
         }
 
+        /// `tracing`'s settings.
         pub const TracingOptions = struct {
             /// The collector's OTLP/HTTP base URL. Null: the
             /// `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (read
@@ -1502,8 +1591,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             sample_all: bool = true,
             /// Paths not traced.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Spans per export request.
             batch_size: usize = 256,
+            /// How often finished spans are sent, at the latest.
             interval_ms: u32 = 2000,
+            /// Spans held while waiting to be sent; past it, new ones are
+            /// dropped.
             queue_len: usize = 4096,
         };
 

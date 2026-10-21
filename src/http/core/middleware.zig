@@ -19,6 +19,10 @@ pub const MiddlewareConfig = struct {
     allocator: std.mem.Allocator,
 };
 
+/// A middleware as the router holds it: a pointer to a value with
+/// `execute(self, req, res, executor) !void` (and optionally `deinit`),
+/// for a server whose state is `Ctx`. `init(&value)` wraps one the caller
+/// keeps alive; `app.use` and `app.middleware` copy and own it instead.
 pub fn Middleware(comptime Ctx: type) type {
     return struct {
         const Self = @This();
@@ -32,6 +36,8 @@ pub fn Middleware(comptime Ctx: type) type {
         ) anyerror!void,
         deinitFn: ?*const fn (ptr: *anyopaque) void,
 
+        /// A handle on `impl`, a pointer to a middleware value that must
+        /// outlive the router.
         pub fn init(impl: anytype) Self {
             const Ptr = @TypeOf(impl);
             const Impl = @typeInfo(Ptr).pointer.child;
@@ -55,10 +61,12 @@ pub fn Middleware(comptime Ctx: type) type {
             };
         }
 
+        /// Runs the middleware.
         pub fn execute(self: Self, req: *Request, res: *Response, executor: *Executor(Ctx)) !void {
             return self.executeFn(self.ptr, req, res, executor);
         }
 
+        /// Calls the value's `deinit`, if it has one.
         pub fn deinit(self: Self) void {
             if (self.deinitFn) |f| {
                 f(self.ptr);
@@ -67,6 +75,8 @@ pub fn Middleware(comptime Ctx: type) type {
     };
 }
 
+/// What a middleware's `execute` gets as `executor`: `executor.next()`
+/// runs the rest of the chain, and `executor.ctx` is the server's state.
 pub fn Executor(comptime Ctx: type) type {
     return struct {
         const Self = @This();
@@ -85,6 +95,7 @@ pub fn Executor(comptime Ctx: type) type {
         /// `uncaughtError`.
         error_handler: ?ErrorHandler = null,
 
+        /// Runs the chain from the start. Called by the router.
         pub fn run(self: *Self) !void {
             self.next() catch |err| switch (err) {
                 // Connection-level failures can't produce a response; propagate
@@ -127,6 +138,9 @@ pub fn Executor(comptime Ctx: type) type {
             };
         }
 
+        /// Runs the next middleware, or the handler after the last one;
+        /// a middleware that does not call it ends the request with what
+        /// it put in the response.
         pub fn next(self: *Self) anyerror!void {
             if (self.index < self.middlewares.len) {
                 const mw = self.middlewares[self.index];

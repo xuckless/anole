@@ -12,6 +12,7 @@ const Response = @import("../response.zig").Response;
 
 const Compress = @This();
 
+/// The middleware: `app.use(anole.middleware.Compress.init())`.
 pub fn init() Compress {
     return .{};
 }

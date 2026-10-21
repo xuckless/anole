@@ -8,6 +8,8 @@ const http = @import("../http.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
+/// How `app.static` and `app.staticDir` serve a directory:
+/// `try app.staticDir("/", "public", .{ .precompressed = &.{ .br, .gzip } })`.
 pub const StaticOptions = struct {
     /// Served for a request that names a directory. `null` answers it with
     /// a 404 instead.
@@ -56,6 +58,8 @@ fn byQuality(req: *const Request, candidates: []const Precompressed, out: *[8]Pr
     return out[0..n];
 }
 
+/// A compressed copy a static file may have beside it: `.br` (`.br`
+/// files), `.zstd` (`.zst`), `.gzip` (`.gz`).
 pub const Precompressed = enum {
     br,
     zstd,
@@ -162,6 +166,7 @@ pub const Static = struct {
     }
 };
 
+/// How `app.embedded` serves a byte string, usually an `@embedFile`.
 pub const EmbeddedOptions = struct {
     /// Defaults to the type the extension of the route's path gives.
     content_type: ?http.ContentType = null,
