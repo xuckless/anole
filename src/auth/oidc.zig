@@ -321,7 +321,7 @@ fn param(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
 test "fuzz: OIDC discovery documents, token responses and ID token claims" {
     try @import("../fuzz.zig").bytes(struct {
         const issuer = "https://issuer.example";
-        const secret = "fuzz-secret";
+        const secret = "fuzz-secret-fuzz-secret-fuzz-sec";
         const now = 1700000000;
 
         fn encode(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {

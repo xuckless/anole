@@ -43,7 +43,10 @@ pub const Key = struct {
 
     /// The key itself, in the form its algorithm needs.
     pub const Material = union(enum) {
-        /// The shared secret, for the HS algorithms.
+        /// The shared secret, for the HS algorithms: at least as long as
+        /// the hash (32 bytes for HS256, 48 for HS384, 64 for HS512), as
+        /// RFC 7518 3.2 requires. A shorter one verifies nothing:
+        /// `verify` fails with `error.WeakKey`.
         hmac: []const u8,
         /// Big-endian modulus and exponent.
         rsa: struct { n: []const u8, e: []const u8 },
@@ -71,12 +74,15 @@ pub const Policy = struct {
 
 /// Why `verify` refused a token. `NoMatchingKey`: no key has the token's
 /// `alg` (and `kid`); `BadSignature`: one did, and the signature does not
-/// match it.
+/// match it; `WeakKey`: the key that would check it is an HMAC secret
+/// shorter than its hash, which anyone could guess (the application's
+/// configuration is wrong, not the token).
 pub const Error = error{
     Malformed,
     UnsupportedAlgorithm,
     NoMatchingKey,
     BadSignature,
+    WeakKey,
     Expired,
     NotYetValid,
     IssuedInFuture,
@@ -150,6 +156,7 @@ pub fn verify(arena: std.mem.Allocator, token: []const u8, keys: []const Key, po
         if (key.alg != alg) continue;
         if (kid != null and key.kid != null and !std.mem.eql(u8, kid.?, key.kid.?)) continue;
         any_candidate = true;
+        if (key.material == .hmac and key.material.hmac.len < minHmacKey(alg)) return error.WeakKey;
         if (verifySignature(key, alg, signing_input, signature)) {
             verified = true;
             break;
@@ -192,6 +199,16 @@ fn checkClaims(v: Verified, policy: Policy, now: i64) Error!void {
         };
         if (!ok) return error.WrongAudience;
     }
+}
+
+/// The shortest HMAC secret `alg` takes: its hash's output (RFC 7518 3.2).
+fn minHmacKey(alg: Alg) usize {
+    return switch (alg) {
+        .HS256 => 32,
+        .HS384 => 48,
+        .HS512 => 64,
+        else => 0,
+    };
 }
 
 fn verifySignature(key: Key, alg: Alg, input: []const u8, sig: []const u8) bool {
@@ -345,8 +362,13 @@ test "verify: RFC 7515 A.1 HS256, claims policy, and algorithm pinning" {
     const other: Key = .{ .alg = .HS512, .material = .{ .hmac = secret } };
     try std.testing.expectError(error.NoMatchingKey, verify(arena, rfc_hs256_token, &.{other}, .{}, before));
     // A wrong secret.
-    const wrong: Key = .{ .alg = .HS256, .material = .{ .hmac = "nope" } };
+    const wrong: Key = .{ .alg = .HS256, .material = .{ .hmac = "a wrong secret, 32 bytes or more" } };
     try std.testing.expectError(error.BadSignature, verify(arena, rfc_hs256_token, &.{wrong}, .{}, before));
+    // A secret shorter than the hash verifies nothing (RFC 7518 3.2), not
+    // even a token signed with it.
+    const short: Key = .{ .alg = .HS256, .material = .{ .hmac = "nope" } };
+    try std.testing.expectError(error.WeakKey, verify(arena, rfc_hs256_token, &.{short}, .{}, before));
+    try std.testing.expectError(error.WeakKey, verify(arena, rfc_hs256_token, &.{.{ .alg = .HS256, .material = .{ .hmac = "" } }}, .{}, before));
     // alg none.
     try std.testing.expectError(error.UnsupportedAlgorithm, verify(arena, "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.", &.{key}, .{}, 0));
 }
@@ -415,7 +437,7 @@ test "fuzz: JWS verification and JWK Sets" {
             const secret = try decode(arena, rfc_hs256_key);
             const keys = [_]Key{
                 .{ .alg = .HS256, .material = .{ .hmac = secret } },
-                .{ .alg = .HS512, .kid = "k2", .material = .{ .hmac = "another secret" } },
+                .{ .alg = .HS512, .kid = "k2", .material = .{ .hmac = "another secret, for HS512 at least sixty-four bytes long, so: pad" } },
             };
             if (verify(arena, input, &keys, .{}, 1300819000)) |v| {
                 // Only a signature over exactly this input verifies.

@@ -105,6 +105,15 @@ pub const RequireJwt = struct {
                 log.debug("bearer token refused: {t}", .{err});
                 return self.refuse(res, .invalid_token);
             },
+            // An HMAC secret too short to be safe: the server's
+            // configuration, which no token can get past.
+            error.WeakKey => {
+                log.err("bearer token not verified: the HMAC key is shorter than its hash (32 bytes for HS256, 48 for HS384, 64 for HS512)", .{});
+                res.status = .internal_server_error;
+                res.content_type = .text;
+                res.body = "500 Internal Server Error\n";
+                return;
+            },
             // The keys could not be had (the provider is down): not the
             // token's fault, so not a 401 that would make the client drop it.
             else => {

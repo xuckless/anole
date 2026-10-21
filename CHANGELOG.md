@@ -341,8 +341,9 @@ for macOS and Linux.
 
 ### Auth, state and limits
 
-- JWS/JWT verification with one pinned algorithm per key and JWKS keyrings
-  that fetch outside their lock, one fetch at a time; a bearer-token
+- JWS/JWT verification with one pinned algorithm per key (an HMAC secret
+  shorter than its hash verifies nothing, `error.WeakKey`) and JWKS
+  keyrings that fetch outside their lock, one fetch at a time; a bearer-token
   middleware (`anole.auth.RequireJwt`) with RFC 6750 errors, scopes and
   required claims (`required_claims`, `sub` by default), the verified token
   handed to the handler through the request's locals (`claims`, `subject`),

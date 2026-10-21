@@ -50,6 +50,9 @@ These defaults are enforced, not optional:
 - `nbf` and `iat` are checked when present. `iss`, `aud` (a string or an
   array) and `max_age_seconds` are checked when you set them in the policy.
 - An HMAC comparison runs in constant time.
+- An HMAC secret shorter than its hash (32 bytes for HS256, 48 for HS384,
+  64 for HS512, as RFC 7518 requires) verifies nothing: `verify` fails with
+  `error.WeakKey`, and `RequireJwt` answers 500 and logs the fix.
 
 The result, `Verified`, gives you the header and claims as JSON objects,
 plus `string("sub")` and `integer("exp")`. They live in the arena you pass,
@@ -69,6 +72,7 @@ go there), and refuses the request as RFC 6750 says:
 | A token that does not verify, or misses a required claim | 401, `error="invalid_token"` (expired ones also get an `error_description`) |
 | A token without the required scopes | 403, `error="insufficient_scope"` |
 | The keyring could not fetch the keys | 503, so the client keeps its token |
+| The HMAC key is shorter than its hash (`error.WeakKey`) | 500, and an error in the log |
 
 ```zig
 const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
