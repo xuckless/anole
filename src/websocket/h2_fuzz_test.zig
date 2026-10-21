@@ -9,6 +9,7 @@ const dusty = @import("dusty");
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec");
 const websocket = @import("root.zig");
+const H2Socket = @import("h2_socket.zig").H2Socket;
 const deflate = if (features.compression) @import("deflate.zig") else struct {};
 
 /// The body reader's source. One check runs at a time, so it is global: the
@@ -36,7 +37,7 @@ const Transcript = struct {
 
 fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize, compressed: bool) !Transcript {
     source = .{ .data = input, .step = step };
-    const sock = try arena.create(websocket.H2Socket);
+    const sock = try arena.create(H2Socket);
     const out = try arena.alloc(u8, 64 * 1024);
     sock.* = .{
         .io = std.testing.io,

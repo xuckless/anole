@@ -31,6 +31,7 @@ const features = @import("build_options");
 const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
+const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
@@ -2076,7 +2077,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             const io_ = a.io();
             const alloc = std.testing.allocator;
             try a.waitReady();
-            var bundle = try tls.testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
+            var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
             defer bundle.deinit(alloc);
             // The certificate's DER: the bundle holds exactly it.
             const der = bundle.bytes.items;

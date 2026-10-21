@@ -446,9 +446,9 @@ test "h2 client: the system trust store by default, a CA in memory, mutual TLS f
 
     // The default is the system store, which has certificates in it and
     // does not trust a development certificate.
-    const system = (try anole_tls.dusty_tls.clientStore(gpa, io, @as(dusty.TlsCa, .system))).?;
-    defer anole_tls.dusty_tls.releaseStore(system);
-    try std.testing.expect(anole_tls.dusty_tls.storeCertCount(system) > 0);
+    const system = (try @import("anole_dusty_tls").clientStore(gpa, io, @as(dusty.TlsCa, .system))).?;
+    defer @import("anole_dusty_tls").releaseStore(system);
+    try std.testing.expect(@import("anole_dusty_tls").storeCertCount(system) > 0);
 
     var srv = try Running.start(gpa, io, &.{.{ .address = loopback, .tls = .{
         .pem = .{ .cert = server_pem.cert, .key = server_pem.key },

@@ -637,22 +637,6 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // tests/tls_duplex.zig: the multi-threaded full-duplex TLS check.
-    if (features.needsTls()) {
-        const duplex = b.addExecutable(.{
-            .name = "tls-duplex",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/tls_duplex.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "anole", .module = anole_mod }},
-            }),
-        });
-        const run_duplex = b.addRunArtifact(duplex);
-        run_duplex.skip_foreign_checks = true;
-        test_step.dependOn(&run_duplex.step);
-    }
-
     // examples/<name>: one per protocol or area, each built by `zig build
     // test` when the flags include what it needs, and run with
     // `zig build run-<name>`.

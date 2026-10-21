@@ -45,7 +45,7 @@ fn emptyCall(call: *Call, _: pb.Empty) anyerror!pb.Empty {
 
 fn unaryCall(call: *Call, req: pb.SimpleRequest) anyerror!pb.SimpleResponse {
     try echoMetadata(call);
-    if (req.expect_compressed) |e| if (e.value and call.request_compression == .identity)
+    if (req.expect_compressed) |e| if (e.value and call.requestCompression() == .identity)
         return call.fail(.invalid_argument, "expected a compressed request");
     try echoStatus(call, req.response_status);
     return .{ .payload = try payload(call, req.response_size) };
