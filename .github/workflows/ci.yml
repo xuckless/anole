@@ -298,3 +298,23 @@ jobs:
       # CA made for the run.
       - name: Tests against a live server
         run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh
+
+  mongodb:
+    name: MongoDB (live client tests)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["mongo:7.0", "mongo:8.0"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: mongodb
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # A replica set of one with authentication and failCommand, plain and
+      # over TLS on a CA made for the run; SCRAM-SHA-256 and SCRAM-SHA-1.
+      - name: Tests with a live server
+        run: tests/mongodb/run.sh ${{ matrix.image }}
