@@ -9,6 +9,7 @@ const dusty = @import("../root.zig");
 const c = @import("nghttp2");
 const build_options = @import("build_options");
 const tls = @import("tls");
+const h2 = @import("h2.zig");
 
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 
@@ -323,6 +324,10 @@ const Handlers = struct {
         try req.io.sleep(.fromMilliseconds(300), .awake);
         res.body = "slow but whole";
     }
+    fn slower(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.io.sleep(.fromMilliseconds(900), .awake);
+        res.body = "slower but whole";
+    }
     /// A streamed body far past the client's 64 KiB stream window.
     fn big(_: *dusty.Request, res: *dusty.Response) !void {
         var buf: [4096]u8 = undefined;
@@ -396,6 +401,7 @@ const Fixture = struct {
         self.server.router.get("/trailers", Handlers.trailers);
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
+        self.server.router.get("/slower", Handlers.slower);
         self.server.router.post("/late", Handlers.late);
         self.server.router.post("/stall", Handlers.stall);
         // The same handlers on routes that promise not to wait, which run
@@ -904,6 +910,44 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     const resp = client.get(id);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("slow but whole", resp.body.items);
+}
+
+/// Holds every write of the HTTP/2 writer for 200 ms (`h2.test_before_flush`).
+fn holdFlush(io: std.Io) std.Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(200), .awake);
+}
+
+test "HTTP/2: a drain waits for a response that is taken from the session but not yet written" {
+    // nghttp2 closes a stream when the writer takes its last frame, before
+    // the write. The stream's count in the in-flight requests must last
+    // until that write is done, or the drain sees zero and cancels the
+    // connection with the response still in the writer's buffer. Every
+    // write is held 200 ms, which makes that window 200 ms wide; the drain's
+    // two GOAWAYs are out by about 500 ms, the response comes at 900.
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+
+    h2.test_before_flush = holdFlush;
+    defer h2.test_before_flush = null;
+    const id = try client.request("GET", "/slower", null);
+    try client.sendPending();
+    try io.sleep(.fromMilliseconds(100), .awake);
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+
+    try client.runUntilClosed();
+    const resp = client.get(id);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("slower but whole", resp.body.items);
 }
 
 test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 stream" {

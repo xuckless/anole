@@ -514,8 +514,9 @@ pub const Connection = struct {
     /// stream from a truncation. Best effort: the peer may be gone. Only
     /// while no other task writes to the connection, and before the
     /// transport is shut down. Nothing for a plain connection, or for a TLS
-    /// module without `close`.
-    pub fn closeNotify(self: *Connection) void {
+    /// module without `close`. A cancel that reached the write is passed
+    /// on: the TLS module takes it as one more failed write.
+    pub fn closeNotify(self: *Connection) std.Io.Cancelable!void {
         if (!build_options.use_tls) return;
         const c = if (self.tls_conn) |*c| c else return;
         if (self.close_notify_sent) return;
@@ -523,6 +524,7 @@ pub const Connection = struct {
         if (comptime !@hasDecl(tls.Connection, "close")) return;
         const R = @typeInfo(@TypeOf(tls.Connection.close)).@"fn".return_type.?;
         if (comptime @typeInfo(R) == .error_union) c.close() catch {} else c.close();
+        if (self.getWriteError()) |err| if (err == error.Canceled) return error.Canceled;
     }
 
     /// The protocol the client and server agreed on through ALPN, or null
@@ -1602,7 +1604,7 @@ pub fn Server(comptime Ctx: type) type {
                 self.request_buffers.release(b);
                 buffers.* = null;
             }
-            self.closeNotify(connection, timer);
+            try self.closeNotify(connection, timer);
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
@@ -1623,12 +1625,12 @@ pub fn Server(comptime Ctx: type) type {
         /// `Connection.closeNotify`, bounded by `linger_timeout` where the
         /// timer can bound it: a peer that stopped reading must not hold the
         /// task on the last 24 bytes.
-        fn closeNotify(self: *Self, connection: *Connection, timer: *Timer) void {
+        fn closeNotify(self: *Self, connection: *Connection, timer: *Timer) std.Io.Cancelable!void {
             if (connection.tls_conn == null or connection.close_notify_sent) return;
             const bounded = timer.canBound();
             if (bounded) timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
             defer if (bounded) timer.clear(self.io);
-            connection.closeNotify();
+            return connection.closeNotify();
         }
 
         /// After a refused TLS handshake: the alert has been flushed, but
@@ -1637,14 +1639,20 @@ pub fn Server(comptime Ctx: type) type {
         /// the send side and read what the client still sends, until it
         /// hangs up, `linger_timeout`, or `linger_limit` bytes. Skipped
         /// where the timer cannot bound the reads.
-        noinline fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) void {
+        noinline fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) std.Io.Cancelable!void {
             if (!timer.canBound()) return;
-            stream.shutdown(self.io, .send) catch return;
+            stream.shutdown(self.io, .send) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
             timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
             defer timer.clear(self.io);
             var buf: [512]u8 = undefined;
             var r = stream.reader(self.io, &buf);
-            _ = r.interface.discardShort(linger_limit) catch {};
+            // The deadline arrives as a cancel, and stays one.
+            _ = r.interface.discardShort(linger_limit) catch {
+                if (r.err) |err| if (err == error.Canceled) return error.Canceled;
+            };
         }
 
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
@@ -1730,7 +1738,7 @@ pub fn Server(comptime Ctx: type) type {
                                 // flood the error log (nginx logs these at
                                 // info too).
                                 log.info("TLS handshake failed: {}", .{cause});
-                                self.lingerAfterRefusal(stream, &timer);
+                                try self.lingerAfterRefusal(stream, &timer);
                             }
                             return;
                         };
