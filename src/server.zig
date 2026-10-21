@@ -209,7 +209,7 @@ pub const Options = struct {
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
         /// How long a connection may sit idle before it is closed.
-        idle_timeout_ms: u32 = 30_000,
+        idle_timeout: std.Io.Duration = .fromSeconds(30),
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
         /// 0-RTT run at once, with `Early-Data: 1` among their headers
@@ -910,7 +910,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .key_pem = cs.pem.key,
                     .max_streams_bidi = q.max_streams_bidi,
                     .validate_address = q.validate_address,
-                    .idle_timeout_ms = q.idle_timeout_ms,
+                    .idle_timeout = q.idle_timeout,
                     .hq_interop_root = q.hq_interop_root,
                     .early_data = q.early_data,
                     .enable_connect_protocol = q.enable_connect_protocol,

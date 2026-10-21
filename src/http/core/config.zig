@@ -290,7 +290,9 @@ pub const ServerConfig = struct {
     /// `fd_limit.maxConnections`): past that limit `accept` fails anyway.
     /// 10,000 on Windows, which has no such limit.
     ///
-    /// An open connection costs about 2K, 33K more under TLS, and
+    /// An idle connection costs a few kilobytes, about 9K under TLS on Linux
+    /// once parked (`timeout.idle_park`; about 20K while it keeps its task),
+    /// and
     /// `request.buffer_size + 12K` more while a request is being served, or
     /// for as long as it is open with `request.keep_buffers_between_requests`
     /// on, of which an ordinary request touches one page; and

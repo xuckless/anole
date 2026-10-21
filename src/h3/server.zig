@@ -96,7 +96,8 @@ pub const Options = struct {
     /// Connection and per-stream receive windows.
     max_data: u64 = 16 << 20,
     max_stream_data: u64 = 1 << 20,
-    idle_timeout_ms: u32 = 30_000,
+    /// How long a connection may sit idle before it is closed.
+    idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// Validate every client address with a Retry round trip before
     /// keeping state for it (costs one RTT; resists spoofed floods).
     validate_address: bool = false,
@@ -200,7 +201,7 @@ fn transportParams(options: *const Options) ngtcp2.TransportParams {
     params.initial_max_streams_uni = 3 + if (options.webtransport) options.webtransport_max_streams_uni else 0;
     // HTTP datagrams (RFC 9297), for WebTransport.
     if (options.webtransport) params.max_datagram_frame_size = 65535;
-    params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+    params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
     return params;
 }
 

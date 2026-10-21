@@ -325,6 +325,20 @@ pub const Request = struct {
         return result;
     }
 
+    /// A path parameter by name, null when the route has none of that name:
+    /// `req.param("id")` for "/users/:id". The same as `req.params.get`;
+    /// `req.params.getInt(u64, "id")` parses one.
+    pub fn param(self: *const Request, name: []const u8) ?[]const u8 {
+        return self.params.get(name);
+    }
+
+    /// A query-string value by name, percent-decoded, null when absent:
+    /// `req.queryParam("page")` for "?page=2". The same as `req.query.get`;
+    /// `req.query.getInt(u32, "page")` parses one.
+    pub fn queryParam(self: *const Request, name: []const u8) ?[]const u8 {
+        return self.query.get(name);
+    }
+
     /// The JSON body as a `T` (`std.json`), allocated in the request's
     /// arena: `const in = try req.bind(NewUser);`. Fields the body has and
     /// `T` does not are ignored. A request without a body fails with

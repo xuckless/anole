@@ -225,6 +225,9 @@ for macOS and Linux.
 - `Options.error_handler`, a plain function that answers handler errors
   without a `Ctx`, and `anole.defaultError(req, res, err)`, the default
   answer, for it or an `uncaughtError` to fall back on.
+- `req.param(name)` and `req.queryParam(name)`: a path parameter and a
+  query-string value by name (short for `req.params.get` and
+  `req.query.get`).
 - `req.bind(T)`: the JSON body as a `T` in the request's arena, unknown
   fields ignored, 400 when it is missing (`error.MissingBody`) or does not
   fit (`error.InvalidJsonBody`); `req.bindWith(T, options)` takes

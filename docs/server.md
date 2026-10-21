@@ -541,7 +541,7 @@ same for it, and `http3` holds the settings; one HTTP/3 port per server.
 
 `http3` fields: `address` and `port` (the TLS listener's when null), `alt_svc`
 (true), `max_streams_bidi` (100 concurrent requests per connection),
-`idle_timeout_ms` (30 000), `validate_address` (false), `early_data`
+`idle_timeout` (30 s, a `std.Io.Duration`), `validate_address` (false), `early_data`
 (false), `sockets` (null: one per executor on Linux, see
 [Cores](#cores)), `enable_connect_protocol` (true: extended CONNECT, for RFC 9220
 WebSockets) and `webtransport` (false; `app.webtransport` turns it on). With `validate_address`, every new client must prove its address

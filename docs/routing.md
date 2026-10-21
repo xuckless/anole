@@ -56,8 +56,9 @@ fn getUser(req: *anole.Request, res: *anole.Response) !void {
 }
 ```
 
-`params` and `query` have `get`, `getInt`, `getFloat`, `count` and
-`iterator`; `getInt` and `getFloat` return null for a missing or malformed
+`req.param("id")` and `req.queryParam("fields")` are the short forms of
+`req.params.get` and `req.query.get`. `params` and `query` have `get`,
+`getInt`, `getFloat`, `count` and `iterator`; `getInt` and `getFloat` return null for a missing or malformed
 value. Path parameters are the raw bytes of the path, with percent-escapes
 left as they are. Query values are decoded (`%XX` and `+`).
 
