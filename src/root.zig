@@ -177,18 +177,18 @@ pub const defaultError = http.defaultError;
 pub const errorStatus = http.errorStatus;
 
 /// TLS on BoringSSL (`-Dtls=boringssl`): `selfSigned` for development
-/// certificates, the module the HTTP core uses for HTTPS, and the raw
-/// bindings. Listener certificates are `Cert`.
+/// certificates and `version()`. Listener certificates are `Cert`; the
+/// clients take their TLS options inline.
 pub const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 
 /// HTTP/2 (`-Dhttp2`): a client (`ClientConnection`, the same API as
-/// `h3`'s) and the nghttp2 bindings. The server side is built into
-/// `Server` (h2 by ALPN, h2c on cleartext listeners).
+/// `h3`'s) and `version()`. The server side is built into `Server` (h2 by
+/// ALPN, h2c on cleartext listeners).
 pub const h2 = if (features.http2) @import("h2/root.zig") else struct {};
 
 /// HTTP/3 over QUIC on ngtcp2 + nghttp3 (`-Dhttp3`): the endpoint `Server`
-/// runs beside a TLS listener (`listenTls`, `ServerOptions.http3`), and a
-/// client (`ClientConnection`).
+/// runs beside a TLS listener (`listenTls`, `ServerOptions.http3`), a
+/// client (`ClientConnection`, the same API as `h2`'s) and `version()`.
 pub const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 
 /// gzip and deflate on zlib-ng, and zstd (`-Dcompression`), as the server
@@ -315,7 +315,7 @@ test "feature constraints hold" {
 
 test "anole.h2 and anole.h3 export the same client names" {
     if (!features.http2 or !features.http3) return error.SkipZigTest;
-    inline for (.{ "ClientConnection", "Stream", "ClientStream", "Header", "ConnectOptions", "RequestOptions", "StreamError" }) |name| {
+    inline for (.{ "ClientConnection", "Stream", "Header", "ConnectOptions", "RequestOptions", "StreamError", "version" }) |name| {
         try std.testing.expect(@hasDecl(h2, name) and @hasDecl(h3, name));
     }
     // One error set for both, so code over either handles the same causes.
@@ -323,8 +323,11 @@ test "anole.h2 and anole.h3 export the same client names" {
     inline for (.{ "ca", "insecure_skip_verify" }) |field| {
         try std.testing.expect(@FieldType(h2.ConnectOptions.Tls, field) == @FieldType(h3.ConnectOptions.Tls, field));
     }
-    inline for (.{ "connect_timeout", "timeout", "address", "host", "port" }) |field| {
+    inline for (.{ "connect_timeout", "timeout", "address", "host", "port", "stream_window", "max_data" }) |field| {
         try std.testing.expect(@FieldType(h2.ConnectOptions, field) == @FieldType(h3.ConnectOptions, field));
     }
-    try std.testing.expect(@FieldType(h2.RequestOptions, "timeout") == @FieldType(h3.RequestOptions, "timeout"));
+    inline for (.{ "body", "timeout" }) |field| {
+        try std.testing.expect(@FieldType(h2.RequestOptions, field) == @FieldType(h3.RequestOptions, field));
+    }
+    try std.testing.expect(@TypeOf(h2.version) == @TypeOf(h3.version));
 }

@@ -151,6 +151,12 @@ defer gpa.free(body);
   `s.readError()` and `s.writeError()` say which of those four it was.
 - A stream's `status`, `headers` and `trailers` live until `release`; copy
   what you keep.
+- `stream_window` (64 KiB) is what the server may send on a stream before
+  its reader takes it, and `max_data` (16 MiB) the same for the
+  connection. Each stream allocates a receive queue of `stream_window` up
+  front, hence the smaller default than HTTP/3's.
+- `RequestOptions.body_bytes` (HTTP/2 only) sends a whole body at once, in
+  place of `body = true` and the writer.
 
 ## HTTP/3
 
@@ -170,10 +176,15 @@ Each connection binds its own UDP socket. `connect` returns after the
 handshake, and fails with `error.HandshakeFailed` (a certificate it does not
 trust among other causes), `error.Timeout` (past `connect_timeout`, 10 s by
 default) or `error.NoH3`. `timeout` is each request's budget, as for
-HTTP/2. The other `ConnectOptions` are `stream_window` (256 KiB), `max_data`
-(16 MiB) and `idle_timeout_ms` (30 s). `anole.h3` exports the names
-`anole.h2` does: `ClientConnection`, `Stream` (also as `ClientStream`),
-`Header`, `ConnectOptions`, `RequestOptions` and `StreamError`.
+HTTP/2. `stream_window` (256 KiB) and `max_data` (16 MiB) mean what they
+do for HTTP/2, with the same types; the stream window's default is larger
+because an HTTP/3 stream's buffer grows as data arrives. Only HTTP/3 has
+`idle_timeout` (30 s, QUIC's idle timeout), `session_cache`, `early_data`
+and `webtransport` (below), and `RequestOptions.early`; `tls` is not
+optional. `anole.h3` exports the names `anole.h2` does:
+`ClientConnection`, `Stream`, `Header`, `ConnectOptions`, `RequestOptions`,
+`StreamError` and `version()` ("ngtcp2/1.25.0 nghttp3/1.18.0", against
+`anole.h2.version()`'s "nghttp2/1.70.0").
 
 The client does not discover HTTP/3 from `Alt-Svc` or retry over TCP.
 Connect to it when you know the server speaks it.
