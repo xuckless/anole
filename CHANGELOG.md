@@ -32,6 +32,10 @@ for macOS and Linux.
   ciphertext buffer (a 1 KiB stash, blocks borrowed from a per-thread pool
   while records are in flight) and BoringSSL sheds its handshake
   configuration: about 20 KB per idle TLS connection instead of 29 on Linux.
+  The request-buffer pool gives back, every 5 s, the sets a burst of
+  connections left unused, and a WebSocket's reply batching shares one
+  backstop task per executor instead of one per socket: a busy pipelining
+  WebSocket holds about 34 KB instead of 43.
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
   / `app.listenTls(":443", .fromFiles("cert.pem", "key.pem"))` in Go's address
   notation (`":3000"` is every interface). `listenTls` adds HTTP/3 with
