@@ -5,6 +5,10 @@
 const std = @import("std");
 
 pub const Server = @import("server.zig").Server;
+/// What takes an HTTP/1.1 connection over after an upgrade, served in
+/// bursts with the connection parked in between (`Response.adopt`).
+pub const Adopter = @import("server.zig").Adopter;
+pub const Burst = @import("server.zig").Burst;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;

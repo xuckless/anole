@@ -9,6 +9,7 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
+const Adopter = @import("server.zig").Adopter;
 pub const Sink = @import("sink.zig").Sink;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
@@ -1211,6 +1212,18 @@ pub const Response = struct {
 
     /// Upgrade HTTP connection to WebSocket.
     /// Returns null if request is not a valid WebSocket upgrade request.
+    /// Hands the connection over to `adopter` (see `Adopter`) once the
+    /// handler returns, rather than closing it: for a protocol the request
+    /// upgraded to that serves the connection without a task of its own
+    /// while it is idle (a WebSocket with callbacks). Over HTTP/1.1 only,
+    /// after the 101 went out (`upgradeWebSocket`). From then on, whatever
+    /// the handler does, `adopter.release` runs when the connection closes.
+    /// The request and this response end with the handler.
+    pub fn adopt(self: *Response, adopter: *Adopter) error{Unsupported}!void {
+        if (self.sink != null or self.status != .switching_protocols or !self.headers_written) return error.Unsupported;
+        self.conn.adopter = adopter;
+    }
+
     pub fn upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
         // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
         // WebSocket (RFC 8441), which a sink does not offer.

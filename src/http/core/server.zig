@@ -275,6 +275,8 @@ pub const Connection = struct {
     /// the proxy.
     proxied_peer: ?std.Io.net.IpAddress = null,
     proxied_secure: bool = false,
+    /// What took the connection over after an upgrade (`Response.adopt`).
+    adopter: ?*Adopter = null,
     tls_rng: std.Random.IoSource = undefined,
     tls_reader: tls.Connection.Reader = undefined,
     tls_writer: tls.Connection.Writer = undefined,
@@ -724,6 +726,76 @@ fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) v
     timer.set(io, timeout);
 }
 
+/// A protocol that takes an HTTP/1.1 connection over once a request
+/// upgraded it (`Response.adopt`), such as a WebSocket served through
+/// callbacks. The server runs `serve` on the request's task once the
+/// handler has returned, and then again each time the connection, parked
+/// in between (`timeout.idle_park`), has input, on a task started for it on
+/// the same executor. So an idle connection holds no task.
+pub const Adopter = struct {
+    /// Serves the connection on the calling task until it is done
+    /// (`.close`), or idle with nothing in flight (`.park`, after
+    /// `Burst.waitInput` said `.idle`). Before it returns, either way,
+    /// nothing is left in the reader or unwritten in the writer, and
+    /// neither has a buffer in this task's frame or in the request's (the
+    /// first run's); after `.close` (or an error) no other task writes to
+    /// the connection.
+    serve: *const fn (*Adopter, *Burst) anyerror!Burst.End,
+    /// The connection is closing: the last call, before its socket is
+    /// closed. On a task on the connection's executor.
+    release: *const fn (*Adopter) void,
+    /// When the server closes the connection whatever it is doing, if ever:
+    /// armed during each run of `serve`, and kept while parked.
+    deadline: ?std.Io.Clock.Timestamp = null,
+};
+
+/// One run of an `Adopter`'s `serve`.
+pub const Burst = struct {
+    connection: *Connection,
+    io: std.Io,
+    timer: *Timer,
+    /// How long `waitInput` waits before it reports `.idle`; null when the
+    /// connection cannot park.
+    park_after: ?std.Io.Duration,
+    deadline: ?std.Io.Clock.Timestamp,
+
+    pub const End = enum { close, park };
+    pub const Input = enum {
+        /// Something to read (or the end of the stream, which the next read
+        /// reports).
+        ready,
+        /// Nothing arrived for the park delay, and nothing is in flight:
+        /// park, unless the adopter is in the middle of something.
+        idle,
+    };
+
+    /// Waits for input with nothing buffered (the reader needs a buffer),
+    /// up to the park delay. Fails as a read would.
+    pub fn waitInput(self: *Burst) !Input {
+        const r = self.connection.reader;
+        if (r.bufferedLen() > 0) return .ready;
+        const after = self.park_after orelse return .ready;
+        self.timer.set(self.io, .{ .duration = .{ .raw = after, .clock = .awake } });
+        defer self.armDeadline();
+        r.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return .ready,
+            error.ReadFailed => {
+                const e = self.connection.getReadError() orelse error.Unexpected;
+                if (e != error.Canceled or !self.timer.fired()) return e;
+                self.connection.clearReadError();
+                // Mid-record on TLS, say: the reads that follow wait.
+                return if (self.connection.parkable()) .idle else .ready;
+            },
+        };
+        return .ready;
+    }
+
+    /// The deadline, or no timer, for what the run does next.
+    pub fn armDeadline(self: *Burst) void {
+        if (self.deadline) |d| self.timer.set(self.io, .{ .deadline = d }) else self.timer.clear(self.io);
+    }
+};
+
 pub fn Server(comptime Ctx: type) type {
     const MiddlewareItem = struct {
         middleware: Middleware(Ctx),
@@ -861,6 +933,10 @@ pub fn Server(comptime Ctx: type) type {
             accepted_at: std.Io.Clock.Timestamp,
             /// Requests whose head was read, on every task so far.
             request_count: usize = 0,
+            /// In flight for the drain while no task holds the count: from
+            /// the upgrade that handed the connection to an `Adopter` until
+            /// it closes, as a handler looping over the socket would be.
+            counted: bool = false,
             parked: park.Parked = .{ .vtable = &park_vtable },
 
             const park_vtable: park.VTable = .{ .wake = wake, .expire = expire, .close = close };
@@ -1937,9 +2013,32 @@ pub fn Server(comptime Ctx: type) type {
         /// HTTP/1.x on `conn` until it closes or parks. A TLS connection that
         /// ends without failing sends close_notify.
         fn serveRequests(self: *Self, conn: *Conn, timer: *Timer, busy: *bool) !Outcome {
-            const outcome = try self.handleRequests(conn, timer, busy);
+            const outcome = if (conn.connection.adopter != null)
+                try self.serveAdopted(conn, timer)
+            else
+                try self.handleRequests(conn, timer, busy);
             if (outcome == .close) self.closeNotify(&conn.connection, timer);
             return outcome;
+        }
+
+        /// A run of what took `conn` over (`Adopter`).
+        fn serveAdopted(self: *Self, conn: *Conn, timer: *Timer) !Outcome {
+            const a = conn.connection.adopter.?;
+            var burst: Burst = .{
+                .connection = &conn.connection,
+                .io = self.io,
+                .timer = timer,
+                .park_after = self.parkAfter(null),
+                .deadline = a.deadline,
+            };
+            burst.armDeadline();
+            return switch (try a.serve(a, &burst)) {
+                .close => .close,
+                .park => {
+                    conn.parked.deadline = if (a.deadline) |d| d.raw else null;
+                    return .park;
+                },
+            };
         }
 
         /// The task started for a parked connection whose socket became
@@ -1986,11 +2085,14 @@ pub fn Server(comptime Ctx: type) type {
         /// Closes `conn`'s socket, frees it and gives back its slot. On a
         /// task on its executor, with no other task serving it.
         fn closeConn(self: *Self, conn: *Conn) void {
+            if (conn.connection.adopter) |a| a.release(a);
             conn.connection.deinit();
             conn.connection.stream.close(self.io);
             if (conn.material) |m| m.release(self.allocator);
+            const counted = conn.counted;
             self.allocator.destroy(conn);
             self.releaseConnectionSlot();
+            if (counted) self.finishRequest();
         }
 
         /// Whether the peer sent, or may still send, input that was not
@@ -2129,8 +2231,19 @@ pub fn Server(comptime Ctx: type) type {
             defer connection.replaceReadBuffer(&.{});
             var buffers: ?*RequestBuffers = null;
             defer if (buffers) |b| {
-                connection.releaseWriteBuffer();
+                // An adopter's writer is its own, under its lock: it took
+                // it out of the buffers before it returned.
+                if (connection.adopter == null) connection.releaseWriteBuffer();
                 self.request_buffers.release(b);
+            };
+            // A handler that handed the connection over (`Response.adopt`)
+            // but whose request did not get as far as the first run, which
+            // takes the adopter's windows out of the buffers: the adopter is
+            // done with before they go back.
+            var adopter_ran = false;
+            defer if (connection.adopter) |a| if (!adopter_ran) {
+                connection.adopter = null;
+                a.release(a);
             };
 
             var request: Request = .{
@@ -2452,6 +2565,16 @@ pub fn Server(comptime Ctx: type) type {
                     // Input after a 101 belongs to the upgraded protocol.
                     if (response.status != .switching_protocols and hasUnreadInput(connection, &parser)) {
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                    }
+                    if (connection.adopter != null) {
+                        // In flight until it closes, the connection's count
+                        // rather than a task's.
+                        conn.counted = busy.*;
+                        busy.* = false;
+                        // The first run, on this task, with the request's
+                        // buffers still under the windows the upgrade left.
+                        adopter_ran = true;
+                        return self.serveAdopted(conn, timer);
                     }
                     break;
                 }

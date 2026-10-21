@@ -8,6 +8,19 @@
 //!     }
 //!     app.ws("/echo", echo);
 //!
+//! A socket that is mostly idle (a chat, notifications) can be served with
+//! callbacks instead (`Server.wsCallbacks`, through `callbacks`): over
+//! HTTP/1.1 it then holds no task while it waits for the peer, only a small
+//! heap object, and a task is started for each burst of messages (see
+//! `callbacks`):
+//!
+//!     const Chat = struct {
+//!         pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void {
+//!             try ws.send(msg.type, msg.data);
+//!         }
+//!     };
+//!     app.wsCallbacks("/chat", Chat);
+//!
 //! and from any handler, `upgrade`:
 //!
 //!     fn chat(req: *anole.Request, res: *anole.Response) !void {
@@ -116,6 +129,13 @@ pub const Socket = struct {
     /// Why `next` returned null when it was not the peer's close: the
     /// error `receive` failed with.
     end_error: ?anyerror = null,
+    /// The code of the peer's close, once one arrived (null for a close
+    /// with no code, or none yet).
+    close_code: ?CloseCode = null,
+    /// The application's, for state it keeps per socket: a callback socket
+    /// (`callbacks`) sets it in `open` and frees what it points at in
+    /// `close`. See `contextAs`.
+    context: ?*anyopaque = null,
 
     /// Both live in the request's arena, so a task beside the handler (the
     /// drain watch, a `Rooms.broadcast`) acts on the same one.
@@ -136,10 +156,28 @@ pub const Socket = struct {
     /// The next text, binary or close message. Pings are answered and
     /// pongs dropped on the way; a compressed message is inflated.
     pub fn receive(self: *Socket) !Message {
-        var msg = switch (self.conn) {
+        return self.finishMessage(switch (self.conn) {
             inline else => |ws| try ws.receive(),
-        };
-        if (msg.type == .close) self.closed.store(true, .release);
+        });
+    }
+
+    /// Over HTTP/1.1, for a reading task that waits for the peer in its
+    /// own way (`callbacks`): the next message once one has begun in the
+    /// read buffer, null when it is empty (dusty's
+    /// `WebSocket.receiveStarted`).
+    fn receiveStarted(self: *Socket) !?Message {
+        const msg = (try self.conn.h1.receiveStarted()) orelse return null;
+        return try self.finishMessage(msg);
+    }
+
+    /// What `receive` does with a message the connection handed over:
+    /// inflate, check, note a close.
+    fn finishMessage(self: *Socket, received: Message) !Message {
+        var msg = received;
+        if (msg.type == .close) {
+            self.close_code = msg.close_code;
+            self.closed.store(true, .release);
+        }
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
         const d = self.deflate orelse unreachable; // RSV1 is refused unless negotiated
@@ -153,6 +191,11 @@ pub const Socket = struct {
             return error.InvalidUtf8;
         }
         return msg;
+    }
+
+    /// `context` as a `*T`.
+    pub fn contextAs(self: *const Socket, comptime T: type) *T {
+        return @ptrCast(@alignCast(self.context.?));
     }
 
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
@@ -262,6 +305,15 @@ const DrainWatch = struct {
 /// handler answers it as it sees fit). The socket lives as long as the
 /// handler: the request's arena holds it.
 pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions) !?Socket {
+    return openSocket(req, res, options, null);
+}
+
+/// `upgrade`. With `owner`, the socket's parts that outlive the request
+/// over HTTP/1.1 (the WebSocket, its messages' memory, the compressor, the
+/// drain watch) come from it rather than from the request's arena, for a
+/// socket served after its handler returned (`callbacks`); `freeParts`
+/// gives them back.
+fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, owner: ?std.mem.Allocator) !?Socket {
     // An extended CONNECT, over HTTP/2 or HTTP/3.
     const h2 = req.protocol != null;
     if (h2) {
@@ -270,15 +322,19 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
         if (!std.mem.eql(u8, version, "13")) return null;
     }
 
+    // What lives as long as the socket.
+    const alloc = if (h2) req.arena else owner orelse req.arena;
+
     // permessage-deflate: the first offer we can take, answered in the
     // handshake's response.
     var deflate: if (features.compression) ?*deflate_impl.Deflate else void = if (features.compression) null else {};
+    errdefer if (comptime features.compression) if (owner != null and !h2) if (deflate) |d| alloc.destroy(d);
     if (comptime features.compression) if (options.compression) {
         if (req.headers.get("Sec-WebSocket-Extensions")) |offers| {
             var buf: [160]u8 = undefined;
             if (deflate_impl.negotiate(offers, options.deflate, &buf)) |accepted| {
                 try res.header("Sec-WebSocket-Extensions", try req.arena.dupe(u8, accepted.response));
-                const d = try req.arena.create(deflate_impl.Deflate);
+                const d = try alloc.create(deflate_impl.Deflate);
                 d.* = .init(accepted.config, options.deflate);
                 deflate = d;
             }
@@ -289,7 +345,7 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
     var socket: Socket = .{
         .conn = undefined,
         .deflate = deflate,
-        .allocator = req.arena,
+        .allocator = alloc,
         .io = req.io,
         .max_message_size = options.max_message_size,
         .drain = req.drain,
@@ -297,26 +353,46 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
     if (h2) {
         socket.conn = .{ .h2 = try H2Socket.accept(req, res, options, negotiated) };
     } else {
-        const ws = try req.arena.create(WebSocket);
-        ws.* = (try res.upgradeWebSocket(req)) orelse return null;
+        const ws = try alloc.create(WebSocket);
+        errdefer if (owner != null) alloc.destroy(ws);
+        ws.* = (try res.upgradeWebSocket(req)) orelse {
+            if (owner != null) alloc.destroy(ws);
+            if (comptime features.compression) if (owner != null) if (deflate) |d| alloc.destroy(d);
+            return null;
+        };
+        // Its messages' memory too, when the socket outlives the request
+        // (empty yet).
+        if (owner != null) ws.msg_arena = .init(alloc);
         ws.max_message_size = options.max_message_size;
         ws.rsv1_allowed = negotiated;
         socket.conn = .{ .h1 = ws };
     }
     req.setTimeout(options.timeout);
     if (options.close_on_drain) if (req.drain_hooks) |hooks| {
-        const watch = try req.arena.create(DrainWatch);
+        const watch = try alloc.create(DrainWatch);
         watch.* = .{
             .hooks = hooks,
             .io = req.io,
             .conn = socket.conn,
-            .reason = try req.arena.dupe(u8, options.drain_reason),
+            // Copied for a socket in the request's arena, where `options`
+            // may be a caller's temporary; a socket that outlives the
+            // request has comptime options.
+            .reason = if (owner != null and !h2) options.drain_reason else try req.arena.dupe(u8, options.drain_reason),
             .executor = placement.currentExecutor(req.io),
         };
         hooks.add(req.io, &watch.hook);
         socket.drain_watch = watch;
     };
     return socket;
+}
+
+/// Deinitializes `socket` and frees what `openSocket` took from `owner`.
+fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
+    const ws = socket.conn.h1;
+    socket.deinit();
+    if (comptime features.compression) if (socket.deflate) |d| owner.destroy(d);
+    if (socket.drain_watch) |w| owner.destroy(w);
+    owner.destroy(ws);
 }
 
 // Out of line, like everything a socket's handler does not run while it
@@ -368,6 +444,223 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
         }
     }.h else S.serve;
 }
+
+/// A route handler for `Server.wsCallbacks`: a WebSocket served through
+/// callbacks, which over HTTP/1.1 keeps no task while it waits for the
+/// peer. `Handler` is a namespace with
+///
+///   - `message(ws: *Socket, msg: Message) !void`, required: each text or
+///     binary message (inflated, UTF-8 checked), its data valid during the
+///     call;
+///   - `open(ws: *Socket, req: *Request) !void`, optional: right after the
+///     handshake, with the request at hand for the last time. Copy what the
+///     socket needs into `ws.context`, join rooms, send a greeting;
+///   - `close(ws: *Socket) void`, optional: once, when the socket is done
+///     (the peer closed it, `ws.close_code` says how; the connection
+///     ended, `ws.end_error`; the server stopped or a callback failed).
+///     Leave rooms and free `ws.context` here. The socket goes away after.
+///
+/// each with the server's state first when it has one (`*Ctx`). Callbacks
+/// run one at a time on a task on the socket's executor and may wait (a
+/// database, a lock); messages that arrive meanwhile wait for them. A
+/// failing `open` or `message` closes the socket with 1011. Pings are
+/// answered and replies batched as with `ws.next()`. `ws.send` works from
+/// any task at any time, `ws.close` too, and the socket can be in `Rooms`.
+///
+/// Over HTTP/1.1 the connection is handed over to the socket once the
+/// handshake is done (`dusty.Response.adopt`): when it has had nothing to
+/// read for `timeout.idle_park`, its task ends and it parks; the next
+/// message starts a task again. What other tasks send meanwhile goes out
+/// unbuffered. Over HTTP/2 and HTTP/3 the socket keeps its stream's task.
+/// `options.timeout`, when set, closes the socket at that deadline.
+pub fn callbacks(comptime Ctx: type, comptime Handler: type, comptime options: UpgradeOptions) dusty.Router(Ctx).Handler {
+    const H = Hooks(Ctx, Handler);
+    const S = struct {
+        fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            const state: ?*anyopaque = if (Ctx == void) null else ctx;
+            if (req.protocol != null) {
+                var ws = (try upgrade(req, res, options)) orelse return refuse(res);
+                defer ws.deinit();
+                return serveOnTask(&ws, req, res, &H.table, state);
+            }
+            const self = (try H1Callbacks.open(req, res, options, &H.table, state)) orelse return refuse(res);
+            // The connection is the socket's from here: a failure closes
+            // the socket, not the request.
+            H.table.open(state, &self.socket, req) catch |err| self.openFailed(req, err);
+        }
+    };
+    return if (Ctx == void) struct {
+        fn h(req: *dusty.Request, res: *dusty.Response) anyerror!void {
+            return S.serve({}, req, res);
+        }
+    }.h else S.serve;
+}
+
+/// A callback socket's `Handler`, behind plain function pointers.
+const Table = struct {
+    open: *const fn (state: ?*anyopaque, *Socket, *dusty.Request) anyerror!void,
+    message: *const fn (state: ?*anyopaque, *Socket, Message) anyerror!void,
+    close: *const fn (state: ?*anyopaque, *Socket) void,
+};
+
+fn Hooks(comptime Ctx: type, comptime Handler: type) type {
+    if (!@hasDecl(Handler, "message")) @compileError("a WebSocket callbacks type needs pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void");
+    return struct {
+        const table: Table = .{ .open = open, .message = message, .close = close };
+
+        fn arity(comptime f: anytype, comptime plain: usize, comptime name: []const u8) bool {
+            const n = @typeInfo(@TypeOf(f)).@"fn".param_types.len;
+            if (n == plain) return false;
+            if (n == plain + 1 and Ctx != void) return true;
+            @compileError("WebSocket callback " ++ name ++ " has the wrong parameters: " ++ @typeName(@TypeOf(f)));
+        }
+
+        fn ctxOf(state: ?*anyopaque) *Ctx {
+            return @ptrCast(@alignCast(state.?));
+        }
+
+        fn open(state: ?*anyopaque, ws: *Socket, req: *dusty.Request) anyerror!void {
+            if (comptime !@hasDecl(Handler, "open")) return;
+            const f = Handler.open;
+            return if (comptime arity(f, 2, "open")) f(ctxOf(state), ws, req) else f(ws, req);
+        }
+
+        fn message(state: ?*anyopaque, ws: *Socket, msg: Message) anyerror!void {
+            const f = Handler.message;
+            return if (comptime arity(f, 2, "message")) f(ctxOf(state), ws, msg) else f(ws, msg);
+        }
+
+        fn close(state: ?*anyopaque, ws: *Socket) void {
+            if (comptime !@hasDecl(Handler, "close")) return;
+            const f = Handler.close;
+            return if (comptime arity(f, 1, "close")) f(ctxOf(state), ws) else f(ws);
+        }
+    };
+}
+
+/// A callback socket on its stream's task (HTTP/2, HTTP/3): the callbacks
+/// in a loop, as a `route` handler would run them.
+fn serveOnTask(ws: *Socket, req: *dusty.Request, res: *dusty.Response, table: *const Table, state: ?*anyopaque) anyerror!void {
+    defer table.close(state, ws);
+    table.open(state, ws, req) catch |err| return failed(ws, req, res, err);
+    while (try ws.next()) |msg| {
+        table.message(state, ws, msg) catch |err| return failed(ws, req, res, err);
+    }
+}
+
+/// A callback socket over HTTP/1.1, on the heap for its life. The HTTP core
+/// hands the connection over to it after the handshake (`dusty.Adopter`),
+/// and runs `serve` on a task each time the connection has something to
+/// read; in between, the connection is parked and no task waits for it.
+const H1Callbacks = struct {
+    adopter: dusty.Adopter,
+    socket: Socket,
+    /// The server's allocator: this, and the socket's parts (`openSocket`).
+    gpa: std.mem.Allocator,
+    table: *const Table,
+    state: ?*anyopaque,
+    /// `open` failed: the socket ends at once, as a `route` handler's would.
+    ending: bool = false,
+
+    /// Each run's reader and writer windows, on its task's stack. A frame
+    /// bigger than the read window is read straight into its message.
+    const window_len = 2048;
+
+    fn open(req: *dusty.Request, res: *dusty.Response, comptime options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
+        const gpa = res.conn.allocator;
+        const self = try gpa.create(H1Callbacks);
+        errdefer gpa.destroy(self);
+        var socket = (try openSocket(req, res, options, gpa)) orelse {
+            gpa.destroy(self);
+            return null;
+        };
+        errdefer freeParts(gpa, &socket);
+        self.* = .{
+            .adopter = .{ .serve = serve, .release = release, .deadline = deadline(req.io, options.timeout) },
+            .socket = socket,
+            .gpa = gpa,
+            .table = table,
+            .state = state,
+        };
+        // An HTTP/1.1 response whose 101 went out.
+        try res.adopt(&self.adopter);
+        return self;
+    }
+
+    /// `timeout` as a deadline on the awake clock, which is the one a
+    /// parked connection's is kept on.
+    fn deadline(io: std.Io, timeout: std.Io.Timeout) ?std.Io.Clock.Timestamp {
+        const left = timeout.toDurationFromNow(io) orelse return null;
+        return std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = left.raw, .clock = .awake });
+    }
+
+    fn openFailed(self: *H1Callbacks, req: *dusty.Request, err: anyerror) void {
+        self.ending = true;
+        if (err == error.Canceled) return;
+        std.log.scoped(.anole).warn("WebSocket open for {s} failed: {t}", .{ req.url, err });
+        if (!self.socket.closed.load(.acquire)) self.socket.close(.internal_error, "") catch {};
+    }
+
+    fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
+        const self: *H1Callbacks = @fieldParentPtr("adopter", a);
+        const ws = self.socket.conn.h1;
+        if (self.ending) return self.finish(null);
+        // The first run keeps the windows the upgrade left, in the request's
+        // buffers; the core gives those back once this returns.
+        var read_window: [window_len]u8 = undefined;
+        var write_window: [window_len]u8 = undefined;
+        if (ws.transport.reader.buffer.len == 0) ws.attachBuffers(&read_window, &write_window);
+        while (true) {
+            const started = self.socket.receiveStarted() catch |err| return self.finish(err);
+            const msg = started orelse {
+                // Nothing buffered: what a batch held goes out, and the
+                // connection waits, here or parked.
+                ws.flushBatch() catch |err| return self.finish(err);
+                const input = burst.waitInput() catch |err| return self.finish(err);
+                if (input == .idle) {
+                    ws.detachBuffers();
+                    return .park;
+                }
+                continue;
+            };
+            switch (msg.type) {
+                .text, .binary => self.table.message(self.state, &self.socket, msg) catch |err| {
+                    if (err != error.Canceled and !self.socket.closed.load(.acquire)) {
+                        std.log.scoped(.anole).warn("WebSocket message handler failed: {t}", .{err});
+                        self.socket.close(.internal_error, "") catch {};
+                    }
+                    return self.finish(err);
+                },
+                .close => return self.finish(null),
+                else => {},
+            }
+        }
+    }
+
+    /// Ends the socket from its reading side: sending is over, and the
+    /// windows are given up (`dusty.Adopter.serve`). `close` runs as the
+    /// core releases it.
+    fn finish(self: *H1Callbacks, err: ?anyerror) dusty.Burst.End {
+        if (err) |e| if (self.socket.end_error == null and self.socket.close_code == null) {
+            self.socket.end_error = e;
+        };
+        self.socket.closed.store(true, .release);
+        self.socket.conn.h1.shut();
+        return .close;
+    }
+
+    fn release(a: *dusty.Adopter) void {
+        const self: *H1Callbacks = @fieldParentPtr("adopter", a);
+        const gpa = self.gpa;
+        // Closed by the server (a deadline, the stop) while parked, or
+        // before its first run: no frame goes out from here on.
+        self.socket.closed.store(true, .release);
+        self.socket.conn.h1.shut();
+        self.table.close(self.state, &self.socket);
+        freeParts(gpa, &self.socket);
+        gpa.destroy(self);
+    }
+};
 
 /// Named groups of sockets for publish/subscribe: a handler joins its
 /// socket to rooms, and anything may broadcast to a room. Safe from any task
@@ -764,6 +1057,7 @@ pub const H2Socket = struct {
 test {
     _ = @import("rooms_test.zig");
     _ = @import("h1_test.zig");
+    _ = @import("callbacks_test.zig");
     _ = @import("h2_fuzz_test.zig");
     if (features.http2) _ = @import("h2_test.zig");
     if (features.compression) _ = @import("deflate.zig");
