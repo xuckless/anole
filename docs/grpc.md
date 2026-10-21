@@ -153,7 +153,7 @@ app.grpcWith(pb.Greeter, .{ .SayHello = sayHello }, .{
 ```
 
 `app.grpc` is `anole.grpc.register(Ctx, app.router, pb.Greeter(Call,
-anyerror), impl)` (and `registerWith`), which work on any dusty router.
+anyerror), impl)` (and `registerWith`), which work on any `anole.http` router.
 
 `max_message_size` bounds each request message after decompression; a larger
 one fails the call with RESOURCE_EXHAUSTED. `data` is for handlers that serve
@@ -401,7 +401,7 @@ enum, or a Timestamp, Duration, FieldMask or wrapper), and that `body` and
 ### Routes
 
 The verbs are `get`, `put`, `post`, `delete` and `patch`, plus `custom` with
-any HTTP method dusty knows (`custom: { kind: "SEARCH" path: "/v1/books" }`),
+any HTTP method the router knows (`custom: { kind: "SEARCH" path: "/v1/books" }`),
 and each of `additional_bindings` is a route too. Path templates take the
 whole syntax:
 
@@ -599,8 +599,7 @@ and, with `--tls`, over TLS with a certificate made for the run. grpc's
 HTTP/2 server checks (`tools/http2_interop`, `tests/grpc/interop/run-http2.sh`)
 pass their framing cases over h2c and TLS and the TLS profile, except five
 results the tool itself causes (listed with reasons in
-`tests/grpc/interop/http2-known-failures.txt`). All of it runs in CI. For
-benchmark numbers against grpc-go, see the README.
+`tests/grpc/interop/http2-known-failures.txt`). All of it runs in CI.
 
 ## Not there yet
 

@@ -96,7 +96,7 @@ Start with [Getting Started](Getting-Started), then read the guide for what you 
 | --- | --- |
 {guides}
 
-Also in the repository: the [README]({REPO}#readme) (features, build flags, benchmarks),
+Also in the repository: the [README]({REPO}#readme) (features, build flags),
 [CHANGELOG.md]({REPO}/blob/main/CHANGELOG.md), [SECURITY.md]({REPO}/blob/main/SECURITY.md)
 and the [examples]({REPO}/tree/main/examples).
 

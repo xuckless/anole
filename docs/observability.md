@@ -136,7 +136,7 @@ The middleware reads the IDs after the handler returns, so its position
 among the other middleware does not change what it logs. Its
 `duration_us` covers the middleware that come after it and the handler.
 
-dusty's simpler `anole.middleware.Logger` is also available. It logs
+The HTTP core's simpler `anole.middleware.Logger` is also available. It logs
 through `std.log` at info level, without trace IDs:
 
 ```
@@ -166,7 +166,7 @@ pub const std_options = anole.std_options;
 ```
 
 `anole.logFn` is kept for programs that set it. It renames the scopes older
-builds of the HTTP core used (`dusty` and the like) and is otherwise std's
+builds of the HTTP core used and is otherwise std's
 default.
 
 ## Metrics
