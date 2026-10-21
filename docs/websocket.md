@@ -135,8 +135,8 @@ The socket lives as long as the handler. It is held in the request's arena,
 so do not keep a pointer to it after the handler returns. Always
 `defer ws.deinit()`; on HTTP/2 and HTTP/3 that also ends the stream.
 
-Over HTTP/2, call `anole.websocket.upgrade`, not dusty's
-`res.upgradeWebSocket`. The dusty call handles HTTP/1.1 only and returns null
+Over HTTP/2, call `anole.websocket.upgrade`, not the HTTP core's
+`res.upgradeWebSocket`. That call handles HTTP/1.1 only and returns null
 for an HTTP/2 request. If you must keep code that uses it, turn RFC 8441 off
 in the server options (keep the stream limit, which this field replaces):
 
@@ -145,7 +145,7 @@ in the server options (keep the stream limit, which this field replaces):
 ```
 
 Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
-(the dusty call never handled HTTP/3 anyway). A plain CONNECT, without
+(`res.upgradeWebSocket` never handled HTTP/3 anyway). A plain CONNECT, without
 `:protocol`, gets 501 over HTTP/3: Anole is no proxy.
 
 ### Upgrade options

@@ -155,8 +155,10 @@ pub const Socket = struct {
     /// A close went out through `close`, or came in through `receive` (and
     /// was answered), or `next` saw the connection end.
     closed: std.atomic.Value(bool) = .init(false),
-    /// Why `next` returned null when it was not the peer's close: the
-    /// error `receive` failed with.
+    /// Why the socket ended when it was not the peer's close (`next`
+    /// returned null, or a callback socket's `close` ran): the error its
+    /// read failed with, `error.EndOfStream` for a peer that left without
+    /// a close frame.
     end_error: ?anyerror = null,
     /// The code of the peer's close, once one arrived (null for a close
     /// with no code, or none yet).
@@ -514,7 +516,7 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
 /// any task at any time, `ws.close` too, and the socket can be in `Rooms`.
 ///
 /// Over HTTP/1.1 the connection is handed over to the socket once the
-/// handshake is done (`dusty.Response.adopt`): when it has had nothing to
+/// handshake is done (`anole.http.Response.adopt`): when it has had nothing to
 /// read for `timeout.idle_park`, its task ends and it parks; the next
 /// message starts a task again. What other tasks send meanwhile goes out
 /// unbuffered. Over HTTP/2 and HTTP/3 the socket keeps its stream's task.

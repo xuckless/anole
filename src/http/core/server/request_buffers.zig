@@ -370,6 +370,7 @@ pub const RequestBuffersPool = struct {
         shard.writes.push(w);
     }
 
+    /// The bytes of write buffer `w`, which follow its header.
     pub fn writeBytes(self: *const RequestBuffersPool, w: *WriteBuffer) []u8 {
         return @as([*]u8, @ptrCast(w))[@sizeOf(WriteBuffer)..][0..self.write_buffer_len];
     }

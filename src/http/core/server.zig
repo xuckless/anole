@@ -815,7 +815,10 @@ pub const Burst = struct {
     repark: bool = false,
     had_input: bool = false,
 
+    /// How a run of `Adopter.serve` ends: the connection closes, or parks
+    /// until it has input again.
     pub const End = enum { close, park };
+    /// What `waitInput` found.
     pub const Input = enum {
         /// Something to read.
         ready,

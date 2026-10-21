@@ -73,6 +73,7 @@ pub const Parked = struct {
     /// `Shelf.long_park`).
     woke_from_long: bool = false,
 
+    /// Whether the connection is on a shelf now.
     pub fn isParked(self: *const Parked) bool {
         return self.shelf != null;
     }
@@ -212,6 +213,8 @@ pub const Shelf = struct {
         if (first) self.bell.notify();
     }
 
+    /// Takes `w` off the shelf's watch list (`watch`), on the same executor,
+    /// before the task that registered it is done with the connection.
     pub fn unwatch(self: *Shelf, w: *Watch) void {
         if (comptime !supported) return;
         self.watches.remove(&w.node);
