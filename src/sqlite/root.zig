@@ -63,6 +63,7 @@
 const std = @import("std");
 const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
 const observe = @import("../observe/root.zig");
 
@@ -173,7 +174,7 @@ pub const Db = struct {
         // the read-only connections cannot.
         self.writer.conn = try Connection.open(self, true, options);
         errdefer self.writer.conn.close(gpa);
-        const count = if (memory) 0 else options.readers orelse @min(db.executorCount(io), 8);
+        const count = if (memory) 0 else options.readers orelse @min(internal.executorCount(io), 8);
         self.readers.conns = try gpa.alloc(Connection, count);
         errdefer gpa.free(self.readers.conns);
         self.readers.free = try gpa.alloc(*Connection, count);
@@ -328,7 +329,7 @@ pub const Db = struct {
                 }
             }
         };
-        return unbound(TxResult(func), db.bounded(cx, .sqlite, options.timeout, Run.run, .{ self, cx, options, args }));
+        return unbound(TxResult(func), internal.bounded(cx, .sqlite, options.timeout, Run.run, .{ self, cx, options, args }));
     }
 
     /// The writer connection for the driver's own calls (`Conn.run`), held
@@ -526,7 +527,7 @@ pub const Query = struct {
             }
         };
         const call_ = q.db.observer.start(cx);
-        const result = unbound(CallError!Rows(T), db.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
+        const result = unbound(CallError!Rows(T), internal.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
         const kw = operation(sql);
         call_.end(cx, kw.text(), null, if (result) |_| null else |e| e);
         return result;
@@ -539,7 +540,7 @@ pub const Query = struct {
             }
         };
         const call_ = q.db.observer.start(cx);
-        const result = unbound(CallError!Out(op, T), db.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
+        const result = unbound(CallError!Out(op, T), internal.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
         const kw = operation(sql);
         call_.end(cx, kw.text(), null, if (result) |_| null else |e| e);
         return result;
@@ -1202,7 +1203,7 @@ fn failed(d: *Db, cx: anytype, f: *const Failure) db.Error {
         }
     }
     if (f.quiet) return d.error_map.errorFor(f.class);
-    return db.fail(cx, d.error_map, detail);
+    return internal.fail(cx, d.error_map, detail);
 }
 
 // ---------------------------------------------------------------------------

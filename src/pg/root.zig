@@ -54,6 +54,7 @@ const std = @import("std");
 const features = @import("build_options");
 const dusty = @import("dusty");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 
 /// pg.zig itself (xuckless/pg.zig), for `acquire`'s connection, its
@@ -336,7 +337,7 @@ pub const Db = struct {
     arena: std.heap.ArenaAllocator,
     name: []const u8,
     settings: Settings,
-    pools: db.PerExecutor(Shard),
+    pools: internal.PerExecutor(Shard),
     errors: db.ErrorMap,
     observer: db.Observer,
     readiness: db.Readiness,
@@ -426,7 +427,7 @@ pub const Db = struct {
             startup = .init(a);
             for (s.parameters) |p| try startup.?.put(p.name, p.value);
         }
-        const executors = db.executorCount(io);
+        const executors = internal.executorCount(io);
         const total: usize = s.max_connections orelse opts.max_connections orelse @max(4, 2 * executors);
         const pool_opts: pg.Pool.Opts = .{
             .size = 1,
@@ -591,8 +592,8 @@ pub const Db = struct {
     ///         _ = try tx.exec(req, "UPDATE accounts SET cents = cents - $1 WHERE id = $2", .{ cents, from });
     ///         _ = try tx.exec(req, "UPDATE accounts SET cents = cents + $1 WHERE id = $2", .{ cents, to });
     ///     }
-    pub fn transaction(self: *Db, c: anytype, opts: db.TxOptions, comptime func: anytype, args: anytype) db.Bounded(Retry(func, @TypeOf(c), @TypeOf(args)).run) {
-        return db.bounded(c, .postgresql, opts.timeout, Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
+    pub fn transaction(self: *Db, c: anytype, opts: db.TxOptions, comptime func: anytype, args: anytype) internal.Bounded(Retry(func, @TypeOf(c), @TypeOf(args)).run) {
+        return internal.bounded(c, .postgresql, opts.timeout, Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
     }
 
     fn Retry(comptime func: anytype, comptime C: type, comptime Args: type) type {
@@ -682,11 +683,11 @@ pub const Db = struct {
         return result catch |err| self.narrow(&ctx, err);
     }
 
-    /// `func(args...)` before `deadline`, as `anole.db.bounded` (whose
+    /// `func(args...)` before `deadline`, as `internal.bounded` (whose
     /// timeout, `QueryOptions.timeout`, a call's deadline is), or a
     /// transaction's: past it, the call is canceled where it waits and
     /// fails with the `timeout` class (`GatewayTimeout`).
-    fn guarded(self: *Db, ctx: *const Ctx, deadline: ?dusty.Deadline, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) db.Bounded(func) {
+    fn guarded(self: *Db, ctx: *const Ctx, deadline: ?dusty.Deadline, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) internal.Bounded(func) {
         const d = deadline orelse return @call(.auto, func, args);
         return d.run(func, args) catch |err| switch (err) {
             error.Timeout => ctx.fail(self.errors, .{ .system = .postgresql, .class = .timeout, .message = "the call ran past its timeout" }),
@@ -1434,7 +1435,7 @@ const Ctx = struct {
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
 
-    /// `anole.db.fail` on the context it stands for.
+    /// `internal.fail` on the context it stands for.
     fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
@@ -1450,10 +1451,10 @@ fn erase(c: anytype) Ctx {
     if (C == *Ctx or C == *const Ctx) return c.*;
     const R = struct {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return db.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = db.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------

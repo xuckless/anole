@@ -81,6 +81,7 @@ const features = @import("build_options");
 const dusty = @import("dusty");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
@@ -401,7 +402,7 @@ pub const Client = struct {
     /// AUTH and SELECT, sent as a connection opens; empty when neither is
     /// needed.
     login: Batch,
-    pools: db.PerExecutor(Pool),
+    pools: internal.PerExecutor(Pool),
     errors: db.ErrorMap,
     observer: db.Observer,
     readiness: db.Readiness,
@@ -471,7 +472,7 @@ pub const Client = struct {
         if (s.database != 0) try login.add(.{ "SELECT", s.database });
         self.login = login.finish();
 
-        const executors = db.executorCount(io);
+        const executors = internal.executorCount(io);
         const total: usize = opts.max_connections orelse 10 * executors;
         self.pools = try .init(gpa, io);
         var made: usize = 0;
@@ -1866,7 +1867,7 @@ const Ctx = struct {
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
 
-    /// `anole.db.fail` on the context it stands for.
+    /// `internal.fail` on the context it stands for.
     fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
@@ -1882,10 +1883,10 @@ fn erase(c: anytype) Ctx {
     if (C == *Ctx or C == *const Ctx) return c.*;
     const R = struct {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
-            return db.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = db.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------

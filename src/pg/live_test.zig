@@ -7,6 +7,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const http = @import("../http/root.zig");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const pg = @import("root.zig");
 const server_mod = @import("../server.zig");
 const client_mod = @import("../client.zig");
@@ -332,7 +333,7 @@ test "pg: live a pool per executor" {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
-            const here = db.executorIndex(io_).?;
+            const here = internal.executorIndex(io_).?;
             for (0..10) |_| {
                 const pid = try db_.one(i64, &ctx, "SELECT pg_backend_pid()::int8", .{});
                 // Each executor keeps to its one connection.
@@ -383,7 +384,7 @@ test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
                 _ = wrong.fetchAdd(1, .monotonic);
                 return;
             };
-            const here = db.executorIndex(io_).?;
+            const here = internal.executorIndex(io_).?;
             if (seen[here].cmpxchgStrong(0, got.n, .monotonic, .monotonic)) |prev| {
                 if (prev != got.n) _ = wrong.fetchAdd(1, .monotonic);
             }

@@ -5,6 +5,7 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const anole_db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
 const observe = @import("../observe/root.zig");
 const server_mod = @import("../server.zig");
@@ -386,7 +387,7 @@ test "sqlite: :memory: is one database seen from every executor" {
             var sc: Scratch = undefined;
             sc.init(io_);
             defer sc.deinit();
-            const here = anole_db.executorIndex(io_) orelse 99;
+            const here = internal.executorIndex(io_) orelse 99;
             _ = d.exec(&sc.ctx, "INSERT INTO seen VALUES (?)", .{here}) catch return;
             // Rows other executors wrote are visible here.
             const n = d.one(i64, &sc.ctx, "SELECT count(*) FROM seen", .{}) catch return;

@@ -8,6 +8,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const http = @import("../http/root.zig");
 const db = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const redis = @import("root.zig");
 const server_mod = @import("../server.zig");
 const client_mod = @import("../client.zig");
@@ -305,7 +306,7 @@ test "redis: live a pool per executor" {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
             var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
-            const here = db.executorIndex(io_).?;
+            const here = internal.executorIndex(io_).?;
             for (0..10) |_| {
                 const id = try cl.one(i64, &ctx, .{ "CLIENT", "ID" });
                 // Each executor keeps to its one connection.

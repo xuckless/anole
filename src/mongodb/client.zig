@@ -14,6 +14,7 @@ const std = @import("std");
 const bson = @import("bson");
 const dusty = @import("dusty");
 const shared = @import("../db/root.zig");
+const internal = @import("../db/internal.zig");
 const net = @import("../net/client_stream.zig");
 const wire = @import("wire.zig");
 const sdam = @import("sdam.zig");
@@ -100,7 +101,7 @@ const Pool = struct {
 pub const Server = struct {
     client: *Client,
     address: conn_mod.Address,
-    pools: shared.PerExecutor(Pool),
+    pools: internal.PerExecutor(Pool),
     /// Mirrors the topology's pool generation; connections of an older one
     /// are closed when they come back.
     generation: std.atomic.Value(u32) = .init(0),
@@ -164,7 +165,7 @@ pub const Client = struct {
     group: std.Io.Group = .init,
     closing: std.atomic.Value(bool) = .init(false),
     scram_cache: scram.Cache = .{},
-    sessions: shared.PerExecutor(SessionPool),
+    sessions: internal.PerExecutor(SessionPool),
     /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
     /// cached results: `app.mongo.cache.invalidate(.{ .tag = "users" })`.
     cache: shared.QueryCache,
@@ -767,7 +768,7 @@ pub const Client = struct {
     /// Sends the command `ctx` builds and returns what `ctx.result` reads
     /// from the reply, with everything the specs ask around it: server
     /// selection, a pooled connection, an implicit session, a retry,
-    /// `maxTimeMS`, error mapping (`anole.db.fail`), metrics and a span.
+    /// `maxTimeMS`, error mapping (`internal.fail`), metrics and a span.
     ///
     /// `ctx` is a pointer to a struct with
     ///     fn body(ctx, b: *bson.Builder, x: *Exchange) !void       the command's fields
@@ -980,7 +981,7 @@ pub const Context = struct {
     /// For spans.
     request: ?*const dusty.Request,
 
-    /// `anole.db.fail` on the context it stands for.
+    /// `internal.fail` on the context it stands for.
     pub fn fail(self: *const Context, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error {
         return self.record(self.any, map, detail);
     }
@@ -992,10 +993,10 @@ pub fn erase(c: anytype) Context {
     if (C == *Context or C == *const Context) return c.*;
     const R = struct {
         fn record(any: *anyopaque, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error {
-            return shared.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
+            return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(@constCast(c)), .record = R.record, .request = shared.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(@constCast(c)), .record = R.record, .request = internal.requestOf(c) };
 }
 
 /// What every call can fail with: the shared errors (`anole.db.Error`),
