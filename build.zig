@@ -7,7 +7,7 @@
 //!
 //! Every C library is a lazy dependency in build.zig.zon and is requested only
 //! when a feature that needs it is on, so `-Dprofile=minimal` fetches and
-//! compiles no C library besides dusty's llhttp.
+//! compiles no C library besides llhttp (the HTTP core's parser).
 //!
 //! Steps:
 //!   test        unit tests + smoke tests of the enabled features
@@ -368,7 +368,7 @@ pub fn build(b: *std.Build) void {
         return;
     };
 
-    // Core: zio (runtime) and dusty (HTTP/1.1), always on.
+    // Core: zio (runtime) and the HTTP core (src/http/core), always on.
     const core = Core.init(b, c_mods, target, optimize);
 
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
@@ -388,42 +388,62 @@ pub fn build(b: *std.Build) void {
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
 
-    // dusty-test: dusty's own test suite on what Anole injects into it
-    // (BoringSSL through src/tls/dusty_tls.zig, nghttp2 1.70.0, zlib-ng,
-    // zstd): a conformance check of those seams.
-    if (core.dusty_by[1][1][1]) |dusty_full| {
-        // A second instance of the same sources and imports, but with
-        // dusty's own zio stub: its tests run on std.testing.io, and the
-        // real zio's timers need a zio task.
-        const dusty_root = dusty_full.root_source_file.?;
+    // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
+    // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
+    // nghttp2, zlib-ng and zstd. Part of `test`, and `core-test` alone.
+    if (core.dusty_by[1][1][1] != null and target.query.isNative()) {
+        const core_full = core.dusty_by[1][1][1].?;
+        // A second instance of the same sources and imports, but with the
+        // core's zio stub: its tests run on std.testing.io, and the real
+        // zio's timers need a zio task.
+        const core_root = core_full.root_source_file.?;
         const test_mod = b.createModule(.{
-            .root_source_file = dusty_root,
+            .root_source_file = core_root,
             .target = target,
             .optimize = optimize,
-            .link_libc = dusty_full.link_libc,
+            .link_libc = true,
         });
-        var imports = dusty_full.import_table.iterator();
+        var imports = core_full.import_table.iterator();
         while (imports.next()) |e| test_mod.addImport(e.key_ptr.*, e.value_ptr.*);
-        test_mod.addAnonymousImport("zio", .{ .root_source_file = dusty_root.dirname().path(b, "zio_stub.zig") });
-        // And its stub for the HTTP/2 client: Anole's imports this dusty's
-        // sources a second time.
-        test_mod.addAnonymousImport("h2_client", .{ .root_source_file = dusty_root.dirname().path(b, "h2_client_stub.zig") });
-        test_mod.include_dirs.appendSlice(b.allocator, dusty_full.include_dirs.items) catch @panic("OOM");
-        test_mod.c_macros.appendSlice(b.allocator, dusty_full.c_macros.items) catch @panic("OOM");
-        test_mod.link_objects.appendSlice(b.allocator, dusty_full.link_objects.items) catch @panic("OOM");
-        // dusty's own test runner, as its build uses (some tests log at
-        // err on purpose).
-        const dusty_tests = b.addTest(.{
-            .name = "dusty-test",
+        test_mod.addAnonymousImport("zio", .{ .root_source_file = b.path("src/http/core/zio_stub.zig") });
+        // And the stub HTTP/2 client: Anole's would import these sources a
+        // second time.
+        test_mod.addAnonymousImport("h2_client", .{ .root_source_file = b.path("src/http/core/h2_client_stub.zig") });
+        test_mod.include_dirs.appendSlice(b.allocator, core_full.include_dirs.items) catch @panic("OOM");
+        test_mod.link_objects.appendSlice(b.allocator, core_full.link_objects.items) catch @panic("OOM");
+        // The core's test runner (some tests log at err on purpose).
+        const core_tests = b.addTest(.{
+            .name = "core-test",
             .root_module = test_mod,
-            .test_runner = .{ .path = dusty_root.dirname().dirname().path(b, "test_runner.zig"), .mode = .simple },
+            .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
+            .use_llvm = use_llvm,
         });
-        const run_dusty_tests = b.addRunArtifact(dusty_tests);
-        run_dusty_tests.skip_foreign_checks = true;
-        // Its tests open fixtures (examples/certs/...) relative to dusty's
-        // package root.
-        run_dusty_tests.setCwd(dusty_root.dirname().dirname());
-        b.step("dusty-test", "Run dusty's own tests on Anole's TLS, nghttp2, zlib-ng and zstd").dependOn(&run_dusty_tests.step);
+        const run_core_tests = b.addRunArtifact(core_tests);
+        // The TLS tests open certs/cert.pem and certs/key.pem from where
+        // they run: a certificate made now by tests/test_cert.zig, so no
+        // key is committed.
+        const make_cert = b.addRunArtifact(b.addExecutable(.{
+            .name = "test-cert",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/test_cert.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            }),
+        }));
+        run_core_tests.setCwd(make_cert.addOutputDirectoryArg("certs").dirname());
+        test_step.dependOn(&run_core_tests.step);
+        // Its "fuzz:" targets again, under Zig's own test runner, which is
+        // what drives the fuzzer (the core's runner has none): `zig build
+        // test --fuzz` fuzzes them with Anole's.
+        const core_fuzz = b.addTest(.{
+            .name = "core-fuzz",
+            .root_module = test_mod,
+            .filters = &.{"fuzz:"},
+            .use_llvm = use_llvm,
+        });
+        test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
+        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng and zstd").dependOn(&run_core_tests.step);
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -775,8 +795,37 @@ fn resolveFeatures(b: *std.Build) Features {
     return f;
 }
 
+/// llhttp (src/http/core/llhttp, MIT): its bindings and its static library,
+/// made once and shared by every HTTP core instance.
+const LlHttp = struct {
+    mod: *std.Build.Module,
+    lib: *std.Build.Step.Compile,
+
+    fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) LlHttp {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("src/http/core/llhttp/llhttp.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        tc.addIncludePath(b.path("src/http/core/llhttp"));
+        const lib = b.addLibrary(.{
+            .name = "llhttp",
+            .linkage = .static,
+            .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        });
+        lib.root_module.addCSourceFiles(.{
+            .root = b.path("src/http/core/llhttp"),
+            .files = &.{ "llhttp.c", "api.c", "http.c" },
+            .flags = &.{"-std=c99"},
+        });
+        lib.root_module.addIncludePath(b.path("src/http/core/llhttp"));
+        return .{ .mod = tc.createModule(), .lib = lib };
+    }
+};
+
 const Core = struct {
     zio: *std.Build.Module,
+    llhttp: LlHttp,
     /// dusty instances by [tls][http2][compression]. One exists for each
     /// combination this build can satisfy: TLS needs BoringSSL in the build,
     /// HTTP/2 nghttp2, compression zlib-ng. Different arguments give separate
@@ -801,16 +850,17 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .dusty_by = @splat(@splat(@splat(null))), .h2_client_by = @splat(@splat(@splat(null))), .tls_seam = seam };
+        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(null))), .h2_client_by = @splat(@splat(@splat(null))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
                 if (http2 and c_mods.nghttp2 == null) continue;
                 for ([_]bool{ false, true }) |compression| {
                     if (compression and c_mods.zlib == null) continue;
-                    const dusty_mod = dustyModule(
+                    const dusty_mod = coreModule(
                         b,
                         zio_mod,
+                        core.llhttp,
                         if (tls) seam else null,
                         if (http2) c_mods.nghttp2 else null,
                         if (compression) c_mods.zlib else null,
@@ -868,9 +918,13 @@ const Core = struct {
         return mod;
     }
 
-    fn dustyModule(
+    /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one
+    /// combination of TLS, HTTP/2 and compression. What a combination leaves
+    /// out gets the core's stub instead (`tls`, `zlib`), or no import at all.
+    fn coreModule(
         b: *std.Build,
         zio_mod: *std.Build.Module,
+        llhttp: LlHttp,
         tls: ?*std.Build.Module,
         nghttp2: ?*std.Build.Module,
         zlib: ?*std.Build.Module,
@@ -878,33 +932,33 @@ const Core = struct {
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
-        const mod = b.dependency("dusty", .{
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/http/core/root.zig"),
             .target = target,
             .optimize = optimize,
-            // With TLS, the `tls` import is injected (Anole's BoringSSL
-            // module) instead of dusty's bundled tls.zig, which is then
-            // never fetched.
-            .use_tls = tls != null,
-            .use_bundled_tls = false,
-            // With HTTP/2, the `nghttp2` import is Anole's nghttp2 1.70.0
-            // module (which links the library) instead of dusty's vendored
-            // 1.69.0, so only one copy is linked.
-            .use_http2 = nghttp2 != null,
-            .use_bundled_nghttp2 = false,
-            // gzip/deflate on zlib-ng: the `zlib` import is zlib.zig's wrapper
-            // over Anole's zlib-ng, so dusty's pinned zlib.zig (and its
-            // vendored C zlib) is never fetched.
-            .use_zlib = zlib != null,
-            .use_bundled_zlib = false,
-            // zstd for responses and request bodies, on Anole's zstd.
-            .use_zstd = zstd != null,
-        }).module("dusty");
-        // Replace dusty's zio stub so its timeouts use zio.AutoCancel.
+            .link_libc = true,
+        });
+        const opts = b.addOptions();
+        opts.addOption(bool, "use_tls", tls != null);
+        opts.addOption(bool, "use_http2", nghttp2 != null);
+        opts.addOption(bool, "use_zlib", zlib != null);
+        opts.addOption(bool, "use_zstd", zstd != null);
+        mod.addOptions("build_options", opts);
+        // The real runtime, so timeouts use zio.AutoCancel; the core's own
+        // tests use src/http/core/zio_stub.zig instead.
         mod.addImport("zio", zio_mod);
-        if (tls) |m| mod.addImport("tls", m);
+        // Replaced by src/h2/client.zig in the HTTP/2 instances (h2ClientModule).
+        mod.addAnonymousImport("h2_client", .{ .root_source_file = b.path("src/http/core/h2_client_stub.zig") });
+        if (tls) |m| mod.addImport("tls", m) else mod.addAnonymousImport("tls", .{ .root_source_file = b.path("src/http/core/tls_stub.zig") });
         if (nghttp2) |m| mod.addImport("nghttp2", m);
-        if (zlib) |m| mod.addImport("zlib", m);
+        if (zlib) |m| mod.addImport("zlib", m) else mod.addAnonymousImport("zlib", .{ .root_source_file = b.path("src/http/core/zlib_stub.zig") });
         if (zstd) |m| mod.addImport("zstd", m);
+        mod.addImport("llhttp", llhttp.mod);
+        // llhttp is a library of its own, not C sources of this module, so
+        // the module holds only Zig: Zig 0.17's fuzzer cannot take clang's
+        // coverage tables from C compiled into a fuzzed module.
+        mod.linkLibrary(llhttp.lib);
+        mod.addIncludePath(b.path("src/http/core/llhttp"));
         return mod;
     }
 };

@@ -111,8 +111,9 @@ pub fn checkUdpAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!vo
     const len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (std.c.bind(fd, &storage.any, len) != 0 and std.posix.errno(@as(c_int, -1)) == .ADDRINUSE) {
         const fmt = "UDP {f} is already in use: another process is bound to it";
-        // Tests provoke it on purpose, and fail on any error logged.
-        if (@import("builtin").is_test) log.warn(fmt, .{address}) else log.err(fmt, .{address});
+        // Tests provoke it on purpose: logged there, even at warn, the build
+        // runner prints the test's output under "failed command".
+        if (!@import("builtin").is_test) log.err(fmt, .{address});
         return error.AddressInUse;
     }
 }

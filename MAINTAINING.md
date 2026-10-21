@@ -10,7 +10,7 @@ that happens promptly.
 | Component | Pinned in | Form |
 | --- | --- | --- |
 | zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` |
-| dusty | build.zig.zon | commit of the xuckless/dusty fork, branch `anole` |
+| HTTP core (from dusty) | src/http/core | Anole code since 2026-10-20; see "The HTTP core" below |
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (tarball) |
@@ -85,7 +85,7 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      (`checkSharedSfparse`) stops the build when the two copies differ; then
      rename one copy's symbols with `-D` macros or build one shared sfparse.
 4. Run everything CI runs: `zig build test`, `zig build test-flags`,
-   `zig build dusty-test`, the profile builds, h2spec, Autobahn, the gRPC
+   the profile builds, h2spec, Autobahn, the gRPC
    interop, `tests/h3/run.sh`, `tests/interop/run.sh` and
    `tests/interop/webtransport/run.sh`.
 
@@ -96,17 +96,9 @@ are pinned by commit. Work happens on a topic branch, is merged into `anole`
 with `--no-ff`, pushed, and then pinned here with
 `zig fetch --save=<name> git+https://github.com/xuckless/<repo>#<commit>`.
 Commits are authored as `xuckless <xuckless@users.noreply.github.com>`.
-Nothing goes upstream unless an upstream asks for it; the PRs already open
-against lalinsky/dusty (#263-#270) are left as they are.
+Nothing goes upstream unless an upstream asks for it (zio is the exception:
+lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 
-- **dusty**: after a change, run its own suite under Zig 0.17 and 0.16
-  (`zig build test` in the fork), and Anole's `zig build dusty-test`, which
-  runs that suite on Anole's TLS, nghttp2, zlib-ng and zstd. Its fuzz
-  targets ("fuzz:" tests, src/fuzz.zig as in Anole) run through
-  `zig build fuzz -Duse_http2=true --fuzz=200K` in the fork, since its own
-  test runner has no fuzzer; CI's `fuzz` job runs them from the pinned
-  package. C compiled into the dusty module breaks Zig 0.17's fuzzer, so
-  C goes in a static library the module links (as llhttp and nghttp2 do).
 - **zio**: after a change, run its suite in both scheduling modes
   (`./check.sh` and `./check.sh --scheduling pinned` in the fork; Anole
   runs pinned). Its changes: the pinned mode's run queue (`pinned-fifo`), and
@@ -117,6 +109,26 @@ against lalinsky/dusty (#263-#270) are left as they are.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.
 
+## The HTTP core
+
+`src/http/core` is the HTTP/1.1 server, router, middleware, client,
+WebSocket and HTTP/2 engine. It started as lalinsky/dusty (MIT, base d3cb485)
+and Anole's fork of it (xuckless/dusty, last at 86d152f), and has been
+Anole code since 2026-10-20: changes land here directly. Keep the
+attribution header on every file and THIRD_PARTY_NOTICES part B current.
+
+- Its own tests run in `zig build test` (and alone as `zig build core-test`)
+  with its test runner and its zio stub, on Anole's TLS, nghttp2, zlib-ng
+  and zstd. Their certificate is made at build time by
+  `tests/test_cert.zig`; no key is committed.
+- Its "fuzz:" targets run a second time under Zig's own test runner, so
+  `zig build test --fuzz` fuzzes them with Anole's.
+- C compiled into the core's module breaks Zig 0.17's fuzzer, so C goes in a
+  static library the module links, as llhttp does (`LlHttp` in build.zig).
+- Upstream watch: look through lalinsky/dusty's commits since d3cb485 before
+  each release and port the fixes that apply. The PRs open there from the
+  fork (#263-#270) are left as they are.
+
 ## The Zig version
 
 Anole targets one Zig minor version at a time. `build.zig` accepts any 0.17.x
@@ -125,8 +137,7 @@ build.zig.zon's `minimum_zig_version` says the same (it is only advisory).
 
 Moving to the next minor version (0.18):
 
-1. Move every Zig dependency to a commit that supports it: zio, the dusty fork
-   (keep its 0.17 support while users need it), zig-protobuf, the
+1. Move every Zig dependency to a commit that supports it: zio, zig-protobuf, the
    websocket-zig and zig-jwt forks, and translate-c's matching branch.
 2. Change the version check in `build.zig`, `minimum_zig_version`, the
    README's requirements, and the CI workflows' `version:`.

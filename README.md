@@ -11,7 +11,7 @@ showed up with. (Zig's mascot is a lizard too.)
 Anole doesn't reinvent the hard parts. It stands on libraries that have
 already survived the internet:
 - [zio](https://github.com/lalinsky/zio) for async I/O;
-- [dusty](https://github.com/lalinsky/dusty) for HTTP, through a fork;
+- [dusty](https://github.com/lalinsky/dusty) for HTTP, adapted into Anole as its HTTP core;
 - nghttp2 for HTTP/2;
 - BoringSSL for TLS;
 - ngtcp2 and nghttp3 for HTTP/3.
