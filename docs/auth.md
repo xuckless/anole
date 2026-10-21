@@ -92,13 +92,10 @@ without `RequireJwt`. For claims that are arrays or objects, or checks of
 your own, set `.hook = .{ .ptr = ..., .func = ... }`: it gets the whole
 `Verified` before the handler, and an error from it refuses the token.
 
-`.claims` lists string claims that must be present (`.required = true`
-refuses a token without one; by default `sub` is required). Each is also
-copied into `req.session` under its `key` (by default `sub` as `"jwt_sub"`)
-for this request only, and taken out again when the handler returns, so a
-session middleware in front never saves it into a cookie. Reading claims
-from the session is deprecated: use `claims` and `subject`. The copy into
-the session goes after 0.1.
+`.required_claims` lists string claims a token must carry; one without
+them gets 401 `invalid_token`. It is `&.{"sub"}` by default, so
+`anole.auth.subject(req)` is never null behind the middleware; `&.{}`
+requires none. Nothing from the token goes into `req.session`.
 
 ### Signing
 
@@ -373,14 +370,20 @@ is `ak_` plus 256 random bits in base64url, 46 characters. Show the key to
 its owner once. Store only the digest, a SHA-256: the key is random, so a
 slow hash adds nothing.
 
-`apikey.Middleware` takes the key from `Authorization: Bearer ak_...` or
-`X-API-Key`, hashes it, and asks your lookup function for the owner. It
-answers 401 with `WWW-Authenticate: Bearer` when there is no owner. The
-handler reads the owner with `anole.auth.apikey.owner(req)` (from the
-request's locals). It is also in `req.session` as `"api_key_owner"` for that
-request only (taken out again when the handler returns, so a session
-middleware in front never saves it); that copy is deprecated and goes after
-0.1.
+`apikey.Middleware` takes the key from the request (`apikey.fromRequest`),
+hashes it, and asks your lookup function for the owner. It answers 401 with
+`WWW-Authenticate: Bearer` when there is no owner. The handler reads the
+owner with `anole.auth.apikey.owner(req)` (from the request's locals).
+
+The key can come in two headers:
+
+- `X-API-Key: <key>`, with any value: the header means nothing else, so
+  keys without the prefix (imported from another system) work there.
+- `Authorization: Bearer ak_...`, only with the `ak_` prefix. JWTs use the
+  same header (`RequireJwt`), and the prefix is what tells the two apart:
+  a bearer token without it is not an API key.
+
+When both are sent, the bearer form wins.
 
 ```zig
 fn lookup(ptr: ?*anyopaque, arena: std.mem.Allocator, digest: anole.auth.apikey.Digest) anyerror!?[]const u8 {

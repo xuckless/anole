@@ -35,18 +35,8 @@ pub fn subject(req: *const dusty.Request) ?[]const u8 {
     return v.string("sub");
 }
 
-/// A claim copied into `req.session` under `key`. Deprecated: read the
-/// token with `claims(req)` or `subject(req)`. The copy into the session
-/// goes after 0.1.
-pub const Claim = struct {
-    claim: []const u8,
-    key: []const u8,
-    /// A token without this claim (as a string) is refused.
-    required: bool = false,
-};
-
-/// Called with the verified token before the handler, for what the claim
-/// mapping cannot express (arrays, nested objects). Its claims live in
+/// Called with the verified token before the handler, for checks of your
+/// own (array or object claims, a revocation list). Its claims live in
 /// `req.arena`. An error refuses the request with 401 `invalid_token`.
 pub const Hook = struct {
     ptr: ?*anyopaque = null,
@@ -63,14 +53,10 @@ pub const Keys = union(enum) {
 
 /// `RequireJwt` settings beyond the claims policy.
 pub const Options = struct {
-    /// Claims copied into `req.session` (string claims only); a `required`
-    /// one also refuses a token without it. The entries are there for the
-    /// handler and taken out again when it returns, with whatever the
-    /// session held under those keys put back, so a session middleware in
-    /// front never saves them. Deprecated as a way to read claims (use
-    /// `claims(req)` and `subject(req)`); the default copy of `sub` into
-    /// "jwt_sub" goes after 0.1.
-    claims: []const Claim = &.{.{ .claim = "sub", .key = "jwt_sub", .required = true }},
+    /// String claims a token must carry; one without any of them is
+    /// refused with 401 `invalid_token`. `sub` by default, so `subject(req)`
+    /// is never null behind the middleware; `&.{}` requires none.
+    required_claims: []const []const u8 = &.{"sub"},
     /// Every one of these must be in the token's `scope` claim (a
     /// space-separated string, RFC 8693); 403 otherwise.
     scopes: []const []const u8 = &.{},
@@ -130,6 +116,9 @@ pub const RequireJwt = struct {
             },
         };
 
+        for (self.options.required_claims) |name| {
+            if (v.string(name) == null) return self.refuse(res, .invalid_token);
+        }
         if (self.options.scopes.len > 0) {
             const granted = v.string("scope") orelse "";
             for (self.options.scopes) |want| {
@@ -142,31 +131,6 @@ pub const RequireJwt = struct {
         }
 
         try req.setLocal(claims_key, v);
-
-        // Copy the claims in, remembering what the session held.
-        const mapped = self.options.claims;
-        const saved = try req.arena.alloc(?[]const u8, mapped.len);
-        for (mapped, saved) |c, *prev| prev.* = req.session.get(c.key);
-        const was_modified = req.session.modified;
-        defer {
-            const handler_modified = req.session.modified;
-            for (mapped, saved) |c, prev| {
-                if (prev) |p| req.session.set(c.key, p) catch {} else req.session.remove(c.key);
-            }
-            req.session.modified = handler_modified;
-        }
-        for (mapped) |c| {
-            if (v.string(c.claim)) |value| {
-                try req.session.set(c.key, value);
-            } else {
-                req.session.remove(c.key);
-                if (c.required) {
-                    req.session.modified = was_modified;
-                    return self.refuse(res, .invalid_token);
-                }
-            }
-        }
-        req.session.modified = was_modified;
         if (self.options.hook) |h| h.func(h.ptr, req, &v) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |e| return e,
             else => {
