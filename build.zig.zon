@@ -72,6 +72,12 @@
             .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
             .lazy = true,
         },
+        // -Dbrotli: google/brotli 1.2.0, built by build/brotli.zig.
+        .brotli = .{
+            .url = "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz",
+            .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
+            .lazy = true,
+        },
         .zlib_zig = .{
             .url = "git+https://github.com/lalinsky/zlib.zig#537dbce25b1b29a0361845b019711dad35699aa6",
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",

@@ -116,4 +116,5 @@ comptime {
     _ = @import("server/static.zig");
     _ = @import("server/static_test.zig");
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
+    if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");
 }

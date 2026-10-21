@@ -1781,6 +1781,7 @@ pub fn Server(comptime Ctx: type) type {
         pub fn configureResponse(self: *const Self, res: *Response) void {
             res.send_date = self.config.response.date;
             res.default_content_type = self.config.response.default_content_type;
+            res.brotli_quality = self.config.response.brotli_quality;
             res.error_format = self.config.errors;
         }
 

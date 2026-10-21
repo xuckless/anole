@@ -31,6 +31,7 @@ const ngtcp2_build = @import("build/ngtcp2.zig");
 const nghttp3_build = @import("build/nghttp3.zig");
 const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
+const brotli_build = @import("build/brotli.zig");
 const yyjson_build = @import("build/yyjson.zig");
 const hiredis_build = @import("build/hiredis.zig");
 const sqlite_build = @import("build/sqlite.zig");
@@ -62,6 +63,9 @@ pub const Features = struct {
     /// gzip/deflate (zlib-ng) and zstd: response compression and request
     /// decompression.
     compression: bool,
+    /// Brotli (google/brotli) as a third response coding next to zstd and
+    /// gzip. Needs `compression`.
+    brotli: bool,
     /// JSON on yyjson (`anole.json`).
     json: bool,
     /// Redis/Valkey on hiredis (`anole.redis`): session and rate-limit
@@ -78,9 +82,9 @@ pub const Features = struct {
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true },
         };
     }
 
@@ -88,6 +92,7 @@ pub const Features = struct {
     pub fn invalid(f: Features) ?[]const u8 {
         if (f.grpc and !f.http2) return "-Dgrpc=true requires -Dhttp2=true (gRPC runs over HTTP/2 with trailers)";
         if (f.http3 and f.tls == .none) return "-Dhttp3=true requires -Dtls=boringssl (QUIC always uses TLS 1.3)";
+        if (f.brotli and !f.compression) return "-Dbrotli=true requires -Dcompression=true (Brotli is one of the Compress middleware's codings)";
         return null;
     }
 
@@ -100,7 +105,7 @@ pub const Features = struct {
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
-            (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
+            (!f.compression or have.compression) and (!f.brotli or have.brotli) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
             (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth) and
             (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb);
     }
@@ -120,6 +125,13 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
     .{ .name = "full-no-compression", .features = blk: {
         var f = Features.preset(.full);
         f.compression = false;
+        f.brotli = false;
+        break :blk f;
+    } },
+    // zstd and gzip without Brotli.
+    .{ .name = "full-no-brotli", .features = blk: {
+        var f = Features.preset(.full);
+        f.brotli = false;
         break :blk f;
     } },
     .{ .name = "http2-no-grpc", .features = blk: {
@@ -459,9 +471,9 @@ pub fn build(b: *std.Build) void {
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
-    // nghttp2, zlib-ng and zstd. Part of `test`, and `core-test` alone.
-    if (core.dusty_by[1][1][1] != null and target.query.isNative()) {
-        const core_full = core.dusty_by[1][1][1].?;
+    // nghttp2, zlib-ng, zstd and Brotli. Part of `test`, and `core-test` alone.
+    if (core.dusty_by[1][1][1][@intFromBool(features.brotli)] != null and target.query.isNative()) {
+        const core_full = core.dusty_by[1][1][1][@intFromBool(features.brotli)].?;
         // A second instance of the same sources and imports, but with the
         // core's zio stub: its tests run on std.testing.io, and the real
         // zio's timers need a zio task.
@@ -512,7 +524,7 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
-        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng and zstd").dependOn(&run_core_tests.step);
+        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli").dependOn(&run_core_tests.step);
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -908,7 +920,8 @@ pub fn build(b: *std.Build) void {
 
 /// Reads -Dprofile and the per-feature overrides. A feature that depends on a
 /// turned-off one follows it when it was not set explicitly (`-Dtls=none`
-/// turns http3 off, `-Dhttp2=false` turns grpc off); an explicit contradiction
+/// turns http3 off, `-Dhttp2=false` turns grpc off, `-Dcompression=false`
+/// brotli); an explicit contradiction
 /// is an error.
 fn resolveFeatures(b: *std.Build) Features {
     const profile = b.option(Profile, "profile", "Feature preset: minimal (HTTP/1.1 only), web, full (default)") orelse .full;
@@ -919,6 +932,7 @@ fn resolveFeatures(b: *std.Build) Features {
     const websocket = b.option(bool, "websocket", "WebSocket (overrides the profile)");
     const auth = b.option(bool, "auth", "Auth: JWT, OIDC, sessions, API keys (overrides the profile)");
     const compression = b.option(bool, "compression", "gzip/deflate (zlib-ng) and zstd (overrides the profile)");
+    const brotli = b.option(bool, "brotli", "Brotli response compression (google/brotli); needs -Dcompression=true (overrides the profile)");
     const json = b.option(bool, "json", "JSON on yyjson (overrides the profile)");
     const redis = b.option(bool, "redis", "Redis/Valkey client on hiredis (overrides the profile)");
     const postgres = b.option(bool, "postgres", "PostgreSQL client (overrides the profile)");
@@ -933,6 +947,7 @@ fn resolveFeatures(b: *std.Build) Features {
     if (websocket) |v| f.websocket = v;
     if (auth) |v| f.auth = v;
     if (compression) |v| f.compression = v;
+    if (brotli) |v| f.brotli = v;
     if (json) |v| f.json = v;
     if (redis) |v| f.redis = v;
     if (postgres) |v| f.postgres = v;
@@ -941,6 +956,7 @@ fn resolveFeatures(b: *std.Build) Features {
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
+    if (!f.compression and brotli == null) f.brotli = false;
 
     if (f.invalid()) |msg| {
         std.debug.print("error: invalid Anole feature flags: {s}\n", .{msg});
@@ -980,15 +996,15 @@ const LlHttp = struct {
 const Core = struct {
     zio: *std.Build.Module,
     llhttp: LlHttp,
-    /// dusty instances by [tls][http2][compression]. One exists for each
-    /// combination this build can satisfy: TLS needs BoringSSL in the build,
-    /// HTTP/2 nghttp2, compression zlib-ng. Different arguments give separate
-    /// dusty instances, so test-flags can build every combination side by
-    /// side.
-    dusty_by: [2][2][2]?*std.Build.Module,
+    /// dusty instances by [tls][http2][compression][brotli]. One exists for
+    /// each combination this build can satisfy: TLS needs BoringSSL in the
+    /// build, HTTP/2 nghttp2, compression zlib-ng, Brotli google/brotli and
+    /// compression. Different arguments give separate dusty instances, so
+    /// test-flags can build every combination side by side.
+    dusty_by: [2][2][2][2]?*std.Build.Module,
     /// src/h2/client.zig for each HTTP/2 dusty instance, which imports it as
     /// `h2_client` (and it imports that dusty back), by the same index.
-    h2_client_by: [2][2][2]?*std.Build.Module,
+    h2_client_by: [2][2][2][2]?*std.Build.Module,
     /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
 
@@ -1004,33 +1020,37 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(null))), .h2_client_by = @splat(@splat(@splat(null))), .tls_seam = seam };
+        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
                 if (http2 and c_mods.nghttp2 == null) continue;
                 for ([_]bool{ false, true }) |compression| {
                     if (compression and c_mods.zlib == null) continue;
-                    const dusty_mod = coreModule(
-                        b,
-                        zio_mod,
-                        core.llhttp,
-                        if (tls) seam else null,
-                        if (http2) c_mods.nghttp2 else null,
-                        if (compression) c_mods.zlib else null,
-                        if (compression) c_mods.zstd else null,
-                        target,
-                        optimize,
-                    );
-                    core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)] = dusty_mod;
-                    if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)] = h2ClientModule(
-                        b,
-                        dusty_mod,
-                        c_mods.nghttp2.?,
-                        if (tls) seam else null,
-                        target,
-                        optimize,
-                    );
+                    for ([_]bool{ false, true }) |brotli| {
+                        if (brotli and (!compression or c_mods.brotli == null)) continue;
+                        const dusty_mod = coreModule(
+                            b,
+                            zio_mod,
+                            core.llhttp,
+                            if (tls) seam else null,
+                            if (http2) c_mods.nghttp2 else null,
+                            if (compression) c_mods.zlib else null,
+                            if (compression) c_mods.zstd else null,
+                            if (brotli) c_mods.brotli else null,
+                            target,
+                            optimize,
+                        );
+                        core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
+                        if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
+                            b,
+                            dusty_mod,
+                            c_mods.nghttp2.?,
+                            if (tls) seam else null,
+                            target,
+                            optimize,
+                        );
+                    }
                 }
             }
         }
@@ -1038,11 +1058,11 @@ const Core = struct {
     }
 
     fn dusty(core: Core, f: Features) *std.Build.Module {
-        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
+        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)][@intFromBool(f.brotli)].?;
     }
 
     fn h2Client(core: Core, f: Features) *std.Build.Module {
-        return core.h2_client_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
+        return core.h2_client_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)][@intFromBool(f.brotli)].?;
     }
 
     /// The HTTP/2 client, as its own module so dusty's client can take it
@@ -1073,7 +1093,7 @@ const Core = struct {
     }
 
     /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one
-    /// combination of TLS, HTTP/2 and compression. What a combination leaves
+    /// combination of TLS, HTTP/2, compression and Brotli. What a combination leaves
     /// out gets the core's stub instead (`tls`, `zlib`), or no import at all.
     fn coreModule(
         b: *std.Build,
@@ -1083,6 +1103,7 @@ const Core = struct {
         nghttp2: ?*std.Build.Module,
         zlib: ?*std.Build.Module,
         zstd: ?*std.Build.Module,
+        brotli: ?*std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -1097,6 +1118,7 @@ const Core = struct {
         opts.addOption(bool, "use_http2", nghttp2 != null);
         opts.addOption(bool, "use_zlib", zlib != null);
         opts.addOption(bool, "use_zstd", zstd != null);
+        opts.addOption(bool, "use_brotli", brotli != null);
         mod.addOptions("build_options", opts);
         // The real runtime, so timeouts use zio.AutoCancel; the core's own
         // tests use src/http/core/zio_stub.zig instead.
@@ -1107,6 +1129,7 @@ const Core = struct {
         if (nghttp2) |m| mod.addImport("nghttp2", m);
         if (zlib) |m| mod.addImport("zlib", m) else mod.addAnonymousImport("zlib", .{ .root_source_file = b.path("src/http/core/zlib_stub.zig") });
         if (zstd) |m| mod.addImport("zstd", m);
+        if (brotli) |m| mod.addImport("brotli", m);
         mod.addImport("llhttp", llhttp.mod);
         // llhttp is a library of its own, not C sources of this module, so
         // the module holds only Zig: Zig 0.17's fuzzer cannot take clang's
@@ -1137,6 +1160,8 @@ const CModules = struct {
     zlib_c: ?*std.Build.Module = null,
     /// zstd.h (compression)
     zstd: ?*std.Build.Module = null,
+    /// brotli/encode.h and brotli/decode.h (brotli)
+    brotli: ?*std.Build.Module = null,
     /// xuckless/websocket-zig, the sans-IO frame codec for WebSocket over
     /// HTTP/2 (websocket). Pure Zig, but fetched lazily like the C libraries.
     websocket: ?*std.Build.Module = null,
@@ -1170,6 +1195,7 @@ const CModules = struct {
         const nghttp3_dep = if (f.http3) b.lazyDependency("nghttp3", .{}) else null;
         const zlib_ng_dep = if (f.compression) b.lazyDependency("zlib_ng", .{}) else null;
         const zstd_dep = if (f.compression) b.lazyDependency("zstd", .{}) else null;
+        const brotli_dep = if (f.brotli) b.lazyDependency("brotli", .{}) else null;
         // Only its src/root.zig is used (its module would compile a second,
         // vendored zlib).
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
@@ -1192,6 +1218,7 @@ const CModules = struct {
         if (f.needsTls() and boringssl_dep == null) return null;
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
+        if (f.brotli and brotli_dep == null) return null;
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
@@ -1243,6 +1270,10 @@ const CModules = struct {
         if (zstd_dep) |up| {
             const lib = zstd_build.library(b, up, target, optimize);
             m.zstd = zstd_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
+        if (brotli_dep) |up| {
+            const lib = brotli_build.library(b, up, target, optimize);
+            m.brotli = brotli_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
 
         if (nghttp2_dep) |up| {
@@ -1313,6 +1344,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "websocket", f.websocket);
     options.addOption(bool, "auth", f.auth);
     options.addOption(bool, "compression", f.compression);
+    options.addOption(bool, "brotli", f.brotli);
     options.addOption(bool, "json", f.json);
     options.addOption(bool, "redis", f.redis);
     options.addOption(bool, "postgres", f.postgres);
@@ -1366,6 +1398,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         mod.addImport("anole_zlib_c", o.c.zlib_c.?);
         mod.addImport("anole_zstd_c", o.c.zstd.?);
     }
+    if (f.brotli) mod.addImport("anole_brotli_c", o.c.brotli.?);
     if (f.needsTls()) {
         mod.addImport("anole_boringssl_c", o.c.boringssl.?);
         mod.addImport("anole_dusty_tls", o.core.tls_seam.?);

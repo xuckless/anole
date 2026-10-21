@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 const ErrorFormat = @import("config.zig").ErrorFormat;
 const statusBody = @import("middleware.zig").statusBody;
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
+const brotli_io = if (build_options.use_brotli) @import("brotli_io.zig") else struct {};
 
 var no_buf: [0]u8 = .{};
 
@@ -525,7 +526,7 @@ pub const StreamingBodyWriter = struct {
     }
 };
 
-/// Compresses a streamed body (gzip or zstd) between the handler and the
+/// Compresses a streamed body (gzip, zstd or Brotli) between the handler and the
 /// framing: what the handler writes goes into the coder, and what that
 /// produces collects in `out` until there is a chunk's worth. Allocated from
 /// the arena, since the coder writes into `out` by pointer and the body
@@ -539,12 +540,14 @@ const StreamCompressor = struct {
     const Coder = union(enum) {
         gzip: zlib.Compress,
         zstd: if (build_options.use_zstd) zstd_io.Compress else void,
+        br: if (build_options.use_brotli) brotli_io.Compress else void,
     };
 
     fn input(self: *StreamCompressor) *std.Io.Writer {
         return switch (self.coder) {
             .gzip => |*g| &g.writer,
             .zstd => |*z| if (build_options.use_zstd) &z.writer else unreachable,
+            .br => |*z| if (build_options.use_brotli) &z.writer else unreachable,
         };
     }
 
@@ -568,9 +571,23 @@ const StreamCompressor = struct {
                 self.coder = .{ .zstd = undefined };
                 try self.coder.zstd.init(res.arena, &self.out, &.{}, .{});
             } else unreachable,
+            // Its memory is malloc'd: `deinit` frees it, from `finish` or
+            // from `Response.deinit` for a body never ended.
+            .br => if (build_options.use_brotli) {
+                self.coder = .{ .br = undefined };
+                try self.coder.br.init(&self.out, &.{}, .{ .quality = res.brotli_quality });
+            } else unreachable,
             else => self.coder = .{ .gzip = try .init(res.arena, &self.out, &.{}, .gzip, options) },
         }
         return self;
+    }
+
+    /// Frees what is not the arena's (Brotli's encoder). Idempotent.
+    fn deinit(self: *StreamCompressor) void {
+        switch (self.coder) {
+            .br => |*z| if (build_options.use_brotli) z.deinit() else unreachable,
+            else => {},
+        }
     }
 
     fn write(self: *StreamCompressor, pending: []const u8, data: []const []const u8, splat: usize) std.Io.Writer.Error!void {
@@ -592,7 +609,9 @@ const StreamCompressor = struct {
         switch (self.coder) {
             .gzip => |*g| try g.finish(),
             .zstd => |*z| if (build_options.use_zstd) try z.finish() else unreachable,
+            .br => |*z| if (build_options.use_brotli) try z.finish() else unreachable,
         }
+        self.deinit();
         try self.out.flush();
     }
 
@@ -672,7 +691,8 @@ pub const Response = struct {
     /// The request this answers, when the server built the pair. Set by the
     /// server.
     request: ?*const Request = null,
-    /// Send the body gzipped if the request's `Accept-Encoding` allows it.
+    /// Send the body compressed (zstd, Brotli or gzip, as the build has
+    /// them) if the request's `Accept-Encoding` allows it.
     /// Settled with the headers: by `stream`, or by `write` for a buffered
     /// body, which goes out as it is when it is short or does not shrink.
     /// Ignored when the handler set its own `Content-Encoding`,
@@ -688,6 +708,13 @@ pub const Response = struct {
     /// to go out as it was kept its `ETag` strong, which still matches the
     /// weak one under the weak comparison `If-None-Match` uses.
     compress: bool = false,
+    /// Brotli's quality, 0 to 11, when `compress` picks `br`. Set by the
+    /// server from `ServerConfig.response.brotli_quality`; a handler may
+    /// change it for its own response before the headers go out.
+    brotli_quality: u4 = 5,
+    /// The streamed body's compressor, once `stream` made one: freed by
+    /// `deinit` if the body was never ended.
+    stream_compressor: ?*StreamCompressor = null,
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
@@ -788,6 +815,7 @@ pub const Response = struct {
     /// Closes a file body that `write` never got to send.
     pub fn deinit(self: *Response) void {
         self.closeFile();
+        if (self.stream_compressor) |compressor| compressor.deinit();
     }
 
     pub const SendFileOptions = struct {
@@ -879,6 +907,7 @@ pub const Response = struct {
             }
         else
             null;
+        self.stream_compressor = compressor;
         self.headers_written = true;
 
         if (compression != .off) self.addVary();
@@ -1261,9 +1290,10 @@ pub const Response = struct {
         identity,
         gzip,
         zstd,
+        br,
 
         fn isCoding(c: Compression) bool {
-            return c == .gzip or c == .zstd;
+            return c == .gzip or c == .zstd or c == .br;
         }
 
         fn name(c: Compression) []const u8 {
@@ -1272,13 +1302,13 @@ pub const Response = struct {
     };
 
     /// Whether compression applies to this response at all, and if so,
-    /// whether the client takes gzip.
+    /// which of our codings the client takes.
     ///
     /// Settles nothing: the headers that say so go on with `addVary` and
     /// `markCompressed`, which have their room reserved here, so that
     /// nothing fails after a response has started claiming a coding.
     fn negotiateCompression(self: *const Response) Compression {
-        if (!(build_options.use_zlib or build_options.use_zstd) or !self.compress) return .off;
+        if (!(build_options.use_zlib or build_options.use_zstd or build_options.use_brotli) or !self.compress) return .off;
         if (self.file != null) return .off;
         // A tunnel (RFC 8441), not a representation.
         if (self.request) |r| if (r.protocol != null) return .off;
@@ -1301,12 +1331,16 @@ pub const Response = struct {
         if (self.headers.keys.len - self.headers.len < needed) return .off;
 
         const request = self.request orelse return .identity;
-        // The client's q-values first; on a tie, zstd, which compresses
-        // better and faster than gzip.
+        // The client's q-values first; on a tie, zstd, then Brotli, then
+        // gzip. zstd compresses about as well as gzip at a third of the
+        // time; Brotli at quality 5 is 10-15% smaller than either on JSON
+        // of a few KiB, at about twice gzip's time.
         const zstd_q: u16 = if (build_options.use_zstd) http.encodingQuality(&request.headers, "zstd") else 0;
+        const br_q: u16 = if (build_options.use_brotli) http.encodingQuality(&request.headers, "br") else 0;
         const gzip_q: u16 = if (build_options.use_zlib) http.encodingQuality(&request.headers, "gzip") else 0;
-        if (zstd_q == 0 and gzip_q == 0) return .identity;
-        return if (zstd_q >= gzip_q) .zstd else .gzip;
+        if (zstd_q == 0 and br_q == 0 and gzip_q == 0) return .identity;
+        if (zstd_q >= br_q and zstd_q >= gzip_q) return .zstd;
+        return if (br_q >= gzip_q) .br else .gzip;
     }
 
     /// `Vary: *` included, which says the response varies by anything.
@@ -1359,6 +1393,7 @@ pub const Response = struct {
         if (len < min_compress_len) return;
         const compressed = switch (coding) {
             .zstd => if (build_options.use_zstd) self.zstdBody(len) catch return else unreachable,
+            .br => if (build_options.use_brotli) self.brotliBody(len) catch return else unreachable,
             else => self.deflateBody(len) catch return,
         };
         if (compressed.len() >= len) return;
@@ -1374,6 +1409,19 @@ pub const Response = struct {
         var out: BodyWriter = .into(self, &compressed);
         var z: zstd_io.Compress = undefined;
         try z.init(self.arena, &out.interface, &.{}, .{ .window_log = null, .pledged_size = len });
+        if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&z.writer) else try z.writer.writeAll(self.body);
+        try z.finish();
+        try out.interface.flush();
+        return compressed;
+    }
+
+    /// The buffered body as one Brotli stream, its window fitted to it.
+    fn brotliBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error || error{CompressFailed})!BodyBuffer {
+        var compressed: BodyBuffer = try .init(self.arena);
+        var out: BodyWriter = .into(self, &compressed);
+        var z: brotli_io.Compress = undefined;
+        try z.init(&out.interface, &.{}, .{ .quality = self.brotli_quality, .lgwin = brotli_io.windowFor(len), .size_hint = len });
+        defer z.deinit();
         if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&z.writer) else try z.writer.writeAll(self.body);
         try z.finish();
         try out.interface.flush();
@@ -3754,6 +3802,164 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary: Accept-Encoding\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+}
+
+test "Response: Accept-Encoding picks zstd, br or gzip by q-value, then in that order" {
+    if (!(build_options.use_zlib and build_options.use_zstd and build_options.use_brotli)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    const cases = [_]struct { []const u8, Response.Compression }{
+        // HttpArena's json-comp and Safari: br over gzip on a tie.
+        .{ "gzip, br", .br },
+        .{ "br", .br },
+        // Chrome and Firefox: zstd first on a tie.
+        .{ "gzip, deflate, br, zstd", .zstd },
+        .{ "br;q=1.0, zstd;q=0.9, gzip", .br },
+        .{ "br;q=0.5, gzip", .gzip },
+        .{ "gzip;q=0.2, br;q=0.8, zstd;q=0.5", .br },
+        .{ "*", .zstd },
+        .{ "*;q=0.1, br", .br },
+        .{ "*, zstd;q=0, gzip;q=0.5", .br },
+        .{ "br;q=0, gzip", .gzip },
+        .{ "br;q=0", .identity },
+        .{ "identity", .identity },
+        .{ "deflate", .identity },
+        .{ "", .identity },
+    };
+    for (cases) |case| {
+        var request: Request = .{ .arena = arena.allocator(), .parser = undefined, .transport = undefined };
+        request.headers = try http.Headers.init(arena.allocator(), 4);
+        try request.headers.put("Accept-Encoding", case[0]);
+        var response = try Response.init(arena.allocator(), &connection, 8);
+        response.request = &request;
+        response.compress = true;
+        std.testing.expectEqual(case[1], response.negotiateCompression()) catch |err| {
+            std.debug.print("Accept-Encoding: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+fn testBrRequest(arena: std.mem.Allocator) !Request {
+    var request: Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    request.headers = try http.Headers.init(arena, 4);
+    try request.headers.put("Accept-Encoding", "gzip, br");
+    return request;
+}
+
+fn testBrotliDecode(arena: std.mem.Allocator, encoded: []const u8, max: usize) ![]u8 {
+    const c = @import("brotli");
+    const out = try arena.alloc(u8, max);
+    var len: usize = max;
+    if (c.BrotliDecoderDecompress(encoded.len, encoded.ptr, &len, out.ptr) != c.BROTLI_DECODER_RESULT_SUCCESS) return error.InvalidBrotli;
+    return out[0..len];
+}
+
+test "Response: a buffered body goes out as br, at the configured quality" {
+    if (!build_options.use_brotli) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var text: std.Io.Writer.Allocating = .init(arena.allocator());
+    for (0..100) |i| try text.writer.print("{{\"id\":{d},\"name\":\"Widget {d}\",\"price\":{d}}},", .{ i, i % 9, i * 37 % 500 });
+    const body = text.written();
+
+    var sizes: [2]usize = undefined;
+    for ([_]u4{ 1, 9 }, &sizes) |quality, *size| {
+        var buf: [8192]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        const request = try testBrRequest(arena.allocator());
+        var response = try Response.init(arena.allocator(), &connection, 8);
+        defer response.deinit();
+        response.request = &request;
+        response.compress = true;
+        response.brotli_quality = quality;
+        response.content_type = .json;
+        response.body = body;
+        try response.write();
+
+        const written = conn_writer.buffered();
+        const split = std.mem.indexOf(u8, written, "\r\n\r\n").?;
+        const head = written[0 .. split + 2];
+        try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br\r\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, head, "Vary: Accept-Encoding\r\n") != null);
+        const encoded = written[split + 4 ..];
+        try std.testing.expect(std.mem.indexOf(u8, head, try std.fmt.allocPrint(arena.allocator(), "Content-Length: {d}\r\n", .{encoded.len})) != null);
+        try std.testing.expectEqualStrings(body, try testBrotliDecode(arena.allocator(), encoded, body.len));
+        size.* = encoded.len;
+    }
+    try std.testing.expect(sizes[1] < sizes[0]);
+}
+
+test "Response: a streamed body goes out as br, each flush decodable" {
+    if (!build_options.use_brotli) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [16384]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    const request = try testBrRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 8);
+    defer response.deinit();
+    response.request = &request;
+    response.compress = true;
+    response.content_type = .text;
+
+    var stream_buf: [128]u8 = undefined;
+    var w = try response.stream(&stream_buf);
+    var plain: std.Io.Writer.Allocating = .init(arena.allocator());
+    for (0..50) |i| {
+        try w.interface.print("event {d}: something happened, and then something else happened\n", .{i});
+        try plain.writer.print("event {d}: something happened, and then something else happened\n", .{i});
+        if (i % 10 == 9) try w.interface.flush();
+    }
+    try w.end();
+
+    const written = conn_writer.buffered();
+    const split = std.mem.indexOf(u8, written, "\r\n\r\n").?;
+    const head = written[0 .. split + 2];
+    try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Transfer-Encoding: chunked\r\n") != null);
+    // Undo the chunking: several chunks, one per flush and the end.
+    var encoded: std.Io.Writer.Allocating = .init(arena.allocator());
+    var rest = written[split + 4 ..];
+    var chunks: usize = 0;
+    while (true) {
+        const eol = std.mem.indexOf(u8, rest, "\r\n").?;
+        const size = try std.fmt.parseInt(usize, rest[0..eol], 16);
+        if (size == 0) break;
+        try encoded.writer.writeAll(rest[eol + 2 ..][0..size]);
+        rest = rest[eol + 2 + size + 2 ..];
+        chunks += 1;
+    }
+    try std.testing.expect(chunks >= 5);
+    try std.testing.expectEqualStrings(plain.written(), try testBrotliDecode(arena.allocator(), encoded.written(), plain.written().len));
+    // The encoder's memory (malloc'd) went back when the body ended.
+    try std.testing.expect(response.stream_compressor.?.coder.br.state == null);
+}
+
+test "Response.deinit frees the Brotli encoder of a stream never ended" {
+    if (!build_options.use_brotli) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    const request = try testBrRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 8);
+    response.request = &request;
+    response.compress = true;
+    var stream_buf: [64]u8 = undefined;
+    var w = try response.stream(&stream_buf);
+    try w.interface.writeAll("abandoned half way");
+    try std.testing.expect(response.stream_compressor.?.coder.br.state != null);
+    response.deinit();
+    try std.testing.expect(response.stream_compressor.?.coder.br.state == null);
 }
 
 const test_templates = struct {
