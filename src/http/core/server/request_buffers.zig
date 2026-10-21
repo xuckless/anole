@@ -23,13 +23,62 @@ const placement = @import("../placement.zig");
 /// A request's read and write buffers and arena, in one allocation with
 /// this header.
 pub const RequestBuffers = struct {
+    /// Its chunks come from `backing` through `chunkAllocator`.
     arena: std.heap.ArenaAllocator,
     read_buffer: []u8,
     write_buffer: []u8,
+    /// The pool's allocator.
+    backing: std.mem.Allocator,
     node: std.SinglyLinkedList.Node = .{},
     /// The shard it was taken from, and goes back to.
     shard: u8 = 0,
+
+    /// The arena's allocator: `backing`, with the pages of a chunk the
+    /// arena frees given back to the OS first (a trimmed set, or an arena
+    /// that outgrew its chunk), since an allocator keeps freed memory
+    /// resident for its next allocations.
+    fn chunkAllocator(self: *RequestBuffers) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn backingOf(ctx: *anyopaque) std.mem.Allocator {
+        const self: *RequestBuffers = @ptrCast(@alignCast(ctx));
+        return self.backing;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        return backingOf(ctx).rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        return backingOf(ctx).rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        return backingOf(ctx).rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        releasePages(memory);
+        backingOf(ctx).rawFree(memory, alignment, ret_addr);
+    }
 };
+
+/// glibc's `malloc_trim`, where the allocator may be glibc's malloc.
+const have_malloc_trim = builtin.os.tag == .linux and builtin.abi.isGnu() and builtin.link_libc;
+extern "c" fn malloc_trim(pad: usize) c_int;
+
+/// Gives the OS back the whole pages inside `memory`, about to be freed:
+/// only where they would stay resident otherwise (Linux), and clear of
+/// what an allocator writes into freed memory at either end.
+fn releasePages(memory: []u8) void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (memory.len < 128) return;
+    const page = std.heap.pageSize();
+    const start = std.mem.alignForward(usize, @intFromPtr(memory.ptr) + 64, page);
+    const end = std.mem.alignBackward(usize, @intFromPtr(memory.ptr) + memory.len - 64, page);
+    if (end > start) _ = std.os.linux.madvise(@ptrFromInt(start), end - start, std.os.linux.MADV.DONTNEED);
+}
 
 pub const RequestBuffersPool = struct {
     allocator: std.mem.Allocator,
@@ -185,21 +234,22 @@ pub const RequestBuffersPool = struct {
     }
 
     fn destroyAll(self: *RequestBuffersPool, list: std.SinglyLinkedList) void {
+        if (list.first == null) return;
+        // glibc's malloc also keeps the page under each freed chunk's
+        // header resident; it gives those back too.
+        defer if (comptime have_malloc_trim) {
+            _ = malloc_trim(0);
+        };
         var it = list.first;
         while (it) |node| {
             it = node.next;
             const buffers: *RequestBuffers = @fieldParentPtr("node", node);
-            // The pages go back to the OS too: an allocator that keeps
-            // freed memory for its next allocations (a heap, a size class)
-            // would keep them resident. Only whole pages inside the
-            // buffers, clear of any bookkeeping the allocator writes into
-            // freed memory at either end.
-            if (comptime builtin.os.tag == .linux) {
-                const page = std.heap.pageSize();
-                const start = std.mem.alignForward(usize, @intFromPtr(buffers.read_buffer.ptr) + 64, page);
-                const end = std.mem.alignBackward(usize, @intFromPtr(buffers.write_buffer.ptr) + buffers.write_buffer.len - 64, page);
-                if (end > start) _ = std.os.linux.madvise(@ptrFromInt(start), end - start, std.os.linux.MADV.DONTNEED);
-            }
+            // Its pages go back to the OS too, not only to the allocator:
+            // the arena's chunks as it frees them (`chunkAllocator`), then
+            // the buffers.
+            buffers.arena.deinit();
+            buffers.arena = .init(buffers.chunkAllocator());
+            releasePages(@as([*]u8, @ptrCast(buffers))[@sizeOf(RequestBuffers)..][0..self.buffersLen()]);
             self.destroy(buffers);
         }
     }
@@ -217,10 +267,12 @@ pub const RequestBuffersPool = struct {
         const buffers: *RequestBuffers = @ptrCast(memory.ptr);
         const read_buffer = memory[@sizeOf(RequestBuffers)..][0..self.read_buffer_len];
         buffers.* = .{
-            .arena = .init(self.allocator),
+            .arena = undefined,
             .read_buffer = read_buffer,
             .write_buffer = memory[@sizeOf(RequestBuffers) + read_buffer.len ..],
+            .backing = self.allocator,
         };
+        buffers.arena = .init(buffers.chunkAllocator());
         errdefer self.destroy(buffers);
         // Reset keeps the memory, as one node the requests are then carved
         // from.
