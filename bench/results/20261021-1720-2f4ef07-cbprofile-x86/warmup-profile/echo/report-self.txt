@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 9K of event 'cpu_core/cycles/P'
+# Event count (approx.): 15573150845
+#
+# Overhead  Symbol                                                       
+# ........  .............................................................
+#
+     6.59%  [k] nft_do_chain
+     5.79%  [.] runtime.Executor.switchOut
+     5.15%  [.] websocket.root.Socket.next
+     3.27%  [k] fdget
+     2.77%  [k] __nf_conntrack_find_get
+     2.52%  [.] websocket.root.Socket.send
+     2.26%  [.] runtime.Executor.run
+     2.17%  [k] __inet_lookup_established
+     2.03%  [k] selinux_socket_recvmsg
+     1.87%  [.] websocket.WebSocket.writeFrameRsv
+     1.81%  [.] compiler_rt.memcpy.memcpyFast
+     1.66%  [.] websocket.WebSocket.writeFrame
+     1.48%  [.] server.Connection.lendWriteBuffer
+     1.46%  [k] io_poll_wake
+     1.41%  [k] ____sys_recvmsg
+     1.39%  [k] sock_has_perm
+     1.28%  [k] nft_meta_get_eval
+     1.25%  [.] heap.ArenaAllocator.alloc
+     1.24%  [.] websocket.Backstop.run
+     1.21%  [k] __sys_sendto
+     1.10%  [k] nft_meta_store_ifname
+     1.06%  [k] sock_def_readable
+     1.03%  [k] __wake_up_common
+     0.99%  [k] sized_strscpy
+     0.98%  [k] tcp_rcv_space_adjust
+     0.96%  [k] tcp_recvmsg_locked
+     0.95%  [.] server.Connection.releaseWriteBuffer
+     0.94%  [k] skb_defer_free_flush
+     0.93%  [.] io.netWriteOpImpl
+     0.89%  [k] __skb_datagram_iter
+     0.89%  [k] tcp_rcv_established
+     0.76%  [k] __raw_spin_lock_irqsave
+     0.74%  [k] _copy_to_iter
+     0.74%  [.] ev.sockreg.service__func_899
+     0.72%  [k] tcp_v4_rcv
+     0.72%  [k] tcp_sendmsg_locked
+     0.72%  [.] Io.net.Stream.Reader.readVec
+     0.71%  [.] ev.sockreg.submitIo__func_2989
+     0.66%  [k] skb_release_data
+     0.64%  [k] strnlen
+     0.62%  [.] websocket.root.route.S.serve.3
+     0.61%  [k] io_req_local_work_add
+     0.57%  [.] io.operateInner
+     0.55%  [k] tcp_delack_timer
+     0.54%  [k] try_charge_memcg
+     0.52%  [k] __tcp_transmit_skb
+     0.52%  [.] ev.loop.Loop.addInternal
+     0.52%  [k] __pi_memcpy
+     0.51%  [.] heap.ArenaAllocator.reset

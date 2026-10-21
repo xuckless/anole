@@ -42,18 +42,21 @@ func (s *Suite) WsPipe() {
 			if s.manifests[name].WS == "" {
 				continue
 			}
-			srv, err := sut.Start(s.Cfg, name, "h1", tier, map[string]string{"TICK_HZ": "0"}, 0)
-			if err != nil {
-				s.record(Case{Scenario: "wspipe", Server: name, Mode: "h1", Proto: "ws", Tier: tier.Name, Error: err.Error()})
-				continue
-			}
 			for _, path := range paths {
+				// A fresh server per route: a route measured after another
+				// one would inherit its leftover memory and pooled stacks.
+				srv, err := sut.Start(s.Cfg, name, "h1", tier, map[string]string{"TICK_HZ": "0"}, 0)
+				if err != nil {
+					s.record(Case{Scenario: "wspipe", Server: name, Mode: "h1", Proto: "ws", Tier: tier.Name, Endpoint: path, Error: err.Error()})
+					continue
+				}
 				if path != "/ws/echo" {
 					// Optional routes (/ws/echo-cb: WebSocket callbacks) only
 					// where the server has them.
 					probe, failed := ws.OpenQuiet(context.Background(), "ws://127.0.0.1:8080"+path, 1, 1, 1)
 					ws.CloseAll(probe)
 					if failed > 0 {
+						sut.Stop()
 						continue
 					}
 				}
@@ -69,8 +72,8 @@ func (s *Suite) WsPipe() {
 					}
 					s.record(c)
 				}
+				sut.Stop()
 			}
-			sut.Stop()
 		}
 	}
 }

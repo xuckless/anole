@@ -1,0 +1,4 @@
+fds: 11239
+socket fds: 11231
+tcp states on :8080 (01 ESTAB, 08 CLOSE_WAIT, 0A LISTEN):
+      2 0A

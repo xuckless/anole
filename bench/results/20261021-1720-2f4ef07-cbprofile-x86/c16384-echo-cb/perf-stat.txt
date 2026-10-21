@@ -1,0 +1,20 @@
+# started on Wed Oct 21 17:21:57 2026
+
+
+ Performance counter stats for process id '1712557':
+
+           4000.31 msec task-clock                                                            
+                 0      page-faults                                                           
+                36      context-switches                                                      
+           1173683      raw_syscalls:sys_enter                                                
+                 0      syscalls:sys_enter_ppoll                                              
+                 0      syscalls:sys_enter_epoll_ctl                                          
+                 0      syscalls:sys_enter_mprotect                                           
+                 0      syscalls:sys_enter_munmap                                             
+                 1      syscalls:sys_enter_madvise                                            
+            569032      syscalls:sys_enter_recvfrom                                           
+            569051      syscalls:sys_enter_sendto                                             
+                 0      syscalls:sys_enter_recvmsg                                            
+
+       4.001117130 seconds time elapsed
+

@@ -1,0 +1,4 @@
+fds: 10
+socket fds: 2
+tcp states on :8080:
+      2 0A

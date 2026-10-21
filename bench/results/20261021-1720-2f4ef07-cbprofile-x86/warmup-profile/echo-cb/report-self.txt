@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 9K of event 'cpu_core/cycles/P'
+# Event count (approx.): 15363305511
+#
+# Overhead  Symbol                                                       
+# ........  .............................................................
+#
+     8.56%  [.] runtime.Executor.switchOut
+     6.20%  [k] nft_do_chain
+     6.09%  [.] websocket.root.H1Callbacks.serve
+     3.68%  [k] fdget
+     3.45%  [k] selinux_socket_recvmsg
+     2.74%  [k] __nf_conntrack_find_get
+     2.44%  [.] runtime.Executor.run
+     2.15%  [k] __sys_recvfrom
+     2.09%  [k] __inet_lookup_established
+     2.08%  [.] websocket.root.Socket.send
+     1.85%  [.] websocket.WebSocket.writeFrame
+     1.57%  [k] io_poll_wake
+     1.54%  [k] sock_has_perm
+     1.23%  [k] nft_meta_get_eval
+     1.20%  [k] __wake_up_common
+     1.20%  [.] io.netWriteOpImpl
+     1.18%  [.] heap.ArenaAllocator.alloc
+     1.09%  [k] sock_def_readable
+     1.07%  [k] sized_strscpy
+     1.05%  [k] nft_meta_store_ifname
+     1.03%  [.] Io.net.Stream.Reader.readVec
+     1.01%  [k] __sys_sendto
+     0.97%  [.] server.Connection.lendWriteBuffer
+     0.94%  [k] tcp_rcv_space_adjust
+     0.93%  [k] tcp_rcv_established
+     0.93%  [k] skb_defer_free_flush
+     0.91%  [k] __skb_datagram_iter
+     0.79%  [k] tcp_recvmsg_locked
+     0.76%  [.] heap.ArenaAllocator.reset
+     0.75%  [.] group.Group.spawnInto__func_1650.Wrapper.start
+     0.69%  [.] websocket.WebSocket.writeFrameRsv
+     0.68%  [.] os.net.recv
+     0.67%  [k] tcp_delack_timer
+     0.67%  [.] ev.sockreg.submitIo__func_2989
+     0.66%  [k] tcp_v4_rcv
+     0.66%  [k] __raw_spin_lock_irqsave
+     0.65%  [.] server.Connection.releaseWriteBuffer
+     0.63%  [.] io.operateInner
+     0.58%  [k] _copy_from_iter
+     0.57%  [.] io.operateImpl
+     0.54%  [k] _copy_to_iter
+     0.51%  [.] ev.loop.Loop.addInternal
+     0.50%  [.] os.net.send
+     0.50%  [k] __pi_memcpy
+     0.50%  [k] tcp_sendmsg_locked
+     0.49%  [k] strnlen
+     0.48%  [.] websocket.Backstop.run
+     0.48%  [.] runtime.Executor.scheduleTask
+     0.48%  [k] __tcp_transmit_skb

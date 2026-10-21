@@ -1,0 +1,8 @@
+echo c=16384 gap=0s: warm 1.992 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 2.103 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 290MB, @10s 328MB, current 462MB
+echo-cb c=16384 gap=0s: warm 2.047 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 1.71 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 241MB, @10s 418MB, current 621MB
+echo c=16384 gap=5s: warm 1.995 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 2.14 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 159MB, @10s 325MB, current 463MB
+echo-cb c=16384 gap=5s: warm 2.061 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 1.743 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 243MB, @10s 404MB, current 600MB
+echo c=4096 gap=0s: warm 2.41 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 2.409 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 80MB, @10s 83MB, current 118MB
+echo-cb c=4096 gap=0s: warm 2.525 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 2.097 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 67MB, @10s 103MB, current 153MB
+echo c=4096 gap=5s: warm 2.444 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 2.353 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 45MB, @10s 82MB, current 116MB
+echo-cb c=4096 gap=5s: warm 2.537 {'connect': 0, 'read': 0, 'timeout': 0} 0 | run 2.055 {'connect': 0, 'read': 0, 'timeout': 0} 0 | anon before run 65MB, @10s 107MB, current 160MB

@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 12K of event 'cpu_core/cycles/P'
+# Event count (approx.): 20493274572
+#
+# Overhead  Symbol                                                       
+# ........  .............................................................
+#
+     7.30%  [k] nft_do_chain
+     6.36%  [.] websocket.root.H1Callbacks.serve
+     6.33%  [.] runtime.Executor.switchOut
+     3.00%  [k] __nf_conntrack_find_get
+     2.95%  [k] fdget
+     2.70%  [.] websocket.root.Socket.send
+     2.36%  [k] __inet_lookup_established
+     1.95%  [.] websocket.WebSocket.writeFrame
+     1.87%  [k] selinux_socket_recvmsg
+     1.68%  [k] sock_has_perm
+     1.57%  [k] io_poll_wake
+     1.43%  [k] __wake_up_common
+     1.41%  [.] heap.ArenaAllocator.alloc
+     1.34%  [.] io.netWriteOpImpl
+     1.30%  [k] __sys_sendto
+     1.25%  [k] nft_meta_get_eval
+     1.23%  [.] runtime.Executor.run
+     1.15%  [k] skb_defer_free_flush
+     1.12%  [k] tcp_delack_timer
+     1.09%  [k] __sys_recvfrom
+     1.08%  [k] sock_def_readable
+     1.07%  [k] nft_meta_store_ifname
+     1.07%  [.] server.Connection.lendWriteBuffer
+     1.02%  [k] __skb_datagram_iter
+     1.01%  [k] tcp_rcv_established
+     0.98%  [k] _copy_to_iter
+     0.93%  [k] sized_strscpy
+     0.92%  [k] tcp_rcv_space_adjust
+     0.83%  [.] io.operateInner
+     0.81%  [.] websocket.WebSocket.writeFrameRsv
+     0.78%  [k] tcp_recvmsg_locked
+     0.77%  [k] tcp_sendmsg_locked
+     0.73%  [k] ktime_get
+     0.73%  [k] __raw_spin_lock_irqsave
+     0.73%  [.] compiler_rt.memcpy.memcpyFast
+     0.72%  [k] tcp_v4_rcv
+     0.66%  [.] server.Connection.releaseWriteBuffer
+     0.62%  [k] _copy_from_iter
+     0.61%  [.] ev.sockreg.submitIo__func_2989
+     0.60%  [.] heap.ArenaAllocator.reset
+     0.56%  [k] __tcp_transmit_skb
+     0.53%  [k] __pi_memcpy
+     0.51%  [k] strnlen
+     0.49%  [.] os.net.send
+     0.48%  [k] skb_release_data
+     0.48%  [k] selinux_socket_sock_rcv_skb
+     0.46%  [k] expr_call_ops_eval
+     0.43%  [.] websocket.root.Hooks(main.App,main.EchoCallbacks).message
+     0.43%  [k] nft_match_eval

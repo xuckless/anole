@@ -1,0 +1,80 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 9K of event 'cpu_core/cycles/P'
+# Event count (approx.): 15573150845
+#
+# Children      Self  Symbol                                                        
+# ........  ........  ..............................................................
+#
+    95.71%     0.00%  [.] coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+    95.71%     0.00%  [.] task.AnyTask.startFn
+    95.71%     0.00%  [k] 0000000000000000
+    94.45%     0.00%  [.] group.Group.spawnInto__func_1263.Wrapper.start
+    94.45%     0.00%  [.] middleware.Executor(main.App).next
+    94.45%     0.00%  [.] middleware.Executor(main.App).run
+    94.45%     0.00%  [.] server.Server(main.App).handleConnectionWrapper
+    94.45%     0.00%  [.] server.Server(main.App).handleRequests
+    94.39%     0.62%  [.] websocket.root.route.S.serve.3
+    74.67%     0.28%  [.] io.operateImpl
+    74.38%     0.57%  [.] io.operateInner
+    72.49%     0.17%  [.] common.waitForIo
+    68.30%     2.52%  [.] websocket.root.Socket.send
+    65.68%     1.66%  [.] websocket.WebSocket.writeFrame
+    64.36%     0.09%  [.] ev.backends.linux.epoll.checkCompletion
+    64.36%     0.71%  [.] ev.sockreg.submitIo__func_2989
+    64.02%     1.87%  [.] websocket.WebSocket.writeFrameRsv
+    63.55%     0.04%  [.] entry_SYSCALL_64_after_hwframe
+    63.52%     0.14%  [.] do_syscall_64
+    58.81%     0.06%  [.] Io.Writer.defaultFlush
+    58.75%     0.39%  [.] Io.net.Stream.Writer.drain
+    57.94%     0.93%  [.] io.netWriteOpImpl
+    52.66%     0.48%  [.] os.net.send
+    51.63%     1.21%  [.] __sys_sendto
+    51.63%     0.00%  [.] __x64_sys_sendto
+    46.73%     0.02%  [.] tcp_sendmsg
+    46.61%     0.72%  [.] tcp_sendmsg_locked
+    42.55%     0.00%  [.] __tcp_push_pending_frames
+    42.53%     0.16%  [.] tcp_write_xmit
+    40.82%     0.52%  [.] __tcp_transmit_skb
+    39.86%     0.26%  [.] __ip_queue_xmit
+    32.54%     0.10%  [.] ip_output
+    31.61%     0.18%  [.] ip_finish_output2
+    31.40%     0.15%  [.] __dev_queue_xmit
+    31.10%     0.07%  [.] handle_softirqs
+    30.60%     0.12%  [.] __local_bh_enable_ip
+    30.52%     0.06%  [.] do_softirq.part.0
+    29.79%     0.08%  [.] net_rx_action
+    27.43%     0.01%  [.] __napi_poll
+    27.40%     0.10%  [.] process_backlog
+    27.14%     0.02%  [.] __netif_receive_skb_one_core
+    25.53%     5.15%  [.] websocket.root.Socket.next
+    20.42%     0.49%  [.] nf_hook_slow
+    17.04%     0.72%  [.] Io.net.Stream.Reader.readVec
+    15.87%     0.32%  [.] io.netReadOpImpl
+    14.19%     6.59%  [.] nft_do_chain
+    13.74%     0.04%  [.] ip_local_deliver_finish
+    13.53%     0.08%  [.] ip_protocol_deliver_rcu
+    13.44%     0.72%  [.] tcp_v4_rcv
+    11.69%     0.13%  [.] common.Waiter.wait__func_884
+    11.63%     0.22%  [.] os.net.recv
+    11.54%     0.37%  [.] task.AnyTask.yield__func_1228
+    10.79%     0.27%  [.] nft_do_chain_inet
+    10.64%     0.06%  [.] __sys_recvmsg
+    10.14%     0.03%  [.] ip_rcv
+     9.66%     0.01%  [.] tcp_v4_do_rcv
+     9.12%     0.89%  [.] tcp_rcv_established
+     9.00%     0.07%  [.] ___sys_recvmsg
+     8.70%     1.41%  [.] ____sys_recvmsg
+     7.35%     0.31%  [k] tcp_data_queue
+     7.12%     0.02%  [.] sock_recvmsg
+     7.00%     0.01%  [.] ip_local_out
+     6.99%     0.08%  [.] __ip_local_out
+     6.55%     1.06%  [.] sock_def_readable
+     5.90%     5.79%  [.] runtime.Executor.switchOut
+     5.43%     0.01%  [.] __wake_up_sync_key
+     5.35%     1.03%  [.] __wake_up_common
+     4.86%     0.08%  [.] tcp_recvmsg
+     4.60%     0.96%  [.] tcp_recvmsg_locked

@@ -1,0 +1,39 @@
+{
+  "version": "0.6.1",
+  "target": "127.0.0.1:8080/ws/echo-cb",
+  "mode": "websocket",
+  "connections": 16384,
+  "threads": 16,
+  "pipeline_depth": 16,
+  "duration_sec": 15,
+  "elapsed_sec": 15.002,
+  "requests": 26403968,
+  "responses": 26141824,
+  "rps": 1742579.87,
+  "bandwidth_bps": 12379353.67,
+  "bytes_read": 185712512,
+  "latency_us": {
+    "avg": 119385,
+    "p50": 133100,
+    "p90": 138100,
+    "p99": 141600,
+    "p999": 142700,
+    "samples": 26141824
+  },
+  "ws_upgrades": 16384,
+  "ws_upgrade_failures": 0,
+  "ws_frames": 26141824,
+  "status": {
+    "2xx": 26141824,
+    "3xx": 0,
+    "4xx": 0,
+    "5xx": 0,
+    "other": 0
+  },
+  "errors": {
+    "connect": 0,
+    "read": 0,
+    "timeout": 0
+  },
+  "reconnects": 0
+}

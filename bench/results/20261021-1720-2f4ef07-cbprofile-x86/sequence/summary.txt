@@ -1,0 +1,6 @@
+echo [16384]: c=16384 2.165M anon@10s=319MB current=453MB;
+echo [4096 16384]: c=4096 2.458M anon@10s=81MB current=114MB; c=16384 2.14M anon@10s=322MB current=456MB;
+echo [512 4096 16384]: c=512 3.478M anon@10s=11MB current=16MB; c=4096 2.429M anon@10s=82MB current=119MB; c=16384 2.144M anon@10s=322MB current=458MB;
+echo-cb [16384]: c=16384 2.233M anon@10s=259MB current=394MB;
+echo-cb [4096 16384]: c=4096 2.564M anon@10s=66MB current=101MB; c=16384 2.136M anon@10s=285MB current=427MB;
+echo-cb [512 4096 16384]: c=512 3.608M anon@10s=9MB current=14MB; c=4096 2.527M anon@10s=68MB current=101MB; c=16384 2.092M anon@10s=298MB current=445MB;

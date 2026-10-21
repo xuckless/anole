@@ -1,0 +1,2 @@
+FROM fedora:44
+RUN dnf install -y perf procps-ng && dnf clean all
