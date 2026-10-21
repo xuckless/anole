@@ -14,10 +14,10 @@
 //!   GET  /service/stats needs `X-API-Key: ak_...`
 //!
 //! Users: alice (editor) and bob (reader), both with the password
-//! "demo-password". Every secret here (the session key, the JWT key, the
-//! API key, the password hashes) is made at startup and printed or kept in
-//! memory only, so nothing survives a restart. docs/auth.md walks through
-//! the routes with curl.
+//! "demo-password". Every secret here (the JWT key, the API key, the
+//! password hashes, and the session key unless SESSION_KEY sets it) is
+//! made at startup and printed or kept in memory only, so nothing survives
+//! a restart. docs/auth.md walks through the routes with curl.
 const std = @import("std");
 const anole = @import("anole");
 const auth = anole.auth;
@@ -170,11 +170,15 @@ pub fn main(init: std.process.Init) !void {
         .exp = now + 3600,
     }, &jwt_secret);
 
-    // Sessions sealed in the cookie (XChaCha20-Poly1305), with a key made
-    // here; give every node the same key from your secret store instead.
-    var session_key: [anole.session.key_length]u8 = undefined;
-    io.random(&session_key);
-    var sessions = anole.session.Middleware.init(.{ .key = session_key });
+    // Sessions sealed in the cookie (XChaCha20-Poly1305). The key comes
+    // from SESSION_KEY (32 random bytes in base64, `openssl rand -base64
+    // 32`), the same on every node, as in production; without it, a random
+    // development key, with a warning in the log.
+    const session_key = if (init.environ_map.get("SESSION_KEY")) |text|
+        try anole.session.keyFromBase64(text)
+    else
+        anole.session.devKey(io);
+    var sessions = try anole.session.Middleware.init(.{ .key = session_key });
     var csrf = auth.csrf.Middleware.init(.{});
     var limiter = anole.ratelimit.MemoryLimiter.init(init.gpa, io, .{});
     defer limiter.deinit();

@@ -8,7 +8,7 @@
 //! it can read it: keep secrets out, or use `anole.session` (encrypted
 //! cookies, or server-side stores).
 //!
-//!     app.use(try anole.middleware.Session.init(.{ .secret_key = key }));
+//!     app.use(try anole.http.middleware.Session.init(.{ .secret_key = key }));
 //!     ...
 //!     try req.session.set("user", user_id);
 
@@ -90,8 +90,9 @@ pub const SessionData = struct {
 
 /// `Session.init`'s settings.
 pub const Config = struct {
-    /// The HMAC-SHA256 key the cookie is signed with; keep it secret and
-    /// at least 32 random bytes.
+    /// The HMAC-SHA256 key the cookie is signed with: at least 32 random
+    /// bytes from your secret store. `init` refuses a shorter one, or one
+    /// of zeros, with `error.WeakSessionKey`.
     secret_key: []const u8,
     cookie_name: []const u8 = "session",
     /// How long the cookie lasts, renewed on every response while the
@@ -110,9 +111,27 @@ config: Config,
 
 const Session = @This();
 
-/// The middleware: `app.use(try anole.middleware.Session.init(.{ .secret_key = key }))`.
-pub fn init(config: Config) !Session {
+/// The middleware: `app.use(try anole.http.middleware.Session.init(.{ .secret_key = key }))`.
+/// Fails with `error.WeakSessionKey` (and logs it) when the key is shorter
+/// than 32 bytes or all zeros: such cookies could be forged.
+pub fn init(config: Config) error{WeakSessionKey}!Session {
+    if (!strongKey(config.secret_key)) {
+        log.err("session: secret_key must be at least 32 random bytes from your secret store, not shorter and not all zeros", .{});
+        return error.WeakSessionKey;
+    }
     return .{ .config = config };
+}
+
+fn strongKey(key: []const u8) bool {
+    return key.len >= 32 and !std.mem.allEqual(u8, key, 0);
+}
+
+test "init: a key shorter than 32 bytes, or of zeros, is refused" {
+    try std.testing.expect(!strongKey(""));
+    try std.testing.expect(!strongKey("short-key"));
+    try std.testing.expect(!strongKey(&@as([32]u8, @splat(0))));
+    try std.testing.expect(strongKey("test-secret-key-that-is-long-enough"));
+    _ = try init(.{ .secret_key = "test-secret-key-that-is-long-enough" });
 }
 
 pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {

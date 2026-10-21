@@ -253,7 +253,10 @@ expires the cookie when the handler cleared the session. In a handler, use
 16 entries, with no NUL bytes in keys or values.
 
 Pass `.key` for a sealed cookie, or `.store` for server-side sessions.
-`Config` also has `cookie_name` (`anole_session`), `ttl_seconds` (24 h,
+`init` returns an error union: in cookie mode it refuses to start without
+a key (`error.SessionKeyMissing`, with the fix in the log), so a forgotten
+key never gives cookies anyone could forge or read. `Config` also has
+`cookie_name` (`anole_session`), `ttl_seconds` (24 h,
 renewed by each response that carries the session) and `cookie_opts`
 (`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`). Chrome, Firefox and curl
 keep `Secure` cookies on `http://localhost`; anywhere else, serve over HTTPS.
@@ -270,13 +273,23 @@ There are three ways to keep sessions:
 
 A sealed cookie that was changed, renamed or has expired is no session.
 Make its key from 32 random bytes, keep it in your secret store, and give
-every node the same one.
+every node the same one. `anole.session.keyFromBase64` reads it from
+configuration (`openssl rand -base64 32` makes one); a missing key, or
+one of all zeros, is refused. For local development only,
+`anole.session.devKey(io)` makes a random key and logs a warning: sessions
+then end on every restart and differ between nodes.
+
+```zig
+const key = try anole.session.keyFromBase64(init.environ_map.get("SESSION_KEY") orelse return error.NoSessionKey);
+app.use(try anole.session.Middleware.init(.{ .key = key }));
+// local development: .{ .key = anole.session.devKey(app.io()) }
+```
 
 ```zig
 var mem = anole.session.MemoryStore.init(gpa, app.io()); // then .store = mem.store()
 const redis = try app.redis(.{}); // REDIS_URL, else redis://127.0.0.1:6379 (docs/database.md)
 var rs: anole.session.RedisStore = .{ .client = redis, .gpa = gpa }; // keys "anole:session:<id>" with the TTL
-var sessions = anole.session.Middleware.init(.{ .store = rs.store() });
+var sessions = try anole.session.Middleware.init(.{ .store = rs.store() });
 ```
 
 A store is a vtable of `load`, `save` and `destroy` (`anole.session.Store`),

@@ -36,7 +36,7 @@ test "CSRF: a token from the session, required on POST" {
     const io = rt.io();
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
     defer server.deinit();
-    var sessions = session.Middleware.init(.{ .key = @splat(9) });
+    var sessions = try session.Middleware.init(.{ .key = @splat(9) });
     var protect = csrf.Middleware.init(.{});
     server.router.use(dusty.Middleware(void).init(&sessions));
     server.router.use(dusty.Middleware(void).init(&protect));
@@ -95,10 +95,12 @@ test "API key: the owner reaches the handler but never a session cookie" {
     defer server.deinit();
     const Keys = struct {
         fn lookup(_: ?*anyopaque, _: std.mem.Allocator, d: apikey.Digest) anyerror!?[]const u8 {
-            return if (std.mem.eql(u8, &d, &apikey.digest("k1"))) "svc-a" else null;
+            if (std.mem.eql(u8, &d, &apikey.digest("k1"))) return "svc-a";
+            if (std.mem.eql(u8, &d, &apikey.digest("ak_k2"))) return "svc-b";
+            return null;
         }
     };
-    var sessions = session.Middleware.init(.{ .key = @splat(9) });
+    var sessions = try session.Middleware.init(.{ .key = @splat(9) });
     var keys = apikey.Middleware.init(.{ .ptr = null, .lookup = Keys.lookup });
     server.router.use(dusty.Middleware(void).init(&sessions));
     server.router.use(dusty.Middleware(void).init(&keys));

@@ -142,7 +142,9 @@ pub const Request = http.Request;
 /// `res.header(name, value)`, `res.fail(status, message)`.
 pub const Response = http.Response;
 /// The built-in middleware: the HTTP core's (`Cors`, `Compress`,
-/// `RequestId`, `Logger`, `Session`) and `ResponseCache`.
+/// `RequestId`, `Logger`) and `ResponseCache`. Sessions are
+/// `anole.session.Middleware`, rate limits `anole.ratelimit.Middleware`,
+/// auth in `anole.auth`.
 ///
 ///     app.use(anole.middleware.RequestId.init(.{}));
 ///     app.use(anole.middleware.Cors.init(.{}));
@@ -157,9 +159,6 @@ pub const middleware = struct {
     /// A log line per request (scope `access`); `anole.observe.AccessLog`
     /// has more formats.
     pub const Logger = http.middleware.Logger;
-    /// `req.session` in a signed (not encrypted) cookie; `anole.session`
-    /// has encrypted cookies and server-side stores.
-    pub const Session = http.middleware.Session;
     /// Whole responses kept per executor and served without running the
     /// handler; `anole.cached` puts one on a route, `app.responseCache`
     /// makes one for several.
