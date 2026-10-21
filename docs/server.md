@@ -367,6 +367,20 @@ no `TIME_WAIT`), before the first of them binds. On macOS, as on other BSDs, a l
 address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
 allowed: the kernel treats those as different addresses.
 
+### Many connections
+
+Each open connection has a coroutine, and each coroutine's stack is two
+memory mappings. Linux caps mappings per process with `vm.max_map_count`,
+which is 65,530 by default on Debian, RHEL and their derivatives (Ubuntu
+22.10 and later default to 1,048,576), so a server there stops taking new
+connections at about 30,000 open at once. Raise it on hosts that hold
+more, along with the open-file limit (`ulimit -n`, `LimitNOFILE=` in a
+systemd unit):
+
+```sh
+sysctl -w vm.max_map_count=1048576   # or a file in /etc/sysctl.d/
+```
+
 ## HTTP/2
 
 HTTP/2 (`-Dhttp2`, on in `web` and `full`) reaches the same router and

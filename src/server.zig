@@ -181,6 +181,11 @@ pub const Options = struct {
         /// Speak WebTransport (draft-02, what Chrome and Firefox use), for
         /// `anole.webtransport.accept`. `app.webtransport` turns it on.
         webtransport: bool = false,
+        /// Requests for `no_wait` routes that arrive whole run on the
+        /// endpoint task, with no task each (as over HTTP/2). A `no_wait`
+        /// handler that waits anyway then holds up every HTTP/3 connection
+        /// on its core; false gives each request its task again.
+        inline_no_wait: bool = true,
     };
 
     pub const Https = struct {
@@ -576,6 +581,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         .early_data = q.early_data,
                         .enable_connect_protocol = q.enable_connect_protocol,
                         .webtransport = q.webtransport or self.extras.webtransport,
+                        .inline_no_wait = q.inline_no_wait,
                         .client_auth = h3ClientAuth(https.client_auth, client_ca),
                         .fds = h3_fds,
                         .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
