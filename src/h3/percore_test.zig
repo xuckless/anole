@@ -256,6 +256,12 @@ test "h3 per-core: without the program, packets that land on another endpoint's 
     }
     // And every connection still answers, from its own endpoint's thread.
     for (conns) |conn| _ = try f.served(conn, gpa);
+    // A packet passed on last (a late ACK, say) can still sit in its
+    // owner's inbox: forwarded_in counts it when the owner takes it.
+    for (0..200) |_| {
+        if (f.sum("forwarded_in") == f.sum("forwarded_out")) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
     try std.testing.expectEqual(f.sum("forwarded_out"), f.sum("forwarded_in"));
     try std.testing.expectEqual(@as(u64, 0), f.sum("dropped"));
     try f.expectNoForeign();

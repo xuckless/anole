@@ -21,25 +21,34 @@ jobs:
         # macos-latest is Apple silicon (arm64).
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A hung test fails the step at about 3x its usual time (macOS, the
+    # slower runner) instead of holding the runner for GitHub's 6 h limit.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.17.0
       - name: Unit and smoke tests (default profile, every feature on)
+        timeout-minutes: 35
         run: zig build test --summary all
       - name: Every preset and edge flag combination
+        timeout-minutes: 25
         run: zig build test-flags --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
       - name: Profile minimal (no C library besides llhttp)
+        timeout-minutes: 15
         run: zig build test -Dprofile=minimal --summary all
       - name: Profile web (BoringSSL + nghttp2, no HTTP/3)
+        timeout-minutes: 15
         run: zig build test -Dprofile=web --summary all
       - name: Full profile without TLS (turns HTTP/3 off)
+        timeout-minutes: 15
         run: zig build test -Dtls=none --summary all
       - name: HTTP/3 without HTTP/2 (nghttp3 without nghttp2)
+        timeout-minutes: 15
         run: zig build test -Dhttp2=false -Dhttp3=true --summary all
       - name: Invalid flag combination is rejected
         shell: bash
@@ -134,11 +143,18 @@ jobs:
           cache-key: quic-interop
       # The runner reads its traces with pyshark; it needs a current tshark
       # (its own CI uses this PPA).
+      # Retried: the PPA answers 503 now and then; Ubuntu's own tshark is
+      # too old for the runner, so there is no fallback.
       - name: Install tshark
         run: |
-          sudo add-apt-repository -y ppa:wireshark-dev/nightly
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark
+          for i in 1 2 3 4 5; do
+            sudo add-apt-repository -y ppa:wireshark-dev/nightly &&
+              sudo apt-get update -qq &&
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark &&
+              exit 0
+            sleep $((i * 15))
+          done
+          exit 1
       - name: tests/interop/run.sh
         run: tests/interop/run.sh ngtcp2,quic-go
         env:
@@ -160,11 +176,18 @@ jobs:
         with:
           version: 0.17.0
           cache-key: webtransport-interop
+      # Retried: the PPA answers 503 now and then; Ubuntu's own tshark is
+      # too old for the runner, so there is no fallback.
       - name: Install tshark
         run: |
-          sudo add-apt-repository -y ppa:wireshark-dev/nightly
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark
+          for i in 1 2 3 4 5; do
+            sudo add-apt-repository -y ppa:wireshark-dev/nightly &&
+              sudo apt-get update -qq &&
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark &&
+              exit 0
+            sleep $((i * 15))
+          done
+          exit 1
       - name: tests/interop/webtransport/run.sh flupke-webtransport
         run: tests/interop/webtransport/run.sh flupke-webtransport
         env:
@@ -218,6 +241,7 @@ jobs:
       # pieces, a connection's bytes over HTTP/1.1 and HTTP/2); a plain
       # `zig build test` runs them on their seeds and fixed mutations only.
       - name: zig build test --fuzz=200K
+        timeout-minutes: 75
         run: zig build test -Dllvm=true --fuzz=200K
 
   grpc-interop:
@@ -273,6 +297,7 @@ jobs:
       # server's certificate: the script starts the server itself, with a
       # CA made for the run.
       - name: Tests against a live server
+        timeout-minutes: 20
         run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh
 
   postgres:
@@ -296,6 +321,7 @@ jobs:
       # server's certificate: the script starts the server itself, with a
       # CA made for the run.
       - name: Tests against a live server
+        timeout-minutes: 20
         run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh
 
   mongodb:
@@ -323,4 +349,5 @@ jobs:
       # A replica set of one with authentication and failCommand, plain and
       # over TLS on a CA made for the run; SCRAM-SHA-256 and SCRAM-SHA-1.
       - name: Tests with a live server
+        timeout-minutes: 20
         run: tests/mongodb/run.sh ${{ matrix.image }}
