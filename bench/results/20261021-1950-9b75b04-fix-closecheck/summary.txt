@@ -1,0 +1,12 @@
+== epoll /ws/echo-cb (anon_inode:[eventpoll] ) run: 2.254 M frames/s {'connect': 0, 'read': 0, 'timeout': 0}
++15s: fds=10 sockets=2 cpu=0% current=19MB anon=9MB
++60s: fds=10 sockets=2 cpu=0% current=18MB anon=9MB
+== epoll /ws/echo (anon_inode:[eventpoll] ) run: 2.171 M frames/s {'connect': 0, 'read': 0, 'timeout': 0}
++15s: fds=10 sockets=2 cpu=0% current=24MB anon=20MB
++60s: fds=10 sockets=2 cpu=0% current=24MB anon=20MB
+== uring /ws/echo-cb (anon_inode:[io_uring] ) run: 2.32 M frames/s {'connect': 0, 'read': 0, 'timeout': 0}
++15s: fds=8 sockets=2 cpu=0% current=14MB anon=10MB
++60s: fds=8 sockets=2 cpu=0% current=14MB anon=10MB
+== uring /ws/echo (anon_inode:[io_uring] ) run: 2.247 M frames/s {'connect': 0, 'read': 0, 'timeout': 0}
++15s: fds=8 sockets=2 cpu=0% current=22MB anon=18MB
++60s: fds=8 sockets=2 cpu=0% current=22MB anon=18MB

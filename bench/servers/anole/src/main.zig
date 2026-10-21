@@ -201,6 +201,13 @@ fn wsTrade(app: *App, ws: *websocket.Socket, req: *anole.Request) !void {
     }
 }
 
+/// QUIC's idle timeout, 120 s: `idle_timeout` (a Duration) on current Anole,
+/// `idle_timeout_ms` before it.
+fn http3Options() anole.ServerOptions.Http3 {
+    const H3 = anole.ServerOptions.Http3;
+    return if (@hasField(H3, "idle_timeout")) .{ .idle_timeout = .fromSeconds(120) } else .{ .idle_timeout_ms = 120_000 };
+}
+
 pub fn main(init: std.process.Init) !void {
     const mode = std.meta.stringToEnum(Mode, env("MODE", "h1")) orelse {
         std.log.err("MODE={s} is not supported here (grpc runs the interop server)", .{env("MODE", "")});
@@ -226,7 +233,7 @@ pub fn main(init: std.process.Init) !void {
             else => null,
         },
         // QUIC's idle timeout to the benchmark's 75 s keep-alive floor.
-        .http3 = if (mode == .h3) .{ .idle_timeout_ms = 120_000 } else null,
+        .http3 = if (mode == .h3) http3Options() else null,
         .server = .{
             // Video streams and sockets outlive the 30 s default; the
             // challenge wants idle keep-alive kept 65 s or more; the
