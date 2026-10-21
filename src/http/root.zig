@@ -43,6 +43,9 @@ pub const defaultError = dusty.defaultError;
 /// Fails with `error.AddressInUse` when a socket already listens on the
 /// address (which SO_REUSEPORT would silently share).
 pub const checkAddressFree = dusty.checkAddressFree;
+/// The open-file limit (raised at startup), and the connection cap worked
+/// out from it.
+pub const fd_limit = dusty.fd_limit;
 
 /// The whole dusty module, for anything not re-exported above.
 pub const dusty_module = dusty;

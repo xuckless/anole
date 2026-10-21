@@ -152,12 +152,14 @@ not load or an address that does not parse is returned by `listen`, and by
 | --- | --- | --- |
 | `http` | `null` | The cleartext listener. With neither it nor `https` set, 127.0.0.1:8080. |
 | `https` | `null` | The TLS listener. Needs `-Dtls=boringssl`. |
-| `http3` | `null` | HTTP/3 over QUIC. Needs `-Dhttp3` and `https`. |
+| `http3` | `null` | HTTP/3 over QUIC. Needs `-Dhttp3` and `https` (or a listener in `listeners` with `http3 = true`, which it then tunes). |
+| `listeners` | none | More listeners, each with its own address or unix socket, TLS and protocols; see [Several listeners](#several-listeners). |
 | `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
 | `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
 | `process` | `null` | `init.minimal` enables socket activation, SIGUSR2 restarts and `sd_notify`. |
 | `restart_timeout_ms` | 10 000 | How long a restart waits for the new process. |
 | `listen_tls_http3` | true | Whether `listenTls` adds HTTP/3 (when built in). |
+| `raise_fd_limit` | true | Raise the soft open-file limit to the hard one at `init`; see [Many connections](#many-connections). |
 | `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
 | `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
@@ -209,7 +211,80 @@ the first two: `.cert = .fromFiles("cert.pem", "key.pem")`.
 `server` goes to dusty as is, except that `listeners` and `http2` are
 replaced by the fields above. Its timeouts and limits are covered in
 [routing.md](routing.md#timeouts-and-limits); `trusted_proxy_hops` below;
-`max_connections` (10 000) caps open connections.
+`max_connections` caps open connections, by default at what the open-file
+limit allows (see [Many connections](#many-connections)).
+
+## Several listeners
+
+`http` and `https` cover one cleartext and one TLS port. For more, or for
+ports that each speak something different, list them in `listeners`, beside
+or instead of those two. Each has:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `name` | made up | What the listener is called: `LISTEN_FDNAMES` for socket activation and restarts, and `req.listener.name` for handlers. Unique, at most 255 bytes, no `:`. Without one: `http-<port>`, `https-<port>` or `unix-<path>`. |
+| `address`, `port` | `127.0.0.1`, 8080 | Where it listens. |
+| `unix` | `null` | A unix domain socket at this path instead. |
+| `tls` | `null` | `.{ .cert = ... }` for TLS, with optional `alpn_protocols` and `client_auth`. Listeners that name the same certificate (the same files, the same PEM) share one copy of it. |
+| `http1` | true | HTTP/1.1 (and 1.0). |
+| `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
+| `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
+| `proxy_protocol` | false | Every connection starts with a PROXY protocol header. |
+
+A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
+or one of them. One with `http2 = false` gives a client that offers `h2`
+HTTP/1.1; one with `http1 = false` closes a connection whose ALPN did not
+agree on `h2`, and a cleartext one with `http1 = false` closes a connection
+that does not open with the HTTP/2 preface. `http`'s and `https`'s
+listeners are named `http` and `https`, and come first in `addresses()`.
+
+One process serving four ports, each with its own mix:
+
+```zig
+const cert: anole.Cert = .fromFiles("/certs/server.crt", "/certs/server.key");
+var app = try anole.App.init(init.gpa, .{
+    .listeners = &.{
+        // HTTP/1.1, and h2c for clients that open with the preface (gRPC too).
+        .{ .name = "http", .address = "0.0.0.0", .port = 8080 },
+        // TLS, HTTP/1.1 only: h2 is not offered.
+        .{ .name = "https-h1", .address = "0.0.0.0", .port = 8081, .tls = .{ .cert = cert }, .http2 = false },
+        // h2c only.
+        .{ .name = "h2c", .address = "0.0.0.0", .port = 8082, .http1 = false },
+        // TLS with HTTP/2 and HTTP/1.1, and HTTP/3 on UDP 8443.
+        .{ .name = "https", .address = "0.0.0.0", .port = 8443, .tls = .{ .cert = cert }, .http3 = true },
+    },
+    .process = init.minimal,
+});
+```
+
+Every listener serves the same routes. To keep some of them to one listener,
+such as metrics on an internal port, put them in a group behind
+`anole.onlyOn(name)`, which answers 404 on the others:
+
+```zig
+var app = try anole.App.init(init.gpa, .{
+    .https = .{ .address = "0.0.0.0", .port = 443, .cert = cert },
+    .listeners = &.{
+        .{ .name = "admin", .port = 9090 }, // 127.0.0.1 only
+        .{ .name = "proxy", .unix = "/run/myapp/http.sock" },
+    },
+});
+const admin = app.group("/admin", .{anole.onlyOn("admin")});
+admin.get("/stats", stats);
+```
+
+A unix socket file that a stopped server left behind is replaced when
+nothing listens on it; one that something answers on is `AddressInUse`.
+Anole never removes the file itself, since a restarted server may still be
+serving it.
+
+`listeners` alone, without `http` or `https`, is set up by `run` (or by
+`listen` and `listenTls`, which add theirs in front), not by `init`; with
+either of those, by `init`. Each listener gets the per-core accept sockets,
+the address check, its startup line and its share of the drain, as `http`
+and `https` do, and each TLS listener's certificate reloads with the rest.
+HTTP/3 serves one port per server; a second `http3 = true` fails with
+`error.SeveralHttp3Listeners`.
 
 ## App state and handlers
 
@@ -326,7 +401,7 @@ executor (see [Cores](#cores)). On macOS the accept loops share one socket,
 and HTTP/3 has one.
 
 `run` handles SIGINT and SIGTERM (and SIGUSR2 when `process` is set), and
-SIGHUP when there is an `https` listener, which reloads its certificate
+SIGHUP when there is a TLS listener, which reloads the certificates
 (see [TLS](#tls)) and goes on serving. The first of SIGINT, SIGTERM and
 SIGUSR2, or `stop()`, starts a graceful drain:
 
@@ -369,13 +444,43 @@ allowed: the kernel treats those as different addresses.
 
 ### Many connections
 
-Each open connection has a coroutine, and each coroutine's stack is two
+Every connection is a file descriptor, and the process's soft open-file
+limit is often 1024 (256 on macOS), kept low for old programs that use
+`select`. So `init` raises the soft limit to the hard one, as Go does at
+startup: 524,288 under systemd by default, 1,048,576 in Docker, and on macOS
+`kern.maxfilesperproc` at most. (`raise_fd_limit = false` leaves it alone;
+processes the server starts inherit the raised limit.)
+
+`server.max_connections` follows the limit by default. When serving starts
+it is the soft limit less what other descriptors need:
+
+- 64 for the process at large (standard streams, log files, the DNS
+  resolver, files opened at startup);
+- 8 per executor (its event loop's descriptors, an HTTP/3 UDP socket);
+- every listening socket (one per executor and listener on Linux);
+- an eighth of the limit, for what grows with traffic beside the
+  connections: files the static handler is sending, the outbound client's
+  connections, database pools.
+
+With Docker's 1,048,576 and 16 executors that is about 917,000 connections;
+with a limit that stays at 1024, about 800. Past the cap the server stops
+accepting and new connections wait in the kernel's accept queue, rather than
+`accept` failing for want of a descriptor. 10,000 on Windows. Set
+`.server = .{ .max_connections = 50_000 }` to cap it lower, as memory
+suggests: an idle connection costs a few kilobytes and one with TLS about 35
+KiB (see `ServerConfig.max_connections`); `null` lifts the cap. The startup
+debug log names the cap it worked out.
+
+To allow more, raise the hard limit where the process starts:
+`LimitNOFILE=1048576` in a systemd unit, `--ulimit nofile=1048576:1048576`
+for `docker run`, `ulimit -Hn` in a shell (as root).
+
+Each open connection also has a coroutine, and each coroutine's stack is two
 memory mappings. Linux caps mappings per process with `vm.max_map_count`,
 which is 65,530 by default on Debian, RHEL and their derivatives (Ubuntu
 22.10 and later default to 1,048,576), so a server there stops taking new
-connections at about 30,000 open at once. Raise it on hosts that hold
-more, along with the open-file limit (`ulimit -n`, `LimitNOFILE=` in a
-systemd unit):
+connections at about 30,000 open at once, whatever the cap. Raise it on
+hosts that hold more:
 
 ```sh
 sysctl -w vm.max_map_count=1048576   # or a file in /etc/sysctl.d/
@@ -389,7 +494,8 @@ handlers as HTTP/1.1.
 - Over TLS, clients choose it through ALPN (`h2`, then `http/1.1`).
 - On the cleartext port, a client that opens with the HTTP/2 preface gets
   HTTP/2 ("prior knowledge", `curl --http2-prior-knowledge`); others get
-  HTTP/1.1 on the same port. `.http = .{ .h2c = false }` turns this off. The
+  HTTP/1.1 on the same port. `.http = .{ .h2c = false }` turns this off,
+  and a listener in `listeners` with `http1 = false` speaks h2c alone. The
   old `Upgrade: h2c` handshake is not supported.
 - When the client resets a stream (RST_STREAM) before its response is
   complete, or the connection is lost, the stream's handler is canceled: its
@@ -409,11 +515,13 @@ handlers as HTTP/1.1.
 
 HTTP/3 needs `-Dhttp3` (on in `full`) and an `https` listener, whose
 certificate it shares. With `.http3 = .{}`, QUIC listens on UDP at the HTTPS
-address and port, and every response that did not come over HTTP/3 carries
-`Alt-Svc: h3=":443"; ma=86400`, so browsers switch to it. Handlers see
-`req.version_major == 3`.
+address and port, and every response of the HTTPS listener that did not come
+over HTTP/3 carries `Alt-Svc: h3=":443"; ma=86400`, so browsers switch to
+it. Handlers see `req.version_major == 3`, and `req.listener` is the HTTPS
+listener's. With `listeners`, `http3 = true` on one TLS listener does the
+same for it, and `http3` holds the settings; one HTTP/3 port per server.
 
-`http3` fields: `address` and `port` (`https`'s when null), `alt_svc`
+`http3` fields: `address` and `port` (the TLS listener's when null), `alt_svc`
 (true), `max_streams_bidi` (100 concurrent requests per connection),
 `idle_timeout_ms` (30 000), `validate_address` (false), `early_data`
 (false), `sockets` (null: one per executor on Linux, see
@@ -534,10 +642,10 @@ outside `minimal`).
 - A handshake has the same deadline as a request (`timeout.request`). Failed
   handshakes are logged at `info`, since any client can cause them.
 
-**Certificate reload.** `app.reloadCertificates()` loads the certificate and
-key again (from their files, for `.files`) and the `client_auth` CAs (from
-theirs), and switches the HTTPS listener and HTTP/3 to them without a
-restart. SIGHUP does the same while `run` serves, so a renewal hook can run
+**Certificate reload.** `app.reloadCertificates()` loads every TLS
+listener's certificate and key again (from their files, for `.files`) and
+the `client_auth` CAs (from theirs), and switches the TLS listeners and
+HTTP/3 to them without a restart: all of them, or, if one fails, none. SIGHUP does the same while `run` serves, so a renewal hook can run
 `kill -HUP <pid>` (or `systemctl kill -s HUP myapp`). With `process` set,
 systemd hears `RELOADING=1` and then `READY=1`.
 
@@ -548,7 +656,8 @@ systemd hears `RELOADING=1` and then `READY=1`.
 - A reload that fails (a file missing, a key that does not match the
   certificate) returns the error, or logs it on SIGHUP, and the server goes
   on with the certificate it had.
-- `app.setCertificate(cert)` switches to a different source the same way:
+- `app.setCertificate(cert)` switches every TLS listener to a different
+  source the same way:
   new PEM from a secret store (`.{ .pem = ... }`), other files, or a fresh
   `.dev_self_signed`. Later reloads read that source.
 
@@ -598,9 +707,11 @@ Pass the process to enable all of this: `.process = init.minimal`.
 
 **Socket activation.** When `LISTEN_PID` is this process, Anole serves the
 `LISTEN_FDS` sockets from fd 3 on, as systemd passes them. It matches them by
-`LISTEN_FDNAMES` (`http`, `https`, and `h3` for HTTP/3's UDP sockets), or by
-position (`http`, `https`, then every one left for HTTP/3) when they have no
-names. A listener with no inherited socket opens its own, and one named `h3`
+`LISTEN_FDNAMES` (each listener's name: `http`, `https`, those in
+`listeners`; and `h3` for HTTP/3's UDP sockets), or by position (the
+listeners in order, then every one left for HTTP/3) when they have no
+names. A restart passes every listener's socket under its name, so a new
+build whose `listeners` changed order still gets each port right. A listener with no inherited socket opens its own, and one named `h3`
 must be a datagram socket. Several `h3` sockets are one `SO_REUSEPORT` group,
 one endpoint each, in the order they were bound in: the steering program
 picks a socket by its place in the group, which is the order of the `bind`

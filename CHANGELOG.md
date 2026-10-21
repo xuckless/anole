@@ -43,6 +43,24 @@ for macOS and Linux.
   `http`/`https` in the options, the listeners are set up by `listen`,
   `listenTls` or `run`, hand-off, `sd_notify` and `waitReady` included.
   `anole.Cert.fromFiles` / `fromPem`.
+- Several listeners: `Options.listeners`, beside `http` and `https`, each
+  with its own address or unix socket, TLS certificate (listeners naming the
+  same one share it), protocols (`http1`, `http2`: ALPN over TLS, h2c on
+  cleartext; `http3` on one TLS listener) and name. One process can serve
+  e.g. HTTP/1.1 + h2c, TLS HTTP/1.1 only, h2c only and TLS h2 + HTTP/3 on
+  four ports. Names go into `LISTEN_FDNAMES` for socket activation and
+  SIGUSR2 restarts, and to handlers as `req.listener.name`;
+  `anole.onlyOn(name)` keeps a group's routes to one listener (an admin
+  port). Certificate reloads cover every TLS listener, all or none.
+  `Alt-Svc` now goes out only on the TLS listener HTTP/3 serves the port of
+  (no longer on cleartext responses, where browsers ignore it). The HTTP
+  core's `Listener` gains `http1` (off: HTTP/2 only) and `name`.
+- The open-file limit: `init` raises the soft RLIMIT_NOFILE to the hard one
+  (as Go does; `Options.raise_fd_limit`), and `max_connections` defaults to
+  what that limit allows less a reserve for other descriptors (64, 8 per
+  executor, the listening sockets, and an eighth of the limit), instead of
+  10,000. An explicit `max_connections` still wins; 10,000 on Windows.
+  `anole.http.fd_limit`.
 - One line per subsystem, owned by the server: `app.grpc(pb.Service,
   handlers)` (a struct literal, a namespace, or methods on a value; gRPC,
   gRPC-Web, Connect and transcoded routes), `grpcHealth()` (NOT_SERVING on

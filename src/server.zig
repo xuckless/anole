@@ -13,7 +13,8 @@
 //!
 //! `anole.App` is `Server(void)` with a two-argument `init`. With state,
 //! `Server(App).init(gpa, options, &state)`; the listeners can also be set
-//! in `options` (`http`, `https`, `http3`) and served with `run`:
+//! in `options` (`http`, `https`, `http3`, and any number more in
+//! `listeners`) and served with `run`:
 //!
 //!     var app = try anole.Server(void).init(init.gpa, .{
 //!         .http = .{ .port = 8080 },
@@ -96,8 +97,25 @@ pub const Options = struct {
     /// The TLS listener, or null for none. Needs `-Dtls=boringssl`.
     https: ?Https = null,
     /// HTTP/3 over QUIC, beside `https` and with its certificate, or null
-    /// for none. Needs `-Dhttp3` (on by default) and `https`.
+    /// for none. Needs `-Dhttp3` (on by default) and `https`. With
+    /// `listeners`, the settings for the one marked `http3`.
     http3: ?Http3 = null,
+    /// More listeners, for full control: each with its own address (or
+    /// unix socket), TLS certificate and protocols, served after `http`
+    /// and `https` and through the same routes. One port per protocol, an
+    /// internal port for metrics, a unix socket for a proxy on the same
+    /// machine. See `Listener`.
+    ///
+    ///     .listeners = &.{
+    ///         .{ .name = "public", .address = "0.0.0.0", .port = 443, .tls = .{ .cert = cert }, .http3 = true },
+    ///         .{ .name = "admin", .port = 9090 },
+    ///     },
+    listeners: []const Listener = &.{},
+    /// Raise the soft open-file limit to the hard one when the server is
+    /// made, as Go does at startup: every connection is a file descriptor,
+    /// and the soft limit is often 1024. `server.max_connections` follows
+    /// the limit by default. Processes started from here inherit it.
+    raise_fd_limit: bool = true,
     /// HTTP/2 settings, for h2c and h2 over TLS. 250 concurrent streams per
     /// connection by default.
     http2: http.ServerConfig.Http2 = .{ .max_concurrent_streams = 250 },
@@ -210,6 +228,47 @@ pub const Options = struct {
         proxy_protocol: bool = false,
     };
 
+    /// A listener in `listeners`: where, plain or TLS, and what it speaks.
+    pub const Listener = struct {
+        /// What the listener is called: socket activation and SIGUSR2
+        /// restarts match inherited sockets by it (`LISTEN_FDNAMES`), and
+        /// handlers see it in `req.listener.name` (`anole.onlyOn`). Unique
+        /// among the server's listeners ("http" and "https" are `http`'s
+        /// and `https`'s), at most 255 bytes, no ':'. Null: "http-<port>",
+        /// "https-<port>", or "unix-<path>".
+        name: ?[]const u8 = null,
+        address: []const u8 = "127.0.0.1",
+        port: u16 = 8080,
+        /// A unix domain socket at this path instead of `address` and
+        /// `port`. A socket file left behind by a server that is gone is
+        /// replaced; one that something still listens on is an error.
+        unix: ?[]const u8 = null,
+        /// TLS with this certificate, or null for cleartext.
+        tls: ?Tls = null,
+        /// HTTP/1.1 (and 1.0).
+        http1: bool = true,
+        /// HTTP/2: "h2" by ALPN over TLS; on a cleartext listener, for
+        /// clients that open with its preface (h2c, prior knowledge).
+        /// Needs `-Dhttp2`.
+        http2: bool = features.http2,
+        /// HTTP/3 on the same port number over UDP (or `Options.http3`'s
+        /// address and port), with `Options.http3`'s settings, and
+        /// advertised with `Alt-Svc` on this listener's responses. TLS
+        /// listeners only, and one per server. Needs `-Dhttp3`.
+        http3: bool = false,
+        proxy_protocol: bool = false,
+
+        pub const Tls = struct {
+            /// Listeners that name the same certificate (the same files,
+            /// the same PEM, `dev_self_signed`) share one copy of it.
+            cert: Cert,
+            /// Offered by ALPN, in order. Null: "h2" and "http/1.1", those
+            /// of the two the listener speaks.
+            alpn_protocols: ?[]const []const u8 = null,
+            client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+        };
+    };
+
     pub const Cert = union(enum) {
         /// PEM text in memory, copied by `init`.
         pem: struct { cert: []const u8, key: []const u8 },
@@ -235,6 +294,26 @@ pub const Options = struct {
 /// `Server(void)` with `init(gpa, options)`: a server without state, for
 /// handlers that take `(req, res)`.
 pub const App = ServerOf(void, true);
+
+/// Middleware that lets requests through on the listener named `name`
+/// alone (`Options.Listener.name`; "http" and "https" are `http`'s and
+/// `https`'s, HTTP/3 its TLS listener's), and answers 404 on the others:
+/// routes for an internal port. Every listener shares the routes; this
+/// keeps some of them to one.
+///
+///     const admin = app.group("/admin", .{anole.onlyOn("admin")});
+pub fn onlyOn(name: []const u8) OnlyOn {
+    return .{ .name = name };
+}
+
+pub const OnlyOn = struct {
+    name: []const u8,
+
+    pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, executor: anytype) !void {
+        if (!std.mem.eql(u8, req.listener.name, self.name)) return error.NotFound;
+        return executor.next();
+    }
+};
 
 pub fn Server(comptime Ctx: type) type {
     return ServerOf(Ctx, false);
@@ -266,9 +345,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         h3: H3Endpoint,
         /// The blocking pool, when `Options.blocking` asked for one.
         blocking_pool: ?*blocking.Pool = null,
-        /// The TLS listener's certificate, for `reloadCertificates`; null
-        /// without `https`.
-        cert: ?*CertState = null,
+        /// The TLS listeners' certificates, one per distinct source, for
+        /// `reloadCertificates`; empty without a TLS listener.
+        certs: []const *CertState = &.{},
         /// Middleware the server copied (`use`, `group`, `middleware`),
         /// deinitialized with it.
         owned_middleware: std.ArrayList(http.Middleware(Ctx)) = .empty,
@@ -301,6 +380,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// The database connectors made here (`postgres`, `sqlite`), in order.
             connectors: std.ArrayList(Connector) = .empty,
             connectors_started: bool = false,
+            /// One certificate reload at a time.
+            cert_mutex: std.Io.Mutex = .init,
         };
 
         /// A database connector the server made: when serving starts it
@@ -329,22 +410,44 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
 
-        /// The TLS listener's certificate: the PEM in use, where a reload
-        /// reads it again, and the listener configuration dusty serves
-        /// from, whose `pem` a reload points at the new one.
+        /// A certificate the TLS listeners serve: the PEM in use, where a
+        /// reload reads it again, and the listener configurations dusty
+        /// serves from, whose `pem` a reload points at the new one.
+        /// Listeners that name the same source share one.
         const CertState = struct {
             gpa: std.mem.Allocator,
-            /// One reload at a time.
-            mutex: std.Io.Mutex = .init,
             /// Owned, the key zeroed when freed.
             pem: Pem,
             /// For `.files`: the paths each reload reads again. Owned.
             files: ?struct { cert_path: []u8, key_path: []u8 } = null,
-            listener: *http.Listener,
+            /// What the options named, to find listeners that share it.
+            /// Only read while the listeners are set up.
+            source: Options.Cert,
+            /// The listeners serving it.
+            listeners: std.ArrayList(*http.Listener) = .empty,
+            /// The TLS listener HTTP/3 serves the port of, when it serves
+            /// this certificate: its client CAs are HTTP/3's.
+            h3_listener: ?*http.Listener = null,
+
+            /// Whether `a` and `b` name the same certificate.
+            fn sameSource(a: Options.Cert, b: Options.Cert) bool {
+                return switch (a) {
+                    .pem => |p| b == .pem and std.mem.eql(u8, p.cert, b.pem.cert) and std.mem.eql(u8, p.key, b.pem.key),
+                    .files => |f| b == .files and std.mem.eql(u8, f.cert_path, b.files.cert_path) and
+                        std.mem.eql(u8, f.key_path, b.files.key_path),
+                    .dev_self_signed => b == .dev_self_signed,
+                };
+            }
 
             const Pem = struct {
                 cert: []u8,
                 key: []u8,
+
+                fn dupe(p: Pem, gpa: std.mem.Allocator) !Pem {
+                    const cert = try gpa.dupe(u8, p.cert);
+                    errdefer gpa.free(cert);
+                    return .{ .cert = cert, .key = try gpa.dupe(u8, p.key) };
+                }
 
                 fn deinit(p: *Pem, gpa: std.mem.Allocator) void {
                     gpa.free(p.cert);
@@ -413,13 +516,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// A certificate or key file larger than this is refused.
         const max_pem_len = 1 << 20;
 
-        /// `Alt-Svc` on responses that did not come over HTTP/3, once
-        /// HTTP/3 is set up (`value`).
+        /// `Alt-Svc` on responses from the TLS listener HTTP/3 serves the
+        /// port of (`listener`) that did not come over HTTP/3, once HTTP/3
+        /// is set up (`value`).
         const AltSvc = struct {
             value: ?[]const u8 = null,
+            listener: ?*const http.Listener = null,
 
             pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
-                if (self.value) |v| if (req.version_major != 3) try res.header("Alt-Svc", v);
+                if (self.value) |v| if (req.version_major != 3 and self.listener != null and req.listener == self.listener.?) try res.header("Alt-Svc", v);
                 return executor.next();
             }
         };
@@ -439,6 +544,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
+            // Before anything opens a socket, and before `run` works out
+            // the connection cap from it.
+            if (opts.raise_fd_limit) if (http.fd_limit.raiseSoftLimit()) |r| {
+                std.log.scoped(.anole).debug("raised the open-file limit from {d} to {d}", .{ r.from, r.to });
+            };
             const arena = try gpa.create(std.heap.ArenaAllocator);
             arena.* = .init(gpa);
             errdefer {
@@ -504,17 +614,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
             // get 425 Too Early, on every route. Now, before any route, and
             // for `listenTls` too, which turns HTTP/3 on later.
-            if (features.http3 and (opts.http3 != null or opts.listen_tls_http3)) {
+            const h3_possible = features.http3 and (opts.http3 != null or opts.listen_tls_http3 or anyHttp3(opts.listeners));
+            if (h3_possible) {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
                 self.router.use(http.Middleware(Ctx).init(guard));
             }
+            // Neither `http` nor `https`: `listen`, `listenTls` or `run`
+            // sets up the listeners, `listeners` among them.
             if (opts.http == null and opts.https == null) {
                 self.pending = opts;
                 // `listenTls` turns HTTP/3 on once routes exist, when no
                 // middleware can be added any more: its `Alt-Svc` goes in
                 // now, silent until then.
-                if (features.http3 and (opts.http3 != null or opts.listen_tls_http3)) self.alt_svc = self.addAltSvc();
+                if (h3_possible) self.alt_svc = self.addAltSvc();
             } else {
                 try self.listenOn(opts);
             }
@@ -528,130 +641,251 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return alt;
         }
 
-        /// Sets up the listeners `opts` names (`http`, `https`, `http3`;
-        /// 127.0.0.1:8080 when it names none). Once, before serving.
+        /// A listener to set up: `http`, `https` and `listeners` alike.
+        const Spec = struct { name: []const u8, listener: Options.Listener };
+
+        /// `opts`' listeners in serving order (`http`, `https`, then
+        /// `listeners`), named. `checkSpecs` checks them.
+        fn listenerSpecs(a: std.mem.Allocator, opts: Options) ![]const Spec {
+            var specs: std.ArrayList(Spec) = .empty;
+            // 127.0.0.1:8080 when nothing else is named.
+            const http_opts: ?Options.Http = opts.http orelse if (opts.https == null and opts.listeners.len == 0) .{} else null;
+            if (http_opts) |h| try specs.append(a, .{ .name = "http", .listener = .{
+                .address = h.address,
+                .port = h.port,
+                .http2 = h.h2c and features.http2,
+                .proxy_protocol = h.proxy_protocol,
+            } });
+            if (opts.https) |h| try specs.append(a, .{ .name = "https", .listener = .{
+                .address = h.address,
+                .port = h.port,
+                .tls = .{ .cert = h.cert, .alpn_protocols = h.alpn_protocols, .client_auth = h.client_auth },
+                .http3 = opts.http3 != null,
+                .proxy_protocol = h.proxy_protocol,
+            } });
+            for (opts.listeners) |l| {
+                var name = l.name orelse if (l.unix) |path|
+                    try std.fmt.allocPrint(a, "unix-{s}", .{path})
+                else
+                    try std.fmt.allocPrint(a, "{s}-{d}", .{ if (l.tls != null) "https" else "http", l.port });
+                // A made-up name taken already (two on port 0): made unique.
+                if (l.name == null) for (specs.items) |other| {
+                    if (std.mem.eql(u8, other.name, name)) {
+                        name = try std.fmt.allocPrint(a, "{s}-{d}", .{ name, specs.items.len });
+                        break;
+                    }
+                };
+                try specs.append(a, .{ .name = name, .listener = l });
+            }
+            return specs.items;
+        }
+
+        /// Fails when `specs` cannot be served as they are, saying why to
+        /// `why`: names unique, each listener speaking something, HTTP/3 on
+        /// one TLS listener at most, and on one when `opts.http3` is set.
+        fn checkSpecs(specs: []const Spec, opts: Options, why: *std.Io.Writer) !void {
+            var h3_count: usize = 0;
+            for (specs, 0..) |spec, i| {
+                const l = spec.listener;
+                if (spec.name.len == 0 or spec.name.len > 255 or std.mem.indexOfScalar(u8, spec.name, ':') != null) {
+                    try why.print("listener name \"{s}\": names are 1 to 255 bytes, with no ':' (LISTEN_FDNAMES separates them with it)", .{spec.name});
+                    return error.InvalidListenerName;
+                }
+                for (specs[0..i]) |other| if (std.mem.eql(u8, other.name, spec.name)) {
+                    try why.print("two listeners are named \"{s}\"", .{spec.name});
+                    return error.DuplicateListenerName;
+                };
+                if (!l.http1 and !l.http2) {
+                    try why.print("listener \"{s}\" speaks neither HTTP/1.1 nor HTTP/2", .{spec.name});
+                    return error.NoProtocols;
+                }
+                if (l.http2 and !features.http2) {
+                    try why.print("listener \"{s}\" speaks HTTP/2, which this build leaves out (-Dhttp2)", .{spec.name});
+                    return error.Http2NotBuilt;
+                }
+                if (l.http3) {
+                    if (comptime !features.http3) {
+                        try why.print("listener \"{s}\" speaks HTTP/3, which this build leaves out (-Dhttp3)", .{spec.name});
+                        return error.Http3NotBuilt;
+                    }
+                    if (l.tls == null or l.unix != null) {
+                        try why.print("listener \"{s}\": HTTP/3 needs TLS and a UDP port", .{spec.name});
+                        return error.Http3NeedsTls;
+                    }
+                    h3_count += 1;
+                }
+            }
+            if (h3_count > 1) {
+                try why.print("HTTP/3 is on for {d} listeners; a server serves it on one", .{h3_count});
+                return error.SeveralHttp3Listeners;
+            }
+            if (opts.http3 != null and h3_count == 0) {
+                if (comptime !features.http3) {
+                    try why.writeAll("http3 is set, but this build leaves HTTP/3 out (-Dhttp3)");
+                    return error.Http3NotBuilt;
+                }
+                try why.writeAll("http3 is set, but no TLS listener serves it: set https, or http3 = true on a TLS listener");
+                return error.Http3NeedsHttps;
+            }
+        }
+
+        /// Whether a listener in `listeners` asks for HTTP/3.
+        fn anyHttp3(listeners: []const Options.Listener) bool {
+            for (listeners) |l| if (l.http3) return true;
+            return false;
+        }
+
+        /// The ALPN protocols a TLS listener offers by default.
+        fn defaultAlpn(l: Options.Listener) []const []const u8 {
+            if (l.http2 and l.http1) return &.{ "h2", "http/1.1" };
+            if (l.http2) return &.{"h2"};
+            return &.{"http/1.1"};
+        }
+
+        /// Sets up the listeners `opts` names (`http`, `https`,
+        /// `listeners`, `http3`; 127.0.0.1:8080 when it names none). Once,
+        /// before serving.
         fn listenOn(self: *Self, opts: Options) !void {
             const gpa = self.gpa;
             const a = self.arena.allocator();
             const rt_io = self.rt.io();
             const server = self.server;
+            const specs = try listenerSpecs(a, opts);
+            {
+                var why_buf: [512]u8 = undefined;
+                var why: std.Io.Writer = .fixed(&why_buf);
+                checkSpecs(specs, opts, &why) catch |err| {
+                    std.log.scoped(.anole).err("{s}", .{why.buffered()});
+                    return err;
+                };
+            }
             // One accept loop per executor (dusty's default on zio); on
             // Linux each with its own SO_REUSEPORT socket, so the kernel
             // spreads connections over the executors.
             // Hand-off needs one socket per listener, which we open (or
             // inherit) ourselves.
             const handoff_mode = opts.process != null;
+            if (handoff_mode and specs.len > handoff.max_tcp_listeners) return error.TooManyListeners;
             const per_core_sockets = builtin.os.tag == .linux and !handoff_mode;
             const inherited = if (opts.process) |p| handoff.inherited(p.environ) else null;
             var held: std.ArrayList(handoff.Listener) = .empty;
-            var listeners: std.ArrayList(http.Listener) = .empty;
-            const http_opts: ?Options.Http = opts.http orelse if (opts.https == null) .{} else null;
-            if (http_opts) |h| {
-                const address = try std.Io.net.IpAddress.parse(h.address, h.port);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, "http", 0, address);
-                if (fd) |f| try held.append(a, .{ .fd = f, .name = "http" });
-                try listeners.append(a, .{
-                    .address = .{ .ip = address },
-                    .http2_prior_knowledge = h.h2c and features.http2,
-                    .socket_per_acceptor = per_core_sockets,
-                    .proxy_protocol = h.proxy_protocol,
-                    .fd = fd,
-                });
-            }
-            // The certificate is read here, files included, and handed to
-            // dusty (and HTTP/3) as PEM: a reload reads it again the same way.
-            var cert_state: ?*CertState = null;
-            errdefer if (cert_state) |cs| cs.deinit();
-            if (opts.https) |h| {
-                if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
-                const cs = try a.create(CertState);
-                cs.* = .{ .gpa = gpa, .pem = try CertState.load(gpa, rt_io, h.cert), .listener = undefined };
-                cert_state = cs;
-                try cs.setSource(h.cert);
-                const config: http.ServerConfig.Tls = .{
-                    .alpn_protocols = h.alpn_protocols orelse
-                        if (features.http2) &.{ "h2", "http/1.1" } else &.{"http/1.1"},
-                    .client_auth = h.client_auth,
-                    .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key },
-                };
-                const address = try std.Io.net.IpAddress.parse(h.address, h.port);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, "https", listeners.items.len, address);
-                if (fd) |f| try held.append(a, .{ .fd = f, .name = "https" });
-                try listeners.append(a, .{
-                    .address = .{ .ip = address },
-                    .socket_per_acceptor = per_core_sockets,
-                    .proxy_protocol = h.proxy_protocol,
+            // Fixed now: the certificates and Alt-Svc point into it.
+            const listeners = try a.alloc(http.Listener, specs.len);
+            // The certificates are read here, files included, and handed
+            // to dusty (and HTTP/3) as PEM: a reload reads them again the
+            // same way.
+            var certs: std.ArrayList(*CertState) = .empty;
+            errdefer for (certs.items) |cs| cs.deinit();
+            var h3_at: ?usize = null;
+            for (specs, listeners, 0..) |spec, *out, i| {
+                const l = spec.listener;
+                const address: http.Address = if (l.unix) |path|
+                    .{ .unix = try std.Io.net.UnixAddress.init(path) }
+                else
+                    .{ .ip = try std.Io.net.IpAddress.parse(l.address, l.port) };
+                var config: ?http.ServerConfig.Tls = null;
+                if (l.tls) |t| {
+                    if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
+                    const cs = for (certs.items) |cs| {
+                        if (CertState.sameSource(cs.source, t.cert)) break cs;
+                    } else blk: {
+                        const cs = try a.create(CertState);
+                        cs.* = .{ .gpa = gpa, .pem = try CertState.load(gpa, rt_io, t.cert), .source = t.cert };
+                        try certs.append(a, cs);
+                        try cs.setSource(t.cert);
+                        break :blk cs;
+                    };
+                    try cs.listeners.append(a, out);
+                    config = .{
+                        .alpn_protocols = t.alpn_protocols orelse defaultAlpn(l),
+                        .client_auth = t.client_auth,
+                        .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key },
+                    };
+                }
+                if (l.http3) h3_at = i;
+                if (address == .unix and !handoff_mode) try clearStaleUnixSocket(rt_io, address.unix);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, i, address);
+                if (fd) |f| try held.append(a, .{ .fd = f, .name = spec.name });
+                out.* = .{
+                    .address = address,
+                    .name = spec.name,
+                    .http1 = l.http1,
+                    .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
+                    .socket_per_acceptor = per_core_sockets and address == .ip,
+                    .proxy_protocol = l.proxy_protocol,
                     .tls = config,
                     .fd = fd,
-                });
+                };
             }
-            if (listeners.items.len == 0) return error.NoListeners;
-            // The HTTPS listener comes last; the list grows no more.
-            if (cert_state) |cs| cs.listener = &listeners.items[listeners.items.len - 1];
 
-            server.config.listeners = listeners.items;
+            server.config.listeners = listeners;
             errdefer server.config.listeners = &.{};
 
             var endpoint: H3Endpoint = if (features.http3) null else {};
-            if (opts.http3) |q| {
-                if (comptime !features.http3) return error.Http3NotBuilt;
-                if (comptime features.http3) {
-                    const https = opts.https orelse return error.Http3NeedsHttps;
-                    // Mutual TLS: the same CAs and mode as the TCP listener,
-                    // loaded once more here (dusty loads its own when it
-                    // starts listening).
-                    var client_ca: ?std.crypto.Certificate.Bundle = null;
-                    defer if (client_ca) |*b| b.deinit(gpa);
-                    if (https.client_auth) |ca| client_ca = try ca.ca.load(gpa, rt_io);
-                    // The UDP sockets: inherited (`h3`, in the order the
-                    // predecessor bound them, or by position after the TCP
-                    // listeners), with the predecessor's secret.
-                    var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
-                    const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.items.len, &h3_buf) else &.{};
-                    const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
-                    const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
-                        .address = try std.Io.net.IpAddress.parse(q.address orelse https.address, q.port orelse https.port),
-                        .cert_pem = cert_state.?.pem.cert,
-                        .key_pem = cert_state.?.pem.key,
-                        .max_streams_bidi = q.max_streams_bidi,
-                        .validate_address = q.validate_address,
-                        .idle_timeout_ms = q.idle_timeout_ms,
-                        .hq_interop_root = q.hq_interop_root,
-                        .early_data = q.early_data,
-                        .enable_connect_protocol = q.enable_connect_protocol,
-                        .webtransport = q.webtransport or self.extras.webtransport,
-                        .inline_no_wait = q.inline_no_wait,
-                        .client_auth = h3ClientAuth(https.client_auth, client_ca),
-                        .fds = h3_fds,
-                        .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
-                        .secret = secret,
-                        // The same drain deadline as HTTP/1.1 and HTTP/2.
-                        .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
-                            @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
-                        else
-                            std.math.maxInt(u32),
-                    });
-                    errdefer ep.deinit();
-                    endpoint = ep;
-                    // Named in the HTTPS listener's startup line.
-                    const tcp = &listeners.items[listeners.items.len - 1];
-                    const udp_port = ep.address().getPort();
-                    tcp.extra_protocols = if (udp_port == tcp.address.ip.getPort())
-                        &.{"HTTP/3"}
+            if (comptime features.http3) if (h3_at) |at| {
+                const q = opts.http3 orelse Options.Http3{};
+                const l = specs[at].listener;
+                const tcp = &listeners[at];
+                const cs = for (certs.items) |cs| {
+                    if (std.mem.indexOfScalar(*http.Listener, cs.listeners.items, tcp) != null) break cs;
+                } else unreachable;
+                cs.h3_listener = tcp;
+                const client_auth = l.tls.?.client_auth;
+                // Mutual TLS: the same CAs and mode as the TCP listener,
+                // loaded once more here (dusty loads its own when it
+                // starts listening).
+                var client_ca: ?std.crypto.Certificate.Bundle = null;
+                defer if (client_ca) |*b| b.deinit(gpa);
+                if (client_auth) |ca| client_ca = try ca.ca.load(gpa, rt_io);
+                // The UDP sockets: inherited (`h3`, in the order the
+                // predecessor bound them, or by position after the TCP
+                // listeners), with the predecessor's secret.
+                var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
+                const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.len, &h3_buf) else &.{};
+                const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
+                const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
+                    .address = try std.Io.net.IpAddress.parse(q.address orelse l.address, q.port orelse l.port),
+                    .cert_pem = cs.pem.cert,
+                    .key_pem = cs.pem.key,
+                    .max_streams_bidi = q.max_streams_bidi,
+                    .validate_address = q.validate_address,
+                    .idle_timeout_ms = q.idle_timeout_ms,
+                    .hq_interop_root = q.hq_interop_root,
+                    .early_data = q.early_data,
+                    .enable_connect_protocol = q.enable_connect_protocol,
+                    .webtransport = q.webtransport or self.extras.webtransport,
+                    .inline_no_wait = q.inline_no_wait,
+                    .client_auth = h3ClientAuth(client_auth, client_ca),
+                    .listener_name = specs[at].name,
+                    .fds = h3_fds,
+                    .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
+                    .secret = secret,
+                    // The same drain deadline as HTTP/1.1 and HTTP/2.
+                    .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
+                        @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
                     else
-                        try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
-                    // Every socket, in the group's order.
-                    if (handoff_mode) for (ep.endpoints()) |e| try held.append(a, .{ .fd = e.udp.socket.handle, .name = "h3" });
-                    if (q.alt_svc) {
-                        const alt = self.alt_svc orelse self.addAltSvc();
-                        self.alt_svc = alt;
-                        alt.value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{ep.address().getPort()});
-                    }
+                        std.math.maxInt(u32),
+                });
+                errdefer ep.deinit();
+                endpoint = ep;
+                // Named in the TLS listener's startup line.
+                const udp_port = ep.address().getPort();
+                tcp.extra_protocols = if (udp_port == tcp.address.ip.getPort())
+                    &.{"HTTP/3"}
+                else
+                    try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
+                // Every socket, in the group's order.
+                if (handoff_mode) for (ep.endpoints()) |e| try held.append(a, .{ .fd = e.udp.socket.handle, .name = "h3" });
+                if (q.alt_svc) {
+                    const alt = self.alt_svc orelse self.addAltSvc();
+                    self.alt_svc = alt;
+                    alt.listener = tcp;
+                    alt.value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{udp_port});
                 }
-            }
+            };
             self.held = held.items;
             self.h3 = endpoint;
-            self.cert = cert_state;
+            self.certs = certs.items;
         }
 
         /// The HTTP/3 endpoint's mutual TLS settings: the TCP listener's
@@ -671,13 +905,41 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// The socket for one listener in hand-off mode: inherited if one
         /// was passed in under `name` (or at `index`), else opened here.
         /// Null outside hand-off mode (dusty binds).
-        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: std.Io.net.IpAddress) !?handoff.Fd {
+        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address) !?handoff.Fd {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
-            // SO_REUSEPORT would share the port with whoever has it.
-            try http.checkAddressFree(address);
-            const s = try address.listen(io_, .{ .reuse_address = true });
-            return s.socket.handle;
+            switch (address) {
+                .ip => |ip| {
+                    // SO_REUSEPORT would share the port with whoever has it.
+                    try http.checkAddressFree(ip);
+                    const s = try ip.listen(io_, .{ .reuse_address = true });
+                    return s.socket.handle;
+                },
+                .unix => |unix| {
+                    try clearStaleUnixSocket(io_, unix);
+                    const s = try unix.listen(io_, .{});
+                    return s.socket.handle;
+                },
+            }
+        }
+
+        /// Removes the socket file at `address` when nothing listens on it
+        /// any more (a server that stopped without removing it, as Anole
+        /// never does: a successor may be serving it), so it can be bound
+        /// again. One that something answers on is in use.
+        fn clearStaleUnixSocket(io_: std.Io, address: std.Io.net.UnixAddress) !void {
+            if (address.isAbstract()) return;
+            const cwd = std.Io.Dir.cwd();
+            const stat = cwd.statFile(io_, address.path, .{}) catch return;
+            if (stat.kind != .unix_domain_socket) return;
+            if (address.connect(io_)) |stream| {
+                stream.close(io_);
+                std.log.scoped(.anole).err("unix:{s} is already in use: another process is listening on it", .{address.path});
+                return error.AddressInUse;
+            } else |err| switch (err) {
+                error.ConnectionRefused => cwd.deleteFile(io_, address.path) catch {},
+                else => {},
+            }
         }
 
         pub fn deinit(self: *Self) void {
@@ -704,7 +966,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.client_registered) client_mod.unregister(&extras.client_entry);
             extras.client.deinit();
             for (extras.dirs.items) |d| d.close(self.rt.io());
-            if (self.cert) |cs| cs.deinit();
+            for (self.certs) |cs| cs.deinit();
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
             server_on_thread = false;
@@ -723,7 +985,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// a container), "127.0.0.1:3000" or "localhost:3000" this machine
         /// only, "[::]:3000" every IPv6 interface. HTTP/1.1, and HTTP/2 for
         /// clients that open with its preface (h2c). For a server whose
-        /// `init` options named no listener.
+        /// `init` options named neither `http` nor `https`; it serves the
+        /// options' `listeners` too.
         pub fn listen(self: *Self, address: []const u8) !void {
             var opts = try self.takePending("listen");
             const at = address_mod.parse(address) catch |err| return self.failStart(err);
@@ -743,7 +1006,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             var opts = try self.takePending("listenTls");
             const at = address_mod.parse(address) catch |err| return self.failStart(err);
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
-            if (features.http3 and opts.listen_tls_http3 and opts.http3 == null) opts.http3 = .{};
+            // Unless a listener in `listeners` serves HTTP/3 already.
+            if (features.http3 and opts.listen_tls_http3 and opts.http3 == null and !anyHttp3(opts.listeners)) opts.http3 = .{};
             try self.configure(opts);
             return self.run();
         }
@@ -1295,73 +1559,110 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return mongo;
         }
 
-        /// Loads the TLS certificate and key again (from their files, for
-        /// `.files`) and the client CAs of `https.client_auth` (from theirs),
-        /// and switches the HTTPS listener and HTTP/3 to them. Connections
-        /// that start from then on get the new ones; connections already
-        /// open, handshakes in progress included, keep theirs. Session
-        /// tickets issued before still resume. SIGHUP calls it while `run`
-        /// serves.
+        /// Loads every TLS listener's certificate and key again (from their
+        /// files, for `.files`) and their client CAs (`client_auth`, from
+        /// theirs), and switches the TLS listeners and HTTP/3 to them.
+        /// Connections that start from then on get the new ones;
+        /// connections already open, handshakes in progress included, keep
+        /// theirs. Session tickets issued before still resume. SIGHUP calls
+        /// it while `run` serves.
         ///
-        /// On an error (a file missing, a key that does not match the
-        /// certificate) nothing changes: the server goes on with what it
-        /// had. Call it from a task of the server's runtime (`io()`); one
-        /// reload runs at a time.
+        /// All or nothing: on an error (a file missing, a key that does not
+        /// match the certificate) nothing changes, on any listener, and the
+        /// server goes on with what it had. Call it from a task of the
+        /// server's runtime (`io()`); one reload runs at a time.
         pub fn reloadCertificates(self: *Self) !void {
-            const cs = self.cert orelse return error.NoTlsListener;
+            if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try cs.mutex.lock(io_);
-            defer cs.mutex.unlock(io_);
-            var next: CertState.Pem = if (cs.files) |f|
-                try CertState.load(cs.gpa, io_, .{ .files = .{ .cert_path = f.cert_path, .key_path = f.key_path } })
-            else
-                try CertState.load(cs.gpa, io_, .{ .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key } });
-            errdefer next.deinit(cs.gpa);
-            try self.switchCertificate(cs, next);
+            try self.extras.cert_mutex.lock(io_);
+            defer self.extras.cert_mutex.unlock(io_);
+            const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
+            defer self.gpa.free(next);
+            var loaded: usize = 0;
+            defer for (next[0..loaded]) |*p| p.deinit(self.gpa);
+            for (self.certs, next) |cs, *n| {
+                n.* = if (cs.files) |f|
+                    try CertState.load(cs.gpa, io_, .{ .files = .{ .cert_path = f.cert_path, .key_path = f.key_path } })
+                else
+                    try CertState.load(cs.gpa, io_, .{ .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key } });
+                loaded += 1;
+            }
+            try self.switchCertificates(next);
+            loaded = 0;
         }
 
-        /// As `reloadCertificates`, from `cert` instead: new PEM in memory,
-        /// other files, or a fresh development certificate. On success it
-        /// becomes the source later reloads (and SIGHUP) read again.
+        /// As `reloadCertificates`, from `cert` instead, for every TLS
+        /// listener: new PEM in memory, other files, or a fresh development
+        /// certificate. On success it becomes the source later reloads (and
+        /// SIGHUP) read again.
         pub fn setCertificate(self: *Self, cert: Options.Cert) !void {
-            const cs = self.cert orelse return error.NoTlsListener;
+            if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try cs.mutex.lock(io_);
-            defer cs.mutex.unlock(io_);
-            var next = try CertState.load(cs.gpa, io_, cert);
-            errdefer next.deinit(cs.gpa);
-            try self.switchCertificate(cs, next);
+            try self.extras.cert_mutex.lock(io_);
+            defer self.extras.cert_mutex.unlock(io_);
+            const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
+            defer self.gpa.free(next);
+            var loaded: usize = 0;
+            defer for (next[0..loaded]) |*p| p.deinit(self.gpa);
+            next[0] = try CertState.load(self.gpa, io_, cert);
+            loaded = 1;
+            for (next[1..]) |*n| {
+                n.* = try next[0].dupe(self.gpa);
+                loaded += 1;
+            }
+            try self.switchCertificates(next);
+            loaded = 0;
             // In place now; only the paths are left to remember.
-            cs.setSource(cert) catch |err| {
+            for (self.certs) |cs| cs.setSource(cert) catch |err| {
                 std.log.scoped(.anole).warn("certificate in use, but its source is not remembered for the next reload: {t}", .{err});
                 cs.freeSource();
             };
         }
 
-        /// Puts `next` in place on the TCP listener and HTTP/3, or neither.
-        /// Takes `next` on success. Under `cs.mutex`.
-        fn switchCertificate(self: *Self, cs: *CertState, next: CertState.Pem) !void {
-            const listener_tls = &cs.listener.tls.?;
+        /// Puts `next` (one per `certs`) in place on the TLS listeners and
+        /// HTTP/3, or none of it. Takes `next` on success. Under
+        /// `cert_mutex`.
+        fn switchCertificates(self: *Self, next: []const CertState.Pem) !void {
+            const gpa = self.gpa;
             // HTTP/3's context first: it checks the certificate and key, and
-            // is dropped if the TCP listener's reload fails.
+            // is dropped if the TCP listeners' reload fails.
             var quic: if (features.http3) ?h3.TlsContext else void = if (features.http3) null else {};
             if (comptime features.http3) if (self.h3) |ep| {
-                var client_ca: ?std.crypto.Certificate.Bundle = null;
-                defer if (client_ca) |*b| b.deinit(cs.gpa);
-                if (listener_tls.client_auth) |ca| client_ca = try ca.ca.load(cs.gpa, self.rt.io());
-                quic = try ep.loadTls(next.cert, next.key, h3ClientAuth(listener_tls.client_auth, client_ca));
+                for (self.certs, next) |cs, n| {
+                    const tcp = cs.h3_listener orelse continue;
+                    const client_auth = tcp.tls.?.client_auth;
+                    var client_ca: ?std.crypto.Certificate.Bundle = null;
+                    defer if (client_ca) |*b| b.deinit(gpa);
+                    if (client_auth) |ca| client_ca = try ca.ca.load(gpa, self.rt.io());
+                    quic = try ep.loadTls(n.cert, n.key, h3ClientAuth(client_auth, client_ca));
+                }
             };
             errdefer if (comptime features.http3) if (quic) |*q| q.deinit();
 
-            const before = listener_tls.pem;
-            listener_tls.pem = .{ .cert = next.cert, .key = next.key };
+            const TlsPem = @FieldType(http.ServerConfig.Tls, "pem");
+            var count: usize = 0;
+            for (self.certs) |cs| count += cs.listeners.items.len;
+            const before = try gpa.alloc(TlsPem, count);
+            defer gpa.free(before);
+            var i: usize = 0;
+            for (self.certs, next) |cs, n| for (cs.listeners.items) |l| {
+                before[i] = l.tls.?.pem;
+                l.tls.?.pem = .{ .cert = n.cert, .key = n.key };
+                i += 1;
+            };
             self.server.reloadTls() catch |err| {
-                listener_tls.pem = before;
+                i = 0;
+                for (self.certs) |cs| for (cs.listeners.items) |l| {
+                    l.tls.?.pem = before[i];
+                    i += 1;
+                };
                 return err;
             };
             if (comptime features.http3) if (quic) |q| self.h3.?.useTls(q);
-            cs.pem.deinit(cs.gpa);
-            cs.pem = next;
+            for (self.certs, next) |cs, n| {
+                cs.pem.deinit(cs.gpa);
+                cs.pem = n;
+            }
         }
 
         /// Ends `run`, as a signal would: the server drains and `run`
@@ -1370,8 +1671,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.stopped.set(self.rt.io());
         }
 
-        /// The bound address of each listener (`http` first), once serving;
-        /// a listener given port 0 has its real port here.
+        /// The bound address of each listener (`http`, `https`, then
+        /// `listeners`, in order), once serving; a listener given port 0
+        /// has its real port here.
         pub fn addresses(self: *const Self) []const http.Address {
             return self.server.addresses;
         }
@@ -1385,8 +1687,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and
         /// drains the requests in flight (bounded by `timeout.shutdown`).
-        /// Sets up the listeners first when `init` left them (127.0.0.1:8080
-        /// unless `listen` or `listenTls` named others). Call it from the
+        /// Sets up the listeners first when `init` left them (the options'
+        /// `listeners`, or 127.0.0.1:8080 when there are none, unless
+        /// `listen` or `listenTls` named others). Call it from the
         /// thread that called `init`.
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
@@ -1412,7 +1715,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const restartable = self.process != null and self.held.len > 0;
             if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
             // SIGHUP reloads the certificate, where there is one.
-            if (self.cert != null) try sel.concurrent(.reload, reloadOnHangup, .{self});
+            if (self.certs.len > 0) try sel.concurrent(.reload, reloadOnHangup, .{self});
             // Once serving: systemd hears (`NOTIFY_SOCKET`), and a successor
             // tells the predecessor that started it.
             var notify: ?std.Io.Future(void) = if (self.process) |p|
@@ -2077,4 +2380,279 @@ test "anole.Server: use, group and middleware copy what they are given, and dein
     }
     // The `use` copy, `shared`, and the copy in the "/api" group.
     try std.testing.expectEqual(@as(u32, 3), deinits);
+}
+
+/// Raw HTTP/1.1 over one connection, for the listener tests: the whole
+/// answer (up to 4 KiB), empty when the server closes without one.
+const RawGet = struct {
+    fn over(io_: std.Io, stream: std.Io.net.Stream, path: []const u8, out: []u8) ![]const u8 {
+        defer stream.close(io_);
+        var wbuf: [256]u8 = undefined;
+        var w = stream.writer(io_, &wbuf);
+        try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+        try w.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io_, &rbuf);
+        var fw: std.Io.Writer = .fixed(out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        return fw.buffered();
+    }
+
+    fn ip(io_: std.Io, address: std.Io.net.IpAddress, path: []const u8, out: []u8) ![]const u8 {
+        return over(io_, try address.connect(io_, .{ .mode = .stream }), path, out);
+    }
+};
+
+fn handleListenerName(req: *http.Request, res: *http.Response) !void {
+    try res.print(.text, "on {s}", .{req.listener.name});
+}
+
+test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 + h3 with Alt-Svc, a unix socket, TLS h2 only, onlyOn" {
+    if (comptime features.tls != .boringssl or !features.http2 or !features.http3) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pem = try tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    const cert: Options.Cert = .fromPem(pem.cert, pem.key);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Relative: a unix socket path has room for about 104 bytes.
+    const sock_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/s.sock", .{tmp.sub_path});
+    defer gpa.free(sock_path);
+
+    var app = try Server(void).init(gpa, .{
+        .listeners = &.{
+            .{ .name = "plain", .port = 0 },
+            .{ .name = "h1tls", .port = 0, .tls = .{ .cert = cert }, .http2 = false },
+            .{ .name = "h2c", .port = 0, .http1 = false },
+            .{ .name = "tls", .port = 0, .tls = .{ .cert = cert }, .http3 = true },
+            .{ .name = "admin", .port = 0 },
+            .{ .unix = sock_path },
+            .{ .name = "h2tls", .port = 0, .tls = .{ .cert = cert }, .http1 = false },
+        },
+        .executors = .exact(2),
+    }, {});
+    defer app.deinit();
+    app.get("/", handleListenerName);
+    app.group("/admin", .{onlyOn("admin")}).get("/stats", handleListenerName);
+
+    const Check = struct {
+        const h2c = @import("anole_h2_client");
+        const alloc = std.testing.allocator;
+
+        fn h2Get(conn: *h2c.ClientConnection, path: []const u8) ![]u8 {
+            const s = try conn.request(&.{
+                .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
+                .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+            }, .{});
+            defer s.release();
+            try s.waitHead();
+            if (s.status != 200) return error.UnexpectedStatus;
+            return s.reader().allocRemaining(alloc, .unlimited);
+        }
+
+        fn expectH2(conn: *h2c.ClientConnection, want: []const u8) !void {
+            defer conn.close();
+            const body = try h2Get(conn, "/");
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings(want, body);
+        }
+
+        fn run(a: *Server(void), p: *const tls.Pem, path: []const u8) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const addrs = a.addresses();
+            try std.testing.expectEqual(@as(usize, 7), addrs.len);
+            const plain = addrs[0].ip;
+            const h1tls = addrs[1].ip.getPort();
+            const h2c_only = addrs[2].ip;
+            const tls_port = addrs[3].ip.getPort();
+            const admin = addrs[4].ip;
+            var out: [4096]u8 = undefined;
+
+            // HTTP/1.1 and h2c on one port; no Alt-Svc on cleartext.
+            var resp = try RawGet.ip(io_, plain, "/", &out);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+            try std.testing.expect(std.mem.endsWith(u8, resp, "on plain"));
+            try std.testing.expect(std.mem.indexOf(u8, resp, "Alt-Svc") == null);
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{ .host = "127.0.0.1", .port = plain.getPort() }), "on plain");
+
+            // h2c only: HTTP/1.1 gets the connection closed, unanswered.
+            resp = try RawGet.ip(io_, h2c_only, "/", &out);
+            try std.testing.expectEqual(@as(usize, 0), resp.len);
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{ .host = "127.0.0.1", .port = h2c_only.getPort() }), "on h2c");
+
+            // TLS, HTTP/1.1 only: a client that offers h2 alone does not
+            // get it; one that offers both gets HTTP/1.1. No Alt-Svc.
+            const ca: http.dusty_module.TlsCa = .{ .pem = p.cert };
+            try std.testing.expect(std.meta.isError(h2c.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .port = h1tls,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+            })));
+            var client = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
+            defer client.deinit();
+            var url_buf: [64]u8 = undefined;
+            {
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h1tls}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on h1tls", (try r.body()).?);
+                try std.testing.expect(r.headers().get("Alt-Svc") == null);
+            }
+
+            // TLS with HTTP/2 and HTTP/3, advertised on this listener.
+            const q = a.http3Address().?;
+            var alt_buf: [64]u8 = undefined;
+            const alt = try std.fmt.bufPrint(&alt_buf, "h3=\":{d}\"; ma=86400", .{q.getPort()});
+            {
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{tls_port}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on tls", (try r.body()).?);
+                try std.testing.expectEqualStrings(alt, r.headers().get("Alt-Svc").?);
+            }
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .port = tls_port,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+            }), "on tls");
+            {
+                const conn = try h3.ClientConnection.connect(alloc, io_, .{
+                    .host = "localhost",
+                    .address = q,
+                    .port = q.getPort(),
+                    .tls = .{ .ca = .{ .pem = p.cert } },
+                });
+                defer conn.close();
+                const s = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/" },
+                    .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer s.release();
+                try s.waitHead();
+                const body = try s.reader().allocRemaining(alloc, .unlimited);
+                defer alloc.free(body);
+                // HTTP/3 requests report the TLS listener they serve.
+                try std.testing.expectEqualStrings("on tls", body);
+            }
+
+            // onlyOn: /admin on its listener alone.
+            resp = try RawGet.ip(io_, admin, "/admin/stats", &out);
+            try std.testing.expect(std.mem.endsWith(u8, resp, "on admin"));
+            resp = try RawGet.ip(io_, plain, "/admin/stats", &out);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 404 "));
+
+            // The unix socket, named after its path.
+            const unix = try std.Io.net.UnixAddress.init(path);
+            resp = try RawGet.over(io_, try unix.connect(io_), "/", &out);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+            var name_buf: [128]u8 = undefined;
+            try std.testing.expect(std.mem.endsWith(u8, resp, try std.fmt.bufPrint(&name_buf, "on unix-{s}", .{path})));
+
+            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone (as
+            // the HTTP client does by default) is not served.
+            const h2tls = addrs[6].ip.getPort();
+            try std.testing.expect(std.meta.isError(client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .port = h2tls,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+            }), "on h2tls");
+        }
+    };
+    var client_future = try app.io().concurrent(Check.run, .{ &app, &pem, sock_path });
+    try app.run();
+    try client_future.await(app.io());
+    // Every TLS listener named the same certificate: one copy.
+    try std.testing.expectEqual(@as(usize, 1), app.certs.len);
+    try std.testing.expectEqual(@as(usize, 3), app.certs[0].listeners.items.len);
+}
+
+test "anole.Server: listeners that cannot be set up are refused, with what is wrong" {
+    const S = Server(void);
+    const Case = struct { opts: Options, err: anyerror };
+    const cert: Options.Cert = .dev_self_signed;
+    const cases = [_]Case{
+        .{ .opts = .{ .listeners = &.{ .{ .name = "a" }, .{ .name = "a" } } }, .err = error.DuplicateListenerName },
+        // `http` is "http".
+        .{ .opts = .{ .http = .{}, .listeners = &.{.{ .name = "http" }} }, .err = error.DuplicateListenerName },
+        .{ .opts = .{ .listeners = &.{.{ .name = "a:b" }} }, .err = error.InvalidListenerName },
+        .{ .opts = .{ .listeners = &.{.{ .http1 = false, .http2 = false }} }, .err = error.NoProtocols },
+        .{ .opts = .{ .listeners = &.{.{ .http3 = true }} }, .err = if (features.http3) error.Http3NeedsTls else error.Http3NotBuilt },
+        .{ .opts = .{ .listeners = &.{
+            .{ .port = 1, .tls = .{ .cert = cert }, .http3 = true },
+            .{ .port = 2, .tls = .{ .cert = cert }, .http3 = true },
+        } }, .err = if (features.http3) error.SeveralHttp3Listeners else error.Http3NotBuilt },
+        .{ .opts = .{ .http3 = .{}, .listeners = &.{.{ .tls = .{ .cert = cert } }} }, .err = if (features.http3) error.Http3NeedsHttps else error.Http3NotBuilt },
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    for (cases) |c| {
+        const specs = try S.listenerSpecs(arena.allocator(), c.opts);
+        var why_buf: [512]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        try std.testing.expectError(c.err, S.checkSpecs(specs, c.opts, &why));
+        try std.testing.expect(why.buffered().len > 0);
+    }
+    // The names made up for listeners without one, unique on port 0 too.
+    const specs = try S.listenerSpecs(arena.allocator(), .{
+        .http = .{},
+        .listeners = &.{ .{ .port = 0 }, .{ .port = 0 }, .{ .port = 9443, .tls = .{ .cert = cert } }, .{ .unix = "/run/app.sock" } },
+    });
+    var names: [5][]const u8 = undefined;
+    for (specs, &names) |spec, *n| n.* = spec.name;
+    for ([_][]const u8{ "http", "http-0", "http-0-2", "https-9443", "unix-/run/app.sock" }, names) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "anole.Server: the open-file limit is raised, and max_connections follows it unless set" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const before = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, before) catch {};
+    var low = before;
+    low.cur = @min(before.max, 512);
+    try std.posix.setrlimit(.NOFILE, low);
+
+    {
+        // Two listeners, one socket each (one per executor on Linux).
+        var app = try App.init(gpa, .{
+            .listeners = &.{ .{ .port = 0 }, .{ .port = 0 } },
+            .executors = .exact(2),
+        });
+        defer app.deinit();
+        const soft = http.fd_limit.softLimit().?;
+        if (before.max > 512) try std.testing.expect(soft > 512);
+        const Run = struct {
+            fn run(a: *App, limit: u64) !void {
+                defer a.stop();
+                try a.waitReady();
+                const sockets: usize = if (builtin.os.tag == .linux) 4 else 2;
+                try std.testing.expectEqual(http.fd_limit.maxConnections(limit, 2, sockets), a.server.config.max_connections.?);
+            }
+        };
+        var f = try app.io().concurrent(Run.run, .{ &app, soft });
+        try app.run();
+        try f.await(app.io());
+    }
+
+    // Set: kept as it is; and with `raise_fd_limit` off, the limit is left
+    // alone.
+    try std.posix.setrlimit(.NOFILE, low);
+    var capped = try App.init(gpa, .{
+        .listeners = &.{.{ .port = 0 }},
+        .executors = .exact(1),
+        .raise_fd_limit = false,
+        .server = .{ .max_connections = 77 },
+    });
+    defer capped.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(low.cur)), http.fd_limit.softLimit().?);
+    const Capped = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            try a.waitReady();
+            try std.testing.expectEqual(@as(?u32, 77), a.server.config.max_connections);
+        }
+    };
+    var g = try capped.io().concurrent(Capped.run, .{&capped});
+    try capped.run();
+    try g.await(capped.io());
 }

@@ -38,6 +38,7 @@ const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
 const somaxconn = @import("somaxconn.zig").somaxconn;
+const fd_limit = @import("fd_limit.zig");
 
 const log = std.log.scoped(.anole);
 
@@ -687,9 +688,10 @@ pub fn describeListener(w: *std.Io.Writer, cfg: *const Listener, address: Addres
         }
     }
     if (first) {
-        try w.writeAll("HTTP/1.1");
+        const h2c = !secure and cfg.http2_prior_knowledge and build_options.use_http2;
+        if (cfg.http1 or !h2c) try w.writeAll("HTTP/1.1");
+        if (h2c) try w.writeAll(if (cfg.http1) ", HTTP/2 cleartext" else "HTTP/2 cleartext");
         first = false;
-        if (!secure and cfg.http2_prior_knowledge and build_options.use_http2) try w.writeAll(", HTTP/2 cleartext");
     }
     for (cfg.extra_protocols) |p| try w.print(", {s}", .{p});
     if (cfg.proxy_protocol) try w.writeAll("; PROXY protocol");
@@ -937,6 +939,17 @@ pub fn Server(comptime Ctx: type) type {
                 opened += 1;
                 address.* = l.address;
             }
+            if (self.config.max_connections == ServerConfig.max_connections_from_fd_limit) {
+                var sockets: usize = 0;
+                for (active) |*l| sockets += 1 + l.extra_servers.len;
+                const soft = fd_limit.softLimit();
+                self.config.max_connections = if (soft) |n| fd_limit.maxConnections(n, executors orelse 1, sockets) else fd_limit.fallback_max_connections;
+                // Logging allocates, which can swallow a cancel (see
+                // `placement.concurrent`).
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                log.debug("at most {d} connections at once (open-file limit {?d})", .{ self.config.max_connections.?, soft });
+            }
             // Out of `reloadTls`'s reach before the listeners close.
             self.lockTls();
             self.active_listeners = active;
@@ -1109,6 +1122,11 @@ pub fn Server(comptime Ctx: type) type {
         fn open(self: *Self, cfg: *const Listener, kernel_backlog: u31, acceptor_count: usize) !ActiveListener {
             var l: ActiveListener = .{ .config = cfg, .address = cfg.address, .server = undefined };
             errdefer l.freeTls(self.allocator);
+
+            if (!cfg.http1 and (!build_options.use_http2 or (cfg.tls == null and !cfg.http2_prior_knowledge))) {
+                log.err("{f} serves neither HTTP/1.x (http1 is off) nor HTTP/2 (needs use_http2, and http2_prior_knowledge on a cleartext listener)", .{cfg.address});
+                return error.NoProtocols;
+            }
 
             if (cfg.tls) |tls_cfg| {
                 if (!build_options.use_tls) {
@@ -1724,6 +1742,11 @@ pub fn Server(comptime Ctx: type) type {
                             return self.closeNotify(&connection, &timer);
                         };
                     }
+                    // An HTTP/2-only listener, and ALPN did not agree on it.
+                    if (!l.config.http1) {
+                        log.debug("closing a TLS connection that did not choose h2 on an HTTP/2-only listener", .{});
+                        return self.closeNotify(&connection, &timer);
+                    }
                     try self.handleRequests(l, &connection, &timer, &busy, accepted_at);
                     return self.closeNotify(&connection, &timer);
                 }
@@ -1934,6 +1957,11 @@ pub fn Server(comptime Ctx: type) type {
                         timer.clear(self.io);
                         return h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
                     }
+                }
+                // An HTTP/2-only cleartext listener: no preface, no service.
+                if (!l.config.http1 and !(build_options.use_tls and l.config.tls != null)) {
+                    log.debug("closing a connection that did not open with the HTTP/2 preface on an HTTP/2-only listener", .{});
+                    return;
                 }
                 // A request runs to `timeout.request` from its arrival (the
                 // first from accept), and its head must arrive within

@@ -1,13 +1,17 @@
 #!/bin/sh
-# A zero-downtime restart (SIGUSR2) of examples/full with HTTP/1.1, HTTPS
-# and HTTP/3 on, under a stand-in for systemd's notification socket:
+# A zero-downtime restart (SIGUSR2) of examples/full with four named
+# listeners (HTTP/1.1 + h2c; TLS with HTTP/2, HTTP/1.1 and HTTP/3; TLS with
+# HTTP/1.1 alone; h2c alone), under a stand-in for systemd's notification
+# socket:
 #   - READY=1 once serving; RELOADING=1, then MAINPID=<new> READY=1 from the
 #     successor on SIGUSR2; no STOPPING=1 from the process handing over;
 #     STOPPING=1 on SIGTERM;
 #   - the UDP socket goes to the successor: an HTTP/3 connection open
 #     across the restart is closed by the old process (CONNECTION_CLOSE,
 #     H3_NO_ERROR) at once, and new ones reach the successor;
-#   - TCP and HTTP/3 serve throughout, and a second restart works too;
+#   - TCP and HTTP/3 serve throughout, each listener's socket reaching the
+#     successor under its own name (LISTEN_FDNAMES), so each port still
+#     speaks what it did; a second restart works too;
 #   - SIGHUP reloads the certificate (RELOADING=1, then READY=1) and the
 #     process goes on serving.
 #   tests/restart/run.sh [path-to-full]
@@ -23,6 +27,8 @@ python3 -m venv "$work/venv"
 py="$work/venv/bin/python -I"
 port=18580
 tls_port=18581
+h1_tls_port=18582
+h2c_port=18583
 
 fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[f]ull $port" || true; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
 # Waits up to 10 s for a line matching $1 in the notification log, after
@@ -38,18 +44,25 @@ check_all() {
   [ "$out" = hello ] || fail "https ($1): $out"
   out=$($py "$here/../h3/client.py" "https://127.0.0.1:$tls_port/" --quiet --repeat 3) || fail "h3 ($1)"
   [ "$(echo "$out" | tail -1)" = "3 responses" ] || fail "h3 ($1): $out"
+  # TLS, HTTP/1.1 alone: a client offering h2 gets HTTP/1.1.
+  out=$(curl -sk --http2 -w ' %{http_version}' "https://127.0.0.1:$h1_tls_port/") || fail "https-h1 ($1)"
+  [ "$out" = "hello 1.1" ] || fail "https-h1 ($1): $out"
+  # h2c alone: HTTP/2 with prior knowledge, and HTTP/1.1 closed unanswered.
+  out=$(curl -s --http2-prior-knowledge -w ' %{http_version}' "http://127.0.0.1:$h2c_port/") || fail "h2c ($1)"
+  [ "$out" = "hello 2" ] || fail "h2c ($1): $out"
+  if curl -s --http1.1 "http://127.0.0.1:$h2c_port/" >/dev/null; then fail "h2c ($1): served HTTP/1.1"; fi
 }
 
 : >"$work/notify.log"
 $py "$here/notify.py" "$work/notify" "$work/notify.log" &
 pids="$!"
 sleep 0.5
-NOTIFY_SOCKET="$work/notify" "$server_bin" $port $tls_port >"$work/server.log" 2>&1 &
+NOTIFY_SOCKET="$work/notify" "$server_bin" $port $tls_port $h1_tls_port $h2c_port >"$work/server.log" 2>&1 &
 first=$!
 pids="$pids $first"
 await_notify "^READY=1$"
 check_all "first process"
-echo "PASS READY=1, then HTTP/1.1, HTTPS and HTTP/3"
+echo "PASS READY=1, then HTTP/1.1, HTTPS, HTTP/3, TLS HTTP/1.1 only and h2c only"
 
 lines=$(wc -l <"$work/notify.log")
 kill -HUP $first
