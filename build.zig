@@ -448,6 +448,14 @@ pub fn build(b: *std.Build) void {
         const sqlite_tests = b.addTest(.{ .name = "anole-test-sqlite", .root_module = tests.root_module, .filters = &.{"sqlite:"}, .use_llvm = use_llvm });
         b.step("test-sqlite", "Run the SQLite tests").dependOn(&b.addRunArtifact(sqlite_tests).step);
     }
+    // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
+    // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
+    if (features.mongodb) {
+        const mongo_tests = b.addTest(.{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const run_mongo_tests = b.addRunArtifact(mongo_tests);
+        run_mongo_tests.has_side_effects = mongodb_test_url != null;
+        b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
+    }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
@@ -620,6 +628,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
         .{ .name = "postgres", .needs = features.postgres, .about = "a posts API on PostgreSQL (DATABASE_URL), on port 3000" },
         .{ .name = "sqlite", .needs = features.sqlite, .about = "a to-do API on SQLite (todos.db, or a path after --), on port 3000" },
+        .{ .name = "mongodb", .needs = features.mongodb, .about = "a users API on MongoDB (MONGODB_URI), on port 3000" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;

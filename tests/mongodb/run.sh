@@ -68,5 +68,5 @@ for target in \
     "mongodb://sha1:$password@localhost:$port/?replicaSet=rs0&authSource=admin&authMechanism=SCRAM-SHA-1" \
     "$base&tls=true&tlsCAFile=$work/ca.pem"; do
     echo "== $(echo "$target" | sed -E 's#//([^:]+):[^@]+@#//\1:***@#')"
-    "$zig" build test --summary line "-Dmongodb-test-url=$target"
+    "$zig" build test-mongodb --summary line "-Dmongodb-test-url=$target"
 done

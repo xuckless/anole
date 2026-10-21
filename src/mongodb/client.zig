@@ -323,7 +323,7 @@ pub const Client = struct {
         var buf: [2048]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var c: shared.Ctx = .{ .io = io, .arena = fba.allocator() };
-        self.db("admin").with(.{ .timeout = .fromSeconds(2) }).runCommand(&c, .{ .ping = 1 }) catch return false;
+        _ = self.db("admin").with(.{ .timeout = .fromSeconds(2) }).runCommand(&c, .{ .ping = 1 }) catch return false;
         return true;
     }
 
