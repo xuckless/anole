@@ -1,0 +1,2963 @@
+// Adapted from lalinsky/dusty (MIT, Copyright (c) 2025 Lukas Lalinsky and
+// contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
+// See LICENSE.dusty and THIRD_PARTY_NOTICES.
+
+const std = @import("std");
+const Uri = std.Uri;
+const tls = @import("tls");
+/// A TLS module may load a CA bundle once into its own form
+/// (`tls.TrustStore`: `init(bundle)`, `deinit()`), taken by each handshake
+/// as `trust`, so none of them converts the bundle again. tls.zig has none.
+const has_trust_store = build_options.use_tls and @hasDecl(tls, "TrustStore");
+const TrustStore = if (has_trust_store) tls.TrustStore else void;
+const build_options = @import("build_options");
+/// An HTTP/2 client, injected as the `h2_client` import like `tls` and
+/// `nghttp2` (src/h2_client_stub.zig lists what it must provide). With one,
+/// `ClientConfig.http2` offers "h2" through ALPN, and a connection on which
+/// the server picks it is handed to it after the handshake.
+const h2_client = @import("h2_client");
+const has_h2_client = build_options.use_tls and !@hasDecl(h2_client, "is_stub");
+
+const unix_path_max = 108;
+
+/// How long a request that failed to go out waits for the server's answer
+/// anyway.
+const early_response_wait: std.Io.Duration = .fromMilliseconds(50);
+
+const config_mod = @import("config.zig");
+const body_read_reserve = config_mod.body_read_reserve;
+
+const http = @import("http.zig");
+const Method = http.Method;
+const Status = http.Status;
+const Headers = http.Headers;
+const ContentType = http.ContentType;
+const ContentEncoding = http.ContentEncoding;
+
+const WebSocket = @import("websocket.zig").WebSocket;
+
+const ResponseParser = @import("parser.zig").ResponseParser;
+const ParsedResponse = @import("parser.zig").ParsedResponse;
+const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
+const BodySource = @import("parser.zig").BodySource;
+const Transport = @import("transport.zig").Transport;
+const Deadline = @import("deadline.zig").Deadline;
+const KeepAliveParams = @import("parser.zig").KeepAliveParams;
+const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
+
+/// Protocol type for HTTP/HTTPS connections.
+pub const Protocol = enum {
+    http,
+    https,
+
+    pub fn defaultPort(self: Protocol) u16 {
+        return switch (self) {
+            .http => 80,
+            .https => 443,
+        };
+    }
+
+    pub fn fromScheme(scheme: []const u8) error{UnsupportedScheme}!Protocol {
+        if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "ws")) return .http;
+        if (std.mem.eql(u8, scheme, "https") or std.mem.eql(u8, scheme, "wss")) return .https;
+        return error.UnsupportedScheme;
+    }
+};
+
+/// Negotiated HTTP wire version for a connection. Set after the TLS handshake
+/// from the ALPN-selected protocol; defaults to HTTP/1.1 (cleartext, or TLS
+/// without ALPN/with "http/1.1" selected).
+pub const HttpVersion = enum {
+    http_1_1,
+    http_2,
+
+    /// Maps a TLS ALPN protocol id ("h2", "http/1.1") to a version. An unknown
+    /// or missing id falls back to HTTP/1.1.
+    pub fn fromAlpn(alpn: ?[]const u8) HttpVersion {
+        const id = alpn orelse return .http_1_1;
+        if (std.mem.eql(u8, id, "h2")) return .http_2;
+        return .http_1_1;
+    }
+};
+
+test "nghttp2 links and reports a version" {
+    // Only when built with HTTP/2: the `nghttp2` module doesn't exist otherwise,
+    // and this comptime-false branch is skipped during analysis.
+    if (build_options.use_http2) {
+        const ng = @import("nghttp2");
+        const info = ng.nghttp2_version(0);
+        try std.testing.expect(info != null);
+        try std.testing.expect(info.*.version_num != 0);
+    }
+}
+
+/// Default User-Agent sent with requests unless overridden.
+pub const default_user_agent = "dusty/0.4.0";
+
+/// Configuration for the HTTP client.
+pub const ClientConfig = struct {
+    /// Maximum number of redirects to follow (0 = disabled).
+    max_redirects: u8 = 10,
+    /// Maximum response body size in bytes.
+    max_response_size: usize = 10_485_760, // 10MB
+    /// Maximum idle connections to keep in pool (0 = no pooling).
+    max_idle_connections: u8 = 8,
+    /// Buffer size (bytes) for reading the response head: the status line
+    /// and all headers. This is also the limit on it -- parsed header names
+    /// and values are slices into this buffer rather than copies, so the head
+    /// is held whole. A server that sends more gets error.HeadersTooLarge and
+    /// its connection torn down.
+    buffer_size: usize = 16384,
+    /// TLS settings for https:// (and wss://) connections. Requires the
+    /// `use_tls` build option; with TLS compiled out any HTTPS request fails
+    /// with error.TlsNotConfigured. Applies to every connection the client
+    /// makes: connections are pooled and reused across requests, so the trust
+    /// settings and client identity cannot be varied per request.
+    tls: TlsConfig = .{},
+    /// Maximum number of headers allowed in a response.
+    max_response_header_count: usize = 64,
+    /// Maximum time for `fetch`: connecting, the TLS handshake, sending,
+    /// every redirect, and the response through the end of its body, or
+    /// through the end of its head for a request that streams the body.
+    /// Defaults to 30 seconds; set to null for no limit, or replace it for
+    /// one request with `FetchOptions.timeout`.
+    ///
+    /// Costs a second task per request on any backend but zio, so on
+    /// `std.Io.Threaded` a request with a timeout runs on a thread of its
+    /// own, and where no second task can be had, as in a single-threaded
+    /// build, the request fails with `error.ConcurrencyUnavailable`.
+    timeout: ?std.Io.Duration = .fromSeconds(30),
+    /// User-Agent header sent with requests. Set to null to omit it.
+    /// A per-request User-Agent header takes precedence over this default.
+    user_agent: ?[]const u8 = default_user_agent,
+    /// Offer HTTP/2 ("h2") through TLS ALPN on HTTPS connections. Only
+    /// effective with an injected HTTP/2 client (the `h2_client` import);
+    /// ignored without one, and for cleartext (http://) connections. A
+    /// connection on which the server picks h2 carries one request at a time
+    /// and is pooled like an HTTP/1.1 one. Defaults off.
+    http2: bool = false,
+};
+
+/// TLS settings for the HTTP client.
+pub const TlsConfig = struct {
+    /// Certificate authorities used to verify the server's certificate chain.
+    ca: Ca = .system,
+    /// Certificate and key to present when the server asks the client to
+    /// authenticate itself (mutual TLS). When null, a server that requires a
+    /// client certificate rejects the handshake.
+    client_certificate: ?ClientCertificate = null,
+    /// Accept any server certificate and skip host name checking. This makes
+    /// the connection trivially interceptable; for testing only.
+    insecure_skip_verify: bool = false,
+
+    /// Where the client gets the certificate authorities it trusts. `.none` is
+    /// only valid together with `insecure_skip_verify`.
+    pub const Ca = config_mod.TlsCa;
+
+    pub const ClientCertificate = struct {
+        /// PEM certificate chain, leaf first, resolved against `dir`.
+        /// Ignored when `pem` is set.
+        cert_path: []const u8 = "",
+        /// PEM private key for the leaf certificate, resolved against `dir`.
+        /// Must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
+        /// KEY"); passphrase-protected keys are not supported. Ignored when
+        /// `pem` is set.
+        key_path: []const u8 = "",
+        /// The chain and key as PEM text in memory, in place of the paths,
+        /// as `ServerConfig.Tls.pem` is for a listener. Read on the first
+        /// HTTPS request; it must stay alive until then.
+        pem: ?Pem = null,
+        /// Directory the paths are resolved against. Defaults to the current
+        /// working directory.
+        dir: ?std.Io.Dir = null,
+
+        pub const Pem = config_mod.ServerConfig.Tls.Pem;
+    };
+
+    pub const Path = config_mod.TlsPath;
+};
+
+/// Options for a single fetch request.
+pub const FetchOptions = struct {
+    method: Method = .get,
+    headers: ?*const Headers = null,
+    body: ?[]const u8 = null,
+    /// Override default redirect limit for this request.
+    max_redirects: ?u8 = null,
+    /// Replaces `ClientConfig.timeout` for this request. Null inherits it;
+    /// `.none` lifts it. A duration runs from the call to `fetch`, and a
+    /// deadline is taken as given.
+    timeout: ?std.Io.Timeout = null,
+    /// Decompress response body automatically (sends Accept-Encoding header).
+    decompress: bool = true,
+    /// Leave the response body on the wire for the caller to read through
+    /// `ClientResponse.reader`, rather than reading it whole inside `fetch`.
+    /// Unbounded by `timeout`, and by `ClientConfig.max_response_size`.
+    stream: bool = false,
+    /// Connect over a Unix domain socket instead of TCP.
+    /// Useful for communicating with Docker Engine (e.g. "/var/run/docker.sock").
+    /// The URL host and path are still used for the HTTP request line and Host header.
+    unix_socket_path: ?[]const u8 = null,
+};
+
+/// Options for a WebSocket upgrade request.
+pub const WebSocketUpgradeOptions = struct {
+    headers: ?*const Headers = null,
+    /// Connect over a Unix domain socket instead of TCP.
+    unix_socket_path: ?[]const u8 = null,
+};
+
+/// A WebSocket connection established via client upgrade.
+pub const WebSocketClient = struct {
+    ws: WebSocket,
+    conn: *Connection,
+
+    // Flushing only through `WebSocket`, which holds its write mutex; a flush
+    // of the writer from out here would touch it unguarded.
+
+    pub fn send(self: *WebSocketClient, msg_type: WebSocket.MessageType, data: []const u8) !void {
+        return self.ws.send(msg_type, data);
+    }
+
+    pub fn receive(self: *WebSocketClient) !WebSocket.Message {
+        return self.ws.receive();
+    }
+
+    pub fn receiveMany(self: *WebSocketClient) ![]const WebSocket.Message {
+        return self.ws.receiveMany();
+    }
+
+    pub fn tryReceive(self: *WebSocketClient) !?WebSocket.Message {
+        return self.ws.tryReceive();
+    }
+
+    pub fn ping(self: *WebSocketClient, data: []const u8) !void {
+        return self.ws.ping(data);
+    }
+
+    pub fn flush(self: *WebSocketClient) !void {
+        return self.ws.flush();
+    }
+
+    pub fn close(self: *WebSocketClient, code: WebSocket.CloseCode, reason: []const u8) !void {
+        return self.ws.close(code, reason);
+    }
+
+    pub fn deinit(self: *WebSocketClient) void {
+        self.ws.deinit();
+        self.conn.deinit();
+        self.conn.pool.allocator.destroy(self.conn);
+    }
+};
+
+/// Borrowed view of the client-wide TLS material, handed to each HTTPS
+/// connection. The pointers reference storage owned by the `Client`, which
+/// outlives every connection it hands them to.
+const TlsRef = struct {
+    ca_bundle: *std.crypto.Certificate.Bundle,
+    /// `ca_bundle` loaded once by the TLS module, when it offers that.
+    trust: ?*const TrustStore,
+    /// Client certificate for mutual TLS, null when none is configured.
+    client_cert: ?*tls.config.CertKeyPair,
+    insecure_skip_verify: bool,
+};
+
+/// Parse a URL string into a std.Uri.
+fn parseUrl(url: []const u8) !Uri {
+    return Uri.parse(url) catch return error.InvalidUrl;
+}
+
+/// Get port and protocol from URI.
+fn uriPortAndProtocol(uri: Uri) error{UnsupportedScheme}!struct { port: u16, protocol: Protocol } {
+    const protocol = try Protocol.fromScheme(uri.scheme);
+    const port = uri.port orelse protocol.defaultPort();
+    return .{ .port = port, .protocol = protocol };
+}
+
+/// An IPv6 literal keeps its brackets in the URI, in the pool key and in
+/// the Host header, where they belong. The address parser wants them off.
+fn unbracketed(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
+}
+
+/// Get host string from URI.
+fn uriHost(uri: Uri, buffer: *[255]u8) ![]const u8 {
+    const component = uri.host orelse return error.InvalidUrl;
+    const hostname = component.toRaw(buffer) catch return error.InvalidUrl;
+    // A host with nothing to decode is returned as is, not copied into
+    // `buffer`, so its length is not bounded by it.
+    if (hostname.len == 0 or hostname.len > buffer.len) return error.InvalidUrl;
+    return hostname;
+}
+
+/// Get path for HTTP request line.
+fn uriPath(uri: Uri) []const u8 {
+    const path = uri.path.percent_encoded;
+    if (path.len == 0) return "/";
+    return path;
+}
+
+/// Pool of idle connections for reuse.
+///
+/// `acquire`/`release` are safe to call from multiple tasks running in
+/// parallel: `idle`/`idle_len` are guarded by `mutex`, and the critical
+/// sections only touch the list, so they never suspend. Closing an evicted
+/// connection does suspend, so that always happens after the lock has been
+/// dropped. `init`/`deinit` are not part of that contract — they must not run
+/// concurrently with `acquire`/`release`.
+///
+/// A connection released with its response body unread is handed to a task
+/// in `drains`, which discards the rest of the body and then releases it.
+/// `deinit` cancels those tasks, so they close their connections instead.
+pub const ConnectionPool = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex,
+    idle: std.DoublyLinkedList,
+    idle_len: usize,
+    max_idle: u8,
+    drains: std.Io.Group = .init,
+
+    /// Bounds on the unread body a background drain discards to keep a
+    /// connection, the same as Go's net/http.
+    const drain_max_bytes = 256 << 10;
+    const drain_timeout: std.Io.Duration = .fromMilliseconds(50);
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_idle: u8) ConnectionPool {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .mutex = .init,
+            .idle = .{},
+            .idle_len = 0,
+            .max_idle = max_idle,
+        };
+    }
+
+    pub fn deinit(self: *ConnectionPool) void {
+        // A drain that completes during the cancel releases its connection
+        // into `idle`; a canceled one closes its own.
+        self.drains.cancel(self.io);
+
+        // Close and free all idle connections
+        while (self.idle.popFirst()) |node| {
+            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", node));
+            conn.deinit();
+            self.allocator.destroy(conn);
+        }
+    }
+
+    /// Try to acquire an existing connection for the given host:port, protocol, and optional unix socket path.
+    pub fn acquire(self: *ConnectionPool, remote_host: []const u8, remote_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) ?*Connection {
+        const io = self.io;
+        const now = std.Io.Timestamp.now(io, .awake);
+
+        // Connections found expired along the way. They are already out of the
+        // pool and owned by us, so they get closed after the lock is dropped.
+        var expired: std.DoublyLinkedList = .{};
+
+        const found = found: {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            // Search from end (most recently used)
+            var node = self.idle.last;
+            while (node) |n| {
+                const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
+                node = n.prev;
+
+                if (conn.matches(remote_host, remote_port, protocol, unix_socket_path)) {
+                    self.idle.remove(n);
+                    self.idle_len -= 1;
+
+                    // Check if connection has expired due to idle timeout
+                    if (conn.idle_deadline) |deadline| {
+                        if (now.nanoseconds >= deadline.nanoseconds) {
+                            expired.append(n);
+                            continue;
+                        }
+                    }
+
+                    break :found conn;
+                }
+            }
+            break :found null;
+        };
+
+        while (expired.popFirst()) |n| {
+            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
+            conn.deinit();
+            self.allocator.destroy(conn);
+        }
+
+        return found;
+    }
+
+    /// Release a connection back to the pool, or close it if pool is full or connection is closing.
+    pub fn release(self: *ConnectionPool, conn: *Connection) void {
+        // Don't pool connections that are closing
+        if (conn.closing or self.max_idle == 0) {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return;
+        }
+
+        // Reset before taking the lock; it only touches this connection.
+        conn.reset() catch {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return;
+        };
+
+        const evicted: ?*Connection = evicted: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            // If pool is full, evict the oldest connection
+            var old: ?*Connection = null;
+            if (self.idle_len >= self.max_idle) {
+                if (self.idle.popFirst()) |old_node| {
+                    old = @alignCast(@fieldParentPtr("pool_node", old_node));
+                    self.idle_len -= 1;
+                }
+            }
+
+            self.idle.append(&conn.pool_node);
+            self.idle_len += 1;
+            break :evicted old;
+        };
+
+        // Closing suspends, so it must happen outside the critical section.
+        if (evicted) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+        }
+    }
+
+    /// Hands `conn` to a background drain, or returns false if no task
+    /// could be had for it, in which case the caller still owns it.
+    fn startDrain(self: *ConnectionPool, conn: *Connection) bool {
+        self.drains.concurrent(self.io, drain, .{ self, conn }) catch return false;
+        return true;
+    }
+
+    fn drain(self: *ConnectionPool, conn: *Connection) std.Io.Cancelable!void {
+        defer self.release(conn);
+        const deadline: Deadline = .init(self.io, .{ .duration = .{ .raw = drain_timeout, .clock = .awake } });
+        const complete = deadline.run(discardBody, .{conn}) catch |err| switch (err) {
+            error.Canceled => {
+                conn.closing = true;
+                return error.Canceled;
+            },
+            else => false,
+        };
+        if (!complete) conn.closing = true;
+    }
+
+    /// No decoding: the body is being thrown away to keep the connection.
+    fn discardBody(conn: *Connection) ResponseBodyReader.Error!bool {
+        var buf: [1024]u8 = undefined;
+        var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &buf);
+        _ = body_reader.interface.discardShort(drain_max_bytes + 1) catch |err| switch (err) {
+            error.ReadFailed => return body_reader.err orelse error.Unexpected,
+        };
+        return conn.parser.isBodyComplete();
+    }
+};
+
+/// A client connection that owns all resources for a request/response cycle.
+pub const Connection = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    arena: std.heap.ArenaAllocator,
+    parser: ResponseParser,
+    parsed_response: ParsedResponse,
+    buffer_size: usize,
+    max_response_headers: usize,
+    pool: *ConnectionPool,
+
+    // Protocol and TLS
+    protocol: Protocol,
+    // Negotiated wire version. For HTTPS this is set from TLS ALPN after the
+    // handshake; otherwise it stays .http_1_1.
+    http_version: HttpVersion = .http_1_1,
+    tcp_reader: std.Io.net.Stream.Reader,
+    tcp_writer: std.Io.net.Stream.Writer,
+
+    // TLS TCP layer buffers (allocated from main allocator, persist across requests).
+    // These hold the encrypted (ciphertext) data exchanged over the raw socket.
+    tls_tcp_read_buffer: []u8,
+    tls_tcp_write_buffer: []u8,
+    tls_conn: ?tls.Connection,
+    // Cleartext Reader/Writer adapters layered on top of tls_conn. They store a
+    // pointer back to tls_conn, so the Connection must never be moved after init.
+    tls_reader: tls.Connection.Reader,
+    tls_writer: tls.Connection.Writer,
+    tls_rng: std.Random.IoSource,
+
+    // HTTP layer buffers (allocated from main allocator, persist across requests)
+    read_buffer: []u8,
+    write_buffer: []u8,
+
+    // Pointers to the actual reader/writer interfaces used for HTTP I/O.
+    //
+    // Public, and bare interfaces, so they can only report
+    // `ReadFailed`/`WriteFailed`. That is allowed here because there is no
+    // layer above them to lose the answer: `getReadError`/`getWriteError`
+    // beside them resolve what actually failed.
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+
+    // Connection pool metadata
+    pool_node: std.DoublyLinkedList.Node = .{},
+    host_buffer: [255]u8 = undefined,
+    host_len: u8 = 0,
+    port: u16 = 0,
+    closing: bool = false,
+    // Unix socket path (empty means TCP connection)
+    unix_path_buffer: [unix_path_max]u8 = undefined,
+    unix_path_len: u8 = 0,
+
+    // Keep-Alive tracking
+    request_count: u16 = 0,
+    keep_alive: KeepAliveParams = .{},
+    idle_deadline: ?std.Io.Timestamp = null,
+
+    // When the handshake picked "h2": the session, which reads and writes the
+    // connection from then on, and the stream of the request in flight.
+    h2: if (has_h2_client) ?*h2_client.ClientConnection else void,
+    h2_stream: if (has_h2_client) ?*h2_client.Stream else void,
+
+    /// Initialize the connection in place (required because parser stores internal pointers).
+    pub fn init(
+        self: *Connection,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        pool: *ConnectionPool,
+        stream: std.Io.net.Stream,
+        remote_host: []const u8,
+        remote_port: u16,
+        buffer_size: usize,
+        max_response_headers: usize,
+        protocol: Protocol,
+        tls_config: ?TlsRef,
+        unix_socket_path: ?[]const u8,
+        advertise_http2: bool,
+    ) !void {
+        self.allocator = allocator;
+        self.io = io;
+        self.stream = stream;
+        self.arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer self.arena.deinit();
+        self.pool = pool;
+        self.closing = false;
+        self.buffer_size = buffer_size;
+        self.max_response_headers = max_response_headers;
+
+        // Keep-Alive tracking
+        self.request_count = 0;
+        self.keep_alive = .{};
+        self.idle_deadline = null;
+
+        // Store host for connection pooling
+        const len: u8 = @intCast(@min(remote_host.len, self.host_buffer.len));
+        @memcpy(self.host_buffer[0..len], remote_host[0..len]);
+        self.host_len = len;
+        self.port = remote_port;
+
+        // Store unix socket path for connection pooling
+        if (unix_socket_path) |path| {
+            if (path.len > unix_path_max) return error.NameTooLong;
+            const plen: u8 = @intCast(path.len);
+            @memcpy(self.unix_path_buffer[0..plen], path[0..plen]);
+            self.unix_path_len = plen;
+        } else {
+            self.unix_path_len = 0;
+        }
+
+        self.parsed_response = .{ .arena = self.arena.allocator() };
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
+
+        // Protocol and TLS initialization
+        self.protocol = protocol;
+        self.http_version = .http_1_1;
+        if (comptime has_h2_client) {
+            self.h2 = null;
+            self.h2_stream = null;
+        }
+
+        if (protocol == .https) {
+            if (!build_options.use_tls) return error.TlsNotConfigured;
+            const tls_cfg = tls_config orelse return error.MissingTlsConfig;
+
+            // TCP-layer (ciphertext) buffers. tls.zig requires the input buffer to
+            // fit a full TLS record; the output buffer caps the produced record size.
+            self.tls_tcp_read_buffer = try allocator.alloc(u8, tls.input_buffer_len);
+            errdefer allocator.free(self.tls_tcp_read_buffer);
+            self.tls_tcp_write_buffer = try allocator.alloc(u8, tls.output_buffer_len);
+            errdefer allocator.free(self.tls_tcp_write_buffer);
+
+            // HTTP-layer (cleartext) buffers, used by the tls.Connection reader/writer.
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + body_read_reserve);
+            errdefer allocator.free(self.read_buffer);
+            self.write_buffer = try allocator.alloc(u8, 1024);
+            errdefer allocator.free(self.write_buffer);
+
+            self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
+            self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
+
+            self.tls_rng = .{ .io = self.io };
+
+            // Offer h2 (preferred) and http/1.1 via ALPN when HTTP/2 is enabled;
+            // otherwise advertise nothing, preserving HTTP/1.1-only behavior.
+            const alpn_protocols: []const []const u8 = if (advertise_http2)
+                &.{ "h2", "http/1.1" }
+            else
+                &.{};
+
+            var options: tls.config.Client = .{
+                .host = remote_host,
+                .root_ca = tls_cfg.ca_bundle.*,
+                .insecure_skip_verify = tls_cfg.insecure_skip_verify,
+                .auth = tls_cfg.client_cert,
+                .now = std.Io.Clock.real.now(self.io),
+                .rng = self.tls_rng.interface(),
+                .alpn_protocols = alpn_protocols,
+            };
+            if (comptime has_trust_store) options.trust = tls_cfg.trust;
+            self.tls_conn = tls.client(
+                &self.tcp_reader.interface,
+                &self.tcp_writer.interface,
+                options,
+            ) catch |err| {
+                // tls.zig only ever saw the ciphertext reader or writer fail
+                // generically, so for those the cause is a layer down.
+                // Nothing is negotiated yet, so that layer is all there is.
+                const ciphertext: Transport = .{
+                    .reader = &self.tcp_reader.interface,
+                    .writer = &self.tcp_writer.interface,
+                    .tcp_reader = &self.tcp_reader,
+                    .tcp_writer = &self.tcp_writer,
+                };
+                return switch (err) {
+                    error.ReadFailed => ciphertext.getReadError() orelse error.Unexpected,
+                    error.WriteFailed => ciphertext.getWriteError() orelse error.Unexpected,
+                    else => |e| e,
+                };
+            };
+
+            // Record the negotiated wire version from the ALPN selection.
+            self.http_version = HttpVersion.fromAlpn(self.tls_conn.?.alpn_protocol);
+
+            self.tls_reader = self.tls_conn.?.reader(self.read_buffer);
+            self.tls_writer = self.tls_conn.?.writer(self.write_buffer);
+            self.reader = &self.tls_reader.interface;
+            self.writer = &self.tls_writer.interface;
+
+            if (comptime has_h2_client) if (self.http_version == .http_2) {
+                self.h2 = h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream) catch |err| {
+                    if (@hasDecl(tls.Connection, "deinit")) self.tls_conn.?.deinit();
+                    return err;
+                };
+            };
+        } else {
+            self.tls_conn = null;
+            self.tls_tcp_read_buffer = &.{};
+            self.tls_tcp_write_buffer = &.{};
+
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + body_read_reserve);
+            errdefer allocator.free(self.read_buffer);
+            self.write_buffer = try allocator.alloc(u8, 1024);
+            errdefer allocator.free(self.write_buffer);
+
+            self.tcp_reader = stream.reader(io, self.read_buffer);
+            self.tcp_writer = stream.writer(io, self.write_buffer);
+
+            self.reader = &self.tcp_reader.interface;
+            self.writer = &self.tcp_writer.interface;
+        }
+    }
+
+    /// A borrowed view of the reader/writer stack, and the one thing that
+    /// knows how to say what a failed read or write actually was. Shared with
+    /// the server rather than reimplemented, which is how the TLS layer's
+    /// errors stopped being invisible here.
+    pub fn transport(self: *Connection) Transport {
+        const has_tls = build_options.use_tls and self.tls_conn != null;
+        return .{
+            .reader = self.reader,
+            .writer = self.writer,
+            .tcp_reader = &self.tcp_reader,
+            .tcp_writer = &self.tcp_writer,
+            .tls_reader = if (has_tls) &self.tls_reader else null,
+            .tls_writer = if (has_tls) &self.tls_writer else null,
+        };
+    }
+
+    pub const ReadError = Transport.ReadError;
+    pub const WriteError = Transport.WriteError;
+
+    /// The real error behind a generic `error.ReadFailed`, if any was recorded.
+    pub fn getReadError(self: *Connection) ?ReadError {
+        return self.transport().getReadError();
+    }
+
+    /// The real error behind a generic `error.WriteFailed`, if any was
+    /// recorded.
+    pub fn getWriteError(self: *Connection) ?WriteError {
+        return self.transport().getWriteError();
+    }
+
+    pub fn deinit(self: *Connection) void {
+        // The session's tasks use the TLS connection and the socket, so it
+        // goes first.
+        if (comptime has_h2_client) if (self.h2) |session| {
+            if (self.h2_stream) |s| s.release();
+            self.h2_stream = null;
+            session.close();
+            self.h2 = null;
+        };
+        if (build_options.use_tls) {
+            // See server.zig `Connection.deinit`: only a TLS module that owns
+            // per-connection state declares `deinit`.
+            if (@hasDecl(tls.Connection, "deinit")) {
+                if (self.tls_conn) |*c| c.deinit();
+            }
+            self.tls_conn = null;
+        }
+        self.stream.close(self.io);
+        if (self.protocol == .https) {
+            self.allocator.free(self.tls_tcp_read_buffer);
+            self.allocator.free(self.tls_tcp_write_buffer);
+        }
+        self.allocator.free(self.read_buffer);
+        self.allocator.free(self.write_buffer);
+        self.arena.deinit();
+    }
+
+    pub fn reset(self: *Connection) !void {
+        // Reset for reuse (connection pooling)
+        _ = self.arena.reset(.retain_capacity);
+        self.parsed_response = .{ .arena = self.arena.allocator() };
+        self.parser.reset();
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
+        self.closing = false;
+
+        // HTTP/2: the stream goes (reset if its body is unread), and the
+        // connection stays while the server takes requests on it. The
+        // session owns the reader.
+        if (comptime has_h2_client) if (self.h2) |session| {
+            if (self.h2_stream) |st| st.release();
+            self.h2_stream = null;
+            if (!session.isOpen()) return error.ConnectionClosed;
+            return;
+        };
+
+        // As part of reading body, we shrank the buffer
+        const buffered = self.reader.buffered();
+        @memmove(self.read_buffer[0..buffered.len], buffered);
+        self.reader.buffer = self.read_buffer;
+        self.reader.seek = 0;
+        self.reader.end = buffered.len;
+    }
+
+    pub fn flush(self: *Connection) WriteError!void {
+        // For HTTPS this drains the cleartext writer, which encrypts and flushes
+        // the underlying TCP writer in one step; for HTTP it flushes the socket directly.
+        self.writer.flush() catch |err| switch (err) {
+            error.WriteFailed => return self.getWriteError() orelse error.Unexpected,
+        };
+    }
+
+    fn parseHead(self: *Connection) !void {
+        parseResponseHeaders(self.reader, &self.parser) catch |err| switch (err) {
+            error.ReadFailed => return self.getReadError() orelse error.Unexpected,
+            else => |e| return e,
+        };
+    }
+
+    pub fn host(self: *const Connection) []const u8 {
+        return self.host_buffer[0..self.host_len];
+    }
+
+    pub fn unixPath(self: *const Connection) ?[]const u8 {
+        if (self.unix_path_len == 0) return null;
+        return self.unix_path_buffer[0..self.unix_path_len];
+    }
+
+    /// Check if this connection matches the given host, port, protocol, and transport.
+    pub fn matches(self: *const Connection, match_host: []const u8, match_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) bool {
+        if (unix_socket_path) |path| {
+            return self.protocol == protocol and std.mem.eql(u8, self.unixPath() orelse return false, path);
+        }
+        if (self.unix_path_len != 0) return false;
+        return self.protocol == protocol and self.port == match_port and std.ascii.eqlIgnoreCase(self.host(), match_host);
+    }
+
+    /// Whether the response body may still be on the wire. Over HTTP/2 it
+    /// never is in the way: releasing the stream resets it.
+    fn bodyPending(self: *Connection) bool {
+        if (comptime has_h2_client) if (self.h2 != null) return false;
+        return !self.parser.isBodyComplete();
+    }
+
+    /// Release this connection back to its pool, handling keep-alive logic.
+    /// A response body that wasn't fully read is drained in the background
+    /// when it is small enough, and the connection closed otherwise.
+    pub fn release(self: *Connection) void {
+        // Increment request count
+        self.request_count +|= 1;
+
+        // HTTP/2: no keep-alive headers and no body to drain; `reset`
+        // releases the stream.
+        if (comptime has_h2_client) if (self.h2 != null) {
+            self.pool.release(self);
+            return;
+        };
+
+        // Check basic keep-alive from Connection header
+        if (!self.parser.shouldKeepAlive()) {
+            self.closing = true;
+        } else {
+            // Parse Keep-Alive header on first response
+            if (self.request_count == 1) {
+                if (self.parsed_response.headers.get("Keep-Alive")) |keep_alive| {
+                    self.keep_alive = parseKeepAliveHeader(keep_alive);
+                }
+            }
+
+            // Update idle deadline after each request
+            if (self.keep_alive.timeout) |timeout| {
+                self.idle_deadline = std.Io.Timestamp.now(self.io, .awake).addDuration(.fromSeconds(@as(i64, timeout)));
+            }
+
+            // Check if we've reached max requests
+            if (self.keep_alive.max) |max| {
+                if (self.request_count >= max) {
+                    self.closing = true;
+                }
+            }
+        }
+
+        // The parser is always at the body's position on the wire, whatever
+        // was read through a decoder: what the decoder holds was already
+        // counted. A failed read leaves no such guarantee.
+        if (!self.parser.isBodyComplete()) {
+            const drainable = !self.closing and self.pool.max_idle != 0 and
+                !self.parser.hasFailed() and self.getReadError() == null and
+                (self.parsed_response.content_length orelse 0) <= ConnectionPool.drain_max_bytes;
+            if (drainable and self.pool.startDrain(self)) return;
+            self.closing = true;
+        }
+
+        self.pool.release(self);
+    }
+};
+
+/// HTTP client response.
+/// Call deinit() when done to release the connection.
+pub const ClientResponse = struct {
+    // Direct pointers for reading (testable without full connection)
+    arena: std.mem.Allocator,
+    parser: *ResponseParser,
+    transport: Transport,
+    parsed: *ParsedResponse,
+    max_response_size: usize,
+    decompress: bool = true,
+
+    // Cached body (read lazily)
+    _body: ?[]const u8 = null,
+    _body_read: bool = false,
+
+    // Set up on the first body read that calls for decoding, and kept so a
+    // second `reader()` does not build a second decoder over the same body.
+    _decode: ?*ResponseBodyReader.Decode = null,
+    _body_reader_taken: bool = false,
+
+    // Connection reference for cleanup (optional for testing)
+    owner: ?*Connection = null,
+
+    /// The body as an HTTP/2 stream delivers it, unframed, in place of
+    /// `parser` and `transport`.
+    raw: ?BodySource = null,
+
+    /// Release the connection back to the pool (or close if not reusable).
+    pub fn deinit(self: *ClientResponse) void {
+        if (self.owner) |conn| {
+            conn.release();
+        }
+    }
+
+    /// Get response status.
+    pub fn status(self: *const ClientResponse) Status {
+        return self.parsed.status;
+    }
+
+    /// Get response headers.
+    pub fn headers(self: *const ClientResponse) *const Headers {
+        return &self.parsed.headers;
+    }
+
+    /// Get HTTP version.
+    pub fn version(self: *const ClientResponse) struct { major: u8, minor: u8 } {
+        return .{
+            .major = self.parsed.version_major,
+            .minor = self.parsed.version_minor,
+        };
+    }
+
+    /// Get content type if present.
+    pub fn contentType(self: *const ClientResponse) ?ContentType {
+        return self.parsed.content_type;
+    }
+
+    /// The coding the body arrived in. Undone by the body reader unless
+    /// `decompress` is off, in which case reading the body yields what the
+    /// wire carried.
+    ///
+    /// Once it is being undone the `Content-Encoding` header is removed,
+    /// because it would describe the body a caller is about to read as
+    /// something it is not. This still says what arrived.
+    pub fn contentEncoding(self: *const ClientResponse) ContentEncoding {
+        return self.parsed.content_encoding;
+    }
+
+    /// How long the body was on the wire, when the headers said. Removed
+    /// from the headers alongside the coding for the same reason, and kept
+    /// here for the same one.
+    pub fn contentLength(self: *const ClientResponse) ?usize {
+        return self.parsed.content_length;
+    }
+
+    /// Both of these describe the body as it arrived, and it is not going
+    /// to arrive that way any more: what the caller reads is decoded, and a
+    /// longer or shorter number of bytes. Leaving them is how a proxy comes
+    /// to forward plain bytes labelled `gzip`. `contentEncoding` and
+    /// `contentLength` keep the answer for a caller that wants it.
+    fn dropEncodedBodyHeaders(self: *ClientResponse) void {
+        _ = self.parsed.headers.remove("Content-Encoding");
+        _ = self.parsed.headers.remove("Content-Length");
+    }
+
+    /// What a failed body read can turn out to be, sentinels resolved. The
+    /// reader `reader` hands out carries one of these in `.err`.
+    pub const ReadError = ResponseBodyReader.Error;
+
+    /// Read the entire response body into memory.
+    /// Result is cached for subsequent calls.
+    pub fn body(self: *ClientResponse) !?[]const u8 {
+        if (self._body_read) {
+            return self._body;
+        }
+
+        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        var no_buf: [0]u8 = .{};
+        var r = try self.reader(&no_buf);
+        const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ResponseTooLarge,
+            error.ReadFailed => return r.err orelse error.Unexpected,
+            else => |e| return e,
+        };
+
+        self._body_read = true;
+        if (result.len == 0) {
+            self._body = null;
+            return null;
+        }
+        self._body = result;
+        return result;
+    }
+
+    /// The response body: transfer framing undone, and the content coding
+    /// too unless `decompress` is off. Read through `.interface`, and
+    /// `.err` says what an `error.ReadFailed` from it actually was.
+    ///
+    /// `buffer` is where bytes wait between the connection and the caller,
+    /// the way `Response.stream` takes one for the other direction. It is
+    /// what `peek` and the `take` family read out of, so size it for the
+    /// longest thing they need to see at once; an empty slice is fine for a
+    /// caller that only ever streams.
+    ///
+    /// One per response. `body` takes it if you have not, so a caller that
+    /// streams cannot then ask for the body whole.
+    pub fn reader(self: *ClientResponse, buffer: []u8) !ResponseBodyReader {
+        var r = ResponseBodyReader.init(self.parser, self.transport, buffer);
+        r.raw = self.raw;
+
+        // Once the body is in memory there is nothing left on the wire, and
+        // what is cached has already been decoded.
+        if (self._body_read) {
+            r.interface = .fixed(self._body orelse &.{});
+            return r;
+        }
+
+        // The buffer belongs to the caller, so a second reader starts empty
+        // and whatever the first one had buffered is unreachable -- bytes off
+        // the body, with nothing to say they went missing.
+        std.debug.assert(!self._body_reader_taken); // one body reader per response
+
+        // A message complete at the head has no body, whatever the coding
+        // headers say -- a HEAD response, a 204, a Content-Length of zero.
+        // A decoder started on nothing would report a body cut short.
+        if (self._decode) |decode| {
+            r.decode = decode;
+        } else if (self.decompress and !self.parser.isBodyComplete()) {
+            try r.startDecoding(self.arena, self.parsed.content_encoding);
+            if (r.decode != null) self.dropEncodedBodyHeaders();
+            self._decode = r.decode;
+        }
+
+        // Claimed only once there is a reader to claim it for. A coding we
+        // cannot undo fails above, and nothing was read; a caller that
+        // handles that error has to be able to ask again.
+        self._body_reader_taken = true;
+        return r;
+    }
+};
+
+/// HTTP client for making requests.
+///
+/// A single client can be shared by tasks running in parallel: the connection
+/// pool and the CA bundle are both internally synchronized. Sharing one client
+/// is also what makes connection reuse and a single CA bundle scan possible.
+/// `init`/`deinit` are not part of that contract — they must not run
+/// concurrently with requests.
+///
+/// Connections are freed and reset from background tasks as well as from
+/// requests, so `allocator` must be thread-safe whenever `io` runs tasks in
+/// parallel.
+pub const Client = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: ClientConfig,
+    pool: ConnectionPool,
+    tls_state: TlsState,
+    tls_lock: std.Io.RwLock,
+    tls_loaded: std.atomic.Value(bool),
+
+    /// TLS material shared by every HTTPS connection. Reading the trust store
+    /// and deriving the client key are expensive, so both are loaded once on
+    /// the first HTTPS request and reused afterwards.
+    const TlsState = struct {
+        ca_bundle: std.crypto.Certificate.Bundle = .empty,
+        trust: ?TrustStore = null,
+        client_cert: ?tls.config.CertKeyPair = null,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .pool = ConnectionPool.init(allocator, io, config.max_idle_connections),
+            .tls_state = .{},
+            .tls_lock = .init,
+            .tls_loaded = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    fn ensureTlsState(self: *Client) !TlsRef {
+        if (!self.tls_loaded.load(.acquire)) {
+            try self.tls_lock.lock(self.io);
+            defer self.tls_lock.unlock(self.io);
+            if (!self.tls_loaded.load(.unordered)) {
+                try self.loadTlsState();
+                self.tls_loaded.store(true, .release);
+            }
+        }
+        return .{
+            .ca_bundle = &self.tls_state.ca_bundle,
+            .trust = if (self.tls_state.trust) |*t| t else null,
+            .client_cert = if (self.tls_state.client_cert) |*pair| pair else null,
+            .insecure_skip_verify = self.config.tls.insecure_skip_verify,
+        };
+    }
+
+    /// Builds the CA bundle and client certificate into locals and only commits
+    /// them once both succeed, so a failure leaves `tls_state` empty and a later
+    /// retry starts from a clean bundle instead of appending to a half-built one.
+    fn loadTlsState(self: *Client) !void {
+        const cfg = self.config.tls;
+        if (cfg.ca == .none and !cfg.insecure_skip_verify) return error.NoCertificateAuthority;
+
+        var ca_bundle = try cfg.ca.load(self.allocator, self.io);
+        errdefer ca_bundle.deinit(self.allocator);
+        var trust: ?TrustStore = null;
+        if (comptime has_trust_store) if (cfg.ca != .none) {
+            trust = try TrustStore.init(ca_bundle);
+        };
+        errdefer if (comptime has_trust_store) if (trust) |*t| t.deinit();
+
+        var client_cert: ?tls.config.CertKeyPair = null;
+        errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
+        if (cfg.client_certificate) |cc| {
+            client_cert = if (cc.pem) |pem|
+                try tls.config.CertKeyPair.fromSlice(self.allocator, self.io, pem.cert, pem.key)
+            else
+                try tls.config.CertKeyPair.fromFilePath(
+                    self.allocator,
+                    self.io,
+                    cc.dir orelse std.Io.Dir.cwd(),
+                    cc.cert_path,
+                    cc.key_path,
+                );
+        }
+
+        self.tls_state = .{ .ca_bundle = ca_bundle, .trust = trust, .client_cert = client_cert };
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.pool.deinit();
+        self.tls_state.ca_bundle.deinit(self.allocator);
+        if (comptime has_trust_store) if (self.tls_state.trust) |*t| t.deinit();
+        if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
+    }
+
+    /// Perform an HTTP request.
+    pub fn fetch(
+        self: *Client,
+        url: []const u8,
+        options: FetchOptions,
+    ) !ClientResponse {
+        const uri = try parseUrl(url);
+        const info = try uriPortAndProtocol(uri);
+        const max_redirects = options.max_redirects orelse self.config.max_redirects;
+        // Pinned here, so every redirect and the body share one budget.
+        const deadline: Deadline = .init(self.io, options.timeout orelse self.defaultTimeout());
+        return deadline.run(fetchInternal, .{ self, FetchState{
+            .uri = uri,
+            .port = info.port,
+            .protocol = info.protocol,
+            .options = options,
+            .redirects_remaining = max_redirects,
+        } });
+    }
+
+    fn defaultTimeout(self: *const Client) std.Io.Timeout {
+        const duration = self.config.timeout orelse return .none;
+        return .{ .duration = .{ .raw = duration, .clock = .awake } };
+    }
+
+    /// Acquire a connection from the pool or create a new one.
+    fn acquireConnection(
+        self: *Client,
+        host: []const u8,
+        port: u16,
+        protocol: Protocol,
+        tls_config: ?TlsRef,
+        unix_socket_path: ?[]const u8,
+        // Whether to offer HTTP/2 via TLS ALPN. Callers that can't speak h2
+        // (e.g. the WebSocket upgrade path) must pass false.
+        advertise_http2: bool,
+    ) !*Connection {
+        if (self.pool.acquire(host, port, protocol, unix_socket_path)) |conn| {
+            if (advertise_http2 or conn.http_version != .http_2) return conn;
+            // An HTTP/2 connection cannot carry what this is for (a
+            // WebSocket upgrade); it stays for the next fetch.
+            self.pool.release(conn);
+        }
+        return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+    }
+
+    /// Open a new connection, bypassing the pool.
+    fn dialConnection(
+        self: *Client,
+        host: []const u8,
+        port: u16,
+        protocol: Protocol,
+        tls_config: ?TlsRef,
+        unix_socket_path: ?[]const u8,
+        advertise_http2: bool,
+    ) !*Connection {
+        const stream = if (unix_socket_path) |path| unix: {
+            const unix_addr = try std.Io.net.UnixAddress.init(path);
+            break :unix try unix_addr.connect(self.io);
+        } else if (std.Io.net.IpAddress.parse(unbracketed(host), port)) |addr| tcp: {
+            break :tcp try addr.connect(self.io, .{ .mode = .stream });
+        } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
+        errdefer stream.close(self.io);
+
+        const conn = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(conn);
+        try conn.init(
+            self.allocator,
+            self.io,
+            &self.pool,
+            stream,
+            host,
+            port,
+            self.config.buffer_size,
+            self.config.max_response_header_count,
+            protocol,
+            tls_config,
+            unix_socket_path,
+            advertise_http2,
+        );
+        return conn;
+    }
+
+    /// Connect to a WebSocket server.
+    pub fn connectWebSocket(
+        self: *Client,
+        url: []const u8,
+        options: WebSocketUpgradeOptions,
+    ) !WebSocketClient {
+        const uri = try parseUrl(url);
+        const info = try uriPortAndProtocol(uri);
+        var host_buffer: [255]u8 = undefined;
+        const host = try uriHost(uri, &host_buffer);
+
+        // Load the shared TLS material for HTTPS
+        const tls_config: ?TlsRef = if (info.protocol == .https) blk: {
+            if (!build_options.use_tls) return error.TlsNotConfigured;
+            break :blk try self.ensureTlsState();
+        } else null;
+
+        // Reject any CRLF/NUL smuggled in via the URL host.
+        try http.validateHeaderValue(host);
+
+        // Acquire or create a connection. WebSocket upgrades are HTTP/1.1 only,
+        // so never advertise h2 here.
+        const conn = try self.acquireConnection(host, info.port, info.protocol, tls_config, options.unix_socket_path, false);
+        errdefer {
+            conn.deinit();
+            self.allocator.destroy(conn);
+        }
+
+        // Generate Sec-WebSocket-Key: 16 random bytes -> base64
+        var key_bytes: [16]u8 = undefined;
+        self.io.random(&key_bytes);
+        var key_buf: [24]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&key_buf, &key_bytes);
+
+        // Write upgrade request. Through a bare writer, so it can only report
+        // the sentinel; resolved here, once, the way the response path is.
+        writeUpgradeRequest(conn.writer, .{
+            .uri = uri,
+            .host = host,
+            .port = info.port,
+            .protocol = info.protocol,
+            .key = &key_buf,
+            .headers = options.headers,
+        }) catch |err| {
+            conn.closing = true;
+            switch (err) {
+                error.WriteFailed => return conn.getWriteError() orelse error.Unexpected,
+                else => |e| return e,
+            }
+        };
+
+        try conn.flush();
+
+        // Parse response headers
+        parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
+            error.ReadFailed => return conn.getReadError() orelse error.Unexpected,
+            else => |e| return e,
+        };
+
+        // Validate 101 Switching Protocols
+        if (conn.parsed_response.status != .switching_protocols) {
+            return error.WebSocketUpgradeFailed;
+        }
+
+        // Validate Sec-WebSocket-Accept
+        const accept = conn.parsed_response.headers.get("Sec-WebSocket-Accept") orelse
+            return error.WebSocketUpgradeFailed;
+        var expected_accept: [28]u8 = undefined;
+        WebSocket.computeAcceptKey(&key_buf, &expected_accept);
+        if (!std.mem.eql(u8, accept, &expected_accept)) {
+            return error.WebSocketUpgradeFailed;
+        }
+
+        var seed: u64 = undefined;
+        self.io.random(std.mem.asBytes(&seed));
+        var ws = WebSocket.init(self.io, conn.transport(), conn.allocator, seed);
+        ws.is_client = true;
+        return .{ .ws = ws, .conn = conn };
+    }
+
+    fn fetchInternal(self: *Client, state: FetchState) !ClientResponse {
+        var host_buffer: [255]u8 = undefined;
+        const host = try uriHost(state.uri, &host_buffer);
+
+        // Load the shared TLS material for HTTPS
+        const tls_config: ?TlsRef = if (state.protocol == .https) blk: {
+            if (!build_options.use_tls) return error.TlsNotConfigured;
+            break :blk try self.ensureTlsState();
+        } else null;
+
+        // Acquire or create a connection. The redirect path releases it early
+        // and continues with fallible work, so the errdefer must be disarmed
+        // after that release to avoid releasing the connection twice.
+        const advertise_http2 = has_h2_client and self.config.http2 and state.protocol == .https;
+        var reused = true;
+        var conn = self.pool.acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
+            reused = false;
+            break :blk try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
+        };
+        var conn_released = false;
+        errdefer if (!conn_released) self.pool.release(conn);
+
+        var lost = false;
+        self.sendRequest(conn, state, host, &lost) catch |err| {
+            // The server may have closed the idle connection just as it was
+            // picked up. Retried on a new one under the same conditions as
+            // Go's net/http.
+            if (!lost or !reused or !isReplayable(state.options)) return err;
+            self.pool.release(conn);
+            conn_released = true;
+            conn = try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
+            conn_released = false;
+            try self.sendRequest(conn, state, host, &lost);
+        };
+
+        // From here on an error leaves the body where it is, and the
+        // errdefer above pools the connection. A body still on the wire
+        // would be read as the next response, so it may not go back.
+        errdefer if (!conn_released and conn.bodyPending()) {
+            conn.closing = true;
+        };
+
+        // Check for unsupported content encoding
+        if (state.options.decompress and conn.parsed_response.content_encoding == .unknown) {
+            return error.UnsupportedContentEncoding;
+        }
+
+        // Check for redirects
+        const status_code = @backingInt(conn.parsed_response.status);
+        if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) {
+            if (conn.parsed_response.headers.get("Location")) |location| {
+                // Resolve redirect URL using RFC 3986
+                var resolve_buf: [2048]u8 = undefined;
+                if (location.len > resolve_buf.len) return error.InvalidUrl;
+                @memcpy(resolve_buf[0..location.len], location);
+                var aux_buf: []u8 = resolve_buf[0..];
+                const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
+                const redirect_info = try uriPortAndProtocol(redirect_uri);
+
+                if (!conn.parser.shouldKeepAlive() or self.pool.max_idle == 0) conn.closing = true;
+
+                // Drain small redirect bodies (up to 2KB) so the connection can
+                // be returned to the pool rather than closed.
+                if (!conn.closing and conn.bodyPending()) {
+                    const max_drain = 2048;
+                    var drain_buf: [1024]u8 = undefined;
+                    // No decoding: this is throwing the body away to keep the
+                    // connection, so what it would decode to does not matter.
+                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &drain_buf);
+                    _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
+                        error.ReadFailed => {
+                            conn.closing = true;
+                            return body_reader.err orelse error.Unexpected;
+                        },
+                    };
+                    if (!conn.parser.isBodyComplete()) conn.closing = true;
+                }
+                self.pool.release(conn);
+                conn_released = true;
+
+                // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
+                // QUERY keeps its method and body on 301/302 (RFC 10008, Section 2.5).
+                // 307/308 preserve the original method and body.
+                var redirect_options = state.options;
+                if (status_code == 301 or status_code == 302 or status_code == 303) {
+                    const method = redirect_options.method;
+                    const keeps_method = method == .get or method == .head or
+                        (method == .query and status_code != 303);
+                    if (!keeps_method) {
+                        redirect_options.method = .get;
+                        redirect_options.body = null;
+                    } else if (status_code == 303) {
+                        redirect_options.body = null;
+                    }
+                }
+
+                // Strip sensitive headers when:
+                //   - already stripping from a previous hop, OR
+                //   - crossing to a different domain/host (same-domain and subdomain keep headers), OR
+                //   - downgrading from https to http (credentials would travel in plaintext).
+                var redirect_host_buffer: [255]u8 = undefined;
+                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
+                const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
+                const redirect_strip_sensitive = state.strip_sensitive_headers or
+                    !isDomainOrSubdomain(redirect_host, effective_initial_host) or
+                    (state.protocol == .https and redirect_info.protocol == .http);
+
+                // Strip body-related headers when there is no body to send.
+                const redirect_strip_body = redirect_options.body == null;
+
+                // Compute Referer for the next hop (RFC 7231 §5.5.2).
+                // Don't send Referer when downgrading https→http (would leak in plaintext).
+                // If the user already set a Referer header, forward it as-is.
+                var referer_buf: [2048]u8 = undefined;
+                const redirect_referer: ?[]const u8 = blk: {
+                    if (state.protocol == .https and redirect_info.protocol == .http) break :blk null;
+                    if (redirect_options.headers) |h| {
+                        if (h.get("Referer")) |existing| break :blk existing;
+                    }
+                    var w = std.Io.Writer.fixed(&referer_buf);
+                    state.uri.writeToStream(&w, .{
+                        .scheme = true,
+                        .authority = true,
+                        .authentication = false, // strip userinfo — never leak credentials in Referer
+                        .path = true,
+                        .query = true,
+                        .fragment = false, // strip fragment — not sent to servers per RFC 7231
+                        .port = true,
+                    }) catch break :blk null;
+                    break :blk w.buffered();
+                };
+
+                return self.fetchInternal(.{
+                    .uri = redirect_uri,
+                    .port = redirect_info.port,
+                    .protocol = redirect_info.protocol,
+                    .options = redirect_options,
+                    .redirects_remaining = state.redirects_remaining - 1,
+                    .initial_host = effective_initial_host,
+                    .strip_sensitive_headers = redirect_strip_sensitive,
+                    .strip_body_headers = redirect_strip_body,
+                    .referer = redirect_referer,
+                });
+            }
+        }
+
+        // Build response with direct pointers for reading
+        var response = ClientResponse{
+            .arena = conn.arena.allocator(),
+            .parser = &conn.parser,
+            .transport = conn.transport(),
+            .parsed = &conn.parsed_response,
+            .max_response_size = self.config.max_response_size,
+            .decompress = state.options.decompress,
+            .owner = conn,
+            .raw = if (comptime has_h2_client) if (conn.h2_stream) |st| .{ .reader = st.reader(), .err = h2BodyError } else null else null,
+        };
+        // Under the request's deadline, which ends with this call. A body
+        // left on the wire is the caller's to read, on the caller's time.
+        if (!state.options.stream) _ = try response.body();
+        return response;
+    }
+
+    /// Writes the request on `conn` and reads the response head. `lost` is
+    /// set when the connection failed before any of the response arrived.
+    fn sendRequest(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
+        if (conn.http_version == .http_2) {
+            if (comptime has_h2_client) return self.sendRequestH2(conn, state, host, lost);
+            // Never offered without a client to speak it; and the TLS
+            // connection is committed to h2, so it is not pooled.
+            conn.closing = true;
+            return error.Http2NotImplemented;
+        }
+
+        // Whatever the proxy answers, what follows a CONNECT on the wire
+        // cannot be relied on to be the next response.
+        if (state.options.method == .connect) conn.closing = true;
+
+        conn.parser.head_request = state.options.method == .head;
+        conn.parser.connect_request = state.options.method == .connect;
+
+        // Send request. On write/flush failure the connection is dead or has
+        // a partially written request, so mark it closing before the errdefer
+        // releases it — otherwise it gets pooled again and poisons the pool.
+        var write_err: ?Connection.WriteError = null;
+        writeRequest(conn.writer, .{
+            .method = state.options.method,
+            .uri = state.uri,
+            .host = host,
+            .port = state.port,
+            .protocol = state.protocol,
+            .headers = state.options.headers,
+            .body = state.options.body,
+            .decompress = state.options.decompress,
+            .strip_sensitive_headers = state.strip_sensitive_headers,
+            .strip_body_headers = state.strip_body_headers,
+            .referer = state.referer,
+            .user_agent = self.config.user_agent,
+        }) catch |err| {
+            conn.closing = true;
+            switch (err) {
+                error.WriteFailed => write_err = conn.getWriteError() orelse error.Unexpected,
+                else => |e| return e,
+            }
+        };
+
+        if (write_err == null) conn.flush() catch |err| {
+            conn.closing = true;
+            write_err = err;
+        };
+
+        // A failed head read leaves whatever it got in the buffer, so an
+        // empty one means none of the response arrived, unless an interim
+        // response was read and dropped from it.
+        if (write_err) |err| {
+            if (err == error.Canceled) return err;
+            // A server that rejects the request (413, 401, ...) may answer
+            // and close before reading all of it. The fetch's own deadline
+            // still applies on top of this one.
+            const early: Deadline = .init(self.io, .{ .duration = .{ .raw = early_response_wait, .clock = .awake } });
+            early.run(Connection.parseHead, .{conn}) catch |read_err| switch (read_err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    lost.* = conn.reader.end == 0 and !conn.parser.state.saw_interim;
+                    return err;
+                },
+            };
+        } else {
+            // Any failure leaves the connection at an unknown stream
+            // position, so it must not be pooled.
+            conn.parseHead() catch |err| {
+                conn.closing = true;
+                lost.* = err != error.Canceled and conn.reader.end == 0 and !conn.parser.state.saw_interim;
+                return err;
+            };
+        }
+    }
+
+    /// `sendRequest` over HTTP/2: the request as one stream, and its
+    /// response head in `conn.parsed_response` as the HTTP/1.1 parser
+    /// leaves it. The body stays on the stream for `ClientResponse`.
+    fn sendRequestH2(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
+        if (comptime !has_h2_client) unreachable;
+        try http.validateHeaderValue(host);
+        const arena = conn.arena.allocator();
+        const path = uriPath(state.uri);
+        var fields: H2Fields = .{ .arena = arena };
+        try fields.list.appendSlice(arena, &.{
+            .{ .name = ":method", .value = state.options.method.name() },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = if (state.uri.query) |query|
+                try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query.percent_encoded })
+            else
+                path },
+        });
+        try requestFields(.{
+            .method = state.options.method,
+            .uri = state.uri,
+            .host = host,
+            .port = state.port,
+            .protocol = state.protocol,
+            .headers = state.options.headers,
+            .body = state.options.body,
+            .decompress = state.options.decompress,
+            .strip_sensitive_headers = state.strip_sensitive_headers,
+            .strip_body_headers = state.strip_body_headers,
+            .referer = state.referer,
+            .user_agent = self.config.user_agent,
+        }, &fields, H2Fields.add);
+
+        // The fetch's deadline bounds every wait below; the stream has
+        // none of its own. The body goes out as the server takes it while
+        // this waits for the head, so a server that answers as it reads
+        // cannot stall the request.
+        const stream = conn.h2.?.request(fields.list.items, .{ .body_bytes = state.options.body, .timeout = .none }) catch |err| {
+            // The server sent GOAWAY, or the connection failed, before
+            // this request: none of it went out.
+            conn.closing = true;
+            lost.* = err == error.ConnectionClosed;
+            return err;
+        };
+        conn.h2_stream = stream;
+        stream.waitHead() catch |err| {
+            // The connection went with nothing of the response: as an
+            // HTTP/1.1 connection lost before the response, which a reused
+            // one may retry.
+            if (err == error.ConnectionClosed) {
+                conn.closing = true;
+                lost.* = true;
+            }
+            return err;
+        };
+
+        const parsed = &conn.parsed_response;
+        parsed.status = try http.Status.fromCode(stream.status);
+        parsed.version_major = 2;
+        parsed.version_minor = 0;
+        for (stream.headers.items) |h| try parsed.headers.add(try arena.dupe(u8, h.name), try arena.dupe(u8, h.value));
+        // As the parser's `onHeadersComplete` reads them.
+        if (parsed.headers.get("Content-Type")) |v| parsed.content_type = ContentType.fromContentType(v);
+        if (parsed.headers.get("Content-Encoding")) |v| parsed.content_encoding = ContentEncoding.fromString(v);
+        if (parsed.headers.get("Content-Length")) |v| parsed.content_length = std.fmt.parseInt(usize, v, 10) catch null;
+        conn.parser.state.headers_complete = true;
+        // A response that has no body whatever its headers say, so nothing
+        // starts decoding one.
+        conn.parser.state.message_complete = state.options.method == .head or
+            parsed.status == .no_content or parsed.status == .not_modified or
+            parsed.content_length == 0;
+    }
+};
+
+/// Whether a request may be sent again after a connection failure, by the
+/// same rules as Go's net/http. A body is a slice, so it can always be resent.
+fn isReplayable(options: FetchOptions) bool {
+    switch (options.method) {
+        .get, .head, .options, .trace, .query => return true,
+        else => {},
+    }
+    const headers = options.headers orelse return false;
+    return headers.get("Idempotency-Key") != null or headers.get("X-Idempotency-Key") != null;
+}
+
+const FetchState = struct {
+    uri: Uri,
+    port: u16,
+    protocol: Protocol,
+    options: FetchOptions,
+    redirects_remaining: u8,
+    initial_host: []const u8 = "",
+    strip_sensitive_headers: bool = false,
+    strip_body_headers: bool = false,
+    referer: ?[]const u8 = null,
+};
+
+const WriteRequestOptions = struct {
+    method: Method,
+    uri: Uri,
+    host: []const u8,
+    port: u16,
+    protocol: Protocol,
+    headers: ?*const Headers = null,
+    body: ?[]const u8 = null,
+    decompress: bool = true,
+    strip_sensitive_headers: bool = false,
+    strip_body_headers: bool = false,
+    referer: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
+};
+
+const WriteUpgradeRequestOptions = struct {
+    uri: Uri,
+    host: []const u8,
+    port: u16,
+    protocol: Protocol,
+    key: []const u8,
+    headers: ?*const Headers,
+};
+
+/// The WebSocket upgrade request, on the wire. Takes the writer rather than
+/// the connection so it can only report the sentinel, which is the caller's
+/// to resolve -- the same split `writeRequest` has.
+fn writeUpgradeRequest(writer: *std.Io.Writer, opts: WriteUpgradeRequestOptions) !void {
+    const path = uriPath(opts.uri);
+    if (opts.uri.query) |query| {
+        try writer.print("GET {s}?{s} HTTP/1.1\r\n", .{ path, query.percent_encoded });
+    } else {
+        try writer.print("GET {s} HTTP/1.1\r\n", .{path});
+    }
+
+    if ((opts.protocol == .http and opts.port == 80) or (opts.protocol == .https and opts.port == 443)) {
+        try writer.print("Host: {s}\r\n", .{opts.host});
+    } else {
+        try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
+    }
+
+    try writer.writeAll("Upgrade: websocket\r\n");
+    try writer.writeAll("Connection: Upgrade\r\n");
+    try writer.print("Sec-WebSocket-Key: {s}\r\n", .{opts.key});
+    try writer.writeAll("Sec-WebSocket-Version: 13\r\n");
+
+    // User-provided headers, minus the ones the upgrade owns.
+    if (opts.headers) |h| {
+        var it = h.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Upgrade")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Connection")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Key")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Version")) continue;
+            try http.validateHeaderName(entry.key);
+            try http.validateHeaderValue(entry.value);
+            try writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+        }
+    }
+
+    return writer.writeAll("\r\n");
+}
+
+fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
+    // Reject any CRLF/NUL smuggled in via the URL host (a URL like
+    // "http://foo%0d%0aX-Evil:1/" would otherwise inject a header).
+    try http.validateHeaderValue(opts.host);
+
+    // Request line - path with query
+    const path = uriPath(opts.uri);
+    if (opts.uri.query) |query| {
+        try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ opts.method.name(), path, query.percent_encoded });
+    } else {
+        try writer.print("{s} {s} HTTP/1.1\r\n", .{ opts.method.name(), path });
+    }
+
+    try requestFields(opts, writer, writeField);
+
+    // End of headers
+    try writer.writeAll("\r\n");
+
+    // Body
+    if (opts.body) |b| {
+        try writer.writeAll(b);
+    }
+}
+
+fn writeField(writer: *std.Io.Writer, name: []const u8, value: []const u8) !void {
+    try writer.print("{s}: {s}\r\n", .{ name, value });
+}
+
+/// The request's header fields, `Host` first, each validated and handed to
+/// `emit(sink, name, value)`: what HTTP/1.1 writes after the request line
+/// and HTTP/2 sends after its pseudo-headers. `value` may be a temporary.
+fn requestFields(opts: WriteRequestOptions, sink: anytype, comptime emit: anytype) !void {
+    // Host header
+    var host_buf: [300]u8 = undefined;
+    if ((opts.protocol == .http and opts.port == 80) or (opts.protocol == .https and opts.port == 443)) {
+        try emit(sink, "Host", opts.host);
+    } else {
+        try emit(sink, "Host", try std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ opts.host, opts.port }));
+    }
+
+    // Content-Length for body. A method that usually carries one says so
+    // even when there is none: some servers answer 411 otherwise.
+    var length_buf: [24]u8 = undefined;
+    if (opts.body) |b| {
+        try emit(sink, "Content-Length", try std.fmt.bufPrint(&length_buf, "{d}", .{b.len}));
+    } else if (opts.method == .post or opts.method == .put or opts.method == .patch) {
+        try emit(sink, "Content-Length", "0");
+    }
+
+    // User-provided headers
+    var has_accept_encoding = false;
+    var has_referer = false;
+    var has_user_agent = false;
+    if (opts.headers) |h| {
+        var it = h.iterator();
+        while (it.next()) |entry| {
+            // Skip headers we already set
+            if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Content-Length")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Accept-Encoding")) has_accept_encoding = true;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Referer")) has_referer = true;
+            if (std.ascii.eqlIgnoreCase(entry.key, "User-Agent")) has_user_agent = true;
+
+            if (opts.strip_sensitive_headers) {
+                if (std.ascii.eqlIgnoreCase(entry.key, "Authorization")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Www-Authenticate")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Cookie")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Cookie2")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Proxy-Authorization")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Proxy-Authenticate")) continue;
+            }
+            if (opts.strip_body_headers) {
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Encoding")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Language")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Location")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Type")) continue;
+            }
+
+            try http.validateHeaderName(entry.key);
+            try http.validateHeaderValue(entry.value);
+            try emit(sink, entry.key, entry.value);
+        }
+    }
+
+    // Add auto-Referer from previous hop if user didn't provide one
+    if (opts.referer) |referer| {
+        if (!has_referer) {
+            try http.validateHeaderValue(referer);
+            try emit(sink, "Referer", referer);
+        }
+    }
+
+    // Add default User-Agent if configured and user didn't provide one
+    if (opts.user_agent) |ua| {
+        if (!has_user_agent) {
+            try http.validateHeaderValue(ua);
+            try emit(sink, "User-Agent", ua);
+        }
+    }
+
+    // Add default Accept-Encoding if decompress enabled and user didn't
+    // provide one, and only for codings this build can undo.
+    if (build_options.use_zlib and opts.decompress and !has_accept_encoding) {
+        try emit(sink, "Accept-Encoding", "gzip, deflate");
+    }
+}
+
+/// The request as HTTP/2 header fields: the pseudo-headers, then the
+/// fields `requestFields` gives, `Host` as `:authority`, names in lower
+/// case, without the fields HTTP/2 forbids (RFC 9113 §8.2.2). Copied into
+/// `arena`.
+const H2Fields = if (has_h2_client) struct {
+    arena: std.mem.Allocator,
+    list: std.ArrayList(h2_client.Header) = .empty,
+
+    fn add(self: *@This(), name: []const u8, value: []const u8) !void {
+        const connection_specific = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
+        for (connection_specific) |n| if (std.ascii.eqlIgnoreCase(name, n)) return;
+        if (std.ascii.eqlIgnoreCase(name, "te") and !std.ascii.eqlIgnoreCase(value, "trailers")) return;
+        const lower = if (std.ascii.eqlIgnoreCase(name, "host")) ":authority" else try std.ascii.allocLowerString(self.arena, name);
+        try self.list.append(self.arena, .{ .name = lower, .value = try self.arena.dupe(u8, value) });
+    }
+} else void;
+
+/// What a failed read of an HTTP/2 response body was, in the transport's
+/// terms: a reset stream or a lost connection is the peer resetting it.
+fn h2BodyError(reader: *std.Io.Reader) ?Transport.ReadError {
+    if (comptime !has_h2_client) unreachable;
+    const err = h2_client.Stream.ofReader(reader).readError() orelse return null;
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        error.Timeout => error.ConnectionTimedOut,
+        else => error.ConnectionResetByPeer,
+    };
+}
+
+/// Returns true if sub is the same domain as parent, or a subdomain of it.
+/// Used to decide whether to forward sensitive headers on redirect.
+/// Matches Go's net/http shouldCopyHeaderOnRedirect logic.
+fn isDomainOrSubdomain(sub: []const u8, parent: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(sub, parent)) return true;
+    // Don't treat IPv6 addresses (including zone IDs like "::1%25.evil.com") as subdomains.
+    if (std.mem.indexOfAny(u8, sub, ":%") != null) return false;
+    // sub must end with ".<parent>".
+    if (sub.len <= parent.len + 1) return false;
+    const dot_idx = sub.len - parent.len - 1;
+    return sub[dot_idx] == '.' and std.ascii.eqlIgnoreCase(sub[dot_idx + 1 ..], parent);
+}
+
+/// The statuses a Location is followed for. The rest of 3xx are not
+/// redirects: a 304 answers a conditional request, a 300 offers choices.
+fn isRedirect(status: http.Status) bool {
+    return switch (status) {
+        .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => true,
+        else => false,
+    };
+}
+
+/// How many interim responses may precede the final one. Go's limit, and
+/// what keeps an endless stream of them from keeping a request open forever.
+const max_interim_responses = 5;
+
+/// 1xx, less 101: that one ends the HTTP exchange rather than preceding
+/// the response to it.
+fn isInterim(status: http.Status) bool {
+    const code = @backingInt(status);
+    return code >= 100 and code < 200 and status != .switching_protocols;
+}
+
+/// Parse HTTP response headers from a reader. Interim responses are read
+/// and dropped on the way, so what is parsed on return is the final one.
+fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
+    var parsed_len: usize = 0;
+    var interim: usize = 0;
+    while (true) {
+        while (!parser.state.headers_complete) {
+            const buffered = reader.buffered();
+            const unparsed = buffered[parsed_len..];
+            if (unparsed.len > 0) {
+                parser.feed(unparsed) catch |err| switch (err) {
+                    error.Paused => {
+                        const consumed = parser.getConsumedBytes(unparsed.ptr);
+                        parsed_len += consumed;
+                        continue;
+                    },
+                    else => return err,
+                };
+                parsed_len += unparsed.len;
+                continue;
+            }
+            // Same ceiling as the server's `parseHeaders`, and for the same
+            // reason: the head is held whole, so a buffer with no room left is a
+            // head that will never complete.
+            if (reader.buffer.len - reader.end < body_read_reserve) return error.HeadersTooLarge;
+            reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (parsed_len == 0) return error.EndOfStream;
+                    return error.IncompleteResponse;
+                },
+                else => |e| return e,
+            };
+        }
+        if (!isInterim(parser.response.status)) break;
+
+        if (interim == max_interim_responses) return error.TooManyInterimResponses;
+        interim += 1;
+
+        // The interim head is thrown away, and so is the room it took: the
+        // final head gets the whole buffer. Moved by hand because a fixed
+        // reader refuses to rebase.
+        reader.toss(parsed_len);
+        parsed_len = 0;
+        const rest = reader.buffered();
+        @memmove(reader.buffer[0..rest.len], rest);
+        reader.seek = 0;
+        reader.end = rest.len;
+        try parser.restart();
+    }
+    // And, as there, a fill may use every byte it was given room for, so the
+    // head can finish inside the reserve without the check above ever
+    // firing. The body reader gets what is left, and cannot read into
+    // nothing.
+    if (reader.buffer.len - parsed_len < body_read_reserve) return error.HeadersTooLarge;
+
+    reader.toss(parsed_len);
+    parser.resumeParsing();
+
+    // Shorten buffer so body reading doesn't overwrite header data.
+    // Headers remain valid in buffer[0..headers_len], body uses the rest.
+    std.debug.assert(reader.seek == parsed_len);
+    const headers_len = reader.seek;
+    reader.buffer = reader.buffer[headers_len..];
+    reader.end -= headers_len;
+    reader.seek = 0;
+
+    // Feed empty buffer to advance state machine for bodyless responses
+    parser.feed(&.{}) catch |err| switch (err) {
+        error.Paused => {},
+        else => return err,
+    };
+}
+
+// Tests
+
+/// A reader over `raw` with `body_read_reserve` bytes of slack past it, the
+/// way a connection's read buffer has slack past the head it just parsed.
+/// `Reader.fixed` alone leaves none, and a head with nothing behind it is
+/// rejected -- the body reader would have nowhere to read into.
+fn fixedMessageReader(gpa: std.mem.Allocator, raw: []const u8) !std.Io.Reader {
+    const backing = try gpa.alloc(u8, raw.len + body_read_reserve);
+    @memcpy(backing[0..raw.len], raw);
+    var r: std.Io.Reader = .fixed(backing);
+    r.end = raw.len;
+    return r;
+}
+
+test "unbracketed: takes the brackets off an IPv6 literal and nothing else" {
+    try std.testing.expectEqualStrings("::1", unbracketed("[::1]"));
+    try std.testing.expectEqualStrings("127.0.0.1", unbracketed("127.0.0.1"));
+    try std.testing.expectEqualStrings("example.com", unbracketed("example.com"));
+    try std.testing.expectEqualStrings("[", unbracketed("["));
+}
+
+test "parseUrl: IPv6 literal keeps its brackets" {
+    const uri = try parseUrl("http://[::1]:8080/path");
+    var host_buf: [255]u8 = undefined;
+    const host = try uriHost(uri, &host_buf);
+    try std.testing.expectEqualStrings("[::1]", host);
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(8080, info.port);
+}
+
+test "uriHost: decodes escaped host and rejects a missing or oversized host" {
+    var host_buf: [255]u8 = undefined;
+    try std.testing.expectEqualStrings("example.com", try uriHost(try parseUrl("http://exam%70le.com/"), &host_buf));
+    try std.testing.expectError(error.InvalidUrl, uriHost(try parseUrl("http:/path"), &host_buf));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("http://"));
+    // Zig 0.17's Uri.parse already refuses a host this long; on 0.16 it is
+    // uriHost that runs out of room for it.
+    const long_host = "http://" ++ @as([256]u8, @splat('a'));
+    if (parseUrl(long_host)) |uri| {
+        try std.testing.expectError(error.InvalidUrl, uriHost(uri, &host_buf));
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidUrl, err);
+    }
+}
+
+test "parseUrl: basic URL" {
+    const uri = try parseUrl("http://example.com/path");
+    var host_buf: [255]u8 = undefined;
+    const host = try uriHost(uri, &host_buf);
+    try std.testing.expectEqualStrings("example.com", host);
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(80, info.port);
+    try std.testing.expectEqual(Protocol.http, info.protocol);
+    try std.testing.expectEqualStrings("/path", uriPath(uri));
+}
+
+test "parseUrl: URL with port" {
+    const uri = try parseUrl("http://example.com:8080/path");
+    var host_buf: [255]u8 = undefined;
+    const host = try uriHost(uri, &host_buf);
+    try std.testing.expectEqualStrings("example.com", host);
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(8080, info.port);
+    try std.testing.expectEqual(Protocol.http, info.protocol);
+    try std.testing.expectEqualStrings("/path", uriPath(uri));
+}
+
+test "parseUrl: URL without path" {
+    const uri = try parseUrl("http://example.com");
+    var host_buf: [255]u8 = undefined;
+    const host = try uriHost(uri, &host_buf);
+    try std.testing.expectEqualStrings("example.com", host);
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(80, info.port);
+    try std.testing.expectEqual(Protocol.http, info.protocol);
+    try std.testing.expectEqualStrings("/", uriPath(uri));
+}
+
+test "parseUrl: URL without scheme is invalid" {
+    try std.testing.expectError(error.InvalidUrl, parseUrl("example.com/path"));
+}
+
+test "parseUrl: HTTPS returns port 443" {
+    const uri = try parseUrl("https://example.com/path");
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(443, info.port);
+    try std.testing.expectEqual(Protocol.https, info.protocol);
+}
+
+test "parseUrl: unknown scheme returns UnsupportedScheme" {
+    const uri = try parseUrl("ftp://example.com/path");
+    try std.testing.expectError(error.UnsupportedScheme, uriPortAndProtocol(uri));
+}
+
+test "parseUrl: URL with query string" {
+    const uri = try parseUrl("http://example.com/path?foo=bar&baz=qux");
+    var host_buf: [255]u8 = undefined;
+    const host = try uriHost(uri, &host_buf);
+    try std.testing.expectEqualStrings("example.com", host);
+    try std.testing.expectEqualStrings("/path", uriPath(uri));
+    try std.testing.expectEqualStrings("foo=bar&baz=qux", uri.query.?.percent_encoded);
+}
+
+test "Uri.resolveInPlace: relative path" {
+    const base = try parseUrl("http://example.com/foo/bar");
+
+    // Test absolute path redirect
+    {
+        var buf: [256]u8 = undefined;
+        const location = "/new/path";
+        @memcpy(buf[0..location.len], location);
+        var aux: []u8 = buf[0..];
+        const resolved = try Uri.resolveInPlace(base, location.len, &aux);
+        try std.testing.expectEqualStrings("http", resolved.scheme);
+        try std.testing.expectEqualStrings("example.com", resolved.host.?.percent_encoded);
+        try std.testing.expectEqualStrings("/new/path", resolved.path.percent_encoded);
+    }
+
+    // Test relative path redirect
+    {
+        var buf: [256]u8 = undefined;
+        const location = "other";
+        @memcpy(buf[0..location.len], location);
+        var aux: []u8 = buf[0..];
+        const resolved = try Uri.resolveInPlace(base, location.len, &aux);
+        try std.testing.expectEqualStrings("http", resolved.scheme);
+        try std.testing.expectEqualStrings("example.com", resolved.host.?.percent_encoded);
+        try std.testing.expectEqualStrings("/foo/other", resolved.path.percent_encoded);
+    }
+
+    // Test absolute URL redirect
+    {
+        var buf: [256]u8 = undefined;
+        const location = "http://other.com/different";
+        @memcpy(buf[0..location.len], location);
+        var aux: []u8 = buf[0..];
+        const resolved = try Uri.resolveInPlace(base, location.len, &aux);
+        try std.testing.expectEqualStrings("http", resolved.scheme);
+        try std.testing.expectEqualStrings("other.com", resolved.host.?.percent_encoded);
+        try std.testing.expectEqualStrings("/different", resolved.path.percent_encoded);
+    }
+}
+
+test "ClientResponse.body: basic response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse.body: a corrupt gzip body reports the decompression failure" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++ ("not a gzip stream at all" ++ "12345678");
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // The bytes arrived intact; it is the layer above the body reader that
+    // could not make sense of them, so that is where the answer is.
+    try std.testing.expectError(error.CorruptInput, response.body());
+}
+
+test "ClientResponse: a streaming read can be resolved without going through body" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++
+        ("not a gzip stream at all" ++ "12345678");
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // Streaming the body rather than calling `body`, which is the case with
+    // no other way to find out what happened.
+    var read_buf: [64]u8 = undefined;
+    var r = try response.reader(&read_buf);
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
+
+    // Asked of the reader that was handed out, which is the point: a caller
+    // holding it needs nothing else to find out what a failed read was.
+    try std.testing.expectEqual(error.CorruptInput, r.err.?);
+}
+
+test "ClientResponse.body: a body read that failed before it started can be asked for again" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // Nothing was read, so nothing was taken -- the server picked the
+    // encoding, and asking twice must not trip the one-reader assert.
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+}
+
+test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
+    // `fetch` returns a `ClientResponse` by value and `reader` returns the
+    // body reader by value, so both are copied per response whether or not
+    // anything was coded. The read buffer comes from the caller, and the
+    // decoder is allocated when the headers call for it -- so neither of
+    // these grows with either.
+    try std.testing.expect(@sizeOf(ClientResponse) < @sizeOf(ResponseBodyReader.Decode));
+    try std.testing.expect(@sizeOf(ResponseBodyReader) < @sizeOf(ResponseBodyReader.Decode));
+}
+
+test "Client: no std.Io sentinel escapes its public API" {
+    // Listing the names of these error sets takes more than the default
+    // quota on Zig 0.16.
+    @setEvalBranchQuota(10_000);
+    // `ReadFailed`/`WriteFailed` say only that a read or write failed, which
+    // the caller knew when it called. The client stacks more layers than the
+    // server does -- socket, TLS, request and response framing,
+    // decompression -- and any of them could drop its answer on the way up.
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    inline for (.{
+        ErrorSetOf(ClientResponse.body),
+        ErrorSetOf(Client.fetch),
+        ErrorSetOf(Client.connectWebSocket),
+        ErrorSetOf(WebSocketClient.send),
+        ErrorSetOf(WebSocketClient.receive),
+        ErrorSetOf(WebSocketClient.receiveMany),
+        ErrorSetOf(WebSocketClient.tryReceive),
+        // The wrapper a streaming caller resolves through, not just the
+        // functions that resolve for them.
+        ClientResponse.ReadError,
+        ResponseBodyReader.Error,
+    }) |Set| {
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
+        }
+    }
+
+    // Not a sentinel, but not a cause either: reading a body, a stream that
+    // stopped early is `IncompleteBody`, and `EndOfStream` here would be
+    // read as the peer having hung up. `fetch` is excluded because a
+    // connection-close-delimited response can end that way for real.
+    inline for (.{ ClientResponse.ReadError, ResponseBodyReader.Error }) |Set| {
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "EndOfStream"));
+        }
+    }
+}
+
+test "ClientResponse.body: large body over 128 bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const body_content = &@as([256]u8, @splat('A'));
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n" ++ body_content;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqual(256, body.?.len);
+    try std.testing.expectEqualStrings(body_content, body.?);
+}
+
+test "ClientResponse.body: no body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqual(null, body);
+    try std.testing.expectEqual(.no_content, response.status());
+}
+
+test "parseResponseHeaders: interim responses are dropped on the way to the final one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 100 Continue\r\n\r\n" ++
+        "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n" ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqual(.ok, response.status());
+    // Nothing of the interim heads survives.
+    try std.testing.expectEqual(null, response.headers().get("Link"));
+    try std.testing.expectEqualStrings("hello", (try response.body()).?);
+}
+
+test "parseResponseHeaders: an endless run of interim responses is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = repeat("HTTP/1.1 100 Continue\r\n\r\n", max_interim_responses + 1) ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try std.testing.expectError(error.TooManyInterimResponses, parseResponseHeaders(&reader, &parser));
+}
+
+test "ClientResponse.body: chunked trailers are not headers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n0\r\nX-Trailer: value\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqualStrings("hello", (try response.body()).?);
+    try std.testing.expectEqual(null, response.headers().get("X-Trailer"));
+}
+
+test "ClientResponse.body: a body cut short is IncompleteBody" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Five bytes promised, two sent.
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectError(error.IncompleteBody, response.body());
+}
+
+test "ClientResponse.body: connection-close (EOF-delimited) body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // No Content-Length and no Transfer-Encoding: body is delimited by EOF.
+    const body_content = "body delimited by connection close, not length.";
+    const raw_response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nconnection: close\r\n\r\n" ++ body_content;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings(body_content, body.?);
+    try std.testing.expectEqual(.forbidden, response.status());
+}
+
+test "ClientResponse.reader: streaming read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    var read_buf: [64]u8 = undefined;
+    var body_reader = try response.reader(&read_buf);
+
+    // Read in chunks
+    var buf: [5]u8 = undefined;
+    var n = try body_reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+
+    n = try body_reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings(" worl", buf[0..n]);
+
+    n = try body_reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings("d", buf[0..n]);
+}
+
+test "ClientResponse.reader: after body() returns cached data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // First read body fully
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // Now reader should return cached body
+    var read_buf: [64]u8 = undefined;
+    var body_reader = try response.reader(&read_buf);
+    const cached = try body_reader.interface.allocRemaining(arena.allocator(), .unlimited);
+    try std.testing.expectEqualStrings("hello", cached);
+}
+
+test "ClientResponse.body: gzip decompression" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "hello" gzip compressed
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+        .decompress = true,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse: decoding takes the headers that described the encoded body" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqualStrings("gzip", response.headers().get("Content-Encoding").?);
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // A proxy forwarding these would send five plain bytes labelled as
+    // twenty-five gzipped ones.
+    try std.testing.expectEqual(@as(?[]const u8, null), response.headers().get("Content-Encoding"));
+    try std.testing.expectEqual(@as(?[]const u8, null), response.headers().get("Content-Length"));
+
+    // What arrived is still answerable, just not as a header.
+    try std.testing.expectEqual(ContentEncoding.gzip, response.contentEncoding());
+    try std.testing.expectEqual(@as(?usize, 25), response.contentLength());
+}
+
+test "ClientResponse.body: gzip decompression disabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "hello" gzip compressed
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+        .decompress = false,
+    };
+
+    // With decompress disabled, we should get the raw gzip bytes
+    const body = try response.body();
+    try std.testing.expectEqual(25, body.?.len);
+    try std.testing.expectEqualStrings(gzip_hello, body.?);
+}
+
+test "ClientResponse.body: an empty body with a Content-Encoding is not decoded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Not a gzip stream, not even an empty one; a decoder would call it cut short.
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqual(null, try response.body());
+    try std.testing.expectEqualStrings("gzip", response.headers().get("Content-Encoding").?);
+}
+
+test "Protocol.fromScheme: http" {
+    const proto = try Protocol.fromScheme("http");
+    try std.testing.expectEqual(Protocol.http, proto);
+}
+
+test "Protocol.fromScheme: https" {
+    const proto = try Protocol.fromScheme("https");
+    try std.testing.expectEqual(Protocol.https, proto);
+}
+
+test "Protocol.fromScheme: unsupported scheme" {
+    try std.testing.expectError(error.UnsupportedScheme, Protocol.fromScheme("ftp"));
+}
+
+test "Protocol.defaultPort: http" {
+    try std.testing.expectEqual(80, Protocol.http.defaultPort());
+}
+
+test "Protocol.defaultPort: https" {
+    try std.testing.expectEqual(443, Protocol.https.defaultPort());
+}
+
+test "uriPortAndProtocol: https default" {
+    const uri = try parseUrl("https://example.com/path");
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(443, info.port);
+    try std.testing.expectEqual(Protocol.https, info.protocol);
+}
+
+test "isDomainOrSubdomain: exact match" {
+    try std.testing.expect(isDomainOrSubdomain("example.com", "example.com"));
+    try std.testing.expect(isDomainOrSubdomain("EXAMPLE.COM", "example.com"));
+}
+
+test "isDomainOrSubdomain: subdomain" {
+    try std.testing.expect(isDomainOrSubdomain("sub.example.com", "example.com"));
+    try std.testing.expect(isDomainOrSubdomain("a.b.example.com", "example.com"));
+}
+
+test "isDomainOrSubdomain: different domain" {
+    try std.testing.expect(!isDomainOrSubdomain("other.com", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("notexample.com", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("example.com.evil.com", "example.com"));
+}
+
+test "isDomainOrSubdomain: IPv6 never a subdomain" {
+    try std.testing.expect(!isDomainOrSubdomain("::1", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("[::1]", "example.com"));
+}
+
+test "isDomainOrSubdomain: IPv6 zone ID never a subdomain" {
+    try std.testing.expect(!isDomainOrSubdomain("::1%25.example.com", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("fe80::1%eth0.example.com", "example.com"));
+}
+
+test "writeRequest: sends default User-Agent" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://example.com/");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .user_agent = default_user_agent,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "User-Agent: " ++ default_user_agent ++ "\r\n") != null);
+}
+
+test "writeRequest: omits User-Agent when null" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://example.com/");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .user_agent = null,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "User-Agent:") == null);
+}
+
+test "writeRequest: user-provided User-Agent overrides default" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("User-Agent", "my-app/2.0");
+
+    const uri = try parseUrl("http://example.com/");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .user_agent = default_user_agent,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "User-Agent: my-app/2.0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, default_user_agent) == null);
+}
+
+test "writeRequest: sets Referer on redirect" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://example.com/new");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .referer = "http://example.com/old",
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Referer: http://example.com/old\r\n") != null);
+}
+
+test "writeRequest: does not override user-provided Referer" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Referer", "http://custom.example.com/");
+
+    const uri = try parseUrl("http://example.com/new");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .referer = "http://example.com/old",
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Referer: http://custom.example.com/\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "http://example.com/old") == null);
+}
+
+test "redirect: Referer strips userinfo and fragment" {
+    // Verify that writeToStream with authentication=false, fragment=false
+    // produces a clean Referer without credentials or fragment.
+    var referer_buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&referer_buf);
+    const uri = try parseUrl("http://user:pass@example.com/path?q=1#section");
+    try uri.writeToStream(&w, .{
+        .scheme = true,
+        .authority = true,
+        .authentication = false,
+        .path = true,
+        .query = true,
+        .fragment = false,
+        .port = true,
+    });
+    const referer = w.buffered();
+    try std.testing.expectEqualStrings("http://example.com/path?q=1", referer);
+}
+
+test "writeRequest: strips sensitive headers on cross-origin redirect" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("Cookie", "session=abc");
+    try headers.put("X-Custom", "keep-me");
+
+    const uri = try parseUrl("http://other.com/path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "other.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_sensitive_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Cookie") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "redirect: strips sensitive headers on https to http downgrade" {
+    // Verify the stripping condition fires on scheme downgrade even when host is identical.
+    // We exercise the flag directly since the full redirect loop requires a live server.
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("X-Custom", "keep-me");
+
+    const uri = try parseUrl("http://example.com/path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_sensitive_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "redirect: once stripping triggered it persists across hops" {
+    // strip_sensitive_headers=true should propagate even if a later hop passes the host check.
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("X-Custom", "keep-me");
+
+    // Simulate a hop that is back on the original host but already has strip=true.
+    const uri = try parseUrl("http://example.com/new-path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_sensitive_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "writeRequest: a bodyless POST says Content-Length: 0, a GET says nothing" {
+    const uri = try parseUrl("http://example.com/path");
+    inline for (.{ .post, .put, .patch }) |method| {
+        var buf: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writeRequest(&writer, .{
+            .method = method,
+            .uri = uri,
+            .host = "example.com",
+            .port = 80,
+            .protocol = .http,
+        });
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Content-Length: 0\r\n") != null);
+    }
+    inline for (.{ .get, .head, .delete, .options }) |method| {
+        var buf: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writeRequest(&writer, .{
+            .method = method,
+            .uri = uri,
+            .host = "example.com",
+            .port = 80,
+            .protocol = .http,
+        });
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Content-Length") == null);
+    }
+}
+
+test "writeRequest: strips body headers when body removed" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Content-Type", "application/json");
+    try headers.put("Content-Language", "en");
+    try headers.put("X-Custom", "keep-me");
+
+    const uri = try parseUrl("http://example.com/path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_body_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Language") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "Connection.release: the Keep-Alive timeout is in seconds" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [256]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5, max=100\r\nContent-Length: 0\r\n\r\n") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        _ = try resp.body();
+    }
+
+    try std.testing.expectEqual(1, client.pool.idle_len);
+    const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool.idle.first.?));
+    const now = std.Io.Timestamp.now(io, .awake);
+    const left = conn.idle_deadline.?.nanoseconds - now.nanoseconds;
+    // Five seconds, less however long the release took to get here.
+    try std.testing.expect(left > 4 * std.time.ns_per_s);
+    try std.testing.expect(left <= 5 * std.time.ns_per_s);
+    peer_future.cancel(io);
+}
+
+/// `s` repeated `n` times, for test fixtures. Zig 0.17 removed `**`.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        break :blk &final;
+    };
+}

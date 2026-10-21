@@ -743,10 +743,10 @@ listener that is not built fails with `error.TlsNotBuilt` or
 
 ## Full control with `anole.http`
 
-`app.router` and `app.server` are dusty's router and server, and
-`anole.http` is the dusty module, with TLS already on BoringSSL
-(`anole.http.dusty_module` has whatever it does not re-export). You can skip
-`Server` and drive dusty yourself:
+`app.router` and `app.server` are the HTTP core's router and server
+(src/http/core, adapted from dusty), and `anole.http` is that core, with TLS
+already on BoringSSL (`anole.http.dusty_module` has whatever it does not
+re-export). You can skip `Server` and drive the core yourself:
 
 ```zig
 const rt = try anole.zio.Runtime.init(init.gpa, .{ .executors = .auto });

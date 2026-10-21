@@ -30,10 +30,6 @@ jobs:
         run: zig build test --summary all
       - name: Every preset and edge flag combination
         run: zig build test-flags --summary all
-      # dusty's own suite on the TLS (BoringSSL), nghttp2, zlib-ng and zstd
-      # Anole injects into it.
-      - name: dusty's tests on Anole's seams
-        run: zig build dusty-test --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
@@ -217,24 +213,12 @@ jobs:
         with:
           version: 0.17.0
           cache-key: fuzz
-      # The fuzz targets are the "fuzz:" tests (src/fuzz.zig); a plain
+      # The fuzz targets are the "fuzz:" tests (src/fuzz.zig, and the HTTP
+      # core's: the PROXY protocol, requests through llhttp whole and in
+      # pieces, a connection's bytes over HTTP/1.1 and HTTP/2); a plain
       # `zig build test` runs them on their seeds and fixed mutations only.
       - name: zig build test --fuzz=200K
         run: zig build test -Dllvm=true --fuzz=200K
-      # The dusty fork's own targets (the PROXY protocol, requests through
-      # llhttp whole and in pieces, a connection's bytes over HTTP/1.1 and
-      # HTTP/2), run from the pinned package. Its test runner has no fuzzer,
-      # so they run through its `fuzz` step; a pin from before that step
-      # existed is skipped.
-      - name: dusty fork, zig build fuzz --fuzz=200K
-        run: |
-          zig build --fetch
-          cd zig-pkg/dusty-*/
-          if zig build -l | grep -qE '^ +fuzz '; then
-            zig build fuzz -Dllvm=true -Duse_http2=true --fuzz=200K
-          else
-            echo "The pinned dusty has no fuzz step yet."
-          fi
 
   grpc-interop:
     name: gRPC interop (both directions with grpc-go, h2c and TLS; grpc's HTTP/2 checks)

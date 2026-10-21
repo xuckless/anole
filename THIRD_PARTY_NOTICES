@@ -2,18 +2,18 @@ Third-party notices for Anole
 =============================
 
 Anole is MIT-licensed (see LICENSE). It is built from the components below.
-Nothing in this list is vendored into this repository: each package is
-fetched by `zig build` from the pinned URL in build.zig.zon. Most packages
-keep their own licence file, but the zio package ships no LICENSE (its
-build.zig.zon .paths leave it out; Anole's dusty fork now ships one), so this
-file carries the notices of both: the copyright lines in part A and the MIT
-text in part C. Files in
-this repository that adapt third-party code carry an attribution header and
-are listed in part B.
+The packages in part A are fetched by `zig build` from the pinned URL in
+build.zig.zon, not vendored. Most keep their own licence file, but the zio
+package ships no LICENSE (its build.zig.zon .paths leave it out), so this
+file carries its notice: the copyright line in part A and the MIT text in
+part C. Files in this repository that adapt third-party code carry an
+attribution header and are listed in part B; that includes the HTTP core
+(src/http/core, adapted from dusty) and the llhttp sources inside it.
 
 Which components end up in a binary depends on the build flags:
-`-Dprofile=minimal` links only zio, dusty and llhttp; `-Dtls=boringssl` adds
-BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds ngtcp2 and nghttp3.
+`-Dprofile=minimal` links only zio, the HTTP core and llhttp;
+`-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
+ngtcp2 and nghttp3.
 
 
 A. Fetched packages
@@ -27,20 +27,6 @@ zio (async runtime)
             recvmmsg/sendmmsg patches; some are open upstream as
             lalinsky/zio #836-#838)
   Pinned:   commit ebb701426b4431a1e04ab1efb1d1cb43fc7f0c12 of the fork
-  Linked:   always
-
-dusty (HTTP/1.1 server, router, client, WebSocket)
-  Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
-  Source:   https://github.com/lalinsky/dusty, used through Anole's fork
-            https://github.com/xuckless/dusty (branch anole: upstream
-            d3cb485 plus Anole's patches; the first ones are open
-            upstream as lalinsky/dusty #263-#270, the rest are fork-only)
-  Pinned:   commit 86d152f353c8ec029185e75ce5d2caf8d5756e59 of the fork
-  Linked:   always
-
-llhttp 9.3.1 (HTTP/1.1 parser, vendored inside dusty at src/llhttp)
-  Licence:  MIT. Copyright Fedor Indutny, 2018
-  Source:   https://github.com/nodejs/llhttp
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)
@@ -161,6 +147,25 @@ Aro (C front end used by translate-c at build time; not linked)
 
 B. Code adapted into this repository
 ------------------------------------
+
+src/http/core/ (the HTTP core: HTTP/1.1 server, router, middleware,
+client, WebSocket, the HTTP/2 server engine, static files, assets)
+  Adapted from dusty, through Anole's fork, whose changes (the HTTP/2
+  engine, TLS and nghttp2 seams, h2c, the PROXY protocol, inherited
+  listeners, task placement and the rest) are Anole's own. Every Zig file
+  carries an attribution header; dusty's licence is kept as
+  src/http/core/LICENSE.dusty.
+  Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
+  Source:   https://github.com/lalinsky/dusty, commit d3cb485, through
+            https://github.com/xuckless/dusty, commit
+            86d152f353c8ec029185e75ce5d2caf8d5756e59 (branch anole)
+  Linked:   always
+
+src/http/core/llhttp/ (llhttp 9.3.1, the HTTP/1.1 parser, as dusty
+vendored it; its licence is src/http/core/llhttp/LICENSE)
+  Licence:  MIT. Copyright Fedor Indutny, 2018
+  Source:   https://github.com/nodejs/llhttp
+  Linked:   always
 
 build/boringssl.zig
   Adapted from allyourcodebase/boringssl's build.zig.

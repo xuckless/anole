@@ -1,0 +1,2106 @@
+// Adapted from lalinsky/dusty (MIT, Copyright (c) 2025 Lukas Lalinsky and
+// contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
+// See LICENSE.dusty and THIRD_PARTY_NOTICES.
+
+const std = @import("std");
+const dusty = @import("root.zig");
+const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
+
+test "Client: simple GET request" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "Hello from test!\n";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            const port = s.address.ip.getPort();
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            defer stream.shutdown(_io, .both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+
+            try writer.interface.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            try writer.interface.flush();
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+
+            std.log.info("Response: {s} (port {})", .{ status_line, port });
+            try std.testing.expect(std.mem.indexOf(u8, status_line, "200 OK") != null);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: fetch GET request" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/api", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "Hello from API!\n";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            const port = s.address.ip.getPort();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api", .{port});
+
+            std.log.info("Making request to: {s}", .{url});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            std.log.info("Got response status: {d}", .{@backingInt(response.status())});
+
+            try std.testing.expectEqual(.ok, response.status());
+
+            const body = try response.body();
+            std.log.info("Got body: {?s}", .{body});
+            try std.testing.expect(body != null);
+            try std.testing.expectEqualStrings("Hello from API!\n", body.?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: connection pooling" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            const port = s.address.ip.getPort();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            // Pool should be empty initially
+            try std.testing.expectEqual(@as(usize, 0), client.pool.idle_len);
+
+            // First request
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+
+                try std.testing.expectEqual(.ok, response.status());
+                _ = try response.body();
+            }
+
+            // After first response is released, connection should be in pool
+            try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+
+            // Second request should reuse the pooled connection
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+
+                try std.testing.expectEqual(.ok, response.status());
+                _ = try response.body();
+            }
+
+            // Connection should be back in pool
+            try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: pool evicts dead connection after server goes away" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.waitReady(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    // A healthy fetch parks a keep-alive connection in the pool.
+    {
+        var response = try client.fetch(url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+        _ = try response.body();
+    }
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+
+    // The server goes away, killing the pooled connection.
+    server_future.cancel(io) catch {};
+
+    // The fetch over the dead pooled connection fails...
+    var failed = false;
+    if (client.fetch(url, .{})) |response| {
+        var r = response;
+        r.deinit();
+    } else |_| {
+        failed = true;
+    }
+    try std.testing.expect(failed);
+
+    // ...and the dead connection must be evicted, not returned to the pool,
+    // so the next fetch dials fresh instead of re-acquiring it forever.
+    try std.testing.expectEqual(@as(usize, 0), client.pool.idle_len);
+}
+
+test "Client: redirect failing after connection release does not double-release" {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        location: []const u8,
+    };
+
+    // Find a port with no listener behind it: bind, note the port, close.
+    // Redirecting there makes the redirect fetch fail at dial time, after
+    // the first connection was already released back to the pool.
+    const dead_port = blk: {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try addr.listen(io, .{});
+        const p = listener.socket.address.getPort();
+        listener.deinit(io);
+        break :blk p;
+    };
+
+    var location_buf: [64]u8 = undefined;
+    var ctx: Ctx = .{
+        .location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.1:{d}/", .{dead_port}),
+    };
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+
+    server.router.get("/redirect", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.status = .found;
+            try res.header("Location", c.location);
+        }
+    }.handle);
+
+    server.router.get("/ok", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            _ = c;
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.waitReady(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const redirect_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/redirect", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var failed = false;
+    if (client.fetch(redirect_url, .{})) |response| {
+        var r = response;
+        r.deinit();
+    } else |_| {
+        failed = true;
+    }
+    try std.testing.expect(failed);
+
+    // The connection was released back to the pool before the redirect
+    // failed; the failure must not release it a second time.
+    try std.testing.expectEqual(1, client.pool.idle_len);
+
+    // The pooled connection is still usable.
+    var ok_url_buf: [64]u8 = undefined;
+    const ok_url = try std.fmt.bufPrint(&ok_url_buf, "http://127.0.0.1:{d}/ok", .{port});
+    {
+        var response = try client.fetch(ok_url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+        _ = try response.body();
+    }
+    try std.testing.expectEqual(1, client.pool.idle_len);
+}
+
+test "Client: a connection with an unread response body is drained and reused" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "some response body";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.waitReady(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var response = try client.fetch(url, .{ .stream = true });
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+    }
+    try client.pool.drains.await(io);
+    try std.testing.expectEqual(1, client.pool.idle_len);
+
+    // Reused rather than joined by a second connection.
+    {
+        var response = try client.fetch(url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqualStrings("some response body", (try response.body()).?);
+    }
+    try std.testing.expectEqual(1, client.pool.idle_len);
+}
+
+test "Client: an unread body that is too long or stalls is not drained into the pool" {
+    const io = std.testing.io;
+    const long_head = "HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n";
+    const long = try std.testing.allocator.alloc(u8, long_head.len + 300000);
+    defer std.testing.allocator.free(long);
+    @memcpy(long[0..long_head.len], long_head);
+    @memset(long[long_head.len..], 'x');
+
+    const heads = [_][]const u8{ long, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial" };
+    for (heads) |head| {
+        var peer: StallingServer = undefined;
+        try peer.start(io, head);
+        defer peer.stop(io);
+
+        var client = dusty.Client.init(std.testing.allocator, io, .{});
+        defer client.deinit();
+        {
+            var response = try client.fetch(try peer.url(), .{ .stream = true });
+            defer response.deinit();
+        }
+        try client.pool.drains.await(io);
+        try std.testing.expectEqual(0, client.pool.idle_len);
+    }
+}
+
+test "Client: deinit cancels a drain still in progress" {
+    const io = std.testing.io;
+    var peer: StallingServer = undefined;
+    try peer.start(io, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial");
+    defer peer.stop(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+    var response = try client.fetch(try peer.url(), .{ .stream = true });
+    response.deinit();
+}
+
+test "Client: pool survives concurrent fetches on a shared client" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.waitReady(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+    // More workers than idle slots, so releases keep racing against evictions.
+    const max_idle = 4;
+    const workers = 8;
+    const rounds = 20;
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .max_idle_connections = max_idle });
+    defer client.deinit();
+
+    const worker = struct {
+        fn run(c: *dusty.Client, u: []const u8) !void {
+            for (0..rounds) |_| {
+                var response = try c.fetch(u, .{});
+                defer response.deinit();
+
+                try std.testing.expectEqual(.ok, response.status());
+                const body = try response.body();
+                try std.testing.expectEqualStrings("OK", body.?);
+            }
+        }
+    }.run;
+
+    const WorkerFuture = std.Io.Future(@typeInfo(@TypeOf(worker)).@"fn".return_type.?);
+    var futures: [workers]WorkerFuture = undefined;
+    var started: usize = 0;
+    errdefer for (futures[0..started]) |*f| f.cancel(io) catch {};
+
+    while (started < workers) : (started += 1) {
+        futures[started] = try io.concurrent(worker, .{ &client, url });
+    }
+
+    var first_err: ?anyerror = null;
+    for (&futures) |*f| {
+        f.await(io) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+    if (first_err) |err| return err;
+
+    // idle_len must still agree with the list, and must respect max_idle.
+    var counted: usize = 0;
+    var node = client.pool.idle.first;
+    while (node) |n| : (node = n.next) counted += 1;
+
+    try std.testing.expectEqual(counted, client.pool.idle_len);
+    try std.testing.expect(client.pool.idle_len <= max_idle);
+
+    // Guard against the invariants above passing on a pool that never pooled
+    // anything: connections must actually be getting reused.
+    try std.testing.expect(client.pool.idle_len > 0);
+}
+
+test "Client: WebSocket upgrade" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.get("/ws", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var ws = try res.upgradeWebSocket(req) orelse {
+                res.status = .bad_request;
+                return;
+            };
+
+            try ws.send(.text, "Welcome!");
+
+            while (true) {
+                const msg = ws.receive() catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    else => return err,
+                };
+                if (msg.type == .close) return;
+                if (msg.type == .text or msg.type == .binary) {
+                    try ws.send(msg.type, msg.data);
+                }
+            }
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            const port = s.address.ip.getPort();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/ws", .{port});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            var ws = try client.connectWebSocket(url, .{});
+            defer ws.deinit();
+
+            const welcome = try ws.receive();
+            try std.testing.expectEqual(.text, welcome.type);
+            try std.testing.expectEqualStrings("Welcome!", welcome.data);
+
+            try ws.send(.text, "Hello WebSocket!");
+
+            const echo = try ws.receive();
+            try std.testing.expectEqual(.text, echo.type);
+            try std.testing.expectEqualStrings("Hello WebSocket!", echo.data);
+
+            try ws.close(.normal, "done");
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: unix socket fetch" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.Io.net.has_unix_sockets) return error.SkipZigTest;
+
+    const io = std.testing.io;
+
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/dusty-client-test-unix-{d}.sock", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+
+    var ready: std.Io.Event = .unset;
+
+    var server_future = try io.concurrent(struct {
+        fn run(path: []const u8, r: *std.Io.Event, _io: std.Io) !void {
+            const unix_addr = try std.Io.net.UnixAddress.init(path);
+            var server = try unix_addr.listen(_io, .{});
+            defer server.deinit(_io);
+            defer std.Io.Dir.cwd().deleteFile(_io, path) catch {};
+
+            r.set(_io);
+
+            const stream = try server.accept(_io);
+            defer stream.close(_io);
+            defer stream.shutdown(_io, .both) catch {};
+
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            while (true) {
+                const line = try reader.interface.takeDelimiterExclusive('\n');
+                reader.interface.toss(1);
+                if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+            }
+
+            var write_buf: [512]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Length: 14\r\n" ++
+                    "Connection: close\r\n" ++
+                    "\r\n" ++
+                    "Hello, Docker!",
+            );
+            try writer.interface.flush();
+        }
+    }.run, .{ socket_path, &ready, io });
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(path: []const u8, r: *std.Io.Event, _io: std.Io) !void {
+            try r.wait(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            var response = try client.fetch("http://localhost/test", .{
+                .unix_socket_path = path,
+            });
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+
+            const b = try response.body();
+            try std.testing.expect(b != null);
+            try std.testing.expectEqualStrings("Hello, Docker!", b.?);
+        }
+    }.run, .{ socket_path, &ready, io });
+
+    try client_future.await(io);
+}
+
+const build_options = @import("build_options");
+
+// Self-signed test certificate, made at build time by tests/test_cert.zig
+// (`anole.tls.selfSigned`) in the directory the tests run in. It is CA:TRUE
+// with SANs for localhost, 127.0.0.1 and ::1, so the same file serves as the
+// server certificate and as the CA that validates it.
+const test_cert_path = "certs/cert.pem";
+const test_key_path = "certs/key.pem";
+
+test "Client: one server serves a plain listener and a TLS listener" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{
+            .{ .address = loopback_addr },
+            .{
+                .address = loopback_addr,
+                .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+            },
+        },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = if (req.secure) "over tls" else "in the clear";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const plain_url = try std.fmt.bufPrint(&url_buf, "http://localhost:{d}/", .{s.addresses[0].ip.getPort()});
+            var plain = try client.fetch(plain_url, .{});
+            defer plain.deinit();
+            try std.testing.expectEqual(.ok, plain.status());
+            try std.testing.expectEqualStrings("in the clear", (try plain.body()).?);
+
+            const tls_url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.addresses[1].ip.getPort()});
+            var secure = try client.fetch(tls_url, .{});
+            defer secure.deinit();
+            try std.testing.expectEqual(.ok, secure.status());
+            try std.testing.expectEqualStrings("over tls", (try secure.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: HTTPS with a custom CA file" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/secure", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expect(req.secure);
+            res.body = "over tls";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/secure", .{s.address.ip.getPort()});
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("over tls", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: HTTPS to a listener whose certificate is PEM in memory" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Read here only to have PEM text; the listener never sees a path.
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .pem = .{ .cert = cert_pem, .key = key_pem } } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expect(req.secure);
+            res.body = "pem in memory";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("pem in memory", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+/// One keep-alive request on a TLS connection of the test's own; the
+/// handler answers "ok".
+fn tlsRoundTrip(conn: anytype) !void {
+    var wbuf: [256]u8 = undefined;
+    var w = conn.writer(&wbuf);
+    try w.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [4096]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    const status = try r.interface.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+    while (true) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    try std.testing.expectEqualStrings("ok", try r.interface.take(2));
+}
+
+test "Server: reloadTls swaps a listener's certificate; open connections keep theirs, a failed reload changes nothing" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const tls = @import("tls");
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    // The caller's configuration, which a reload reads again.
+    var listeners = [_]dusty.Listener{.{ .address = loopback_addr, .tls = .{ .pem = .{ .cert = cert_pem, .key = key_pem } } }};
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &listeners }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.handle);
+
+    // Not running: only checks that it loads.
+    try server.reloadTls();
+    listeners[0].tls.?.pem.?.key = "not a key";
+    try std.testing.expect(std.meta.isError(server.reloadTls()));
+    listeners[0].tls.?.pem.?.key = key_pem;
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), l: *dusty.Listener, good_key: []const u8, _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+            var bundle = try ca.load(std.testing.allocator, _io);
+            defer bundle.deinit(std.testing.allocator);
+
+            // A connection from before the reload.
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var read_buf: [tls.input_buffer_len]u8 = undefined;
+            var write_buf: [tls.output_buffer_len]u8 = undefined;
+            var tcp_reader = stream.reader(_io, &read_buf);
+            var tcp_writer = stream.writer(_io, &write_buf);
+            var rng: std.Random.IoSource = .{ .io = _io };
+            var conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+                .host = "localhost",
+                .root_ca = bundle,
+                .now = std.Io.Clock.real.now(_io),
+                .rng = rng.interface(),
+            });
+            try tlsRoundTrip(&conn);
+
+            try s.reloadTls();
+            // It keeps working, and new connections are served.
+            try tlsRoundTrip(&conn);
+            var client = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
+            defer client.deinit();
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqualStrings("ok", (try response.body()).?);
+            }
+
+            // A key that does not load: an error, and the listener
+            // goes on with the one it has.
+            l.tls.?.pem.?.key = "not a key";
+            try std.testing.expect(std.meta.isError(s.reloadTls()));
+            l.tls.?.pem.?.key = good_key;
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqualStrings("ok", (try response.body()).?);
+            }
+            try tlsRoundTrip(&conn);
+        }
+    }.run, .{ &server, &listeners[0], key_pem, io });
+
+    try client_future.await(io);
+}
+
+test "Server: tls.alpn_protocols is offered to the client through ALPN" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const tls = @import("tls");
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .alpn_protocols = &.{"http/1.1"},
+        } }},
+    }, {});
+    defer server.deinit();
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+            var bundle = try ca.load(std.testing.allocator, _io);
+            defer bundle.deinit(std.testing.allocator);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var read_buf: [tls.input_buffer_len]u8 = undefined;
+            var write_buf: [tls.output_buffer_len]u8 = undefined;
+            var tcp_reader = stream.reader(_io, &read_buf);
+            var tcp_writer = stream.writer(_io, &write_buf);
+            var rng: std.Random.IoSource = .{ .io = _io };
+
+            // The client prefers h2; the server only lists http/1.1.
+            const conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+                .host = "localhost",
+                .root_ca = bundle,
+                .now = std.Io.Clock.real.now(_io),
+                .rng = rng.interface(),
+                .alpn_protocols = &.{ "h2", "http/1.1" },
+            });
+            try std.testing.expectEqualStrings("http/1.1", conn.alpn_protocol orelse return error.NoAlpn);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: presents a client certificate for mutual TLS" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // The test certificate is CA:TRUE and self-signed, so the same file serves
+    // as the server certificate, the client certificate, and the CA that
+    // validates both.
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+        } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "authed";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{
+                    .ca = .{ .file = .{ .path = test_cert_path } },
+                    .client_certificate = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+                },
+            });
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("authed", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: CA and client certificate as PEM in memory, against a listener checking clients with a PEM CA" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Read here only to have PEM text; nothing below sees a path.
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .pem = .{ .cert = cert_pem, .key = key_pem },
+            .client_auth = .{ .ca = .{ .pem = cert_pem } },
+        } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "authed from memory";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, cert: []const u8, key: []const u8) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{
+                    .ca = .{ .pem = cert },
+                    .client_certificate = .{ .pem = .{ .cert = cert, .key = key } },
+                },
+            });
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("authed from memory", (try response.body()).?);
+        }
+    }.run, .{ &server, io, cert_pem, key_pem });
+
+    try client_future.await(io);
+}
+
+test "TlsCa: .pem loads what .file loads" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+
+    const from_file: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+    var a = try from_file.load(gpa, io);
+    defer a.deinit(gpa);
+    // Twice over, with CRLF line ends: the same certificate, kept once.
+    const doubled = try std.mem.concat(gpa, u8, &.{ cert_pem, cert_pem });
+    defer gpa.free(doubled);
+    const crlf = try std.mem.replaceOwned(u8, gpa, doubled, "\n", "\r\n");
+    defer gpa.free(crlf);
+    const from_pem: dusty.TlsCa = .{ .pem = crlf };
+    var b = try from_pem.load(gpa, io);
+    defer b.deinit(gpa);
+
+    try std.testing.expect(a.bytes.items.len > 0);
+    try std.testing.expectEqualSlices(u8, a.bytes.items, b.bytes.items);
+    try std.testing.expectEqual(a.map.count(), b.map.count());
+
+    const cut: dusty.TlsCa = .{ .pem = cert_pem[0 .. cert_pem.len - 30] };
+    try std.testing.expectError(error.MissingEndCertificateMarker, cut.load(gpa, io));
+    const empty: dusty.TlsCa = .{ .pem = "" };
+    var none = try empty.load(gpa, io);
+    defer none.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), none.bytes.items.len);
+}
+
+test "Server: client_auth .require rejects a client with no certificate" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
+        } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "unreachable";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            // In TLS 1.3 the client finishes its flight before the server can
+            // reject the missing certificate, so the refusal surfaces on the
+            // first read rather than as a handshake error -- and as the alert
+            // the server actually sent, which is a layer below what the read
+            // itself could report.
+            try std.testing.expectError(error.TlsAlertCertificateRequired, client.fetch(url, .{}));
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Server: client_auth .request accepts a client with no certificate" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
+        } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "anonymous";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("anonymous", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: rejects a server certificate the configured CA does not cover" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            const port = s.address.ip.getPort();
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{port});
+
+            // The system trust store does not contain the self-signed test
+            // cert, and says so: which certificate check failed is the whole
+            // point of the answer here.
+            var strict = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer strict.deinit();
+            try std.testing.expectError(error.CertificateIssuerNotFound, strict.fetch(url, .{}));
+
+            // insecure_skip_verify takes it anyway.
+            var lax = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .none, .insecure_skip_verify = true },
+            });
+            defer lax.deinit();
+            var response = try lax.fetch(url, .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.ok, response.status());
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: ca .none without insecure_skip_verify is rejected" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{
+        .tls = .{ .ca = .none },
+    });
+    defer client.deinit();
+
+    // Fails while loading the TLS material, before any connection is attempted.
+    try std.testing.expectError(error.NoCertificateAuthority, client.fetch("https://localhost:1/", .{}));
+}
+
+test "Client: a response head too large for the buffer is rejected, not a panic" {
+    const io = std.testing.io;
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    // A peer whose head never ends inside the client's buffer.
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            rd.interface.fillMore() catch {};
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nX-Big: ") catch {};
+            w.interface.splatByteAll('A', 20000) catch {};
+            w.interface.writeAll("\r\nContent-Length: 0\r\n\r\n") catch {};
+            w.interface.flush() catch {};
+            s.shutdown(_io, .both) catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.HeadersTooLarge, client.fetch(url, .{}));
+
+    peer_future.cancel(io);
+}
+
+/// Serves one response whose head is exactly `head_len` bytes -- a header
+/// value padded so the terminating CRLFCRLF lands on the byte asked for --
+/// with a five-byte body behind it, and checks what the client makes of it.
+///
+/// The body is the point: what the head does not use of the read buffer is
+/// all the body reader gets, so a head that parses but leaves nothing behind
+/// it fails only once something reads a body.
+fn expectClientResultForHeadOfLength(head_len: usize, expected_body: ?[]const u8) !void {
+    const io = std.testing.io;
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, len: usize, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            rd.interface.fillMore() catch {};
+
+            const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Pad: ";
+            const suffix = "\r\n\r\n";
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            w.interface.writeAll(prefix) catch {};
+            w.interface.splatByteAll('A', len - prefix.len - suffix.len) catch {};
+            w.interface.writeAll(suffix) catch {};
+            w.interface.writeAll("hello") catch {};
+            w.interface.flush() catch {};
+            s.shutdown(_io, .both) catch {};
+        }
+    }.run, .{ &listener, head_len, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    if (expected_body) |want| {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings(want, (try resp.body()) orelse "");
+    } else {
+        try std.testing.expectError(error.HeadersTooLarge, client.fetch(url, .{}));
+    }
+
+    peer_future.cancel(io);
+}
+
+test "Client: a response head of exactly the limit is read, body and all" {
+    try expectClientResultForHeadOfLength(16384, "hello");
+}
+
+test "Client: a response head one byte over the limit is rejected" {
+    try expectClientResultForHeadOfLength(16385, null);
+}
+
+test "Client: a response head ending exactly at the buffer end is rejected, not a panic" {
+    try expectClientResultForHeadOfLength(16384 + 1024, null);
+}
+
+/// Serves `first` to whatever arrives, then `second` to the next request on
+/// the same connection, and holds the connection open so that a client
+/// waiting for a body that is not coming waits on the socket.
+fn twoResponsePeer(comptime first: []const u8, comptime second: []const u8) type {
+    return struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            rd.interface.tossBuffered();
+            w.interface.writeAll(first) catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch return;
+            w.interface.writeAll(second) catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    };
+}
+
+/// A HEAD response is allowed to carry the headers a GET would have, body
+/// length and coding included, without the body. The client must not wait
+/// for that body, and the connection must be reusable afterwards.
+fn expectHeadThenGet(comptime head_response: []const u8) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer(
+        head_response,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ).run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{ .method = .head });
+        defer resp.deinit();
+        try std.testing.expectEqual(.ok, resp.status());
+        try std.testing.expectEqual(null, try resp.body());
+    }
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings("ok", (try resp.body()).?);
+    }
+    peer_future.cancel(io);
+}
+
+test "Client: HEAD response with Content-Length has no body and keeps the connection" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+}
+
+test "Client: HEAD response with chunked Transfer-Encoding has no body" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+}
+
+test "Client: HEAD response with Content-Encoding has no body to decode" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
+}
+
+/// Answers the first connection keep-alive and closes it without reading
+/// another request, then answers "fresh" on the next connection.
+fn closeIdlePeer(l: *std.Io.net.Server, io: std.Io) void {
+    const responses = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh",
+    };
+    for (responses) |response| {
+        const s = l.accept(io) catch return;
+        defer s.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var rd = s.reader(io, &rbuf);
+        var wbuf: [256]u8 = undefined;
+        var w = s.writer(io, &wbuf);
+        rd.interface.fillMore() catch return;
+        w.interface.writeAll(response) catch return;
+        w.interface.flush() catch return;
+    }
+}
+
+test "Client: a stale pooled connection is retried for GET, not for POST" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    for ([_]dusty.Method{ .get, .post }) |method| {
+        var peer_future = try io.concurrent(closeIdlePeer, .{ &listener, io });
+        defer peer_future.cancel(io);
+        // On the second pass this is retried too: the peer closed "fresh".
+        {
+            var resp = try client.fetch(url, .{});
+            defer resp.deinit();
+            try std.testing.expectEqualStrings("first", (try resp.body()).?);
+        }
+        try std.testing.expectEqual(1, client.pool.idle_len);
+
+        if (client.fetch(url, .{ .method = method, .body = "x" })) |r| {
+            var resp = r;
+            defer resp.deinit();
+            try std.testing.expectEqual(.get, method);
+            try std.testing.expectEqualStrings("fresh", (try resp.body()).?);
+        } else |err| {
+            try std.testing.expectEqual(.post, method);
+            if (err == error.Canceled or err == error.Timeout) return err;
+        }
+    }
+}
+
+test "Client: a 2xx CONNECT response has no body and its connection is not pooled" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer("HTTP/1.1 200 OK\r\n\r\n", "").run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{ .method = .connect });
+        defer resp.deinit();
+        try std.testing.expectEqual(.ok, resp.status());
+        try std.testing.expectEqual(null, try resp.body());
+    }
+    try std.testing.expectEqual(0, client.pool.idle_len);
+    peer_future.cancel(io);
+}
+
+// The exchange in #159: a server that sends Early Hints ahead of the real
+// response, and then answers a second request on the same connection.
+// That second answer is what shows the first one left nothing behind.
+test "Client: an interim response is not the response, and does not poison the connection" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            rd.interface.tossBuffered();
+            w.interface.writeAll("HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n") catch return;
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch return;
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqual(.ok, resp.status());
+        try std.testing.expectEqual(null, resp.headers().get("Link"));
+        try std.testing.expectEqualStrings("first", (try resp.body()).?);
+    }
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings("second", (try resp.body()).?);
+    }
+    peer_future.cancel(io);
+}
+
+test "Client: a redirect the client cannot follow does not leave its body for the next request" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    // A Location the client cannot resolve, on a response with a body and
+    // a connection the server keeps open. The second response is served to
+    // the next request wherever it arrives: on that connection, if the
+    // client kept it, or on a new one.
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const responses = [_][]const u8{
+                "HTTP/1.1 302 Found\r\nLocation: mailto:someone@example.com\r\nContent-Length: 2\r\n\r\nok",
+                "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond",
+            };
+            var next: usize = 0;
+            while (next < responses.len) {
+                const s = l.accept(_io) catch return;
+                defer s.close(_io);
+                var rbuf: [4096]u8 = undefined;
+                var rd = s.reader(_io, &rbuf);
+                var wbuf: [1024]u8 = undefined;
+                var w = s.writer(_io, &wbuf);
+                while (next < responses.len) {
+                    rd.interface.fillMore() catch break;
+                    rd.interface.tossBuffered();
+                    w.interface.writeAll(responses[next]) catch return;
+                    w.interface.flush() catch return;
+                    next += 1;
+                }
+            }
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.UnsupportedScheme, client.fetch(url, .{}));
+
+    // Either a fresh connection, or the same one with nothing left over.
+    var resp = try client.fetch(url, .{});
+    defer resp.deinit();
+    try std.testing.expectEqualStrings("second", (try resp.body()).?);
+    peer_future.cancel(io);
+}
+
+test "Client: an IPv6 literal URL connects, with the brackets kept in the Host header" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("::1", 0);
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch |err| switch (err) {
+        // No IPv6 loopback here.
+        error.AddressUnavailable, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io, expected_port: u16) !void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [256]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            try rd.interface.fillMore();
+            var host_line_buf: [64]u8 = undefined;
+            const host_line = try std.fmt.bufPrint(&host_line_buf, "Host: [::1]:{d}\r\n", .{expected_port});
+            try std.testing.expect(std.mem.indexOf(u8, rd.interface.buffered(), host_line) != null);
+            try w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            try w.interface.flush();
+        }
+    }.run, .{ &listener, io, port });
+    defer peer_future.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://[::1]:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var resp = try client.fetch(url, .{});
+    defer resp.deinit();
+    try std.testing.expectEqualStrings("ok", (try resp.body()).?);
+    try peer_future.await(io);
+}
+
+/// A peer answers with `status_line` and a Location; following it would
+/// fetch the second response, so the first one coming back is the proof.
+fn expectLocationNotFollowed(comptime status_line: []const u8, expected: dusty.Status) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer(
+        status_line ++ "\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfollowed",
+    ).run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var resp = try client.fetch(url, .{});
+    defer resp.deinit();
+    try std.testing.expectEqual(expected, resp.status());
+    try std.testing.expectEqual(null, try resp.body());
+    peer_future.cancel(io);
+}
+
+test "Client: a 304 with a Location is not a redirect" {
+    try expectLocationNotFollowed("HTTP/1.1 304 Not Modified", .not_modified);
+}
+
+test "Client: a 300 with a Location is not a redirect" {
+    try expectLocationNotFollowed("HTTP/1.1 300 Multiple Choices", .multiple_choices);
+}
+
+test "Client: a 305 with a Location is not a redirect" {
+    try expectLocationNotFollowed("HTTP/1.1 305 Use Proxy", .use_proxy);
+}
+
+/// Buffers one request, headers and Content-Length body, and returns it.
+fn readWholeRequest(r: *std.Io.Reader) ![]const u8 {
+    while (true) {
+        const buf = r.buffered();
+        if (std.mem.indexOf(u8, buf, "\r\n\r\n")) |end| {
+            var len: usize = 0;
+            var lines = std.mem.splitSequence(u8, buf[0..end], "\r\n");
+            while (lines.next()) |line| {
+                const prefix = "content-length:";
+                if (line.len > prefix.len and std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) {
+                    len = try std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " "), 10);
+                }
+            }
+            if (buf.len >= end + 4 + len) return buf[0 .. end + 4 + len];
+        }
+        try r.fillMore();
+    }
+}
+
+/// A QUERY answered with `status_line` and a Location; the peer echoes the
+/// redirected request back as the body.
+fn expectQueryRedirect(comptime status_line: []const u8, expected_start: []const u8, expected_end: []const u8) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [4096]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            const first = readWholeRequest(&rd.interface) catch return;
+            rd.interface.toss(first.len);
+            w.interface.writeAll(status_line ++ "\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n") catch return;
+            w.interface.flush() catch return;
+            const request = readWholeRequest(&rd.interface) catch return;
+            w.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ request.len, request }) catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var resp = try client.fetch(url, .{ .method = .query, .body = "q=1" });
+    defer resp.deinit();
+    const echoed = (try resp.body()).?;
+    try std.testing.expectStringStartsWith(echoed, expected_start);
+    try std.testing.expectStringEndsWith(echoed, expected_end);
+    peer_future.cancel(io);
+}
+
+test "Client: QUERY keeps its method and body on 302, and becomes GET on 303" {
+    try expectQueryRedirect("HTTP/1.1 302 Found", "QUERY /next ", "\r\n\r\nq=1");
+    try expectQueryRedirect("HTTP/1.1 303 See Other", "GET /next ", "\r\n\r\n");
+}
+
+/// Reads the request head, answers with `response` unless it is empty, and
+/// closes with the body unread, which resets the connection under the
+/// client's write.
+fn rejectingPeer(listener: *std.Io.net.Server, io: std.Io, response: []const u8) void {
+    const s = listener.accept(io) catch return;
+    defer s.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rd = s.reader(io, &rbuf);
+    var w = s.writer(io, &.{});
+    while (std.mem.indexOf(u8, rd.interface.buffered(), "\r\n\r\n") == null) {
+        rd.interface.fillMore() catch return;
+    }
+    w.interface.writeAll(response) catch return;
+}
+
+fn fetchRejected(client: *dusty.Client, response: []const u8) !dusty.ClientResponse {
+    const io = client.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var peer_future = try io.concurrent(rejectingPeer, .{ &listener, io, response });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+
+    // Well past what the socket buffers on both ends can take in.
+    const body = try std.testing.allocator.alloc(u8, 16 << 20);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+
+    return client.fetch(url, .{ .method = .post, .body = body });
+}
+
+test "Client: a response sent while the request body is still going out is returned" {
+    // Windows drops what was received once the connection is reset.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var client = dusty.Client.init(std.testing.allocator, std.testing.io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try fetchRejected(&client, "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntoo much");
+        defer resp.deinit();
+        try std.testing.expectEqual(.payload_too_large, resp.status());
+        try std.testing.expectEqualStrings("too much", (try resp.body()).?);
+    }
+    try std.testing.expectEqual(0, client.pool.idle_len);
+
+    // No answer: the write error, not the read that found nothing.
+    if (fetchRejected(&client, "")) |r| {
+        var unexpected = r;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.ConnectionResetByPeer, error.SocketUnconnected => {},
+        else => return err,
+    }
+}
+
+/// A peer that accepts one connection, sends `head` once the request has
+/// arrived, and then holds the connection open without another byte until
+/// canceled.
+fn stallingPeer(listener: *std.Io.net.Server, io: std.Io, head: []const u8) void {
+    const s = listener.accept(io) catch return;
+    defer s.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rd = s.reader(io, &rbuf);
+    var wbuf: [256]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    rd.interface.fillMore() catch return;
+    w.interface.writeAll(head) catch return;
+    w.interface.flush() catch return;
+    // Nothing more is coming. The peer hanging up ends this early.
+    rd.interface.fillMore() catch {};
+}
+
+const StallingServer = struct {
+    listener: std.Io.net.Server,
+    future: std.Io.Future(void),
+    url_buf: [64]u8 = undefined,
+
+    /// In place: the peer task holds a pointer to `listener`.
+    fn start(self: *StallingServer, io: std.Io, head: []const u8) !void {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.listener = try addr.listen(io, .{ .reuse_address = true });
+        errdefer self.listener.deinit(io);
+        self.future = try io.concurrent(stallingPeer, .{ &self.listener, io, head });
+    }
+
+    fn url(self: *StallingServer) ![]const u8 {
+        const port = self.listener.socket.address.getPort();
+        return std.fmt.bufPrint(&self.url_buf, "http://127.0.0.1:{d}/", .{port});
+    }
+
+    fn stop(self: *StallingServer, io: std.Io) void {
+        self.future.cancel(io);
+        self.listener.deinit(io);
+    }
+};
+
+fn millisSince(io: std.Io, started: std.Io.Clock.Timestamp) i64 {
+    const ended = std.Io.Clock.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ended.raw.nanoseconds - started.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+test "Client: a response head that never arrives is cut off by ClientConfig.timeout" {
+    const io = std.testing.io;
+    var peer: StallingServer = undefined;
+    try peer.start(io, "");
+    defer peer.stop(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{
+        .timeout = .fromMilliseconds(150),
+    });
+    defer client.deinit();
+
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
+    const elapsed = millisSince(io, started);
+    try std.testing.expect(elapsed >= 150);
+    try std.testing.expect(elapsed < 3000);
+
+    // A request cut short leaves nothing behind to be reused.
+    try std.testing.expectEqual(0, client.pool.idle_len);
+}
+
+test "Client: FetchOptions.timeout replaces the client default" {
+    const io = std.testing.io;
+
+    { // no default, but a limit on this request
+        var peer: StallingServer = undefined;
+        try peer.start(io, "");
+        defer peer.stop(io);
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = null });
+        defer client.deinit();
+        try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{
+            .timeout = .{ .duration = .{ .raw = .fromMilliseconds(150), .clock = .awake } },
+        }));
+    }
+    { // a default, lifted for this request
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+        defer server.deinit();
+        server.router.get("/slow", struct {
+            fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+                try req.io.sleep(.fromMilliseconds(300), .awake);
+                res.body = "late";
+            }
+        }.handle);
+        var server_future = try io.concurrent(struct {
+            fn run(s: *dusty.Server(void)) !void {
+                try s.run();
+            }
+        }.run, .{&server});
+        defer server_future.cancel(io) catch {};
+        try server.waitReady(io);
+
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(100) });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/slow", .{server.address.ip.getPort()});
+
+        var response = try client.fetch(url, .{ .timeout = .none });
+        defer response.deinit();
+        try std.testing.expectEqualStrings("late", (try response.body()).?);
+    }
+}
+
+test "Client: the request deadline covers the body, unless it is streamed" {
+    const io = std.testing.io;
+    // Ten bytes promised, five delivered, and then silence.
+    const head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
+
+    { // fetch reads the body, so it is fetch that runs out of time
+        var peer: StallingServer = undefined;
+        try peer.start(io, head);
+        defer peer.stop(io);
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(150) });
+        defer client.deinit();
+
+        try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
+        try std.testing.expectEqual(0, client.pool.idle_len);
+    }
+    { // streamed: fetch returns at the head, and what follows is on the caller's time
+        var peer: StallingServer = undefined;
+        try peer.start(io, head);
+        defer peer.stop(io);
+        // Room for the head on a loaded runner, and well past by the time
+        // the body is read.
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(500) });
+        defer client.deinit();
+
+        var response = try client.fetch(try peer.url(), .{ .stream = true });
+        defer response.deinit();
+        try std.testing.expectEqual(.ok, response.status());
+
+        try io.sleep(.fromMilliseconds(800), .awake);
+        var buf: [64]u8 = undefined;
+        var reader = try response.reader(&buf);
+        try std.testing.expectEqualStrings("hello", try reader.interface.take(5));
+    }
+}
+
+test "Client: redirects share the request's budget" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    const Hops = struct {
+        fn first(req: *dusty.Request, res: *dusty.Response) !void {
+            try req.io.sleep(.fromMilliseconds(100), .awake);
+            res.status = .found;
+            try res.headers.put("Location", "/second");
+        }
+        fn second(req: *dusty.Request, res: *dusty.Response) !void {
+            try req.io.sleep(.fromMilliseconds(100), .awake);
+            res.body = "done";
+        }
+    };
+    server.router.get("/first", Hops.first);
+    server.router.get("/second", Hops.second);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/first", .{server.address.ip.getPort()});
+
+    // Each hop alone is within the limit; the two together are not.
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(150) });
+    defer client.deinit();
+    try std.testing.expectError(error.Timeout, client.fetch(url, .{}));
+
+    var patient = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(2000) });
+    defer patient.deinit();
+    var response = try patient.fetch(url, .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("done", (try response.body()).?);
+}
+
+fn expectRedirectFollowedWithoutDrain(comptime redirect_head: []const u8, config: dusty.ClientConfig) !void {
+    const io = std.testing.io;
+    var target: StallingServer = undefined;
+    try target.start(io, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone");
+    defer target.stop(io);
+
+    var head_buf: [256]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buf, redirect_head, .{try target.url()});
+    var redirector: StallingServer = undefined;
+    try redirector.start(io, head);
+    defer redirector.stop(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, config);
+    defer client.deinit();
+    var response = try client.fetch(try redirector.url(), .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("done", (try response.body()).?);
+}
+
+test "Client: a redirect body is not drained from a connection that won't be reused" {
+    // The redirect bodies never finish, so draining one runs into the timeout.
+    try expectRedirectFollowedWithoutDrain(
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nConnection: close\r\n\r\npartial",
+        .{ .timeout = .fromMilliseconds(2000) },
+    );
+    try expectRedirectFollowedWithoutDrain(
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nContent-Length: 100\r\n\r\npartial",
+        .{ .timeout = .fromMilliseconds(2000), .max_idle_connections = 0 },
+    );
+}
+
+test "Server: res.compress gzips buffered and streamed bodies for a client that accepts it" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    const Handlers = struct {
+        const line = "the quick brown fox jumps over the lazy dog\n";
+
+        fn buffered(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var w = res.writer();
+            for (0..100) |_| try w.interface.writeAll(line);
+            try w.end();
+        }
+
+        fn streamed(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var buf: [256]u8 = undefined;
+            var w = try res.stream(&buf);
+            for (0..50) |_| try w.interface.writeAll(line);
+            try w.interface.flush();
+            for (0..50) |_| try w.interface.writeAll(line);
+            try w.end();
+        }
+
+        fn events(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var buf: [256]u8 = undefined;
+            var stream = try res.startEventStream(&buf);
+            for (0..3) |_| try stream.send(line, .{ .event = "fox" });
+            try stream.body.end();
+        }
+
+        fn short(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            res.body = line;
+        }
+    };
+    server.router.get("/buffered", Handlers.buffered);
+    server.router.get("/streamed", Handlers.streamed);
+    server.router.get("/short", Handlers.short);
+    server.router.get("/events", Handlers.events);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn fetch(client: *dusty.Client, port: u16, path: []const u8, identity: bool, encoding: dusty.ContentEncoding, expected: []const u8) !void {
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+            var headers = try dusty.Headers.init(std.testing.allocator, 4);
+            defer headers.deinit(std.testing.allocator);
+            if (identity) try headers.put("Accept-Encoding", "identity");
+
+            var response = try client.fetch(url, .{ .headers = &headers });
+            defer response.deinit();
+            try std.testing.expectEqual(encoding, response.contentEncoding());
+            try std.testing.expectEqualStrings("Accept-Encoding", response.headers().get("Vary").?);
+            try std.testing.expectEqualStrings(expected, (try response.body()).?);
+        }
+
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            const port = s.address.ip.getPort();
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            const long = repeat(Handlers.line, 100);
+            try fetch(&client, port, "/buffered", false, .gzip, long);
+            try fetch(&client, port, "/streamed", false, .gzip, long);
+            try fetch(&client, port, "/short", false, .identity, Handlers.line);
+            const event = "event: fox\ndata: the quick brown fox jumps over the lazy dog\ndata: \n\n";
+            try fetch(&client, port, "/events", false, .gzip, repeat(event, 3));
+            try fetch(&client, port, "/buffered", true, .identity, long);
+            try fetch(&client, port, "/streamed", true, .identity, long);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+/// `s` repeated `n` times, for test fixtures. Zig 0.17 removed `**`.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        break :blk &final;
+    };
+}

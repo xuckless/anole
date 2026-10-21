@@ -9,6 +9,21 @@ The first release: one server core for REST, WebSockets and gRPC over
 HTTP/1.1, HTTP/2 and HTTP/3, with TLS, auth and observability, on Zig 0.17.0
 for macOS and Linux.
 
+### The HTTP core is Anole code
+
+- The HTTP/1.1 server, router, middleware, client, WebSocket and HTTP/2
+  engine, which came from lalinsky/dusty through Anole's fork, now live in
+  `src/http/core` (MIT, attributed in every file and in THIRD_PARTY_NOTICES).
+  Anole no longer fetches a `dusty` package. The public API is unchanged:
+  `anole.http` is the core, `anole.http.dusty_module` still names it.
+- Its tests run in `zig build test` (`zig build dusty-test` is gone; `zig
+  build core-test` runs them alone), on a certificate made at build time
+  instead of a committed key, and its fuzz targets run with Anole's under
+  `zig build test --fuzz`.
+- The fork's vendored nghttp2 1.69.0 copy is dropped (Anole always built its
+  own nghttp2), and llhttp is compiled once instead of once per feature
+  combination.
+
 ### Server
 
 - `anole.App` (`Server(void)` with `init(gpa, options)`) and `app.listen(":3000")`
