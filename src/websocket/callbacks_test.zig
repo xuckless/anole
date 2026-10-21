@@ -336,6 +336,24 @@ test "WebSocket callbacks: a busy socket keeps its task; one woken after a long 
     try std.testing.expect(parked_again);
 }
 
+test "WebSocket callbacks: with parking off, the socket waits on its task" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, .{ .timeout = .{ .idle_park = null } });
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/ws");
+    defer c.close(f.io);
+    try c.expectText("hello");
+    for (0..3) |_| {
+        try c.send(0x1, "again");
+        try c.expectText("again");
+        try f.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expectEqual(0, f.server.parkedConnections());
+}
+
 test "WebSocket callbacks: another task sends to a parked socket" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;

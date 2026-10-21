@@ -757,6 +757,9 @@ pub const Burst = struct {
     /// How long `waitInput` waits before it reports `.idle`; null when the
     /// connection cannot park.
     park_after: ?std.Io.Duration,
+    /// What tells `waitInput` that the park delay passed, while the run is
+    /// registered with its shelf (with `park_after`).
+    watch: park.Watch = .{},
     deadline: ?std.Io.Clock.Timestamp,
     /// The connection woke after a long park (`park.Shelf.long_park`):
     /// once it has had input, `waitInput` reports `.idle` as soon as
@@ -779,21 +782,32 @@ pub const Burst = struct {
     pub fn waitInput(self: *Burst) !Input {
         const r = self.connection.reader;
         if (r.bufferedLen() > 0) return .ready;
-        const after = self.park_after orelse return .ready;
+        if (self.park_after == null) {
+            r.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return .ready,
+                error.ReadFailed => return self.connection.getReadError() orelse error.Unexpected,
+            };
+            return .ready;
+        }
         if (self.repark and self.had_input and self.connection.parkable()) return .idle;
         self.had_input = true;
-        self.timer.set(self.io, .{ .duration = .{ .raw = after, .clock = .awake } });
-        defer self.armDeadline();
+        // No timer per wait: the shelf's driver ends a wait that lasts the
+        // park delay (`park.Watch`).
+        self.watch.begin();
         r.fillMore() catch |err| switch (err) {
-            error.EndOfStream => return .ready,
+            error.EndOfStream => {
+                _ = self.watch.end(false);
+                return .ready;
+            },
             error.ReadFailed => {
                 const e = self.connection.getReadError() orelse error.Unexpected;
-                if (e != error.Canceled or !self.timer.fired()) return e;
+                if (!self.watch.end(e == error.Canceled)) return e;
                 self.connection.clearReadError();
                 // Mid-record on TLS, say: the reads that follow wait.
                 return if (self.connection.parkable()) .idle else .ready;
             },
         };
+        _ = self.watch.end(false);
         return .ready;
     }
 
@@ -2040,6 +2054,9 @@ pub fn Server(comptime Ctx: type) type {
                 .repark = conn.parked.woke_from_long,
             };
             burst.armDeadline();
+            const shelf = if (burst.park_after == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null;
+            if (shelf) |s| s.watch(&burst.watch) else burst.park_after = null;
+            defer if (shelf) |s| s.unwatch(&burst.watch);
             return switch (try a.serve(a, &burst)) {
                 .close => .close,
                 .park => {

@@ -18,7 +18,10 @@
 //! down, so that their polls come back through the queue, where the driver
 //! closes them: in any order, and without canceling polls one by one, which
 //! costs a walk of the queue each. When the server stops (`stop`), the driver
-//! does the same with all of them, and ends once every poll is back.
+//! does the same with all of them, and ends once every poll is back. It also
+//! tells the tasks serving adopted connections (WebSockets with callbacks)
+//! when a wait for input has lasted the park delay (`Watch`), so that they
+//! need no timer per wait.
 //! Everything here happens on the shelf's executor, between tasks that do not
 //! yield while they touch it, so nothing takes a lock (the doorbell that
 //! `stop` rings is thread-safe).
@@ -35,9 +38,11 @@ const zio = @import("zio");
 pub const supported = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "CompletionQueue") and
     @hasDecl(zio, "ev") and @hasDecl(zio.ev, "NetPoll") and @hasDecl(zio.ev, "Async") and
     @hasDecl(zio, "Group") and @hasDecl(zio.Group, "spawnInto") and
-    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo");
+    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio, "currentTask");
 
 const NetPoll = if (supported) zio.ev.NetPoll else void;
+/// A zio task, as `zio.currentTask` returns it.
+const TaskPtr = if (supported) @typeInfo(@typeInfo(@TypeOf(zio.currentTask)).@"fn".return_type.?).optional.child else void;
 
 /// How often a shelf looks for parked connections past their deadline:
 /// the deadlines are kept to about this.
@@ -80,6 +85,67 @@ pub const Parked = struct {
         self.expiring = false;
         if (self.back) return self.vtable.close(self);
         if (comptime supported) zio.os.net.shutdown(self.poll.handle, .both) catch {};
+    }
+};
+
+/// Idle detection for a task that serves a connection and waits for its
+/// input many times over (an adopted connection, a WebSocket with
+/// callbacks), without a timer armed and cleared around every wait: the
+/// task marks its waits (`begin`, `end`) and is registered with its shelf
+/// for as long as it serves (`Shelf.watch`), and the shelf's driver, which
+/// looks at every registered task each half `Shelf.long_park`, ends a wait
+/// that has gone on for `long_park` (up to half as long again) the way a
+/// timer would, with an auto-cancel of the task's wait. A busy connection
+/// then pays two stores per wait, where a timer took a clock read, a lock
+/// and two operations on the executor's timer heap, whose cost grows with
+/// the number of sockets waiting.
+pub const Watch = struct {
+    node: std.DoublyLinkedList.Node = .{},
+    task: TaskPtr = undefined,
+    /// Bumped as each wait begins.
+    seq: u32 = 0,
+    waiting: bool = false,
+    /// What the driver last saw: the wait, and how many of its looks found
+    /// that same wait going on.
+    seen_seq: u32 = 0,
+    seen_count: u8 = 0,
+    /// The driver canceled the current wait, which the task's `delivered`
+    /// count was at.
+    poked: bool = false,
+    delivered: u7 = 0,
+
+    /// Before the task waits for input.
+    pub fn begin(self: *Watch) void {
+        self.seq +%= 1;
+        self.waiting = true;
+    }
+
+    /// After the wait returned, with `canceled` whether it failed with
+    /// `error.Canceled`: true when this watch ended the wait (the input has
+    /// been idle for the park delay), and the cancel is used up. A wait that
+    /// returned anyway takes back a cancel that came too late to end it, so
+    /// no later wait of the task's sees it.
+    pub fn end(self: *Watch, canceled: bool) bool {
+        self.waiting = false;
+        if (comptime !supported) return false;
+        if (!self.poked) return false;
+        self.poked = false;
+        if (canceled) return self.task.checkAutoCancel();
+        _ = self.task.retractAutoCancel(self.delivered);
+        return false;
+    }
+
+    /// From the driver, on the task's executor: cancels the task's wait.
+    fn poke(self: *Watch) void {
+        if (comptime !supported) return;
+        self.poked = true;
+        if (self.task.setCanceled(.auto)) |d| {
+            self.delivered = d;
+            self.task.wake();
+        } else {
+            // Canceled already (the server stops): nothing to take back.
+            self.poked = false;
+        }
     }
 };
 
@@ -131,6 +197,48 @@ pub const Shelf = struct {
     /// faults to make again. One that comes back sooner keeps its task, so
     /// a connection that turns busy pays for one extra park at most.
     long_park: std.Io.Duration,
+    /// The tasks serving adopted connections on this executor (`Watch`).
+    watches: std.DoublyLinkedList = .{},
+
+    /// Registers the calling task, on the shelf's executor, for idle
+    /// detection while it serves a connection: `unwatch` before it is done
+    /// with `w`.
+    pub fn watch(self: *Shelf, w: *Watch) void {
+        if (comptime !supported) return;
+        w.* = .{ .task = zio.currentTask().? };
+        const first = self.watches.first == null;
+        self.watches.append(&w.node);
+        // The driver looks at watches only while it has any.
+        if (first) self.bell.notify();
+    }
+
+    pub fn unwatch(self: *Shelf, w: *Watch) void {
+        if (comptime !supported) return;
+        self.watches.remove(&w.node);
+    }
+
+    /// How often the driver looks at the watches.
+    fn watchInterval(self: *const Shelf) std.Io.Duration {
+        return .fromNanoseconds(@max(self.long_park.nanoseconds >> 1, std.time.ns_per_ms));
+    }
+
+    /// The driver's look at the watches: ends each wait seen going on at
+    /// the last two looks too.
+    fn lookAtWatches(self: *Shelf) void {
+        if (self.closed) return;
+        var it = self.watches.first;
+        while (it) |n| : (it = n.next) {
+            const w: *Watch = @alignCast(@fieldParentPtr("node", n));
+            if (!w.waiting or w.seen_seq != w.seq) {
+                w.seen_seq = w.seq;
+                w.seen_count = 0;
+                continue;
+            }
+            if (w.poked) continue;
+            w.seen_count +|= 1;
+            if (w.seen_count >= 2) w.poke();
+        }
+    }
 
     /// Parks `p`, its socket `handle` watched for input. False when it
     /// cannot be (the shelf is closed, or its queue refuses): the caller
@@ -218,8 +326,9 @@ pub const Shelf = struct {
 
 /// A shelf's driver, on its executor: starts a task for each parked
 /// connection whose socket becomes readable, expires those past their
-/// deadline every `sweep_interval`, and once the shelf stops, expires the
-/// rest and ends when all of them are closed.
+/// deadline every `sweep_interval`, ends the waits of watched tasks that
+/// have gone on for the park delay (`Watch`), and once the shelf stops,
+/// expires the rest and ends when all of them are closed.
 pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
     if (comptime !supported) return;
     defer shelf.done.set(io);
@@ -229,16 +338,28 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
         return;
     };
     var next_sweep = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = sweep_interval, .clock = .awake });
+    var next_look: ?std.Io.Clock.Timestamp = null;
     while (!shelf.closed or shelf.count.load(.monotonic) > 0) {
-        const left = std.Io.Clock.Timestamp.now(io, .awake).durationTo(next_sweep).raw.nanoseconds;
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        // Here rather than on a timeout only, which a steady stream of
+        // wakes would never let happen.
+        if (now.compare(.gte, next_sweep)) {
+            shelf.sweep(now.raw);
+            next_sweep = now.addDuration(.{ .raw = sweep_interval, .clock = .awake });
+        }
+        if (shelf.watches.first == null) {
+            next_look = null;
+        } else if (next_look == null) {
+            next_look = now.addDuration(.{ .raw = shelf.watchInterval(), .clock = .awake });
+        } else if (now.compare(.gte, next_look.?)) {
+            shelf.lookAtWatches();
+            next_look = now.addDuration(.{ .raw = shelf.watchInterval(), .clock = .awake });
+        }
+        const until = if (next_look) |l| (if (l.compare(.lt, next_sweep)) l else next_sweep) else next_sweep;
+        const left = now.durationTo(until).raw.nanoseconds;
         const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@max(0, left)), .clock = .awake } };
         const c = shelf.cq.waitTimeout(.fromStd(timeout)) catch |err| switch (err) {
-            error.Timeout => {
-                const now = std.Io.Clock.Timestamp.now(io, .awake);
-                shelf.sweep(now.raw);
-                next_sweep = now.addDuration(.{ .raw = sweep_interval, .clock = .awake });
-                continue;
-            },
+            error.Timeout => continue,
             // Canceled rather than stopped: zio has canceled every poll and
             // closed the queue, and what comes back is closed here.
             error.Canceled => {
