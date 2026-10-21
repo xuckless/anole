@@ -10,9 +10,16 @@
 //! for its stateless resets and address validation tokens through a pipe
 //! of its own (`ANOLE_H3_SECRET_FD`): see `Server.run` for what happens to
 //! the QUIC connections.
+//!
+//! Unix only: Windows has no fd inheritance by number, fork or SIGUSR2.
+//! There `supported` is false, nothing is ever inherited, and `spawn` fails
+//! with `error.Unsupported` (the server never calls it there).
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
+
+/// False on Windows (see above).
+pub const supported = builtin.os.tag != .windows;
 
 pub const Fd = std.posix.fd_t;
 /// Room for `max_tcp_listeners` TCP listeners and an HTTP/3 socket per
@@ -58,6 +65,7 @@ pub const Inherited = struct {
 /// The sockets passed in by systemd or a predecessor: `LISTEN_PID` must
 /// be this process, `LISTEN_FDS` how many, starting at fd 3.
 pub fn inherited(environ: std.process.Environ) ?Inherited {
+    if (comptime !supported) return null;
     const out = parseListenEnv(
         environ.getPosix("LISTEN_PID"),
         environ.getPosix("LISTEN_FDS"),
@@ -72,6 +80,7 @@ pub fn inherited(environ: std.process.Environ) ?Inherited {
 /// What `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` say to the process
 /// `self_pid`; the names are slices of `names_text`.
 fn parseListenEnv(pid_text: ?[]const u8, fds_text: ?[]const u8, names_text: ?[]const u8, self_pid: c.pid_t) ?Inherited {
+    if (comptime !supported) return null;
     const pid = std.fmt.parseInt(c.pid_t, pid_text orelse return null, 10) catch return null;
     if (pid != self_pid) return null;
     const count = std.fmt.parseInt(usize, fds_text orelse return null, 10) catch return null;
@@ -90,6 +99,7 @@ fn parseListenEnv(pid_text: ?[]const u8, fds_text: ?[]const u8, names_text: ?[]c
 /// (`inherited` is not null), so a stale variable cannot name some other
 /// file.
 pub fn inheritedSecret(environ: std.process.Environ) ?[32]u8 {
+    if (comptime !supported) return null;
     const text = environ.getPosix("ANOLE_H3_SECRET_FD") orelse return null;
     const fd = std.fmt.parseInt(Fd, text, 10) catch return null;
     defer _ = c.close(fd);
@@ -105,11 +115,13 @@ pub fn inheritedSecret(environ: std.process.Environ) ?[32]u8 {
 
 /// Whether a predecessor started this process and waits for it to serve.
 pub fn isSuccessor(environ: std.process.Environ) bool {
+    if (comptime !supported) return false;
     return environ.getPosix("ANOLE_READY_FD") != null;
 }
 
 /// Tells the predecessor that this process is serving, if it is waiting.
 pub fn notifyReady(environ: std.process.Environ) void {
+    if (comptime !supported) return;
     const text = environ.getPosix("ANOLE_READY_FD") orelse return;
     const fd = std.fmt.parseInt(Fd, text, 10) catch return;
     _ = c.write(fd, "1", 1);
@@ -125,6 +137,7 @@ pub const Successor = struct {
     /// Waits up to `timeout_ms` for the successor to say it is serving,
     /// without holding the executor's thread.
     pub fn waitReady(self: Successor, io: std.Io, timeout_ms: u32) bool {
+        if (comptime !supported) unreachable; // `spawn` never made one
         defer _ = c.close(self.ready_fd);
         var waited: u32 = 0;
         while (waited < timeout_ms) : (waited += 50) {
@@ -141,6 +154,7 @@ pub const Successor = struct {
     /// Stops a successor that never reported serving, so two servers do
     /// not share the sockets, and reaps it.
     pub fn abandon(self: Successor) void {
+        if (comptime !supported) unreachable; // `spawn` never made one
         _ = c.kill(self.pid, c.SIG.KILL);
         var status: c_int = 0;
         _ = c.waitpid(self.pid, &status, 0);
@@ -150,6 +164,7 @@ pub const Successor = struct {
 /// Starts a new copy of this program, with the same arguments and
 /// environment, holding `listeners`, and `h3_secret` if given.
 pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minimal, listeners: []const Listener, h3_secret: ?*const [32]u8) !Successor {
+    if (comptime !supported) return error.Unsupported;
     if (listeners.len == 0 or listeners.len > max_listeners) return error.TooManyListeners;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -255,6 +270,7 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
 }
 
 test "Inherited.find: by name, else by position" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     var named: Inherited = .{ .count = 2 };
     named.fds[0] = 3;
     named.fds[1] = 4;
@@ -272,6 +288,7 @@ test "Inherited.find: by name, else by position" {
 }
 
 test "Inherited.findAll: every socket of a name in order, else the rest by position" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     var named: Inherited = .{ .count = 5 };
     const names = [_][]const u8{ "http", "h3", "https", "h3", "h3" };
     for (0..5) |i| {
@@ -294,6 +311,7 @@ test "Inherited.findAll: every socket of a name in order, else the rest by posit
 }
 
 test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     var p: [2]Fd = undefined;
     try std.testing.expectEqual(@as(c_int, 0), c.pipe(&p));
     defer _ = c.close(p[1]);
@@ -316,6 +334,7 @@ test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
 }
 
 test "fuzz: LISTEN_PID, LISTEN_FDS and LISTEN_FDNAMES" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     try @import("fuzz.zig").bytes(struct {
         fn check(input: []const u8) !void {
             // The three values, newline-separated; a missing one is unset.

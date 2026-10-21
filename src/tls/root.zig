@@ -651,6 +651,7 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
 }
 
 test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
     var h = try Https.init();
     defer h.deinit();
     const io = h.io;
@@ -710,6 +711,7 @@ test "TLS hello: mutual TLS names the acceptable CAs in the CertificateRequest" 
 }
 
 test "TLS hello: a connection the server closes ends with close_notify" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
     var h = try Https.init();
     defer h.deinit();
     const io = h.io;
@@ -770,6 +772,7 @@ test "TLS hello: an RSA-4096 handshake fits the default coroutine stacks on both
 }
 
 test "TLS hello: a returning client resumes its session with a ticket" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
     var h = try Https.init();
     defer h.deinit();
     const io = h.io;
@@ -826,6 +829,7 @@ test "TLS hello: a returning client resumes its session with a ticket" {
 }
 
 test "TLS hello: a certificate reload serves the new certificate, and tickets from before it still resume" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
     var h = try Https.init();
     defer h.deinit();
     const io = h.io;

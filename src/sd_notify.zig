@@ -20,15 +20,21 @@
 //!                                    SIGTERM, `stop`), never when handing
 //!                                    over: under `NotifyAccess=all` it would
 //!                                    stop the whole service.
+//!
+//! Windows has no systemd: every call does nothing there (`supported`).
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
 
 const log = std.log.scoped(.anole);
 
+/// False on Windows, where there is no systemd to tell.
+pub const supported = builtin.os.tag != .windows;
+
 /// Sends `state` to the socket in `NOTIFY_SOCKET`, if there is one. Best
 /// effort: a failure is logged, never returned, as with `sd_notify`.
 pub fn notify(environ: std.process.Environ, state: []const u8) void {
+    if (comptime !supported) return;
     const path = environ.getPosix("NOTIFY_SOCKET") orelse return;
     send(path, state) catch |err| log.warn("sd_notify to {s}: {t}", .{ path, err });
 }
@@ -38,6 +44,7 @@ pub const SendError = error{ InvalidNotifySocket, Unsupported, SocketFailed, Sen
 /// One datagram holding `state` to the AF_UNIX datagram socket at `path`
 /// ('@' first: Linux's abstract namespace).
 pub fn send(path: []const u8, state: []const u8) SendError!void {
+    if (comptime !supported) return error.Unsupported;
     var addr: c.sockaddr.un = std.mem.zeroes(c.sockaddr.un);
     addr.family = c.AF.UNIX;
     const abstract = path.len > 0 and path[0] == '@';
@@ -75,6 +82,7 @@ pub const max_message_len = 64;
 
 /// CLOCK_MONOTONIC in microseconds.
 pub fn monotonicUsec() u64 {
+    if (comptime !supported) return 0;
     var ts: c.timespec = undefined;
     if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.us_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_us;
@@ -95,6 +103,7 @@ pub fn stopping(environ: std.process.Environ) void {
 }
 
 test "sd_notify: messages" {
+    if (comptime !supported) return error.SkipZigTest; // no systemd on Windows
     var buf: [max_message_len]u8 = undefined;
     try std.testing.expectEqualStrings("READY=1", formatReady(&buf, null));
     try std.testing.expectEqualStrings("MAINPID=4242\nREADY=1", formatReady(&buf, 4242));
@@ -135,6 +144,7 @@ const Listener = struct {
 };
 
 test "sd_notify: a datagram to NOTIFY_SOCKET, by path and (Linux) by abstract name" {
+    if (comptime !supported) return error.SkipZigTest; // no systemd on Windows
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // The test's temporary directory is under the working directory.

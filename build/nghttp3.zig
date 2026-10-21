@@ -132,7 +132,14 @@ pub fn configureC(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void
             mod.addCMacro("HAVE_DECL_BE64TOH", "0");
             mod.addCMacro("HAVE_DECL_BSWAP_64", "0");
         },
-        else => @panic("nghttp3: unsupported target OS (Anole supports Linux and macOS)"),
+        .windows => {
+            // nghttp3's Windows paths test WIN32 (see ngtcp2.zig).
+            mod.addCMacro("WIN32", "1");
+            mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+            mod.addCMacro("HAVE_DECL_BE64TOH", "0");
+            mod.addCMacro("HAVE_DECL_BSWAP_64", "0");
+        },
+        else => @panic("nghttp3: unsupported target OS (Anole supports Linux, macOS and Windows)"),
     }
     if (target.result.cpu.arch.endian() == .big) mod.addCMacro("WORDS_BIGENDIAN", "1");
 }

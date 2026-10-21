@@ -39,7 +39,7 @@ const Ctx = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     const cert = args.next() orelse return error.Usage;
     const key = args.next() orelse return error.Usage;

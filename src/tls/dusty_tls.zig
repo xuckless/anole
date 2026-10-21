@@ -32,6 +32,7 @@
 //! The handshake configuration is shed once the handshake is done
 //! (`SSL_set_shed_handshake_config`).
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("anole_boringssl_c");
 
 const log = std.log.scoped(.anole_tls);
@@ -897,6 +898,16 @@ const TicketKeys = struct {
 };
 
 fn monotonicSeconds() i64 {
+    if (builtin.os.tag == .windows) {
+        // No clock_gettime in std.c there: the performance counter, as
+        // std.Io's awake clock reads it.
+        const w = std.os.windows;
+        var qpc: w.LARGE_INTEGER = undefined;
+        var qpf: w.LARGE_INTEGER = undefined;
+        _ = w.ntdll.RtlQueryPerformanceCounter(&qpc);
+        _ = w.ntdll.RtlQueryPerformanceFrequency(&qpf);
+        return @divTrunc(qpc, @max(qpf, 1));
+    }
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @intCast(ts.sec);

@@ -142,5 +142,6 @@ test "HTTP/1.1 smoke: GET /users/:id over loopback on zio" {
 }
 
 test {
-    _ = @import("park_test.zig");
+    // Idle parking is off on Windows (the core's server/park.zig).
+    if (@import("builtin").os.tag != .windows) _ = @import("park_test.zig");
 }

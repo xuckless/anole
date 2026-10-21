@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
     app.use(anole.observe.AccessLog.init(.{})); // a line per request on stderr
     app.use(anole.middleware.Cors.init(.{})); // any origin, preflights answered
     routes(&app);
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     try app.listen(args.next() orelse ":3000");
 }

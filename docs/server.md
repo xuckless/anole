@@ -884,6 +884,38 @@ listener that is not built fails with `error.TlsNotBuilt` or
 .https = if (anole.features.tls != .none) .{ .port = 8443, .cert = .dev_self_signed } else null,
 ```
 
+## Windows
+
+Windows (x86_64) is a development target: Anole builds there with every
+feature, runs, and passes its tests on CI, so an app can be written and
+tested on a Windows machine. Serve production from Linux. What Windows
+lacks, and does instead:
+
+- **One listening socket per listener**, shared by the accept loops, as on
+  macOS: no per-core `SO_REUSEPORT` sockets. Listeners bind without
+  `SO_REUSEADDR`, which on Windows would let another socket take the same
+  port; the bind itself fails with `error.AddressInUse` on a port in use.
+- **HTTP/3 on one UDP socket**, without connection-ID steering, UDP batching
+  (GSO/GRO) or control messages: no ECN, and replies from a listener on a
+  wildcard address leave from the address Windows picks rather than the one
+  the client wrote to (no `IP_PKTINFO`).
+- **Ctrl-C drains** the server as SIGINT does, and closing the console window
+  as SIGTERM does. There is no SIGUSR2 restart and no SIGHUP: reload
+  certificates with `reloadCertificates()` or `setCertificate()`.
+- **No listener hand-off, socket activation or `sd_notify`**: with `process`
+  set, the server still reads its environment from it, and nothing else
+  changes.
+- **No idle parking**: an idle connection keeps its task and stack, so idle
+  connections cost more memory than on Linux and macOS.
+- **No open-file limit** to raise: `server.max_connections` defaults to
+  10,000.
+- **BoringSSL without its assembly** (written for NASM, which Zig does not
+  assemble), so TLS is slower.
+- Variables such as `DATABASE_URL` and `OTEL_SERVICE_NAME` are read from the
+  C library's environment.
+
+To serve from a Windows machine, run the Linux build in WSL2 or Docker.
+
 ## Full control with `anole.http`
 
 `app.router` and `app.server` are the HTTP core's router and server

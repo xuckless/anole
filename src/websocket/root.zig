@@ -887,7 +887,8 @@ pub const Rooms = struct {
 test {
     _ = @import("rooms_test.zig");
     _ = @import("h1_test.zig");
-    _ = @import("callbacks_test.zig");
+    // About parked callback sockets; idle parking is off on Windows.
+    if (@import("builtin").os.tag != .windows) _ = @import("callbacks_test.zig");
     _ = @import("h2_fuzz_test.zig");
     if (features.http2) _ = @import("h2_test.zig");
     if (features.compression) _ = @import("deflate.zig");

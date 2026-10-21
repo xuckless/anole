@@ -717,7 +717,12 @@ pub const Listener = @import("config.zig").Listener;
 /// `reuse_address`, and not for an inherited socket (`Listener.fd`), which
 /// is already bound; call it before opening a socket of your own that is to
 /// be handed over.
+///
+/// Nothing on Windows: listeners there bind without SO_REUSEADDR (which on
+/// Windows lets a second socket take a port that is in use), so the bind
+/// itself fails on a port in use.
 pub fn checkAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void {
+    if (comptime builtin.os.tag == .windows) return;
     if (address.getPort() == 0) return;
     const posix = std.posix;
     const sys = posix.system;
@@ -1454,7 +1459,9 @@ pub fn Server(comptime Ctx: type) type {
                     if (cfg.reuse_address) try checkAddressFree(ip);
                     break :blk try ip.listen(self.io, .{
                         .kernel_backlog = kernel_backlog,
-                        .reuse_address = cfg.reuse_address,
+                        // Windows' SO_REUSEADDR would let another socket
+                        // bind the port too (`checkAddressFree`).
+                        .reuse_address = cfg.reuse_address and builtin.os.tag != .windows,
                     });
                 },
                 .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = kernel_backlog }),
@@ -1486,6 +1493,9 @@ pub fn Server(comptime Ctx: type) type {
         /// Wraps a listening socket this process did not open. Under zio,
         /// which drives its own sockets non-blocking, it is made so too.
         fn inheritSocket(io: std.Io, fd: std.posix.fd_t, configured: Address) !std.Io.net.Server {
+            // Inherited sockets (`Listener.fd`) come from hand-off and
+            // socket activation, which are Unix only.
+            if (comptime builtin.os.tag == .windows) return error.InheritedSocketUnsupported;
             const c = std.c;
             if (placement.executorCount(io) != null) {
                 const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
@@ -2910,6 +2920,7 @@ fn fuzzConnection(input: []const u8) !void {
 }
 
 test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
     const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     // A client's SETTINGS (empty), then HEADERS on stream 1 with END_STREAM
     // and END_HEADERS: :method GET, :scheme http, :path /, :authority

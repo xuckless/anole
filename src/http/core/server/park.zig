@@ -28,14 +28,15 @@
 //!
 //! Only on zio with pinned executors: elsewhere `supported` is false, or the
 //! drivers cannot be placed (`spawnOn` fails), and connections keep their
-//! task while idle, as before.
+//! task while idle, as before. Not on Windows, a development target, where
+//! idle connections keep their task too.
 
 const std = @import("std");
 const zio = @import("zio");
 
 /// The `zio` in use has the completion queue and placement: not the core's
-/// test stub.
-pub const supported = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "CompletionQueue") and
+/// test stub. Not Windows.
+pub const supported = @import("builtin").os.tag != .windows and !@hasDecl(zio, "is_stub") and @hasDecl(zio, "CompletionQueue") and
     @hasDecl(zio, "ev") and @hasDecl(zio.ev, "NetPoll") and @hasDecl(zio.ev, "Async") and
     @hasDecl(zio, "Group") and @hasDecl(zio.Group, "spawnInto") and
     @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio, "currentTask");

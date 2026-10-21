@@ -76,7 +76,10 @@ pub fn library(
     const flags: []const []const u8 = switch (target.result.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => &([_][]const u8{ c99, staticlib, "-D_DARWIN_C_SOURCE" } ++ have_posix),
         .linux => &([_][]const u8{ c99, staticlib, "-D_GNU_SOURCE" } ++ have_posix),
-        else => @panic("nghttp2: unsupported target OS (Anole supports Linux and macOS)"),
+        // nghttp2 picks its Windows paths (GetTickCount64, no arpa/inet.h)
+        // from _WIN32 itself.
+        .windows => &.{ c99, staticlib, "-DWIN32_LEAN_AND_MEAN" },
+        else => @panic("nghttp2: unsupported target OS (Anole supports Linux, macOS and Windows)"),
     };
 
     lib.root_module.addIncludePath(upstream.path("lib"));

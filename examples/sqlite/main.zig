@@ -79,7 +79,7 @@ pub fn routes(app: *anole.Server(App)) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     const path = args.next() orelse "todos.db";
     const address = args.next() orelse ":3000";

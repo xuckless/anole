@@ -33,6 +33,15 @@ const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
+/// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
+const unix_signals = builtin.os.tag != .windows;
+
+/// `name` in `environ`; on Windows, where `Environ` holds UTF-16 with
+/// nothing to slice, in the C library's environment.
+fn envVar(environ: std.process.Environ, name: []const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) return @import("db/url.zig").env(null, name);
+    return environ.getPosix(name);
+}
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
 const early_data = @import("early_data.zig");
@@ -825,7 +834,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // spreads connections over the executors.
             // Hand-off needs one socket per listener, which we open (or
             // inherit) ourselves.
-            const handoff_mode = opts.process != null;
+            // Not on Windows (`handoff.supported`): there `process` only
+            // carries the environment, and dusty binds as usual.
+            const handoff_mode = opts.process != null and handoff.supported;
             if (handoff_mode and specs.len > handoff.max_tcp_listeners) return error.TooManyListeners;
             const per_core_sockets = builtin.os.tag == .linux and !handoff_mode;
             const inherited = if (opts.process) |p| handoff.inherited(p.environ) else null;
@@ -1649,8 +1660,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const env = if (self.process) |p| p.environ else null;
             const e = try self.arena.allocator().create(observe.trace.Exporter);
             e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), self.client(), .{
-                .endpoint = opts.endpoint orelse (if (env) |v| v.getPosix("OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
-                .service_name = opts.service_name orelse (if (env) |v| v.getPosix("OTEL_SERVICE_NAME") else null) orelse "anole",
+                .endpoint = opts.endpoint orelse (if (env) |v| envVar(v, "OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
+                .service_name = opts.service_name orelse (if (env) |v| envVar(v, "OTEL_SERVICE_NAME") else null) orelse "anole",
                 .sample_all = opts.sample_all,
                 .exclude = opts.exclude,
                 .batch_size = opts.batch_size,
@@ -1906,10 +1917,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             try sel.concurrent(.served, serve, .{self.server});
             if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
+            // Windows has neither SIGUSR2 nor SIGHUP (zio maps Ctrl-C to
+            // `.interrupt` and closing the console to `.terminate`): no
+            // restart, and certificates reload by `reloadCertificates` only.
             const restartable = self.process != null and self.held.len > 0;
-            if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
+            if (comptime unix_signals) if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
             // SIGHUP reloads the certificate, where there is one.
-            if (self.certs.len > 0) try sel.concurrent(.reload, reloadOnHangup, .{self});
+            if (comptime unix_signals) if (self.certs.len > 0) try sel.concurrent(.reload, reloadOnHangup, .{self});
             // Once serving: systemd hears (`NOTIFY_SOCKET`), and a successor
             // tells the predecessor that started it.
             var notify: ?std.Io.Future(void) = if (self.process) |p|
@@ -1924,6 +1938,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (done == .reload) continue;
                 if (done != .restart) break done;
                 // SIGUSR2: start the successor; drain once it serves.
+                if (comptime !unix_signals) unreachable;
                 if (self.restart()) break done;
                 try sel.concurrent(.restart, waitForSignal, .{.user2});
             };
@@ -2002,7 +2017,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // A successor names itself the main process before its
             // predecessor starts to exit.
             const successor = handoff.isSuccessor(process.environ);
-            sd_notify.ready(process.environ, if (successor) std.c.getpid() else null);
+            const main_pid: ?i64 = if (comptime handoff.supported) (if (successor) std.c.getpid() else null) else null;
+            sd_notify.ready(process.environ, main_pid);
             handoff.notifyReady(process.environ);
         }
 
@@ -2402,18 +2418,23 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
 
             // SIGHUP, once `run` listens for it.
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[2].cert });
-            var armed = false;
-            for (0..500) |_| {
-                var current: std.posix.Sigaction = undefined;
-                std.posix.sigaction(.HUP, null, &current);
-                if (current.handler.handler != std.posix.SIG.DFL) {
-                    armed = true;
-                    break;
+            if (comptime unix_signals) {
+                var armed = false;
+                for (0..500) |_| {
+                    var current: std.posix.Sigaction = undefined;
+                    std.posix.sigaction(.HUP, null, &current);
+                    if (current.handler.handler != std.posix.SIG.DFL) {
+                        armed = true;
+                        break;
+                    }
+                    try io_.sleep(.fromMilliseconds(10), .awake);
                 }
-                try io_.sleep(.fromMilliseconds(10), .awake);
+                try std.testing.expect(armed);
+                _ = std.c.kill(std.c.getpid(), std.c.SIG.HUP);
+            } else {
+                // No SIGHUP on Windows: the call it makes.
+                try a.reloadCertificates();
             }
-            try std.testing.expect(armed);
-            _ = std.c.kill(std.c.getpid(), std.c.SIG.HUP);
             const switched = for (0..300) |_| {
                 if (ReloadCheck.h1(io_, port, dir, "ca2.pem")) |_| break true else |_| {}
                 try io_.sleep(.fromMilliseconds(10), .awake);

@@ -18,6 +18,11 @@ pub fn library(
         .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
     });
     lib.root_module.addCSourceFiles(.{ .root = upstream.path("."), .files = sources, .flags = &.{ "-std=c99", "-D_GNU_SOURCE" } });
+    if (target.result.os.tag == .windows) {
+        // net.c's socket calls go through hiredis's Winsock shims.
+        lib.root_module.addCSourceFiles(.{ .root = upstream.path("."), .files = &.{"sockcompat.c"}, .flags = &.{"-std=c99"} });
+        lib.root_module.linkSystemLibrary("ws2_32", .{});
+    }
     inline for (.{ "hiredis.h", "read.h", "sds.h", "alloc.h" }) |h| lib.installHeader(upstream.path(h), "hiredis/" ++ h);
     return lib;
 }

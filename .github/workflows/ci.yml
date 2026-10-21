@@ -85,21 +85,72 @@ jobs:
           grep -F "invalid Anole feature flags" <<<"$out"
 
   cross:
-    name: cross (aarch64-linux-gnu, compile and link only)
+    name: cross (${{ matrix.target }}, compile and link only)
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64-windows: every preset and edge combination, which the
+        # windows job (default profile only) does not build.
+        target: [aarch64-linux-gnu, x86_64-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.17.0
-          cache-key: cross-aarch64-linux-gnu
+          cache-key: cross-${{ matrix.target }}
       # Zig fetches git and tarball dependencies itself on a cold cache;
       # the runners' network fails now and then (NameServerFailure,
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build every test binary and the full example
-        run: zig build test-flags full -Dtarget=aarch64-linux-gnu --summary all
+        run: zig build test-flags full -Dtarget=${{ matrix.target }} --summary all
+
+  windows:
+    name: windows (development target; default profile)
+    runs-on: windows-latest
+    # Windows is a development target ("works on Windows, fast on Linux"):
+    # the core tests run, the examples build and one serves a request. The
+    # Unix-only parts (per-core SO_REUSEPORT sockets, HTTP/3 steering and
+    # UDP batching, listener hand-off and SIGUSR2, LISTEN_FDS, sd_notify,
+    # idle parking) are compiled out there and their tests skipped.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: windows
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Unit and smoke tests (default profile, every feature on)
+        timeout-minutes: 60
+        run: zig build test --summary all
+      - name: Build and install the examples
+        timeout-minutes: 20
+        run: zig build --summary all
+      # The smallest example serves one request; Ctrl-C would drain it,
+      # but a runner has no console to send one to, so it is killed.
+      - name: examples/hello answers a request
+        timeout-minutes: 5
+        run: |
+          ./zig-out/bin/hello.exe > hello.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 50); do
+            if body=$(curl -fsS http://127.0.0.1:3000/ 2>/dev/null); then break; fi
+            sleep 0.2
+          done
+          kill $pid || true
+          cat hello.log
+          echo "response: $body"
+          test -n "$body"
 
   h2spec:
     name: h2spec (HTTP/2 conformance, h2c and TLS)

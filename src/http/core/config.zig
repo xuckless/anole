@@ -146,6 +146,8 @@ pub const Listener = struct {
     /// to that silently.
     kernel_backlog: ?u31 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
+    /// Ignored on Windows, where SO_REUSEADDR would let another socket
+    /// bind the same port.
     reuse_address: bool = true,
     /// Serve cleartext HTTP/2 to a client that opens with the HTTP/2
     /// connection preface ("prior knowledge", RFC 9113 §3.3), alongside
