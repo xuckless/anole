@@ -275,3 +275,26 @@ jobs:
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Tests with a live server
         run: zig build test -Dredis-test-port=6379 --summary all
+
+  postgres:
+    name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["postgres:17"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: postgres
+      # Zig fetches git dependencies itself on a cold cache, and its DNS
+      # lookups fail now and then on the runners (NameServerFailure).
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # A service container takes no files, and the TLS run needs the
+      # server's certificate: the script starts the server itself, with a
+      # CA made for the run.
+      - name: Tests against a live server
+        run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh
