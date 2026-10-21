@@ -658,6 +658,7 @@ the typed calls, which read it into your type:
 | `acquire(req)` | one connection for several calls, given back with `release()` |
 | `subscribe(req, channels)`, `psubscribe` | a pub/sub connection of its own |
 | `with(.{ .timeout })` | the same calls, bounded |
+| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
 
 The arguments are a tuple: strings as they are (binary-safe), numbers in
 decimal, `bool` as 1 or 0, enums by name, null left out, slices and
@@ -675,6 +676,21 @@ For what most apps do there are helpers: `get`, `set` (`.ttl`, `.nx`, `.xx`,
 `sismember`; `zadd`, `zincrBy`, `zscore`, `zrem`, `zrange`,
 `zrangeWithScores` (a leaderboard: `zrangeWithScores(req, "board", 0, 9, .{ .rev = true })`);
 `publish`. Everything else is `command` or a typed call.
+
+`.coalesce` and `.cache` apply to `one`, `optional` and `all` and the
+read helpers (`get`, `hget`, `hgetAll`, `lrange`, `smembers`,
+`sismember`, `zscore`, `zrange`, `zrangeWithScores`) when the command
+only reads: `GET`, `MGET`, `HGETALL`, `ZRANGE` and the other names in
+`anole.redis.read_commands`. Every other command, `command`, pipelines,
+pub/sub and calls on an `acquire`d connection run as they are, whatever
+the options. A nil reply is a reply, and kept.
+
+```zig
+const profile = try app.cache.with(.{ .cache = .{ .ttl = .fromSeconds(30), .tag = "profiles" } }).hgetAll(Profile, req, key);
+// After a write:
+_ = try app.cache.hset(req, key, changed);
+app.cache.cache.invalidate(.{ .tag = "profiles" });
+```
 
 ### Pipelines and transactions
 
@@ -781,7 +797,8 @@ Two opt-in options on the reads (`one`, `optional`, `all`) of every
 connector, and on MongoDB's `find`, `findOne`, `findOptional`, `distinct`,
 `estimatedDocumentCount`, `countDocuments` and `aggregate` (a pipeline
 written as a tuple of stages that ends in neither `$out` nor `$merge`;
-any other runs unshared). Nothing is shared or cached unless a call asks: a call without
+any other runs unshared), and on Redis's read commands and read helpers
+([above](#redis-and-valkey)). Nothing is shared or cached unless a call asks: a call without
 them is the plain call, with nothing added (no key, no lookup, no
 allocation).
 
@@ -816,7 +833,9 @@ result from `optional` or `all` is a result and is kept.
 **Invalidation**: `app.db.cache.invalidate(.all)`, `.invalidate(.{ .tag =
 "posts" })` for the results cached with that tag, or
 `.invalidateQuery(sql, .{args})` for one statement's results (for
-MongoDB, invalidate by tag: `app.mongo.cache.invalidate(.{ .tag = "users" })`). It reaches
+MongoDB, invalidate by tag: `app.mongo.cache.invalidate(.{ .tag = "users" })`;
+for Redis, the command's name, then the rest:
+`app.cache.cache.invalidateQuery("GET", .{key})`). It reaches
 every executor at once, including a statement still running: a result read
 before the invalidation is not kept, and a caller arriving after it does
 not join that statement.
@@ -832,7 +851,8 @@ unless that write invalidated.
 Bounds are per connector, split between the executors, and least recently
 used results go first: `.cache = .{ .max_entries = 4096, .max_bytes = 32 << 20 }`
 in the connector's options (`app.postgres(.{ .cache = ... })`,
-`app.sqlite(.{ .path = ..., .cache = ... })`, `app.mongodb(.{ .cache = ... })`). A result larger than an
+`app.sqlite(.{ .path = ..., .cache = ... })`, `app.mongodb(.{ .cache = ... })`,
+`app.redis(.{ .cache = ... })`). A result larger than an
 executor's share is not kept. With `app.metrics`, each cache reports
 `anole_cache_hits_total`, `anole_cache_misses_total`,
 `anole_cache_coalesced_total`, `anole_cache_stores_total`,

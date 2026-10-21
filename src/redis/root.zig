@@ -61,6 +61,16 @@
 //!   `with(.{ .timeout })` is `GatewayTimeout` (504). `Options.errors`
 //!   moves them. Only a pipeline's own replies are checked: errors inside
 //!   an EXEC reply come back as `.err` replies.
+//! - Caching: `with(.{ .coalesce = true })` and `with(.{ .cache = .{ .ttl,
+//!   .tag } })` (`anole.db.QueryCache`) share or keep the reads made with
+//!   `one`, `optional` and `all` and the read helpers (`get`, `hget`,
+//!   `hgetAll`, `lrange`, `smembers`, `sismember`, `zscore`, `zrange`,
+//!   `zrangeWithScores`), for read commands only (`GET`, `MGET`,
+//!   `HGETALL`, `ZRANGE` and the like; `read_commands`). Other commands,
+//!   `command`, pipelines, pub/sub and calls on an `acquire`d connection
+//!   run as they are. Drop kept replies with `cache.invalidate(.{ .tag })`,
+//!   or `cache.invalidateQuery("GET", .{key})` (the name, then the rest of
+//!   the command).
 //! - Cancellation: a call canceled in flight (the request's deadline, an
 //!   HTTP/2 reset, `with(.{ .timeout })`) closes its connection, whose
 //!   reply may still be on its way.
@@ -140,6 +150,9 @@ pub const Options = struct {
     /// Where `REDIS_URL` comes from; null: the process's environment
     /// (`app.redis` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
+    /// The bounds of the replies kept for reads with `.cache`
+    /// (`anole.db.QueryOptions`).
+    cache: db.CacheOptions = .{},
 
     pub const Tls = struct {
         /// What the server's certificate must chain to; null: the URL's
@@ -393,6 +406,9 @@ pub const Client = struct {
     idle_timeout: ?Duration,
     ping_timeout: Duration,
     connect_at_start: bool,
+    /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
+    /// kept replies: `app.cache.cache.invalidate(.{ .tag = "profiles" })`.
+    cache: db.QueryCache,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
@@ -416,7 +432,9 @@ pub const Client = struct {
             .idle_timeout = opts.idle_timeout,
             .ping_timeout = opts.ping_timeout,
             .connect_at_start = opts.connect_at_start,
+            .cache = try .init(gpa, io, .redis, opts.name, opts.cache),
         };
+        errdefer self.cache.deinit();
         errdefer self.arena.deinit();
         const a = self.arena.allocator();
         const s = try Settings.resolve(a, opts);
@@ -470,6 +488,8 @@ pub const Client = struct {
     /// `deinit` does it then).
     pub fn deinit(self: *Client) void {
         const gpa = self.gpa;
+        // First: a read still running for the cache holds a connection.
+        self.cache.deinit();
         for (self.pools.pools) |*p| {
             for (p.idle[0..p.idle_len]) |conn| conn.close();
             if (p.open > p.idle_len) log.warn("redis \"{s}\": {d} connections were still taken at deinit", .{ self.name, p.open - p.idle_len });
@@ -487,6 +507,7 @@ pub const Client = struct {
     /// executor and fails if one cannot.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.redis, self.name, registry, tracer);
+        try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
         if (!self.connect_at_start) return;
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
@@ -502,7 +523,8 @@ pub const Client = struct {
         }
     }
 
-    /// The calls with `opts` (of which Redis takes `timeout`):
+    /// The calls with `opts` (of which Redis takes `timeout`, `coalesce`
+    /// and `cache`, the last two for reads only; see the top of this file):
     /// `app.cache.with(.{ .timeout = .fromMilliseconds(200) }).get(req, key)`.
     pub fn with(self: *Client, opts: db.QueryOptions) Query {
         return .{ .client = self, .opts = opts };
@@ -870,20 +892,39 @@ pub const Query = struct {
         return self.client.call(c, self.opts.timeout, null, Reply, .reply, args);
     }
 
+    // The reads go through the cache, which shares them when `opts` asks
+    // (`coalesce`, `cache`) and the command only reads.
+
     pub fn one(self: Query, comptime T: type, c: anytype, args: anytype) Error!T {
-        return self.client.call(c, self.opts.timeout, null, T, .one, args);
+        return self.read(T, .one, c, args);
     }
 
     pub fn optional(self: Query, comptime T: type, c: anytype, args: anytype) Error!?T {
-        return self.client.call(c, self.opts.timeout, null, T, .optional, args);
+        return self.read(T, .optional, c, args);
     }
 
     pub fn all(self: Query, comptime T: type, c: anytype, args: anytype) Error![]T {
-        return self.client.call(c, self.opts.timeout, null, T, .all, args);
+        return self.read(T, .all, c, args);
     }
 
     pub fn pipeline(self: Query, c: anytype, commands: anytype) Error![]Reply {
         return self.client.call(c, self.opts.timeout, null, Reply, .replies, commands);
+    }
+
+    /// Through the cache when `opts` asks for sharing and `args` is a
+    /// tuple naming a read command (`read_commands`); the cache's key is
+    /// the name in capitals, then the rest of the command. Else the plain
+    /// call.
+    fn read(self: Query, comptime T: type, comptime mode: Mode, c: anytype, args: anytype) Error!Out(T, mode) {
+        if (comptime !splittable(@TypeOf(args))) return self.plain(T, mode, c, args);
+        if (!self.opts.coalesce and self.opts.cache == null) return self.plain(T, mode, c, args);
+        var buf: [max_read_name]u8 = undefined;
+        const name = readCommand(&buf, args[0]) orelse return self.plain(T, mode, c, args);
+        return self.client.cache.read(Out(T, mode), c, self.opts, name, rest(args), Read(T, mode){ .query = self });
+    }
+
+    fn plain(self: Query, comptime T: type, comptime mode: Mode, c: anytype, args: anytype) Error!Out(T, mode) {
+        return self.client.call(c, self.opts.timeout, null, T, mode, args);
     }
 
     pub const get = Commands(Query).get;
@@ -912,6 +953,98 @@ pub const Query = struct {
     pub const zrangeWithScores = Commands(Query).zrangeWithScores;
     pub const publish = Commands(Query).publish;
 };
+
+/// A read as `anole.db.QueryCache` makes it: the plain call of `name`
+/// with the rest of the command, with the caller's context or a shared
+/// call's own.
+fn Read(comptime T: type, comptime mode: Mode) type {
+    return struct {
+        query: Query,
+
+        pub fn run(r: @This(), c: anytype, name: []const u8, args: anytype) Error!Out(T, mode) {
+            return r.query.plain(T, mode, c, .{ name, args });
+        }
+    };
+}
+
+/// The commands whose replies `coalesce` and `cache` may share: those
+/// that only read and answer the same for the same data (not
+/// `SRANDMEMBER`, `SCAN` or scripts).
+pub const read_commands = std.StaticStringMap(void).initComptime(.{
+    .{"GET"},         .{"MGET"},        .{"GETRANGE"},         .{"STRLEN"},
+    .{"EXISTS"},      .{"TYPE"},        .{"TTL"},              .{"PTTL"},
+    .{"EXPIRETIME"},  .{"PEXPIRETIME"}, .{"HGET"},             .{"HMGET"},
+    .{"HGETALL"},     .{"HKEYS"},       .{"HVALS"},            .{"HLEN"},
+    .{"HEXISTS"},     .{"HSTRLEN"},     .{"LRANGE"},           .{"LINDEX"},
+    .{"LLEN"},        .{"LPOS"},        .{"SMEMBERS"},         .{"SISMEMBER"},
+    .{"SMISMEMBER"},  .{"SCARD"},       .{"SINTER"},           .{"SUNION"},
+    .{"SDIFF"},       .{"SINTERCARD"},  .{"ZRANGE"},           .{"ZRANGEBYSCORE"},
+    .{"ZRANGEBYLEX"}, .{"ZREVRANGE"},   .{"ZREVRANGEBYSCORE"}, .{"ZREVRANGEBYLEX"},
+    .{"ZSCORE"},      .{"ZMSCORE"},     .{"ZCARD"},            .{"ZCOUNT"},
+    .{"ZLEXCOUNT"},   .{"ZRANK"},       .{"ZREVRANK"},         .{"ZINTER"},
+    .{"ZUNION"},      .{"ZDIFF"},       .{"ZINTERCARD"},       .{"XRANGE"},
+    .{"XREVRANGE"},   .{"XLEN"},        .{"GEOPOS"},           .{"GEODIST"},
+    .{"GEOHASH"},     .{"GEOSEARCH"},   .{"BITCOUNT"},         .{"BITPOS"},
+    .{"GETBIT"},      .{"SORT_RO"},     .{"DBSIZE"},
+});
+
+const max_read_name = 24;
+
+/// Whether `A` is a tuple whose first item is a string: a command
+/// `read` can split into its name and the rest.
+fn splittable(comptime A: type) bool {
+    const info = @typeInfo(A);
+    if (info != .@"struct" or !info.@"struct".is_tuple or info.@"struct".field_types.len == 0) return false;
+    return isString(info.@"struct".field_types[0]);
+}
+
+fn isString(comptime S: type) bool {
+    return switch (@typeInfo(S)) {
+        .pointer => |p| switch (p.size) {
+            .slice => p.child == u8,
+            .one => switch (@typeInfo(p.child)) {
+                .array => |a| a.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// `name` in capitals, in `buf`, when it is one of `read_commands`.
+fn readCommand(buf: *[max_read_name]u8, name: anytype) ?[]const u8 {
+    const s: []const u8 = name;
+    if (s.len > buf.len) return null;
+    const upper = std.ascii.upperString(buf[0..s.len], s);
+    return if (read_commands.has(upper)) upper else null;
+}
+
+/// A command's items after its name, as a tuple whose items can be kept
+/// (literals made runtime values: integers as `i64`, floats as `f64`).
+fn Rest(comptime A: type) type {
+    const all_types = @typeInfo(A).@"struct".field_types;
+    var types: [all_types.len - 1]type = undefined;
+    for (all_types[1..], &types) |F, *R| R.* = switch (@typeInfo(F)) {
+        .comptime_int => i64,
+        .comptime_float => f64,
+        .null => ?u8,
+        .enum_literal => []const u8,
+        else => F,
+    };
+    const final = types;
+    return @Tuple(&final);
+}
+
+fn rest(args: anytype) Rest(@TypeOf(args)) {
+    const A = @TypeOf(args);
+    var out: Rest(A) = undefined;
+    inline for (@typeInfo(A).@"struct".field_types[1..], 1..) |F, i| out[i - 1] = switch (@typeInfo(F)) {
+        .enum_literal => @tagName(args[i]),
+        else => args[i],
+    };
+    return out;
+}
 
 /// A connection taken with `Client.acquire`: the same calls, all on it,
 /// until `release`.
@@ -1223,11 +1356,11 @@ fn Commands(comptime Self: type) type {
         /// `zrangeWithScores(req, "board", 0, 9, .{ .rev = true })`.
         pub fn zrangeWithScores(self: Self, c: anytype, key: []const u8, start: i64, stop: i64, opts: RangeOptions) Error![]Scored {
             const rev: ?[]const u8 = if (opts.rev) "REV" else null;
-            const flat = try self.all(Reply, c, .{ "ZRANGE", key, start, stop, rev, "WITHSCORES" });
+            const flat = try self.all([]const u8, c, .{ "ZRANGE", key, start, stop, rev, "WITHSCORES" });
             const out = try c.arena.alloc(Scored, flat.len / 2);
             for (out, 0..) |*o, i| o.* = .{
-                .member = flat[2 * i].text() orelse "",
-                .score = std.fmt.parseFloat(f64, flat[2 * i + 1].text() orelse "") catch std.math.nan(f64),
+                .member = flat[2 * i],
+                .score = std.fmt.parseFloat(f64, flat[2 * i + 1]) catch std.math.nan(f64),
             };
             return out;
         }
@@ -1840,6 +1973,9 @@ test "redis: replies into types" {
 const Fake = struct {
     listener: std.Io.net.Server,
     accepted: std.atomic.Value(u32) = .init(0),
+    /// GETs and INCRs answered; a GET of "shared" waits 50 ms first.
+    gets: std.atomic.Value(u32) = .init(0),
+    incrs: std.atomic.Value(u32) = .init(0),
 
     fn port(self: *Fake) u16 {
         return self.listener.socket.address.getPort();
@@ -1851,11 +1987,11 @@ const Fake = struct {
         while (true) {
             const conn = try self.listener.accept(io);
             _ = self.accepted.fetchAdd(1, .monotonic);
-            group.concurrent(io, session, .{ conn, io }) catch conn.close(io);
+            group.concurrent(io, session, .{ self, conn, io }) catch conn.close(io);
         }
     }
 
-    fn session(conn: std.Io.net.Stream, io: std.Io) void {
+    fn session(self: *Fake, conn: std.Io.net.Stream, io: std.Io) void {
         defer conn.close(io);
         var rbuf: [4096]u8 = undefined;
         var wbuf: [4096]u8 = undefined;
@@ -1878,6 +2014,11 @@ const Fake = struct {
             }
             const cmd = words[0][0..lens[0]];
             const eql = std.mem.eql;
+            if (eql(u8, cmd, "GET")) {
+                _ = self.gets.fetchAdd(1, .monotonic);
+                if (eql(u8, words[1][0..lens[1]], "shared")) io.sleep(.fromMilliseconds(50), .awake) catch return;
+            }
+            if (eql(u8, cmd, "INCR")) _ = self.incrs.fetchAdd(1, .monotonic);
             const reply: []const u8 = if (eql(u8, cmd, "SET") or eql(u8, cmd, "MULTI"))
                 "+OK\r\n"
             else if (eql(u8, cmd, "GET"))
@@ -2042,4 +2183,90 @@ test "redis: a pool per executor" {
         try testing.expectEqual(@as(usize, 1), p.open);
     }
     try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
+}
+
+test "redis: coalesced and cached reads, invalidation" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const client = try Client.init(gpa, io, .{ .url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()}), .environ = .empty });
+    defer client.deinit();
+
+    // 8 callers on each of 2 executors: one GET per executor.
+    const Worker = struct {
+        fn run(q: Query, io_: std.Io, bad: *std.atomic.Value(u32)) void {
+            var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena_state.deinit();
+            var c: db.Ctx = .{ .io = io_, .arena = arena_state.allocator() };
+            const v = q.get(&c, "shared") catch null;
+            if (v == null or !std.mem.eql(u8, v.?, "value")) _ = bad.fetchAdd(1, .monotonic);
+        }
+    };
+    var bad: std.atomic.Value(u32) = .init(0);
+    {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..16) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 2 }, Worker.run, .{ client.with(.{ .coalesce = true }), io, &bad });
+        try group.await(io);
+    }
+    try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), fake.gets.load(.monotonic));
+    try testing.expectEqual(@as(u64, 14), client.cache.stats().coalesced);
+
+    // Cached: one GET per executor until invalidated by its tag.
+    const cached = client.with(.{ .cache = .{ .ttl = .fromSeconds(60), .tag = "values" } });
+    fake.gets.store(0, .monotonic);
+    for (0..2) |_| {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..8) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 2 }, Worker.run, .{ cached, io, &bad });
+        try group.await(io);
+    }
+    try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), fake.gets.load(.monotonic));
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    // The command's name in any case is one key; another key is another.
+    _ = try cached.optional([]const u8, &c, .{ "get", "shared" });
+    try testing.expectEqual(@as(u32, 2), fake.gets.load(.monotonic));
+    _ = try cached.get(&c, "k");
+    _ = try cached.get(&c, "k");
+    try testing.expectEqual(@as(u32, 3), fake.gets.load(.monotonic));
+    // nil is a reply, and kept.
+    try testing.expect(try cached.get(&c, "missing") == null);
+    try testing.expect(try cached.get(&c, "missing") == null);
+    try testing.expectEqual(@as(u32, 4), fake.gets.load(.monotonic));
+    // A struct from HGETALL, kept as one.
+    const Profile = struct { name: []const u8, visits: u32 };
+    _ = try cached.hgetAll(Profile, &c, "u");
+    try testing.expectEqualStrings("Ada", (try cached.hgetAll(Profile, &c, "u")).name);
+
+    client.cache.invalidate(.{ .tag = "values" });
+    _ = try cached.get(&c, "k");
+    try testing.expectEqual(@as(u32, 5), fake.gets.load(.monotonic));
+    client.cache.invalidateQuery("GET", .{"k"});
+    _ = try cached.get(&c, "k");
+    try testing.expectEqual(@as(u32, 6), fake.gets.load(.monotonic));
+
+    // Writes, `command`, pipelines and acquired connections never share.
+    for (0..3) |_| _ = try cached.incr(&c, "n");
+    try testing.expectEqual(@as(u32, 3), fake.incrs.load(.monotonic));
+    _ = try cached.command(&c, .{ "GET", "k" });
+    _ = try cached.pipeline(&c, .{.{ "GET", "k" }});
+    var conn = try client.acquire(&c);
+    _ = try conn.get(&c, "k");
+    conn.release();
+    _ = try client.get(&c, "k");
+    try testing.expectEqual(@as(u32, 10), fake.gets.load(.monotonic));
 }
