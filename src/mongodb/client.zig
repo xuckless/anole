@@ -788,7 +788,12 @@ pub const Client = struct {
                     };
                     if (op.server == null) x.server = self.select(io, deadline) catch |err| return switch (err) {
                         error.Canceled => error.Canceled,
-                        else => c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = switch (err) {
+                        // The call's own timeout came first: a 504, as when
+                        // the deadline cancels it anywhere else.
+                        else => if (err == error.ServerSelectionTimeout and past(io, deadline))
+                            c.fail(self.error_map, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout waiting for a server", .table = op.collection })
+                        else
+                            c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = switch (err) {
                             error.IncompatibleServer => "the server's wire version is outside the client's",
                             else => "no server to send the command to (server selection timed out)",
                         }, .table = op.collection }),
@@ -796,7 +801,7 @@ pub const Client = struct {
                     const server = x.server;
                     const connection = self.acquire(server, io, deadline) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
-                        error.PoolTimeout => return c.fail(self.error_map, .{ .system = .mongodb, .class = .unavailable, .message = "no pooled connection free in time", .table = op.collection }),
+                        error.PoolTimeout => return c.fail(self.error_map, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .message = "no pooled connection free in time", .table = op.collection }),
                         else => {
                             // A failed handshake or authentication: the
                             // server is marked Unknown and its pools cleared.
@@ -912,6 +917,12 @@ pub const Client = struct {
         return connection.roundTrip(&m);
     }
 };
+
+/// `deadline` is set and has passed.
+fn past(io: std.Io, deadline: ?std.Io.Clock.Timestamp) bool {
+    const d = deadline orelse return false;
+    return !std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, d);
+}
 
 fn mapBuildError(err: anyerror) error{ OutOfMemory, DocumentTooLarge, InvalidDocument } {
     return switch (err) {
