@@ -598,8 +598,8 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// How much unread input is thrown away before hanging up on the peer,
 /// and how long that is given: a peer that has read the answer hangs up
 /// within a round trip, and the request deadline may be off.
-const linger_limit: usize = 64 * 1024;
-const linger_timeout: std.Io.Duration = .fromSeconds(1);
+pub const linger_limit: usize = 64 * 1024;
+pub const linger_timeout: std.Io.Duration = .fromSeconds(1);
 
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++

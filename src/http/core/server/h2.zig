@@ -37,6 +37,8 @@ const build_options = @import("build_options");
 const c = @import("nghttp2");
 const http = @import("../http.zig");
 const Connection = @import("../server.zig").Connection;
+const linger_limit = @import("../server.zig").linger_limit;
+const linger_timeout = @import("../server.zig").linger_timeout;
 const Listener = @import("../config.zig").Listener;
 const ServerConfig = @import("../config.zig").ServerConfig;
 const Request = @import("../request.zig").Request;
@@ -189,6 +191,10 @@ pub fn Engine(comptime Ctx: type) type {
             inline_ok: bool = false,
             /// The reader is done; the writer sends what is left and exits.
             closing: bool = false,
+            /// The session is over and the writer has shut the send side
+            /// (`shutSend`): what the peer still sends is not for the
+            /// session, only for the lingering close to throw away.
+            send_shut: bool = false,
             /// A GOAWAY went out because the server is draining.
             goaway_sent: bool = false,
             /// The drain's GOAWAY notice went out and the final one is not
@@ -540,17 +546,24 @@ pub fn Engine(comptime Ctx: type) type {
             try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
 
             var reader_failed = false;
-            readerLoop(&conn, &group) catch |err| switch (err) {
+            // Whether the peer's side may still be open, with input the
+            // session will not read: the session ended first (a GOAWAY
+            // either way, or a protocol error).
+            var linger = false;
+            if (readerLoop(&conn, &group)) |end| {
+                linger = end == .done;
+            } else |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
                     reader_failed = true;
                     if (Connection.isPeerGone(err)) {
                         log.debug("HTTP/2 connection closed by peer: {}", .{err});
                     } else {
+                        linger = true;
                         log.info("HTTP/2 connection error: {}", .{err});
                     }
                 },
-            };
+            }
 
             // Let the writer send what the session still has (a GOAWAY after
             // a protocol error, the last responses), then stop. No more
@@ -577,12 +590,69 @@ pub fn Engine(comptime Ctx: type) type {
             group.await(conn.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
             };
+            if (linger) try lingeringClose(&conn);
         }
+
+        /// Hangs up on a peer whose side is still open once the session is
+        /// over, so the peer still gets the last frames. Closing with input
+        /// unread makes the kernel send a reset instead of a FIN, and a
+        /// reset can make the peer throw away the GOAWAY it has not read
+        /// yet; a peer that sent a GOAWAY may also still send a PING
+        /// (h2spec 3.8, 7). So, as HTTP/1.x's `lingeringClose`: close_notify
+        /// under TLS and the send side shut (the writer did both if it saw
+        /// the session end), then what the peer sends is thrown away until
+        /// it hangs up, `linger_timeout` passes, or `linger_limit` bytes.
+        /// Skipped where the timer cannot bound the reads. The engine's
+        /// tasks have ended, so this is the only reader and writer.
+        fn lingeringClose(conn: *Conn) std.Io.Cancelable!void {
+            var timer: Timer = .init(null);
+            if (!timer.canBound()) return;
+            if (!shutSend(conn)) return;
+            timer.set(conn.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            defer timer.clear(conn.io);
+            _ = conn.connection.reader.discardShort(linger_limit) catch {
+                // The peer hanging up is the end this waits for, and any
+                // other failure has been reported by the reader already.
+                // The deadline arrives as a cancel, and stays one.
+                if (conn.connection.getReadError()) |cause| if (cause == error.Canceled) return error.Canceled;
+            };
+        }
+
+        /// Ends the server's side of the connection, once: close_notify
+        /// under TLS (bounded by `linger_timeout`: a peer that stopped
+        /// reading must not hold the task on it), then the send side shut,
+        /// so the peer reads a clean end after the last frame. Only from
+        /// the side that writes: the writer while it runs, the connection's
+        /// task after. Whether the peer may still be there to read from.
+        fn shutSend(conn: *Conn) bool {
+            {
+                conn.lock();
+                defer conn.unlock();
+                if (conn.send_shut) return true;
+                conn.send_shut = true;
+            }
+            {
+                var timer: Timer = .init(null);
+                if (timer.canBound()) timer.set(conn.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+                defer timer.clear(conn.io);
+                conn.connection.closeNotify();
+            }
+            conn.connection.stream.shutdown(conn.io, .send) catch |err| switch (err) {
+                // Already gone: nothing left to throw away.
+                error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return false,
+                else => {},
+            };
+            return true;
+        }
+
+        /// How the reader ended: the peer ended its side (`eof`), or the
+        /// session did, with the peer's side still open (`done`).
+        const ReaderEnd = enum { eof, done };
 
         /// Reads the connection and feeds the session until the peer is
         /// done or the session wants nothing more. Holds the keepalive
         /// deadline while no stream is open.
-        fn readerLoop(conn: *Conn, group: *std.Io.Group) !void {
+        fn readerLoop(conn: *Conn, group: *std.Io.Group) !ReaderEnd {
             const reader = conn.connection.reader;
             var timer: Timer = .init(null);
             defer timer.clear(conn.io);
@@ -592,6 +662,8 @@ pub fn Engine(comptime Ctx: type) type {
                     const consumed = consumed: {
                         conn.lock();
                         defer conn.unlock();
+                        // The writer closed the session's side already.
+                        if (conn.send_shut) return .done;
                         conn.group = group;
                         defer conn.group = null;
                         const rv = c.nghttp2_session_mem_recv2(conn.session, buffered.ptr, buffered.len);
@@ -611,10 +683,10 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.kickWriter();
 
                     conn.lock();
-                    const done = c.nghttp2_session_want_read(conn.session) == 0 and
-                        c.nghttp2_session_want_write(conn.session) == 0;
+                    const done = conn.send_shut or (c.nghttp2_session_want_read(conn.session) == 0 and
+                        c.nghttp2_session_want_write(conn.session) == 0);
                     conn.unlock();
-                    if (done) return;
+                    if (done) return .done;
                     continue;
                 }
 
@@ -628,7 +700,7 @@ pub fn Engine(comptime Ctx: type) type {
                 } else timer.clear(conn.io);
 
                 reader.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => return,
+                    error.EndOfStream => return .eof,
                     error.ReadFailed => return conn.connection.getReadError() orelse error.Unexpected,
                 };
             }
@@ -708,9 +780,9 @@ pub fn Engine(comptime Ctx: type) type {
                     continue;
                 }
                 // The session is over (a GOAWAY went out, for a protocol
-                // error or after the last stream of a closing session) and
-                // wants neither to read nor to write: close the connection,
-                // which also ends the reader's wait (RFC 9113 §5.4.1).
+                // error or after the last stream of a closing session, or
+                // came in with no stream open) and wants neither to read
+                // nor to write: close the connection (RFC 9113 §5.4.1).
                 conn.lock();
                 const finished = c.nghttp2_session_want_read(conn.session) == 0 and
                     c.nghttp2_session_want_write(conn.session) == 0;
@@ -728,8 +800,8 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 conn.unlock();
                 if (finished) {
-                    conn.connection.stream.shutdown(conn.io, .both) catch {};
-                    return;
+                    _ = shutSend(conn);
+                    return awaitReader(conn);
                 }
                 if (closing and !handlers_running) return;
                 // Nothing to send: the spill's memory goes back while the
@@ -750,6 +822,27 @@ pub fn Engine(comptime Ctx: type) type {
                     continue;
                 }
                 try conn.io.futexWait(u32, &conn.write_gen.raw, gen);
+            }
+        }
+
+        /// After the writer shut the send side: the peer, seeing the end,
+        /// hangs up, which ends the reader's wait; then the lingering close
+        /// takes over. A peer that stays has `linger_timeout`, then the
+        /// receive side is shut too, which ends the wait regardless.
+        fn awaitReader(conn: *Conn) std.Io.Cancelable!void {
+            const deadline = (std.Io.Timeout{ .duration = .{ .raw = linger_timeout, .clock = .awake } }).toDeadline(conn.io);
+            const at = deadline.toTimestamp(conn.io).?;
+            while (true) {
+                const gen = conn.write_gen.load(.acquire);
+                conn.lock();
+                const closing = conn.closing;
+                conn.unlock();
+                if (closing) return;
+                if (std.Io.Clock.Timestamp.now(conn.io, at.clock).compare(.gte, at)) {
+                    conn.connection.stream.shutdown(conn.io, .both) catch {};
+                    return;
+                }
+                try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, deadline);
             }
         }
 
