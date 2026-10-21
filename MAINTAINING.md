@@ -240,7 +240,11 @@ by hand.
 
 ## Cutting a release
 
-1. Update CHANGELOG.md: turn "Unreleased" into the version and date.
+1. Update CHANGELOG.md: turn "Unreleased" into the version and date. Set
+   the same version in build.zig.zon's `.version` and in the MongoDB
+   client's handshake metadata (`driver_version` in
+   src/mongodb/connection.zig), and point the install snippets (README.md,
+   docs/getting-started.md) at the new tag.
 2. Make sure CI is green on the commit, including the `consumer` job, which
    builds a fresh project that adds Anole with `zig fetch --save`.
 3. Tag it `vX.Y.Z` and push the tag. Users then add it with

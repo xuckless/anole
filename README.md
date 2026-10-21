@@ -73,7 +73,8 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>`.
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.1.0`
+   (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
 3. `zig build run`, then `curl localhost:3000/`.
@@ -245,13 +246,16 @@ Constraints:
   `-Dtls=none` and `-Dhttp3=true` is an error.
 
 In code, the chosen flags are `anole.features`. A minimal build of
-Hello, World is about 1.1 MB; everything on is about 5 MB.
+Hello, World is about 1.3 MB; everything on is about 6 MB.
 
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>
+zig fetch --save git+https://github.com/xuckless/anole#v0.1.0
 ```
+
+Any later tag (see the [releases](https://github.com/xuckless/anole/releases))
+or a commit works the same way.
 
 A complete `build.zig`, with gRPC code generated from a `.proto` as part of
 `zig build` (no extra step, nothing to commit):

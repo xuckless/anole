@@ -3,11 +3,11 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## 0.1.0 (unreleased, draft)
+## 0.1.0 (2026-10-21)
 
-The first release: one server core for REST, WebSockets and gRPC over
-HTTP/1.1, HTTP/2 and HTTP/3, with TLS, auth and observability, on Zig 0.17.0
-for macOS and Linux.
+The first release: one server core for REST, WebSockets, gRPC and
+WebTransport over HTTP/1.1, HTTP/2 and HTTP/3, with TLS, auth, database
+connectors and observability, on Zig 0.17 for macOS and Linux.
 
 ### The HTTP core is Anole code
 
@@ -112,7 +112,7 @@ for macOS and Linux.
   per core, connections never leave the core that accepted them), the
   listeners, SIGINT/SIGTERM handling and a graceful drain with a hard
   deadline.
-- HTTP/1.1 through a fork of dusty: a segment-trie router with path parameters
+- HTTP/1.1 on the HTTP core: a segment-trie router with path parameters
   and wildcards, nested groups, middleware, keep-alive and pipelining,
   per-phase timeouts and body limits, static files with ranges, ETags and
   precompressed variants, and no allocation per request on a warm
@@ -128,7 +128,8 @@ for macOS and Linux.
   `Alt-Svc`, Retry, stateless reset, QUIC v2, ECN, PKTINFO, GSO and GRO on
   Linux, per-request timeouts, a GOAWAY drain and mutual TLS. The QUIC interop runner
   passes every server case it was given against ngtcp2's and quic-go's
-  clients.
+  clients. Breaking: `http3.idle_timeout_ms` is `http3.idle_timeout`, a
+  `std.Io.Duration` (30 s by default), as the HTTP/3 client's is.
 - HTTP/3 0-RTT, opt-in (`http3.early_data`), after RFC 8470: GET, HEAD and
   OPTIONS from early data run at once, marked `Early-Data: 1`; other methods
   wait for the handshake, which a replay never completes.
@@ -345,9 +346,10 @@ for macOS and Linux.
 
 ### Clients
 
-- Outbound HTTP/1.1 and HTTPS (dusty's client on BoringSSL), an HTTP/2 client
-  and an HTTP/3 client, usable from handlers through `req.io`. dusty's client
-  speaks HTTP/2 too when a server picks it (`ClientConfig.http2 = true`).
+- Outbound HTTP/1.1 and HTTPS (the HTTP core's client on BoringSSL), an
+  HTTP/2 client and an HTTP/3 client, usable from handlers through `req.io`.
+  The HTTP core's client speaks HTTP/2 too when a server picks it
+  (`ClientConfig.http2 = true`).
 - One set of TLS options for all three: the system trust store by default
   (loaded once), a CA file, directory or PEM in memory, client certificates
   for mutual TLS from files or memory, and
@@ -366,7 +368,7 @@ for macOS and Linux.
 - Breaking: their `tls.root_ca` bundle is now `tls.ca` (an
   `anole.http.TlsCa`, the system store by default, where it trusted nothing
   before); `tls.certificate = .{ .cert_pem, .key_pem }` is
-  `tls.client_certificate`, dusty's shape (`.pem = .{ .cert, .key }` or
+  `tls.client_certificate`, the HTTP core's shape (`.pem = .{ .cert, .key }` or
   `cert_path`/`key_path`); the HTTP/3 client's `handshake_timeout_ms` is
   `connect_timeout`.
 - The HTTP/3 client resumes sessions from an `anole.h3.SessionCache`, sends
@@ -525,8 +527,8 @@ for macOS and Linux.
   (`-Dprofile=minimal|web|full`); what is off is neither downloaded nor
   compiled. `web` has PostgreSQL and SQLite; `full` adds MongoDB and
   Redis.
-- Release binaries of examples/full on x86_64 Linux: 5.0 MB with
-  everything, 1.1 MB minimal. Brotli adds about 0.8 MB (its encoder and the
+- Release binaries of examples/full on x86_64 Linux (loaded sections,
+  `tools/binary_size.py`): 6.1 MB with everything, 1.3 MB minimal. Brotli adds about 0.8 MB (its encoder and the
   122 KB dictionary with its lookup tables), so `-Dbrotli=false` is the
   first flag to drop for a smaller binary that still compresses.
 - The public surface (what Zig's autodoc shows from `anole`) is the API
@@ -548,6 +550,12 @@ for macOS and Linux.
 - Guides for the server, routing, WebSockets, WebTransport, gRPC, clients,
   databases, auth and observability, with every Zig snippet compiled
   against the API.
+- A docs site, https://xuckless.github.io/anole/, built from docs/ with an
+  API reference at /api/ (`zig build docs`, Zig's autodoc of the `anole`
+  module, from doc comments on the public API), and a GitHub wiki kept in
+  sync with docs/.
+- SECURITY.md (private reports through GitHub's advisories) and issue
+  templates.
 - Examples, each with `zig build run-<name>`: `hello` (the smallest
   server), `rest` (a JSON CRUD API behind an API-key middleware, checked
   by tests/rest_test.zig), `websocket`, `grpc`, `auth`, `clients`,
@@ -559,8 +567,8 @@ for macOS and Linux.
 
 ### Quality
 
-- CI on Linux and macOS: unit tests for every flag combination, dusty's own
-  test suite on Anole's TLS and C libraries, h2spec, Autobahn, gRPC interop,
+- CI on Linux and macOS: unit tests for every flag combination, the HTTP
+  core's own test suite on Anole's TLS and C libraries, h2spec, Autobahn, gRPC interop,
   HTTP/3 (WebTransport and RFC 9220 included) against aioquic, the QUIC
   interop runner and its WebTransport mode, fuzzing of the parsers
   and shim boundaries (HTTP/1.1 requests whole and in pieces, a whole
@@ -589,5 +597,9 @@ for macOS and Linux.
 - MongoDB: transactions, change streams, `mongodb+srv://`, read
   preferences other than `primary`, `loadBalanced`, compression, and the
   request's own deadline sent as `maxTimeMS`. Redis Cluster and Sentinel.
-- Benchmarks on a dedicated Linux machine (the first results, on a Mac, are
-  in the README).
+- Windows (#47): until it is a development target, use WSL2 or Docker.
+- Independent benchmark results: Anole's HttpArena entry follows this
+  release.
+
+Known limitations and planned work are tracked in GitHub Issues:
+https://github.com/xuckless/anole/issues
