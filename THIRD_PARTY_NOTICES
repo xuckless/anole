@@ -13,7 +13,7 @@ attribution header and are listed in part B; that includes the HTTP core
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
 `-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
-ngtcp2 and nghttp3.
+ngtcp2 and nghttp3; `-Dpostgres` adds pg.zig and buffer.zig.
 
 
 A. Fetched packages
@@ -112,6 +112,24 @@ hiredis (RESP reader and command formatter)
             Sanfilippo, (c) 2010-2011 Pieter Noordhuis, and contributors
   Source:   https://github.com/redis/hiredis (tag archive v1.5.0)
   Linked:   -Dredis=true
+
+pg.zig (PostgreSQL client)
+  Licence:  MIT. Copyright (c) 2024 Karl Seguin
+  Source:   https://github.com/karlseguin/pg.zig, used through Anole's fork
+            https://github.com/xuckless/pg.zig (branch anole: upstream master
+            4d63344 plus a read timeout, CancelRequest, an automatic
+            prepared statement cache, pool lifetimes, a refused connect's
+            error kept, and TLS through an injected module instead of
+            OpenSSL; Anole injects its BoringSSL client, src/pg/tls.zig)
+  Pinned:   commit 6ffefc88696ec34441297d4b898cc3d9279c844c of the fork
+  Linked:   -Dpostgres=true
+
+buffer.zig (byte buffers; a dependency of pg.zig)
+  Licence:  MIT. Copyright (c) 2024 Karl Seguin
+  Source:   https://github.com/karlseguin/buffer.zig
+  Pinned:   commit a0de50267550666dc126051f672a8f0b55c44083 (pinned by
+            pg.zig's build.zig.zon)
+  Linked:   -Dpostgres=true
 
 zig-protobuf (protobuf runtime and protoc-gen-zig; protoc release zips)
   Licence:  MIT. Copyright (c) 2021 Arwalk

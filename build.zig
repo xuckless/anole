@@ -401,6 +401,13 @@ pub fn build(b: *std.Build) void {
 
     // Core: zio (runtime) and the HTTP core (src/http/core), always on.
     const core = Core.init(b, c_mods, target, optimize);
+    // pg.zig's TLS: Anole's BoringSSL client (src/pg/tls.zig).
+    if (c_mods.pg_tls) |pg| pg.addImport("tls", b.createModule(.{
+        .root_source_file = b.path("src/pg/tls.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "anole_dusty_tls", .module = core.tls_seam.? }},
+    }));
 
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
     const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .public = true });
@@ -418,6 +425,15 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
+
+    // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
+    // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
+    if (features.postgres) {
+        const pg_tests = b.addTest(.{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const run_pg_tests = b.addRunArtifact(pg_tests);
+        run_pg_tests.has_side_effects = postgres_test_url != null;
+        b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
+    }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
@@ -566,6 +582,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
         .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },
         .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
+        .{ .name = "postgres", .needs = features.postgres, .about = "a posts API on PostgreSQL (DATABASE_URL), on port 3000" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;
@@ -1071,6 +1088,12 @@ const CModules = struct {
     hiredis: ?*std.Build.Module = null,
     /// xuckless/zig-jwt (auth).
     jwt: ?*std.Build.Module = null,
+    /// xuckless/pg.zig (postgres), pure Zig, fetched lazily. Two instances:
+    /// one whose `tls` import is Anole's BoringSSL client (src/pg/tls.zig,
+    /// added in `build` once the core's TLS module exists), and one built
+    /// without TLS, for builds that leave it out.
+    pg_tls: ?*std.Build.Module = null,
+    pg_plain: ?*std.Build.Module = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -1091,6 +1114,8 @@ const CModules = struct {
         const yyjson_dep = if (f.json) b.lazyDependency("yyjson", .{}) else null;
         const hiredis_dep = if (f.redis) b.lazyDependency("hiredis", .{}) else null;
         const jwt_dep = if (f.auth) b.lazyDependency("zig_jwt", .{ .target = target, .optimize = optimize }) else null;
+        const pg_tls_dep = if (f.postgres and f.needsTls()) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .injected }) else null;
+        const pg_plain_dep = if (f.postgres) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .none }) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
@@ -1102,6 +1127,7 @@ const CModules = struct {
         if (f.json and yyjson_dep == null) return null;
         if (f.redis and hiredis_dep == null) return null;
         if (f.auth and jwt_dep == null) return null;
+        if (f.postgres and (pg_plain_dep == null or (f.needsTls() and pg_tls_dep == null))) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
@@ -1110,6 +1136,8 @@ const CModules = struct {
         if (websocket_dep) |dep| m.websocket = dep.module("websocket");
         if (protobuf_dep) |dep| m.protobuf = dep.module("protobuf");
         if (jwt_dep) |dep| m.jwt = dep.module("zig-jwt");
+        if (pg_tls_dep) |dep| m.pg_tls = dep.module("pg");
+        if (pg_plain_dep) |dep| m.pg_plain = dep.module("pg");
         if (!f.needsTranslateC()) return m;
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
@@ -1238,6 +1266,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
     if (f.auth) mod.addImport("anole_jwt", o.c.jwt.?);
+    if (f.postgres) mod.addImport("anole_pg", if (f.needsTls()) o.c.pg_tls.? else o.c.pg_plain.?);
     // The generated test service (tests/grpc/gen), outside src/.
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),

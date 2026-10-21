@@ -18,6 +18,7 @@ that happens promptly.
 | zlib-ng, zstd, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
 | zig-protobuf | build.zig.zon | upstream commit; it pins protoc per platform |
 | websocket-zig, zig-jwt | build.zig.zon | commits of the xuckless forks, branch `anole` |
+| pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
 | translate-c | build.zig.zon | commit on its `zig-0.17.x` branch |
 
 `tools/advisories.py` holds a second copy of the C libraries' versions, so it
@@ -108,6 +109,19 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed.
+- **pg.zig** (PostgreSQL, `-Dpostgres`): upstream master 4d63344 plus a
+  read timeout, `Conn.cancel()` (CancelRequest), the automatic statement
+  cache, pool `max_lifetime`/`idle_timeout`, `Pool.acquireOpts` keeping a
+  refused connect's error, and TLS through an injected `tls` module
+  instead of OpenSSL (Anole's is `src/pg/tls.zig`). The first four are
+  also on branches based on upstream master (`upstream-read-timeout`,
+  `upstream-cancel-request`, `upstream-statement-cache`,
+  `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig
+  #150-#153; generic fixes may go upstream (user, 2026-10-18), the TLS
+  swap stays in the fork. On an upstream move: merge master into `anole`,
+  run the fork's `tests/run.sh` (a throwaway postgres:17, on std's
+  Threaded Io and on zio, with and without TLS), re-pin, and run Anole's
+  `tests/postgres/run.sh` (plain and verify-full TLS).
 
 ## The HTTP core
 

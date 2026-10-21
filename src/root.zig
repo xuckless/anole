@@ -107,6 +107,11 @@ pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 /// metrics and tracing hooks.
 pub const db = @import("db/root.zig");
 
+/// PostgreSQL (-Dpostgres): `app.postgres(.{})` (DATABASE_URL), then
+/// `app.db.all(Post, req, sql, .{args})` and the other `anole.db` verbs,
+/// on Anole's fork of pg.zig with a pool per executor.
+pub const pg = if (features.postgres) @import("pg/root.zig") else struct {};
+
 /// Outbound connections for the database clients: `ClientStream`, TCP or
 /// a Unix socket, plain or TLS on BoringSSL.
 pub const net = struct {
@@ -159,6 +164,7 @@ test {
     _ = json;
     _ = redis;
     _ = db;
+    _ = pg;
     _ = @import("net/client_stream.zig");
     _ = session;
     _ = early_data;
