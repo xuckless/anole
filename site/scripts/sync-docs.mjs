@@ -108,9 +108,20 @@ function rewriteLink(target, from) {
 	return `${github}/${kind}/${branch}/${rel}${hash}`;
 }
 
+// Each guide's H1, so link text that names a guide's file (`[routing.md](...)`)
+// reads as its title on the site.
+const titles = new Map(
+	readdirSync(docsDir)
+		.filter((f) => f.endsWith('.md'))
+		.map((f) => [f, readFileSync(join(docsDir, f), 'utf8').match(/^# +(.+?)\s*$/m)?.[1]])
+		.filter(([, t]) => t),
+);
+
 function rewriteLinks(md, from) {
 	return mapProse(md, (text) =>
-		text.replace(/(\]\()([^)\s]+)((?:\s+"[^"]*")?\))/g, (_, open, target, close) => open + rewriteLink(target, from) + close),
+		text
+			.replace(/(\]\()([^)\s]+)((?:\s+"[^"]*")?\))/g, (_, open, target, close) => open + rewriteLink(target, from) + close)
+			.replace(/\[([a-z0-9-]+\.md)\]\(/g, (m, name) => (titles.has(name) ? `[${titles.get(name)}](` : m)),
 	);
 }
 
