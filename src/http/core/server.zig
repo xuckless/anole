@@ -720,7 +720,12 @@ pub const Listener = @import("config.zig").Listener;
 /// is already bound; call it before opening a socket of your own that is to
 /// be handed over. `ipv6_only` is the socket's (`Listener.ipv6_only`): a
 /// dual-stack `::` (false) also conflicts with IPv4 sockets on the port.
+///
+/// Nothing on Windows: listeners there bind without SO_REUSEADDR (which on
+/// Windows lets a second socket take a port that is in use), so the bind
+/// itself fails on a port in use.
 pub fn checkAddressFree(address: std.Io.net.IpAddress, ipv6_only: ?bool) error{AddressInUse}!void {
+    if (comptime builtin.os.tag == .windows) return;
     if (address.getPort() == 0) return;
     const posix = std.posix;
     const sys = posix.system;
@@ -743,7 +748,9 @@ pub fn checkAddressFree(address: std.Io.net.IpAddress, ipv6_only: ?bool) error{A
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (posix.errno(sys.bind(fd, &storage.any, len)) == .ADDRINUSE) {
-        log.err("{f} is already in use: another process is listening on it", .{address});
+        // Tests provoke it on purpose, and Zig's test runner fails a test
+        // that logs at err (as net.checkUdpAddressFree in src/h3).
+        if (!builtin.is_test) log.err("{f} is already in use: another process is listening on it", .{address});
         return error.AddressInUse;
     }
 }
@@ -1542,7 +1549,9 @@ pub fn Server(comptime Ctx: type) type {
                     if (cfg.reuse_address) try checkAddressFree(ip, cfg.ipv6_only);
                     break :blk try listenIp(self.io, ip, .{
                         .kernel_backlog = kernel_backlog,
-                        .reuse_address = cfg.reuse_address,
+                        // Windows' SO_REUSEADDR would let another socket
+                        // bind the port too (`checkAddressFree`).
+                        .reuse_address = cfg.reuse_address and builtin.os.tag != .windows,
                         .ipv6_only = cfg.ipv6_only,
                     });
                 },
@@ -1576,6 +1585,9 @@ pub fn Server(comptime Ctx: type) type {
         /// Wraps a listening socket this process did not open. Under zio,
         /// which drives its own sockets non-blocking, it is made so too.
         fn inheritSocket(io: std.Io, fd: std.posix.fd_t, configured: Address) !std.Io.net.Server {
+            // Inherited sockets (`Listener.fd`) come from hand-off and
+            // socket activation, which are Unix only.
+            if (comptime builtin.os.tag == .windows) return error.InheritedSocketUnsupported;
             const c = std.c;
             if (placement.executorCount(io) != null) {
                 const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
@@ -3023,6 +3035,7 @@ fn fuzzConnection(input: []const u8) !void {
 }
 
 test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
     const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     // A client's SETTINGS (empty), then HEADERS on stream 1 with END_STREAM
     // and END_HEADERS: :method GET, :scheme http, :path /, :authority

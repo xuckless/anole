@@ -128,8 +128,8 @@ pub fn library(
             m.addCMacro("HAVE_SYS_AUXV_H", "1");
             m.addCMacro("HAVE_LINUX_AUXVEC_H", "1");
         },
-        .macos => {},
-        else => @panic("zlib-ng: unsupported target OS (Anole supports Linux and macOS)"),
+        .macos, .windows => {},
+        else => @panic("zlib-ng: unsupported target OS (Anole supports Linux, macOS and Windows)"),
     }
 
     const hdrs = generatedHeaders(b, upstream);

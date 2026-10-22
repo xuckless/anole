@@ -43,8 +43,8 @@ pub fn library(
     });
     const m = lib.root_module;
     switch (target.result.os.tag) {
-        .linux, .macos => {},
-        else => @panic("brotli: unsupported target OS (Anole supports Linux and macOS)"),
+        .linux, .macos, .windows => {},
+        else => @panic("brotli: unsupported target OS (Anole supports Linux, macOS and Windows)"),
     }
     m.addIncludePath(upstream.path("c/include"));
     inline for (.{ common, enc, dec }) |files| {

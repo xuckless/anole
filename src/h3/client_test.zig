@@ -571,6 +571,7 @@ fn helloFromSuccessor(_: *dusty.Request, res: *dusty.Response) !void {
 }
 
 test "h3 server: a hand-over closes the connections at once and leaves the socket to the successor" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // hands the UDP socket over by fd (dup), which is Unix only
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -950,6 +951,7 @@ test "h3: 0-RTT carries on across a certificate reload" {
 }
 
 test "h3: 0-RTT the server refuses goes again after the handshake" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // hands the UDP socket over by fd (dup), which is Unix only
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();

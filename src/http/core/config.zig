@@ -146,6 +146,8 @@ pub const Listener = struct {
     /// to that silently.
     kernel_backlog: ?u31 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
+    /// Ignored on Windows, where SO_REUSEADDR would let another socket
+    /// bind the same port.
     reuse_address: bool = true,
     /// IPV6_V6ONLY for a listener on an IPv6 address. False takes IPv4
     /// clients too on the same socket (`::` then serves both families):

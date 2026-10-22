@@ -437,6 +437,8 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// One more socket of the group, SO_REUSEPORT, as zio wants it.
         fn bindMember(io: std.Io, at: std.Io.net.IpAddress, ipv6_only: ?bool) !std.Io.net.Socket {
+            // One socket per listener there (`init`).
+            if (comptime builtin.os.tag == .windows) unreachable;
             const fd = try net.bindReusePort(at, ipv6_only);
             return adoptSocket(io, fd, at) catch |err| {
                 _ = std.c.close(fd);
@@ -473,6 +475,8 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Wraps a UDP socket this process did not open. Under zio, which
         /// drives its own sockets non-blocking, it is made so too.
         fn adoptSocket(io: std.Io, fd: std.posix.fd_t, configured: std.Io.net.IpAddress) !std.Io.net.Socket {
+            // Inherited sockets come from hand-off, which is Unix only.
+            if (comptime builtin.os.tag == .windows) return error.InheritedSocketUnsupported;
             const sc = std.c;
             var kind: c_int = 0;
             var kind_len: std.posix.socklen_t = @sizeOf(c_int);

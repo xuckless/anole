@@ -35,6 +35,29 @@ breaking changes are listed anyway.
   `.database` (for an `X-Cache: HIT|MISS` header). A `*anole.db.Ctx` keeps
   it in `last_source`.
 
+### Windows, as a development target
+
+- `zig build -Dtarget=x86_64-windows` builds the library, the examples and
+  the tests with every feature, and a `windows` CI job runs `zig build test`
+  on Windows, and examples/hello and examples/full serve requests there
+  (HTTP/1.1, h2c, HTTPS with HTTP/2). The `cross` job also
+  builds every preset and edge flag combination for x86_64-windows.
+- BoringSSL builds without its assembly there (NASM syntax), nghttp2,
+  ngtcp2, nghttp3, zlib-ng, zstd, Brotli and hiredis get their Windows
+  settings, and ngtcp2 uses its own socket address types
+  (`NGTCP2_USE_GENERIC_SOCKADDR`), since mingw's `sockaddr_in6` does not
+  translate.
+- Compiled out on Windows: per-core `SO_REUSEPORT` sockets, HTTP/3
+  connection-ID steering, UDP batching and control messages (ECN,
+  `IP_PKTINFO`), listener hand-off and SIGUSR2, SIGHUP reloads,
+  `LISTEN_FDS`, `sd_notify` and idle parking. Ctrl-C drains the server.
+  Tests of those parts are skipped there with the reason. See
+  [docs/server.md](docs/server.md#windows).
+- Listeners on Windows bind without `SO_REUSEADDR`, which there would let
+  another socket take a port in use.
+- The examples read their arguments with `args.iterateAllocator`, which
+  works on Windows too.
+
 ## 0.1.0 (2026-10-21)
 
 The first release: one server core for REST, WebSockets, gRPC and

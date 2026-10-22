@@ -135,7 +135,7 @@ fn lookupKey(ptr: ?*anyopaque, _: std.mem.Allocator, digest: auth.apikey.Digest)
 
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8084;
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     const arena = init.arena.allocator();

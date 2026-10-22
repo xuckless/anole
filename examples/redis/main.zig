@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     app.post("/rooms/:room", publish);
     app.get("/rooms/:room/events", events);
 
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     try app.listen(args.next() orelse ":3000");
 }
