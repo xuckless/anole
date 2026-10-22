@@ -327,3 +327,34 @@ Notes:
   ticks (gaps), at 1 000 × 1000 Hz and at 2 000 bots.
 - **Bun** leads echo throughput at both connection counts and is the best of
   the four at 500 bots.
+
+## $12 challenge, quick ladder (done 18:26)
+
+Setup:
+- The challenge's load.js behaviour, with its real think times. Steps run
+  from 2 500 to 100 000 users, with a 20 s ramp and a 40 s window each.
+- Postgres runs on its own cores. 1 CPU / 2 GB and 4 CPU / 8 GB.
+- At Builder's call, the 5-minute bisection was skipped and the ladder was
+  not extended past 100 000 users.
+
+**The ceiling doesn't rank anyone on CPU.** With the challenge's think times,
+100 000 users make only about 10.6k req/s. No server was CPU-bound at any
+step. What the ladder does separate is **memory per user**, which decides the
+2 GB tier.
+
+| | score, 1 CPU / 2 GB | score, 4 CPU / 8 GB | RSS at 40k users (1 CPU) | RSS at 100k users (1 CPU) | CPU busy at 100k (1 CPU) | p99 at 100k |
+|---|---|---|---|---|---|---|
+| anole | **≥100 000** | ≥100 000 | **200 MB** | 492 MB | **0.28** | 1.29 ms |
+| bun | **≥100 000** | ≥100 000 | 178 MB | **425 MB** | 0.61 | 1.54 ms |
+| axum | 50 000 (OOM at 52 500) | ≥100 000 | 1 564 MB | – | – | – |
+| fiber | 43 750 (OOM at 45 000) | ≥100 000 (5.0 GB) | 2 035 MB | – | – | – |
+
+Notes:
+- **Memory per user:** Anole ~4.9 KB and Bun ~4.3 KB. Axum is ~39 KB and
+  Fiber ~50 KB, which is why they run out of the 2 GB limit at 50k and 44k
+  users.
+- Anole needs the least CPU for the same load: 0.28 of a core at 100k users,
+  against Bun's 0.61.
+- p99 latency stays at 1.2–1.6 ms for every server until its limit.
+- The full per-step data (RSS, p99 and CPU at each step) is in cases.jsonl,
+  under scenario "twelve".

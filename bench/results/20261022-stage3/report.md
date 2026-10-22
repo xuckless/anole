@@ -179,6 +179,28 @@ oha with `--latency-correction` (coordinated omission accounted for), 64 connect
 | fastapi | h3 | rate=50%max | fail [16] | | | | | | |
 | fastapi | h3 | rate=75%max | fail [17] | | | | | | |
 
+## The $12 server challenge (Postgres)
+
+load.js's users (feed, think, post, think, 15% like, 2% write, idle), added in steps; each step's window must keep p95 < 500 ms, p99 < 1 s and < 1% errors. Score: the most users that passed. Server memory is the peak in that step.
+
+### 1cpu
+
+| Server | Score (users) | req/s at score | p95 ms | p99 ms | memory MB | cores busy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| anole | **100,000** | 10,583 | 1 | 1 | 493 | 0.29 |
+| fiber | 43,750 | | | | | |
+| axum | **50,000** | 5,293 | 1 | 1 | 1960 | 0.27 |
+| bun | **100,000** | 10,587 | 1 | 2 | 426 | 0.42 |
+
+### 4cpu
+
+| Server | Score (users) | req/s at score | p95 ms | p99 ms | memory MB | cores busy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| anole | **100,000** | 10,587 | 1 | 1 | 492 | 0.41 |
+| fiber | **100,000** | 10,585 | 1 | 1 | 5000 | 0.50 |
+| axum | **100,000** | 10,586 | 1 | 1 | 3958 | 0.73 |
+| bun | **100,000** | 10,587 | 1 | 1 | 472 | 0.61 |
+
 ## WebSockets (HTTP/1.1)
 
 Idle: sockets held open and the memory each costs. Echo: closed-loop 64-byte messages, msgs/s and round trip. Fan-out: subscribers on /ws/feed at the tick rate; delivered msgs/s against expected, and tick lag (receive time minus the server's send stamp). Trading: one bot in ten also sends orders on /ws/trade and waits for each fill; order round trip in the notes and the feed column.
