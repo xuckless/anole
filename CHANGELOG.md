@@ -88,6 +88,10 @@ Fixes from the QUIC interop runner's matrix (Anole's server against all
   picoquic, s2n-quic) answered the second probe only; validation still
   succeeded, but observers that check the first challenge (the interop
   runner's rebind-port and rebind-addr cases) did not see it answered.
+- The flush no longer holds (up to 1 ms, for the answers of the requests
+  a batch started) when the batch carried 0-RTT requests or completed the
+  handshake: the server's handshake flight, the ACK of the client's 0-RTT
+  packets and HANDSHAKE_DONE go out at once.
 - After a NAT rebinding, the first packet to the client's new address is
   now always the PATH_CHALLENGE (xuckless/ngtcp2 patch): while pacing held
   data back, an ACK the client's packets called for went out to the new
