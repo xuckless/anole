@@ -7,6 +7,7 @@ const dusty = @import("dusty");
 const pb = @import("anole_transcode_pb");
 const grpc = @import("root.zig");
 const transcode = @import("transcode.zig");
+const grpc_server = @import("server.zig");
 const features = @import("build_options");
 
 const Library = pb.Library(grpc.Call, anyerror);
@@ -653,6 +654,47 @@ pub fn slowExchange(gpa: std.mem.Allocator, io: std.Io, port: u16, parts: []cons
     const bound: dusty.Deadline = .init(io, .{ .duration = .{ .raw = wait, .clock = .awake } });
     try bound.run(read, .{ &reader.interface, needle });
     return gpa.dupe(u8, reader.interface.buffered());
+}
+
+test "fuzz: request messages decoded as gRPC decodes them (protobuf and JSON)" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            if (input.len == 0) return;
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            // The first byte picks the codec and the message type.
+            const codec: grpc.Codec = if (input[0] & 1 != 0) .json else .proto;
+            const payload = input[1..];
+            switch (input[0] >> 1 & 1) {
+                0 => try roundTrip(pb.Book, arena, codec, payload),
+                else => try roundTrip(pb.GetBookRequest, arena, codec, payload),
+            }
+        }
+
+        /// Refusing the input is fine; running out of memory or crashing is
+        /// not. What decodes encodes again.
+        fn roundTrip(comptime T: type, arena: std.mem.Allocator, codec: grpc.Codec, payload: []const u8) !void {
+            const message = grpc_server.decodePayload(T, arena, codec, payload) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.DecodeFailed => return,
+            };
+            var out: std.Io.Writer.Allocating = .init(arena);
+            try message.encode(&out.writer, arena);
+            // JSON refuses what it cannot write (a Timestamp out of range),
+            // which it reports as OutOfMemory.
+            _ = message.jsonEncode(.{}, grpc_server.json_options, arena) catch {};
+        }
+    }.check, &.{
+        "\x00\x0a\x01a\x12\x01T\x18\x03\x20\x01\x2a\x01x\x32\x05\x0a\x03Ada\x42\x06\x08\x80\x92\xb8\xc3\x06\x5a\x03978",
+        "\x02\x0a\x04name\x4a\x02\x08\x01\x5a\x02\x01\x02",
+        "\x00\x6b\x6b\x6b\x6b\x6b\x6b\x6c\x6c\x6c\x6c\x6c\x6c",
+        "\x00\x0a\xff\xff\xff\xff\x07",
+        "\x00\x32\x80\x80\x80\x80\x08",
+        "\x01{\"name\":\"a\",\"published\":\"2024-03-00T00:00:00Z\",\"author\":{\"name\":\"x\"}}",
+        "\x03{\"since\":\"2024-02-29T23:59:60Z\",\"pages\":[1,2],\"big\":\"18446744073709551615\"}",
+        "\x01{\"isbn\":\"1\",\"printing\":2,\"tags\":[[[[[[[[]]]]]]]]}",
+    });
 }
 
 test "transcoding: off for a registration" {

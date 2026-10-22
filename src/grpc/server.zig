@@ -341,6 +341,10 @@ pub fn register(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service
 
 /// `register`, with options for this registration (a message size limit,
 /// data for the handlers).
+///
+/// The routes go on `router` itself: the router's own middleware
+/// (`router.use`) runs for them, but a group's (`router.group`) does not,
+/// even for transcoded REST routes whose paths start with its prefix.
 pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service: type, comptime impl: Service, options: RegisterOptions) void {
     // The routes hand it to each call; it lives as long as the router.
     const registration = router.arena.allocator().create(RegisterOptions) catch @panic("OOM");
