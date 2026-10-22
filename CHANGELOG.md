@@ -421,7 +421,9 @@ Breaking below.
   2 x `limits.ws_max_message` bytes); past that `anole_ws_publish` returns
   `ANOLE_E_AGAIN` and sends nothing. A publish larger than
   `limits.ws_max_message` is refused (`ANOLE_E_INVALID`). Bindings should
-  handle `ANOLE_E_AGAIN` from publish.
+  handle `ANOLE_E_AGAIN` from publish. Topics use `Rooms`' per-member
+  queues (above), each bounded by `limits.ws_high_water`, so a subscriber
+  that stops reading holds up no publish.
 - C ABI configuration: `limits.inline_body_max` and `limits.ws_max_message`
   are capped at 1 GiB (larger values are a configuration error).
 - C ABI configuration: a `jwt` middleware with `jwks_url` needs `audience`

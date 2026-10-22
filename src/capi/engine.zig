@@ -669,6 +669,10 @@ pub const Engine = struct {
         e.inline_body_max = cfg.limits.inline_body_max;
         e.stream_high_water = cfg.limits.stream_high_water;
         e.record_budget = @max(16 * @as(usize, cfg.limits.ws_high_water), 2 * @as(usize, cfg.limits.ws_max_message));
+        // A topic's subscriber gets as much queued as `anole_ws_send` lets
+        // wait for a socket; past it, publishes skip it, and one stuck that
+        // way is closed.
+        if (comptime features.websocket) e.rooms.options.max_queued_bytes = cfg.limits.ws_high_water;
         e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
         e.timeouts[0] = @as(i96, cfg.timeouts.request_ms) * std.time.ns_per_ms;
         // One per process: `respond` and the handlers find it here.

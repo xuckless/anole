@@ -957,9 +957,11 @@ static void test_main_server(void) {
       close(c.fd);
       CHECK(wait_for(&cs.ws_closes, 3));
     }
-    /* a subscriber that stops reading: publishes held up by it are bounded */
+    /* a subscriber that stops reading holds up no publish: what is queued
+       for it is bounded (limits.ws_high_water), and another subscriber
+       still gets every publish */
     {
-      static char chunk[64 * 1024];
+      static char chunk[60 * 1024]; /* fits a 16-bit frame length */
       uint32_t x = 12345;
       for (size_t i = 0; i < sizeof chunk; i++) {
         x = x * 1103515245u + 12345u;
@@ -967,22 +969,29 @@ static void test_main_server(void) {
       }
       ws_connect(&c, port);
       CHECK(wait_for(&cs.ws_open, 4));
-      int refused = 0;
-      for (int i = 0; i < 8000 && !refused; i++) {
+      for (int i = 0; i < 2000; i++) {
         anole_status st = anole_ws_publish(s, room, ANOLE_WS_BINARY, chunk, sizeof chunk, 0);
         CHECK(st == ANOLE_OK || st == ANOLE_E_AGAIN);
-        if (st == ANOLE_E_AGAIN) refused = 1;
+        if (st == ANOLE_E_AGAIN) usleep(1000);
       }
-      CHECK(refused);
-      close(c.fd);
-      CHECK(wait_for(&cs.ws_closes, 4));
-      /* the held-up publishes end with the socket */
+      static conn_reader c2;
+      static char frame[64 * 1024];
+      ws_connect(&c2, port);
+      CHECK(wait_for(&cs.ws_open, 5));
       int ok = 0;
       for (int i = 0; i < 300 && !ok; i++) {
-        if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "x", 1, 0) == ANOLE_OK) ok = 1;
+        if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "after", 5, 0) == ANOLE_OK) ok = 1;
         else usleep(10000);
       }
       CHECK(ok);
+      /* chunks still being fanned out may come first */
+      size_t n2 = 0;
+      int op;
+      while ((op = ws_read_frame(&c2, frame, sizeof frame, &n2)) == 2) {}
+      CHECK(op == 1 && strcmp(frame, "after") == 0);
+      close(c2.fd);
+      close(c.fd);
+      CHECK(wait_for(&cs.ws_closes, 5));
     }
   }
   printf("ok websocket\n");

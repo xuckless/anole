@@ -281,10 +281,12 @@ past that, the sockets feeding it are not read until it catches up. `anole_ws_se
 (`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WS_DRAIN`),
 `anole_ws_close` sends a close. Topics are Anole's: `anole_ws_subscribe`,
 `anole_ws_unsubscribe`, and `anole_ws_publish(server, topic, ...)` fans out
-on Anole's threads without entering the language. Publishes still being fanned
-out are bounded (64 per executor, and the larger of 16 x `limits.ws_high_water`
-and 2 x `limits.ws_max_message` bytes), because a subscriber that stops reading
-holds up every publish sending to it: past the bound `anole_ws_publish` answers
+on Anole's threads without entering the language. A publish waits for no
+subscriber: each one has up to `limits.ws_high_water` bytes queued for it;
+past that, publishes skip it, and a subscriber whose send stays stuck that way
+for a second is closed. Publishes still being fanned out are bounded too (64
+per executor, and the larger of 16 x `limits.ws_high_water` and
+2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
 `ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
 ## Lifecycle
