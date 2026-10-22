@@ -1387,6 +1387,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Requests of the latest round whose handlers have yet to
             /// answer or wait: the flush holds for them (`hold_ns`).
             holding: std.atomic.Value(u32) = .init(0),
+            /// The latest round carried 0-RTT requests or completed the
+            /// handshake: its flush does not hold. A client that sent 0-RTT
+            /// sees its data acknowledged, and its handshake finished, in
+            /// the very next flight, not a hold later: clients whose RTT
+            /// guess is still tiny otherwise count that data lost and send
+            /// it again in 1-RTT.
+            hold_off: std.atomic.Value(bool) = .init(false),
             drain: enum { none, notice, final } = .none,
             /// The connection speaks "hq-interop", not HTTP/3.
             hq: bool = false,
@@ -1603,6 +1610,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.round_ts = ts;
                     _ = conn.round.fetchAdd(1, .monotonic);
                     conn.holding.store(0, .monotonic);
+                    conn.hold_off.store(false, .monotonic);
                     conn.hold_until = ts + hold_ns;
                 }
                 var r = remote;
@@ -1657,7 +1665,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
                         conn.unlock();
                     }
-                    if (conn.holding.load(.monotonic) > 0 and now(io) < conn.hold_until) {
+                    if (conn.holding.load(.monotonic) > 0 and !conn.hold_off.load(.monotonic) and now(io) < conn.hold_until) {
                         // Requests of the latest batch are still on their
                         // way to an answer: their packets, and the ACK
                         // that would otherwise leave alone, wait a little
@@ -2065,6 +2073,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 stream.round = conn.round.load(.monotonic);
                 stream.holds = true;
                 _ = conn.holding.fetchAdd(1, .monotonic);
+                // 0-RTT: the handshake's flight and the ACK go at once.
+                if (!conn.handshakeDone()) conn.hold_off.store(true, .monotonic);
                 _ = conn.tasks.fetchAdd(1, .acq_rel);
                 placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
                     _ = conn.tasks.fetchSub(1, .acq_rel);
@@ -3086,6 +3096,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             const p = c.ngtcp2_conn_get_path2(conn.q);
             const n = c.ngtcp2_crypto_generate_regular_token(&token, &conn.ep.secret, conn.ep.secret.len, p.*.remote.addr, p.*.remote.addrlen, wallClock(conn.ep.io));
             if (n > 0) _ = c.ngtcp2_conn_submit_new_token(conn.q, &token, @intCast(n));
+            // HANDSHAKE_DONE and the ACK of the client's Finished go in the
+            // next flight, not after the requests of this round.
+            conn.hold_off.store(true, .monotonic);
             if (conn.ep.options.early_data and c.SSL_session_reused(conn.ssl) != 0)
                 log.debug("resumed; 0-RTT: {s}", .{quic_tls.earlyDataReason(conn.ssl)});
             // Requests held for the handshake may go on.
