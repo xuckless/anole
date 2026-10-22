@@ -3,6 +3,7 @@
 //! exports call), and Anole's own clients check what goes out. The C suite
 //! (tests/capi/consumer.c) covers HTTP/1.1 and the exported API.
 const std = @import("std");
+const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const abi = engine.abi;
@@ -88,7 +89,10 @@ const Answerer = struct {
                 _ = try engine.streamWrite(e, h, big[0..1000], true);
                 try engine.streamEnd(e, h, &.{.{ .name = .of("x-t"), .value = .of("done") }});
             },
-            4 => {
+            // anole_respond_fd is not on Windows (std.c.open does not exist there).
+            4 => if (comptime builtin.os.tag == .windows) {
+                try engine.respond(e, h, 200, text, "world", false);
+            } else {
                 const fd = std.c.open(@ptrCast(self.file_path.ptr), .{ .ACCMODE = .RDONLY });
                 if (fd < 0) return error.Open;
                 defer _ = std.c.close(fd);
