@@ -224,40 +224,42 @@ const deflate_impl = if (features.compression) @import("deflate.zig") else struc
     pub const Deflate = void;
 };
 
+/// The HTTP version a `Socket` runs over.
+pub const HttpVersion = enum { http1, http2, http3 };
+
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
 pub const Socket = struct {
-    /// The protocol underneath, to tell which you got: `.h1` (the HTTP
-    /// core's HTTP/1.1 WebSocket) or `.h2` (a stream of HTTP/2 or HTTP/3).
-    /// Send and receive through `Socket`'s methods, not through it; see
-    /// `Conn`.
-    conn: Conn,
+    /// The protocol underneath: `.h1` (the HTTP core's HTTP/1.1 WebSocket)
+    /// or `.stream` (a stream of HTTP/2 or HTTP/3). Anole's: send and
+    /// receive through `Socket`'s methods, and ask `httpVersion`.
+    _conn: Conn,
     /// permessage-deflate, when negotiated.
-    deflate: if (features.compression) ?*deflate_impl.Deflate else void =
+    _deflate: if (features.compression) ?*deflate_impl.Deflate else void =
         if (features.compression) null else {},
     /// What the socket's parts live in: the request's arena, or for a
     /// callback socket over HTTP/1.1 the server's allocator. Used only by
     /// the task that reads the socket; the compressor has an allocator of
     /// its own.
-    allocator: std.mem.Allocator,
+    _allocator: std.mem.Allocator,
     /// The request's `std.Io`.
     io: std.Io,
     /// The executor the socket was opened on, where `Rooms` sends to it
     /// from; null off zio.
-    executor: ?usize = null,
+    _executor: ?usize = null,
     /// `UpgradeOptions.max_message_size`.
     max_message_size: usize,
     /// Held across compressing and sending a message, so tasks sending on
     /// one socket (a `Rooms.broadcast` beside the socket's own handler) do
     /// not interleave on the compressor.
-    send_mutex: std.Io.Mutex = .init,
+    _send_mutex: std.Io.Mutex = .init,
     /// The server's drain signal (`Request.drain`); null in a request the
     /// server did not build.
-    drain: ?*std.Io.Event = null,
+    _drain: ?*std.Io.Event = null,
     /// Sends 1001 when the drain starts (`UpgradeOptions.close_on_drain`).
-    drain_watch: ?*DrainWatch = null,
+    _drain_watch: ?*DrainWatch = null,
     /// A close went out through `close`, or came in through `receive` (and
     /// was answered), or `next` saw the connection end.
-    closed: std.atomic.Value(bool) = .init(false),
+    _closed: std.atomic.Value(bool) = .init(false),
     /// Why the socket ended when it was not the peer's close (`next`
     /// returned null, or a callback socket's `close` ran): the error its
     /// read failed with, `error.EndOfStream` for a peer that left without
@@ -269,21 +271,23 @@ pub const Socket = struct {
     /// The subprotocol selected in the handshake; null for none. Lives as
     /// long as the socket.
     subprotocol: ?[]const u8 = null,
+    /// `httpVersion`.
+    _http_version: HttpVersion = .http1,
     /// The application's, for state it keeps per socket: a callback socket
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
     context: ?*anyopaque = null,
     /// The rooms the socket is in (`Rooms.join`), across every `Rooms`:
     /// `deinit` leaves them all. Under `memberships_lock`.
-    memberships: ?*Rooms.Member = null,
+    _memberships: ?*Rooms.Member = null,
     /// Over `memberships`; held only for a list operation, inside the
     /// `Rooms`' own lock.
-    memberships_lock: std.atomic.Mutex = .unlocked,
+    _memberships_lock: std.atomic.Mutex = .unlocked,
     /// The task that serves the socket over HTTP/2 or HTTP/3 (its stream's),
     /// and over HTTP/1.1 on Windows (its connection's, see
     /// `abort_cancels_h1_reader`), which `abortConnection` cancels; null
     /// over HTTP/1.1 elsewhere and off zio.
-    task: ?placement.Task = null,
+    _task: ?placement.Task = null,
 
     /// Which protocol a socket runs on. The sockets it points at are
     /// internal: they hand over permessage-deflate messages still
@@ -293,14 +297,24 @@ pub const Socket = struct {
     pub const Conn = union(enum) {
         h1: *WebSocket,
         /// An HTTP/2 or an HTTP/3 stream (RFC 8441, RFC 9220).
-        h2: *H2Socket,
+        stream: *H2Socket,
     };
+
+    /// The HTTP version the socket runs over.
+    pub fn httpVersion(self: *const Socket) HttpVersion {
+        return self._http_version;
+    }
+
+    /// A close went out or came in, or the connection ended.
+    pub fn isClosed(self: *const Socket) bool {
+        return self._closed.load(.acquire);
+    }
 
     /// Whether the server has started to drain. With `close_on_drain` the
     /// close is already on its way; without, the handler should end the
     /// socket (close 1001, then `receive` until the answer) soon.
     pub fn draining(self: *const Socket) bool {
-        const d = self.drain orelse return false;
+        const d = self._drain orelse return false;
         return d.isSet();
     }
 
@@ -312,7 +326,7 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
-        return @call(.always_inline, finishMessage, .{ self, switch (self.conn) {
+        return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
         } });
     }
@@ -322,7 +336,7 @@ pub const Socket = struct {
     /// read buffer, null when it is empty (the core's
     /// `WebSocket.receiveStarted`).
     fn receiveStarted(self: *Socket) !?Message {
-        const msg = (try self.conn.h1.receiveStarted()) orelse return null;
+        const msg = (try self._conn.h1.receiveStarted()) orelse return null;
         return try self.finishMessage(msg);
     }
 
@@ -332,11 +346,11 @@ pub const Socket = struct {
         var msg = received;
         if (msg.type == .close) {
             self.close_code = msg.close_code;
-            self.closed.store(true, .release);
+            self._closed.store(true, .release);
         }
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
-        const d = self.deflate orelse unreachable; // RSV1 is refused unless negotiated
+        const d = self._deflate orelse unreachable; // RSV1 is refused unless negotiated
         msg.data = d.decompress(msg.data, self.max_message_size) catch |err| {
             self.close(if (err == error.MessageTooLarge) .too_large else .invalid_payload, "") catch {};
             return err;
@@ -359,18 +373,18 @@ pub const Socket = struct {
     /// the socket's own handler from other tasks (`Rooms.broadcast`).
     /// A text message must be valid UTF-8; that is the caller's to keep.
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
-        try self.send_mutex.lock(self.io);
-        defer self.send_mutex.unlock(self.io);
+        try self._send_mutex.lock(self.io);
+        defer self._send_mutex.unlock(self.io);
         if (comptime features.compression) {
-            if (self.deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
+            if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
                 const packed_data = try d.compress(data);
-                return switch (self.conn) {
+                return switch (self._conn) {
                     .h1 => |ws| ws.sendCompressed(msg_type, packed_data),
-                    .h2 => |ws| ws.sendMessage(msg_type, packed_data, true),
+                    .stream => |ws| ws.sendMessage(msg_type, packed_data, true),
                 };
             };
         }
-        return switch (self.conn) {
+        return switch (self._conn) {
             inline else => |ws| ws.send(msg_type, data),
         };
     }
@@ -378,7 +392,7 @@ pub const Socket = struct {
     /// Sends a ping with `data`: at most 125 bytes, else
     /// `error.LargeControlFrame`. The pong is dropped inside `receive`.
     pub fn ping(self: *Socket, data: []const u8) !void {
-        return switch (self.conn) {
+        return switch (self._conn) {
             inline else => |ws| ws.ping(data),
         };
     }
@@ -396,7 +410,7 @@ pub const Socket = struct {
                 const e: anyerror = err;
                 if (e == error.Canceled or e == error.OutOfMemory) return e;
                 self.end_error = e;
-                self.closed.store(true, .release);
+                self._closed.store(true, .release);
                 return null;
             };
             switch (msg.type) {
@@ -410,8 +424,8 @@ pub const Socket = struct {
     /// Sends a close frame. The peer's answer still arrives through
     /// `receive`.
     pub noinline fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
-        self.closed.store(true, .release);
-        return switch (self.conn) {
+        self._closed.store(true, .release);
+        return switch (self._conn) {
             inline else => |ws| ws.close(code, reason),
         };
     }
@@ -424,9 +438,9 @@ pub const Socket = struct {
         // First, so nothing sends on the socket once it is gone: no room
         // keeps it, and no broadcast is still sending to it.
         Rooms.leaveEvery(self);
-        if (self.drain_watch) |w| w.stop();
-        if (comptime features.compression) if (self.deflate) |d| d.deinit();
-        switch (self.conn) {
+        if (self._drain_watch) |w| w.stop();
+        if (comptime features.compression) if (self._deflate) |d| d.deinit();
+        switch (self._conn) {
             inline else => |ws| ws.deinit(),
         }
     }
@@ -450,8 +464,8 @@ const abort_cancels_h1_reader = builtin.os.tag == .windows;
 /// still alive (a `Rooms` sender, which `leave` waits for), so the task
 /// serving it has not returned.
 fn abortConnection(socket: *Socket) void {
-    socket.closed.store(true, .release);
-    switch (socket.conn) {
+    socket._closed.store(true, .release);
+    switch (socket._conn) {
         .h1 => |ws| {
             ws.write_mutex.lockUncancelable(socket.io);
             ws.closed = true;
@@ -463,11 +477,11 @@ fn abortConnection(socket: *Socket) void {
             if (ws.transport.tcp_reader) |r| r.stream.shutdown(socket.io, .both) catch {};
             if (comptime abort_cancels_h1_reader) if (socket.task) |t| placement.cancelTask(t);
         },
-        .h2 => |ws| {
+        .stream => |ws| {
             ws.write_mutex.lockUncancelable(socket.io);
             ws.closed = true;
             ws.write_mutex.unlock(socket.io);
-            if (socket.task) |t| placement.cancelTask(t);
+            if (socket._task) |t| placement.cancelTask(t);
         },
     }
 }
@@ -564,21 +578,26 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
 
     const max_message = options.max_message_size orelse req._config.ws_max_message;
     var socket: Socket = .{
-        .conn = undefined,
-        .deflate = deflate,
-        .allocator = alloc,
+        ._conn = undefined,
+        ._deflate = deflate,
+        ._allocator = alloc,
         .io = req.io,
         .max_message_size = max_message,
         .subprotocol = subprotocol,
-        .drain = req.drain,
-        .executor = placement.currentExecutor(req.io),
+        ._http_version = switch (req.version_major) {
+            3 => .http3,
+            2 => .http2,
+            else => .http1,
+        },
+        ._drain = req.drain,
+        ._executor = placement.currentExecutor(req.io),
         // The stream's task serves the socket for its whole life over
         // HTTP/2 and HTTP/3; over HTTP/1.1 a callback socket outlives the
         // task that opened it where connections park (not on Windows).
-        .task = if (h2 or abort_cancels_h1_reader) placement.currentTask(req.io) else null,
+        ._task = if (h2 or abort_cancels_h1_reader) placement.currentTask(req.io) else null,
     };
     if (h2) {
-        socket.conn = .{ .h2 = try H2Socket.accept(req, res, max_message, negotiated) };
+        socket._conn = .{ .stream = try H2Socket.accept(req, res, max_message, negotiated) };
     } else {
         const ws = try alloc.create(WebSocket);
         errdefer if (owner != null) alloc.destroy(ws);
@@ -593,7 +612,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         if (owner != null) ws.msg_arena = .init(alloc);
         ws.max_message_size = max_message;
         ws.rsv1_allowed = negotiated;
-        socket.conn = .{ .h1 = ws };
+        socket._conn = .{ .h1 = ws };
     }
     req.setDeadline(options.timeout);
     if (options.close_on_drain) if (req._drain_hooks) |hooks| {
@@ -601,7 +620,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         watch.* = .{
             .hooks = hooks,
             .io = req.io,
-            .conn = socket.conn,
+            .conn = socket._conn,
             // Copied for a socket in the request's arena, where `options`
             // may be a caller's temporary; a socket that outlives the
             // request has comptime options.
@@ -609,17 +628,17 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
             .executor = placement.currentExecutor(req.io),
         };
         hooks.add(req.io, &watch.hook);
-        socket.drain_watch = watch;
+        socket._drain_watch = watch;
     };
     return socket;
 }
 
 /// Deinitializes `socket` and frees what `openSocket` took from `owner`.
 fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
-    const ws = socket.conn.h1;
+    const ws = socket._conn.h1;
     socket.deinit();
-    if (comptime features.compression) if (socket.deflate) |d| owner.destroy(d);
-    if (socket.drain_watch) |w| owner.destroy(w);
+    if (comptime features.compression) if (socket._deflate) |d| owner.destroy(d);
+    if (socket._drain_watch) |w| owner.destroy(w);
     if (socket.subprotocol) |sp| owner.free(sp);
     owner.destroy(ws);
 }
@@ -637,7 +656,7 @@ noinline fn failed(ws: *Socket, req: *dusty.Request, res: *dusty.Response, err: 
     // The peer went away mid-send: not the handler's fault.
     if (res.peerGone()) return;
     std.log.scoped(.anole).warn("WebSocket handler for {s} failed: {t}", .{ req.url, err });
-    if (!ws.closed.load(.acquire)) ws.close(.internal_error, "") catch {};
+    if (!ws._closed.load(.acquire)) ws.close(.internal_error, "") catch {};
 }
 
 /// A route handler for `Server.ws`: upgrades, runs `handler` with the open
@@ -664,7 +683,7 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
                 else => unreachable,
             };
             result catch |err| return failed(&ws, req, res, err);
-            if (!ws.closed.load(.acquire)) ws.close(.normal, "") catch {};
+            if (!ws._closed.load(.acquire)) ws.close(.normal, "") catch {};
         }
     };
     return if (Ctx == void) struct {
@@ -836,12 +855,12 @@ const H1Callbacks = struct {
         self.ending = true;
         if (err == error.Canceled) return;
         std.log.scoped(.anole).warn("WebSocket open for {s} failed: {t}", .{ req.url, err });
-        if (!self.socket.closed.load(.acquire)) self.socket.close(.internal_error, "") catch {};
+        if (!self.socket._closed.load(.acquire)) self.socket.close(.internal_error, "") catch {};
     }
 
     fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
         const self: *H1Callbacks = @fieldParentPtr("adopter", a);
-        const ws = self.socket.conn.h1;
+        const ws = self.socket._conn.h1;
         if (self.ending) return self.finish(null);
         // The core gives the request's buffers back before the first run,
         // unless the peer sent something behind the handshake already: then
@@ -864,7 +883,7 @@ const H1Callbacks = struct {
             };
             switch (msg.type) {
                 .text, .binary => self.table.message(self.state, &self.socket, msg) catch |err| {
-                    if (err != error.Canceled and !self.socket.closed.load(.acquire)) {
+                    if (err != error.Canceled and !self.socket._closed.load(.acquire)) {
                         std.log.scoped(.anole).warn("WebSocket message handler failed: {t}", .{err});
                         self.socket.close(.internal_error, "") catch {};
                     }
@@ -883,8 +902,8 @@ const H1Callbacks = struct {
         if (err) |e| if (self.socket.end_error == null and self.socket.close_code == null) {
             self.socket.end_error = e;
         };
-        self.socket.closed.store(true, .release);
-        self.socket.conn.h1.shut();
+        self.socket._closed.store(true, .release);
+        self.socket._conn.h1.shut();
         return .close;
     }
 
@@ -893,8 +912,8 @@ const H1Callbacks = struct {
         const gpa = self.gpa;
         // Closed by the server (a deadline, the stop) while parked, or
         // before its first run: no frame goes out from here on.
-        self.socket.closed.store(true, .release);
-        self.socket.conn.h1.shut();
+        self.socket._closed.store(true, .release);
+        self.socket._conn.h1.shut();
         self.table.close(self.state, &self.socket);
         freeParts(gpa, &self.socket);
         gpa.destroy(self);
@@ -1106,22 +1125,22 @@ pub const Rooms = struct {
     }
 
     fn lockMemberships(socket: *Socket) void {
-        while (!socket.memberships_lock.tryLock()) std.atomic.spinLoopHint();
+        while (!socket._memberships_lock.tryLock()) std.atomic.spinLoopHint();
     }
 
     /// `m` into `socket`'s memberships. Under the mutex.
     fn linkMember(socket: *Socket, m: *Member) void {
         lockMemberships(socket);
-        defer socket.memberships_lock.unlock();
-        m.next_of_socket = socket.memberships;
-        socket.memberships = m;
+        defer socket._memberships_lock.unlock();
+        m.next_of_socket = socket._memberships;
+        socket._memberships = m;
     }
 
     /// `m` out of `socket`'s memberships. Under the mutex.
     fn unlinkMember(socket: *Socket, m: *Member) void {
         lockMemberships(socket);
-        defer socket.memberships_lock.unlock();
-        var link = &socket.memberships;
+        defer socket._memberships_lock.unlock();
+        var link = &socket._memberships;
         while (link.*) |cur| : (link = &cur.next_of_socket) {
             if (cur == m) {
                 link.* = cur.next_of_socket;
@@ -1135,13 +1154,13 @@ pub const Rooms = struct {
     fn leaveEvery(socket: *Socket) void {
         while (true) {
             lockMemberships(socket);
-            const first = socket.memberships orelse {
-                socket.memberships_lock.unlock();
+            const first = socket._memberships orelse {
+                socket._memberships_lock.unlock();
                 return;
             };
             // Alive as long as a socket is in it (see `Rooms`).
             const rooms = first.rooms;
-            socket.memberships_lock.unlock();
+            socket._memberships_lock.unlock();
             rooms.leaveAllOf(socket);
         }
     }
@@ -1154,8 +1173,8 @@ pub const Rooms = struct {
         var mine: ?*Member = null;
         {
             lockMemberships(socket);
-            defer socket.memberships_lock.unlock();
-            var link = &socket.memberships;
+            defer socket._memberships_lock.unlock();
+            var link = &socket._memberships;
             while (link.*) |m| {
                 if (m.rooms == self) {
                     link.* = m.next_of_socket;
@@ -1345,7 +1364,7 @@ pub const Rooms = struct {
     /// Starts `m`'s sender, `m.running` already set. Without a task to
     /// spare, what is queued waits for the next broadcast to try again.
     fn startSender(self: *Rooms, io: std.Io, m: *Member) void {
-        const where: placement.Where = if (m.socket.executor) |i| .{ .executor = i } else .local;
+        const where: placement.Where = if (m.socket._executor) |i| .{ .executor = i } else .local;
         placement.concurrent(&m.sender, io, where, sendQueued, .{ self, m }) catch {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);

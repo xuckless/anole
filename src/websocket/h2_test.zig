@@ -19,7 +19,7 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
         return;
     };
     defer ws.deinit();
-    try std.testing.expect(ws.conn == .h2);
+    try std.testing.expect(ws.httpVersion() != .http1);
     while (true) {
         const msg = ws.receive() catch |err| switch (err) {
             error.ConnectionClosed => return,

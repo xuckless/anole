@@ -60,13 +60,13 @@ fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize,
     var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}, arena) else {};
     defer if (features.compression) d.deinit();
     var socket: websocket.Socket = .{
-        .conn = .{ .h2 = sock },
-        .allocator = arena,
+        ._conn = .{ .stream = sock },
+        ._allocator = arena,
         .io = std.testing.io,
         .max_message_size = max_message_size,
     };
     if (comptime features.compression) {
-        if (compressed) socket.deflate = &d;
+        if (compressed) socket._deflate = &d;
     }
 
     var t: Transcript = .{};

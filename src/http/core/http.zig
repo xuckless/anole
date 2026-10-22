@@ -829,11 +829,11 @@ pub fn percentDecode(arena: std.mem.Allocator, text: []const u8, plus_is_space: 
     return out;
 }
 
-fn hexValue(c: u8) u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'A'...'F' => c - 'A' + 10,
-        else => c - 'a' + 10,
+fn hexValue(digit: u8) u8 {
+    return switch (digit) {
+        '0'...'9' => digit - '0',
+        'A'...'F' => digit - 'A' + 10,
+        else => digit - 'a' + 10,
     };
 }
 

@@ -89,7 +89,7 @@ const Stalled = struct {
     fn init(self: *Stalled, gpa: std.mem.Allocator, io: std.Io) void {
         self.* = .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} }, .io = io };
         self.ws = dusty.WebSocket.init(io, .{ .writer = &self.interface, .reader = &self.reader }, gpa, 0);
-        self.socket = .{ .conn = .{ .h1 = &self.ws }, .allocator = gpa, .io = io, .max_message_size = 1024 };
+        self.socket = .{ ._conn = .{ .h1 = &self.ws }, ._allocator = gpa, .io = io, .max_message_size = 1024 };
     }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {

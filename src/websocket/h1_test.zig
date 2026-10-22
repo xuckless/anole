@@ -34,7 +34,7 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
             },
             .close => {
                 saw_draining.store(ws.draining(), .release);
-                if (ws.conn == .h1 and ws.conn.h1.batch.started) flusher_started.store(true, .release);
+                if (ws._conn == .h1 and ws._conn.h1.batch.started) flusher_started.store(true, .release);
                 _ = closes_seen.fetchAdd(1, .acq_rel);
                 return;
             },
@@ -300,12 +300,12 @@ fn deflateHandler(req: *dusty.Request, res: *dusty.Response) !void {
         return;
     };
     defer ws.deinit();
-    if (comptime features.compression) if (ws.deflate) |d| deflate_apart.store(d.allocator.ptr != req.arena.ptr, .release);
+    if (comptime features.compression) if (ws._deflate) |d| deflate_apart.store(d.allocator.ptr != req.arena.ptr, .release);
     ws.close(.normal, "") catch {};
 }
 
 /// Sends `head` on a new connection to `addr` and returns the status line.
-fn handshake(io: std.Io, addr: std.Io.net.IpAddress, head: []const u8, line: []u8) ![]const u8 {
+fn answerHead(io: std.Io, addr: std.Io.net.IpAddress, head: []const u8, line: []u8) ![]const u8 {
     var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [512]u8 = undefined;
@@ -338,7 +338,7 @@ test "WebSocket over HTTP/1.1: permessage-deflate keeps its buffers out of the r
     try server.waitReady(io);
 
     var line: [64]u8 = undefined;
-    const status = try handshake(io, server.address.ip, "GET /deflate HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+    const status = try answerHead(io, server.address.ip, "GET /deflate HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", &line);
     try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 101"));
     for (0..1000) |_| {
@@ -373,7 +373,7 @@ test "WebSocket over HTTP/1.1: the handshake needs a GET, a proper key and, from
         .{ .head = "GET /ws HTTP/1.1\r\nHost: x\r\n" ++ rest ++ "Sec-WebSocket-Key: short\r\n\r\n", .status = "HTTP/1.1 400" },
     };
     for (cases) |case| {
-        const got = try handshake(io, server.address.ip, case.head, &line);
+        const got = try answerHead(io, server.address.ip, case.head, &line);
         std.testing.expect(std.mem.startsWith(u8, got, case.status)) catch |err| {
             std.debug.print("{s} -> {s}\n", .{ case.head, got });
             return err;
@@ -403,7 +403,7 @@ fn badHeaders(req: *dusty.Request, res: *dusty.Response) !void {
 }
 
 /// A handshake with `extra` request headers; the answer's head.
-fn handshake(io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, extra: []const u8, out: []u8) ![]const u8 {
+fn upgradeHead(io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, extra: []const u8, out: []u8) ![]const u8 {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [512]u8 = undefined;
@@ -440,14 +440,14 @@ test "WebSocket over HTTP/1.1: a subprotocol the client offered is selected by t
 
     var buf: [1024]u8 = undefined;
     // Offered `b, a` over two lines; the server prefers `a, c`.
-    const head = try handshake(io, server.address.ip, "/sp", "Sec-WebSocket-Protocol: b\r\nSec-WebSocket-Protocol: a\r\n", &buf);
+    const head = try upgradeHead(io, server.address.ip, "/sp", "Sec-WebSocket-Protocol: b\r\nSec-WebSocket-Protocol: a\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101"));
     try std.testing.expect(std.ascii.findIgnoreCase(head, "Sec-WebSocket-Protocol: a\r\n") != null);
     try std.testing.expect(std.ascii.findIgnoreCase(head, "X-User: u1\r\n") != null);
     try std.testing.expect(std.ascii.findIgnoreCase(head, "Set-Cookie: s=1\r\n") != null);
 
     // Offered only `x`: opens without one.
-    const none = try handshake(io, server.address.ip, "/sp", "Sec-WebSocket-Protocol: x\r\n", &buf);
+    const none = try upgradeHead(io, server.address.ip, "/sp", "Sec-WebSocket-Protocol: x\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, none, "HTTP/1.1 101"));
     try std.testing.expect(std.ascii.findIgnoreCase(none, "Sec-WebSocket-Protocol") == null);
 }
@@ -469,6 +469,6 @@ test "WebSocket over HTTP/1.1: extra handshake headers go out with the 101; Sec-
     defer future.cancel(io) catch {};
 
     var buf: [1024]u8 = undefined;
-    const head = try handshake(io, server.address.ip, "/bad", "", &buf);
+    const head = try upgradeHead(io, server.address.ip, "/bad", "", &buf);
     try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 500"));
 }

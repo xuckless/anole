@@ -961,7 +961,7 @@ pub const Engine = struct {
     /// The configuration's databases (`anole_db *`).
     dbs: []db.Db = &.{},
     /// WebSocket topics, shared by every executor.
-    rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa) else {},
+    rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
     /// gRPC services, methods, descriptors and health.
     grpc: grpc.EngineState = .{},
 

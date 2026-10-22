@@ -223,7 +223,7 @@ test "middleware: every built-in takes init(.{})" {
     }
 }
 
-test "api: Request and Response expose no engine fields without _" {
+test "public surface: Request, Response and websocket.Socket expose only the fields handlers may use" {
     const Allowed = struct {
         const request_fields = [_][]const u8{
             "method",           "url",            "version_major", "version_minor",  "headers",          "content_type",
@@ -235,7 +235,12 @@ test "api: Request and Response expose no engine fields without _" {
         const request_decls = [_][]const u8{
             "host",     "peerCertificate", "setTimeout", "setDeadline", "reader",        "readerLimited", "body",
             "param",    "queryParam",      "bind",       "bindWith",    "json",          "jsonValue",     "jsonObject",
-            "setLocal", "local",           "cookies",    "formData",    "multiFormData", "urlUnescape",
+            "setLocal", "local",           "cookies",    "formData",    "multiFormData", "urlUnescape", "paramDecoded",
+        };
+        const socket_fields = [_][]const u8{ "io", "max_message_size", "end_error", "close_code", "context", "subprotocol" };
+        const socket_decls = [_][]const u8{
+            "Conn",  "draining", "receive", "contextAs", "send",  "ping",
+            "next",  "close",    "deinit",  "httpVersion", "isClosed",
         };
         const response_fields = [_][]const u8{
             "status",         "body",      "headers",  "content_type", "arena",          "body_buffer", "io",
@@ -270,6 +275,7 @@ test "api: Request and Response expose no engine fields without _" {
     };
     Allowed.check(http.Request, &Allowed.request_fields, &Allowed.request_decls);
     Allowed.check(http.Response, &Allowed.response_fields, &Allowed.response_decls);
+    if (features.websocket) Allowed.check(anole.websocket.Socket, &Allowed.socket_fields, &Allowed.socket_decls);
 }
 
 test "doc comments: no dusty or core build-option names in public doc comments" {
