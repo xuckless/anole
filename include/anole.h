@@ -426,7 +426,8 @@ ANOLE_API anole_status anole_ws_send(anole_ws w, int type, const void *data, siz
    ANOLE_EV_WS_CLOSE follows once the socket is done. */
 ANOLE_API anole_status anole_ws_close(anole_ws w, uint16_t code, anole_str reason);
 /* Joins or leaves a topic (copied, 1-255 bytes). A socket leaves every
-   topic when it closes. */
+   topic when it closes. A publish called after this returns sees the
+   change (it reaches a socket that joined, and not one that left). */
 ANOLE_API anole_status anole_ws_subscribe(anole_ws w, anole_str topic);
 ANOLE_API anole_status anole_ws_unsubscribe(anole_ws w, anole_str topic);
 /* Sends one message to every socket subscribed to `topic` but `except` (0:

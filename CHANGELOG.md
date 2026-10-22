@@ -50,6 +50,14 @@ breaking changes are listed anyway.
 - `anole.mongodb.dynamic`: those operations named at run time with BSON
   arguments; `aggregate` caches a `bson.Array` pipeline that only reads.
 
+### Fixed
+
+- C ABI: a publish (`anole_ws_publish`) could overtake an
+  `anole_ws_subscribe` made before it, since the subscription is applied
+  on the socket's executor and the publish fans out from another, so a
+  socket that had just subscribed could miss it. A publish now waits for
+  the subscriptions taken before it.
+
 ## 0.1.1 (2026-10-22)
 
 ### Security
