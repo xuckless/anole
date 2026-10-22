@@ -75,6 +75,12 @@ pub const defaultError = dusty.defaultError;
 /// Fails with `error.AddressInUse` when a socket already listens on the
 /// address (which SO_REUSEPORT would silently share).
 pub const checkAddressFree = dusty.checkAddressFree;
+/// A listening TCP socket like `IpAddress.listen`'s, with IPV6_V6ONLY as
+/// asked: `.ipv6_only = false` on `::` takes IPv4 clients too.
+pub const listenIp = dusty.listenIp;
+/// An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) as the IPv4 address
+/// it stands for; any other address as it is.
+pub const unmapIpv4 = dusty.unmapIpv4;
 /// The open-file limit (raised at startup), and the connection cap worked
 /// out from it.
 pub const fd_limit = dusty.fd_limit;

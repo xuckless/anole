@@ -82,6 +82,12 @@ pub const statusBody = @import("middleware.zig").statusBody;
 /// Fails when another socket already listens on the address, which
 /// SO_REUSEPORT would silently share.
 pub const checkAddressFree = @import("server.zig").checkAddressFree;
+/// A listening TCP socket, with IPV6_V6ONLY as asked (dual-stack `::`).
+pub const listenIp = @import("server.zig").listenIp;
+/// `listenIp`'s options.
+pub const ListenIpOptions = @import("server.zig").ListenIpOptions;
+/// An IPv4-mapped IPv6 address as the IPv4 address it stands for.
+pub const unmapIpv4 = @import("server.zig").unmapIpv4;
 /// What the startup line says about a listener: "https://127.0.0.1:8443
 /// (HTTP/2, HTTP/1.1)".
 pub const describeListener = @import("server.zig").describeListener;

@@ -126,6 +126,8 @@ pub const Ctx = struct {
     arena: std.mem.Allocator,
     /// See `lastError`.
     last_error: ?ErrorDetail = null,
+    /// See `lastSource`.
+    last_source: ?Source = null,
 };
 
 /// Per call (`with`). The defaults are the plain path: no extra bound, a
@@ -150,25 +152,61 @@ pub const QueryOptions = struct {
     coalesce: bool = false,
     /// Reads: the result kept per executor for `ttl` and served from
     /// memory meanwhile, a miss coalescing with any identical one in
-    /// flight. Errors are not kept. Drop results early with the
-    /// connector's `cache.invalidate`. See `QueryCache`.
+    /// flight. Errors are not kept, and empty results only while
+    /// `keep_empty`. Drop results early with the connector's
+    /// `cache.invalidate`; `lastSource` says whether a call was answered
+    /// from memory. See `QueryCache`.
     cache: ?Cache = null,
 
-    /// `QueryOptions.cache`: how long a result is kept, and a tag to drop
-    /// it by.
+    /// `QueryOptions.cache`: how long a result is kept, a tag to drop it
+    /// by, and whether an empty one is kept.
     pub const Cache = struct {
         /// How long a result is served from memory.
         ttl: std.Io.Duration,
         /// A name to drop the result by: `cache.invalidate(.{ .tag = "posts" })`.
         tag: ?[]const u8 = null,
+        /// Keep empty results as well: `optional`'s null (Redis nil,
+        /// MongoDB `findOptional` with no match) and `all`'s zero rows
+        /// (MongoDB `find`, `aggregate` and `distinct` with none, an empty
+        /// Redis list or set). False serves them but keeps nothing, so the
+        /// next call asks again: for cache-aside, where a miss is followed
+        /// by filling the store, and "not there yet" must not be served
+        /// for `ttl` after the value exists. `one` and counts never return
+        /// empty (none is `error.NotFound`, never kept).
+        keep_empty: bool = true,
     };
 };
+
+/// Where a call's answer came from (`lastSource`).
+pub const Source = enum {
+    /// This executor's result cache (`QueryOptions.cache`): no round trip.
+    cache,
+    /// An identical call already in flight on this executor, joined
+    /// (`QueryOptions.coalesce`, or a cache miss): its round trip, shared.
+    coalesced,
+    /// A round trip of the call's own to the database.
+    database,
+};
+
+/// Where the last call made with `c` through `.cache` or `.coalesce`
+/// (`with(...)`) got its answer, failed calls included; null when `c` made
+/// none. Plain calls leave it as it was. For an `X-Cache` header:
+///
+///     const top = try app.db.with(.{ .cache = .{ .ttl = .fromSeconds(5) } }).all(Post, req, sql, .{});
+///     try res.header("X-Cache", if (anole.db.lastSource(req) == .cache) "HIT" else "MISS");
+pub fn lastSource(c: anytype) ?Source {
+    return internal.lastSource(c);
+}
 
 /// A connector's coalescing and result cache (`app.db.cache`), behind
 /// `QueryOptions.coalesce` and `QueryOptions.cache`.
 pub const QueryCache = @import("cache.zig").Cache;
 /// Its bounds (each connector's `Options.cache`).
 pub const CacheOptions = @import("cache.zig").Options;
+/// What a connector's read returns (`one`, `optional`, `all`), which tells
+/// the cache what an empty result is: each runner a connector passes to
+/// `QueryCache.read` names its own as `pub const shape`.
+pub const ReadShape = @import("cache.zig").Shape;
 
 /// How `begin` and `transaction` open a transaction.
 pub const TxOptions = struct {

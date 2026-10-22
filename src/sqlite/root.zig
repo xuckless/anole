@@ -513,6 +513,8 @@ pub const Query = struct {
         return struct {
             q: Query,
 
+            pub const shape = @field(db.ReadShape, @tagName(op));
+
             pub fn run(r: @This(), cx: anytype, sql: []const u8, args: anytype) Error!Out(op, T) {
                 return r.q.call(op, T, cx, sql, args);
             }
