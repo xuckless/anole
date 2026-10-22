@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
 
     const database_url = env("DATABASE_URL", "");
     if (database_url.len > 0) {
-        state.twelve = try twelve.State.init(init.gpa, app.io(), database_url, envInt(u32, "PG_POOL", 20), workers, env("JWT_SECRET", "twelve-dollar-challenge"));
+        state.twelve = try twelve.State.init(&app, database_url, envInt(u32, "PG_POOL", 20), env("JWT_SECRET", "twelve-dollar-challenge"));
         twelve.routes(&app);
     }
 

@@ -12,6 +12,7 @@ bench=$(dirname "$here")
 name=anole-bench-pg
 image=postgres:18.0-alpine3.22
 data=$bench/.data
+jwt_secret=twelve-dollar-challenge-hs256-32-byte-key
 
 psql() { docker exec -i "$name" psql -v ON_ERROR_STOP=1 -q -U bench "$@"; }
 
@@ -25,9 +26,12 @@ wait_ready() {
 
 seed() {
   mkdir -p "$data/seed"
-  if [ ! -f "$data/seed/posts.tsv" ]; then
+  # The tokens are signed with the suite's secret (twelveSecret in
+  # tools/internal/suite/twelve.go), not the challenge's 23-byte one.
+  if [ ! -f "$data/seed/posts.tsv" ] || [ "$(cat "$data/seed/jwt_secret" 2>/dev/null)" != "$jwt_secret" ]; then
     docker run --rm -v "$bench/twelve:/twelve:ro,z" -v "$data/seed:/out:z" -u "$(id -u):$(id -g)" \
-      node:24.11-alpine node /twelve/generate.mjs /out
+      -e JWT_SECRET="$jwt_secret" node:24.11-alpine node /twelve/generate.mjs /out
+    printf '%s' "$jwt_secret" >"$data/seed/jwt_secret"
   fi
   psql -d postgres -c "DROP DATABASE IF EXISTS seed" -c "CREATE DATABASE seed"
   psql -d seed <"$here/schema.pg.sql"

@@ -29,6 +29,12 @@ func pg(db string, sql ...string) error {
 	return nil
 }
 
+// twelveSecret replaces the challenge's HS256 secret ("twelve-dollar-challenge",
+// 23 bytes) for every server: RFC 7518 3.2 asks for at least 32, and Anole's
+// JWT verification (0.1.2 on) refuses shorter ones. bench/postgres/run.sh
+// signs tokens.json with the same secret.
+const twelveSecret = "twelve-dollar-challenge-hs256-32-byte-key"
+
 // resetDB makes a fresh "run" database from the seed template.
 func resetDB() error {
 	if err := pg("postgres", "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'run'"); err != nil {
@@ -79,6 +85,7 @@ func (s *Suite) Twelve(pgCPUs, pgCPUsDefault string) {
 			env := map[string]string{
 				"DATABASE_URL": "postgres://bench@127.0.0.1:5432/run",
 				"PG_POOL":      fmt.Sprint(tier.PGPool),
+				"JWT_SECRET":   twelveSecret,
 			}
 			fail := func(err error) {
 				s.record(Case{Scenario: "twelve", Server: name, Mode: "h1", Proto: "h1", Tier: tier.Name, Error: err.Error()})
@@ -104,7 +111,7 @@ func (s *Suite) Twelve(pgCPUs, pgCPUsDefault string) {
 					continue
 				}
 				golden := exec.Command("bash", filepath.Join(s.BenchDir, "twelve", "test.sh"), "http://127.0.0.1:8080")
-				golden.Env = append(golden.Environ(), "GOLDEN="+filepath.Join(s.BenchDir, "twelve", "golden"))
+				golden.Env = append(golden.Environ(), "GOLDEN="+filepath.Join(s.BenchDir, "twelve", "golden"), "JWT_SECRET="+twelveSecret)
 				out, err := golden.CombinedOutput()
 				sut.Stop()
 				if err != nil {

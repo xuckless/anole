@@ -62,7 +62,7 @@ language would reach for (the table in `bench/README.md`).
 | `MEDIA_DIR` | `/media` | Directory served under `/static/`. |
 | `DATABASE_URL` | unset | e.g. `postgres://bench@127.0.0.1:5432/run`. When set, the $12 routes are enabled. |
 | `PG_POOL` | `20` | Total Postgres connections across all workers: each worker opens `ceil(PG_POOL / WORKERS)`. |
-| `JWT_SECRET` | `twelve-dollar-challenge` | HS256 secret. |
+| `JWT_SECRET` | `twelve-dollar-challenge` | HS256 secret. The suite sets `twelve-dollar-challenge-hs256-32-byte-key` (RFC 7518 3.2 wants at least 32 bytes). |
 | `RETAIN` | `0` | Number of retained objects built at startup (GC test). |
 | `TICK_HZ` | `1000` | Ticks per second broadcast on `/ws/feed`. |
 
