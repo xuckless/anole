@@ -15,6 +15,13 @@ breaking changes are listed anyway.
 - `setCookie` refuses a `path` or `domain` containing `;` or a control
   character (`error.InvalidCookiePath`, `error.InvalidCookieDomain`), so a
   value taken from a request cannot add cookie attributes.
+- Session cookies: `cookie_opts` of `anole.session.Config` and of
+  `anole.http.middleware.Session.Config` is now `SessionCookieOpts`, whose
+  every field defaults to the safe value. Setting one field (say
+  `.{ .same_site = .none }`) used to reset the others to plain cookie
+  defaults: no `HttpOnly`, no `Secure`, no `Path`. Breaking: the type
+  changed and has no `max_age` (the middleware sets it); struct literals
+  keep compiling.
 
 ### C ABI (ABI 0.1)
 

@@ -25,6 +25,10 @@ const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;
 const log = std.log.scoped(.anole_session);
 
+/// The session cookie's attributes (`Config.cookie_opts`), with secure
+/// defaults for every field.
+pub const CookieOpts = dusty.SessionCookieOpts;
+
 /// The cookie encryption key's length in bytes (32), for `Config.key`.
 pub const key_length = Cipher.key_length;
 
@@ -201,8 +205,9 @@ pub const Config = struct {
     /// carries it renews it.
     ttl_seconds: u32 = 24 * 3600,
     /// The cookie's attributes: path `/`, `HttpOnly`, `Secure` and
-    /// `SameSite=Lax` by default. `max_age` is set from `ttl_seconds`.
-    cookie_opts: dusty.CookieOpts = .{ .path = "/", .http_only = true, .secure = true, .same_site = .lax },
+    /// `SameSite=Lax` by default, each kept unless set here (`.{ .same_site =
+    /// .none }` changes only that one). `Max-Age` comes from `ttl_seconds`.
+    cookie_opts: CookieOpts = .{},
 };
 
 /// The session entry `regenerate` leaves for the middleware. Never stored:
@@ -297,13 +302,10 @@ pub const Middleware = struct {
         if (req.session.len == 0) {
             // Cleared: forget it, here and in the browser.
             if (self.config.store) |store| if (id) |i| try store.destroy(i);
-            var opts = self.config.cookie_opts;
-            opts.max_age = .zero;
-            return res.setCookie(self.config.cookie_name, "", opts);
+            return res.setCookie(self.config.cookie_name, "", self.config.cookie_opts.withMaxAge(.zero));
         }
         const data = try serialize(req.arena, &req.session);
-        var opts = self.config.cookie_opts;
-        opts.max_age = .fromSeconds(self.config.ttl_seconds);
+        const opts = self.config.cookie_opts.withMaxAge(.fromSeconds(self.config.ttl_seconds));
         if (self.config.store) |store| {
             if (fresh) if (id) |old| try store.destroy(old);
             const session_id = if (fresh) try newId(req.arena, req.io) else id orelse try newId(req.arena, req.io);
@@ -485,4 +487,11 @@ test "fuzz: forged session cookies never open" {
             if (open(arena, key, "sid", raw)) |_| return error.ForgedCookieOpened else |_| {}
         }
     }.check, &.{ "", "AAAA", &@as([80]u8, @splat('A')), &@as([40]u8, @splat(0)) });
+}
+
+test "Config: setting one cookie_opts field keeps the secure defaults of the others" {
+    const mw = try Middleware.init(.{ .key = @splat(1), .cookie_opts = .{ .same_site = .strict } });
+    try std.testing.expect(mw.config.cookie_opts.http_only);
+    try std.testing.expect(mw.config.cookie_opts.secure);
+    try std.testing.expectEqualStrings("/", mw.config.cookie_opts.path);
 }

@@ -235,8 +235,9 @@ const rp: anole.auth.oidc.RelyingParty = .{
 
 With `form_post`, the callback is a cross-site `POST`, so read `code` and
 `state` from `req.formData()`. Browsers don't send a `SameSite=Lax` cookie
-on that request. Set `cookie_opts.same_site = .none` on the session
-middleware, and keep `secure = true`. Apple sends `email_verified` as a
+on that request. Set `.cookie_opts = .{ .same_site = .none }` on the session
+middleware; the other attributes keep their defaults (`Secure`, `HttpOnly`,
+`Path=/`). Apple sends `email_verified` as a
 string; Anole reads it as a boolean. Apple sends the user's name only once,
 in a `user` form field on the first sign-in, so `Identity.name` is null for
 Apple.
@@ -258,7 +259,8 @@ a key (`error.SessionKeyMissing`, with the fix in the log), so a forgotten
 key never gives cookies anyone could forge or read. `Config` also has
 `cookie_name` (`anole_session`), `ttl_seconds` (24 h,
 renewed by each response that carries the session) and `cookie_opts`
-(`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`). Chrome, Firefox and curl
+(`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`; setting one field keeps
+the others' defaults). Chrome, Firefox and curl
 keep `Secure` cookies on `http://localhost`; anywhere else, serve over HTTPS.
 
 There are three ways to keep sessions:

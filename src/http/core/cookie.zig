@@ -109,6 +109,34 @@ pub const CookieOpts = struct {
     };
 };
 
+/// A session cookie's attributes, for the session middleware
+/// (`anole.session.Config.cookie_opts`, `middleware.Session.Config.cookie_opts`).
+/// Unlike `CookieOpts`, every field defaults to the safe choice, so setting
+/// one (`.{ .same_site = .none }`) keeps the others: `Path=/`, `HttpOnly`,
+/// `Secure`, `SameSite=Lax`. `Max-Age` is the middleware's to set.
+pub const SessionCookieOpts = struct {
+    path: []const u8 = "/",
+    /// Empty: this host only.
+    domain: []const u8 = "",
+    secure: bool = true,
+    http_only: bool = true,
+    partitioned: bool = false,
+    same_site: ?CookieOpts.SameSite = .lax,
+
+    /// These attributes with `max_age`, as `setCookie` takes them.
+    pub fn withMaxAge(self: SessionCookieOpts, max_age: ?std.Io.Duration) CookieOpts {
+        return .{
+            .path = self.path,
+            .domain = self.domain,
+            .max_age = max_age,
+            .secure = self.secure,
+            .http_only = self.http_only,
+            .partitioned = self.partitioned,
+            .same_site = self.same_site,
+        };
+    }
+};
+
 /// RFC 6265 cookie-name, which is a token: no separators and no controls.
 /// `serializeCookie` writes the name verbatim, so a name carrying a `;`
 /// would smuggle in attributes of its own.

@@ -15,7 +15,7 @@
 const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
-const CookieOpts = @import("../cookie.zig").CookieOpts;
+const SessionCookieOpts = @import("../cookie.zig").SessionCookieOpts;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const base64url = std.base64.url_safe_no_pad;
@@ -98,13 +98,9 @@ pub const Config = struct {
     /// How long the cookie lasts, renewed on every response while the
     /// session has data; null for a browser-session cookie.
     max_age: ?std.Io.Duration = null,
-    /// Path "/", HttpOnly, Secure and SameSite=Lax by default.
-    cookie_opts: CookieOpts = .{
-        .path = "/",
-        .http_only = true,
-        .secure = true,
-        .same_site = .lax,
-    },
+    /// Path "/", HttpOnly, Secure and SameSite=Lax by default, each kept
+    /// unless set here (`.{ .same_site = .none }` changes only that one).
+    cookie_opts: SessionCookieOpts = .{},
 };
 
 config: Config,
@@ -151,16 +147,10 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
     if (should_set) {
         const result = if (req.session.len == 0) blk: {
             // Session was cleared — delete the cookie
-            var delete_opts = self.config.cookie_opts;
-            delete_opts.max_age = .zero;
-            break :blk res.setCookie(self.config.cookie_name, "", delete_opts);
+            break :blk res.setCookie(self.config.cookie_name, "", self.config.cookie_opts.withMaxAge(.zero));
         } else blk: {
             const signed = try self.signSession(req.arena, &req.session, .now(req.io, .real));
-            var opts = self.config.cookie_opts;
-            if (self.config.max_age) |ma| {
-                opts.max_age = ma;
-            }
-            break :blk res.setCookie(self.config.cookie_name, signed, opts);
+            break :blk res.setCookie(self.config.cookie_name, signed, self.config.cookie_opts.withMaxAge(self.config.max_age));
         };
         result catch |err| switch (err) {
             // The handler streamed its response, so the headers left before
@@ -483,4 +473,11 @@ test "SessionData: clear" {
     try testing.expect(s.modified);
     try testing.expectEqual(0, s.len);
     try testing.expect(s.get("a") == null);
+}
+
+test "Config: setting one cookie_opts field keeps the secure defaults of the others" {
+    const session = try init(.{ .secret_key = "test-secret-key-that-is-long-enough", .cookie_opts = .{ .same_site = .none } });
+    try testing.expect(session.config.cookie_opts.http_only);
+    try testing.expect(session.config.cookie_opts.secure);
+    try testing.expectEqualStrings("/", session.config.cookie_opts.path);
 }

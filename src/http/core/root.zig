@@ -58,6 +58,7 @@ pub const ContentType = @import("http.zig").ContentType;
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
+pub const SessionCookieOpts = @import("cookie.zig").SessionCookieOpts;
 pub const validateCookieName = @import("cookie.zig").validateCookieName;
 pub const validateCookieValue = @import("cookie.zig").validateCookieValue;
 /// Whether a header name or value may go on the wire (the C ABI checks
