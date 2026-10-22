@@ -380,3 +380,95 @@ test "WebSocket over HTTP/1.1: the handshake needs a GET, a proper key and, from
         };
     }
 }
+
+fn subprotocolEcho(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{
+        .subprotocols = &.{ "a", "c" },
+        .headers = &.{ .{ .name = "X-User", .value = "u1" }, .{ .name = "Set-Cookie", .value = "s=1" } },
+    })) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    // The selected name, back to the client.
+    try ws.send(.text, ws.subprotocol orelse "(none)");
+    _ = ws.receive() catch return;
+}
+
+fn badHeaders(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{
+        .headers = &.{.{ .name = "Sec-WebSocket-Accept", .value = "x" }},
+    })) orelse return;
+    ws.deinit();
+}
+
+/// A handshake with `extra` request headers; the answer's head.
+fn handshake(io: std.Io, addr: std.Io.net.IpAddress, path: []const u8, extra: []const u8, out: []u8) ![]const u8 {
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{s}\r\n", .{ path, extra });
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var n: usize = 0;
+    while (std.mem.indexOf(u8, out[0..n], "\r\n\r\n") == null) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        @memcpy(out[n..][0..line.len], line);
+        n += line.len;
+    }
+    return out[0..n];
+}
+
+test "WebSocket over HTTP/1.1: a subprotocol the client offered is selected by the server's order and echoed; none offered, none sent" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    server.router.get("/sp", subprotocolEcho);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    try server.waitReady(io);
+    defer future.cancel(io) catch {};
+
+    var buf: [1024]u8 = undefined;
+    // Offered `b, a` over two lines; the server prefers `a, c`.
+    const head = try handshake(io, server.address.ip, "/sp", "Sec-WebSocket-Protocol: b\r\nSec-WebSocket-Protocol: a\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 101"));
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "Sec-WebSocket-Protocol: a\r\n") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "X-User: u1\r\n") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "Set-Cookie: s=1\r\n") != null);
+
+    // Offered only `x`: opens without one.
+    const none = try handshake(io, server.address.ip, "/sp", "Sec-WebSocket-Protocol: x\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, none, "HTTP/1.1 101"));
+    try std.testing.expect(std.ascii.findIgnoreCase(none, "Sec-WebSocket-Protocol") == null);
+}
+
+test "WebSocket over HTTP/1.1: extra handshake headers go out with the 101; Sec-WebSocket-Accept in them is refused" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    server.router.get("/bad", badHeaders);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    try server.waitReady(io);
+    defer future.cancel(io) catch {};
+
+    var buf: [1024]u8 = undefined;
+    const head = try handshake(io, server.address.ip, "/bad", "", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 500"));
+}
