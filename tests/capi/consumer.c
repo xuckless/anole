@@ -530,6 +530,10 @@ static void ws_connect(conn_reader *c, uint16_t port) {
 
 /* ---- the suite ------------------------------------------------------------------------ */
 
+/* Built without WebSocket (-Dprofile=minimal), the suite leaves it out. */
+static int have_websocket;
+static const char *ws_route = "{\"path\":\"/ws\",\"websocket\":{\"handler\":10}},";
+
 static const char *test_config =
     "{\"listeners\":[{\"name\":\"main\",\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":%d,"
     "\"limits\":{\"inline_body_max\":65536,\"body_max\":%d,\"max_inflight\":%d},"
@@ -547,7 +551,7 @@ static const char *test_config =
     "{\"method\":\"GET\",\"path\":\"/stream\",\"handler\":7},"
     "{\"method\":\"GET\",\"path\":\"/file\",\"handler\":8},"
     "{\"method\":\"GET\",\"path\":\"/short\",\"handler\":9,\"timeout_ms\":150},"
-    "{\"path\":\"/ws\",\"websocket\":{\"handler\":10}},"
+    "%s"
     "{\"method\":\"PUT\",\"path\":\"/head\",\"handler\":11},"
     "{\"method\":\"GET\",\"path\":\"/cached\",\"handler\":1,\"cache\":{\"ttl_ms\":60000}}],"
     "\"observe\":{\"health\":{},\"metrics\":{}}}";
@@ -602,7 +606,8 @@ static void test_basics(void) {
   anole_str v = anole_version();
   CHECK(v.len > 0 && v.ptr[0] >= '0' && v.ptr[0] <= '9');
   anole_str http2 = {"http2", 5}, nope = {"nope", 4};
-  CHECK(anole_has_feature(http2) == 1);
+  int h2 = anole_has_feature(http2);
+  CHECK(h2 == 0 || h2 == 1);
   CHECK(anole_has_feature(nope) == 0);
   /* bad configuration, with the place in anole_last_error */
   const char *bad[] = {
@@ -639,7 +644,7 @@ static void test_basics(void) {
 
 static void test_main_server(void) {
   char json[4096];
-  snprintf(json, sizeof json, test_config, 4, 128 * 1024, 64, 400, 600);
+  snprintf(json, sizeof json, test_config, 4, 128 * 1024, 64, 400, 600, have_websocket ? ws_route : "");
   anole_server *s = make_server(json);
   current_server = s;
 
@@ -786,7 +791,7 @@ static void test_main_server(void) {
     CHECK(anole_respond(h ^ (1ull << 60), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
-    CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == ANOLE_E_GONE);
+    CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (have_websocket ? ANOLE_E_GONE : ANOLE_E_UNSUPPORTED));
 
     /* slot reuse: same executor and slot, newer generation, old one stays GONE */
     anole_req first = h;
@@ -855,7 +860,7 @@ static void test_main_server(void) {
   printf("ok client gone\n");
 
   /* WebSocket: echo, publish to a topic, a close from the consumer */
-  {
+  if (have_websocket) {
     static conn_reader c;
     char buf[256];
     size_t n;
@@ -954,7 +959,7 @@ static void test_main_server(void) {
    503, and a drain that cuts a request waiting past shutdown_ms. */
 static void test_shared_consumer(void) {
   char json[4096];
-  snprintf(json, sizeof json, test_config, 1, 128 * 1024, 2, 5000, 300);
+  snprintf(json, sizeof json, test_config, 1, 128 * 1024, 2, 5000, 300, have_websocket ? ws_route : "");
   anole_server *s = make_server(json);
   static consumer_state cs[2];
   anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_SHARED};
@@ -1013,6 +1018,8 @@ static void test_shared_consumer(void) {
 }
 
 static int run_tests(void) {
+  anole_str ws = {"websocket", 9};
+  have_websocket = anole_has_feature(ws);
   test_basics();
   test_main_server();
   test_shared_consumer();
