@@ -9,6 +9,8 @@ on:
   schedule:
     - cron: "41 6 * * 1"
   workflow_dispatch:
+  # From the Release checks workflow, at every release tag.
+  workflow_call:
   push:
     branches: [main]
     paths: [build.zig.zon, tools/sanitize-c-libs.sh, .github/workflows/sanitize.yml]
