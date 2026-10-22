@@ -741,7 +741,9 @@ pub fn checkAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void 
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (posix.errno(sys.bind(fd, &storage.any, len)) == .ADDRINUSE) {
-        log.err("{f} is already in use: another process is listening on it", .{address});
+        // Tests provoke it on purpose, and Zig's test runner fails a test
+        // that logs at err (as net.checkUdpAddressFree in src/h3).
+        if (!builtin.is_test) log.err("{f} is already in use: another process is listening on it", .{address});
         return error.AddressInUse;
     }
 }
