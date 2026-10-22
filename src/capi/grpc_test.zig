@@ -33,8 +33,9 @@ const Consumer = struct {
 
     fn run(self: *Consumer) void {
         var buf: [256 * 1024]u8 align(8) = undefined;
+        var need: u32 = 0;
         while (!self.stop.load(.acquire)) {
-            const n = engine.pollWait(self.c, &buf, 50) catch unreachable;
+            const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
             var off: usize = 0;
             while (off < n) {
                 const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
@@ -417,7 +418,7 @@ test "capi grpc: every call mode over h2c, status and metadata, deadlines, cance
     const rt = try zio.Runtime.init(alloc, .{});
     defer rt.deinit();
     const io = rt.io();
-    var f = try io.concurrent(check, .{ &a, e.ports.items[0], io });
+    var f = try io.concurrent(check, .{ &a, e.port(0), io });
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
