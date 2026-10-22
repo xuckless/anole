@@ -958,11 +958,21 @@ fn readFrame(call: *Call, reader: *std.Io.Reader, streaming: bool) !?frame.Decod
             else => |e| return e,
         };
     }
+    // A frame already whole in the buffer takes no waiting: no timer.
+    if (frameBuffered(reader)) return frame.readMessage(reader, scratch, call.impl.max_message_size, call.impl.request_compression);
     const limit: dusty.Deadline = .init(call.io, .{ .duration = .{ .raw = timeout, .clock = .awake } });
     return limit.run(frame.readMessage, .{ reader, scratch, call.impl.max_message_size, call.impl.request_compression }) catch |err| switch (err) {
         error.Timeout => error.ReadTimeout,
         else => |e| e,
     };
+}
+
+/// Whether `reader` holds a whole message frame (header and payload).
+fn frameBuffered(reader: *std.Io.Reader) bool {
+    const buffered = reader.buffered();
+    if (buffered.len < frame.header_size) return false;
+    const length = std.mem.readInt(u32, buffered[1..5], .big);
+    return buffered.len - frame.header_size >= length;
 }
 
 /// The rest of the body, of at most `limit - 1` bytes, in the call's
