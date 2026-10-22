@@ -5,6 +5,22 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Breaking
+
+- `anole.pg.Options.reset_session` is now an enum, `.auto` by default:
+  a connection going back to the pool is reset only when what it ran may
+  have changed its session (`SET`, `set_config(..., false)`, `SET ROLE`,
+  temporary tables, advisory locks, `LISTEN`, cursors `WITH HOLD`,
+  `lastval()` after an `INSERT`, `DO`/`CALL`, or a setting the server
+  reports changed), with just the statements that undo it; `PREPARE`,
+  `DEALLOCATE`, `DISCARD ALL` and `LOAD` close the connection. 0.1.1 reset
+  every connection on every release, which cost about a fifth of the
+  requests per second on pooled reads. Action: `true` becomes `.always`
+  (or keep the default), `false` becomes `.off`; in the C ABI's
+  configuration, `"reset_session"` takes `"auto"`, `"always"` or `"off"`.
+  Use `.always` if server-side functions change session state, since
+  `.auto` judges from the SQL text (docs/database.md, Session state).
+
 ### C ABI
 
 - `anole_db_*` with SQLite (additions to ABI 0.1): databases from the

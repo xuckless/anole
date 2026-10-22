@@ -153,8 +153,10 @@ pub const Config = struct {
         /// that fails.
         connect_at_start: bool = false,
         application_name: ?[]const u8 = null,
-        /// Reset each connection's session when a query gives it back.
-        reset_session: bool = true,
+        /// What happens to a connection's session when a query gives it
+        /// back: "auto" resets it when what the query ran may have changed
+        /// it, "always" on every release, "off" never.
+        reset_session: ResetSession = .auto,
         /// SQL run once at start, before the listeners open: a schema.
         init: ?[]const u8 = null,
     };
@@ -476,6 +478,9 @@ pub fn parse(arena: std.mem.Allocator, json: []const u8, why: *std.Io.Writer) Pr
 
 /// libpq's sslmode names ("verify-full"), as `anole.pg.SslMode`'s tags.
 pub const SslMode = enum { disable, allow, prefer, require, verify_ca, verify_full };
+
+/// `databases[].postgres.reset_session`, as `anole.pg.Options.ResetSession`.
+pub const ResetSession = enum { auto, always, off };
 
 pub fn sslMode(text: []const u8) ?SslMode {
     var buf: [16]u8 = undefined;
@@ -842,6 +847,10 @@ test "parse: the defaults, a full document, and what is refused" {
         why.end = 0;
         const p = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://db.internal/app\", \"sslmode\": \"verify-ca\", \"ca_pem\": \"-----BEGIN CERTIFICATE-----\"}}]}", &why);
         try std.testing.expectEqual(SslMode.verify_ca, sslMode(p.databases[0].postgres.?.sslmode.?).?);
+        try std.testing.expectEqual(ResetSession.auto, p.databases[0].postgres.?.reset_session);
+        why.end = 0;
+        const always = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://localhost/app\", \"reset_session\": \"always\"}}]}", &why);
+        try std.testing.expectEqual(ResetSession.always, always.databases[0].postgres.?.reset_session);
     }
     if (features.auth) {
         why.end = 0;

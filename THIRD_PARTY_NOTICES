@@ -142,10 +142,11 @@ pg.zig (PostgreSQL client)
             security patches: server messages checked before they are
             read, LISTEN channel names bounded, SCRAM nonce and iteration
             count checked, allowed login methods (require_auth) and SCRAM
-            channel binding, and an optional session reset on release;
+            channel binding, and an optional session reset on release,
+            every time or only when the SQL may have changed the session;
             for the C ABI: parameters as a slice of tagged unions, and
             results in PostgreSQL's text format)
-  Pinned:   commit dea575b5f1daae55edfcc45cc7adaf7018183ba1 of the fork
+  Pinned:   commit 6f47a57bd5f7d9e96440526d5b51bd7a043a8203 of the fork
   Linked:   -Dpostgres=true
 
 buffer.zig (byte buffers; a dependency of pg.zig)

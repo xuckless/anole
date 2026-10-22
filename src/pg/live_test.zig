@@ -579,14 +579,23 @@ test "pg: live channel binding, and what a call sets for the session is reset" {
     }
 
     // One connection, used by one call and then the next.
-    for ([_]bool{ true, false }) |reset| {
-        const d = try open(io, .{ .max_connections = 1, .reset_session = reset });
+    for ([_]pg.Options.ResetSession{ .auto, .always, .off }) |mode| {
+        const d = try open(io, .{ .max_connections = 1, .reset_session = mode });
         defer d.deinit();
         _ = try d.exec(&c, "SELECT set_config('anole.tenant', '7', false)", .{});
         const seen = try d.one([]const u8, &c, "SELECT coalesce(current_setting('anole.tenant', true), '')", .{});
-        try testing.expectEqualStrings(if (reset) "" else "7", seen);
+        try testing.expectEqualStrings(if (mode == .off) "7" else "", seen);
+        _ = try d.exec(&c, "SET ROLE pg_read_all_data", .{});
+        const role = try d.one([]const u8, &c, "SELECT current_user::text", .{});
+        try testing.expectEqualStrings(if (mode == .off) "pg_read_all_data" else "postgres", role);
+        if (mode == .off) _ = try d.exec(&c, "RESET ROLE", .{});
         // the statement cache outlives the reset
         for (0..3) |i| try testing.expectEqual(@as(i64, @intCast(i)), try d.one(i64, &c, "SELECT $1::int8", .{@as(i64, @intCast(i))}));
+        // what left the session as it was is followed by no reset under .auto
+        const conn = try d.acquire(&c);
+        defer conn.release();
+        try testing.expectEqual(mode == .always, conn.raw._reset_pending);
+        try testing.expect(conn.raw.statementCacheStats().hits >= 2);
     }
 }
 
