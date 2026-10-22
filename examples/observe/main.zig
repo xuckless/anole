@@ -78,7 +78,7 @@ fn notInMaintenance(ctx: ?*anyopaque) bool {
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8085;
     var log_format: observe.access_log.Format = .json;
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     if (args.next()) |f| log_format = std.meta.stringToEnum(observe.access_log.Format, f) orelse return error.UnknownLogFormat;

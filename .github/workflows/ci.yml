@@ -85,21 +85,101 @@ jobs:
           grep -F "invalid Anole feature flags" <<<"$out"
 
   cross:
-    name: cross (aarch64-linux-gnu, compile and link only)
+    name: cross (${{ matrix.target }}, compile and link only)
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64-windows: every preset and edge combination, which the
+        # windows job (default profile only) does not build.
+        target: [aarch64-linux-gnu, x86_64-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.17.0
-          cache-key: cross-aarch64-linux-gnu
+          cache-key: cross-${{ matrix.target }}
       # Zig fetches git and tarball dependencies itself on a cold cache;
       # the runners' network fails now and then (NameServerFailure,
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build every test binary and the full example
-        run: zig build test-flags full -Dtarget=aarch64-linux-gnu --summary all
+        run: zig build test-flags full -Dtarget=${{ matrix.target }} --summary all
+
+  windows:
+    name: windows (development target; default profile)
+    runs-on: windows-latest
+    # Windows is a development target ("works on Windows, fast on Linux"):
+    # the tests run, the examples build and two of them serve requests. The
+    # Unix-only parts (per-core SO_REUSEPORT sockets, HTTP/3 steering and
+    # UDP batching, listener hand-off and SIGUSR2, LISTEN_FDS, sd_notify,
+    # idle parking) are compiled out there and their tests skipped.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    # Strawberry Perl's pkg-config.bat is on the runner's PATH and fails
+    # when Zig asks it about the Windows system libraries (advapi32 for
+    # translate-c): with no pkg-config, Zig links them directly.
+    env:
+      PKG_CONFIG: anole-no-pkg-config
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: windows
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Unit and smoke tests (default profile, every feature on)
+        timeout-minutes: 60
+        run: zig build test --summary all
+      - name: Build and install the examples
+        timeout-minutes: 20
+        run: zig build hello rest websocket grpc auth clients observe postgres sqlite mongodb redis io full --summary all
+      # Two examples serve requests: hello over HTTP/1.1, and full (every
+      # listener, `process` set, so the Unix-only hand-off is skipped)
+      # over HTTP/1.1, HTTPS, and h2c and HTTP/2 over TLS when a curl with
+      # HTTP/2 is on the runner (Git for Windows' is built without it; the
+      # h2 client tests above cover HTTP/2 either way). Ctrl-C would drain
+      # them, but a runner has no console to send one to, so they are killed.
+      - name: examples/hello and examples/full answer requests
+        timeout-minutes: 5
+        run: |
+          h2curl=
+          for c in curl /c/Windows/System32/curl.exe; do
+            if "$c" -V 2>/dev/null | grep -q '^Features:.* HTTP2'; then h2curl=$c; break; fi
+          done
+          get() {
+            for i in $(seq 1 50); do
+              if "$@"; then echo; return 0; fi
+              sleep 0.2
+            done
+            return 1
+          }
+          ok=0
+          ./zig-out/bin/hello.exe > hello.log 2>&1 &
+          hello=$!
+          get curl -fsS http://127.0.0.1:3000/ || ok=1
+          kill $hello || true
+          ./zig-out/bin/full.exe > full.log 2>&1 &
+          full=$!
+          get curl -fsS http://127.0.0.1:8080/ || ok=1
+          get curl -fsSk https://127.0.0.1:8443/ || ok=1
+          if [ -n "$h2curl" ]; then
+            get "$h2curl" -fsS --http2-prior-knowledge http://127.0.0.1:8080/ -w ' (HTTP/%{http_version})' || ok=1
+            get "$h2curl" -fsSk --http2 https://127.0.0.1:8443/ -w ' (HTTP/%{http_version})' || ok=1
+          else
+            echo "no curl with HTTP/2 here: h2c and h2 over TLS not checked from outside"
+          fi
+          kill $full || true
+          echo "--- hello.log"; cat hello.log
+          echo "--- full.log"; cat full.log
+          exit $ok
 
   h2spec:
     name: h2spec (HTTP/2 conformance, h2c and TLS)

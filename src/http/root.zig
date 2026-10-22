@@ -147,6 +147,37 @@ test "HTTP/1.1 smoke: GET /users/:id over loopback on zio" {
     try std.testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nuser 42"));
 }
 
+// What the core's own test of this checks under std.Io.Threaded, here on
+// zio, the runtime Anole serves on: on Windows the listener binds without
+// SO_REUSEADDR and the bind refuses (std.Io.Threaded's Windows bind shares
+// the address, so the core's test is skipped there).
+test "port in use on zio: a second server on the same port fails instead of sharing it" {
+    const zio = @import("zio");
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const Run = struct {
+        fn run(s: *Server(void)) anyerror!void {
+            try s.run();
+        }
+    };
+
+    var first = Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer first.deinit();
+    var first_future = try io.concurrent(Run.run, .{&first});
+    defer first_future.cancel(io) catch {};
+    try first.waitReady(io);
+
+    const taken: Address = .{ .ip = first.address.ip };
+    var second = Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = taken }} }, {});
+    defer second.deinit();
+    var second_future = try io.concurrent(Run.run, .{&second});
+    defer second_future.cancel(io) catch {};
+    try std.testing.expectError(error.AddressInUse, second.waitReady(io));
+}
+
 test {
-    _ = @import("park_test.zig");
+    // Idle parking is off on Windows (the core's server/park.zig).
+    if (@import("builtin").os.tag != .windows) _ = @import("park_test.zig");
 }

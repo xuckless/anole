@@ -421,14 +421,12 @@ fn remoteAddressBody(req: *Request, res: *Response) !void {
 /// Whether this machine has IPv6 loopback (`::1`): not in a container
 /// with IPv6 off.
 fn haveIpv6Loopback() bool {
-    const c = std.c;
-    const fd = c.socket(std.posix.AF.INET6, std.posix.SOCK.DGRAM, 0);
-    if (fd < 0) return false;
-    defer _ = c.close(fd);
+    // Through std.Io, which binds on Windows too.
+    const io = std.testing.io;
     const lo: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };
-    var storage: std.Io.Threaded.PosixAddress = undefined;
-    const len = std.Io.Threaded.addressToPosix(&lo, &storage);
-    return c.bind(fd, &storage.any, len) == 0;
+    const socket = lo.bind(io, .{ .mode = .dgram }) catch return false;
+    socket.close(io);
+    return true;
 }
 
 /// `GET /addr` over a fresh TCP connection to `to`: the body.

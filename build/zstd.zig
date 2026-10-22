@@ -36,12 +36,13 @@ pub fn library(
     });
     const m = lib.root_module;
     switch (target.result.os.tag) {
-        .linux, .macos => {},
-        else => @panic("zstd: unsupported target OS (Anole supports Linux and macOS)"),
+        .linux, .macos, .windows => {},
+        else => @panic("zstd: unsupported target OS (Anole supports Linux, macOS and Windows)"),
     }
     m.addCMacro("ZSTD_LEGACY_SUPPORT", "0");
     m.addCSourceFiles(.{ .root = upstream.path("lib"), .files = sources, .flags = &.{"-std=c99"} });
-    if (target.result.cpu.arch == .x86_64) {
+    // The assembly decoder is ELF/Mach-O only (zstd leaves it out on Windows).
+    if (target.result.cpu.arch == .x86_64 and target.result.os.tag != .windows) {
         m.addAssemblyFile(upstream.path("lib/decompress/huf_decompress_amd64.S"));
     } else {
         m.addCMacro("ZSTD_DISABLE_ASM", "1");

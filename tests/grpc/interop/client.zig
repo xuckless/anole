@@ -144,7 +144,7 @@ fn unimplementedMethod(client: Client, arena: std.mem.Allocator) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     const port = try std.fmt.parseInt(u16, args.next() orelse "10000", 10);
     const case = args.next() orelse return error.MissingTestCase;

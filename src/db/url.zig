@@ -223,9 +223,10 @@ fn decode(arena: std.mem.Allocator, text: []const u8) error{ InvalidUrl, OutOfMe
 /// The environment variable `name` (`DATABASE_URL`, `PGHOST`...), or null
 /// when unset. From `environ` (`std.process.Init.Minimal.environ`, what
 /// `ServerOptions.process` carries) when given, else from the C library's
-/// environment, which Anole always links.
+/// environment, which Anole always links. On Windows always the C
+/// library's: `Environ` holds UTF-16 there, with nothing to slice.
 pub fn env(environ: ?std.process.Environ, name: []const u8) ?[]const u8 {
-    if (environ) |e| return e.getPosix(name);
+    if (comptime @import("builtin").os.tag != .windows) if (environ) |e| return e.getPosix(name);
     var buf: [256]u8 = undefined;
     if (name.len >= buf.len) return null;
     @memcpy(buf[0..name.len], name);
@@ -309,5 +310,6 @@ test "redacted: no password in what is printed" {
 test "env: from the C environment, or from an Environ" {
     try testing.expect(env(null, "ANOLE_SURELY_UNSET_VARIABLE") == null);
     try testing.expect(env(null, "PATH") != null);
-    try testing.expect(env(.empty, "PATH") == null);
+    // Windows reads the C library's environment whatever it is given.
+    if (comptime @import("builtin").os.tag != .windows) try testing.expect(env(.empty, "PATH") == null);
 }

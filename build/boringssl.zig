@@ -4,9 +4,10 @@
 //! Adapted from allyourcodebase/boringssl's build.zig
 //! (https://github.com/allyourcodebase/boringssl, Copyright (c) Lukas Kastern, Zlib licence).
 //! Altered: one combined library instead of bcm/crypto/ssl, no tests/tools/decrepit,
-//! no nasm (Anole has no Windows), no patch step, and BoringSSL's own CMake/Bazel
-//! flags (BORINGSSL_IMPLEMENTATION, -fno-strict-aliasing, -fno-common,
-//! -fno-exceptions, -fno-rtti, -D_XOPEN_SOURCE=700 on Linux).
+//! no nasm (Windows, a development-only target, builds with OPENSSL_NO_ASM), no
+//! patch step, and BoringSSL's own CMake/Bazel flags (BORINGSSL_IMPLEMENTATION,
+//! -fno-strict-aliasing, -fno-common, -fno-exceptions, -fno-rtti,
+//! -D_XOPEN_SOURCE=700 on Linux, the WIN32 defines and ws2_32 on Windows).
 const std = @import("std");
 
 const SourceList = struct {
@@ -28,7 +29,9 @@ pub fn library(
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
     const t = target.result;
-    if (t.os.tag == .windows) @panic("boringssl: Windows is not supported by Anole (no nasm)");
+    // Windows is a development-only target: its x86_64 assembly is NASM
+    // syntax, which Zig does not assemble, so it builds the C fallbacks.
+    const no_asm = t.os.tag == .windows;
 
     const json = upstream.builder.root.root_dir.handle.readFileAlloc(
         b.graph.io,
@@ -64,6 +67,13 @@ pub fn library(
     }) catch @panic("OOM");
     // glibc needs this for pthread_rwlock_t; it disables APIs on Apple and the BSDs.
     if (t.os.tag == .linux) cxx_flags.append(b.allocator, "-D_XOPEN_SOURCE=700") catch @panic("OOM");
+    if (t.os.tag == .windows) cxx_flags.appendSlice(b.allocator, &.{
+        "-D_HAS_EXCEPTIONS=0",
+        "-DWIN32_LEAN_AND_MEAN",
+        "-DNOMINMAX",
+        "-D_CRT_SECURE_NO_WARNINGS",
+    }) catch @panic("OOM");
+    if (no_asm) cxx_flags.append(b.allocator, "-DOPENSSL_NO_ASM") catch @panic("OOM");
 
     const root = upstream.path("");
     inline for (.{ "bcm", "crypto", "ssl" }) |part| {
@@ -75,11 +85,12 @@ pub fn library(
         }
         lib.root_module.addCSourceFiles(.{ .root = root, .files = files.items, .flags = cxx_flags.items });
         // Every .S file is guarded by #if on arch and object format, so all are passed.
-        if (list.@"asm".len != 0)
+        if (list.@"asm".len != 0 and !no_asm)
             lib.root_module.addCSourceFiles(.{ .root = root, .files = list.@"asm", .flags = &.{"-DBORINGSSL_IMPLEMENTATION"} });
     }
 
     lib.root_module.addIncludePath(upstream.path("include"));
+    if (t.os.tag == .windows) lib.root_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     lib.installHeadersDirectory(upstream.path("include"), "", .{});
     return lib;
 }

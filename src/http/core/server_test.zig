@@ -3880,6 +3880,7 @@ test "Server: a warm HTTP/1.1 keepalive connection serves requests without alloc
 }
 
 test "Server: serves on an inherited listening socket (fd)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // inherited sockets (hand-off, socket activation) are Unix only
     const io = std.testing.io;
     // Opened elsewhere, as systemd or a previous process would have.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };

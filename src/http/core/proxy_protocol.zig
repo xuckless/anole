@@ -392,7 +392,9 @@ test "fuzz: PROXY protocol headers, parsed and read off a socket" {
             }
 
             // `read` takes exactly the header off the socket, and says
-            // what parsing it says.
+            // what parsing it says. Not on Windows, which has no
+            // socketpair(2).
+            if (comptime @import("builtin").os.tag == .windows) return;
             var fds: [2]std.c.fd_t = undefined;
             if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
             defer _ = std.c.close(fds[0]);

@@ -69,6 +69,7 @@ pub fn wallClock(io: std.Io) u64 {
 /// share it (`steer`). Blocking; whoever adopts it makes it otherwise.
 /// `ipv6_only` sets IPV6_V6ONLY on an IPv6 address (false: dual-stack).
 pub fn bindReusePort(address: std.Io.net.IpAddress, ipv6_only: ?bool) !std.posix.fd_t {
+    if (comptime @import("builtin").os.tag == .windows) return error.ReusePortFailed;
     const posix = std.posix;
     const family: c_int = switch (address) {
         .ip4 => posix.AF.INET,
@@ -100,6 +101,9 @@ pub fn bindReusePort(address: std.Io.net.IpAddress, ipv6_only: ?bool) !std.posix
 /// a probe with SO_REUSEADDR would join sockets that set it too. Port zero
 /// is not checked, and nothing is when the probe cannot be had.
 pub fn checkUdpAddressFree(address: std.Io.net.IpAddress, ipv6_only: ?bool) error{AddressInUse}!void {
+    // Windows has no SO_REUSEPORT group to join: one socket, whose own
+    // bind fails on a port in use.
+    if (comptime @import("builtin").os.tag == .windows) return;
     if (address.getPort() == 0) return;
     const posix = std.posix;
     const family: c_int = switch (address) {
@@ -146,7 +150,9 @@ fn setIpv6Only(fd: std.posix.fd_t, address: std.Io.net.IpAddress, ipv6_only: ?bo
 /// from the address the peer wrote to), don't-fragment so path MTU
 /// discovery measures the real path, and on Linux segmentation offload
 /// both ways (GSO, GRO). Every option is best-effort: without it QUIC still
-/// works, just with less information.
+/// works, just with less information. On Windows (a development target)
+/// none is set and no control messages pass: no ECN, and replies leave a
+/// wildcard socket from the address the system picks.
 pub const Udp = struct {
     socket: std.Io.net.Socket,
     ip6: bool,
@@ -161,6 +167,10 @@ pub const Udp = struct {
     const linux = std.os.linux;
     const cmsg = std.Io.net.cmsg;
 
+    /// Whether datagrams carry control messages (ECN, PKTINFO, GSO/GRO):
+    /// not on Windows.
+    pub const has_control = native_os != .windows;
+
     /// Room for the control messages either way.
     pub const control_len = 128;
     pub const Control = [control_len]u8;
@@ -172,6 +182,7 @@ pub const Udp = struct {
             .ip6 => |a| std.mem.allEqual(u8, &a.bytes, 0),
         };
         var self: Udp = .{ .socket = socket, .ip6 = ip6, .wildcard = wildcard };
+        if (comptime !has_control) return self;
         const fd = socket.handle;
         if (ip6) {
             _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVTCLASS, 1);
@@ -240,7 +251,7 @@ pub const Udp = struct {
 
     pub fn receive(self: *const Udp, io: std.Io, buf: []u8, control: *align(cmsg_align) Control, timeout: std.Io.Timeout) ReceiveError!Datagram {
         var msg: std.Io.net.IncomingMessage = .init;
-        msg.control = control;
+        if (comptime has_control) msg.control = control;
         const err, const count = self.socket.receiveManyTimeout(io, (&msg)[0..1], buf, .{}, timeout);
         if (err) |e| return e;
         std.debug.assert(count == 1);
@@ -274,7 +285,7 @@ pub const Udp = struct {
         std.debug.assert(buf.len >= batch_buffer_len);
         for (&batch.msgs, &batch.controls) |*m, *ctl| {
             m.* = .init;
-            m.control = ctl;
+            if (comptime has_control) m.control = ctl;
         }
         const err, const count = self.socket.receiveManyTimeout(io, &batch.msgs, buf, .{}, timeout);
         batch.count = count;
@@ -286,6 +297,7 @@ pub const Udp = struct {
 
     fn datagramOf(self: *const Udp, msg: *const std.Io.net.IncomingMessage) Datagram {
         var d: Datagram = .{ .from = msg.from, .local = null, .ecn = 0, .data = msg.data, .segment = msg.data.len };
+        if (comptime !has_control) return d;
         var it: cmsg.Iterator = .{ .control = @alignCast(msg.control) };
         while (it.next()) |m| {
             const level = m.header.level;
@@ -360,6 +372,7 @@ pub const Udp = struct {
     /// the source themselves (ngtcp2 then finds ECN does not get through
     /// and stops marking).
     fn controlFor(self: *const Udp, control: *align(cmsg_align) Control, to: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, len: usize, segment: usize) usize {
+        if (comptime !has_control) return 0;
         var w: usize = 0;
         const mapped = self.ip6 and isIpv4Mapped(to);
         if (mapped and native_os != .linux) return 0;
@@ -505,7 +518,8 @@ pub const Udp = struct {
 
     /// The UDP_SEGMENT size among a message's control messages; 0 for none.
     fn segmentOf(control: []const u8) usize {
-        if (native_os != .linux or control.len == 0) return 0;
+        if (comptime native_os != .linux) return 0;
+        if (control.len == 0) return 0;
         var it: cmsg.Iterator = .{ .control = @alignCast(@constCast(control)) };
         while (it.next()) |m| if (m.header.level == posix.IPPROTO.UDP and m.header.type == linux.UDP.SEGMENT and m.data.len >= 2)
             return std.mem.readInt(u16, m.data[0..2], native_endian);
@@ -557,6 +571,7 @@ test "UDP: a send that a cancelation interrupts leaves it for the next cancelati
 }
 
 test "UDP: ECN codepoints and the local address of a wildcard socket come through" {
+    if (comptime !Udp.has_control) return error.SkipZigTest; // no control messages on Windows
     const zio = @import("zio");
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -602,6 +617,7 @@ test "UDP: ECN codepoints and the local address of a wildcard socket come throug
 }
 
 test "UDP: SO_REUSEPORT sockets share a port, and the probe sees any socket on it" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT on Windows
     const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     const first = try bindReusePort(lo, null);
     var first_open = true;
@@ -658,7 +674,7 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     var got: usize = 0;
     while (got < 3) {
         var dg = try a.receive(io, &buf, &control, timeout);
-        try std.testing.expectEqual(@as(u8, 2), dg.ecn);
+        try std.testing.expectEqual(@as(u8, if (Udp.has_control) 2 else 0), dg.ecn);
         while (dg.next()) |d| {
             try std.testing.expectEqualStrings(([_][]const u8{ "aaaa", "bbbb", "cc" })[got], d);
             got += 1;
@@ -666,5 +682,5 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     }
     const dg = try b.receive(io, &buf, &control, timeout);
     try std.testing.expectEqualStrings("dddd", dg.data);
-    try std.testing.expectEqual(@as(u8, 1), dg.ecn);
+    try std.testing.expectEqual(@as(u8, if (Udp.has_control) 1 else 0), dg.ecn);
 }
