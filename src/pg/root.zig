@@ -38,6 +38,9 @@
 //!   (`require_auth=md5` allows it). SCRAM binds the login to the TLS
 //!   connection when the server offers it (`channel_binding=prefer`;
 //!   `require` insists).
+//! - Sessions: a connection going back to the pool is reset (what `SET`,
+//!   `set_config(..., false)`, `SET ROLE` and temporary tables left), with
+//!   no extra round trip; `Options.reset_session = false` turns it off.
 //! - Pools: `max_connections` split between the executors; a connection
 //!   opens when a call first needs one.
 //! - Statements: each connection prepares a statement the first time it
@@ -128,6 +131,15 @@ pub const Options = struct {
     /// Where `DATABASE_URL` and the `PG*` variables come from; null: the
     /// process's environment (`app.postgres` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
+    /// Reset each connection's session when it goes back to the pool
+    /// (`DISCARD ALL` but for the prepared statements): what one call left
+    /// with `SET`, `set_config(..., false)`, `SET ROLE`, temporary tables or
+    /// advisory locks is gone before the next call gets the connection. The
+    /// reset is sent on release and its answer read with the next call's,
+    /// so it costs the server a little work but no round trip. Off: only
+    /// `SET LOCAL` (or `set_config(..., true)`) inside a transaction is safe,
+    /// since the next call on the connection may be another user's.
+    reset_session: bool = true,
 
     /// Certificates beyond what the URL names (`Options.tls`).
     pub const Tls = struct {
@@ -530,6 +542,7 @@ pub const Client = struct {
             .connect_on_init_count = 0,
             .max_lifetime = if (opts.max_lifetime) |d| millis(d) else null,
             .idle_timeout = if (opts.idle_timeout) |d| millis(d) else null,
+            .reset = if (opts.reset_session) pg.Pool.reset_sql else null,
         };
 
         self.pools = try .init(gpa, io);
@@ -897,7 +910,7 @@ fn sendCancel(io: std.Io, conn: *pg.Conn) void {
 
 fn brokenConnection(err: anyerror) bool {
     return switch (err) {
-        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow => true,
+        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow, error.SessionResetFailed => true,
         else => false,
     };
 }

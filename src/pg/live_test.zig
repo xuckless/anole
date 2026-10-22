@@ -488,7 +488,7 @@ test "pg: live TLS as the URL asks, and a refused login" {
     try testing.expectStringStartsWith(detail.code, "28");
 }
 
-test "pg: live channel binding" {
+test "pg: live channel binding, and what a call sets for the session is reset" {
     const url = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -513,6 +513,16 @@ test "pg: live channel binding" {
         }
     }
 
+    // One connection, used by one call and then the next.
+    for ([_]bool{ true, false }) |reset| {
+        const d = try open(io, .{ .max_connections = 1, .reset_session = reset });
+        defer d.deinit();
+        _ = try d.exec(&c, "SELECT set_config('anole.tenant', '7', false)", .{});
+        const seen = try d.one([]const u8, &c, "SELECT coalesce(current_setting('anole.tenant', true), '')", .{});
+        try testing.expectEqualStrings(if (reset) "" else "7", seen);
+        // the statement cache outlives the reset
+        for (0..3) |i| try testing.expectEqual(@as(i64, @intCast(i)), try d.one(i64, &c, "SELECT $1::int8", .{@as(i64, @intCast(i))}));
+    }
 }
 
 const AppState = struct {
