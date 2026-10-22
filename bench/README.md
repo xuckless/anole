@@ -141,11 +141,35 @@ of memory long before CPU, which makes the score a ranking of memory per
 idle connection, not of throughput or of behavior under load; `raw`,
 `conns`, `latency`, `ws` and `video` measure those.
 
+### Behind nginx
+
+The `<framework>-nginx` servers (`raw` and `twelve` only) put nginx 1.30.1
+in front of each framework, in the framework's own container. nginx takes the
+bench ports (HTTP/1.1, TLS with h2, HTTP/3), and the app listens on
+127.0.0.1:9080 over HTTP/1.1. `servers/front` builds a static nginx and a
+launcher that starts both and stops both.
+
+Every framework gets the same config (`servers/front/nginx.conf.in`): a
+keep-alive upstream pool, no caching, no access log, and the client side as
+the baseline nginx's. Because the proxy shares the tier's CPUs and memory
+with the app, this measures an app behind a proxy on the same box, not a
+separate proxy machine. The difference from the direct numbers is what the
+proxy costs, plus what it adds: TLS, h2 and HTTP/3 for a framework that
+lacks them.
+
 ### Deviations worth knowing
 
-- **Anole's Postgres client** (`servers/anole/src/pg.zig`) is bench-local:
-  Anole has none yet. It is a small async client on Anole's sockets with a
-  pool per executor and prepared statements, as pgx, sqlx and asyncpg do.
+- **The $12 JWT secret.** The challenge signs with `twelve-dollar-challenge`,
+  which is 23 bytes. RFC 7518 3.2 wants an HS256 secret of at least 32 bytes,
+  and Anole refuses a shorter one. Every server, `tokens.json` and the golden
+  tests use `twelve-dollar-challenge-hs256-32-byte-key` instead
+  (`twelveSecret`).
+
+- **Anole's Postgres client** is Anole's own (`app.postgres`, `anole.pg`): a
+  pool per executor (`PG_POOL` split between them) with statements prepared
+  per connection, as pgx, sqlx and asyncpg do. A call that waits more than
+  5 s for a connection gets 503, which is the library's default
+  `acquire_timeout`.
 - **FastAPI's HTTP/3 with more than one worker** runs one Hypercorn per
   worker on its own `SO_REUSEPORT` sockets (`servers/fastapi/h3_workers.py`):
   Hypercorn's `--workers` shares one UDP socket between processes, which
