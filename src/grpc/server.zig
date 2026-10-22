@@ -209,14 +209,24 @@ pub const Call = struct {
         return @ptrCast(@alignCast(self.ctx.?));
     }
 
-    /// Ends the call with `code` and `message`: return what this returns.
+    /// Ends the call with `code` and `message` (copied): return what this returns.
     pub fn fail(self: *Call, code: Code, message: []const u8) Error {
         self.status = code;
-        self.status_message = message;
+        self.status_message = self.arena.dupe(u8, message) catch "out of memory";
         return error.GrpcStatus;
     }
 
-    /// Adds initial metadata (a response header). The response head goes
+    /// `fail` with a formatted message.
+    ///
+    ///     return call.failFmt(.not_found, "no user {d}", .{id});
+    pub fn failFmt(self: *Call, code: Code, comptime fmt: []const u8, args: anytype) Error {
+        self.status = code;
+        self.status_message = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory";
+        return error.GrpcStatus;
+    }
+
+    /// Adds initial metadata (a response header; `name` and `value` are
+    /// copied, and a repeated key keeps every value). The response head goes
     /// out with the first response message: once it has started this
     /// returns `error.HeadersSent`. In a streaming handler, where the
     /// response writer runs as its own task, add headers before the first
@@ -226,18 +236,21 @@ pub const Call = struct {
         try self.impl.write_mutex.lock(self.io);
         defer self.impl.write_mutex.unlock(self.io);
         if (self.impl.out != null) return error.HeadersSent;
-        try self.res.header(name, value);
+        if (!metadata_mod.isSendableKey(name, .header) or !metadata_mod.isSendableValue(name, value)) return error.InvalidMetadata;
+        try self.res.addHeader(try self.arena.dupe(u8, name), try self.arena.dupe(u8, value));
     }
 
     /// Adds trailing metadata, sent with the status. `name` is a metadata
     /// key (lower-case letters, digits, `-`, `_` and `.`) and `value`
     /// printable ASCII; under a `-bin` name, `value` is the base64 text, as
     /// `metadata` returns it (`addBinaryTrailer` takes the bytes). Anything
-    /// else fails with `error.InvalidMetadata`, so a value from the client
+    /// else (or a key the protocols own: `grpc-*` but
+    /// `grpc-status-details-bin`, `connect-*`, `trailer-*`, `content-type`,
+    /// `te`...) fails with `error.InvalidMetadata`, so a value from the client
     /// cannot add lines to the trailers.
     pub fn addTrailer(self: *Call, name: []const u8, value: []const u8) !void {
-        if (!metadata_mod.isValidKey(name) or !validTrailerValue(name, value)) return error.InvalidMetadata;
-        try self.impl.trailers.append(self.arena, .{ .key = name, .value = value });
+        if (!metadata_mod.isSendableKey(name, .trailer) or !metadata_mod.isSendableValue(name, value)) return error.InvalidMetadata;
+        try self.impl.trailers.append(self.arena, .{ .key = try self.arena.dupe(u8, name), .value = try self.arena.dupe(u8, value) });
     }
 
     /// Adds binary trailing metadata: `bytes` under a `-bin` name, base64
@@ -280,20 +293,6 @@ pub const Call = struct {
         return std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d);
     }
 };
-
-/// Whether `value` may go out as trailing metadata under `name`: base64
-/// text for a `-bin` name, else printable ASCII.
-fn validTrailerValue(name: []const u8, value: []const u8) bool {
-    if (metadata_mod.isBinaryKey(name)) {
-        for (value) |ch| switch (ch) {
-            'A'...'Z', 'a'...'z', '0'...'9', '+', '/', '=' => {},
-            else => return false,
-        };
-        return true;
-    }
-    for (value) |ch| if (ch < 0x20 or ch > 0x7e) return false;
-    return true;
-}
 
 /// The four gRPC call shapes, told apart by a generated method's
 /// signature: one request or a queue of them, one response or a queue.
@@ -1470,6 +1469,49 @@ test "addTrailer refuses names and values that are not metadata" {
     const items = call.impl.trailers.items;
     try std.testing.expectEqual(@as(usize, 4), items.len);
     try std.testing.expectEqualStrings("AA0K/w", items[3].value);
+}
+
+test "grpc: addTrailer refuses grpc-status, grpc-message, content-type, te" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
+    for ([_][]const u8{ "grpc-status", "grpc-message", "content-type", "te", "connect-x", "trailer-x" }) |name|
+        try std.testing.expectError(error.InvalidMetadata, call.addTrailer(name, "v"));
+    try call.addTrailer("grpc-status-details-bin", "AAEC");
+    try std.testing.expectEqual(@as(usize, 1), call.impl.trailers.items.len);
+}
+
+test "grpc: fail copies its message" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
+    var buf: [16]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&buf, "no user {d}", .{7});
+    try std.testing.expectError(error.GrpcStatus, call.fail(.not_found, msg));
+    @memset(&buf, 'x');
+    try std.testing.expectEqualStrings("no user 7", call.status_message);
+}
+
+test "grpc: failFmt" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
+    try std.testing.expectError(error.GrpcStatus, call.failFmt(.not_found, "no user {d}", .{42}));
+    try std.testing.expectEqualStrings("no user 42", call.status_message);
+    try std.testing.expectEqual(Code.not_found, call.status);
+}
+
+test "grpc: addTrailer copies" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
+    var name: [8]u8 = "x-served".*;
+    var value: [3]u8 = "one".*;
+    try call.addTrailer(&name, &value);
+    @memset(&name, 'q');
+    @memset(&value, 'q');
+    try std.testing.expectEqualStrings("x-served", call.impl.trailers.items[0].key);
+    try std.testing.expectEqualStrings("one", call.impl.trailers.items[0].value);
 }
 
 test "percentEncode leaves printable ASCII and escapes the rest" {

@@ -634,7 +634,7 @@ fn collectMetadata(req: *http.Request) ![]const [2][]const u8 {
     const out = try req.arena.alloc([2][]const u8, n);
     var k: usize = 0;
     for (req.headers.keys[0..n], req.headers.values[0..n]) |name_in, value| {
-        if (isTransportHeader(name_in)) continue;
+        if (md_keys.isTransportHeader(name_in)) continue;
         var name = name_in;
         for (name_in) |ch| if (std.ascii.isUpper(ch)) {
             name = try std.ascii.allocLowerString(req.arena, name_in);
@@ -653,20 +653,6 @@ fn collectMetadata(req: *http.Request) ![]const [2][]const u8 {
         k += 1;
     }
     return out[0..k];
-}
-
-/// Headers the protocols use themselves, and hop-by-hop ones: not metadata.
-fn isTransportHeader(name: []const u8) bool {
-    if (name.len == 0 or name[0] == ':') return true;
-    const list = [_][]const u8{
-        "content-type",             "te",                 "grpc-timeout",             "grpc-encoding",
-        "grpc-accept-encoding",     "content-length",     "content-encoding",         "accept-encoding",
-        "connect-protocol-version", "connect-timeout-ms", "connect-content-encoding", "connect-accept-encoding",
-        "connection",               "keep-alive",         "transfer-encoding",        "upgrade",
-        "host",
-    };
-    for (list) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
-    return false;
 }
 
 /// The call's task waits for the answer, and writes it.
@@ -1203,16 +1189,12 @@ pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8, now: i96) usize {
 /// (`grpc-*` but grpc-status-details-bin, `connect-*`, `trailer-*`, HTTP's
 /// framing), an ASCII value unless it is `-bin` (bytes, base64-encoded by
 /// Anole).
-fn checkMetadata(list: []const CHeader) error{Invalid}!void {
+fn checkMetadata(list: []const CHeader, place: md_keys.Place) error{Invalid}!void {
     for (list) |hd| {
         const name = hd.name.slice();
-        const value = hd.value.slice();
-        if (!md_keys.isValidKey(name)) return error.Invalid;
-        if (std.mem.startsWith(u8, name, "grpc-") and !std.mem.eql(u8, name, "grpc-status-details-bin")) return error.Invalid;
-        if (std.mem.startsWith(u8, name, "connect-") or std.mem.startsWith(u8, name, "trailer-")) return error.Invalid;
-        if (isTransportHeader(name)) return error.Invalid;
+        if (!md_keys.isSendableKey(name, place)) return error.Invalid;
         if (md_keys.isBinaryKey(name)) continue;
-        for (value) |ch| if (ch < 0x20 or ch > 0x7e) return error.Invalid;
+        if (!md_keys.isSendableValue(name, hd.value.slice())) return error.Invalid;
     }
 }
 
@@ -1236,7 +1218,7 @@ fn unclaim(s: *Slot, h: Handle) void {
 }
 
 pub fn sendHeaders(e: *Engine, hv: u64, md: []const CHeader) AnswerError!void {
-    try checkMetadata(md);
+    try checkMetadata(md, .header);
     _, const s, const h = try claim(e, hv);
     defer unclaim(s, h);
     if (s.grpc.headers_set or s.grpc.has_message) return error.State;
@@ -1365,7 +1347,7 @@ pub fn sendWait(e: *Engine, hv: u64, msg: []const u8, timeout_ms: i32) AnswerErr
 
 pub fn finish(e: *Engine, hv: u64, code: u32, message: []const u8, trailers: []const CHeader) AnswerError!void {
     if (code > 16) return error.Invalid;
-    try checkMetadata(trailers);
+    try checkMetadata(trailers, .trailer);
     if (message.len > 64 * 1024) return error.Invalid;
     _, const s0, const h0 = slotOf(e, hv) catch |err| return e.badHandle(err);
     if (s0.out.gen == h0.gen) {
