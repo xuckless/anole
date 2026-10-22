@@ -123,32 +123,18 @@ pub const Blob = struct {
     }
 };
 
-/// A value whose type is known only at run time: a parameter of `table`
-/// and `run`, or a cell of a `Table`. What the C ABI (`anole_db_*`) and
-/// the language bindings pass.
-pub const Value = union(enum) {
-    null,
-    int: i64,
-    float: f64,
-    /// UTF-8 text; in a row, copied into the arena.
-    text: []const u8,
-    /// Bytes; in a row, copied into the arena.
-    blob: []const u8,
-};
+/// A value whose type is known only at run time (`anole.db.Value`): a
+/// parameter of `table` and `run`, or a cell of a `Table`. A bool binds as
+/// 1 or 0; cells are never bools.
+pub const Value = db.Value;
 
-/// Rows whose columns are known only at run time (`Query.table`): the
-/// result's column names, and each row's cells in that order.
-pub const Table = struct {
-    columns: []const []const u8,
-    rows: []const []const Value,
-};
+/// Rows whose columns are known only at run time (`Query.table`,
+/// `anole.db.Table`); `types` is empty.
+pub const Table = db.Table;
 
-/// What a write did (`Query.run`): the rows it changed, and the rowid of
-/// the last row inserted on the connection.
-pub const Changes = struct {
-    changes: u64,
-    last_insert_rowid: i64,
-};
+/// What a write did (`Query.run`, `anole.db.Changes`): the rows it changed,
+/// and the rowid of the last row inserted on the connection.
+pub const Changes = db.Changes;
 
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
@@ -1357,6 +1343,7 @@ fn bindValues(stmt: *c.sqlite3_stmt, values: []const Value, lifetime: Lifetime, 
         const rc = switch (v) {
             .null => c.sqlite3_bind_null(stmt, index),
             .int => |n| c.sqlite3_bind_int64(stmt, index, n),
+            .bool => |b| c.sqlite3_bind_int64(stmt, index, @intFromBool(b)),
             .float => |x| c.sqlite3_bind_double(stmt, index, x),
             .text => |t| c.sqlite3_bind_text64(stmt, index, t.ptr, t.len, destructor, c.SQLITE_UTF8),
             .blob => |b| c.sqlite3_bind_blob64(stmt, index, b.ptr, b.len, destructor),

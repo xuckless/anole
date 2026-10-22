@@ -295,7 +295,8 @@ per executor, and the larger of 16 x `limits.ws_high_water` and
 
 `anole_db_*` runs SQL without blocking the caller, for event-loop consumers
 (Node, asyncio). A database is configured with the server and opened at
-start, before the listeners, with its `init` script:
+start, before the listeners, with its `init` script. SQLite and PostgreSQL
+are the kinds so far:
 
 ```json
 "databases": [
@@ -323,8 +324,9 @@ anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
   connections on Anole's blocking pool beside the writer (WAL), writes in
   turn on the database's writer thread, `:memory:` all on the writer.
 - `anole_db_query` returns rows: the column names (`columns`), then
-  `nrows * ncolumns` cells (`anole_db_cell`: null, integer, float, text or
-  blob), row after row, all in the record. `anole_db_exec` returns
+  `nrows * ncolumns` cells (`anole_db_cell`: null, integer, float, bool,
+  text or blob), row after row, all in the record. A bool parameter binds
+  as 1 or 0 in SQLite. `anole_db_exec` returns
   `changes` and `last_insert_rowid`; with no parameters its SQL may hold
   several statements.
 - Options (`anole_db_options`, or NULL):
@@ -345,6 +347,60 @@ anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
     for logs. Don't send them to clients.
 - Queries can be queued from `anole_server_start` until the server stops.
   Queries still running at the stop get no answer.
+
+### PostgreSQL
+
+The same calls, options, answers and error classes, with a `"postgres"`
+database:
+
+```json
+"databases": [
+  { "name": "main",
+    "postgres": { "url": "postgres://app:secret@db.internal:5432/app",
+                  "ca_file": "/etc/ssl/db-ca.pem",
+                  "init": "CREATE TABLE IF NOT EXISTS notes (id bigserial PRIMARY KEY, title text UNIQUE NOT NULL)" } }
+]
+```
+
+- It is `anole.pg` underneath ([database.md](database.md)): each executor
+  has its own pool, so a query never leaves the executor that runs it,
+  and `timeout_ms` also sends PostgreSQL a CancelRequest.
+- TLS is checked by default. A server on another host gets
+  `sslmode=verify-full` (TLS, the certificate and the host name checked
+  against the system's store) unless the URL, `"sslmode"` or `PGSSLMODE`
+  says otherwise; a server on this machine gets `prefer`. For a private CA,
+  give `"ca_file"` (or `"ca_pem"`, the PEM text): with either, the server is
+  always checked, and an sslmode that would not check it is refused. The
+  URL's `sslrootcert`, `sslcert` and `sslkey` work as in libpq. `"sslmode"`
+  and an `sslmode=` in the URL together are refused.
+- `"url"` may be left out: then `DATABASE_URL`, else libpq's variables
+  (`PGHOST`, `PGUSER`, `PGPASSWORD`...), from the process's environment.
+- Parameters are `$1`, `$2`... Each value goes as the parameter's type when
+  PostgreSQL takes it that way (an int for int4, int8 or numeric, a blob
+  for bytea, a bool for bool), else as text that PostgreSQL parses into the
+  parameter's type: a timestamptz as text (`"2026-10-22T10:00:00Z"`), an
+  array literal (`"{1,2}"`), a number for a text parameter. A value
+  PostgreSQL can't parse fails the query (`ANOLE_E_DB`, SQLSTATE 22P02).
+- Cells: `bool` is `ANOLE_DB_BOOL`; `int2`, `int4`, `int8`, `oid` are
+  `ANOLE_DB_INT`; `float4`, `float8` are `ANOLE_DB_FLOAT`; `bytea` is
+  `ANOLE_DB_BLOB`; every other type is `ANOLE_DB_TEXT` in PostgreSQL's text
+  format, as psql prints it: `numeric` exactly (`"12.50"`), timestamps as
+  the session prints them (`"2026-10-22 10:00:00+00"`), JSON as its text,
+  arrays as `"{1,2}"`. Every cell carries its column's type OID in
+  `db_type` (`20` int8, `1700` numeric, `1184` timestamptz, `3802`
+  jsonb...), so a binding parses text cells with its ecosystem's own
+  PostgreSQL type parsers (what node-postgres and psycopg do with the same
+  text) instead of Anole guessing at a JavaScript or Python type. NULL
+  cells carry the OID too.
+- `anole_db_exec` returns `changes` (rows inserted, updated or deleted);
+  `last_insert_rowid` is 0. For generated keys, use `RETURNING` with
+  `anole_db_query`.
+- Errors: `error_code` is the SQLSTATE (`"23505"`), `constraint` the
+  constraint's name; the classes are those of `anole.db`
+  (`ANOLE_DB_ERR_UNIQUE` for 23505, `SERIALIZATION` for 40001,
+  `UNAVAILABLE` when no connection could be had...).
+- `ANOLE_DB_WRITE` means nothing here (any connection runs any
+  statement).
 
 ## Lifecycle
 
@@ -386,12 +442,11 @@ routes with native ones.
 ## What comes next
 
 ABI 0.1 is the request/response and WebSocket core, plus `anole_db_*` with
-SQLite. Before the ABI freezes (1.0) and the bindings ship, these come as
+SQLite and PostgreSQL. Before the ABI freezes (1.0) and the bindings ship, these come as
 their own pull requests; their event types and handle kinds are reserved
 already:
 
-- The other databases through `anole_db_*`, in this order: PostgreSQL
-  (the same calls and answers), Redis, MongoDB.
+- The other databases through `anole_db_*`: Redis, then MongoDB.
 - gRPC: server, with service methods implemented in the language.
 - WebTransport: sessions, streams and datagrams.
 - TLS extras: mutual TLS and the client certificate in the request,
