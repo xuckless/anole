@@ -427,7 +427,7 @@ const WtAnswerer = struct {
     }
 
     fn write(self: *WtAnswerer, h: u64, data: []const u8, fin: bool) !void {
-        if (try engine.wt.write(self.e, h, data, fin)) {
+        if (try engine.wt.write(self.e, h, data, fin, false)) {
             _ = self.busies.fetchAdd(1, .monotonic);
             if (self.streams.getPtr(h)) |ent| ent.busy = true;
         }
@@ -501,7 +501,7 @@ const WtAnswerer = struct {
                 if (engine.wt.sendDatagram(e, h, "x")) |_| return error.NotStale else |err| if (err != error.Gone) return err;
                 var it = self.streams.iterator();
                 while (it.next()) |kv| if (kv.value_ptr.session == h) {
-                    if (engine.wt.write(e, kv.key_ptr.*, "x", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                    if (engine.wt.write(e, kv.key_ptr.*, "x", false, false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
                     _ = self.stale_ok.fetchAdd(1, .monotonic);
                 };
                 _ = self.closes.fetchAdd(1, .monotonic);
@@ -619,7 +619,7 @@ fn wtCheck(a: *WtAnswerer, port: u16, io: std.Io, keep: *?*anole.webtransport.Se
         const forged_stream: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 5) << 28) | 1;
         try std.testing.expectError(error.Gone, engine.wt.openStream(a.e, forged_session, false));
         try std.testing.expectError(error.Gone, engine.wt.close(a.e, forged_session, 0, ""));
-        try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false));
+        try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false, false));
         try std.testing.expectError(error.Gone, engine.wt.streamOp(a.e, forged_stream, .release, 0));
         // A request handle is not a session.
         try std.testing.expectError(error.Gone, engine.wt.sendDatagram(a.e, 1, "x"));
@@ -948,4 +948,108 @@ test "capi engine: mutual TLS (require, request, HTTP/3), the client certificate
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
     try std.testing.expect(e.wait(5000));
+}
+
+/// Holds a control call inside the engine (`engine.test_control_hook`)
+/// until the test lets it go.
+const ControlHold = struct {
+    var entered: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn hook() void {
+        entered.set(engine.threadedIo());
+        go.waitUncancelable(engine.threadedIo());
+    }
+
+    fn reload(e: *engine.Engine, out: *?anyerror) void {
+        e.reloadCertificates() catch |err| {
+            out.* = err;
+        };
+    }
+};
+
+test "capi engine: a reload from another thread holds the server's stop until it returns" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const json =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0, "tls": {"self_signed": true}}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = try engine.Engine.create(json, false, &why);
+    defer e.destroy();
+    try e.start();
+    const tio = engine.threadedIo();
+    ControlHold.entered = .unset;
+    ControlHold.go = .unset;
+    engine.test_control_hook = &ControlHold.hook;
+    var result: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, ControlHold.reload, .{ e, &result });
+    // The reload holds the server; nothing else is held.
+    ControlHold.entered.waitUncancelable(tio);
+    engine.test_control_hook = null;
+    try e.drain();
+    // Give the stop time to finish, had it not waited for the reload: the
+    // run thread would free the server and exit (its stack, which held the
+    // server, with it).
+    try std.Io.sleep(tio, .fromMilliseconds(400), .awake);
+    if (e.stopped.isSet()) {
+        e.thread.?.join();
+        e.thread = null;
+    }
+    ControlHold.go.set(tio);
+    t.join();
+    // The reload ran on the live server (a self-signed listener reloads in
+    // place), and the stop went on after it.
+    try std.testing.expectEqual(@as(?anyerror, null), result);
+    try std.testing.expect(e.wait(5000));
+    // After the stop: refused, never followed into a freed server.
+    try std.testing.expectError(error.State, e.reloadCertificates());
+    try e.drain();
+}
+
+const Racer = struct {
+    e: *engine.Engine,
+    stop: *std.atomic.Value(bool),
+    which: u8,
+
+    fn run(r: Racer) void {
+        var n: usize = 0;
+        while (!r.stop.load(.acquire)) : (n += 1) {
+            switch (r.which) {
+                0 => r.e.reloadCertificates() catch {},
+                1 => r.e.setCertificate(.dev_self_signed) catch {},
+                else => if (n % 64 == 63) r.e.drain() catch {} else r.e.reloadCertificates() catch {},
+            }
+        }
+    }
+};
+
+test "capi engine: drain and reloads from other threads race the stop, many times over" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const json =
+        \\{"executors": 2, "timeouts": {"shutdown_ms": 100},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0, "tls": {"self_signed": true}}]}
+    ;
+    const tio = engine.threadedIo();
+    for (0..24) |round| {
+        var why_buf: [256]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        const e = try engine.Engine.create(json, false, &why);
+        defer e.destroy();
+        try e.start();
+        var stop: std.atomic.Value(bool) = .init(false);
+        var threads: [3]std.Thread = undefined;
+        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Racer.run, .{Racer{ .e = e, .stop = &stop, .which = @intCast(i) }});
+        // The stop lands at a different point of the racers' calls each
+        // round.
+        try std.Io.sleep(tio, .fromMicroseconds(@intCast(round * 400)), .awake);
+        try e.drain();
+        try std.testing.expect(e.wait(5000));
+        // Past the stop the calls are refused; let them run into that too.
+        try std.Io.sleep(tio, .fromMilliseconds(2), .awake);
+        stop.store(true, .release);
+        for (threads) |t| t.join();
+        try std.testing.expectError(error.State, e.reloadCertificates());
+    }
 }

@@ -122,6 +122,15 @@ pub fn Router(comptime Ctx: type) type {
         has_routes: bool = false,
         /// Some route was registered with `no_wait`.
         has_no_wait: bool = false,
+        /// A route that conflicts with one registered before it panics
+        /// (a programmer error in Zig code) unless this is set: then it is
+        /// left out, and the first conflict's message is kept in `conflict`
+        /// for the caller to report. For route tables that come from data
+        /// at run time (the C ABI's configuration), where a panic would
+        /// take the host process with it.
+        record_conflicts: bool = false,
+        /// The first conflict found under `record_conflicts`.
+        conflict: ?[]const u8 = null,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -190,6 +199,13 @@ pub fn Router(comptime Ctx: type) type {
             return null;
         }
 
+        /// A conflict: a panic, or under `record_conflicts` the message
+        /// (the first one) and the route left out.
+        fn conflicted(self: *Self, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+            if (!self.record_conflicts) std.debug.panic(fmt, args);
+            if (self.conflict == null) self.conflict = try std.fmt.allocPrint(self.arena.allocator(), fmt, args);
+        }
+
         fn insertRoute(
             self: *Self,
             path: []const u8,
@@ -201,7 +217,7 @@ pub fn Router(comptime Ctx: type) type {
             self.has_routes = true;
             if (opts.no_wait) self.has_no_wait = true;
             if (self.findConflict(path, method)) |c| {
-                std.debug.panic("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
+                return self.conflicted("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
             }
 
             const slot = if (method) |m| &self.trees[@backingInt(m)] else &self.any_tree;
@@ -246,7 +262,7 @@ pub fn Router(comptime Ctx: type) type {
                     // One param or wildcard node captures under one name, and
                     // a route reading another would never find its value.
                     if ((kind == .wildcard or kind == .param) and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
-                        std.debug.panic("route {s}: {s} conflicts with {c}{s}, registered at the same position by another route", .{
+                        return self.conflicted("route {s}: {s} conflicts with {c}{s}, registered at the same position by another route", .{
                             path, segment, segment[0], existing.param_name.?,
                         });
                     }
@@ -283,7 +299,7 @@ pub fn Router(comptime Ctx: type) type {
 
             // A second registration would silently replace the first.
             if (current.route != null) {
-                std.debug.panic("route {s} {s} is registered twice", .{ if (method) |m| m.name() else "ANY", path });
+                return self.conflicted("route {s} {s} is registered twice", .{ if (method) |m| m.name() else "ANY", path });
             }
 
             // Create and store route
@@ -1936,6 +1952,31 @@ test "Router: a method route conflicts with a more specific any() route" {
     for (cases) |case| {
         try std.testing.expectEqual(case[2], conflicts(case[0], case[1]));
     }
+}
+
+test "Router: record_conflicts keeps the first conflict and leaves the route out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    router.get("/users/:id", testHandler);
+    router.get("/users/:name/posts", testHandler2);
+    try std.testing.expectEqualStrings("route /users/:name/posts: :name conflicts with :id, registered at the same position by another route", router.conflict.?);
+    router.get("/users/:id", testHandler2);
+    router.any("/a/b", testHandler);
+    router.get("/a/:x", testHandler);
+    // Still the first.
+    try std.testing.expect(std.mem.indexOf(u8, router.conflict.?, ":name") != null);
+    // What was registered before stands, and the duplicate did not replace it.
+    var req = Request{
+        .method = .get,
+        .url = "/users/7",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
 }
 
 test "Router: a GET route answers HEAD" {

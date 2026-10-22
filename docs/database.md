@@ -296,6 +296,12 @@ try tx.commit(req); // under the request's deadline, like every call
   AUTHORIZATION`, temporary tables, cursors `WITH HOLD`, advisory locks or
   `LISTEN` is gone before another request gets the connection. A
   connection given back inside a transaction is closed, never handed on.
+  A plain call (`exec`, `one`, `all`... on the client, not a `Tx`) that
+  leaves a transaction open, such as a bare `BEGIN`, is rolled back and
+  fails: the next call may get another connection, so the transaction
+  would not be one. Use `begin` or `transaction`; a whole `BEGIN; ...;
+  COMMIT` in one call without parameters still works. SQLite does the
+  same, since its writer is shared by every request.
   `Options.reset_session` says how:
   - `.auto` (the default) resets a connection only when what it ran may
     have changed its session, and then sends only the statements that undo

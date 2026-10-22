@@ -2002,6 +2002,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.pending) |opts| try self.configure(opts);
             logBuildMode();
             self.addHelperRoutes();
+            // Only with `router.record_conflicts` (the C ABI): a route the
+            // helper routes collided with.
+            if (self.router.conflict != null) return self.failStart(error.RouteConflict);
             self.startConnectors() catch |err| return self.failStart(err);
             const rt_io = self.rt.io();
             const Done = union(enum) {

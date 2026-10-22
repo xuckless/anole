@@ -30,6 +30,60 @@ breaking changes are listed anyway.
   HTTP/2 and HTTP/3), so its handler's `receive` ends and its `close`
   callback runs. Until now it stayed open with nothing served to it, for
   ever with the default `timeout`, holding its task and memory.
+- C ABI: handle generations started at 1 again for every server, so after
+  `anole_server_destroy` and a new `anole_server_create` in the same
+  process, a handle kept from the first server (a late answer, a WebSocket
+  send, a WebTransport write) was valid against whatever the second server
+  held in the same slot: it could answer another client's request with a
+  response meant for someone else. The slots of each new server now start
+  past every generation an earlier server handed out, so such a handle is
+  `ANOLE_E_GONE`.
+- Databases (`anole_db_*` in the C ABI, and plain calls on `anole.sqlite`
+  and `anole.pg`): a call that left a transaction open, such as a bare
+  `BEGIN` or a script that failed before its `COMMIT`, was taken as
+  done. On SQLite the shared writer connection stayed inside that
+  transaction, so every later write from any request joined it, unseen by
+  readers and lost by a later `ROLLBACK` from anyone. On PostgreSQL the
+  connection was closed on its way back to the pool and the statements
+  meant for the transaction each committed on their own. Such a call is
+  now rolled back and fails (class `other`, a 500 by default) with a
+  message pointing to `begin`/`transaction`; a whole transaction in one
+  call without parameters still works. A transaction API for the C ABI
+  comes later.
+
+### Breaking
+
+- C ABI 0.6: bit 0 of every send-type call's flags is `ANOLE_BODY_BORROW`,
+  and a call's own flags start at bit 1. `ANOLE_WT_FIN` was 1, the same
+  bit as `ANOLE_BODY_BORROW`, so a borrowing `anole_wt_stream_write` (a
+  binding's usual "borrow above 64 KiB" helper) silently ended the
+  WebTransport stream after its bytes. `ANOLE_WT_FIN` is now 2, in
+  `anole_wt_stream_write`'s flags and in `ANOLE_EV_WT_DATA`'s; a borrowed
+  write is copied as before and gets its `ANOLE_EV_SENT`; unknown flag
+  bits are `ANOLE_E_INVALID`. Action: rebuild against the new `anole.h`
+  (a binding built against ABI 0.5 that passes 1 to end a stream now
+  borrows instead, and its streams do not end).
+
+### Fixed
+
+- C ABI: `anole_server_drain`, `anole_server_reload_certificates` and
+  `anole_server_reload_tls` called from another thread while the server
+  stopped could reach the server after its run thread had freed it (the
+  server lived on that thread's stack), a use-after-free in the host
+  process. The header promises these calls from any thread; they now
+  either act on a server that is still serving or answer as documented
+  (`ANOLE_OK` for a drain once the server is stopping, `ANOLE_E_STATE`
+  for a reload), and a stop waits for a reload under way before it frees
+  the server. `anole.h` states the rule: any thread, between
+  `anole_server_create` and `anole_server_destroy`.
+- C ABI: two routes of the configuration that the router cannot tell
+  apart (the same method and path twice, two parameter names at one
+  position, a method route less specific than an any-method one, or a
+  route on a path Anole serves itself, such as the metrics path) made
+  `anole_server_start` panic, which aborted the host process (Node,
+  Python). `anole_server_start` now answers `ANOLE_E_CONFIG`, and
+  `anole_last_error` names the routes. Zig's `app.get` and friends still
+  panic on a conflict, at registration.
 
 ## 0.1.2 (2026-10-22)
 

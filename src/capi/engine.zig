@@ -47,6 +47,9 @@ pub const Config = config_mod.Config;
 pub const ws = if (features.websocket) @import("ws.zig") else struct {
     pub const ExecState = struct {
         pub fn deinit(_: *ExecState) void {}
+        pub fn maxGen(_: *const ExecState) u32 {
+            return 0;
+        }
     };
 };
 /// gRPC services implemented by consumers (`anole_grpc_*`).
@@ -60,6 +63,9 @@ pub const grpc = if (features.grpc) @import("grpc.zig") else struct {
 pub const wt = if (features.http3) @import("wt.zig") else struct {
     pub const ExecState = struct {
         pub fn deinit(_: *ExecState) void {}
+        pub fn maxGen(_: *const ExecState) u32 {
+            return 0;
+        }
     };
 };
 pub const pipe = pipe_mod;
@@ -147,6 +153,13 @@ pub const max_gen: u32 = std.math.maxInt(u28);
 pub fn nextGen(gen: u32) u32 {
     return if (gen >= max_gen) 1 else gen + 1;
 }
+
+/// The generation every slot of the next server starts at (requests,
+/// WebSockets, WebTransport): past every generation a server before it in
+/// this process handed out, so a handle kept from a destroyed server is
+/// stale on the next one too, where the same slot may hold another request.
+/// Set by `destroy`, read by `create` (one server at a time).
+var next_first_gen: u32 = 1;
 
 pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
@@ -637,6 +650,10 @@ pub const Phase = enum(u8) { created, starting, running, draining, stopped, fail
 
 pub var global: ?*Engine = null;
 
+/// Tests: runs inside a control call (drain, reload) once it holds the
+/// server, before it calls into it.
+pub var test_control_hook: ?*const fn () void = null;
+
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
     config: Config,
@@ -649,8 +666,21 @@ pub const Engine = struct {
     /// `start` with a plain threaded Io (no runtime yet).
     started: std.Io.Event = .unset,
     start_error: ?anyerror = null,
+    /// What `start_error` was about, when there is more to say
+    /// (`error.RouteConflict`: the routes).
+    start_why: [400]u8 = undefined,
+    start_why_len: usize = 0,
     stopped: std.Io.Event = .unset,
+    /// The server, on the run thread's stack: freed when `run` returns.
+    /// Control calls from other threads (`drain`, the reloads) reach it
+    /// only through `enter`.
     app: ?*anole.App = null,
+    /// `ctl_closed` while there is no server to call into (before it
+    /// serves, once `run` returned), plus the control calls inside it: the
+    /// run thread closes it and waits for those before it frees the server.
+    ctl: std.atomic.Value(u32) = .init(ctl_closed),
+    /// The generation its slots start at (`next_first_gen` at create).
+    first_gen: u32 = 1,
     /// The runtime's Io, for waking executor tasks from consumer threads
     /// (zio's wakes work from any thread).
     io: std.Io = undefined,
@@ -706,6 +736,7 @@ pub const Engine = struct {
             .inline_body_max = 0,
             .stream_high_water = 0,
             .rewake = 0,
+            .first_gen = next_first_gen,
         };
         errdefer e.arena.deinit();
         const a = e.arena.allocator();
@@ -812,7 +843,15 @@ pub const Engine = struct {
         const nexec = app.rt.executors.items.len;
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
         e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
+        // The routes come from the configuration: a conflict between them
+        // is ANOLE_E_CONFIG, not a panic in the host process. Those Anole
+        // adds while starting (metrics, health) are checked by `run`.
+        app.router.record_conflicts = true;
         e.buildRoutes(&app) catch |err| return e.failStartDeinit(&app, err);
+        if (app.router.conflict) |why| {
+            e.setWhy(why);
+            return e.failStartDeinit(&app, error.RouteConflict);
+        }
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
@@ -822,8 +861,11 @@ pub const Engine = struct {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
         };
+        // Control calls may reach the server from here until `run` returns.
+        _ = e.ctl.fetchAnd(~ctl_closed, .release);
         e.phase.store(.running, .release);
         const result = app.run();
+        e.closeControl(app.io());
         watcher.cancel(app.io());
         e.tasks.cancel(app.io());
         if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
@@ -833,7 +875,7 @@ pub const Engine = struct {
             if (!e.started.isSet()) {
                 e.start_error = err;
                 e.started.set(threadedIo());
-            } else log.err("server stopped: {t}", .{err});
+            } else if (e.start_error == null) log.err("server stopped: {t}", .{err});
         }
         e.phase.store(.stopped, .release);
         e.app = null;
@@ -977,8 +1019,15 @@ pub const Engine = struct {
         return .{ .list = origins };
     }
 
+    fn setWhy(e: *Engine, why: []const u8) void {
+        const n = @min(why.len, e.start_why.len);
+        @memcpy(e.start_why[0..n], why[0..n]);
+        e.start_why_len = n;
+    }
+
     fn watchReady(e: *Engine, app: *anole.App) void {
         app.waitReady() catch |err| {
+            if (err == error.RouteConflict) if (app.router.conflict) |why| e.setWhy(why);
             e.start_error = err;
             e.started.set(threadedIo());
             return;
@@ -1021,7 +1070,7 @@ pub const Engine = struct {
             const slots = try gpa.alloc(Slot, per);
             errdefer gpa.free(slots);
             x.* = .{ .engine = e, .index = @intCast(i), .slots = slots, .free_head = 0, .ring = try Ring.init(queue) };
-            for (x.slots, 0..) |*s, j| s.* = .{ .next_free = if (j + 1 < per) @intCast(j + 1) else no_slot };
+            for (x.slots, 0..) |*s, j| s.* = .{ .word = .init(pack(e.first_gen, .free)), .next_free = if (j + 1 < per) @intCast(j + 1) else no_slot };
             made += 1;
             if (e.consumers.items.len > 0) {
                 const c = e.consumers.items[i % e.consumers.items.len];
@@ -1031,11 +1080,49 @@ pub const Engine = struct {
         }
     }
 
+    const ctl_closed: u32 = 1 << 31;
+
+    /// The server, for a control call from any thread, or null when there
+    /// is none to call into (not serving yet, or `run` returned): then the
+    /// run thread may be freeing it. `leave` after.
+    fn enter(e: *Engine) ?*anole.App {
+        const prev = e.ctl.fetchAdd(1, .acquire);
+        if (prev & ctl_closed != 0) {
+            _ = e.ctl.fetchSub(1, .release);
+            return null;
+        }
+        const app = e.app.?;
+        if (comptime builtin.is_test) if (test_control_hook) |f| f();
+        return app;
+    }
+
+    fn leave(e: *Engine) void {
+        _ = e.ctl.fetchSub(1, .release);
+    }
+
+    /// On the run thread once `run` returned: no control call enters from
+    /// now on, and those inside have left when this returns, so the server
+    /// can be freed. Waits on the runtime (`io`), which a control call
+    /// inside may still need.
+    fn closeControl(e: *Engine, io: std.Io) void {
+        _ = e.ctl.fetchOr(ctl_closed, .acq_rel);
+        while (e.ctl.load(.acquire) & ~ctl_closed != 0) {
+            io.sleep(.fromMilliseconds(1), .awake) catch std.Thread.yield() catch {};
+        }
+    }
+
     pub fn drain(e: *Engine) !void {
-        const p = e.phase.load(.acquire);
-        if (p != .running) return if (p == .draining or p == .stopped) {} else error.State;
-        e.phase.store(.draining, .release);
-        if (e.app) |app| app.stop();
+        switch (e.phase.load(.acquire)) {
+            .running => {},
+            .draining, .stopped => return,
+            .created, .starting, .failed => return error.State,
+        }
+        // None: `run` returned (a signal, an error), and the server stops
+        // on its own.
+        const app = e.enter() orelse return;
+        defer e.leave();
+        _ = e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire);
+        app.stop();
     }
 
     /// Waits for the stop; false when `timeout_ms` passed first.
@@ -1051,7 +1138,8 @@ pub const Engine = struct {
 
     pub fn reloadCertificates(e: *Engine) !void {
         if (e.phase.load(.acquire) != .running) return error.State;
-        const app = e.app orelse return error.State;
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
         try app.reloadCertificates();
     }
 
@@ -1060,7 +1148,8 @@ pub const Engine = struct {
     /// (and SIGHUP) read from it.
     pub fn setCertificate(e: *Engine, cert: anole.Cert) !void {
         if (e.phase.load(.acquire) != .running) return error.State;
-        const app = e.app orelse return error.State;
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
         try app.setCertificate(cert);
     }
 
@@ -1069,6 +1158,13 @@ pub const Engine = struct {
             if (e.phase.load(.acquire) == .running) e.drain() catch {};
             t.join();
         }
+        // The next server's handles start past every one handed out here.
+        var last = e.first_gen;
+        for (e.execs) |*x| {
+            for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
+            last = @max(last, x.ws.maxGen(), x.wt.maxGen());
+        }
+        next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
             for (x.slots) |*s| {

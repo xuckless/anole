@@ -26,12 +26,19 @@
  *    by handle.
  *  - Handles (anole_req, anole_ws) are 64-bit and generation-checked: a
  *    stale, finished or made-up handle gets ANOLE_E_GONE, never undefined
- *    behaviour.
+ *    behaviour, and so does one kept from a destroyed server once the next
+ *    server of the process runs (its slots start past every generation the
+ *    earlier ones handed out).
  *  - Anole enforces deadlines: a request not answered within its timeout
  *    gets 504 from Anole, and a late answer gets ANOLE_E_GONE.
  *
  * Threads. Every function may be called from any thread unless it says
- * otherwise. A request or WebSocket handle is meant to be used by the thread
+ * otherwise, between anole_server_create and anole_server_destroy (never
+ * during or after destroy). That includes anole_server_drain and the
+ * reloads (Node finalizers, Python atexit and signal handlers) while the
+ * server starts, serves or stops: they act on a server that is still
+ * serving, or answer as their text says once it is not, never on one being
+ * freed. A request or WebSocket handle is meant to be used by the thread
  * that polled it; another thread may use it with the binding's own
  * synchronization (calls on one handle must not overlap). anole_poll on one
  * consumer must not overlap with itself (a shared consumer serializes it).
@@ -54,7 +61,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 5 /* additions */
+#define ANOLE_ABI_VERSION_MINOR 6 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 
 #if defined(_WIN32) && defined(ANOLE_SHARED)
@@ -155,7 +162,11 @@ typedef struct anole_server_options {
 ANOLE_API anole_status anole_server_create(const anole_server_options *options, anole_server **out);
 /* Starts Anole's threads and binds every listener; returns once listening,
    or with the error (the server may then only be destroyed). Consumers
-   attach before this. */
+   attach before this. ANOLE_E_CONFIG: two routes the router cannot tell
+   apart (the same method and path twice, two parameter names at one
+   position, a method route less specific than an any-method one, or a
+   route on a path Anole serves itself, such as observe.metrics);
+   anole_last_error names them. */
 ANOLE_API anole_status anole_server_start(anole_server *s);
 /* The bound port of listener i, in configuration order (the real one when
    port 0 was asked for); i = the number of listeners: the HTTP/3 (UDP)
@@ -163,15 +174,18 @@ ANOLE_API anole_status anole_server_start(anole_server *s);
 ANOLE_API anole_status anole_server_port(anole_server *s, uint32_t i, uint16_t *out);
 /* Stops accepting and drains: HTTP/2 and HTTP/3 GOAWAY, WebSockets close
    1001, requests in flight finish within timeouts.shutdown_ms. Returns at
-   once; again is a no-op. Consumers keep polling and answering until they
-   see ANOLE_EV_STOPPED. */
+   once; again, or once the server stops on its own, is a no-op (ANOLE_OK);
+   ANOLE_E_STATE before anole_server_start has succeeded. Consumers keep
+   polling and answering until they see ANOLE_EV_STOPPED. */
 ANOLE_API anole_status anole_server_drain(anole_server *s);
 /* Blocks the calling thread until the server has stopped (after a drain):
    timeout_ms < 0 waits for ever; ANOLE_E_TIMEOUT when it passes. Never on
    a thread that must keep polling a consumer of this server meanwhile. */
 ANOLE_API anole_status anole_server_wait(anole_server *s, int32_t timeout_ms);
 /* Reads every TLS listener's certificate files again and swaps them in;
-   handshakes under way keep the old ones. */
+   handshakes under way keep the old ones. ANOLE_E_STATE when the server is
+   not running (before start, draining, stopped). A stop that begins while
+   a reload runs waits for it to return before the server is freed. */
 ANOLE_API anole_status anole_server_reload_certificates(anole_server *s);
 /* Swaps every TLS listener's certificate and key (the HTTP/3 one too) for
    new ones: file paths, or PEM text with ANOLE_TLS_PEM (copied). Handshakes
@@ -428,7 +442,7 @@ typedef struct anole_grpc_message_event {
 
 /* WebTransport (draft-02 over HTTP/3, what Chrome and Firefox speak). */
 #define ANOLE_WT_UNI 1u /* anole_wt_open_stream's flag, and ANOLE_EV_WT_STREAM's: one-way */
-#define ANOLE_WT_FIN 1u /* anole_wt_stream_write's flag, and ANOLE_EV_WT_DATA's: the end */
+#define ANOLE_WT_FIN 2u /* anole_wt_stream_write's flag, and ANOLE_EV_WT_DATA's: the end (1 before ABI 0.6) */
 enum { ANOLE_WT_CLOSED_LOCAL = 0, ANOLE_WT_CLOSED_PEER = 1, ANOLE_WT_CLOSED_CONNECTION = 2 };
 
 /* ANOLE_EV_WT_STREAM: a stream the peer opened, both ways or (ANOLE_WT_UNI)
@@ -534,7 +548,10 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
    instead of copying them; they must stay valid and unchanged until
    ANOLE_EV_SENT for them (which arrives even when the client is gone or
    the call fails with ANOLE_E_GONE after taking them). Bindings borrow
-   large bodies (above 64 KiB, say) and copy small ones. */
+   large bodies (above 64 KiB, say) and copy small ones. Bit 0 of every
+   send-type call's flags (anole_respond, anole_stream_write, anole_ws_send,
+   anole_grpc_send, anole_wt_stream_write) is ANOLE_BODY_BORROW; flags of
+   one call start at bit 1, and unknown bits are ANOLE_E_INVALID. */
 #define ANOLE_BODY_BORROW 1u
 
 /* The whole response: status (a code in the IANA registry, or one of the
@@ -691,7 +708,9 @@ ANOLE_API anole_status anole_grpc_health_set(anole_server *s, anole_str service,
    stream limit may hold it). */
 ANOLE_API anole_status anole_wt_open_stream(anole_wt w, uint32_t flags, anole_wt_stream *out);
 /* Queues bytes to send on a stream (copied), and with ANOLE_WT_FIN its end
-   after them. ANOLE_BUSY: queued, but past limits.stream_high_water bytes
+   after them. ANOLE_BODY_BORROW is taken too: the bytes are copied all the
+   same, and ANOLE_EV_SENT follows (ev.handle s), as for every borrowing
+   call. ANOLE_BUSY: queued, but past limits.stream_high_water bytes
    waiting: wait for ANOLE_EV_WRITABLE (ev.handle the stream). ANOLE_E_INVALID
    for a read-only stream or after its end; ANOLE_E_GONE once its sending
    side is over (reset, or stopped by the peer: ANOLE_EV_WT_STREAM_STOP). */

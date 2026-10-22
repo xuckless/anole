@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 5;
+pub const version_minor: u32 = 6;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -179,7 +179,7 @@ pub const WsCloseEvent = extern struct {
 /// `anole_wt_open_stream`'s flag and ANOLE_EV_WT_STREAM's: one-way.
 pub const WT_UNI: u32 = 1;
 /// `anole_wt_stream_write`'s flag and ANOLE_EV_WT_DATA's: the end.
-pub const WT_FIN: u32 = 1;
+pub const WT_FIN: u32 = 2;
 pub const WT_CLOSED_LOCAL: u32 = 0;
 pub const WT_CLOSED_PEER: u32 = 1;
 pub const WT_CLOSED_CONNECTION: u32 = 2;
