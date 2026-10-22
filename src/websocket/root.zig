@@ -183,6 +183,15 @@ pub const Socket = struct {
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
     context: ?*anyopaque = null,
+    /// The rooms the socket is in (`Rooms.join`), across every `Rooms`:
+    /// `deinit` leaves them all. Under `memberships_lock`.
+    memberships: ?*Rooms.Member = null,
+    /// Over `memberships`; held only for a list operation, inside the
+    /// `Rooms`' own lock.
+    memberships_lock: std.atomic.Mutex = .unlocked,
+    /// The task that serves the socket over HTTP/2 or HTTP/3 (its stream's),
+    /// which `abortConnection` cancels; null over HTTP/1.1 and off zio.
+    task: ?placement.Task = null,
 
     /// Which protocol a socket runs on. The sockets it points at are
     /// internal: they hand over permessage-deflate messages still
@@ -315,11 +324,14 @@ pub const Socket = struct {
         };
     }
 
-    /// Releases the socket: the drain watch, the compressor, and the
-    /// stream or connection's WebSocket state. It sends no close; `close`
-    /// first for a clean end. `app.ws` routes do both for you.
+    /// Releases the socket: its rooms (every `Rooms` it joined), the drain
+    /// watch, the compressor, and the stream or connection's WebSocket
+    /// state. It sends no close; `close` first for a clean end. `app.ws`
+    /// routes do both for you.
     pub fn deinit(self: *Socket) void {
-        // First, so nothing sends on the socket once it is gone.
+        // First, so nothing sends on the socket once it is gone: no room
+        // keeps it, and no broadcast is still sending to it.
+        Rooms.leaveEvery(self);
         if (self.drain_watch) |w| w.stop();
         if (comptime features.compression) if (self.deflate) |d| d.deinit();
         switch (self.conn) {
@@ -327,6 +339,34 @@ pub const Socket = struct {
         }
     }
 };
+
+/// Ends the connection under `socket` without a close frame, for a socket
+/// whose sending side is stuck (a `Rooms` member that did not keep up), so
+/// its reading side sees the end: over HTTP/1.1 a TCP shutdown both ways,
+/// over HTTP/2 and HTTP/3 a cancel of the stream's task, which resets the
+/// stream. Nothing more is sent on it either way. From a task that knows
+/// the socket is still alive (a `Rooms` sender, which `leave` waits for).
+fn abortConnection(socket: *Socket) void {
+    socket.closed.store(true, .release);
+    switch (socket.conn) {
+        .h1 => |ws| {
+            ws.write_mutex.lockUncancelable(socket.io);
+            ws.closed = true;
+            ws.write_mutex.unlock(socket.io);
+            // Not a cancelation point: a cancel meant for the stuck send
+            // may still be pending here, and is kept for later.
+            const protection = socket.io.swapCancelProtection(.blocked);
+            defer _ = socket.io.swapCancelProtection(protection);
+            if (ws.transport.tcp_reader) |r| r.stream.shutdown(socket.io, .both) catch {};
+        },
+        .h2 => |ws| {
+            ws.write_mutex.lockUncancelable(socket.io);
+            ws.closed = true;
+            ws.write_mutex.unlock(socket.io);
+            if (socket.task) |t| placement.cancelTask(t);
+        },
+    }
+}
 
 /// Sends close 1001 when the server starts to drain, through the server's
 /// drain hooks (`Request.drain_hooks`): a socket keeps no task of its own
@@ -424,6 +464,10 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         .max_message_size = options.max_message_size,
         .drain = req.drain,
         .executor = placement.currentExecutor(req.io),
+        // The stream's task serves the socket for its whole life over
+        // HTTP/2 and HTTP/3; over HTTP/1.1 a callback socket outlives the
+        // task that opened it.
+        .task = if (h2) placement.currentTask(req.io) else null,
     };
     if (h2) {
         socket.conn = .{ .h2 = try H2Socket.accept(req, res, options.max_message_size, negotiated) };
@@ -758,9 +802,16 @@ const H1Callbacks = struct {
 /// own queue: past `Options.max_queued_bytes` the messages that do not fit
 /// are skipped for it, and with `on_full = .close` (the default) a member
 /// whose send has been stuck for `Options.close_after_ms` is closed: it
-/// gets no more broadcasts, and the send under way to it is canceled, which
-/// ends its sending side. A member whose send fails gets no more either;
+/// gets no more broadcasts, the send under way to it is canceled, and its
+/// connection is ended (a TCP shutdown over HTTP/1.1, a stream reset over
+/// HTTP/2 and HTTP/3), so its handler's `receive` sees the end and its
+/// `close` callback runs. A member whose send fails gets no more either;
 /// its own `receive` sees the connection end.
+///
+/// A socket leaves every room it is in when it is released
+/// (`Socket.deinit`, which `app.ws` and callback sockets run for you), so a
+/// broadcast never reaches a socket that is gone; `leave` is for leaving
+/// earlier. The `Rooms` must outlive every socket that joined it.
 pub const Rooms = struct {
     allocator: std.mem.Allocator,
     options: Options = .{},
@@ -795,9 +846,9 @@ pub const Rooms = struct {
     pub const OnFull = enum {
         /// The message is skipped for that member, and a member whose send
         /// has been stuck for `close_after_ms` gets no more broadcasts: the
-        /// send under way to it is canceled, which ends the socket's
-        /// sending side (its handler's `receive` then ends when the peer
-        /// goes or the socket's timeout passes).
+        /// send under way to it is canceled and its connection is ended,
+        /// so its handler's `receive` ends and the socket leaves its rooms
+        /// as it is released.
         close,
         /// The message is skipped for that member; later ones are queued as
         /// room frees up.
@@ -836,6 +887,16 @@ pub const Rooms = struct {
 
     const Member = struct {
         socket: *Socket,
+        /// The `Rooms` it is in, and the room: the map's own copy of the
+        /// name, valid while the member is in it.
+        rooms: *Rooms,
+        room: []const u8 = "",
+        /// The socket's next membership (`Socket.memberships`); once out of
+        /// that list, the next of the members being left together.
+        next_of_socket: ?*Member = null,
+        /// Closed for not keeping up (`Options.on_full = .close`): its
+        /// sender ends the connection as it stops.
+        overflowed: bool = false,
         /// Messages waiting, from `head` on.
         queue: std.ArrayList(*Payload) = .empty,
         head: usize = 0,
@@ -882,6 +943,7 @@ pub const Rooms = struct {
         /// the mutex.
         fn close(m: *Member, allocator: std.mem.Allocator) void {
             m.broken = true;
+            m.overflowed = true;
             m.dropQueue(allocator);
             if (m.running) if (m.task) |t| placement.cancelTask(t);
         }
@@ -922,15 +984,146 @@ pub const Rooms = struct {
         return if (self.io_set.load(.acquire)) self.io else null;
     }
 
-    /// Frees every room. Call it once no socket is a member any more.
+    /// Frees every room. Call it once no broadcast is under way; a socket
+    /// still in a room is taken out of it (it must still be alive).
     pub fn deinit(self: *Rooms) void {
         var it = self.rooms.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            for (entry.value_ptr.items) |m| self.freeMember(m);
+            for (entry.value_ptr.items) |m| {
+                unlinkMember(m.socket, m);
+                self.freeMember(m);
+            }
             entry.value_ptr.deinit(self.allocator);
         }
         self.rooms.deinit(self.allocator);
+    }
+
+    fn lockMemberships(socket: *Socket) void {
+        while (!socket.memberships_lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// `m` into `socket`'s memberships. Under the mutex.
+    fn linkMember(socket: *Socket, m: *Member) void {
+        lockMemberships(socket);
+        defer socket.memberships_lock.unlock();
+        m.next_of_socket = socket.memberships;
+        socket.memberships = m;
+    }
+
+    /// `m` out of `socket`'s memberships. Under the mutex.
+    fn unlinkMember(socket: *Socket, m: *Member) void {
+        lockMemberships(socket);
+        defer socket.memberships_lock.unlock();
+        var link = &socket.memberships;
+        while (link.*) |cur| : (link = &cur.next_of_socket) {
+            if (cur == m) {
+                link.* = cur.next_of_socket;
+                break;
+            }
+        }
+        m.next_of_socket = null;
+    }
+
+    /// Leaves every room of every `Rooms` `socket` is in (`Socket.deinit`).
+    fn leaveEvery(socket: *Socket) void {
+        while (true) {
+            lockMemberships(socket);
+            const first = socket.memberships orelse {
+                socket.memberships_lock.unlock();
+                return;
+            };
+            // Alive as long as a socket is in it (see `Rooms`).
+            const rooms = first.rooms;
+            socket.memberships_lock.unlock();
+            rooms.leaveAllOf(socket);
+        }
+    }
+
+    /// Takes `socket` out of every room of these rooms.
+    fn leaveAllOf(self: *Rooms, socket: *Socket) void {
+        const io = self.bind(socket.io);
+        self.mutex.lockUncancelable(io);
+        // The socket's memberships here, out of its list into `mine`.
+        var mine: ?*Member = null;
+        {
+            lockMemberships(socket);
+            defer socket.memberships_lock.unlock();
+            var link = &socket.memberships;
+            while (link.*) |m| {
+                if (m.rooms == self) {
+                    link.* = m.next_of_socket;
+                    m.next_of_socket = mine;
+                    mine = m;
+                } else link = &m.next_of_socket;
+            }
+        }
+        var it = mine;
+        while (it) |m| : (it = m.next_of_socket) self.detach(m);
+        const canceled = self.awaitSenders(io, mine);
+        self.mutex.unlock(io);
+        self.release(io, mine);
+        if (canceled) io.recancel();
+    }
+
+    /// `m` out of its room (the room too when it was the last), with
+    /// nothing queued and nothing more to get. Under the mutex.
+    fn detach(self: *Rooms, m: *Member) void {
+        if (self.rooms.getPtr(m.room)) |members| {
+            for (members.items, 0..) |other, i| if (other == m) {
+                _ = members.swapRemove(i);
+                break;
+            };
+            if (members.items.len == 0) {
+                const key = self.rooms.getKey(m.room).?;
+                members.deinit(self.allocator);
+                _ = self.rooms.remove(m.room);
+                self.allocator.free(key);
+            }
+        }
+        m.room = "";
+        m.left = true;
+        m.dropQueue(self.allocator);
+    }
+
+    /// Waits for the senders of `members` (detached, chained through
+    /// `next_of_socket`) to end: a send under way gets
+    /// `Options.leave_grace_ms` to finish, and is canceled after. Under the
+    /// mutex, which it lets go while it waits. Whether the caller was
+    /// canceled meanwhile.
+    fn awaitSenders(self: *Rooms, io: std.Io, members: ?*Member) bool {
+        var canceled = false;
+        const grace: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(self.options.leave_grace_ms), .clock = .awake } };
+        const deadline = grace.toDeadline(io);
+        var it = members;
+        wait: while (it) |m| : (it = m.next_of_socket) {
+            while (m.running) {
+                self.idle.waitTimeout(io, &self.mutex, deadline) catch |err| {
+                    if (err == error.Canceled) canceled = true;
+                    break :wait;
+                };
+            }
+        }
+        it = members;
+        while (it) |m| : (it = m.next_of_socket) {
+            if (m.running) if (m.task) |t| placement.cancelTask(t);
+        }
+        it = members;
+        while (it) |m| : (it = m.next_of_socket) {
+            while (m.running) self.idle.waitUncancelable(io, &self.mutex);
+        }
+        return canceled;
+    }
+
+    /// Frees `members`, whose senders have ended.
+    fn release(self: *Rooms, io: std.Io, members: ?*Member) void {
+        var it = members;
+        while (it) |m| {
+            it = m.next_of_socket;
+            // The sender has ended: this only releases the group.
+            m.sender.cancel(io);
+            self.freeMember(m);
+        }
     }
 
     fn freeMember(self: *Rooms, m: *Member) void {
@@ -939,13 +1132,14 @@ pub const Rooms = struct {
         self.allocator.destroy(m);
     }
 
-    /// Adds `socket` to `room`; nothing when it is a member already. Leave
-    /// before the socket goes away: `defer rooms.leave(room, &ws)`.
+    /// Adds `socket` to `room`; nothing when it is a member already. The
+    /// socket leaves the room when it is released (`Socket.deinit`), or
+    /// earlier through `leave`.
     pub fn join(self: *Rooms, room: []const u8, socket: *Socket) !void {
         const member = try self.allocator.create(Member);
         var used = false;
         defer if (!used) self.allocator.destroy(member);
-        member.* = .{ .socket = socket };
+        member.* = .{ .socket = socket, .rooms = self };
         const io = self.bind(socket.io);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -967,6 +1161,8 @@ pub const Rooms = struct {
             }
             return err;
         };
+        member.room = entry.key_ptr.*;
+        linkMember(socket, member);
         used = true;
     }
 
@@ -977,34 +1173,14 @@ pub const Rooms = struct {
         const io = self.bind(socket.io);
         self.mutex.lockUncancelable(io);
         const members = self.rooms.getPtr(room) orelse return self.mutex.unlock(io);
-        const member = for (members.items, 0..) |m, i| {
-            if (m.socket == socket) break members.swapRemove(i);
+        const member = for (members.items) |m| {
+            if (m.socket == socket) break m;
         } else return self.mutex.unlock(io);
-        if (members.items.len == 0) {
-            const key = self.rooms.getKey(room).?;
-            members.deinit(self.allocator);
-            _ = self.rooms.remove(room);
-            self.allocator.free(key);
-        }
-        member.left = true;
-        member.dropQueue(self.allocator);
-        var canceled = false;
-        if (member.running) {
-            const grace: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(self.options.leave_grace_ms), .clock = .awake } };
-            const deadline = grace.toDeadline(io);
-            while (member.running) {
-                self.idle.waitTimeout(io, &self.mutex, deadline) catch |err| {
-                    if (err == error.Canceled) canceled = true;
-                    break;
-                };
-            }
-            if (member.running) if (member.task) |t| placement.cancelTask(t);
-            while (member.running) self.idle.waitUncancelable(io, &self.mutex);
-        }
+        unlinkMember(socket, member);
+        self.detach(member);
+        const canceled = self.awaitSenders(io, member);
         self.mutex.unlock(io);
-        // The sender has ended: this only releases the group.
-        member.sender.cancel(io);
-        self.freeMember(member);
+        self.release(io, member);
         if (canceled) io.recancel();
     }
 
@@ -1094,6 +1270,16 @@ pub const Rooms = struct {
                 m.broken = true;
                 m.dropQueue(self.allocator);
             }
+        }
+        // Closed for not keeping up while still in its room: its
+        // connection ends, so its handler sees it end and the socket
+        // leaves its rooms as it is released. Still `running`, so the
+        // socket stays alive meanwhile (`leave` waits).
+        if (m.overflowed and !m.left) {
+            m.overflowed = false;
+            self.mutex.unlock(io);
+            abortConnection(m.socket);
+            self.mutex.lockUncancelable(io);
         }
         m.running = false;
         m.task = null;

@@ -16,6 +16,20 @@ breaking changes are listed anyway.
   could open (`GET /files/../../etc/passwd`). To send a file your program
   names outside the directory, open the directory it is in and pass the
   name relative to that.
+- A WebSocket in `anole.websocket.Rooms` now leaves every room it is in
+  when it is released (`Socket.deinit`, which `app.ws`, `app.wsCallbacks`
+  and the C ABI's sockets run). Until now `Rooms` kept a pointer to the
+  socket until the handler called `leave`, so a handler that returned
+  without leaving (an early `return` or error before its `defer`, a `close`
+  callback that missed a room) left a freed socket in the room, and the
+  next broadcast wrote into freed memory: a crash, or memory corruption
+  that a client could trigger by joining and disconnecting. `leave` still
+  works for leaving earlier.
+- A room member closed for not keeping up (`on_full = .close`) now has its
+  connection ended (a TCP shutdown over HTTP/1.1, a stream reset over
+  HTTP/2 and HTTP/3), so its handler's `receive` ends and its `close`
+  callback runs. Until now it stayed open with nothing served to it, for
+  ever with the default `timeout`, holding its task and memory.
 
 ## 0.1.2 (2026-10-22)
 

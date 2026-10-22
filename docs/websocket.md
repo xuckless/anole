@@ -78,7 +78,7 @@ const Chat = struct {
         try ws.send(msg.type, msg.data);
     }
     pub fn close(ws: *anole.websocket.Socket) void {
-        _ = ws; // leave rooms, free ws.context
+        _ = ws; // free ws.context (the socket leaves its rooms by itself)
     }
 };
 
@@ -358,21 +358,24 @@ app.ws("/chat/:room", chat);
 try app.listen(":8082");
 ```
 
-In the handler, join after the upgrade and leave before the socket goes
-away. Defers run in reverse order, so this order is correct:
+In the handler, join after the upgrade. A socket leaves every room it is in
+when it is released (`Socket.deinit`, which `app.ws` and `app.wsCallbacks`
+run for you, and which a handler that calls `upgrade` itself defers), so a
+broadcast never reaches a socket that is gone:
 
 ```zig
 fn chat(app: *App, ws: *anole.websocket.Socket, req: *anole.Request) !void {
     const room = req.params.get("room") orelse "lobby";
     try app.rooms.join(room, ws);
-    defer app.rooms.leave(room, ws);
     while (try ws.next()) |msg| _ = app.rooms.broadcast(room, msg.type, msg.data, null);
 }
 ```
 
-- `join(room, socket)` and `leave(room, socket)` add and remove a member. A
-  room is created on the first join and removed when its last member leaves.
-  Joining a room the socket is already in does nothing.
+- `join(room, socket)` adds a member, and `leave(room, socket)` takes it out
+  before the socket ends (switching rooms, say). A room is created on the
+  first join and removed when its last member leaves. Joining a room the
+  socket is already in does nothing. The `Rooms` must outlive the sockets
+  that join it.
 - `broadcast(room, msg_type, data, except)` queues the message for every
   member except `except` (pass `&ws` to skip the sender, or null for
   everyone) and returns for how many members it was queued. It never waits
@@ -392,16 +395,16 @@ The queue is bounded. `Rooms.initOptions(allocator, .{ ... })` sets
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `max_queued_bytes` | 1 MiB | The most broadcast bytes waiting for one member (each message counts 64 bytes more). A message is always taken when nothing waits. |
-| `on_full` | `.close` | `.close`: messages that do not fit are skipped, and a member whose send has been stuck for `close_after_ms` is closed: it gets no more broadcasts, and the send under way to it is canceled, which ends the socket's sending side. `.drop`: messages that do not fit are skipped and the member stays. |
+| `on_full` | `.close` | `.close`: messages that do not fit are skipped, and a member whose send has been stuck for `close_after_ms` is closed: it gets no more broadcasts, the send under way to it is canceled, and its connection is ended (a TCP shutdown over HTTP/1.1, a stream reset over HTTP/2 and HTTP/3), so its handler's `receive` ends and its `close` callback runs. `.drop`: messages that do not fit are skipped and the member stays. |
 | `close_after_ms` | 1000 | With `.close`, how long a full member's send must have been stuck. |
 | `leave_grace_ms` | 1000 | How long `leave` lets a send under way to the leaving socket finish before it cancels it. |
 
-A member whose send fails, or that was closed, gets nothing more; its own
-`receive` sees the connection end once the peer goes or the socket's
-`timeout` passes, so give sockets in rooms a `timeout` (or call
-`req.setTimeout` before each `receive`). `leave` drops what is still queued
-for the socket and waits for a send under way, at most `leave_grace_ms`, so
-a socket is never sent to after its handler has left the room and returned.
+A member whose send fails gets nothing more; its own `receive` sees the
+connection end. A member closed for not keeping up has its connection ended
+for it, as above, and leaves its rooms as its socket is released. Leaving,
+by `leave` or by the release, drops what is still queued for the socket and
+waits for a send under way, at most `leave_grace_ms`, so a socket is never
+sent to once it has left or been released.
 
 ## Browsers, HTTP/2 and HTTP/3
 

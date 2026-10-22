@@ -583,3 +583,59 @@ test "WebSocket over HTTP/2: a page from another origin gets 403, one from the s
     try own.open();
     try std.testing.expectEqual(@as(u16, 200), own.status);
 }
+
+var lobby: websocket.Rooms = undefined;
+
+/// Joins the lobby and reads until the socket ends; never leaves.
+fn joinLobby(ws: *websocket.Socket) !void {
+    try lobby.join("lobby", ws);
+    while (try ws.next()) |_| {}
+}
+
+test "WebSocket over HTTP/2: a room member that stops reading is closed, its stream ends, and it leaves" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    lobby = .initOptions(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
+    defer lobby.deinit();
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", websocket.route(void, joinLobby, .{}));
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // Opens the socket, then reads nothing more.
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+    for (0..1000) |_| {
+        if (lobby.count("lobby") == 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), lobby.count("lobby"));
+
+    const msg = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(msg);
+    @memset(msg, 'm');
+    var left = false;
+    for (0..5000) |_| {
+        _ = lobby.broadcast("lobby", .binary, msg, null);
+        try io.sleep(.fromMilliseconds(1), .awake);
+        if (lobby.count("lobby") == 0) {
+            left = true;
+            break;
+        }
+    }
+    try std.testing.expect(left);
+}

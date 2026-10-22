@@ -291,3 +291,157 @@ test "Rooms: with on_full = drop, a full member skips messages and stays" {
     try std.testing.expectEqual(@as(usize, 1), r.broadcast("room", .binary, &msg, null));
     r.leave("room", &slow.socket);
 }
+
+test "Rooms: a socket released without leave is out of every room, so no broadcast reaches it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var r: websocket.Rooms = .init(gpa);
+    defer r.deinit();
+    var other_rooms: websocket.Rooms = .init(gpa);
+    defer other_rooms.deinit();
+
+    // On the heap, as a request's arena or a callback socket holds it: once
+    // it is freed, a broadcast that still finds it writes into freed memory.
+    const gone = try gpa.create(Stalled);
+    gone.init(gpa, io);
+    gone.release.set(io);
+    var stays: Stalled = undefined;
+    stays.init(gpa, io);
+    stays.release.set(io);
+    defer stays.ws.deinit();
+
+    try r.join("lobby", &gone.socket);
+    try r.join("news", &gone.socket);
+    try other_rooms.join("lobby", &gone.socket);
+    try r.join("lobby", &stays.socket);
+    try std.testing.expectEqual(@as(usize, 2), r.count("lobby"));
+
+    // Released with no `leave`: an early return before the `defer`, a
+    // `close` callback that forgot a room.
+    gone.socket.deinit();
+    gpa.destroy(gone);
+
+    try std.testing.expectEqual(@as(usize, 1), r.count("lobby"));
+    try std.testing.expectEqual(@as(usize, 0), r.count("news"));
+    try std.testing.expectEqual(@as(usize, 0), other_rooms.count("lobby"));
+    try std.testing.expectEqual(@as(usize, 1), r.broadcast("lobby", .text, "anyone?", null));
+    try std.testing.expectEqual(@as(usize, 0), r.broadcast("news", .text, "anyone?", null));
+    r.leave("lobby", &stays.socket);
+}
+
+var auto_rooms: websocket.Rooms = undefined;
+
+/// Joins the lobby and never leaves it: the socket's end has to.
+fn joinOnly(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{})) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    try auto_rooms.join("lobby", &ws);
+    try ws.send(.text, "joined");
+    while (try ws.next()) |_| {}
+}
+
+/// Polls `rooms.count(room)` until it is `want`, for up to `ms`.
+fn countBecomes(io: std.Io, rooms_: *websocket.Rooms, room: []const u8, want: usize, ms: usize) !bool {
+    for (0..ms) |_| {
+        if (rooms_.count(room) == want) return true;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return rooms_.count(room) == want;
+}
+
+const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
+
+fn startServer(gpa: std.mem.Allocator, io: std.Io, server: *dusty.Server(void)) !std.Io.Future(anyerror!void) {
+    server.* = dusty.Server(void).init(gpa, io, .{ .listeners = loopback }, {});
+    server.router.get("/lobby", joinOnly);
+    const future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{server});
+    try server.waitReady(io);
+    return future;
+}
+
+test "Rooms: a socket whose handler ends without leave leaves its rooms" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    auto_rooms = .init(gpa);
+    defer auto_rooms.deinit();
+
+    var server: dusty.Server(void) = undefined;
+    var server_future = try startServer(gpa, io, &server);
+    defer server.deinit();
+    defer server_future.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/lobby", .{server.address.ip.getPort()});
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var a = try client.connectWebSocket(url, .{});
+    defer a.deinit();
+    try std.testing.expectEqualStrings("joined", (try a.receive()).data);
+    var b = try client.connectWebSocket(url, .{});
+    defer b.deinit();
+    try std.testing.expectEqualStrings("joined", (try b.receive()).data);
+    try std.testing.expectEqual(@as(usize, 2), auto_rooms.count("lobby"));
+
+    // a goes; its handler returns and its socket, in the request's arena,
+    // is gone with it.
+    try a.close(.normal, "");
+    _ = try a.receive(); // the close echo
+    try std.testing.expect(try countBecomes(io, &auto_rooms, "lobby", 1, 2000));
+    try std.testing.expectEqual(@as(usize, 1), auto_rooms.broadcast("lobby", .text, "to b", null));
+    try std.testing.expectEqualStrings("to b", (try b.receive()).data);
+    try b.close(.normal, "");
+    _ = try b.receive();
+    try std.testing.expect(try countBecomes(io, &auto_rooms, "lobby", 0, 2000));
+}
+
+test "Rooms: a member closed for not keeping up is shut down, so its handler ends and it leaves" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    auto_rooms = .initOptions(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
+    defer auto_rooms.deinit();
+
+    var server: dusty.Server(void) = undefined;
+    var server_future = try startServer(gpa, io, &server);
+    defer server.deinit();
+    defer server_future.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/lobby", .{server.address.ip.getPort()});
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    // A client that stops reading after the greeting.
+    var slow = try client.connectWebSocket(url, .{});
+    defer slow.deinit();
+    try std.testing.expectEqualStrings("joined", (try slow.receive()).data);
+    try std.testing.expectEqual(@as(usize, 1), auto_rooms.count("lobby"));
+
+    // Broadcast until the kernel's buffers are full, the member's queue
+    // fills, and its send has been stuck long enough to close it: then its
+    // connection ends, its handler returns, and the room is empty.
+    const msg = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(msg);
+    @memset(msg, 'm');
+    var left = false;
+    for (0..5000) |_| {
+        _ = auto_rooms.broadcast("lobby", .binary, msg, null);
+        try io.sleep(.fromMilliseconds(1), .awake);
+        if (auto_rooms.count("lobby") == 0) {
+            left = true;
+            break;
+        }
+    }
+    try std.testing.expect(left);
+}
