@@ -307,8 +307,8 @@ pub const Client = struct {
             cs.get("tlsAllowInvalidCertificates") != null or cs.get("tlsAllowInvalidHostnames") != null);
         if (tls_on) {
             var t = tls orelse net.ConnectOptions.Tls{};
-            if (cs.string("tlsCAFile")) |path| t.ca = .{ .file = .{ .path = path } };
-            if (cs.string("tlsCertificateKeyFile")) |path| t.client_certificate = .{ .cert_path = path, .key_path = path };
+            if (cs.string("tlsCAFile")) |path| t.ca = .{ .file = path };
+            if (cs.string("tlsCertificateKeyFile")) |path| t.client_certificate = .fromFiles(path, path);
             if (cs.boolean("tlsInsecure") orelse false) t.insecure_skip_verify = true;
             if (cs.boolean("tlsAllowInvalidCertificates") orelse false) t.insecure_skip_verify = true;
             if (cs.boolean("tlsAllowInvalidHostnames") orelse false) t.skip_host_check = true;

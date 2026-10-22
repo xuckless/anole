@@ -164,10 +164,10 @@ pub const Options = struct {
     pub const Tls = struct {
         /// What the server's certificate must chain to; null: the URL's
         /// `ssl_ca_certs`, else the system's store.
-        ca: ?dusty.TlsCa = null,
+        ca: ?dusty.Ca = null,
         /// A client certificate for servers that ask (`tls-auth-clients`);
         /// null: the URL's `ssl_certfile` and `ssl_keyfile`.
-        client_certificate: ?dusty.TlsConfig.ClientCertificate = null,
+        client_certificate: ?dusty.Cert = null,
         /// Accept any certificate (the URL's `ssl_cert_reqs=none`): for a
         /// managed server with a self-signed certificate, on a network you
         /// trust anyway.
@@ -470,8 +470,8 @@ pub const Client = struct {
             // `dial` bounds all of it, the login included.
             .connect_timeout = null,
             .tls = if (s.tls) .{
-                .ca = opts.tls.ca orelse if (s.ca_file) |path| dusty.TlsCa{ .file = .{ .path = path } } else .system,
-                .client_certificate = opts.tls.client_certificate orelse if (s.cert_file) |cert| .{ .cert_path = cert, .key_path = s.key_file.? } else null,
+                .ca = opts.tls.ca orelse if (s.ca_file) |path| dusty.Ca{ .file = path } else .system,
+                .client_certificate = opts.tls.client_certificate orelse if (s.cert_file) |cert| dusty.Cert.fromFiles(cert, s.key_file.?) else null,
                 .insecure_skip_verify = opts.tls.insecure_skip_verify or !s.verify,
             } else null,
         };

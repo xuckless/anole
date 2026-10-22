@@ -17,8 +17,9 @@ pub const Burst = @import("server.zig").Burst;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
-pub const TlsCa = @import("config.zig").TlsCa;
-pub const TlsPath = @import("config.zig").TlsPath;
+pub const Cert = @import("tls_options.zig").Cert;
+pub const Ca = @import("tls_options.zig").Ca;
+pub const ClientAuth = @import("tls_options.zig").ClientAuth;
 /// A peer range for `Listener.proxy_protocol_from`.
 pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
 pub const Router = @import("router.zig").Router;
@@ -112,8 +113,8 @@ pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
 // Client
 pub const Client = @import("client.zig").Client;
-pub const ClientConfig = @import("client.zig").ClientConfig;
-pub const TlsConfig = @import("client.zig").TlsConfig;
+pub const ClientOptions = @import("client.zig").ClientOptions;
+pub const TlsOptions = @import("client.zig").TlsOptions;
 pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;

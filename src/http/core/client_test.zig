@@ -2062,7 +2062,7 @@ fn millisSince(io: std.Io, started: std.Io.Clock.Timestamp) i64 {
     return @intCast(@divTrunc(ended.raw.nanoseconds - started.raw.nanoseconds, std.time.ns_per_ms));
 }
 
-test "Client: a response head that never arrives is cut off by ClientConfig.timeout" {
+test "Client: a response head that never arrives is cut off by ClientOptions.timeout" {
     const io = std.testing.io;
     var peer: StallingServer = undefined;
     try peer.start(io, "");
@@ -2200,7 +2200,7 @@ test "Client: redirects share the request's budget" {
     try std.testing.expectEqualStrings("done", (try response.body()).?);
 }
 
-fn expectRedirectFollowedWithoutDrain(comptime redirect_head: []const u8, config: dusty.ClientConfig) !void {
+fn expectRedirectFollowedWithoutDrain(comptime redirect_head: []const u8, config: dusty.ClientOptions) !void {
     const io = std.testing.io;
     var target: StallingServer = undefined;
     try target.start(io, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone");

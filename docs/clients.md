@@ -58,7 +58,7 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
 
 It trusts the system's CA store and has the defaults below. To change them
 for the server's client, set `ServerOptions.client`, an
-`anole.http.ClientConfig` (CAs, a client certificate, HTTP/2, the timeout,
+`anole.http.ClientOptions` (CAs, a client certificate, HTTP/2, the timeout,
 the pool):
 
 ```zig
@@ -102,7 +102,7 @@ On zio each executor has a pool of its own, as the database connectors do:
 a request takes and gives back connections on its own executor, so a
 connection stays on one thread. (Off zio there is one pool.) Each keeps:
 
-| `ClientConfig` field | Default | What it bounds |
+| `ClientOptions` field | Default | What it bounds |
 | --- | --- | --- |
 | `max_idle_per_host` | 256 | Idle connections to one scheme, host and port (or unix socket). |
 | `max_idle_connections` | 1024 | Idle connections in all. 0 turns pooling off. |
@@ -162,19 +162,19 @@ method and body. Along the way:
   on it). A redirect that would take it elsewhere is not followed: `fetch`
   returns the 307 or 308 response.
 
-`ClientConfig.check_redirect` replaces that last rule with your own: a
+`ClientOptions.check_redirect` replaces that last rule with your own: a
 function that sees each redirect (`status`, `from`, `to`, `method`,
 `has_body`, `hops`, `cross_origin`) and returns `.follow`, `.stop` (return
 the redirect response) or `.fail` (`error.RedirectRefused`).
 
 For a client that fetches URLs from untrusted input (webhooks, link
-previews), set `ClientConfig.deny_private_addresses = true`. It refuses
+previews), set `ClientOptions.deny_private_addresses = true`. It refuses
 loopback, private, link-local (cloud metadata included), shared, multicast
 and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
 The check is on the address the connection reached, after DNS, on every
 hop, before any byte of the request is sent.
 
-`ClientConfig.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
+`ClientOptions.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
 ALPN on HTTPS connections. A server that picks it gets the request over
 HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
 says which was used. Everything above works the same, but such a connection
@@ -320,7 +320,7 @@ NAT rebinding looks; it exists for tests.
 
 ## TLS options
 
-The three clients take the same TLS fields (`anole.http.TlsConfig`'s), and
+The three clients take the same TLS fields (`anole.http.TlsOptions`'s), and
 all of them trust the system store unless told otherwise:
 
 | Need | `.tls = ...` |
@@ -370,7 +370,7 @@ SNI is sent for it.
 ## Timeouts
 
 `anole.http.Client` has one budget per `fetch`: connecting, the handshake,
-sending, every redirect, and reading the body. It is `ClientConfig.timeout`
+sending, every redirect, and reading the body. It is `ClientOptions.timeout`
 (30 s by default; null for none), or `FetchOptions.timeout` for one request:
 
 ```zig

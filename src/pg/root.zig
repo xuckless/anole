@@ -177,10 +177,10 @@ pub const Options = struct {
     pub const Tls = struct {
         /// What `sslmode=verify-ca`/`verify-full` trust; null: the URL's
         /// `sslrootcert`, else the system's store.
-        ca: ?dusty.TlsCa = null,
+        ca: ?dusty.Ca = null,
         /// A client certificate for servers that ask (`clientcert` in
         /// pg_hba.conf); null: the URL's `sslcert` and `sslkey`.
-        client_certificate: ?dusty.TlsConfig.ClientCertificate = null,
+        client_certificate: ?dusty.Cert = null,
     };
 };
 
@@ -501,8 +501,8 @@ pub const Client = struct {
         if (comptime has_tls) {
             errdefer self.freeTls();
             if (s.sslmode == .verify_ca or s.sslmode == .verify_full) {
-                const ca: ?dusty.TlsCa = opts.tls.ca orelse if (s.sslrootcert) |path|
-                    (if (std.mem.eql(u8, path, "system")) null else dusty.TlsCa{ .file = .{ .path = path } })
+                const ca: ?dusty.Ca = opts.tls.ca orelse if (s.sslrootcert) |path|
+                    (if (std.mem.eql(u8, path, "system")) null else dusty.Ca{ .file = path })
                 else
                     null;
                 if (ca) |source| {
@@ -512,20 +512,21 @@ pub const Client = struct {
                     };
                 }
             }
-            const client_cert: ?dusty.TlsConfig.ClientCertificate = opts.tls.client_certificate orelse if (s.sslcert) |cert_path|
-                .{ .cert_path = cert_path, .key_path = s.sslkey orelse {
+            const client_cert: ?dusty.Cert = opts.tls.client_certificate orelse if (s.sslcert) |cert_path|
+                dusty.Cert.fromFiles(cert_path, s.sslkey orelse {
                     log.err("postgres: sslcert is set but sslkey is not", .{});
                     return error.InvalidDatabaseUrl;
-                } }
+                })
             else
                 null;
             if (client_cert) |cc| {
                 const pair = try gpa.create(dusty_tls.config.CertKeyPair);
                 errdefer gpa.destroy(pair);
-                pair.* = (if (cc.pem) |pem|
-                    dusty_tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key)
-                else
-                    dusty_tls.config.CertKeyPair.fromFilePath(gpa, io, cc.dir orelse std.Io.Dir.cwd(), cc.cert_path, cc.key_path)) catch |err| {
+                pair.* = (switch (cc) {
+                    .pem => |pem| dusty_tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key),
+                    .files => |f| dusty_tls.config.CertKeyPair.fromFilePath(gpa, io, std.Io.Dir.cwd(), f.cert_path, f.key_path),
+                    .dev_self_signed => error.DevCertificateUnavailable,
+                }) catch |err| {
                     log.err("postgres: cannot load the client certificate: {t}", .{err});
                     return err;
                 };

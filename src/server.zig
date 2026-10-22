@@ -104,10 +104,19 @@ pub const ExecutorCount = @FieldType(@typeInfo(@TypeOf(zio.Runtime.init)).@"fn".
 /// over.
 threadlocal var server_on_thread: bool = false;
 
+/// A length of time: `.fromSeconds(30)`, `.fromMilliseconds(250)`.
+pub const Duration = std.Io.Duration;
+
 /// `anole.ServerOptions`: everything `App.init` and `Server(Ctx).init`
 /// take. Every field has a default, so `.{}` is a working server (its
 /// listener named later by `listen` or `listenTls`).
+///
+/// The HTTP behaviour groups (`timeouts`, `limits`, `proxy`, `request`,
+/// `response`, `http2`, `errors`) have the same names and defaults as the
+/// C ABI's JSON configuration.
 pub const Options = struct {
+    // Listeners
+
     /// The cleartext listener. When neither this nor `https` is set,
     /// 127.0.0.1:8080; with `https` set and this null, none: an HTTPS-only
     /// server. Set both for both.
@@ -129,15 +138,39 @@ pub const Options = struct {
     ///         .{ .name = "admin", .port = 9090 },
     ///     },
     listeners: []const Listener = &.{},
-    /// Raise the soft open-file limit to the hard one when the server is
-    /// made, as Go does at startup: every connection is a file descriptor,
-    /// and the soft limit is often 1024. `server.max_connections` follows
-    /// the limit by default. Processes started from here inherit it (see
-    /// docs/server.md, "Many connections", for programs that use `select`).
-    raise_fd_limit: bool = true,
+    /// Whether `listenTls` also serves HTTP/3 on the same port number (UDP),
+    /// advertised with `Alt-Svc`, when HTTP/3 is built in (the default
+    /// `full` profile): with `http3`'s settings when set, else the defaults.
+    listen_tls_http3: bool = true,
+
+    // HTTP behaviour: the same groups and names as the C ABI's JSON config.
+
+    /// Time limits: the request, the head, a stalled write, keep-alive, the
+    /// graceful drain.
+    timeouts: Timeouts = .{},
+    /// Size and count limits.
+    limits: Limits = .{},
+    /// Trust in proxies in front of the server.
+    proxy: Proxy = .{},
+    /// How requests are read.
+    request: RequestOptions = .{},
+    /// How responses are written.
+    response: ResponseOptions = .{},
     /// HTTP/2 settings, for h2c and h2 over TLS. 250 concurrent streams per
     /// connection by default.
-    http2: http.ServerConfig.Http2 = .{ .max_concurrent_streams = 250 },
+    http2: Http2 = .{},
+    /// How the server writes its own error answers (404, 405, the status
+    /// an error maps to, `res.fail`): `.auto` sends `{"error":"..."}` to a
+    /// request that takes JSON and text to others, `.json` and `.text`
+    /// always.
+    errors: http.ErrorFormat = .auto,
+    /// Answers handler and middleware errors in place of the default
+    /// mapping, which it can fall back on with `anole.defaultError(req,
+    /// res, err)`: no `Ctx` with `uncaughtError` needed.
+    error_handler: ?http.ErrorHandler = null,
+
+    // Process and runtime
+
     /// Executors (OS threads) for the runtime: one per CPU (cgroup-aware) by
     /// default.
     executors: ExecutorCount = .auto,
@@ -152,6 +185,18 @@ pub const Options = struct {
     /// gzip, 128 KiB in one frame; the DNS resolver, 73 KiB), and a
     /// handler's own needs are the application's to know.
     max_stack_size: usize = 1024 * 1024,
+    /// Raise the soft open-file limit to the hard one when the server is
+    /// made, as Go does at startup: every connection is a file descriptor,
+    /// and the soft limit is often 1024. `limits.max_connections` follows
+    /// the limit by default. Processes started from here inherit it (see
+    /// docs/server.md, "Many connections", for programs that use `select`).
+    raise_fd_limit: bool = true,
+    /// Whether `run` listens for signals: SIGINT and SIGTERM drain and
+    /// stop, SIGHUP reloads certificates (SIGUSR2 needs `process` too).
+    /// False when Anole is embedded in a process whose signals belong to
+    /// someone else (the C ABI under Node or Python): `stop` is then the
+    /// only way to drain.
+    signals: bool = true,
     /// The process's arguments and environment (`init.minimal`). With them
     /// the server takes listening sockets handed over by systemd socket
     /// activation or by the process it replaces (`LISTEN_FDS`), restarts
@@ -163,41 +208,92 @@ pub const Options = struct {
     process: ?std.process.Init.Minimal = null,
     /// How long a restart waits for the new process to be serving before
     /// giving up on it and carrying on.
-    restart_timeout_ms: u32 = 10_000,
-    /// Whether `run` listens for signals: SIGINT and SIGTERM drain and
-    /// stop, SIGHUP reloads certificates (SIGUSR2 needs `process` too).
-    /// False when Anole is embedded in a process whose signals belong to
-    /// someone else (the C ABI under Node or Python): `stop` is then the
-    /// only way to drain.
-    signals: bool = true,
-    /// Whether `listenTls` also serves HTTP/3 on the same port number (UDP),
-    /// advertised with `Alt-Svc`, when HTTP/3 is built in (the default
-    /// `full` profile): with `http3`'s settings when set, else the defaults.
-    listen_tls_http3: bool = true,
+    restart_timeout: Duration = .fromSeconds(10),
     /// A blocking pool (`anole.blocking`): jobs that run on threads beside
     /// the executors, at most this many at once. Password hashing uses it.
     /// Null: none, and such work runs on the request's executor.
     blocking: ?blocking.Options = null,
-    /// How the server writes its own error answers (404, 405, the status
-    /// an error maps to, `res.fail`): `.auto` sends `{"error":"..."}` to a
-    /// request that takes JSON and text to others, `.json` and `.text`
-    /// always. Replaces `server.errors`.
-    errors: http.ErrorFormat = .auto,
-    /// Answers handler and middleware errors in place of the default
-    /// mapping, which it can fall back on with `anole.defaultError(req,
-    /// res, err)`: no `Ctx` with `uncaughtError` needed. Replaces
-    /// `server.error_handler` when set.
-    error_handler: ?http.ErrorHandler = null,
-    /// The rest of the core's server configuration: timeouts, limits,
-    /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
-    /// replaced by the fields above.
-    server: http.ServerConfig = .{},
+
+    // Outbound
+
     /// The server's outbound HTTP client (`app.client()`,
     /// `anole.client(req)`): its pool of idle connections
     /// (`max_idle_per_host`, 256 per executor; `max_idle_connections`,
     /// 1024 per executor; `idle_timeout`, 90 s), its timeout (30 s), the
     /// CAs it trusts (`tls`), redirects and size limits.
-    client: http.ClientConfig = .{},
+    client: http.ClientOptions = .{},
+
+    /// `Options.timeouts`. A duration is null for none.
+    pub const Timeouts = struct {
+        /// The whole request: reading it, the handler, the response (and
+        /// the TLS handshake). Ends early for a streamed or file body
+        /// (`write` then bounds each write). Null: none.
+        request: ?Duration = .fromSeconds(30),
+        /// The request head on HTTP/1.x (Slowloris). Null: `request` alone.
+        read_header: ?Duration = .fromSeconds(10),
+        /// One write the peer does not take for this long ends the
+        /// response (HTTP/1.1: the connection; HTTP/2, HTTP/3: the
+        /// stream). Applies once a stream or file body has started, and to
+        /// every HTTP/2 connection write. Null: none.
+        write: ?Duration = .fromSeconds(30),
+        /// An idle keep-alive connection is closed after this. Null: never.
+        keepalive: ?Duration = .fromSeconds(60),
+        /// An idle HTTP/1.1 connection gives up its task after this
+        /// (parks). Null or zero: never parks.
+        idle_park: ?Duration = .fromSeconds(1),
+        /// The graceful drain. Null: wait for every connection.
+        shutdown: ?Duration = .fromSeconds(10),
+    };
+
+    /// `Options.limits`.
+    pub const Limits = struct {
+        /// The largest request body: `req.body()`, `req.reader()` (declared
+        /// and chunked) and an early 413 on a larger `Content-Length`.
+        body_max: usize = 1 << 20,
+        /// The request line and headers; larger is 431.
+        max_head_size: usize = 16 * 1024,
+        max_header_count: usize = 32,
+        max_param_count: usize = 8,
+        max_query_count: usize = 32,
+        max_form_count: usize = 32,
+        max_multiform_count: usize = 32,
+        /// Open connections at most; 0 follows the open-file limit
+        /// (10 000 on Windows).
+        max_connections: u32 = 0,
+        /// Requests per keep-alive connection; null: no limit.
+        max_requests_per_connection: ?u32 = null,
+        /// The largest WebSocket message, in or out (after inflating): the
+        /// default for routes whose upgrade options set none.
+        ws_max_message: usize = 1 << 20,
+    };
+
+    /// `Options.proxy`.
+    pub const Proxy = struct {
+        /// Proxies in front whose X-Forwarded-For Anole trusts: 0 none.
+        trusted_hops: u8 = 0,
+        /// With `trusted_hops`: the last `X-Forwarded-Proto` value sets
+        /// `req.secure`.
+        trust_forwarded_proto: bool = true,
+        /// With `trusted_hops`: the last `X-Forwarded-Host` value is
+        /// `req.host`.
+        trust_forwarded_host: bool = false,
+    };
+
+    /// `Options.request`.
+    pub const RequestOptions = struct {
+        /// HTTP/1.1 without exactly one Host is 400.
+        require_host: bool = true,
+        /// Undo Content-Encoding on request bodies.
+        decompress: bool = true,
+        /// Keep a connection's request buffers between requests.
+        keep_buffers: bool = false,
+    };
+
+    /// `Options.response`: `write_buffer_size`, `date`,
+    /// `default_content_type`, `max_header_count`, `brotli_quality`.
+    pub const ResponseOptions = http.ServerConfig.Response;
+    /// `Options.http2`: the core's HTTP/2 settings, 250 streams by default.
+    pub const Http2 = http.ServerConfig.Http2;
 
     /// `Options.http`: a cleartext listener.
     pub const Http = struct {
@@ -283,10 +379,10 @@ pub const Options = struct {
         /// `.dev_self_signed`.
         cert: Cert,
         /// "h2" and "http/1.1" when HTTP/2 is built in, else "http/1.1".
-        alpn_protocols: ?[]const []const u8 = null,
+        alpn: ?[]const []const u8 = null,
         /// Mutual TLS: ask clients for a certificate signed by these CAs
         /// (`req.peerCertificate()` has it). Null: none asked for.
-        client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+        client_auth: ?ClientAuth = null,
         /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
         /// As `Http.proxy_protocol_from`.
@@ -335,34 +431,58 @@ pub const Options = struct {
             cert: Cert,
             /// Offered by ALPN, in order. Null: "h2" and "http/1.1", those
             /// of the two the listener speaks.
-            alpn_protocols: ?[]const []const u8 = null,
+            alpn: ?[]const []const u8 = null,
             /// As `Https.client_auth`.
-            client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+            client_auth: ?ClientAuth = null,
         };
     };
 
-    /// `anole.Cert`: where a TLS listener's certificate and key come from.
-    pub const Cert = union(enum) {
-        /// PEM text in memory, copied by `init`.
-        pem: struct { cert: []const u8, key: []const u8 },
-        /// PEM files, read when the server starts.
-        files: struct { cert_path: []const u8, key_path: []const u8 },
-        /// A fresh self-signed certificate for localhost, held in memory:
-        /// for development only.
-        dev_self_signed,
-
-        /// PEM files, read when the server starts (and again by
-        /// `reloadCertificates` and SIGHUP).
-        pub fn fromFiles(cert_path: []const u8, key_path: []const u8) Cert {
-            return .{ .files = .{ .cert_path = cert_path, .key_path = key_path } };
-        }
-
-        /// PEM text in memory.
-        pub fn fromPem(cert: []const u8, key: []const u8) Cert {
-            return .{ .pem = .{ .cert = cert, .key = key } };
-        }
-    };
+    /// `anole.Cert`: a certificate and key, for a listener or a client.
+    pub const Cert = http.Cert;
+    /// `anole.ClientAuth`: mutual TLS on a listener.
+    pub const ClientAuth = http.ClientAuth;
 };
+
+/// The core's server configuration for `opts`: the only place one is built.
+/// The listeners are set later, by `listenOn`.
+fn coreConfig(opts: Options) http.ServerConfig {
+    return .{
+        .timeout = .{
+            .request = opts.timeouts.request,
+            .read_header = opts.timeouts.read_header,
+            .write = opts.timeouts.write,
+            .keepalive = opts.timeouts.keepalive,
+            .request_count = if (opts.limits.max_requests_per_connection) |n| n else null,
+            .idle_park = opts.timeouts.idle_park,
+            .shutdown = opts.timeouts.shutdown,
+        },
+        .request = .{
+            .max_body_size = opts.limits.body_max,
+            .max_content_length = opts.limits.body_max,
+            .require_host = opts.request.require_host,
+            .decompress = opts.request.decompress,
+            .buffer_size = opts.limits.max_head_size,
+            .keep_buffers_between_requests = opts.request.keep_buffers,
+            .max_header_count = opts.limits.max_header_count,
+            .max_param_count = opts.limits.max_param_count,
+            .max_query_count = opts.limits.max_query_count,
+            .max_form_count = opts.limits.max_form_count,
+            .max_multiform_count = opts.limits.max_multiform_count,
+        },
+        .response = opts.response,
+        .http2 = opts.http2,
+        .listeners = &.{},
+        .trusted_proxy_hops = opts.proxy.trusted_hops,
+        .trust_forwarded_proto = opts.proxy.trust_forwarded_proto,
+        .trust_forwarded_host = opts.proxy.trust_forwarded_host,
+        .max_connections = if (opts.limits.max_connections == 0)
+            http.ServerConfig.max_connections_from_fd_limit
+        else
+            opts.limits.max_connections,
+        .errors = opts.errors,
+        .error_handler = opts.error_handler,
+    };
+}
 
 /// `Server(void)` with `init(gpa, options)`: a server without state, for
 /// handlers that take `(req, res)`.
@@ -437,7 +557,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// listening sockets to pass on.
         process: ?std.process.Init.Minimal = null,
         held: []const handoff.Listener = &.{},
-        restart_timeout_ms: u32 = 10_000,
+        restart_timeout: Duration = .fromSeconds(10),
         /// `Options.signals`.
         signals: bool = true,
         /// The HTTP/3 endpoint, when `Options.http3` asked for one.
@@ -683,11 +803,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             server_on_thread = true;
             errdefer server_on_thread = false;
 
-            var server_config = opts.server;
-            server_config.listeners = &.{};
-            server_config.http2 = opts.http2;
-            server_config.errors = opts.errors;
-            if (opts.error_handler) |h| server_config.error_handler = h;
+            const server_config = coreConfig(opts);
             const server = try a.create(http.Server(Ctx));
             server.* = .init(gpa, rt_io, server_config, ctx);
             errdefer server.deinit();
@@ -719,7 +835,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .router = &server.router,
                 .stopped = stopped,
                 .process = opts.process,
-                .restart_timeout_ms = opts.restart_timeout_ms,
+                .restart_timeout = opts.restart_timeout,
                 .signals = opts.signals,
                 .h3 = if (features.http3) null else {},
                 .blocking_pool = pool,
@@ -776,7 +892,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (opts.https) |h| try specs.append(a, .{ .name = "https", .listener = .{
                 .address = h.address,
                 .port = h.port,
-                .tls = .{ .cert = h.cert, .alpn_protocols = h.alpn_protocols, .client_auth = h.client_auth },
+                .tls = .{ .cert = h.cert, .alpn = h.alpn, .client_auth = h.client_auth },
                 .http3 = opts.http3 != null,
                 .proxy_protocol = h.proxy_protocol,
                 .proxy_protocol_from = h.proxy_protocol_from,
@@ -930,7 +1046,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     };
                     try cs.listeners.append(a, out);
                     config = .{
-                        .alpn_protocols = t.alpn_protocols orelse defaultAlpn(l),
+                        .alpn_protocols = t.alpn orelse defaultAlpn(l),
                         .client_auth = t.client_auth,
                         .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key },
                     };
@@ -1048,7 +1164,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// The HTTP/3 endpoint's mutual TLS settings: the TCP listener's
         /// mode, with its CAs (`bundle`, loaded by the caller).
-        fn h3ClientAuth(client_auth: ?http.ServerConfig.Tls.ClientAuth, bundle: ?std.crypto.Certificate.Bundle) if (features.http3) ?h3.ClientAuth else void {
+        fn h3ClientAuth(client_auth: ?http.ClientAuth, bundle: ?std.crypto.Certificate.Bundle) if (features.http3) ?h3.ClientAuth else void {
             if (comptime !features.http3) return;
             const ca = client_auth orelse return null;
             return .{
@@ -2088,7 +2204,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 return false;
             };
             log.info("restart: started process {d}; waiting for it to serve", .{successor.pid});
-            if (!successor.waitReady(self.rt.io(), self.restart_timeout_ms)) {
+            if (!successor.waitReady(self.rt.io(), self.restart_timeout)) {
                 log.err("restart: process {d} did not report serving; stopped it and carrying on", .{successor.pid});
                 successor.abandon();
                 sd_notify.ready(environ, null);

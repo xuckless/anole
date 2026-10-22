@@ -53,16 +53,19 @@ pub const Middleware = dusty.Middleware;
 /// Inside a server use `anole.client(req)`, which shares one.
 pub const Client = dusty.Client;
 /// `Client.init`'s settings.
-pub const ClientConfig = dusty.ClientConfig;
+pub const ClientOptions = dusty.ClientOptions;
 /// Options for `Server.static` / `Router.static` and `Server.embedded`.
 pub const StaticOptions = dusty.StaticOptions;
 /// Options for `Server.embedded`.
 pub const EmbeddedOptions = dusty.EmbeddedOptions;
-/// `ClientConfig.tls`; `anole.h2` and `anole.h3` take the same fields.
-pub const TlsConfig = dusty.TlsConfig;
-/// Where a client's trusted CAs come from: the system store, a file, a
-/// directory, or PEM in memory.
-pub const TlsCa = dusty.TlsCa;
+/// `ClientOptions.tls`; `anole.h2` and `anole.h3` take the same fields.
+pub const TlsOptions = dusty.TlsOptions;
+/// A certificate and its key (`anole.Cert`).
+pub const Cert = dusty.Cert;
+/// Where trusted CAs come from (`anole.Ca`).
+pub const Ca = dusty.Ca;
+/// Mutual TLS on a listener (`anole.ClientAuth`).
+pub const ClientAuth = dusty.ClientAuth;
 
 /// How the server writes its own error answers (`ServerConfig.errors`).
 pub const ErrorFormat = dusty.ErrorFormat;

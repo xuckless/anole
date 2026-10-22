@@ -13,7 +13,7 @@ const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
 /// An HTTP/2 client, injected as the `h2_client` import like `tls` and
 /// `nghttp2` (src/h2_client_stub.zig lists what it must provide). With one,
-/// `ClientConfig.http2` offers "h2" through ALPN, and a connection on which
+/// `ClientOptions.http2` offers "h2" through ALPN, and a connection on which
 /// the server picks it is handed to it after the handshake.
 const h2_client = @import("h2_client");
 const has_h2_client = build_options.use_tls and !@hasDecl(h2_client, "is_stub");
@@ -25,6 +25,8 @@ const unix_path_max = 108;
 const early_response_wait: std.Io.Duration = .fromMilliseconds(50);
 
 const config_mod = @import("config.zig");
+const Cert = config_mod.Cert;
+const Ca = config_mod.Ca;
 const body_read_reserve = config_mod.body_read_reserve;
 
 const http = @import("http.zig");
@@ -96,7 +98,7 @@ test "nghttp2 links and reports a version" {
 pub const default_user_agent = "anole/" ++ build_options.version;
 
 /// Configuration for the HTTP client.
-pub const ClientConfig = struct {
+pub const ClientOptions = struct {
     /// Maximum number of redirects to follow (0 = disabled).
     max_redirects: u8 = 10,
     /// Maximum response body size in bytes.
@@ -134,7 +136,7 @@ pub const ClientConfig = struct {
     /// with error.TlsNotConfigured. Applies to every connection the client
     /// makes: connections are pooled and reused across requests, so the trust
     /// settings and client identity cannot be varied per request.
-    tls: TlsConfig = .{},
+    tls: TlsOptions = .{},
     /// Maximum number of headers allowed in a response.
     max_response_header_count: usize = 64,
     /// Maximum time for `fetch`: connecting, the TLS handshake, sending,
@@ -201,7 +203,7 @@ pub const RedirectAction = enum {
     fail,
 };
 
-/// `ClientConfig.check_redirect`: `check(context, redirect)` decides each
+/// `ClientOptions.check_redirect`: `check(context, redirect)` decides each
 /// redirect. It runs on the fetching task and must not block.
 pub const RedirectPolicy = struct {
     context: ?*anyopaque = null,
@@ -209,42 +211,18 @@ pub const RedirectPolicy = struct {
 };
 
 /// TLS settings for the HTTP client.
-pub const TlsConfig = struct {
+pub const TlsOptions = struct {
     /// Certificate authorities used to verify the server's certificate chain.
     ca: Ca = .system,
     /// Certificate and key to present when the server asks the client to
     /// authenticate itself (mutual TLS). When null, a server that requires a
-    /// client certificate rejects the handshake.
-    client_certificate: ?ClientCertificate = null,
+    /// client certificate rejects the handshake. `.fromFiles` reads PEM
+    /// files (a key PKCS#8 or SEC1, without a passphrase) on the first HTTPS
+    /// request; `.fromPem` takes them from memory.
+    client_certificate: ?Cert = null,
     /// Accept any server certificate and skip host name checking. This makes
     /// the connection trivially interceptable; for testing only.
     insecure_skip_verify: bool = false,
-
-    /// Where the client gets the certificate authorities it trusts. `.none` is
-    /// only valid together with `insecure_skip_verify`.
-    pub const Ca = config_mod.TlsCa;
-
-    pub const ClientCertificate = struct {
-        /// PEM certificate chain, leaf first, resolved against `dir`.
-        /// Ignored when `pem` is set.
-        cert_path: []const u8 = "",
-        /// PEM private key for the leaf certificate, resolved against `dir`.
-        /// Must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
-        /// KEY"); passphrase-protected keys are not supported. Ignored when
-        /// `pem` is set.
-        key_path: []const u8 = "",
-        /// The chain and key as PEM text in memory, in place of the paths,
-        /// as `ServerConfig.Tls.pem` is for a listener. Read on the first
-        /// HTTPS request; it must stay alive until then.
-        pem: ?Pem = null,
-        /// Directory the paths are resolved against. Defaults to the current
-        /// working directory.
-        dir: ?std.Io.Dir = null,
-
-        pub const Pem = config_mod.ServerConfig.Tls.Pem;
-    };
-
-    pub const Path = config_mod.TlsPath;
 };
 
 /// Options for a single fetch request.
@@ -254,7 +232,7 @@ pub const FetchOptions = struct {
     body: ?[]const u8 = null,
     /// Override default redirect limit for this request.
     max_redirects: ?u8 = null,
-    /// Replaces `ClientConfig.timeout` for this request. Null inherits it;
+    /// Replaces `ClientOptions.timeout` for this request. Null inherits it;
     /// `.none` lifts it. A duration runs from the call to `fetch`, and a
     /// deadline is taken as given.
     timeout: ?std.Io.Timeout = null,
@@ -262,7 +240,7 @@ pub const FetchOptions = struct {
     decompress: bool = true,
     /// Leave the response body on the wire for the caller to read through
     /// `ClientResponse.reader`, rather than reading it whole inside `fetch`.
-    /// Unbounded by `timeout`, and by `ClientConfig.max_response_size`.
+    /// Unbounded by `timeout`, and by `ClientOptions.max_response_size`.
     stream: bool = false,
     /// Connect over a Unix domain socket instead of TCP.
     /// Useful for communicating with Docker Engine (e.g. "/var/run/docker.sock").
@@ -423,13 +401,13 @@ pub const ConnectionPool = struct {
     /// in one round.
     const reap_min_sleep: std.Io.Duration = .fromMilliseconds(10);
 
-    /// `ClientConfig`'s pool settings.
+    /// `ClientOptions`'s pool settings.
     pub const Limits = struct {
         max_idle: u16 = 1024,
         max_idle_per_host: u16 = 256,
         idle_timeout: ?std.Io.Duration = .fromSeconds(90),
 
-        pub fn fromConfig(config: ClientConfig) Limits {
+        pub fn fromConfig(config: ClientOptions) Limits {
             return .{
                 .max_idle = config.max_idle_connections,
                 .max_idle_per_host = config.max_idle_per_host,
@@ -1246,7 +1224,7 @@ pub const ClientResponse = struct {
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    config: ClientConfig,
+    config: ClientOptions,
     /// One per executor of `io`'s runtime, up to `max_pools` (executors
     /// past it share, by index modulo); the first `pool_count` are used.
     pools: [max_pools]ConnectionPool,
@@ -1271,7 +1249,7 @@ pub const Client = struct {
     /// The most pools a client has.
     pub const max_pools = 64;
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientOptions) Client {
         const limits: ConnectionPool.Limits = .fromConfig(config);
         return .{
             .allocator = allocator,
@@ -1321,16 +1299,12 @@ pub const Client = struct {
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
-            client_cert = if (cc.pem) |pem|
-                try tls.config.CertKeyPair.fromSlice(self.allocator, self.io, pem.cert, pem.key)
-            else
-                try tls.config.CertKeyPair.fromFilePath(
-                    self.allocator,
-                    self.io,
-                    cc.dir orelse std.Io.Dir.cwd(),
-                    cc.cert_path,
-                    cc.key_path,
-                );
+            client_cert = switch (cc) {
+                .pem => |pem| try tls.config.CertKeyPair.fromSlice(self.allocator, self.io, pem.cert, pem.key),
+                .files => |f| try tls.config.CertKeyPair.fromFilePath(self.allocator, self.io, std.Io.Dir.cwd(), f.cert_path, f.key_path),
+                // Anole's own clients make one with `tls.selfSigned`.
+                .dev_self_signed => return error.DevCertificateUnavailable,
+            };
         }
 
         self.tls_state = .{ .ca_bundle = ca_bundle, .trust = trust, .client_cert = client_cert };

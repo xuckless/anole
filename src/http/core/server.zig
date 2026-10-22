@@ -19,6 +19,7 @@ const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
 const Headers = @import("http.zig").Headers;
 const Response = @import("response.zig").Response;
+const config_mod = @import("config.zig");
 const ServerConfig = @import("config.zig").ServerConfig;
 const default_listeners = @import("config.zig").default_listeners;
 const body_read_reserve = @import("config.zig").body_read_reserve;
@@ -166,7 +167,7 @@ fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, forwarding: F
 const ClientAuthRef = struct {
     bundle: *std.crypto.Certificate.Bundle,
     trust: ?*const TrustStore,
-    mode: ServerConfig.Tls.ClientAuth.Mode,
+    mode: config_mod.ClientAuth.Mode,
 };
 
 /// What every connection accepted on a TLS listener handshakes with: the
@@ -180,7 +181,7 @@ const TlsMaterial = struct {
     auth: tls.config.CertKeyPair,
     client_ca: ?std.crypto.Certificate.Bundle = null,
     client_trust: ?TrustStore = null,
-    client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
+    client_auth_mode: config_mod.ClientAuth.Mode = .require,
 
     /// Reads the certificate, key and client CAs `cfg` names (files are
     /// read now).
@@ -189,7 +190,7 @@ const TlsMaterial = struct {
             log.err("tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
             return error.NoCertificateAuthority;
         };
-        const dir = cfg.dir orelse std.Io.Dir.cwd();
+        const dir = std.Io.Dir.cwd();
         const loaded = if (cfg.pem) |pem|
             tls.config.CertKeyPair.fromSlice(allocator, io, pem.cert, pem.key)
         else if (cfg.cert_path.len == 0 or cfg.key_path.len == 0) {
