@@ -16,7 +16,7 @@ that happens promptly.
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (tarball) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
 | zlib-ng, zstd, Brotli, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
-| zig-protobuf | build.zig.zon | upstream commit; it pins protoc per platform |
+| zig-protobuf | build.zig.zon | commit of the xuckless/zig-protobuf fork, branch `anole`; it pins protoc per platform |
 | websocket-zig, zig-jwt, zig-sqlite | build.zig.zon | commits of the xuckless forks, branch `anole` |
 | pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
 | SQLite 3.54.1 | build.zig.zon | sqlite.org amalgamation zip, compiled by `build/sqlite.zig` |
@@ -136,12 +136,22 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   The bench suite's `conns` and `raw` scenarios measure both.
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
-  when upstream moves and the fixes are still needed.
+  when upstream moves and the fixes are still needed. websocket-zig also
+  carries a security patch (RSV1 refused on control frames and
+  continuations); keep it on every rebase.
+- **zig-protobuf**: upstream e9e18c7 plus security patches in the decoder
+  (nesting depth bound, length-delimited fields checked against the input
+  before allocating, Timestamp validation). On an upstream move: merge it
+  into `anole`, run the fork's tests and conformance suite, re-pin, and
+  run Anole's gRPC tests and fuzz targets.
 - **pg.zig** (PostgreSQL, `-Dpostgres`): upstream master 4d63344 plus a
   read timeout, `Conn.cancel()` (CancelRequest), the automatic statement
   cache, pool `max_lifetime`/`idle_timeout`, `Pool.acquireOpts` keeping a
   refused connect's error, and TLS through an injected `tls` module
-  instead of OpenSSL (Anole's is `src/pg/tls.zig`). The first four are
+  instead of OpenSSL (Anole's is `src/pg/tls.zig`), plus security patches
+  (server messages checked before they are read, LISTEN channel names
+  bounded, SCRAM nonce and iteration count checks, `require_auth` and
+  SCRAM channel binding, the pool's optional session reset). The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig
@@ -222,7 +232,7 @@ build.zig.zon's `minimum_zig_version` says the same (it is only advisory).
 
 Moving to the next minor version (0.18):
 
-1. Move every Zig dependency to a commit that supports it: zio, zig-protobuf, the
+1. Move every Zig dependency to a commit that supports it: zio, the zig-protobuf,
    websocket-zig, zig-jwt and zig-sqlite forks, and translate-c's matching branch.
 2. Change the version check in `build.zig`, `minimum_zig_version`, the
    README's requirements, and the CI workflows' `version:`.
