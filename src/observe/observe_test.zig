@@ -383,3 +383,18 @@ test "access log: the query is left out unless log_query" {
     const kept = try observe.access_log.formatLine(arena, .{ .format = .text, .log_query = true }, &req, 200, 1, 0, null);
     try std.testing.expect(std.mem.startsWith(u8, kept, "GET /callback?code=secret-code&state=s 200 "));
 }
+
+test "tracing: OTEL_SERVICE_NAME from the process environment without .process" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const anole = @import("../root.zig");
+    const libc = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    _ = libc.setenv("OTEL_SERVICE_NAME", "from-the-environment", 1);
+    defer _ = libc.unsetenv("OTEL_SERVICE_NAME");
+    var app = try anole.App.init(std.testing.allocator, .{ .http = .{ .port = 0 }, .executors = .exact(1) });
+    defer app.deinit();
+    const exporter = try app.tracing(.{ .endpoint = "http://127.0.0.1:9", .interval = .fromSeconds(60) });
+    try std.testing.expectEqualStrings("from-the-environment", exporter.options.service_name);
+}

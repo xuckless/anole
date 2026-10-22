@@ -177,3 +177,131 @@ test "anole.Server: the HTTPS listener's startup line names HTTP/3" {
     // Port 0: the UDP socket got a port of its own, so the line names it.
     try std.testing.expect(std.mem.startsWith(u8, tcp.extra_protocols[0], "HTTP/3"));
 }
+
+test "rateLimit: the 3rd request in a minute is 429, with Retry-After" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1) }, {});
+    defer app.deinit();
+    app.rateLimit(.{ .limit = 2 });
+    app.get("/", Handlers.ok);
+    var client_future = try app.io().concurrent(struct {
+        fn run(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const addr = a.addresses()[0].ip;
+            var out: [1024]u8 = undefined;
+            for (0..2) |_| {
+                const ok = try get(io_, addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+                try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 "));
+                try std.testing.expect(has(ok, "RateLimit-Limit: 2\r\n"));
+            }
+            const limited = try get(io_, addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+            try std.testing.expect(std.mem.startsWith(u8, limited, "HTTP/1.1 429 "));
+            try std.testing.expect(has(limited, "Retry-After: "));
+        }
+    }.run, .{&app});
+    try app.run();
+    try client_future.await(app.io());
+}
+
+test "middleware: every built-in takes init(.{})" {
+    _ = http.middleware.Compress.init(.{});
+    _ = http.middleware.Logger.init(.{});
+    _ = http.middleware.Cors.init(.{});
+    _ = http.middleware.RequestId.init(.{});
+    const gpa = std.testing.allocator;
+    var store = anole.session.MemoryStore.init(gpa, std.testing.io, .{});
+    defer store.deinit();
+    var limited = anole.ratelimit.MemoryLimiter.init(gpa, std.testing.io, .{});
+    defer limited.deinit();
+    // Options, not Config, for a middleware's settings.
+    comptime {
+        if (@hasDecl(http.middleware.Cors, "Config") or @hasDecl(http.middleware.Logger, "Config") or
+            @hasDecl(http.middleware.RequestId, "Config") or @hasDecl(anole.session, "Config"))
+            @compileError("settings structs are named Options");
+    }
+}
+
+test "api: Request and Response expose no engine fields without _" {
+    const Allowed = struct {
+        const request_fields = [_][]const u8{
+            "method",         "url",         "version_major", "version_minor", "headers", "content_type",
+            "content_encoding", "content_length", "route",       "params",        "query",   "remote_address",
+            "listener",       "secure",      "protocol",      "forwarded_host", "peer_certificate", "id",
+            "trace_id",       "span_id",     "drain",         "arena",         "io",      "session",
+            "locals",
+        };
+        const request_decls = [_][]const u8{
+            "host",    "peerCertificate", "setTimeout", "setDeadline", "reader",    "readerLimited", "body",
+            "param",   "queryParam",      "bind",       "bindWith",    "json",      "jsonValue",     "jsonObject",
+            "setLocal", "local",          "cookies",    "formData",    "multiFormData", "urlUnescape",
+        };
+        const response_fields = [_][]const u8{
+            "status",      "body",      "headers",      "content_type", "arena",   "body_buffer", "io",
+            "trailers",    "keepalive", "head",         "http10",       "content_length", "body_sent", "compress",
+            "brotli_encoder", "file",   "detached",
+        };
+        const response_decls = [_][]const u8{
+            "BodyFile",   "HeaderError", "SendError",   "WriteError",   "trailer",   "abort",   "headersSent",
+            "peerGone",   "deinit",      "SendFileOptions", "SendFileError", "sendFile", "header", "addHeader",
+            "writer",     "stream",      "clearWriter", "resetBody",    "json",      "jsonWith", "fail",
+            "render",     "encode",      "print",       "setCookie",    "startEventStream", "canDetach", "isDetached",
+            "detach",     "onFinish",    "adopt",       "write",        "memoryBodyLen", "copyBody",
+        };
+        fn listed(comptime list: []const []const u8, name: []const u8) bool {
+            for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+            return false;
+        }
+        fn check(comptime T: type, comptime fields: []const []const u8, comptime decls: []const []const u8) void {
+            comptime {
+                @setEvalBranchQuota(100_000);
+                const info = @typeInfo(T).@"struct";
+                for (info.field_names) |name| {
+                    if (name[0] == '_') continue;
+                    if (!listed(fields, name)) @compileError(@typeName(T) ++ "." ++ name ++ " is public: prefix an engine field with _, or list a handler-facing one in this test on purpose");
+                }
+                for (info.decl_names) |name| {
+                    if (name[0] == '_') continue;
+                    if (!listed(decls, name)) @compileError(@typeName(T) ++ "." ++ name ++ " is public: prefix an engine declaration with _, or list a handler-facing one in this test on purpose");
+                }
+            }
+        }
+    };
+    Allowed.check(http.Request, &Allowed.request_fields, &Allowed.request_decls);
+    Allowed.check(http.Response, &Allowed.response_fields, &Allowed.response_decls);
+}
+
+test "doc comments: no dusty or core build-option names in public doc comments" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(io);
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+    var bad: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const text = dir.readFileAlloc(io, entry.path, gpa, .limited(16 << 20)) catch continue;
+        defer gpa.free(text);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var n: usize = 0;
+        while (lines.next()) |raw| {
+            n += 1;
+            const line = std.mem.trim(u8, raw, " \t");
+            if (!std.mem.startsWith(u8, line, "///") and !std.mem.startsWith(u8, line, "//!")) continue;
+            const names = std.mem.indexOf(u8, line, "dusty") != null or std.mem.indexOf(u8, line, "use_http2") != null or
+                std.mem.indexOf(u8, line, "use_tls") != null;
+            if (!names) continue;
+            // Attribution, and identifiers that still carry the name.
+            const allowed = [_][]const u8{ "Adapted from", "adapted from", "lalinsky/dusty", "xuckless/dusty", "LICENSE.dusty", "dusty_tls", "`dusty.", "dusty_mod", "`dusty`" };
+            const ok = for (allowed) |a| {
+                if (std.mem.indexOf(u8, line, a) != null) break true;
+            } else false;
+            if (ok) continue;
+            std.debug.print("{s}:{d}: {s}\n", .{ entry.path, n, line });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

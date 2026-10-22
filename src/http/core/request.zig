@@ -1777,3 +1777,17 @@ test "Request.body: 100 Continue goes through the response's sink" {
     try std.testing.expectEqual(http.Status.@"continue", probe.interim.?);
     try std.testing.expect(!req._expects_continue);
 }
+
+test "misuse: a second reader is BodyReaderTaken in every build mode" {
+    var req: Request = .{
+        .arena = std.testing.allocator,
+        .io = std.testing.io,
+        ._parser = undefined,
+        ._transport = undefined,
+    };
+    var buf: [16]u8 = undefined;
+    _ = try req.reader(&buf);
+    try std.testing.expectError(error.BodyReaderTaken, req.reader(&buf));
+    // And `body` after `reader` is the same mistake.
+    try std.testing.expectError(error.BodyReaderTaken, req.body());
+}

@@ -175,7 +175,7 @@ pub const EventStream = struct {
 
     /// Whether the server is draining: send a last event and `end`.
     pub fn draining(self: *const EventStream) bool {
-        const req = self.body.res.request orelse return false;
+        const req = self.body.res._request orelse return false;
         const event = req.drain orelse return false;
         return event.isSet();
     }
@@ -4734,4 +4734,60 @@ test "sendFile: a path that would leave the directory is refused as text" {
             try std.testing.expect(!Response.staysInside(path));
         }
     }
+}
+
+test "EventStream: comment, end and draining" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    var drain: std.Io.Event = .unset;
+    request.drain = &drain;
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    response._request = &request;
+    var event_buf: [256]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
+    try std.testing.expect(!stream.draining());
+    try stream.comment("keep-alive");
+    try stream.send("x", .{});
+    drain.set(std.testing.io);
+    try std.testing.expect(stream.draining());
+    try stream.end();
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "e\r\n: keep-alive\n\n\r\n9\r\ndata: x\n\n\r\n0\r\n\r\n"));
+    try std.testing.expectError(error.InvalidEventField, stream.comment("a\nb"));
+}
+
+test "misuse: stream after res.body is BodyAlreadySet" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    response.body = "already";
+    var body_buf: [64]u8 = undefined;
+    try std.testing.expectError(error.BodyAlreadySet, response.stream(&body_buf));
+    try std.testing.expectError(error.BodyAlreadySet, response.writer());
+    // Nothing went out, and the response is as it was.
+    try std.testing.expect(!response.headersSent());
+}
+
+test "misuse: writer after the head is HeadersAlreadySent, resetBody too" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try std.testing.expectError(error.BodyWriterOpen, response.writer());
+    try body.end();
+    try std.testing.expectError(error.HeadersAlreadySent, response.writer());
+    try std.testing.expectError(error.HeadersAlreadySent, response.resetBody());
 }

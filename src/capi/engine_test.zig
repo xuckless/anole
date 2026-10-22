@@ -1053,3 +1053,43 @@ test "capi engine: drain and reloads from other threads race the stop, many time
         try std.testing.expectError(error.State, e.reloadCertificates());
     }
 }
+
+test "parse: proxy, request, response, http2, errors groups reach ServerOptions" {
+    const json =
+        \\{"executors": 1,
+        \\ "timeouts": {"request_ms": null, "read_header_ms": 3000, "write_ms": 2000, "idle_park_ms": null, "shutdown_ms": 150},
+        \\ "limits": {"max_head_size": 8192, "max_header_count": 40, "max_requests_per_connection": 9, "ws_max_message": 65536},
+        \\ "proxy": {"trusted_hops": 2, "trust_forwarded_host": true},
+        \\ "request": {"require_host": false, "keep_buffers": true},
+        \\ "response": {"date": false, "brotli_quality": 3, "default_content_type": "json"},
+        \\ "http2": {"max_concurrent_streams": 7},
+        \\ "errors": "text",
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = try engine.Engine.create(json, false, &why);
+    defer e.destroy();
+    try e.start();
+    const cfg = e.app.?.server.config;
+    try std.testing.expectEqual(@as(?std.Io.Duration, null), cfg.timeout.request);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(3), cfg.timeout.read_header.?);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(2), cfg.timeout.write.?);
+    try std.testing.expectEqual(@as(?std.Io.Duration, null), cfg.timeout.idle_park);
+    try std.testing.expectEqual(std.Io.Duration.fromMilliseconds(150), cfg.timeout.shutdown.?);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.request.buffer_size);
+    try std.testing.expectEqual(@as(usize, 40), cfg.request.max_header_count);
+    try std.testing.expectEqual(@as(?usize, 9), cfg.timeout.request_count);
+    try std.testing.expectEqual(@as(usize, 65536), cfg.request.ws_max_message);
+    try std.testing.expectEqual(@as(usize, 2), cfg.trusted_proxy_hops);
+    try std.testing.expect(cfg.trust_forwarded_host);
+    try std.testing.expect(!cfg.request.require_host);
+    try std.testing.expect(cfg.request.keep_buffers_between_requests);
+    try std.testing.expect(!cfg.response.date);
+    try std.testing.expectEqual(@as(u4, 3), cfg.response.brotli_quality);
+    try std.testing.expectEqual(@as(?anole.http.ContentType, .json), cfg.response.default_content_type);
+    try std.testing.expectEqual(@as(u32, 7), cfg.http2.max_concurrent_streams);
+    try std.testing.expectEqual(anole.http.ErrorFormat.text, cfg.errors);
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+}
