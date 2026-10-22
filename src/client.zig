@@ -14,7 +14,8 @@
 //! given (a request's, or `app.io()`), so it works from any handler and any
 //! task of the server, with or without server state. It wraps dusty's
 //! client (`anole.http.Client`, reachable as `.http`) with inline headers
-//! and JSON decoding of the response.
+//! and JSON decoding of the response. Its settings (the pool, the timeout,
+//! the CAs) come from `ServerOptions.client`.
 const std = @import("std");
 const zio = @import("zio");
 const http = @import("http/root.zig");

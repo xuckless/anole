@@ -56,9 +56,19 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
   core's response, `.http` (on the client) the core's client, for the rest
   of what `anole.http.Client` below offers.
 
-It trusts the system's CA store and has the defaults below. A client with
-other settings (CAs, a client certificate, HTTP/2) is an
-`anole.http.Client` of your own. The APIs that make requests for you
+It trusts the system's CA store and has the defaults below. To change them
+for the server's client, set `ServerOptions.client`, an
+`anole.http.ClientConfig` (CAs, a client certificate, HTTP/2, the timeout,
+the pool):
+
+```zig
+var app = try anole.App.init(gpa, .{
+    .client = .{ .timeout = .fromSeconds(5), .max_idle_per_host = 64 },
+});
+```
+
+A client with settings of its own beside it is an `anole.http.Client` of
+your own. The APIs that make requests for you
 (`anole.auth.Keyring`, `anole.auth.oidc`, `anole.observe.trace.Exporter`)
 take the `anole.Client` that `app.client()` and `anole.client(req)` return;
 wrap one of your own as `.{ .http = &my_client }`.
@@ -81,9 +91,40 @@ const content_type = response.headers().get("Content-Type");
 `fetch` reads the whole body by default, up to `max_response_size` (10 MiB).
 It sends `Accept-Encoding: gzip, deflate` and, when built with
 `-Dcompression` (on by default), undoes gzip, deflate and zstd. The
-response's memory lives until `deinit`. One client is safe to share between tasks; its pool keeps up to
-`max_idle_connections` (8) idle connections and reuses them. The `gpa` you
-pass must be thread-safe.
+response's memory lives until `deinit`. One client is safe to share between
+tasks, and its connections are pooled: `deinit` on a response hands its
+connection back, and the next request to the same scheme, host and port
+takes it. The `gpa` you pass must be thread-safe.
+
+### The connection pool
+
+On zio each executor has a pool of its own, as the database connectors do:
+a request takes and gives back connections on its own executor, so a
+connection stays on one thread. (Off zio there is one pool.) Each keeps:
+
+| `ClientConfig` field | Default | What it bounds |
+| --- | --- | --- |
+| `max_idle_per_host` | 256 | Idle connections to one scheme, host and port (or unix socket). |
+| `max_idle_connections` | 1024 | Idle connections in all. 0 turns pooling off. |
+| `idle_timeout` | 90 s | How long a connection may sit idle before the pool closes it. A shorter `Keep-Alive: timeout=N` from the server wins; null keeps it until the server closes it. |
+
+A pool is never bigger than the number of requests that were in flight at
+once on its executor, so the generous limits cost nothing until a burst
+needs them, and `idle_timeout` closes what a burst left behind (a task per
+pool runs only while connections are idle). Set them lower to keep fewer
+sockets open to an upstream, not to save memory on the common path: when
+many handlers call one host at once and the limit is below how many are in
+flight, every connection that comes back past the limit is closed and the
+next request dials again. That costs a handshake, a socket in TIME_WAIT and
+memory churn on every round; with 32 handlers on one upstream and the old
+limit of 8, a server's memory grew without end (see the changelog). Go's
+`MaxIdleConnsPerHost` of 2 is the same trap; hyper and reqwest keep no
+per-host limit.
+
+Each idle connection holds its read buffer (`buffer_size`, 16 KiB, plus 1
+KiB), a 1 KiB write buffer and at most 32 KiB its last response's arena
+kept. `client.dials` counts the connections the client opened, for
+checking that a steady load reuses them.
 
 A request with headers and a body:
 
