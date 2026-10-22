@@ -134,6 +134,18 @@ fn bigHead(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "big head";
 }
 
+/// GET /fields: the request's cookie, then every `x-multi` value.
+fn fields(req: *dusty.Request, res: *dusty.Response) !void {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(res.arena, req.headers.get("cookie") orelse "");
+    var it = req.headers.iterator();
+    while (it.next()) |e| if (std.ascii.eqlIgnoreCase(e.key, "x-multi")) {
+        try out.append(res.arena, '|');
+        try out.appendSlice(res.arena, e.value);
+    };
+    res.body = out.items;
+}
+
 /// A `no_wait` handler that waits all the same.
 fn slowNoWait(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromMilliseconds(20), .awake);
@@ -199,6 +211,7 @@ const Fixture = struct {
         http.router.get("/port", port);
         http.router.get("/download", download);
         http.router.get("/bighead", bigHead);
+        http.router.get("/fields", fields);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -564,6 +577,29 @@ test "h3 client: a response head past max_field_section_size fails the connectio
     const body = try get(conn, "/bighead", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("big head", body);
+}
+
+test "h3 server: cookie crumbs are joined with \"; \", other repeated fields all kept" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/fields" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "cookie", .value = "a=1" },    .{ .name = "x-multi", .value = "one" },
+        .{ .name = "cookie", .value = "b=2" },    .{ .name = "x-multi", .value = "two" },
+        .{ .name = "cookie", .value = "c=3" },
+    }, .{});
+    defer s.release();
+    try s.waitHead();
+    const body = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("a=1; b=2; c=3|one|two", body);
 }
 
 test "h3 server: Response.abort resets the stream, and the connection carries on" {

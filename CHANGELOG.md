@@ -19,6 +19,10 @@ breaking changes are listed anyway.
 - HTTP/3 client: response heads and trailers are limited to the new
   `ConnectOptions.max_field_section_size` (64 KiB by default, also sent to
   the server); a server that sends more fails the connection.
+- HTTP/3 server: cookie fields sent separately are joined with "; " and
+  other repeated request fields are all kept, as over HTTP/1.1. Before,
+  only the last of each was kept, which could drop or shadow a session
+  cookie.
 
 ### C ABI (ABI 0.1)
 

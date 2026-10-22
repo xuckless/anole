@@ -2373,9 +2373,12 @@ pub fn Endpoint(comptime Ctx: type) type {
 
                 request.headers = dusty.Headers.init(arena, server.config.request.max_header_count) catch return error.OutOfMemory;
                 var too_many = false;
-                for (s.headers.items) |f| request.headers.put(f.name, f.value) catch {
-                    too_many = true;
-                    break;
+                for (s.headers.items) |f| request.headers.addRequestField(arena, f.name, f.value) catch |err| switch (err) {
+                    error.TooManyHeaders => {
+                        too_many = true;
+                        break;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
                 };
                 if (!too_many and request.headers.get("Host") == null and s.authority.len > 0) {
                     request.headers.put("Host", s.authority) catch {
