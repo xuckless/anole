@@ -20,7 +20,7 @@ const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
 /// `Cors.init`'s settings.
-pub const Config = struct {
+pub const Options = struct {
     /// The origins allowed, each as the browser sends it: scheme and host,
     /// and the port when it is not the default (`https://app.example`).
     /// Empty, with `origin` unset, allows every origin.
@@ -44,10 +44,10 @@ pub const Config = struct {
     /// list of origins: with every origin allowed, `init` panics, since
     /// that would let any site act as the signed-in user.
     credentials: bool = false,
-    /// How many seconds a browser may reuse a preflight answer
+    /// How long a browser may reuse a preflight answer
     /// (`Access-Control-Max-Age`). Browsers cap it (Chromium at two
     /// hours); null sends none, which leaves their default of 5 seconds.
-    max_age: ?u32 = 600,
+    max_age: ?std.Io.Duration = .fromSeconds(600),
 };
 
 pub const default_methods = "GET, HEAD, POST, PUT, PATCH, DELETE";
@@ -66,7 +66,7 @@ const Cors = @This();
 
 /// Panics on a configuration that cannot be served safely: credentials
 /// with every origin allowed.
-pub fn init(config: Config) Cors {
+pub fn init(config: Options) Cors {
     var any = config.origins.len == 0 and config.origin == null;
     for (config.origins) |o| {
         if (std.mem.eql(u8, o, "*")) any = true;
@@ -88,7 +88,7 @@ pub fn init(config: Config) Cors {
         .credentials = config.credentials,
     };
     if (config.max_age) |seconds| {
-        self.max_age_len = @intCast((std.fmt.bufPrint(&self.max_age_buf, "{d}", .{seconds}) catch unreachable).len);
+        self.max_age_len = @intCast((std.fmt.bufPrint(&self.max_age_buf, "{d}", .{@max(0, seconds.toSeconds())}) catch unreachable).len);
     }
     return self;
 }

@@ -135,7 +135,7 @@ returns. Options:
 - `.log_query`: also log the query string (false). Off by default, because
   queries carry OIDC `code` and `state`, password-reset tokens and API keys,
   and logs keep them. `anole.middleware.Logger` has the same switch
-  (`Logger.initWith(.{ .log_query = true })`).
+  (`Logger.init(.{ .log_query = true })`).
 
 Each line is a single write, so lines from concurrent requests do not
 interleave. The line is written straight to the file, not through

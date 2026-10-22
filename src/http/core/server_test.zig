@@ -3539,7 +3539,7 @@ test "Server: the Compress middleware gzips text and leaves images alone" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
-    var compress = dusty.middleware.Compress.init();
+    var compress = dusty.middleware.Compress.init(.{});
     const mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&compress)};
     server.router.middlewares = &mws;
     server.router.get("/text", struct {
@@ -3586,7 +3586,7 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
     defer server.deinit();
 
     var request_id = dusty.middleware.RequestId.init(.{});
-    var logger = dusty.middleware.Logger.init();
+    var logger = dusty.middleware.Logger.init(.{});
     server.router.use(dusty.Middleware(void).init(&request_id));
     server.router.use(dusty.Middleware(void).init(&logger));
 

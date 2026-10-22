@@ -4,7 +4,7 @@
 //! a middleware that answers 429 with Retry-After.
 //!
 //!     var limiter = anole.ratelimit.MemoryLimiter.init(gpa, io, .{});
-//!     app.use(anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window_ms = 60_000 }));
+//!     app.use(anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window = .fromSeconds(60) }));
 //!     // by something else than the client's address:
 //!     app.use(anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 10, .key = byApiKey }));
 //!
@@ -18,22 +18,26 @@ const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
 const db = @import("../db/root.zig");
 
-/// How fast a key may go: `limit` requests per `window_ms`, refilled
+/// How fast a key may go: `limit` requests per `window`, refilled
 /// smoothly, with up to `burst` at once. 100 a minute by default.
 pub const Policy = struct {
     /// Requests allowed per window.
     limit: u32 = 100,
-    /// The window `limit` is counted over, in milliseconds.
-    window_ms: i64 = 60_000,
+    /// The window `limit` is counted over.
+    window: std.Io.Duration = .fromSeconds(60),
     /// Bucket size: how many may come at once. 0 means `limit`.
     burst: u32 = 0,
+
+    fn windowMs(p: Policy) i64 {
+        return @max(1, p.window.toMilliseconds());
+    }
 
     fn capacity(p: Policy) f64 {
         return @floatFromInt(if (p.burst > 0) p.burst else p.limit);
     }
 
     fn ratePerMs(p: Policy) f64 {
-        return @as(f64, @floatFromInt(p.limit)) / @as(f64, @floatFromInt(@max(1, p.window_ms)));
+        return @as(f64, @floatFromInt(p.limit)) / @as(f64, @floatFromInt(p.windowMs()));
     }
 };
 
@@ -86,7 +90,7 @@ fn step(tokens: *f64, last_ms: *i64, now_ms: i64, cost: u32, policy: Policy) Res
             .retry_after_seconds = 0,
         };
     }
-    const wait_ms = if (rate > 0) (cost_f - tokens.*) / rate else @as(f64, @floatFromInt(policy.window_ms));
+    const wait_ms = if (rate > 0) (cost_f - tokens.*) / rate else @as(f64, @floatFromInt(policy.windowMs()));
     const retry: u32 = @max(1, @as(u32, @intFromFloat(@ceil(wait_ms / 1000.0))));
     return .{
         .allowed = false,
@@ -141,12 +145,12 @@ pub const MemoryLimiter = struct {
         max_entries: usize = 10_000,
         /// A key unseen this long is forgotten, once its bucket is full
         /// again (forgetting an emptier one would refill it).
-        idle_ms: i64 = 300_000,
+        idle: std.Io.Duration = .fromSeconds(300),
     };
 
     /// An empty limiter. `io` reads the clock.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) MemoryLimiter {
-        return .{ .gpa = gpa, .io = io, .max_entries = @max(1, options.max_entries), .idle_ms = options.idle_ms };
+        return .{ .gpa = gpa, .io = io, .max_entries = @max(1, options.max_entries), .idle_ms = options.idle.toMilliseconds() };
     }
 
     /// Frees every bucket.
@@ -283,7 +287,7 @@ pub const RedisLimiter = if (features.redis) struct {
         const arena = arena_state.allocator();
         const k = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.prefix, key });
         var c: db.Ctx = .{ .io = self.client.io, .arena = arena };
-        const items = try self.client.all(i64, &c, .{ "EVAL", script, 1, k, policy.capacity(), policy.ratePerMs(), cost, policy.window_ms });
+        const items = try self.client.all(i64, &c, .{ "EVAL", script, 1, k, policy.capacity(), policy.ratePerMs(), cost, policy.windowMs() });
         if (items.len != 3) return error.UnexpectedReply;
         const allowed = items[0] == 1;
         const tokens = @as(f64, @floatFromInt(items[1])) / 1000.0;
@@ -378,14 +382,14 @@ pub const Middleware = struct {
     limiter: Limiter,
     options: Options,
 
-    /// `init`'s options: the policy (`limit` per `window_ms`, up to
+    /// `init`'s options: the policy (`limit` per `window`, up to
     /// `burst` at once), what requests are counted by, and what a failing
     /// limiter means.
     pub const Options = struct {
         /// Requests allowed per window (`Policy.limit`).
         limit: u32 = 100,
-        /// The window `limit` is counted over, in milliseconds.
-        window_ms: i64 = 60_000,
+        /// The window `limit` is counted over.
+        window: std.Io.Duration = .fromSeconds(60),
         /// How many may come at once; 0 means `limit`.
         burst: u32 = 0,
         /// What requests are counted by: the client's address by default
@@ -398,12 +402,12 @@ pub const Middleware = struct {
 
         /// The bucket policy these options describe.
         pub fn policy(o: Options) Policy {
-            return .{ .limit = o.limit, .window_ms = o.window_ms, .burst = o.burst };
+            return .{ .limit = o.limit, .window = o.window, .burst = o.burst };
         }
     };
 
     /// A middleware taking from `limiter` (which must outlive it) as
-    /// `options` say: `.{ .limit = 5, .window_ms = 60_000 }` per client
+    /// `options` say: `.{ .limit = 5, .window = .fromSeconds(60) }` per client
     /// address, `.key` to count by something else.
     pub fn init(limiter: Limiter, options: Options) Middleware {
         return .{ .limiter = limiter, .options = options };
@@ -445,7 +449,7 @@ pub const Middleware = struct {
 test "token bucket: burst, refill over time, retry-after" {
     var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
     defer l.deinit();
-    const policy: Policy = .{ .limit = 10, .window_ms = 1000 };
+    const policy: Policy = .{ .limit = 10, .window = .fromMilliseconds(1000) };
     for (0..10) |_| try std.testing.expect((try l.takeAt("a", 1, policy, 0)).allowed);
     const denied = try l.takeAt("a", 1, policy, 0);
     try std.testing.expect(!denied.allowed);
@@ -459,10 +463,10 @@ test "token bucket: burst, refill over time, retry-after" {
 }
 
 test "MemoryLimiter: bounded by LRU eviction, idle keys dropped" {
-    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 3, .idle_ms = 1000 });
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 3, .idle = .fromMilliseconds(1000) });
     defer l.deinit();
     // Full again within a second, so idle buckets may go.
-    const policy: Policy = .{ .limit = 2, .window_ms = 1000 };
+    const policy: Policy = .{ .limit = 2, .window = .fromMilliseconds(1000) };
     _ = try l.takeAt("a", 1, policy, 0);
     _ = try l.takeAt("b", 1, policy, 1);
     _ = try l.takeAt("c", 1, policy, 2);
@@ -486,7 +490,7 @@ test "Middleware: 429 with Retry-After once the bucket is empty" {
     defer limiter.deinit();
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
     defer server.deinit();
-    var mw = Middleware.init(limiter.limiter(), .{ .limit = 2, .window_ms = 60_000 });
+    var mw = Middleware.init(limiter.limiter(), .{ .limit = 2, .window = .fromMilliseconds(60_000) });
     server.router.use(dusty.Middleware(void).init(&mw));
     server.router.get("/", struct {
         fn h(_: *dusty.Request, res: *dusty.Response) !void {
@@ -609,7 +613,7 @@ test "redis: live rate limiter (RedisLimiter)" {
     _ = try client.del(&c, "anole:rl:t");
     var rl: RedisLimiter = .{ .client = client, .gpa = gpa };
     const l = rl.limiter();
-    const policy: Policy = .{ .limit = 3, .window_ms = 60_000 };
+    const policy: Policy = .{ .limit = 3, .window = .fromMilliseconds(60_000) };
     for (0..3) |_| try std.testing.expect((try l.take("t", 1, policy)).allowed);
     const denied = try l.take("t", 1, policy);
     try std.testing.expect(!denied.allowed);
@@ -642,7 +646,7 @@ test "clientAddress: IPv6 clients share their /64, IPv4 clients are one address 
 test "MemoryLimiter: new keys never push out a throttled bucket" {
     var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 4 });
     defer l.deinit();
-    const policy: Policy = .{ .limit = 2, .window_ms = 3_600_000 };
+    const policy: Policy = .{ .limit = 2, .window = .fromMilliseconds(3_600)_000 };
     _ = try l.takeAt("attacker", 1, policy, 0);
     _ = try l.takeAt("attacker", 1, policy, 0);
     try std.testing.expect(!(try l.takeAt("attacker", 1, policy, 0)).allowed);
@@ -657,10 +661,10 @@ test "MemoryLimiter: new keys never push out a throttled bucket" {
 }
 
 test "MemoryLimiter: an idle bucket is forgotten only once it is full again" {
-    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .idle_ms = 1000 });
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .idle = .fromMilliseconds(1000) });
     defer l.deinit();
-    // One an hour: idle for longer than idle_ms, still empty.
-    const policy: Policy = .{ .limit = 1, .window_ms = 3_600_000 };
+    // One an hour: idle for longer than `idle`, still empty.
+    const policy: Policy = .{ .limit = 1, .window = .fromMilliseconds(3_600)_000 };
     try std.testing.expect((try l.takeAt("a", 1, policy, 0)).allowed);
     _ = try l.takeAt("b", 1, policy, 10_000);
     try std.testing.expect(!(try l.takeAt("a", 1, policy, 10_000)).allowed);

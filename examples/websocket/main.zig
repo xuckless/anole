@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
     }, &state);
     defer app.deinit();
 
-    app.use(anole.middleware.Logger.init());
+    app.use(anole.middleware.Logger.init(.{}));
     app.get("/", page);
     // A plain HTTP request to either gets 426 Upgrade Required. A message
     // bigger than 1 MiB is refused with close code 1009.

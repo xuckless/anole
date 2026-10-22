@@ -177,7 +177,7 @@ pub const Response = http.Response;
 ///
 ///     app.use(anole.middleware.RequestId.init(.{}));
 ///     app.use(anole.middleware.Cors.init(.{}));
-///     app.use(anole.middleware.Compress.init());
+///     app.use(anole.middleware.Compress.init(.{}));
 pub const middleware = struct {
     /// Cross-origin requests: `Cors.init(.{})` allows any origin.
     pub const Cors = http.middleware.Cors;

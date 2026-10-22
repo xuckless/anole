@@ -83,7 +83,7 @@ pub const SelfSignedOptions = struct {
     /// subjectAltName entries, in OpenSSL config syntax.
     alt_names: []const u8 = "DNS:localhost,IP:127.0.0.1,IP:::1",
     /// How long the certificate is valid from now.
-    valid_for_seconds: i64 = 7 * 24 * 3600,
+    valid_for: std.Io.Duration = .fromSeconds(7 * 24 * 3600),
     /// P-256 is fast to make and to use; RSA-4096 is the heaviest key a
     /// handshake meets in practice (and takes a second or more to make).
     key: enum { p256, rsa4096 } = .p256,
@@ -136,7 +136,7 @@ pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
     if (c.X509_set_version(x, c.X509_VERSION_3) != 1 or
         c.BN_to_ASN1_INTEGER(bn, c.X509_get_serialNumber(x)) == null or
         c.X509_gmtime_adj(c.X509_getm_notBefore(x), -60) == null or
-        c.X509_gmtime_adj(c.X509_getm_notAfter(x), @intCast(opt.valid_for_seconds)) == null)
+        c.X509_gmtime_adj(c.X509_getm_notAfter(x), @intCast(opt.valid_for.toSeconds())) == null)
         return error.TlsCertificateFailed;
 
     var cn_buf: [256]u8 = undefined;

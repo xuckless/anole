@@ -132,7 +132,7 @@ pub const AppleSecret = struct {
     key_id: []const u8,
     /// The `.p8` key: PEM PKCS#8, EC P-256.
     private_key_pem: []const u8,
-    lifetime_seconds: i64 = 300,
+    lifetime: std.Io.Duration = .fromSeconds(300),
 
     /// A fresh client secret for `client_id` (the Services ID).
     pub fn make(self: AppleSecret, arena: std.mem.Allocator, io: std.Io, client_id: []const u8) ![]const u8 {
@@ -145,7 +145,7 @@ pub const AppleSecret = struct {
         return signer.signWithHeader(.{ .alg = "ES256", .kid = self.key_id }, .{
             .iss = self.team_id,
             .iat = now,
-            .exp = now + self.lifetime_seconds,
+            .exp = now + self.lifetime.toSeconds(),
             .aud = "https://appleid.apple.com",
             .sub = client_id,
         }, key);
@@ -213,7 +213,7 @@ pub const RelyingParty = struct {
     /// token.
     keyring: *Keyring,
     /// Clock skew allowed on the ID token's times.
-    leeway_seconds: i64 = 60,
+    leeway: std.Io.Duration = .fromSeconds(60),
 
     /// A fresh state, nonce and PKCE verifier, and the authorization URL.
     pub fn begin(self: *const RelyingParty, arena: std.mem.Allocator, io: std.Io) !Start {
@@ -292,7 +292,7 @@ pub const RelyingParty = struct {
         return .{
             .issuer = self.provider.issuer,
             .audience = self.client_id,
-            .leeway_seconds = self.leeway_seconds,
+            .leeway = self.leeway,
             .require_iat = true,
         };
     }
@@ -393,7 +393,7 @@ test "fuzz: OIDC discovery documents, token responses and ID token claims" {
             const key: jws.Key = .{ .alg = .HS256, .material = .{ .hmac = secret } };
             // With a maximum age too, which OIDC leaves to the application.
             var aged = rp.idTokenPolicy();
-            aged.max_age_seconds = 600;
+            aged.max_age = .fromSeconds(600);
             _ = jws.verify(arena, tokens.object.get("id_token").?.string, &.{key}, aged, now) catch {};
             const v = jws.verify(arena, tokens.object.get("id_token").?.string, &.{key}, rp.idTokenPolicy(), now) catch return;
             const id = rp.identify(v, tokens.object, saved) catch return;
@@ -407,7 +407,7 @@ test "fuzz: OIDC discovery documents, token responses and ID token claims" {
                 .float => |f| f,
                 else => return error.TestUnexpectedResult,
             };
-            try std.testing.expect(exp > now - rp.leeway_seconds);
+            try std.testing.expect(exp > now - rp.leeway.toSeconds());
             try std.testing.expect(claims.get("iat") != null);
             if (claims.get("azp")) |azp| try std.testing.expectEqualStrings("client-1", azp.string);
             switch (claims.get("aud").?) {

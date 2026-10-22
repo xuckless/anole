@@ -184,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
     var csrf = auth.csrf.Middleware.init(.{});
     var limiter = anole.ratelimit.MemoryLimiter.init(init.gpa, io, .{});
     defer limiter.deinit();
-    var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
+    var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window = .fromSeconds(60) });
     var can_write = auth.rbac.Require.init(&policy, "notes:write", .{ .roles = rolesOf });
     // Bearer tokens: the handler reads the verified token with
     // `auth.claims(req)` and `auth.subject(req)`.
@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
     const key_only = [_]M{.init(&api_keys)};
 
     server.use(anole.middleware.RequestId.init(.{}));
-    server.use(anole.middleware.Logger.init());
+    server.use(anole.middleware.Logger.init(.{}));
     server.group("", &web).get("/login", loginForm);
     server.group("", &limited).post("/login", login);
     server.group("", &web).get("/me", me);

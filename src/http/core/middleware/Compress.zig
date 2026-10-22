@@ -12,17 +12,28 @@ const Response = @import("../response.zig").Response;
 
 const Compress = @This();
 
-/// The middleware: `app.use(anole.middleware.Compress.init())`.
-pub fn init() Compress {
-    return .{};
+/// Brotli's quality for this middleware's responses.
+brotli_quality: ?u4 = null,
+
+/// `init`'s settings.
+pub const Options = struct {
+    /// Brotli's quality (0 to 11) for responses compressed as `br`. Null:
+    /// the server's `response.brotli_quality`.
+    brotli_quality: ?u4 = null,
+};
+
+/// The middleware: `app.use(anole.middleware.Compress.init(.{}))`.
+pub fn init(options: Options) Compress {
+    return .{ .brotli_quality = options.brotli_quality };
 }
 
 /// Only sets a flag before `next()`: requests behind it can detach
 /// (`Detached`).
 pub const detach_safe = true;
 
-pub fn execute(_: *const Compress, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const Compress, req: *Request, res: *Response, next: anytype) !void {
     _ = req;
     res.compress = true;
-    return executor.next();
+    if (self.brotli_quality) |q| res.brotli_quality = q;
+    return next.call();
 }

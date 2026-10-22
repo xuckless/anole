@@ -1204,7 +1204,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Creates a middleware instance managed by the server.
         /// The middleware is allocated on the router's arena and will be freed when the server is deinit'd.
         /// Supports middlewares with init(Config) or init(Config, MiddlewareConfig) signatures.
-        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(Ctx) {
+        pub fn middleware(self: *Self, comptime M: type, config: M.Options) !Middleware(Ctx) {
             const arena = self.router.arena.allocator();
             const m = try arena.create(M);
             const init_info = @typeInfo(@TypeOf(M.init)).@"fn";

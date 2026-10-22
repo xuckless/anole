@@ -155,7 +155,7 @@ pub const Options = struct {
     service_name: []const u8,
     /// Spans sent per request to the collector, and how often.
     batch_size: usize = 256,
-    interval_ms: u32 = 2000,
+    interval: std.Io.Duration = .fromSeconds(2),
     /// Spans waiting beyond this are dropped (and counted).
     queue_len: usize = 4096,
     /// Record only requests whose caller asked for it (sampled flag), or
@@ -252,7 +252,7 @@ pub const Exporter = struct {
             self.send(batch[0..n]);
             // A pause before the next batch, cut short by `deinit`.
             if (n < batch.len) self.closing.waitTimeout(self.io, .{ .duration = .{
-                .raw = .fromMilliseconds(self.options.interval_ms),
+                .raw = self.options.interval,
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => {},

@@ -31,7 +31,7 @@ pub fn token(req: *dusty.Request) ![]const u8 {
 }
 
 /// `Middleware` settings.
-pub const Config = struct {
+pub const Options = struct {
     /// JSON bodies are skipped as jetzig does: a browser cannot send
     /// `application/json` across sites without a CORS preflight. Turn this
     /// on to check them too.
@@ -42,9 +42,9 @@ pub const Config = struct {
 /// form field) and answers 403 when it is missing or wrong. Other methods
 /// pass through.
 pub const Middleware = struct {
-    config: Config,
+    config: Options,
 
-    pub fn init(config: Config) Middleware {
+    pub fn init(config: Options) Middleware {
         return .{ .config = config };
     }
 

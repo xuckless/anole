@@ -283,7 +283,7 @@ pub const Config = struct {
         headers: ?[]const u8 = null,
         expose: ?[]const u8 = null,
         credentials: bool = false,
-        max_age: ?u32 = 600,
+        max_age_ms: ?u32 = 600_000,
     };
     pub const Jwt = struct {
         /// The provider's JWK Set URL, fetched and refreshed; or
@@ -298,7 +298,7 @@ pub const Config = struct {
         /// With `jwks_url` and no `audience`: only for keys that sign for
         /// this application alone.
         allow_any_audience: bool = false,
-        leeway_s: i64 = 60,
+        leeway_ms: i64 = 60_000,
         require_exp: bool = true,
         /// String claims a token must carry.
         required_claims: []const []const u8 = &.{"sub"},
@@ -733,7 +733,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
         })),
         .compress => {
             if (comptime !features.compression) unreachable;
-            return app.middleware(http.middleware.Compress.init());
+            return app.middleware(http.middleware.Compress.init(.{}));
         },
         .cors => |c| return app.middleware(http.middleware.Cors.init(.{
             .origins = c.origins,
@@ -741,7 +741,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
             .headers = c.headers,
             .expose = c.expose,
             .credentials = c.credentials,
-            .max_age = c.max_age,
+            .max_age = if (c.max_age_ms) |ms| .fromMilliseconds(ms) else null,
         })),
         .jwt => |c| {
             if (comptime !features.auth) unreachable;
@@ -757,7 +757,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
                 .issuer = c.issuer,
                 .audience = c.audience,
                 .allow_any_audience = c.allow_any_audience,
-                .leeway_seconds = c.leeway_s,
+                .leeway = .fromMilliseconds(c.leeway_ms),
                 .require_exp = c.require_exp,
             }, .{ .required_claims = c.required_claims, .scopes = c.scopes, .realm = c.realm }));
         },
@@ -767,7 +767,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
             return app.middleware(RateLimitMw{
                 .limiter = limiter,
                 .header = if (std.mem.startsWith(u8, c.key, "header:")) c.key["header:".len..] else null,
-                .policy = .{ .limit = c.limit, .window_ms = c.window_ms, .burst = c.burst },
+                .policy = .{ .limit = c.limit, .window = .fromMilliseconds(c.window_ms), .burst = c.burst },
             });
         },
     }

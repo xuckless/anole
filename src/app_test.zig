@@ -112,7 +112,7 @@ test "anole.App: listen, function middleware, with, staticDir, metrics, health, 
 
     const registry = app.metrics(.{});
     try std.testing.expectEqual(registry, app.metrics(.{}));
-    _ = try app.tracing(.{ .endpoint = endpoint, .service_name = "app-test", .interval_ms = 20 });
+    _ = try app.tracing(.{ .endpoint = endpoint, .service_name = "app-test", .interval = .fromMilliseconds(20) });
     app.use(AppRoutes.stamp);
     app.get("/hello", AppRoutes.hello);
     app.get("/via", AppRoutes.via);

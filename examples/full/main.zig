@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Every response gets an X-Request-Id and an access-log line.
     app.use(anole.middleware.RequestId.init(.{}));
-    app.use(anole.middleware.Logger.init());
+    app.use(anole.middleware.Logger.init(.{}));
 
     app.get("/", handleRoot);
     app.get("/users/:id", handleUser);
