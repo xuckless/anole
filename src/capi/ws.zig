@@ -95,6 +95,8 @@ pub const ExecState = struct {
     work: std.Io.Group = .init,
 
     fn slot(st: *ExecState, i: u32) ?*WsSlot {
+        // `i` may come from a made-up handle: past the table is no socket.
+        if (i / chunk_len >= max_chunks) return null;
         const c = st.chunks[i / chunk_len].load(.acquire) orelse return null;
         return &c[i % chunk_len];
     }

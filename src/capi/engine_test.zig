@@ -22,6 +22,7 @@ const Answerer = struct {
     last_abort: std.atomic.Value(u64) = .init(0),
     sent: std.atomic.Value(u32) = .init(0),
     failures: std.atomic.Value(u32) = .init(0),
+    late_reads: std.atomic.Value(u32) = .init(0),
     file_path: []const u8,
 
     var big: [200 * 1024]u8 = @splat('z');
@@ -103,6 +104,23 @@ const Answerer = struct {
             },
             5 => self.held.store(h, .release),
             6 => try engine.respond(e, h, 200, text, &big, true),
+            // Reads the body, answers, and checks the answered handle is
+            // gone for reads too (the body may live in the request's
+            // memory, which goes with the answer).
+            7 => {
+                var chunk: [16 * 1024]u8 = undefined;
+                var total: usize = 0;
+                while (true) {
+                    const k = try engine.reqRead(e, h, &chunk, 5000);
+                    if (k == 0) break;
+                    total += k;
+                }
+                var out: [32]u8 = undefined;
+                try engine.respond(e, h, 200, text, try std.fmt.bufPrint(&out, "{d}", .{total}), false);
+                if (engine.reqRead(e, h, &chunk, 0)) |_| {
+                    _ = self.late_reads.fetchAdd(1, .monotonic);
+                } else |err| if (err != error.Gone) return err;
+            },
             else => try engine.respond(e, h, 404, &.{}, "", false),
         }
     }
@@ -116,7 +134,8 @@ const routes =
     \\  {"method": "GET", "path": "/file", "handler": 4},
     \\  {"method": "GET", "path": "/hold", "handler": 5},
     \\  {"method": "GET", "path": "/borrow", "handler": 6},
-    \\  {"method": "GET", "path": "/short", "handler": 5, "timeout_ms": 100}
+    \\  {"method": "GET", "path": "/short", "handler": 5, "timeout_ms": 100},
+    \\  {"method": "POST", "path": "/late", "handler": 7}
     \\]
 ;
 
@@ -184,6 +203,38 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 defer s.release();
                 try std.testing.expectEqual(@as(u16, 200), status);
                 try std.testing.expectEqualSlices(u8, big, body);
+            }
+
+            step = "read after answer";
+            {
+                const body = try arena.alloc(u8, 10 * 1024);
+                @memset(body, 'b');
+                for (0..20) |_| {
+                    const status, const out, const s = try get(conn, arena, "POST", "/late", body);
+                    defer s.release();
+                    try std.testing.expectEqual(@as(u16, 200), status);
+                    try std.testing.expectEqualStrings("10240", out);
+                }
+                try std.testing.expectEqual(@as(u32, 0), a.late_reads.load(.acquire));
+            }
+
+            step = "made-up handles";
+            // Garbage handles are refused, never followed.
+            {
+                const forged_ws: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 2) << 28) | 1;
+                if (comptime features.websocket) {
+                    try std.testing.expectError(error.Gone, engine.ws.send(a.e, forged_ws, abi.WS_TEXT, "x", false));
+                    try std.testing.expectError(error.Gone, engine.ws.close(a.e, forged_ws, 1000, ""));
+                    try std.testing.expectError(error.Gone, engine.ws.subscribe(a.e, forged_ws, "t", true));
+                }
+                if (comptime builtin.os.tag != .windows) {
+                    // A length past the end of the file is refused, however large.
+                    const fd = std.c.open(@ptrCast(a.file_path.ptr), .{ .ACCMODE = .RDONLY });
+                    try std.testing.expect(fd >= 0);
+                    defer _ = std.c.close(fd);
+                    try std.testing.expectError(error.Invalid, engine.respondFd(a.e, 1, 200, &.{}, fd, 1, std.math.maxInt(u64)));
+                    try std.testing.expectError(error.Invalid, engine.respondFd(a.e, 1, 200, &.{}, fd, 0, std.math.maxInt(u64)));
+                }
             }
 
             step = "stream";
@@ -269,7 +320,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 \\"listeners": [{"address": "127.0.0.1", "port": 0, "tls": {"self_signed": true}, "http3": true}]
             ;
             const json = "{\"executors\": 2, \"timeouts\": {\"request_ms\": 3000, \"shutdown_ms\": 1000}," ++
-                "\"limits\": {\"body_max\": 1048576}," ++ listener ++ "," ++ routes ++ "}";
+                "\"limits\": {\"body_max\": 1048576, \"inline_body_max\": 4096}," ++ listener ++ "," ++ routes ++ "}";
             var why_buf: [256]u8 = undefined;
             var why: std.Io.Writer = .fixed(&why_buf);
             const e = engine.Engine.create(json, false, &why) catch |err| {

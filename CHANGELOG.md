@@ -5,6 +5,13 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- C ABI: a made-up WebSocket handle, a file length past the end of the file
+  (`anole_respond_fd`), and a request body read after the request was
+  answered are now refused (`ANOLE_E_GONE` / `ANOLE_E_INVALID`) instead of
+  reaching memory they should not. No configuration change needed.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings

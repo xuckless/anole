@@ -1512,8 +1512,11 @@ fn detachedAborted(ctx: *anyopaque) void {
             // for it (a copy, on the consumer's thread).
             .polling => std.atomic.spinLoopHint(),
             // The consumer is answering, or has: the capi task frees it.
+            // The request body may live in the request's memory, which
+            // goes once this returns: reads of it end now.
             .responding, .done, .streaming => {
                 s.orphan = true;
+                x.closePipe(&s.in, gen, si);
                 return;
             },
             .free, .expired => return,
@@ -1540,6 +1543,7 @@ fn finishDetached(x: *Exec, si: u32) void {
     if (stateOf(w) == .streaming or (stateOf(w) == .done and s.reply == .fd)) {
         const group = d.attach();
         placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) catch {
+            x.closePipe(&s.in, gen, si);
             d.finish(error.SystemResources);
             x.release(si);
         };
@@ -1547,6 +1551,9 @@ fn finishDetached(x: *Exec, si: u32) void {
     }
     s.detached = null;
     const result = applyAnswer(x, si, d.request, d.response);
+    // `finish` lets the request's memory go, which a streamed request body
+    // may still be read from: the reads end first.
+    x.closePipe(&s.in, gen, si);
     d.finish(result);
     x.release(si);
 }
@@ -1561,6 +1568,7 @@ fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
         streamAnswer(x, si, gen, d.request, d.response)
     else
         applyAnswer(x, si, d.request, d.response);
+    x.closePipe(&s.in, gen, si);
     d.finish(result);
     x.release(si);
     if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
@@ -1576,6 +1584,7 @@ fn expireDetached(x: *Exec, si: u32, w: u64) void {
     _ = x.engine.expired_count.fetchAdd(1, .monotonic);
     if (s.detached) |d| {
         s.detached = null;
+        x.closePipe(&s.in, gen, si);
         d.response.fail(.gateway_timeout, "the application did not answer in time");
         d.finish({});
     }
@@ -2035,7 +2044,7 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     const size: u64 = st.size;
     if (offset > size) return error.Invalid;
     const n = if (len == 0) size - offset else len;
-    if (offset + n > size) return error.Invalid;
+    if (n > size - offset) return error.Invalid;
     const x, const s, const h = try claim(e, hv);
     errdefer s.word.store(pack(h.gen, .out), .release);
     const dup = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
@@ -2141,8 +2150,11 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
     while (true) {
         const seq = s.in.seq.load(.acquire);
         s.in.acquire();
-        const state = stateOf(s.word.load(.acquire));
-        const mine = genOf(s.word.load(.acquire)) == h.gen and state != .free and state != .expired;
+        const word = s.word.load(.acquire);
+        const state = stateOf(word);
+        // Answered (`done`) is gone too: the body may live in the
+        // request's memory, which goes with the answer.
+        const mine = genOf(word) == h.gen and state != .free and state != .expired and state != .done;
         if (!mine) {
             s.in.release();
             return e.gone();
