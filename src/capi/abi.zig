@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 3;
+pub const version_minor: u32 = 4;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -72,6 +72,8 @@ pub const Stats = extern struct {
     websockets: u64 = 0,
     ws_messages_in: u64 = 0,
     ws_messages_out: u64 = 0,
+    wt_sessions: u64 = 0,
+    wt_datagrams_dropped: u64 = 0,
 };
 
 pub const CONSUMER_SHARED: u32 = 1;
@@ -98,6 +100,14 @@ pub const EventType = enum(u32) {
     grpc_call = 12,
     grpc_message = 13,
     grpc_half_close = 14,
+    wt_open = 20,
+    wt_close = 21,
+    wt_drain = 22,
+    wt_stream = 23,
+    wt_data = 24,
+    wt_stream_reset = 25,
+    wt_stream_stop = 26,
+    wt_datagram = 27,
 };
 
 pub const Event = extern struct {
@@ -157,6 +167,50 @@ pub const WsCloseEvent = extern struct {
     route_id: u32,
     code: u16,
     reserved: u16 = 0,
+    reason: Span,
+};
+
+/// `anole_wt_open_stream`'s flag and ANOLE_EV_WT_STREAM's: one-way.
+pub const WT_UNI: u32 = 1;
+/// `anole_wt_stream_write`'s flag and ANOLE_EV_WT_DATA's: the end.
+pub const WT_FIN: u32 = 1;
+pub const WT_CLOSED_LOCAL: u32 = 0;
+pub const WT_CLOSED_PEER: u32 = 1;
+pub const WT_CLOSED_CONNECTION: u32 = 2;
+
+pub const WtStreamEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    flags: u32,
+    session: u64,
+};
+
+pub const WtDataEvent = extern struct {
+    ev: Event,
+    flags: u32,
+    reserved: u32 = 0,
+    data: Span,
+};
+
+pub const WtCodeEvent = extern struct {
+    ev: Event,
+    code: u32,
+    reserved: u32 = 0,
+};
+
+pub const WtDatagramEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    reserved: u32 = 0,
+    data: Span,
+};
+
+pub const WtCloseEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    code: u32,
+    by: u32,
+    reserved: u32 = 0,
     reason: Span,
 };
 
@@ -310,6 +364,11 @@ comptime {
     std.debug.assert(@sizeOf(DbOptions) == 40);
     std.debug.assert(@sizeOf(DbResultEvent) == 96);
     std.debug.assert(@sizeOf(DbCell) == 16);
+    std.debug.assert(@sizeOf(WtStreamEvent) == 32);
+    std.debug.assert(@sizeOf(WtDataEvent) == 32);
+    std.debug.assert(@sizeOf(WtCodeEvent) == 24);
+    std.debug.assert(@sizeOf(WtDatagramEvent) == 32);
+    std.debug.assert(@sizeOf(WtCloseEvent) == 40);
 }
 
 /// Records are padded to this.

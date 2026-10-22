@@ -158,7 +158,8 @@ keep.
 
 ## Handles
 
-`anole_req`, `anole_ws` and `anole_grpc_call` are 64-bit and generation-checked: a handle that
+`anole_req`, `anole_ws`, `anole_grpc_call`, `anole_wt` and `anole_wt_stream`
+are 64-bit and generation-checked: a handle that
 was answered, expired, aborted, made up, or belongs to another kind gets
 `ANOLE_E_GONE`, never another request. Treat the bits as opaque; 0 is never a
 handle.
@@ -300,6 +301,62 @@ for a second is closed. Publishes still being fanned out are bounded too (64
 per executor, and the larger of 16 x `limits.ws_high_water` and
 2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
 `ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
+
+## WebTransport
+
+A `webtransport` route accepts WebTransport sessions (draft-02 over HTTP/3,
+what Chrome and Firefox speak) and hands them to a consumer. It needs a
+listener with `http3`, and takes no method (a session is an extended
+CONNECT):
+
+```json
+"listeners": [{ "port": 8443, "tls": { "cert_file": "cert.pem", "key_file": "key.pem" }, "http3": true }],
+"routes": [{ "path": "/game", "webtransport": { "handler": 4, "origins": ["https://app.example.com"], "datagram_queue": 64 } }]
+```
+
+```c
+case ANOLE_EV_WT_OPEN:      /* anole_request_event: the CONNECT; ev.handle is the anole_wt */
+case ANOLE_EV_WT_STREAM:    /* the peer opened a stream: ev.handle, its session, ANOLE_WT_UNI */
+case ANOLE_EV_WT_DATA:      /* bytes of a stream in order, ANOLE_WT_FIN with the last */
+case ANOLE_EV_WT_DATAGRAM:  /* one datagram of the session */
+case ANOLE_EV_WT_STREAM_RESET: case ANOLE_EV_WT_STREAM_STOP: /* the peer's code */
+case ANOLE_EV_WT_DRAIN:     /* the server (or the peer) is draining */
+case ANOLE_EV_WT_CLOSE:     /* code, reason, which side; the session and its streams are stale */
+
+anole_wt_stream s;
+anole_wt_open_stream(w, 0 /* or ANOLE_WT_UNI */, &s);   /* the handle is good at once */
+anole_wt_stream_write(s, data, len, ANOLE_WT_FIN);       /* ANOLE_BUSY: wait for ANOLE_EV_WRITABLE */
+anole_wt_stream_release(s);                              /* the end above still goes out */
+anole_wt_send_datagram(w, buf, n);
+anole_wt_close(w, 0, (anole_str){"bye", 3});
+```
+
+- One task on the connection's executor runs each session with the
+  session calls that never wait, so a session costs no thread and no task
+  per stream; what a consumer asks for wakes it like a WebSocket sender.
+- Streams in either direction, opened by either side. The peer's stream
+  data comes in `ANOLE_EV_WT_DATA` records of at most 32 KiB, in order;
+  a consumer that falls behind holds back the reading (the record budget,
+  then QUIC flow control). Writes are copied and queued:
+  `limits.stream_high_water` bytes waiting answers `ANOLE_BUSY`, then
+  `ANOLE_EV_WRITABLE` comes for the stream.
+- Every stream must be released (`anole_wt_stream_release`) or go with
+  its session: the peer may open a new stream only as earlier ones are
+  released. A release resets a sending side not ended with
+  `ANOLE_WT_FIN` and stops a receiving side not read to its end; one
+  written with `ANOLE_WT_FIN` first sends everything.
+- Datagrams: received ones are `ANOLE_EV_WT_DATAGRAM` (the session keeps
+  up to 256 or 1 MiB waiting for the consumer, then drops new ones, as
+  Anole does in Zig). Sent ones wait in a queue of the route's
+  `datagram_queue` (64 by default) and past it **the oldest is dropped**:
+  datagrams are for data that goes stale (positions, frames), so a new one
+  matters more than the one it replaces, and the consumer never has to
+  hold or retry them. Drops count in `anole_stats.wt_datagrams_dropped`.
+  `anole_wt_max_datagram` says the largest one the session takes now;
+  a larger one is `ANOLE_E_TOOBIG`.
+- The drain: `ANOLE_EV_WT_DRAIN`, then each session closes (code 0) unless
+  the route sets `close_on_drain: false`, which leaves it to the consumer
+  until `timeouts.shutdown_ms`.
 
 ## Databases
 
@@ -671,20 +728,21 @@ zig-out/bin/capi-grpc-interop` runs grpc-go's interop client against.
 `zig build capi-test-asan` builds the suite with the system C compiler under
 ASan and UBSan (it runs with `ASAN_OPTIONS=use_sigaltstack=0`: Zig's threads
 install their own signal stack). `zig build test-capi-engine` runs the
-engine's HTTP/2 and HTTP/3 tests; `zig build test-grpc` the gRPC ones
-(native, transcoding, and the ABI's, with descriptors, JSON and
-transcoding). `tests/capi/bench.sh` compares consumer
+engine's HTTP/2, HTTP/3 and WebTransport tests; `zig build test-grpc` the gRPC
+ones (native, transcoding, and the ABI's, with descriptors, JSON and
+transcoding). The C suite's WebTransport part has its server in C and its
+client in Zig (`tests/capi/wt_client.zig`, built with the suite and passed
+to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
 
 ## What comes next
 
 ABI 0.1 was the request/response and WebSocket core, plus `anole_db_*` with
-SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server, and 0.3 MongoDB
-through `anole_db_*`. Before the ABI freezes (1.0) and the bindings ship,
-these come as their own pull requests; their event types and handle kinds
-are reserved already:
+SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server, 0.3 MongoDB through
+`anole_db_*`, and 0.4 WebTransport. Before the ABI freezes (1.0) and the
+bindings ship, these come as their own pull requests; their event types and
+handle kinds are reserved already:
 
-- WebTransport: sessions, streams and datagrams.
 - TLS extras: mutual TLS and the client certificate in the request,
   certificate reload per listener.
 - Then the freeze: ABI 1.0.

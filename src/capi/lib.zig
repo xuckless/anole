@@ -127,6 +127,7 @@ fn answer(err: engine.AnswerError) i32 {
             setError("not in this state (a second message for a unary answer, metadata after the first message, OK without a response message, ...)", .{});
             break :blk abi.E_STATE;
         },
+        error.TooBig => abi.E_TOOBIG,
     };
 }
 
@@ -155,6 +156,7 @@ export fn anole_has_feature(name: Str) c_int {
         .{ "tls", f.tls == .boringssl },
         .{ "http2", f.http2 },
         .{ "http3", f.http3 },
+        .{ "webtransport", f.http3 },
         .{ "websocket", f.websocket },
         .{ "compression", f.compression },
         .{ "brotli", f.brotli },
@@ -472,6 +474,71 @@ export fn anole_grpc_health_set(s: ?*anyopaque, service: Str, status: c_int) i32
         },
         else => answer(err),
     };
+    return abi.OK;
+}
+
+// ---- WebTransport ------------------------------------------------------------------
+
+const have_wt = anole.features.http3;
+
+export fn anole_wt_open_stream(w: u64, flags: u32, out: ?*u64) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    const o = out orelse return abi.E_INVALID;
+    if (flags & ~abi.WT_UNI != 0) return abi.E_INVALID;
+    o.* = engine.wt.openStream(e, w, flags & abi.WT_UNI != 0) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_wt_stream_write(st: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    if (flags & ~abi.WT_FIN != 0) return abi.E_INVALID;
+    const b = bytes(data, len) orelse return abi.E_INVALID;
+    const busy = engine.wt.write(e, st, b, flags & abi.WT_FIN != 0) catch |err| return answer(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_wt_stream_reset(st: u64, code: u32) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    engine.wt.streamOp(e, st, .reset, code) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_wt_stream_stop(st: u64, code: u32) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    engine.wt.streamOp(e, st, .stop, code) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_wt_stream_release(st: u64) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    engine.wt.streamOp(e, st, .release, 0) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_wt_send_datagram(w: u64, data: ?*const anyopaque, len: usize) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    const b = bytes(data, len) orelse return abi.E_INVALID;
+    engine.wt.sendDatagram(e, w, b) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_wt_max_datagram(w: u64) i64 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    const n = engine.wt.maxDatagram(e, w) catch |err| return answer(err);
+    return @intCast(n);
+}
+
+export fn anole_wt_close(w: u64, code: u32, reason: Str) i32 {
+    if (comptime !have_wt) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    engine.wt.close(e, w, code, reason.slice()) catch |err| return answer(err);
     return abi.OK;
 }
 

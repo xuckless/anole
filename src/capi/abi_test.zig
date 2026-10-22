@@ -39,6 +39,11 @@ test "anole.h: every struct as abi.zig lays it out" {
     try expectSameLayout(abi.DbOptions, c.anole_db_options);
     try expectSameLayout(abi.DbResultEvent, c.anole_db_result_event);
     try expectSameLayout(abi.DbCell, c.anole_db_cell);
+    try expectSameLayout(abi.WtStreamEvent, c.anole_wt_stream_event);
+    try expectSameLayout(abi.WtDataEvent, c.anole_wt_data_event);
+    try expectSameLayout(abi.WtCodeEvent, c.anole_wt_code_event);
+    try expectSameLayout(abi.WtDatagramEvent, c.anole_wt_datagram_event);
+    try expectSameLayout(abi.WtCloseEvent, c.anole_wt_close_event);
 }
 
 test "anole.h: every constant as abi.zig has it" {
@@ -79,6 +84,7 @@ test "anole.h: every constant as abi.zig has it" {
     const classes = @typeInfo(abi.DbErrorClass).@"enum";
     inline for (classes.field_names, classes.field_values) |n, v| {
         const name = comptime blk: {
+            @setEvalBranchQuota(10_000);
             var buf: [32]u8 = undefined;
             break :blk "ANOLE_DB_ERR_" ++ std.ascii.upperString(&buf, n);
         };
@@ -117,6 +123,11 @@ test "anole.h: every constant as abi.zig has it" {
     try eq(abi.GRPC_HEALTH_UNKNOWN, c.ANOLE_GRPC_HEALTH_UNKNOWN);
     try eq(abi.GRPC_HEALTH_SERVING, c.ANOLE_GRPC_HEALTH_SERVING);
     try eq(abi.GRPC_HEALTH_NOT_SERVING, c.ANOLE_GRPC_HEALTH_NOT_SERVING);
+    try eq(abi.WT_UNI, c.ANOLE_WT_UNI);
+    try eq(abi.WT_FIN, c.ANOLE_WT_FIN);
+    try eq(abi.WT_CLOSED_LOCAL, c.ANOLE_WT_CLOSED_LOCAL);
+    try eq(abi.WT_CLOSED_PEER, c.ANOLE_WT_CLOSED_PEER);
+    try eq(abi.WT_CLOSED_CONNECTION, c.ANOLE_WT_CLOSED_CONNECTION);
     const info = @typeInfo(abi.EventType).@"enum";
     inline for (info.field_names, info.field_values) |n, v| {
         const name = comptime blk: {
