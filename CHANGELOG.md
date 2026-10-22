@@ -255,6 +255,40 @@ breaking changes are listed anyway.
   ReleaseFast builds, and the bundled C libraries under sanitizers, at every
   release tag. Actions are pinned by commit; downloads in the sanitizer
   script and the Python test packages are checked by hash.
+- **Breaking:** WebSocket and WebTransport handshakes from a browser page of
+  another origin are refused with 403. `UpgradeOptions.allowed_origins` and
+  `webtransport.AcceptOptions.allowed_origins` default to `.same_origin`
+  (the request's own host and port); list other origins with
+  `.{ .list = &.{"https://app.example.com"} }`, or `.any` for endpoints that
+  do not rely on cookies. Clients that send no `Origin` are not affected.
+  C ABI WebSocket routes take `"origins"`. Apps whose pages connect from
+  another origin must list it. See docs/websocket.md#origins.
+- WebSocket over HTTP/1.1: the handshake must be a GET with a
+  `Sec-WebSocket-Key` of 16 bytes in base64 (RFC 6455 §4.2.1); anything else
+  is not upgraded.
+- WebSocket over HTTP/1.1: a control frame whose header claims more than
+  125 bytes, or that is fragmented, is refused (close 1002) before its
+  payload is waited for, on callback sockets too; control-frame payloads no
+  longer take memory from the message being assembled. No configuration
+  change needed.
+- WebSocket `Rooms`: a broadcast no longer waits for any member. It queues
+  the message once for every member, and each member's own task sends its
+  queue in order on the socket's executor. A member's queue is bounded
+  (`Rooms.Options.max_queued_bytes`, 1 MiB); a member whose send has been
+  stuck while its queue is full is closed (`on_full = .close`, the default,
+  after `close_after_ms`) or skips messages (`.drop`). `broadcast` now
+  returns for how many members the message was queued. New:
+  `Rooms.initOptions`. Joining a room twice is one membership, so one
+  `leave` always ends it.
+- permessage-deflate buffers no longer come from the request's arena, which
+  is not thread-safe over HTTP/1.1, so a broadcast compressing for a socket
+  from another executor cannot corrupt it. The docs now say that
+  `req.arena` and `call.arena` are not thread-safe.
+- WebSocket over HTTP/2 and HTTP/3: RSV1 on a control frame or a
+  continuation is refused (close 1002) when permessage-deflate is in use; a
+  ping or pong over 125 bytes from the handler fails with
+  `error.LargeControlFrame`; a close goes out once even when two tasks
+  close at the same time, and a frame cut short ends sending.
 
 ### C ABI (ABI 0.1)
 

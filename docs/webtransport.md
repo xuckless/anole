@@ -124,6 +124,7 @@ closes it (code 0) if it is still open and lets go of every stream.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `allowed_origins` | `.same_origin` | The pages that may open the session (see [Origins](websocket.md#origins)). A browser's CONNECT from another origin gets 403. |
 | `timeout` | `.none` | Replaces the request timeout once the session is open. |
 | `close_on_drain` | true | Close the session (code 0) when the server starts to drain, right after DRAIN_WEBTRANSPORT_SESSION. |
 | `drain_reason` | `"server shutting down"` | The message of that close. |

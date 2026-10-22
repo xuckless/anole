@@ -98,8 +98,9 @@
             .lazy = true,
         },
         .websocket_zig = .{
-            .url = "git+https://github.com/xuckless/websocket-zig#4bd0e5c4f46466ded5478afb0db3a2f72a264ae8",
-            .hash = "websocket-0.0.0-UEQdXjgDAgCbGTdVLwvvGXjiu9jsUWjjxE-ACul9M8HV",
+            // TEMPORARY (sec/ws): local clone, branch anole at 065fac7; the
+            // lead turns this back into the pushed commit's URL and hash.
+            .path = "../../anole-forks/websocket-zig",
             .lazy = true,
         },
         .protobuf = .{

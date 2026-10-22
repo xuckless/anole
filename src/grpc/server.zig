@@ -123,7 +123,10 @@ pub const Call = struct {
     /// `addTrailer` rather than writing to it.
     res: *dusty.Response,
     /// The call's arena (the request's): messages decoded for the handler
-    /// live here, and what the handler returns may too. Thread-safe.
+    /// live here, and what the handler returns may too. Not thread-safe
+    /// (over HTTP/1.1, for Connect, gRPC-Web and transcoded calls, it is
+    /// the connection's request arena): a task the handler starts needs
+    /// memory of its own.
     arena: std.mem.Allocator,
     /// The server's runtime, for the handler's own I/O.
     io: std.Io,
