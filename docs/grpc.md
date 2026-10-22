@@ -617,8 +617,13 @@ and received messages live in `arena`. `r.headers` and `r.trailers` hold the
 response metadata.
 
 `CallOptions` takes a `timeout` (sent as `grpc-timeout`, and the client
-resets the stream past it too), extra `metadata` with lower-case names, and
-`compression = .gzip`. A call without a `timeout` has no time limit on the
+resets the stream past it too), extra `metadata` with lower-case names,
+`compression = .gzip`, and `max_received_bytes`. Received messages live in
+`arena` until you free it, so a call takes at most the channel's
+`max_received_bytes` (64 MiB) of responses in all, each counted at its size
+plus 64; past it the call is canceled with RESOURCE_EXHAUSTED. For a long
+server stream, raise it per call or on the `Channel`, and use an arena you
+reset between calls. A call without a `timeout` has no time limit on the
 client side, whatever the connection's default request `timeout`.
 
 For TLS, connect with `.tls = .{}` (the system trust store), or name a CA

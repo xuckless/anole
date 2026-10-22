@@ -49,6 +49,12 @@ breaking changes are listed anyway.
   `error.InvalidMetadata`, so client data echoed into a trailer cannot add
   trailer lines in gRPC-Web. New `Call.addBinaryTrailer` encodes raw bytes.
   Breaking for handlers that passed raw bytes or upper-case names.
+- gRPC client: a call takes at most `Channel.max_received_bytes` (64 MiB,
+  `CallOptions.max_received_bytes` per call) of response messages in all,
+  then is canceled with RESOURCE_EXHAUSTED, so a server streaming without
+  end cannot grow the caller's arena without bound. Response frames are read
+  and inflated outside the arena and freed once decoded. Behaviour change
+  for clients of streams that send more than 64 MiB.
 
 ### C ABI (ABI 0.1)
 

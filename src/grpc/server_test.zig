@@ -635,6 +635,19 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
     }
     {
+        // A call takes at most `max_received_bytes` of responses in all
+        // (each counted at its size plus 64): 40 messages of about 70
+        // bytes do not fit 1000.
+        var s = try client.stream("ServerStream", arena, .{ .max_received_bytes = 1000 });
+        defer s.deinit();
+        try s.send(.{ .message = "n", .repeat = 40 });
+        try s.closeSend();
+        var n: usize = 0;
+        while (try s.receive()) |_| n += 1;
+        try std.testing.expect(n > 0 and n < 40);
+        try std.testing.expectEqual(grpc.Code.resource_exhausted, s.status.?.code);
+    }
+    {
         var s = try client.stream("ClientStream", arena, .{ .compression = if (features.compression) .gzip else .identity });
         defer s.deinit();
         for ([_][]const u8{ "x", "y", "z" }) |m| try s.send(.{ .message = m });
