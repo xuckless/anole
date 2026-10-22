@@ -513,7 +513,9 @@ fn cookieKey(key: ?[key_length]u8) ?[key_length]u8 {
 pub fn devKey(io: std.Io) [key_length]u8 {
     log.warn("anole.session: using a random development key; sessions end on restart and differ between nodes. Set Config.key from your secret store in production", .{});
     var key: [key_length]u8 = undefined;
-    io.random(&key);
+    // From the operating system, or not at all: a key from a weaker
+    // source would make every cookie forgeable.
+    io.randomSecure(&key) catch |err| std.debug.panic("anole.session.devKey: no secure randomness from the system: {t}", .{err});
     return key;
 }
 

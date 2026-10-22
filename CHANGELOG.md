@@ -98,6 +98,10 @@ breaking changes are listed anyway.
   elsewhere. Without it they are on every listener, as before;
   docs/observability.md now says how to keep them off the public port,
   since they name routes, errors, databases and failing checks.
+- `auth.apikey.generate` and `session.devKey` take their bytes from the
+  operating system (`std.Io.randomSecure`) and fail rather than fall back
+  to a weaker source; `apikey.generate` can now return
+  `error.EntropyUnavailable`.
 
 ### C ABI (ABI 0.1)
 

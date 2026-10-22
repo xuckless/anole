@@ -13,10 +13,12 @@ pub const prefix = "ak_";
 /// A key's SHA-256: what the application stores and looks keys up by.
 pub const Digest = [32]u8;
 
-/// A new key (to show the user once) and its digest (to store).
+/// A new key (to show the user once) and its digest (to store). Its bytes
+/// come straight from the operating system (`randomSecure`); without them
+/// it fails (`error.EntropyUnavailable`) rather than make a weaker key.
 pub fn generate(arena: std.mem.Allocator, io: std.Io) !struct { key: []const u8, digest: Digest } {
     var bytes: [32]u8 = undefined;
-    io.random(&bytes);
+    try io.randomSecure(&bytes);
     const key = try arena.alloc(u8, prefix.len + 43);
     @memcpy(key[0..prefix.len], prefix);
     _ = std.base64.url_safe_no_pad.Encoder.encode(key[prefix.len..], &bytes);
