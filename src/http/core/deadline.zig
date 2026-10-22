@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const placement = @import("placement.zig");
 
 /// Whether the injected `zio` can arm a timer against the running task. The
 /// stub says so by declaring `is_stub`; the real package does not.

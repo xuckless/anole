@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const placement = @import("../placement.zig");
 
 /// The `zio` in use has the completion queue and placement: not the core's
 /// test stub. Not Windows.
