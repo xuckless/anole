@@ -348,3 +348,64 @@ test "static: newer web types have their media types" {
         try std.testing.expectEqualStrings(case[1], header(resp, "Content-Type").?);
     }
 }
+
+/// The directory `sendFileRoute` serves from.
+var sendfile_dir: std.Io.Dir = undefined;
+
+/// The download handler a solo developer writes: the file the request
+/// names, under one directory.
+fn sendFileRoute(req: *dusty.Request, res: *dusty.Response) !void {
+    _ = try res.sendFile(sendfile_dir, req.params.get("name").?, .{});
+}
+
+/// The same, with the name from the query string, percent-decoded.
+fn sendFileQuery(req: *dusty.Request, res: *dusty.Response) !void {
+    _ = try res.sendFile(sendfile_dir, req.queryParam("file") orelse return error.NotFound, .{});
+}
+
+fn exchangeSendFile(request: []const u8, out: []u8) ![]const u8 {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/files/*name", sendFileRoute);
+    server.router.get("/download", sendFileQuery);
+    return send(&server, request, out);
+}
+
+test "sendFile: a request path cannot leave the directory through .. or an absolute path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "top secret" });
+    try tmp.dir.createDir(io, "public", .default_dir);
+    try tmp.dir.createDir(io, "public/sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "public/report.txt", .data = "report" });
+    sendfile_dir = try tmp.dir.openDir(io, "public", .{});
+    defer sendfile_dir.close(io);
+
+    var out: [4096]u8 = undefined;
+    for ([_][]const u8{
+        "GET /files/report.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "GET /download?file=./report.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    }) |request| {
+        const ok = try exchangeSendFile(request, &out);
+        try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+        try std.testing.expectEqualStrings("report", body(ok));
+    }
+
+    const top = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(top);
+    var abs_buf: [1024]u8 = undefined;
+    const absolute = try std.fmt.bufPrint(&abs_buf, "GET /download?file={s}/secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{top});
+    for ([_][]const u8{
+        "GET /files/../secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "GET /files/sub/../../secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "GET /files/./../secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "GET /download?file=..%2Fsecret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "GET /download?file=sub/../../secret.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        absolute,
+    }) |request| {
+        const got = try exchangeSendFile(request, &out);
+        try std.testing.expect(std.mem.indexOf(u8, got, "top secret") == null);
+        try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 404"));
+    }
+}

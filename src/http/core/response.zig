@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http.zig");
 const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
@@ -939,7 +940,9 @@ pub const Response = struct {
     }
 
     pub const SendFileOptions = struct {
-        /// See `std.Io.Dir.OpenFileOptions.resolve_beneath`.
+        /// Also refuse a path that leaves `dir` through a symlink. See
+        /// `std.Io.Dir.OpenFileOptions.resolve_beneath`: how far that holds
+        /// depends on the platform and the `Io`.
         resolve_beneath: bool = false,
     };
 
@@ -951,12 +954,20 @@ pub const Response = struct {
     /// whatever headers the handler and middleware have set by then, and
     /// is closed once sent.
     ///
+    /// `sub_path` stays inside `dir`: an absolute path, a `..` segment or
+    /// a NUL byte (on Windows also a `\`-separated `..`, or a `:`) is
+    /// `error.BadPathName`, which the server answers with 404, so request
+    /// input such as `req.params.get("name")` cannot reach a file outside
+    /// it. To send a file the program itself names elsewhere, open its
+    /// directory and pass the name relative to that.
+    ///
     /// A directory is `error.IsDir`, and anything else that is not a
     /// regular file, such as a device, is `error.NotFile`. Never compressed.
     pub fn sendFile(self: *Response, dir: std.Io.Dir, sub_path: []const u8, options: SendFileOptions) SendFileError!std.Io.File.Stat {
         std.debug.assert(!self.body_writer_open); // body writer already open
         std.debug.assert(!self.headers_written); // body cannot start after the headers
         std.debug.assert(self.body.len == 0 and self.body_buffer.len() == 0); // body already set
+        if (!staysInside(sub_path)) return error.BadPathName;
         const io = self.io;
         const handle = try dir.openFile(io, sub_path, .{ .resolve_beneath = options.resolve_beneath });
         errdefer handle.close(io);
@@ -970,6 +981,20 @@ pub const Response = struct {
         self.closeFile();
         self.file = .{ .handle = handle, .size = size };
         return stat;
+    }
+
+    /// Whether `sub_path`, read as text, names something inside the
+    /// directory it is opened in: relative, with no `..` segment and no NUL
+    /// byte. On Windows `\` separates segments too, and a `:` (a drive or
+    /// an alternate data stream) is refused.
+    fn staysInside(sub_path: []const u8) bool {
+        const windows = builtin.os.tag == .windows;
+        if (std.mem.findScalar(u8, sub_path, 0) != null) return false;
+        if (sub_path.len > 0 and (sub_path[0] == '/' or (windows and sub_path[0] == '\\'))) return false;
+        if (windows and std.mem.findScalar(u8, sub_path, ':') != null) return false;
+        var segments = std.mem.tokenizeAny(u8, sub_path, if (windows) "/\\" else "/");
+        while (segments.next()) |segment| if (std.mem.eql(u8, segment, "..")) return false;
+        return true;
     }
 
     fn closeFile(self: *Response) void {
@@ -4592,4 +4617,18 @@ test "Response sink: no WebSocket upgrade over a sink" {
     try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
     try std.testing.expect((try response.upgradeWebSocket(&request)) == null);
     try std.testing.expectEqual(@as(usize, 0), ts.heads);
+}
+
+test "sendFile: a path that would leave the directory is refused as text" {
+    for ([_][]const u8{ "a.txt", "./a.txt", "dir/a.txt", "a..b", "..a", "a/...", "" }) |path| {
+        try std.testing.expect(Response.staysInside(path));
+    }
+    for ([_][]const u8{ "..", "../a", "a/../b", "a/..", "./../a", "/etc/passwd", "//x", "a\x00b" }) |path| {
+        try std.testing.expect(!Response.staysInside(path));
+    }
+    if (builtin.os.tag == .windows) {
+        for ([_][]const u8{ "..\\a", "a\\..\\b", "\\\\server\\share", "C:\\x", "C:x", "a:stream" }) |path| {
+            try std.testing.expect(!Response.staysInside(path));
+        }
+    }
 }

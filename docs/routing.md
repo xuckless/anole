@@ -428,6 +428,14 @@ try res.trailer("x-checksum", "abc123");
 and sends it after the handler returns. It is never compressed and does no
 ranges or conditional requests; static routes do.
 
+The path stays inside the directory you pass: an absolute path or a `..`
+segment fails with `error.BadPathName` (a 404 if the handler returns it), so
+a name taken from the request (`req.params.get("name")`, a query parameter)
+cannot reach a file elsewhere. Symlinks inside the directory are still
+followed unless `.resolve_beneath = true`. To send a file your program names
+outside the directory, open the directory it is in and pass the name
+relative to that.
+
 ```zig
 fn download(_: *anole.Request, res: *anole.Response) !void {
     _ = res.sendFile(std.Io.Dir.cwd(), "reports/latest.pdf", .{ .resolve_beneath = true }) catch |err| switch (err) {
@@ -575,7 +583,9 @@ the client gets:
   `UnsupportedContentEncoding` 415, and 400 for `InvalidJsonBody` and
   `MissingBody` (from `bind` and `json`), `IncompleteBody` (a body cut
   short) and `MalformedBody` (broken chunked framing, or a body that is not
-  valid gzip or zstd). They are logged at `debug`, not `err`.
+  valid gzip or zstd). `BadPathName`, a path `sendFile` refuses because it
+  would leave its directory, is a 404. They are logged at `debug`, not
+  `err`.
 - Anything else is logged at `err` and answered 500, and what the handler
   wrote is discarded. That includes `std.json`'s `SyntaxError` when the JSON
   was not the request's own (a config file, an upstream response).

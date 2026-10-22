@@ -3,6 +3,20 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Security
+
+- `res.sendFile(dir, path, ...)` no longer opens a path outside `dir`. An
+  absolute path or a `..` segment (on Windows also a `\`-separated one, or
+  a `:`) now fails with `error.BadPathName`, which the server answers with
+  404, as static routes already did. Until now a handler that passed request
+  input to it, such as `res.sendFile(dir, req.params.get("name").?, .{})`
+  or a query parameter, let a client read any file the server process
+  could open (`GET /files/../../etc/passwd`). To send a file your program
+  names outside the directory, open the directory it is in and pass the
+  name relative to that.
+
 ## 0.1.2 (2026-10-22)
 
 ### Breaking
