@@ -114,9 +114,17 @@ fn windowBits(text: []const u8) ?u4 {
 }
 
 /// One socket's compressor and decompressor.
+///
+/// Its buffers come from an allocator of its own, given at `init`: messages
+/// are compressed by whichever task sends them (a `Rooms` broadcast on
+/// another executor, say), so it must be thread-safe, and never the
+/// request's arena of an HTTP/1.1 socket, which is not. Compressing (under
+/// the socket's send lock) and decompressing (by the reading task) use
+/// separate buffers, so the two may run at once.
 pub const Deflate = struct {
     config: Config,
     options: Options,
+    allocator: std.mem.Allocator,
     deflater: c.z_stream = std.mem.zeroes(c.z_stream),
     inflater: c.z_stream = std.mem.zeroes(c.z_stream),
     deflater_ready: bool = false,
@@ -128,22 +136,23 @@ pub const Deflate = struct {
 
     pub const Error = error{ OutOfMemory, InvalidCompressedData, MessageTooLarge };
 
-    pub fn init(config: Config, options: Options) Deflate {
-        return .{ .config = config, .options = options };
+    pub fn init(config: Config, options: Options, allocator: std.mem.Allocator) Deflate {
+        return .{ .config = config, .options = options, .allocator = allocator };
     }
 
-    pub fn deinit(self: *Deflate, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Deflate) void {
         if (self.deflater_ready) _ = c.deflateEnd(&self.deflater);
         if (self.inflater_ready) _ = c.inflateEnd(&self.inflater);
-        self.deflated.deinit(allocator);
-        self.inflated.deinit(allocator);
+        self.deflated.deinit(self.allocator);
+        self.inflated.deinit(self.allocator);
     }
 
     const tail = [4]u8{ 0x00, 0x00, 0xff, 0xff };
 
     /// `data` compressed as one message (the trailing 00 00 ff ff taken
     /// off), valid until the next call.
-    pub fn compress(self: *Deflate, allocator: std.mem.Allocator, data: []const u8) Error![]const u8 {
+    pub fn compress(self: *Deflate, data: []const u8) Error![]const u8 {
+        const allocator = self.allocator;
         if (!self.deflater_ready) {
             if (c.deflateInit2_(&self.deflater, self.options.level, c.Z_DEFLATED, -@as(c_int, self.config.server_window_bits), self.options.mem_level, c.Z_DEFAULT_STRATEGY, c.zlibVersion(), @sizeOf(c.z_stream)) != c.Z_OK)
                 return error.OutOfMemory;
@@ -180,7 +189,8 @@ pub const Deflate = struct {
 
     /// The message `data` inflated, at most `max` bytes, valid until the
     /// next call.
-    pub fn decompress(self: *Deflate, allocator: std.mem.Allocator, data: []const u8, max: usize) Error![]const u8 {
+    pub fn decompress(self: *Deflate, data: []const u8, max: usize) Error![]const u8 {
+        const allocator = self.allocator;
         if (!self.inflater_ready) {
             // The client may use any window up to 15 bits.
             if (c.inflateInit2_(&self.inflater, -15, c.zlibVersion(), @sizeOf(c.z_stream)) != c.Z_OK)
@@ -245,51 +255,51 @@ test "Deflate: messages round-trip, with and without context takeover" {
     const gpa = std.testing.allocator;
     for ([_]bool{ false, true }) |no_takeover| {
         const config: Config = .{ .server_no_context_takeover = no_takeover, .client_no_context_takeover = no_takeover };
-        var tx: Deflate = .init(config, .{});
-        defer tx.deinit(gpa);
-        var rx: Deflate = .init(config, .{});
-        defer rx.deinit(gpa);
+        var tx: Deflate = .init(config, .{}, gpa);
+        defer tx.deinit();
+        var rx: Deflate = .init(config, .{}, gpa);
+        defer rx.deinit();
         const messages = [_][]const u8{ "Hello", "Hello Hello Hello Hello", "", "a different message altogether" };
         for (messages) |m| {
-            const wire = try gpa.dupe(u8, try tx.compress(gpa, m));
+            const wire = try gpa.dupe(u8, try tx.compress(m));
             defer gpa.free(wire);
-            try std.testing.expectEqualStrings(m, try rx.decompress(gpa, wire, 1 << 20));
+            try std.testing.expectEqualStrings(m, try rx.decompress(wire, 1 << 20));
         }
     }
     // A large, very compressible message inflates to far more than the first
     // buffer: the output still pending inside zlib must not be lost.
     {
-        var tx: Deflate = .init(.{}, .{});
-        defer tx.deinit(gpa);
-        var rx: Deflate = .init(.{}, .{});
-        defer rx.deinit(gpa);
+        var tx: Deflate = .init(.{}, .{}, gpa);
+        defer tx.deinit();
+        var rx: Deflate = .init(.{}, .{}, gpa);
+        defer rx.deinit();
         const big = try gpa.alloc(u8, 64 * 1024);
         defer gpa.free(big);
         for (big, 0..) |*b, i| b.* = "BAsd7&jh23"[i % 10];
-        const wire = try gpa.dupe(u8, try tx.compress(gpa, big));
+        const wire = try gpa.dupe(u8, try tx.compress(big));
         defer gpa.free(wire);
         try std.testing.expect(wire.len < 1024);
-        try std.testing.expectEqualSlices(u8, big, try rx.decompress(gpa, wire, 1 << 20));
+        try std.testing.expectEqualSlices(u8, big, try rx.decompress(wire, 1 << 20));
     }
     // An echo: the message just inflated is compressed straight back out.
     {
-        var server: Deflate = .init(.{}, .{});
-        defer server.deinit(gpa);
-        var client: Deflate = .init(.{}, .{});
-        defer client.deinit(gpa);
+        var server: Deflate = .init(.{}, .{}, gpa);
+        defer server.deinit();
+        var client: Deflate = .init(.{}, .{}, gpa);
+        defer client.deinit();
         const text = "an echo of an echo of an echo of an echo of an echo of an echo!!";
-        const sent = try gpa.dupe(u8, try client.compress(gpa, text));
+        const sent = try gpa.dupe(u8, try client.compress(text));
         defer gpa.free(sent);
-        const got = try server.decompress(gpa, sent, 1 << 20);
-        const back = try gpa.dupe(u8, try server.compress(gpa, got));
+        const got = try server.decompress(sent, 1 << 20);
+        const back = try gpa.dupe(u8, try server.compress(got));
         defer gpa.free(back);
-        try std.testing.expectEqualStrings(text, try client.decompress(gpa, back, 1 << 20));
+        try std.testing.expectEqualStrings(text, try client.decompress(back, 1 << 20));
     }
     // RFC 7692 §7.2.3.1: "Hello" compressed by hand.
-    var rx: Deflate = .init(.{}, .{});
-    defer rx.deinit(gpa);
-    try std.testing.expectEqualStrings("Hello", try rx.decompress(gpa, &.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 100));
-    try std.testing.expectError(error.MessageTooLarge, rx.decompress(gpa, &.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 3));
+    var rx: Deflate = .init(.{}, .{}, gpa);
+    defer rx.deinit();
+    try std.testing.expectEqualStrings("Hello", try rx.decompress(&.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 100));
+    try std.testing.expectError(error.MessageTooLarge, rx.decompress(&.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 3));
 }
 
 test "fuzz: permessage-deflate offers" {
@@ -312,12 +322,12 @@ test "fuzz: inflating messages stays within the limit" {
     try @import("../fuzz.zig").bytes(struct {
         fn check(input: []const u8) !void {
             const gpa = std.testing.allocator;
-            var d: Deflate = .init(.{}, .{});
-            defer d.deinit(gpa);
+            var d: Deflate = .init(.{}, .{}, gpa);
+            defer d.deinit();
             // Two messages through the same context.
             const half = input.len / 2;
             for ([_][]const u8{ input[0..half], input[half..] }) |part| {
-                const m = d.decompress(gpa, part, 4096) catch return;
+                const m = d.decompress(part, 4096) catch return;
                 try std.testing.expect(m.len <= 4096);
             }
         }

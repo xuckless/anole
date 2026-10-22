@@ -335,22 +335,36 @@ fn chat(app: *App, ws: *anole.websocket.Socket, req: *anole.Request) !void {
 
 - `join(room, socket)` and `leave(room, socket)` add and remove a member. A
   room is created on the first join and removed when its last member leaves.
-- `broadcast(room, msg_type, data, except)` sends to every member except
-  `except` (pass `&ws` to skip the sender, or null for everyone) and returns
-  how many members it reached. A member whose send fails is skipped; its own
-  `receive` will see the connection end.
+  Joining a room the socket is already in does nothing.
+- `broadcast(room, msg_type, data, except)` queues the message for every
+  member except `except` (pass `&ws` to skip the sender, or null for
+  everyone) and returns for how many members it was queued. It never waits
+  for a member to be sent to.
 - `count(room)` returns the number of members.
 
-Rooms work across HTTP versions and threads: sockets on HTTP/1.1, HTTP/2 and
-HTTP/3 can share a room. A broadcast takes a snapshot of the room's members
-under a short lock and sends outside it, to each member in turn. A slow
-client therefore slows only the broadcasts that include it, and the caller
-of such a broadcast waits for its send; broadcasts to other rooms, joins and
-leaves go on meanwhile. `leave` waits for any send to the leaving socket
-that is under way, so a socket is never sent to after its handler has left
-the room and returned. For large rooms or slow clients, queue messages per
-socket in your own code instead, so one client cannot hold up the rest of
-its room.
+Rooms work across HTTP versions, tasks and threads: sockets on HTTP/1.1,
+HTTP/2 and HTTP/3 can share a room, and anything may broadcast. A broadcast
+copies the message once and adds it to each member's queue under a short
+lock. Each member with something queued has a task of its own, on the
+socket's executor, that sends its queue in order. A slow client therefore
+holds up nobody else, not even the broadcaster: it only fills its own queue.
+
+The queue is bounded. `Rooms.initOptions(allocator, .{ ... })` sets
+`anole.websocket.Rooms.Options`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `max_queued_bytes` | 1 MiB | The most broadcast bytes waiting for one member (each message counts 64 bytes more). A message is always taken when nothing waits. |
+| `on_full` | `.close` | `.close`: messages that do not fit are skipped, and a member whose send has been stuck for `close_after_ms` is closed: it gets no more broadcasts, and the send under way to it is canceled, which ends the socket's sending side. `.drop`: messages that do not fit are skipped and the member stays. |
+| `close_after_ms` | 1000 | With `.close`, how long a full member's send must have been stuck. |
+| `leave_grace_ms` | 1000 | How long `leave` lets a send under way to the leaving socket finish before it cancels it. |
+
+A member whose send fails, or that was closed, gets nothing more; its own
+`receive` sees the connection end once the peer goes or the socket's
+`timeout` passes, so give sockets in rooms a `timeout` (or call
+`req.setTimeout` before each `receive`). `leave` drops what is still queued
+for the socket and waits for a send under way, at most `leave_grace_ms`, so
+a socket is never sent to after its handler has left the room and returned.
 
 ## Browsers, HTTP/2 and HTTP/3
 

@@ -12,6 +12,19 @@ breaking changes are listed anyway.
   payload is waited for, on callback sockets too; control-frame payloads no
   longer take memory from the message being assembled. No configuration
   change needed.
+- WebSocket `Rooms`: a broadcast no longer waits for any member. It queues
+  the message once for every member, and each member's own task sends its
+  queue in order on the socket's executor. A member's queue is bounded
+  (`Rooms.Options.max_queued_bytes`, 1 MiB); a member whose send has been
+  stuck while its queue is full is closed (`on_full = .close`, the default,
+  after `close_after_ms`) or skips messages (`.drop`). `broadcast` now
+  returns for how many members the message was queued. New:
+  `Rooms.initOptions`. Joining a room twice is one membership, so one
+  `leave` always ends it.
+- permessage-deflate buffers no longer come from the request's arena, which
+  is not thread-safe over HTTP/1.1, so a broadcast compressing for a socket
+  from another executor cannot corrupt it. The docs now say that
+  `req.arena` and `call.arena` are not thread-safe.
 
 ### C ABI (ABI 0.1)
 

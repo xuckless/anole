@@ -312,7 +312,7 @@ log, metrics and tracing ([observability.md](observability.md)).
 | `id`, `trace_id`, `span_id` | Set by the request ID and tracing middleware. |
 | `setLocal(key, value)`, `local(T, key)` | Values a middleware hands to the handler for this request; see [Request locals](#request-locals). |
 | `route` | The matched route; `route.?.path` is its pattern. |
-| `arena` | An allocator freed after the response. |
+| `arena` | An allocator freed after the response. Not thread-safe: only the handler's task may use it. |
 | `io` | The server's `std.Io`; see [Async work](#async-work-in-handlers). |
 
 The body is read once, whole or as a stream:

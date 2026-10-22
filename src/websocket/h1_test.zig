@@ -287,3 +287,63 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
     }
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
+
+const features = @import("build_options");
+
+/// Whether the last socket `deflateHandler` opened compresses outside the
+/// request's arena.
+var deflate_apart: std.atomic.Value(bool) = .init(false);
+
+fn deflateHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{})) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    if (comptime features.compression) if (ws.deflate) |d| deflate_apart.store(d.allocator.ptr != req.arena.ptr, .release);
+    ws.close(.normal, "") catch {};
+}
+
+/// Sends `head` on a new connection to `addr` and returns the status line.
+fn handshake(io: std.Io, addr: std.Io.net.IpAddress, head: []const u8, line: []u8) ![]const u8 {
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [512]u8 = undefined;
+    var rbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    var r = stream.reader(io, &rbuf);
+    try w.interface.writeAll(head);
+    try w.interface.flush();
+    const got = try r.interface.takeDelimiterInclusive('\n');
+    const n = @min(got.len, line.len);
+    @memcpy(line[0..n], got[0..n]);
+    return line[0..n];
+}
+
+test "WebSocket over HTTP/1.1: permessage-deflate keeps its buffers out of the request's arena" {
+    if (comptime !features.compression) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    server.router.get("/deflate", deflateHandler);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var line: [64]u8 = undefined;
+    const status = try handshake(io, server.address.ip, "GET /deflate HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", &line);
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 101"));
+    for (0..1000) |_| {
+        if (deflate_apart.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(deflate_apart.load(.acquire));
+}

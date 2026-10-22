@@ -57,8 +57,8 @@ fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize,
     // A batch's flusher task (`H2Socket.deinit` would also end the
     // response, which has none here).
     defer sock.batch.deinit(std.testing.io);
-    var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}) else {};
-    defer if (features.compression) d.deinit(arena);
+    var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}, arena) else {};
+    defer if (features.compression) d.deinit();
     var socket: websocket.Socket = .{
         .conn = .{ .h2 = sock },
         .allocator = arena,

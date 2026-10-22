@@ -137,10 +137,16 @@ pub const Socket = struct {
     /// permessage-deflate, when negotiated.
     deflate: if (features.compression) ?*deflate_impl.Deflate else void =
         if (features.compression) null else {},
-    /// The request's arena.
+    /// What the socket's parts live in: the request's arena, or for a
+    /// callback socket over HTTP/1.1 the server's allocator. Used only by
+    /// the task that reads the socket; the compressor has an allocator of
+    /// its own.
     allocator: std.mem.Allocator,
     /// The request's `std.Io`.
     io: std.Io,
+    /// The executor the socket was opened on, where `Rooms` sends to it
+    /// from; null off zio.
+    executor: ?usize = null,
     /// `UpgradeOptions.max_message_size`.
     max_message_size: usize,
     /// Held across compressing and sending a message, so tasks sending on
@@ -220,7 +226,7 @@ pub const Socket = struct {
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
         const d = self.deflate orelse unreachable; // RSV1 is refused unless negotiated
-        msg.data = d.decompress(self.allocator, msg.data, self.max_message_size) catch |err| {
+        msg.data = d.decompress(msg.data, self.max_message_size) catch |err| {
             self.close(if (err == error.MessageTooLarge) .too_large else .invalid_payload, "") catch {};
             return err;
         };
@@ -246,7 +252,7 @@ pub const Socket = struct {
         defer self.send_mutex.unlock(self.io);
         if (comptime features.compression) {
             if (self.deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
-                const packed_data = try d.compress(self.allocator, data);
+                const packed_data = try d.compress(data);
                 return switch (self.conn) {
                     .h1 => |ws| ws.sendCompressed(msg_type, packed_data),
                     .h2 => |ws| ws.sendMessage(msg_type, packed_data, true),
@@ -305,7 +311,7 @@ pub const Socket = struct {
     pub fn deinit(self: *Socket) void {
         // First, so nothing sends on the socket once it is gone.
         if (self.drain_watch) |w| w.stop();
-        if (comptime features.compression) if (self.deflate) |d| d.deinit(self.allocator);
+        if (comptime features.compression) if (self.deflate) |d| d.deinit();
         switch (self.conn) {
             inline else => |ws| ws.deinit(),
         }
@@ -383,7 +389,12 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
             if (deflate_impl.negotiate(offers, options.deflate, &buf)) |accepted| {
                 try res.header("Sec-WebSocket-Extensions", try req.arena.dupe(u8, accepted.response));
                 const d = try alloc.create(deflate_impl.Deflate);
-                d.* = .init(accepted.config, options.deflate);
+                // Its buffers apart from the request's arena, which is not
+                // thread-safe over HTTP/1.1: other tasks compress what they
+                // send (`Rooms`). The server's allocator there; over HTTP/2
+                // and HTTP/3 the stream's arena is a `std.heap.ArenaAllocator`
+                // over the server's allocator, which is thread-safe.
+                d.* = .init(accepted.config, options.deflate, if (h2) req.arena else res.conn.allocator);
                 deflate = d;
             }
         }
@@ -397,6 +408,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         .io = req.io,
         .max_message_size = options.max_message_size,
         .drain = req.drain,
+        .executor = placement.currentExecutor(req.io),
     };
     if (h2) {
         socket.conn = .{ .h2 = try H2Socket.accept(req, res, options.max_message_size, negotiated) };
@@ -724,42 +736,156 @@ const H1Callbacks = struct {
 /// socket to rooms, and anything may broadcast to a room. Safe from any task
 /// or thread of the runtime.
 ///
-/// A broadcast takes a snapshot of the room's members under the lock and
-/// sends outside it, so a slow member holds up only the broadcasts that
-/// reach it, never another room's or a join or leave elsewhere. A member
-/// that leaves waits for the sends to it that are under way, so a socket is
-/// never sent to after its handler has left and returned. A member's send
-/// failing is that member's affair: its own `receive` sees the connection
-/// end.
+/// A broadcast never waits for a member. It copies the message once and
+/// queues it for every member, and each member with something queued has a
+/// task of its own, on the socket's executor, that sends it in order. A
+/// member that does not keep up (its client stopped reading) only fills its
+/// own queue: past `Options.max_queued_bytes` the messages that do not fit
+/// are skipped for it, and with `on_full = .close` (the default) a member
+/// whose send has been stuck for `Options.close_after_ms` is closed: it
+/// gets no more broadcasts, and the send under way to it is canceled, which
+/// ends its sending side. A member whose send fails gets no more either;
+/// its own `receive` sees the connection end.
 pub const Rooms = struct {
     allocator: std.mem.Allocator,
+    options: Options = .{},
     /// The runtime's `std.Io`, taken from the first socket to join, so
     /// `init` needs none (the rooms can be made before the server).
     io: std.Io = undefined,
     io_set: std.atomic.Value(bool) = .init(false),
     io_lock: std.atomic.Mutex = .unlocked,
-    /// Over `rooms` and every member's `sends`; never held across I/O.
+    /// Over `rooms` and every member's queue and flags; never held across
+    /// I/O.
     mutex: std.Io.Mutex = .init,
-    /// Signalled when a member that left has no sends left.
+    /// Signalled when a member that left has no sender running.
     idle: std.Io.Condition = .init,
     rooms: std.StringHashMapUnmanaged(std.ArrayList(*Member)) = .empty,
 
-    const Member = struct {
-        socket: *Socket,
-        /// Broadcasts sending to this member right now.
-        sends: u32 = 0,
-        /// Out of its room, waiting for `sends` to reach zero.
-        left: bool = false,
+    pub const Options = struct {
+        /// The most broadcast bytes that may wait for one member (each
+        /// message counts 64 bytes more). A message is always taken when
+        /// nothing waits.
+        max_queued_bytes: usize = 1024 * 1024,
+        /// What a broadcast does with a member whose queue is full.
+        on_full: OnFull = .close,
+        /// With `.close`: how long the send under way to a full member must
+        /// have been stuck before it is closed. Until then (a member that
+        /// is only busy) the messages that do not fit are skipped.
+        close_after_ms: u32 = 1000,
+        /// How long `leave` lets a send under way to the leaving socket
+        /// finish before it cancels it.
+        leave_grace_ms: u32 = 1000,
     };
 
-    /// Members a broadcast snapshots on the stack; a bigger room borrows
-    /// from the allocator.
+    pub const OnFull = enum {
+        /// The message is skipped for that member, and a member whose send
+        /// has been stuck for `close_after_ms` gets no more broadcasts: the
+        /// send under way to it is canceled, which ends the socket's
+        /// sending side (its handler's `receive` then ends when the peer
+        /// goes or the socket's timeout passes).
+        close,
+        /// The message is skipped for that member; later ones are queued as
+        /// room frees up.
+        drop,
+    };
+
+    /// One copy of a broadcast message, shared by every queue it is in.
+    const Payload = struct {
+        refs: std.atomic.Value(u32),
+        type: MessageType,
+        len: usize,
+
+        fn create(allocator: std.mem.Allocator, msg_type: MessageType, message: []const u8) !*Payload {
+            const block = try allocator.alignedAlloc(u8, .of(Payload), @sizeOf(Payload) + message.len);
+            const p: *Payload = @ptrCast(block.ptr);
+            p.* = .{ .refs = .init(1), .type = msg_type, .len = message.len };
+            @memcpy(block[@sizeOf(Payload)..], message);
+            return p;
+        }
+
+        fn bytes(p: *const Payload) []const u8 {
+            const base: [*]const u8 = @ptrCast(p);
+            return base[@sizeOf(Payload)..][0..p.len];
+        }
+
+        fn cost(p: *const Payload) usize {
+            return p.len + 64;
+        }
+
+        fn release(p: *Payload, allocator: std.mem.Allocator) void {
+            if (p.refs.fetchSub(1, .acq_rel) != 1) return;
+            const base: [*]align(@alignOf(Payload)) u8 = @ptrCast(p);
+            allocator.free(base[0 .. @sizeOf(Payload) + p.len]);
+        }
+    };
+
+    const Member = struct {
+        socket: *Socket,
+        /// Messages waiting, from `head` on.
+        queue: std.ArrayList(*Payload) = .empty,
+        head: usize = 0,
+        queued_bytes: usize = 0,
+        /// A sender task is started or running; it alone takes from the
+        /// queue.
+        running: bool = false,
+        /// The running sender, for `cancel`; null before it starts.
+        task: ?placement.Task = null,
+        /// When the send under way started; null between sends.
+        sending_since: ?std.Io.Clock.Timestamp = null,
+        /// Its send failed, or it was closed for not keeping up: it gets
+        /// nothing more.
+        broken: bool = false,
+        /// Out of its room, waiting for its sender to end.
+        left: bool = false,
+        sender: std.Io.Group = .init,
+
+        fn pop(m: *Member) ?*Payload {
+            if (m.head == m.queue.items.len) return null;
+            const p = m.queue.items[m.head];
+            m.head += 1;
+            m.queued_bytes -= p.cost();
+            if (m.head == m.queue.items.len) {
+                m.queue.clearRetainingCapacity();
+                m.head = 0;
+            } else if (m.head >= 64 and m.head * 2 >= m.queue.items.len) {
+                const rest = m.queue.items[m.head..];
+                std.mem.copyForwards(*Payload, m.queue.items[0..rest.len], rest);
+                m.queue.items.len = rest.len;
+                m.head = 0;
+            }
+            return p;
+        }
+
+        fn dropQueue(m: *Member, allocator: std.mem.Allocator) void {
+            for (m.queue.items[m.head..]) |p| p.release(allocator);
+            m.queue.clearRetainingCapacity();
+            m.head = 0;
+            m.queued_bytes = 0;
+        }
+
+        /// Gets nothing more, and the send under way is canceled. Under
+        /// the mutex.
+        fn close(m: *Member, allocator: std.mem.Allocator) void {
+            m.broken = true;
+            m.dropQueue(allocator);
+            if (m.running) if (m.task) |t| placement.cancelTask(t);
+        }
+    };
+
+    /// Members a broadcast notes on the stack for starting their senders; a
+    /// bigger room borrows from the allocator.
     const stack_snapshot = 64;
 
-    /// No rooms yet. `allocator` holds the room names and members; it must
-    /// be thread-safe when sockets on several executors join.
+    /// No rooms yet. `allocator` holds the room names, members and queued
+    /// messages; it must be thread-safe when sockets on several executors
+    /// join.
     pub fn init(allocator: std.mem.Allocator) Rooms {
         return .{ .allocator = allocator };
+    }
+
+    /// `init` with options other than the defaults.
+    pub fn initOptions(allocator: std.mem.Allocator, options: Options) Rooms {
+        return .{ .allocator = allocator, .options = options };
     }
 
     /// The `std.Io` to lock with: `io` (a joining or leaving socket's)
@@ -786,17 +912,24 @@ pub const Rooms = struct {
         var it = self.rooms.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            for (entry.value_ptr.items) |m| self.allocator.destroy(m);
+            for (entry.value_ptr.items) |m| self.freeMember(m);
             entry.value_ptr.deinit(self.allocator);
         }
         self.rooms.deinit(self.allocator);
     }
 
-    /// Adds `socket` to `room`. Leave before the socket goes away:
-    /// `defer rooms.leave(room, &ws)`.
+    fn freeMember(self: *Rooms, m: *Member) void {
+        m.dropQueue(self.allocator);
+        m.queue.deinit(self.allocator);
+        self.allocator.destroy(m);
+    }
+
+    /// Adds `socket` to `room`; nothing when it is a member already. Leave
+    /// before the socket goes away: `defer rooms.leave(room, &ws)`.
     pub fn join(self: *Rooms, room: []const u8, socket: *Socket) !void {
         const member = try self.allocator.create(Member);
-        errdefer self.allocator.destroy(member);
+        var used = false;
+        defer if (!used) self.allocator.destroy(member);
         member.* = .{ .socket = socket };
         const io = self.bind(socket.io);
         self.mutex.lockUncancelable(io);
@@ -809,19 +942,29 @@ pub const Rooms = struct {
             };
             entry.value_ptr.* = .empty;
         }
-        try entry.value_ptr.append(self.allocator, member);
+        for (entry.value_ptr.items) |m| if (m.socket == socket) return;
+        entry.value_ptr.append(self.allocator, member) catch |err| {
+            if (entry.value_ptr.items.len == 0) {
+                const key = entry.key_ptr.*;
+                entry.value_ptr.deinit(self.allocator);
+                self.rooms.removeByPtr(entry.key_ptr);
+                self.allocator.free(key);
+            }
+            return err;
+        };
+        used = true;
     }
 
-    /// Takes `socket` out of `room`, once any broadcast sending to it has
-    /// finished with it.
+    /// Takes `socket` out of `room`. Messages still queued for it are
+    /// dropped; a send under way is given `Options.leave_grace_ms` to finish
+    /// and then canceled, so a socket is never sent to once `leave` returns.
     pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
         const io = self.bind(socket.io);
         self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const members = self.rooms.getPtr(room) orelse return;
+        const members = self.rooms.getPtr(room) orelse return self.mutex.unlock(io);
         const member = for (members.items, 0..) |m, i| {
             if (m.socket == socket) break members.swapRemove(i);
-        } else return;
+        } else return self.mutex.unlock(io);
         if (members.items.len == 0) {
             const key = self.rooms.getKey(room).?;
             members.deinit(self.allocator);
@@ -829,58 +972,119 @@ pub const Rooms = struct {
             self.allocator.free(key);
         }
         member.left = true;
-        while (member.sends > 0) self.idle.waitUncancelable(io, &self.mutex);
-        self.allocator.destroy(member);
+        member.dropQueue(self.allocator);
+        var canceled = false;
+        if (member.running) {
+            const grace: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(self.options.leave_grace_ms), .clock = .awake } };
+            const deadline = grace.toDeadline(io);
+            while (member.running) {
+                self.idle.waitTimeout(io, &self.mutex, deadline) catch |err| {
+                    if (err == error.Canceled) canceled = true;
+                    break;
+                };
+            }
+            if (member.running) if (member.task) |t| placement.cancelTask(t);
+            while (member.running) self.idle.waitUncancelable(io, &self.mutex);
+        }
+        self.mutex.unlock(io);
+        // The sender has ended: this only releases the group.
+        member.sender.cancel(io);
+        self.freeMember(member);
+        if (canceled) io.recancel();
     }
 
-    /// Sends one message to every member of `room` but `except`. Returns
-    /// how many it reached. Members joining meanwhile are not sent to.
+    /// Queues one message for every member of `room` but `except`, and
+    /// returns for how many. It does not wait for any of them to be sent
+    /// (see `Rooms`). Members joining meanwhile do not get it.
     pub fn broadcast(self: *Rooms, room: []const u8, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
         const io = self.bound() orelse return 0;
+        const payload = Payload.create(self.allocator, msg_type, data) catch return 0;
+        // The broadcast's own reference; each queue holds one more.
+        defer payload.release(self.allocator);
+
         var stack: [stack_snapshot]*Member = undefined;
         var heap: []*Member = &.{};
         defer self.allocator.free(heap);
-        const snapshot = snap: {
+        var start: []*Member = &.{};
+        var reached: usize = 0;
+        {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             const members = (self.rooms.get(room) orelse return 0).items;
-            const buf: []*Member = if (members.len <= stack.len) &stack else big: {
-                heap = self.allocator.alloc(*Member, members.len) catch {
-                    // No memory for a snapshot: send under the lock
-                    // instead, which only makes this broadcast hold up the
-                    // others.
-                    return sendAll(members, msg_type, data, except);
-                };
-                break :big heap;
-            };
+            // The members whose sender has to be started, started once the
+            // lock is let go. Without memory to note them, they are started
+            // here.
+            const buf: ?[]*Member = if (members.len <= stack.len) &stack else if (self.allocator.alloc(*Member, members.len)) |h| big: {
+                heap = h;
+                break :big h;
+            } else |_| null;
             var n: usize = 0;
             for (members) |m| {
-                if (m.socket == except) continue;
-                m.sends += 1;
-                buf[n] = m;
-                n += 1;
+                if (m.socket == except or m.broken or m.left) continue;
+                if (m.queued_bytes > 0 and m.queued_bytes + payload.cost() > self.options.max_queued_bytes) {
+                    if (self.options.on_full == .close) if (m.sending_since) |since| {
+                        const stuck = since.untilNow(io).raw.toMilliseconds();
+                        if (stuck >= self.options.close_after_ms) m.close(self.allocator);
+                    };
+                    continue;
+                }
+                m.queue.append(self.allocator, payload) catch continue;
+                _ = payload.refs.fetchAdd(1, .monotonic);
+                m.queued_bytes += payload.cost();
+                reached += 1;
+                if (m.running) continue;
+                m.running = true;
+                if (buf) |b| {
+                    b[n] = m;
+                    n += 1;
+                } else self.startSender(io, m);
             }
-            break :snap buf[0..n];
-        };
-        var reached: usize = 0;
-        for (snapshot) |m| {
-            if (m.socket.send(msg_type, data)) |_| reached += 1 else |_| {}
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            m.sends -= 1;
-            if (m.sends == 0 and m.left) self.idle.broadcast(io);
+            if (buf) |b| start = b[0..n];
         }
+        for (start) |m| self.startSender(io, m);
         return reached;
     }
 
-    fn sendAll(members: []const *Member, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
-        var reached: usize = 0;
-        for (members) |m| {
-            if (m.socket == except) continue;
-            m.socket.send(msg_type, data) catch continue;
-            reached += 1;
+    /// Starts `m`'s sender, `m.running` already set. Without a task to
+    /// spare, what is queued waits for the next broadcast to try again.
+    fn startSender(self: *Rooms, io: std.Io, m: *Member) void {
+        const where: placement.Where = if (m.socket.executor) |i| .{ .executor = i } else .local;
+        placement.concurrent(&m.sender, io, where, sendQueued, .{ self, m }) catch {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            m.running = false;
+            if (m.left) self.idle.broadcast(io);
+        };
+    }
+
+    /// A member's sender: sends what is queued for it, in order, until the
+    /// queue is empty or the member is done.
+    fn sendQueued(self: *Rooms, m: *Member) std.Io.Cancelable!void {
+        const io = self.io;
+        var canceled = false;
+        self.mutex.lockUncancelable(io);
+        m.task = placement.currentTask(io);
+        while (!m.left and !m.broken) {
+            const p = m.pop() orelse break;
+            m.sending_since = .now(io, .awake);
+            self.mutex.unlock(io);
+            const sent = if (m.socket.send(p.type, p.bytes())) |_| true else |err| blk: {
+                if (err == error.Canceled) canceled = true;
+                break :blk false;
+            };
+            p.release(self.allocator);
+            self.mutex.lockUncancelable(io);
+            m.sending_since = null;
+            if (!sent) {
+                m.broken = true;
+                m.dropQueue(self.allocator);
+            }
         }
-        return reached;
+        m.running = false;
+        m.task = null;
+        if (m.left) self.idle.broadcast(io);
+        self.mutex.unlock(io);
+        if (canceled) return error.Canceled;
     }
 
     /// How many sockets are in `room`.

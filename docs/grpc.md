@@ -215,7 +215,7 @@ lives until the call ends.
 | Member | What it does |
 | --- | --- |
 | `call.io` | The `std.Io` for async work (timers, outbound calls, files). |
-| `call.arena` | The call's arena; thread-safe. |
+| `call.arena` | The call's arena (the request's). Not thread-safe: a task you start with `io.concurrent` needs memory of its own. |
 | `call.metadata(name)` | A request metadata value by lower-case name, or null. |
 | `call.addHeader(name, value)` | Initial metadata. `error.HeadersSent` once the first response message has gone out. |
 | `call.addTrailer(name, value)` | Trailing metadata, sent with the status. |
