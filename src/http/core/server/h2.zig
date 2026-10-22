@@ -510,12 +510,11 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.kickWriter();
             }
 
-            /// A stream from the connection's spares (its arena reset, with
-            /// what it grew to kept), or a new one. Under the mutex.
+            /// A stream from the connection's spares (its arena trimmed when it
+            /// was released), or a new one. Under the mutex.
             fn create(conn: *Conn, id: i32) !*Stream {
                 if (conn.spare_streams.pop()) |stream| {
-                    var arena = stream.arena;
-                    _ = arena.reset(.{ .retain_with_limit = arena_retain_limit });
+                    const arena = stream.arena;
                     stream.* = .{ .conn = conn, .id = id, .arena = arena };
                     return stream;
                 }
@@ -561,6 +560,9 @@ pub fn Engine(comptime Ctx: type) type {
                     }
                 }
                 if (conn.spare_streams.items.len < max_spare_streams) {
+                    // Trimmed now, not on reuse: the budget above is given
+                    // back, so a spare must not keep a raised body window.
+                    _ = stream.arena.reset(.{ .retain_with_limit = arena_retain_limit });
                     if (conn.spare_streams.append(conn.allocator, stream)) |_| return else |_| {}
                 }
                 stream.destroy(conn.allocator);
