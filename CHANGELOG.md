@@ -27,6 +27,8 @@ breaking changes are listed anyway.
   field that names another host gets 400.
 - HTTP/1.1 requests without a `Host` field, and requests with two, get 400
   (RFC 9112). `server.request.require_host = false` accepts them again.
+- Static files: a file modified after the year 9999 no longer crashes the
+  server while formatting `Last-Modified`; the date is capped at 9999.
 
 ### C ABI (ABI 0.1)
 

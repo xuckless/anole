@@ -285,11 +285,14 @@ test "Status: reason phrases are RFC 9110's" {
 }
 
 /// An IMF-fixdate (RFC 9110 5.6.7), `Sun, 06 Nov 1994 08:49:37 GMT`, of
-/// `seconds` since the epoch. A time before 1970 is given as 1970.
+/// `seconds` since the epoch. A time before 1970 is given as 1970, and one
+/// after the year 9999 (which four digits cannot hold) as its last second.
 pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {
+    // 9999-12-31T23:59:59Z.
+    const last_second: i64 = 253402300799;
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(std.math.clamp(seconds, 0, last_second)) };
     const day = epoch_seconds.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -346,6 +349,11 @@ test "formatHttpDate: IMF-fixdate" {
     var buf: [29]u8 = undefined;
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", formatHttpDate(&buf, 784111777));
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", formatHttpDate(&buf, -5));
+    // A file time past the year 9999 (a stored mtime is anything) is
+    // given as the last second that fits.
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300799));
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300800));
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, std.math.maxInt(i64)));
 }
 
 test "Status: construct from llhttp_status_t" {
