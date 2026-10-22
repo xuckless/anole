@@ -50,6 +50,16 @@ pub const Protocol = server.Protocol;
 /// How a call's messages are encoded (`Call.codec()`): proto or json.
 pub const Codec = server.Codec;
 
+/// The server's call machinery by bytes rather than generated types
+/// (`begin`, `readPayload`, `writePayload`, `finish`), for Anole's C ABI,
+/// whose services are implemented in another language. Not a stable API.
+pub const serving = server;
+/// JSON transcoding's templates, rules and request building, for the C
+/// ABI's transcoded routes. Not a stable API.
+pub const transcode = @import("transcode.zig");
+/// Metadata keys and values: what may go out as gRPC metadata.
+pub const metadata_keys = metadata;
+
 /// The client: `Channel` over an `anole.h2.ClientConnection`, and
 /// `Client(Service)` for typed calls.
 const client = @import("client.zig");
@@ -81,7 +91,7 @@ test {
     _ = deadline;
     _ = @import("compression.zig");
     _ = server;
-    _ = @import("transcode.zig");
+    _ = transcode;
     _ = @import("transcode_test.zig");
     _ = health;
     _ = client;

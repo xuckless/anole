@@ -110,6 +110,16 @@ zig-jwt (JWT building and signing)
   Includes: zig-rsa (https://github.com/deatil/zig-rsa, Apache-2.0)
   Linked:   -Dauth=true
 
+upb (protobuf's C runtime) and utf8_range, from protobuf 36.2
+  Licence:  upb: BSD-3-Clause (text in part F). Copyright 2008 Google Inc.
+            utf8_range: MIT. Copyright (c) 2019 Yibo Cai, Copyright 2022
+            Google LLC
+  Source:   https://github.com/protocolbuffers/protobuf (release tarball
+            v36.2): ruby/ext/google/protobuf_c/ruby-upb.c (upb amalgamated)
+            and third_party/utf8_range
+  Linked:   -Dgrpc=true (the C ABI's gRPC server: protobuf <-> JSON with
+            the consumer's descriptors); built by build/upb.zig
+
 yyjson (JSON reader and writer)
   Licence:  MIT. Copyright (c) 2020 YaoYuan
   Source:   https://github.com/ibireme/yyjson (tag archive 0.13.0)
@@ -587,7 +597,7 @@ not compiled into BoringSSL and so is not reproduced here.
    limitations under the License.
 
 
-F. BSD-3-Clause licence text (zstd, hiredis, protobuf's descriptor.proto)
+F. BSD-3-Clause licence text (zstd, hiredis, protobuf's descriptor.proto, upb)
 -------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of zstd 1.5.7.

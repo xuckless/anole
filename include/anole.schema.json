@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xuckless/anole/blob/main/include/anole.schema.json",
   "title": "Anole C ABI configuration",
-  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error. ABI 0.1.",
+  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error. ABI 0.2.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -49,6 +49,9 @@
       "items": {
         "$ref": "#/$defs/Route"
       }
+    },
+    "grpc": {
+      "$ref": "#/$defs/Grpc"
     },
     "observe": {
       "$ref": "#/$defs/Observe"
@@ -1243,6 +1246,145 @@
           "default": 16777216
         }
       }
+    },
+    "Grpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "gRPC services whose methods the consumer implements (-Dgrpc). Anole serves gRPC over HTTP/2, gRPC-Web, Connect and JSON transcoding, with framing, compression, deadlines, limits and health; messages reach the consumer as protobuf bytes (ANOLE_EV_GRPC_CALL).",
+      "properties": {
+        "descriptor_set": {
+          "type": "string",
+          "description": "The services' descriptors: a serialized google.protobuf.FileDescriptorSet with its imports (protoc --include_imports --descriptor_set_out, buf build -o), base64. With descriptors Anole knows each method's call mode and serves JSON (Connect JSON, gRPC-Web JSON, google.api.http transcoding) by converting to and from protobuf; without them every service lists its methods and only protobuf is served."
+        },
+        "descriptor_set_file": {
+          "type": "string",
+          "description": "The same, as the path of the file (read by anole_server_create). One of descriptor_set and descriptor_set_file."
+        },
+        "services": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/GrpcService"
+          }
+        },
+        "health": {
+          "type": "boolean",
+          "default": false,
+          "description": "Serve grpc.health.v1.Health: the server (\"\") and every service here SERVING until anole_grpc_health_set says otherwise, NOT_SERVING once the server drains."
+        }
+      },
+      "required": [
+        "services"
+      ]
+    },
+    "GrpcService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "The service's full name, \"package.Service\"."
+        },
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The consumer's route id for this service's calls (anole_grpc_call_event.route_id)."
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GrpcMethod"
+          },
+          "description": "The methods served, in the order of their method_id. Left out: all of the service's, in the descriptors' order (needs descriptors)."
+        },
+        "max_message_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1073741824,
+          "default": 4194304,
+          "description": "The largest request message, after inflating; a larger one ends the call with RESOURCE_EXHAUSTED. A consumer's poll buffer must hold a call record with one."
+        },
+        "max_received_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 67108864,
+          "description": "Request message bytes one call takes in all (each counted at its size plus 64); past it, RESOURCE_EXHAUSTED."
+        },
+        "read_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "How long a request message may take once it started arriving; 0 for no limit but the deadline."
+        },
+        "max_call_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "The longest a call may run, capping the client's deadline; 0 for none."
+        },
+        "response_compression": {
+          "enum": [
+            "mirror",
+            "accepted",
+            "never"
+          ],
+          "default": "mirror",
+          "description": "When response messages are gzipped: when the request's were (mirror), whenever the client accepts gzip (accepted), never."
+        },
+        "read_ahead": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 8,
+          "description": "Request messages of a client- or bidirectional-streaming call delivered before the consumer asks for more (anole_grpc_read)."
+        },
+        "transcode": {
+          "type": "boolean",
+          "default": true,
+          "description": "REST routes for the methods annotated with google.api.http (needs descriptors)."
+        },
+        "no_wait": {
+          "type": "boolean",
+          "default": true,
+          "description": "Unary and server-streaming calls that arrive whole over HTTP/2 or HTTP/3 run with no task (detached), as no_wait routes do."
+        }
+      },
+      "required": [
+        "name",
+        "handler"
+      ]
+    },
+    "GrpcMethod": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The method's name, as in the .proto (\"SayHello\")."
+        },
+        "kind": {
+          "enum": [
+            "unary",
+            "server_streaming",
+            "client_streaming",
+            "bidi_streaming"
+          ],
+          "description": "The call mode; needed without descriptors, else checked against them."
+        },
+        "no_side_effects": {
+          "type": "boolean",
+          "description": "Also serve the method as Connect GET (unary only). Default: the descriptors' idempotency_level = NO_SIDE_EFFECTS."
+        }
+      },
+      "required": [
+        "name"
+      ]
     }
   }
 }

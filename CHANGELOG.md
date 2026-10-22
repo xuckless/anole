@@ -39,6 +39,23 @@ breaking changes are listed anyway.
 - `anole.redis`'s `Query.reply` sends a command known only at run time
   (`[]const []const u8`), through the cache for read commands; the result
   caches copy types that hold themselves (a reply tree).
+- C ABI 0.2: a gRPC server whose methods are implemented by the consumer
+  (Node, Python, C). A `"grpc"` configuration section names the services
+  (with their descriptors, a `FileDescriptorSet`, or a method list); Anole
+  serves gRPC over HTTP/2, gRPC-Web, Connect (GET too) and JSON
+  transcoding, with framing, gzip, deadlines, per-call limits and
+  `grpc.health.v1`, and the consumer gets `ANOLE_EV_GRPC_CALL`,
+  `ANOLE_EV_GRPC_MESSAGE` and `ANOLE_EV_GRPC_HALF_CLOSE` with messages as
+  protobuf bytes and answers with `anole_grpc_send_headers`,
+  `anole_grpc_send`, `anole_grpc_send_wait`, `anole_grpc_finish` and
+  `anole_grpc_read` (credit for request messages);
+  `anole_grpc_health_set` sets health statuses. Unary and server-streaming
+  calls that arrive whole over HTTP/2 are answered with no task, as
+  `no_wait` routes are. JSON goes through upb (protobuf's C runtime,
+  BSD-3-Clause, built from the protobuf 36.2 release), linked with
+  `-Dgrpc`. grpc-go's interop client passes its 14 cases against a C
+  implementation of the test service (`tests/capi/grpc_interop.c`). See
+  docs/c-abi.md#grpc.
 
 ### Fixed
 

@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 1;
+pub const version_minor: u32 = 2;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -95,6 +95,9 @@ pub const EventType = enum(u32) {
     ws_drain = 9,
     db_result = 10,
     stopped = 11,
+    grpc_call = 12,
+    grpc_message = 13,
+    grpc_half_close = 14,
 };
 
 pub const Event = extern struct {
@@ -236,6 +239,62 @@ pub const DbCell = extern struct {
 pub const POLL_NOARM: u32 = 1;
 pub const BODY_BORROW: u32 = 1;
 
+// ---- gRPC ----------------------------------------------------------------
+
+pub const GRPC_UNARY: u8 = 0;
+pub const GRPC_SERVER_STREAMING: u8 = 1;
+pub const GRPC_CLIENT_STREAMING: u8 = 2;
+pub const GRPC_BIDI_STREAMING: u8 = 3;
+
+pub const GRPC_PROTOCOL_GRPC: u8 = 0;
+pub const GRPC_PROTOCOL_GRPC_WEB: u8 = 1;
+pub const GRPC_PROTOCOL_GRPC_WEB_TEXT: u8 = 2;
+pub const GRPC_PROTOCOL_CONNECT: u8 = 3;
+pub const GRPC_PROTOCOL_CONNECT_STREAM: u8 = 4;
+pub const GRPC_PROTOCOL_HTTP_JSON: u8 = 5;
+
+pub const GRPC_CALL_MESSAGE: u16 = 1;
+pub const GRPC_CALL_SECURE: u16 = 4;
+pub const GRPC_CALL_EARLY_DATA: u16 = 8;
+pub const GRPC_CALL_JSON: u16 = 16;
+pub const GRPC_CALL_COMPRESSED: u16 = 32;
+
+pub const GRPC_SEND_FINISH: u32 = 2;
+
+pub const GRPC_HEALTH_UNKNOWN: c_int = 0;
+pub const GRPC_HEALTH_SERVING: c_int = 1;
+pub const GRPC_HEALTH_NOT_SERVING: c_int = 2;
+
+/// ANOLE_EV_GRPC_CALL: followed by `anole_span metadata[2 * nmetadata]`,
+/// then the bytes the spans point into.
+pub const GrpcCallEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    method_id: u16,
+    kind: u8,
+    protocol: u8,
+    flags: u16,
+    version: u8,
+    reserved0: u8 = 0,
+    nmetadata: u16,
+    reserved1: u16 = 0,
+    method: Span,
+    message: Span,
+    remote_addr: Span,
+    listener: Span,
+    id: Span,
+    claims: Span,
+    timeout_us: i64,
+};
+
+/// ANOLE_EV_GRPC_MESSAGE: one request message, followed by its bytes.
+pub const GrpcMessageEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    flags: u32 = 0,
+    data: Span,
+};
+
 comptime {
     std.debug.assert(@sizeOf(Event) == 16);
     std.debug.assert(@sizeOf(Span) == 8);
@@ -243,6 +302,8 @@ comptime {
     std.debug.assert(@sizeOf(SentEvent) == 32);
     std.debug.assert(@sizeOf(WsMessageEvent) == 32);
     std.debug.assert(@sizeOf(WsCloseEvent) == 32);
+    std.debug.assert(@sizeOf(GrpcCallEvent) == 88);
+    std.debug.assert(@sizeOf(GrpcMessageEvent) == 32);
     std.debug.assert(@sizeOf(DbValue) == 24);
     std.debug.assert(@sizeOf(DbOptions) == 40);
     std.debug.assert(@sizeOf(DbResultEvent) == 96);
