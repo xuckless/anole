@@ -38,10 +38,14 @@ pub fn main(init: std.process.Init) !void {
         } else return error.Usage;
     }
 
+    // max_streams_bidi stays at its default, 100 (ngtcp2's interop server
+    // uses the same): at 1000, quiche's client ran out of file descriptors
+    // in `multiplexing` (it opens a file per stream it has open), though
+    // the case allows up to 1000.
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
         .https = .{ .address = "0.0.0.0", .port = port, .cert = .{ .files = .{ .cert_path = cert, .key_path = key } } },
-        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000, .early_data = true, .prefer_v2 = v2 },
+        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .early_data = true, .prefer_v2 = v2 },
     }, {});
     defer app.deinit();
     const dir = try std.Io.Dir.cwd().openDir(app.io(), www, .{});
