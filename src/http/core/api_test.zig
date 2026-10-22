@@ -446,6 +446,10 @@ fn freePort() !u16 {
 }
 
 test "port in use: a second server on the same port fails instead of sharing it" {
+    // std.Io.Threaded (std.testing.io) binds on Windows through AFD with the
+    // address shared (its BIND_INFO mode 1 is AFD_SHARE_REUSE), so a second
+    // listener there succeeds. src/http/root.zig checks this on zio.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Footgun: with SO_REUSEPORT both used to listen, splitting the traffic.
     const port = try freePort();
     const listeners: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(port) } } }};
@@ -454,9 +458,7 @@ test "port in use: a second server on the same port fails instead of sharing it"
     try first.start();
     defer first.stop();
 
-    // No probe on Windows, where listeners bind without SO_REUSEADDR: the
-    // bind itself refuses (below).
-    if (builtin.os.tag != .windows) try std.testing.expectError(error.AddressInUse, dusty.checkAddressFree(.{ .ip4 = .loopback(port) }));
+    try std.testing.expectError(error.AddressInUse, dusty.checkAddressFree(.{ .ip4 = .loopback(port) }));
     var second: Running(void) = .{ .server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = listeners }, {}) };
     defer second.server.deinit();
     try std.testing.expectError(error.AddressInUse, second.start());
