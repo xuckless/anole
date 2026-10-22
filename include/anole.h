@@ -106,7 +106,7 @@ ANOLE_API uint32_t anole_abi_version(void);
 /* Anole's version, such as "0.2.0"; static storage. */
 ANOLE_API anole_str anole_version(void);
 /* 1 when `name` is built in, else 0: "tls", "http2", "http3", "websocket",
-   "compression", "brotli", "auth", "sqlite", "postgres". */
+   "compression", "brotli", "auth", "sqlite", "postgres", "redis". */
 ANOLE_API int anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
@@ -443,13 +443,13 @@ ANOLE_API anole_status anole_ws_publish(anole_server *s, anole_str topic, int ty
 
 /* ---- databases ---------------------------------------------------------------- */
 
-/* A database from the configuration's "databases": SQLite or PostgreSQL
-   (Redis and MongoDB follow). Statements run on Anole's threads and never
+/* A database from the configuration's "databases": SQLite, PostgreSQL or
+   Redis (MongoDB follows). Statements run on Anole's threads and never
    block the caller: each call queues one, and its answer comes back as an
    ANOLE_EV_DB_RESULT to the consumer named in the call, with the caller's
    user_data. SQLite: reads run beside the writer (WAL), writes take turns on
-   the database's writer thread. PostgreSQL: each executor has its own pool
-   of connections. Statements may be queued from anole_server_start until
+   the database's writer thread. PostgreSQL and Redis: each executor has its
+   own pool of connections. Statements may be queued from anole_server_start until
    the server stops; ones still running when it stops get no answer
    (ANOLE_EV_STOPPED is the consumer's last event). */
 typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
@@ -458,15 +458,30 @@ typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
    anole_server_create). ANOLE_E_INVALID when there is none. */
 ANOLE_API anole_status anole_db_find(anole_server *s, anole_str name, anole_db **out);
 
-/* Value and cell types. ANOLE_DB_BOOL holds 0 or 1 in `i`. */
-enum { ANOLE_DB_NULL = 0, ANOLE_DB_INT = 1, ANOLE_DB_FLOAT = 2, ANOLE_DB_TEXT = 3, ANOLE_DB_BLOB = 4, ANOLE_DB_BOOL = 5 };
+/* Value and cell types. ANOLE_DB_BOOL holds 0 or 1 in `i`. ARRAY, MAP and
+   ERROR are cells of a Redis reply only (see anole_db_cell). */
+enum {
+  ANOLE_DB_NULL = 0,
+  ANOLE_DB_INT = 1,
+  ANOLE_DB_FLOAT = 2,
+  ANOLE_DB_TEXT = 3,
+  ANOLE_DB_BLOB = 4,
+  ANOLE_DB_BOOL = 5,
+  ANOLE_DB_ARRAY = 6,
+  ANOLE_DB_MAP = 7,
+  ANOLE_DB_ERROR = 8
+};
 
 /* A parameter: binds SQLite's `?` (or `?NNN`), PostgreSQL's $1, $2... in
    order. Text and blobs are copied by the call. SQLite binds a bool as 1 or
    0. PostgreSQL sends each value as the parameter's type when it can (an
    int to int2/int4/int8/numeric, a blob to bytea), else as text that
    PostgreSQL parses into that type: text holding '2026-10-22T10:00:00Z' for
-   a timestamptz, '{1,2}' for an int4[], an int for a text parameter. */
+   a timestamptz, '{1,2}' for an int4[], an int for a text parameter.
+   Redis: `sql` holds the command's name and any fixed words ("GET",
+   "CLIENT INFO"), split on spaces; each parameter is one more argument,
+   binary-safe: text and blobs as they are, numbers in decimal, a bool as 1
+   or 0, NULL left out. Keys and values always go in parameters. */
 typedef struct anole_db_value {
   uint32_t type; /* ANOLE_DB_* */
   uint32_t reserved;
@@ -504,13 +519,19 @@ typedef struct anole_db_options {
    column names and every row. `params` (copied) bind in order; `opts` may
    be NULL. `c` receives the answer; it must be fed by at least one
    executor (ANOLE_E_STATE otherwise, or before start or after the stop).
-   ANOLE_E_INVALID: a bad value type or options size. Returns at once. */
+   ANOLE_E_INVALID: a bad value type or options size. Returns at once.
+   Redis: runs the command and answers with its whole reply. timeout_ms,
+   ANOLE_DB_COALESCE and cache_ttl_ms apply; the last two only to commands
+   that just read (GET, MGET, HGETALL, LRANGE, ZRANGE... as anole.redis's
+   read_commands), others run as they are. */
 ANOLE_API anole_status anole_db_query(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
                                       size_t nparams, const anole_db_options *opts, uint64_t user_data);
 /* Queues a write (SQLite: on the writer): the answer has `changes` and, for
    SQLite, `last_insert_rowid` (PostgreSQL: 0; use RETURNING with
    anole_db_query), and no rows. With no parameters, `sql` may hold several
-   statements (a schema), run in order. */
+   statements (a schema), run in order. Redis: runs the command and answers
+   with no cells; `changes` is its reply when that is an integer (DEL,
+   INCR, LPUSH...), else 0. */
 ANOLE_API anole_status anole_db_exec(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
                                      size_t nparams, const anole_db_options *opts, uint64_t user_data);
 /* Drops the answers kept with cache_tag `tag` on every executor ({NULL, 0}:
@@ -545,7 +566,13 @@ enum {
    float8 are ANOLE_DB_FLOAT; bytea is ANOLE_DB_BLOB; every other type is
    ANOLE_DB_TEXT in PostgreSQL's text format (as psql prints it: numeric
    exactly, '2026-10-22 10:00:00+00', '{1,2}', JSON text), for the caller to
-   parse by db_type, as the language's own PostgreSQL drivers do. */
+   parse by db_type, as the language's own PostgreSQL drivers do.
+   Redis: the reply is a tree of cells in preorder, with no columns
+   (ncolumns 0, nrows the number of cells). Bulk strings are BLOB (bytes,
+   often UTF-8), status replies ("OK") TEXT, integers INT, nil NULL, RESP3
+   doubles FLOAT and booleans BOOL. An ARRAY cell with `i` = n is followed by
+   its n items, each a whole subtree; a MAP with `i` = n by n key, value
+   pairs. ERROR (text) is an error reply inside another, as EXEC's. */
 typedef struct anole_db_cell {
   uint32_t type;    /* ANOLE_DB_* */
   uint32_t db_type; /* PostgreSQL: the type OID; 0 otherwise */
@@ -579,7 +606,7 @@ typedef struct anole_db_result_event {
   anole_span cells;
   anole_span error;      /* the database's message (for logs; not for clients) */
   anole_span error_code; /* the database's own code as text (SQLite's extended code,
-                            PostgreSQL's SQLSTATE) */
+                            PostgreSQL's SQLSTATE, the first word of a Redis error) */
   anole_span constraint; /* the constraint that failed, when the database names it */
 } anole_db_result_event;
 

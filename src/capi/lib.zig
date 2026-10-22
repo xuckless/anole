@@ -157,6 +157,7 @@ export fn anole_has_feature(name: Str) c_int {
         .{ "auth", f.auth },
         .{ "sqlite", f.sqlite },
         .{ "postgres", f.postgres },
+        .{ "redis", f.redis },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;

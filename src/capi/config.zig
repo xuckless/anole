@@ -92,9 +92,10 @@ pub const Config = struct {
     pub const Database = struct {
         /// What `anole_db_find` looks it up by: unique, 1-255 bytes.
         name: []const u8,
-        /// Exactly one of `sqlite` and `postgres`.
+        /// Exactly one of `sqlite`, `postgres` and `redis`.
         sqlite: ?Sqlite = null,
         postgres: ?Postgres = null,
+        redis: ?Redis = null,
         /// The bounds of the answers kept for queries with cache_ttl_ms,
         /// over every executor.
         cache: CacheBounds = .{},
@@ -153,6 +154,30 @@ pub const Config = struct {
         reset_session: bool = true,
         /// SQL run once at start, before the listeners open: a schema.
         init: ?[]const u8 = null,
+    };
+
+    /// A Redis or Valkey server, as `anole.redis.Options` (docs/database.md).
+    pub const Redis = struct {
+        /// redis://user:password@host:6379/0, rediss:// for TLS, or
+        /// unix:///path?db=0. Null: REDIS_URL, else redis://127.0.0.1:6379.
+        url: ?[]const u8 = null,
+        /// rediss://: the CA certificates (PEM) the server's certificate is
+        /// checked against, as a file or as the PEM text. Null: the URL's
+        /// ssl_ca_certs, else the system's store.
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        /// Connections in all, split between the executors. Null: ten per
+        /// executor.
+        max_connections: ?u32 = null,
+        /// How long a command waits for a connection when all are busy.
+        acquire_timeout_ms: u32 = 5000,
+        /// How long opening a connection may take; 0: no limit.
+        connect_timeout_ms: u32 = 10_000,
+        /// Connections idle this long are closed; 0: no limit.
+        idle_timeout_ms: u32 = 5 * 60 * 1000,
+        /// Open a connection per executor at start, and fail the start if
+        /// that fails.
+        connect_at_start: bool = false,
     };
 
     pub const CacheBounds = struct {
@@ -399,7 +424,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
         for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
             return fail(why, "databases[{d}].name \"{s}\" is taken", .{ i, d.name });
-        if ((d.sqlite == null) == (d.postgres == null)) return fail(why, "databases[{d}]: exactly one of sqlite and postgres", .{i});
+        const kinds = @as(u8, @intFromBool(d.sqlite != null)) + @intFromBool(d.postgres != null) + @intFromBool(d.redis != null);
+        if (kinds != 1) return fail(why, "databases[{d}]: exactly one of sqlite, postgres and redis", .{i});
         if (d.sqlite) |sq| {
             if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
             if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
@@ -413,6 +439,11 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             }
             if (p.ca_file != null and p.ca_pem != null) return fail(why, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
             if (p.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].postgres.max_connections: at least 1", .{i});
+        }
+        if (d.redis) |r| {
+            if (comptime !features.redis) return fail(why, "databases[{d}].redis: Redis is not built in (-Dredis)", .{i});
+            if (r.ca_file != null and r.ca_pem != null) return fail(why, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
+            if (r.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].redis.max_connections: at least 1", .{i});
         }
     }
     try checkMiddleware(cfg.middleware, "middleware", why);
@@ -659,6 +690,8 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"sslmode\": \"maybe\"}}]}",
         "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"sslmode\": \"disable\", \"url\": \"postgres://h/d?sslmode=require\"}}]}",
         "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"redis\": {}, \"postgres\": {}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"redis\": {\"max_connections\": 0}}]}",
     };
     for (bad) |doc| {
         why.end = 0;

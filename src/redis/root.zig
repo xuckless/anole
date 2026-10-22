@@ -961,6 +961,17 @@ pub const Query = struct {
         return self.read(T, .all, c, args);
     }
 
+    /// Sends `args`, the command's name and then its items, and returns
+    /// the reply: for commands known only at run time (the C ABI, the
+    /// language bindings). `coalesce` and `cache` apply when the name is
+    /// one of `read_commands`; else, and for a server error, as `command`.
+    pub fn reply(self: Query, c: anytype, args: []const []const u8) Error!Reply {
+        if (args.len == 0 or (!self.opts.coalesce and self.opts.cache == null)) return self.command(c, args);
+        var buf: [max_read_name]u8 = undefined;
+        const name = readCommand(&buf, args[0]) orelse return self.command(c, args);
+        return self.client.cache.read(Reply, c, self.opts, name, args[1..], ReplyRead{ .query = self });
+    }
+
     /// `Client.pipeline`, with the options.
     pub fn pipeline(self: Query, c: anytype, commands: anytype) Error![]Reply {
         return self.client.call(c, self.opts.timeout, null, Reply, .replies, commands);
@@ -1048,6 +1059,17 @@ fn Read(comptime T: type, comptime mode: Mode) type {
         }
     };
 }
+
+/// `Query.reply`'s read through the cache.
+const ReplyRead = struct {
+    query: Query,
+
+    pub const shape: db.ReadShape = .reply;
+
+    pub fn run(r: ReplyRead, c: anytype, name: []const u8, items: []const []const u8) Error!Reply {
+        return r.query.command(c, .{ name, items });
+    }
+};
 
 /// The commands whose replies `coalesce` and `cache` may share: those
 /// that only read and answer the same for the same data (not

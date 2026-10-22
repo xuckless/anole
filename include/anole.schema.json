@@ -906,6 +906,16 @@
             }
           ]
         },
+        "redis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Redis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cache": {
           "type": "object",
           "additionalProperties": false,
@@ -928,7 +938,7 @@
       "required": [
         "name"
       ],
-      "description": "A database for anole_db_*: exactly one of sqlite and postgres."
+      "description": "A database for anole_db_*: exactly one of sqlite, postgres and redis."
     },
     "Sqlite": {
       "type": "object",
@@ -1125,6 +1135,85 @@
         }
       },
       "description": "A PostgreSQL database (anole.pg; docs/database.md)."
+    },
+    "Redis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "redis://user:password@host:6379/0, rediss:// for TLS, or unix:///path?db=0. Null: REDIS_URL, else redis://127.0.0.1:6379."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "rediss://: a PEM file of the CA certificates the server's certificate is checked against. Null: the URL's ssl_ca_certs, else the system's store."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections in all, split between the executors. Null: ten per executor."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a command waits for a connection when all are busy."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long opening a connection may take; 0: no limit."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 300000,
+          "description": "Connections idle this long are closed; 0: no limit."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open a connection per executor at start, and fail the start if that fails."
+        }
+      },
+      "description": "A Redis or Valkey server (anole.redis; docs/database.md)."
     },
     "Cache": {
       "type": "object",

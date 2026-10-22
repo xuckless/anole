@@ -63,6 +63,9 @@ test "anole.h: every constant as abi.zig has it" {
     try eq(abi.DB_TEXT, c.ANOLE_DB_TEXT);
     try eq(abi.DB_BLOB, c.ANOLE_DB_BLOB);
     try eq(abi.DB_BOOL, c.ANOLE_DB_BOOL);
+    try eq(abi.DB_ARRAY, c.ANOLE_DB_ARRAY);
+    try eq(abi.DB_MAP, c.ANOLE_DB_MAP);
+    try eq(abi.DB_ERROR, c.ANOLE_DB_ERROR);
     try eq(abi.DB_WRITE, c.ANOLE_DB_WRITE);
     try eq(abi.DB_COALESCE, c.ANOLE_DB_COALESCE);
     try eq(abi.DB_NO_PREPARE, c.ANOLE_DB_NO_PREPARE);

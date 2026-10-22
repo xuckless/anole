@@ -28,6 +28,10 @@ const sqlite = if (features.sqlite) anole.sqlite else struct {
 const pg = if (features.postgres) anole.pg else struct {
     pub const Client = void;
 };
+const redis = if (features.redis) anole.redis else struct {
+    pub const Client = void;
+    pub const Reply = void;
+};
 
 const log = std.log.scoped(.anole);
 
@@ -45,6 +49,7 @@ const Client = union(enum) {
     none,
     sqlite: *sqlite.Client,
     postgres: *pg.Client,
+    redis: *redis.Client,
 };
 
 /// Per executor: the tasks of the queries it runs, canceled at the stop.
@@ -62,6 +67,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     for (e.dbs) |*d| {
         if (d.config.postgres) |p| {
             if (comptime features.postgres) try openPostgres(d, app, p) else unreachable;
+        } else if (d.config.redis) |r| {
+            if (comptime features.redis) try openRedis(d, app, r) else unreachable;
         } else {
             if (comptime features.sqlite) try openSqlite(d, app, d.config.sqlite.?) else unreachable;
         }
@@ -125,6 +132,25 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
         } else log.err("databases \"{s}\": init failed: {t}", .{ d.config.name, err });
         return err;
     };
+}
+
+fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
+    const ms = std.Io.Duration.fromMilliseconds;
+    const client = try app.redis(anole.redis.Options{
+        .url = r.url,
+        .name = d.config.name,
+        .max_connections = r.max_connections,
+        .acquire_timeout = ms(r.acquire_timeout_ms),
+        .connect_timeout = if (r.connect_timeout_ms > 0) ms(r.connect_timeout_ms) else null,
+        .idle_timeout = if (r.idle_timeout_ms > 0) ms(r.idle_timeout_ms) else null,
+        .tls = .{ .ca = if (r.ca_file) |f| .{ .file = .{ .path = f } } else if (r.ca_pem) |pem| .{ .pem = pem } else null },
+        .connect_at_start = r.connect_at_start,
+        .cache = .{
+            .max_entries = d.config.cache.max_entries,
+            .max_bytes = std.math.cast(usize, d.config.cache.max_bytes) orelse std.math.maxInt(usize),
+        },
+    });
+    d.client = .{ .redis = client };
 }
 
 /// The databases are closed with the server: no new query from now on.
@@ -220,6 +246,7 @@ pub fn invalidate(d: *Db, tag: []const u8) error{State}!void {
         .none => return error.State,
         .sqlite => |client| if (comptime features.sqlite) &client.cache else unreachable,
         .postgres => |client| if (comptime features.postgres) &client.cache else unreachable,
+        .redis => |client| if (comptime features.redis) &client.cache else unreachable,
     };
     if (tag.len == 0) cache.invalidate(.all) else cache.invalidate(.{ .tag = tag });
 }
@@ -257,6 +284,19 @@ fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
                 } else |err| answer.failed(&ctx, err),
             }
         } else unreachable,
+        .redis => |client| if (comptime features.redis) {
+            const with = client.with(options);
+            if (redisArgs(ctx.arena, q.sql, q.params)) |args| {
+                if (with.reply(&ctx, args)) |reply| switch (q.verb) {
+                    .query => answer.reply = reply,
+                    // The reply's count, when it is one (DEL, INCR...).
+                    .exec => answer.changes = .{ .changes = switch (reply) {
+                        .int => |n| @intCast(@max(n, 0)),
+                        else => 0,
+                    } },
+                } else |err| answer.failed(&ctx, err);
+            } else |err| answer.failed(&ctx, err);
+        } else unreachable,
     }
     if (db.lastSource(&ctx)) |src| answer.source = switch (src) {
         .database => abi.DB_FROM_DATABASE,
@@ -283,6 +323,7 @@ const Answer = struct {
     source: u8 = abi.DB_FROM_DATABASE,
     table: ?db.Table = null,
     changes: ?db.Changes = null,
+    reply: ?redis.Reply = null,
     message: []const u8 = "",
     code: []const u8 = "",
     constraint: []const u8 = "",
@@ -331,9 +372,13 @@ const Answer = struct {
                 else => {},
             };
         }
+        if (comptime features.redis) if (a.reply) |r| {
+            nrows = replyCells(r, &bytes);
+        };
         const cols_off = @sizeOf(Ev);
         const cells_off = cols_off + ncol * @sizeOf(abi.Span);
-        const ncells = std.math.mul(usize, ncol, nrows) catch return error.TooBig;
+        // A Redis reply has no columns: its cells are a tree in preorder.
+        const ncells = if (a.reply != null) nrows else std.math.mul(usize, ncol, nrows) catch return error.TooBig;
         const bytes_off = cells_off + ncells * @sizeOf(abi.DbCell);
         const total = bytes_off + bytes;
         if (total > max) return error.TooBig;
@@ -356,6 +401,11 @@ const Answer = struct {
         ev.@"error" = w.put(a.message);
         ev.error_code = w.put(a.code);
         ev.constraint = w.put(a.constraint);
+        if (comptime features.redis) if (a.reply) |r| {
+            const cells: [*]abi.DbCell = @ptrCast(@alignCast(rec.ptr + cells_off));
+            var k: usize = 0;
+            putReply(r, cells, &k, &w);
+        };
         if (a.table) |t| {
             const names: [*]abi.Span = @ptrCast(@alignCast(rec.ptr + cols_off));
             for (t.columns, 0..) |n, i| names[i] = w.put(n);
@@ -377,6 +427,61 @@ const Answer = struct {
         return rec;
     }
 };
+
+/// The cells `r` takes (itself and every item under it), adding the bytes
+/// of its strings to `bytes`.
+fn replyCells(r: redis.Reply, bytes: *usize) usize {
+    switch (r) {
+        .status, .err, .string => |str| bytes.* += str.len,
+        .array, .map => |items| {
+            var n: usize = 1;
+            for (items) |item| n += replyCells(item, bytes);
+            return n;
+        },
+        else => {},
+    }
+    return 1;
+}
+
+/// `r` and its items in preorder from `cells[k.*]`.
+fn putReply(r: redis.Reply, cells: [*]abi.DbCell, k: *usize, w: *Writer) void {
+    const at = k.*;
+    k.* += 1;
+    cells[at] = switch (r) {
+        .nil => .{ .type = abi.DB_NULL, .v = .{ .i = 0 } },
+        .int => |n| .{ .type = abi.DB_INT, .v = .{ .i = n } },
+        .double => |f| .{ .type = abi.DB_FLOAT, .v = .{ .f = f } },
+        .boolean => |b| .{ .type = abi.DB_BOOL, .v = .{ .i = @intFromBool(b) } },
+        .status => |str| .{ .type = abi.DB_TEXT, .v = .{ .s = w.put(str) } },
+        .string => |str| .{ .type = abi.DB_BLOB, .v = .{ .s = w.put(str) } },
+        .err => |str| .{ .type = abi.DB_ERROR, .v = .{ .s = w.put(str) } },
+        .array => |items| .{ .type = abi.DB_ARRAY, .v = .{ .i = @intCast(items.len) } },
+        // RESP3 maps hold key, value, key, value...
+        .map => |items| .{ .type = abi.DB_MAP, .v = .{ .i = @intCast(items.len / 2) } },
+    };
+    switch (r) {
+        .array, .map => |items| for (items) |item| putReply(item, cells, k, w),
+        else => {},
+    }
+}
+
+/// A Redis command from a call: the words of `sql` (the command's name
+/// and any fixed words), then each parameter as bytes: text and blobs as
+/// they are, numbers in decimal, a bool as 1 or 0, null left out.
+fn redisArgs(a: std.mem.Allocator, sql: []const u8, params: []const db.Value) error{ OutOfMemory, BadRequest }![]const []const u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    var words = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+    while (words.next()) |word| try args.append(a, word);
+    if (args.items.len == 0) return error.BadRequest;
+    for (params) |p| try args.append(a, switch (p) {
+        .null => continue,
+        .text, .blob => |b| b,
+        .int => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
+        .float => |f| try std.fmt.allocPrint(a, "{d}", .{f}),
+        .bool => |b| if (b) "1" else "0",
+    });
+    return args.items;
+}
 
 const Writer = struct {
     rec: []u8,

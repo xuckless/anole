@@ -163,6 +163,11 @@ pub const DB_FLOAT: u32 = 2;
 pub const DB_TEXT: u32 = 3;
 pub const DB_BLOB: u32 = 4;
 pub const DB_BOOL: u32 = 5;
+/// Cells of a Redis reply only: `v.i` items (an array), or `v.i` pairs
+/// (a map) follow; an error reply inside another (EXEC's), as text.
+pub const DB_ARRAY: u32 = 6;
+pub const DB_MAP: u32 = 7;
+pub const DB_ERROR: u32 = 8;
 
 pub const DbValue = extern struct {
     type: u32,
