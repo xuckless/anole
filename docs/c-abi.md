@@ -176,7 +176,7 @@ Negative codes mean nothing was done unless the function says otherwise:
 
 | Code | Meaning |
 | --- | --- |
-| `ANOLE_E_INVALID` | a bad argument: status, header name or value, flag, size (a request is still owed) |
+| `ANOLE_E_INVALID` | a bad argument: status, header name or value (`Connection` and `Transfer-Encoding` included: the server writes those), flag, size (a request is still owed) |
 | `ANOLE_E_GONE` | the handle was answered, expired, aborted, is stale or of another kind |
 | `ANOLE_E_AGAIN` | nothing now; an event follows (`anole_req_read` with timeout 0) |
 | `ANOLE_E_NOMEM` | out of memory |
@@ -223,9 +223,22 @@ here and runs on Anole's threads:
 
 - A route has exactly one of `handler` (a consumer's route id), `respond` (a
   fixed answer), `static` (files under a directory) or `websocket`.
+  A `respond` answer's `headers` may not name `Connection` or
+  `Transfer-Encoding`, which the server writes itself, and must be valid
+  field names and values; the configuration is refused otherwise.
 - `middleware` at the top runs for every route, a route's own after it.
   `jwt` with `jwks_url` fetches keys, so its requests keep a task; with
   `jwks` inline (or no `jwt`), HTTP/2 and HTTP/3 requests detach.
+  `jwt` with `jwks_url` needs `audience` (this API's identifier at the
+  provider), since a provider's keys also sign tokens for its other
+  clients; `allow_any_audience: true` is only for keys that sign for this
+  application alone. The configuration is refused otherwise.
+- `rate_limit` keys on the client's address (`"key": "ip"`, IPv6 clients
+  by their /64) or on a header's raw value (`"header:<name>"`). The header
+  is taken as the client sent it, unverified: a client that varies it gets
+  a fresh limit each time. Use `header:` only when a proxy in front sets
+  that header to a verified identity and overwrites any the client sent.
+  Requests without the header share one limit.
 - `cache` keeps GET answers per executor (the response cache) and serves
   hits without reaching the consumer.
 - `no_wait: false` gives each request a task (for comparisons).
@@ -261,12 +274,20 @@ A `websocket` route upgrades over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3
 (RFC 9220). `ANOLE_EV_WS_OPEN` carries the upgrade request; each whole
 message (inflated, UTF-8 checked) is an `ANOLE_EV_WS_MESSAGE`; the end is
 `ANOLE_EV_WS_CLOSE` with the code (1005 without one, 1006 when the
-connection ended without a close). `anole_ws_send` queues a message
+connection ended without a close). Messages waiting for a consumer that is
+behind are bounded per executor by bytes as well as by `limits.queue` (the
+larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`):
+past that, the sockets feeding it are not read until it catches up. `anole_ws_send` queues a message
 (`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WS_DRAIN`),
 `anole_ws_close` sends a close. Topics are Anole's: `anole_ws_subscribe`,
 `anole_ws_unsubscribe`, and `anole_ws_publish(server, topic, ...)` fans out
-on Anole's threads without entering the language. A drain closes sockets with
-1001.
+on Anole's threads without entering the language. A publish waits for no
+subscriber: each one has up to `limits.ws_high_water` bytes queued for it;
+past that, publishes skip it, and a subscriber whose send stays stuck that way
+for a second is closed. Publishes still being fanned out are bounded too (64
+per executor, and the larger of 16 x `limits.ws_high_water` and
+2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
+`ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
 ## Lifecycle
 

@@ -47,7 +47,10 @@ pub const Options = struct {
     /// The name in metrics (`db` label), spans and `/readyz`.
     name: []const u8 = "mongodb",
     /// TLS beyond what the URL says: a CA or a client certificate in
-    /// memory. Setting it turns TLS on.
+    /// memory. Setting it turns TLS on, and then a URL that turns TLS off
+    /// (`tls=false`) or stops checking the certificate (`tlsInsecure`,
+    /// `tlsAllowInvalidCertificates`, `tlsAllowInvalidHostnames`) is
+    /// refused rather than obeyed.
     tls: ?net.ConnectOptions.Tls = null,
     /// Connections at most, split between the executors (`maxPoolSize`;
     /// 0 for no limit).
@@ -280,6 +283,22 @@ pub const Client = struct {
         if (cs.boolean("retryReads")) |v| o.retry_reads = v;
         if (cs.boolean("retryWrites")) |v| o.retry_writes = v;
         self.options = o;
+
+        // The URL often comes from the environment; it may not weaken TLS
+        // that the code asks for, and weakening it otherwise is logged.
+        const weakening = [_][]const u8{ "tlsInsecure", "tlsAllowInvalidCertificates", "tlsAllowInvalidHostnames" };
+        if (opts.tls != null) {
+            if (cs.boolean("tls") == false) {
+                log.warn("mongodb: the URL turns TLS off (tls=false), but Options.tls asks for it; take it out of the URL", .{});
+                return error.InvalidUri;
+            }
+            for (weakening) |name| if (cs.boolean(name) orelse false) {
+                log.warn("mongodb: the URL turns certificate checks off ({s}=true), but Options.tls asks for TLS; take it out of the URL, or set the check off in Options.tls", .{name});
+                return error.InvalidUri;
+            };
+        } else for (weakening) |name| if (cs.boolean(name) orelse false) {
+            log.warn("mongodb: {s}=true: the server's certificate is not fully checked, so whoever is between this process and the server can read and change everything", .{name});
+        };
 
         // TLS: on with tls=true, with any tls* option, or with `opts.tls`.
         var tls: ?net.ConnectOptions.Tls = opts.tls;

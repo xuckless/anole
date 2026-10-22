@@ -454,6 +454,15 @@ pub const Client = struct {
             log.err("redis: {f} needs TLS, which this build leaves out (-Dtls=none)", .{s});
             return error.TlsNotBuilt;
         }
+        if (s.tls and !s.verify) {
+            // The URL often comes from the environment: it may not stop the
+            // checks of a CA the code gives.
+            if (opts.tls.ca != null) {
+                log.warn("redis: the URL turns certificate checks off (ssl_cert_reqs=none), but Options.tls.ca asks for them; take it out of the URL", .{});
+                return error.InvalidDatabaseUrl;
+            }
+            log.warn("redis: ssl_cert_reqs=none: the server's certificate is not checked, so whoever is between this process and {s} can read and change everything", .{s.host});
+        }
         self.stream_options = .{
             .host = s.host,
             .port = s.port,
@@ -903,6 +912,8 @@ pub const Client = struct {
         errdefer stream.close();
         const parser = hiredis.redisReaderCreate() orelse return error.OutOfMemory;
         errdefer hiredis.redisReaderFree(parser);
+        // `convert` (and hiredis's freeReplyObject) recurse once per level.
+        parser.*.maxdepth = max_reply_depth;
         const conn = try self.gpa.create(Connection);
         errdefer self.gpa.destroy(conn);
         conn.* = .{ .gpa = self.gpa, .stream = stream, .parser = parser, .pool = pool };
@@ -1696,6 +1707,10 @@ fn eachArg(v: anytype, visitor: anytype) error{WriteFailed}!void {
 // ---------------------------------------------------------------------------
 // Replies.
 
+/// How deep replies may nest (hiredis allows 1024); deeper is a protocol
+/// error. Redis's own replies nest a few levels.
+const max_reply_depth = 32;
+
 fn convert(arena: std.mem.Allocator, r: *hiredis.redisReply) error{ ProtocolError, OutOfMemory }!Reply {
     const bytes = if (r.str) |s| s[0..r.len] else "";
     return switch (r.type) {
@@ -2084,6 +2099,15 @@ test "redis: replies into types" {
 
 /// A fake server: answers each RESP command it reads with a canned reply,
 /// and counts the connections it accepted.
+/// `depth` arrays, each the only element of the one before, around an
+/// integer.
+fn nested(comptime depth: usize) []const u8 {
+    @setEvalBranchQuota(100_000);
+    var out: []const u8 = "";
+    for (0..depth) |_| out = out ++ "*1\r\n";
+    return out ++ ":1\r\n";
+}
+
 const Fake = struct {
     listener: std.Io.net.Server,
     accepted: std.atomic.Value(u32) = .init(0),
@@ -2154,6 +2178,10 @@ const Fake = struct {
                 "-LOADING Redis is loading the dataset in memory\r\n"
             else if (eql(u8, cmd, "PING"))
                 "+PONG\r\n"
+            else if (eql(u8, cmd, "NESTED"))
+                comptime nested(30)
+            else if (eql(u8, cmd, "DEEP"))
+                comptime nested(1000)
             else if (eql(u8, cmd, "SLOW")) blk: {
                 io.sleep(.fromSeconds(5), .awake) catch return;
                 break :blk "+late\r\n";
@@ -2260,17 +2288,26 @@ test "redis: calls over a fake server: replies, types, pipelines, errors and tim
     // A reply of the wrong type for what was asked: a 500.
     try testing.expectError(error.Database, client.one(i64, &c, .{"KEYS"}));
 
+    // Nested replies, as deep as Redis's own; deeper is a broken
+    // connection, refused before anything recurses that far.
+    var r = try client.command(&c, .{"NESTED"});
+    for (0..30) |_| r = r.array[0];
+    try testing.expectEqual(@as(i64, 1), r.int);
+    try testing.expectError(error.ServiceUnavailable, client.command(&c, .{"DEEP"}));
+    try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
+    try testing.expectEqual(@as(u32, 2), fake.accepted.load(.monotonic));
+
     // Past its timeout: a 504, and the connection, whose reply is still to
     // come, is closed rather than reused.
     try testing.expectError(error.GatewayTimeout, client.with(.{ .timeout = .fromMilliseconds(50) }).command(&c, .{"SLOW"}));
     try testing.expectEqual(db.Class.timeout, db.lastError(&c).?.class);
     try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
-    try testing.expectEqual(@as(u32, 2), fake.accepted.load(.monotonic));
+    try testing.expectEqual(@as(u32, 3), fake.accepted.load(.monotonic));
 
     // A connection left in MULTI is not reused.
     _ = try client.command(&c, .{"MULTI"});
     _ = try client.incr(&c, "n");
-    try testing.expectEqual(@as(u32, 3), fake.accepted.load(.monotonic));
+    try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
 
     // acquire: the calls on one connection, given back after.
     var conn = try client.acquire(&c);
@@ -2278,7 +2315,7 @@ test "redis: calls over a fake server: replies, types, pipelines, errors and tim
     _ = try conn.get(&c, "k");
     conn.release();
     _ = try client.incr(&c, "n");
-    try testing.expectEqual(@as(u32, 3), fake.accepted.load(.monotonic));
+    try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
 
     try testing.expect(Client.ping(client, io));
 }
@@ -2307,6 +2344,9 @@ test "redis: a server that cannot be reached is a 503, and /readyz says so" {
     try testing.expectError(error.ServiceUnavailable, client.get(&c, "k"));
     try testing.expectStringStartsWith(db.lastError(&c).?.message, "cannot connect to redis://127.0.0.1:");
     try testing.expect(!Client.ping(client, io));
+
+    // A URL may not turn off the checks of a CA the code gives.
+    if (has_tls) try testing.expectError(error.InvalidDatabaseUrl, Client.init(gpa, io, .{ .url = "rediss://cache.example.com?ssl_cert_reqs=none", .environ = .empty, .tls = .{ .ca = .system } }));
 }
 
 test "redis: a pool per executor" {

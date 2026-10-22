@@ -206,7 +206,7 @@
         "inline_body_max": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 4294967295,
+          "maximum": 1073741824,
           "default": 65536,
           "description": "Bodies up to this come inline in the request record; larger ones are read with anole_req_read."
         },
@@ -241,7 +241,7 @@
         "ws_max_message": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 4294967295,
+          "maximum": 1073741824,
           "default": 1048576,
           "description": "The largest WebSocket message, in or out (after inflating)."
         },
@@ -496,7 +496,13 @@
                     {
                       "type": "null"
                     }
-                  ]
+                  ],
+                  "description": "Required in the token's aud. Required with jwks_url (a provider's keys also sign tokens for its other clients), unless allow_any_audience."
+                },
+                "allow_any_audience": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "With jwks_url and no audience: only for keys that sign for this application alone."
                 },
                 "leeway_s": {
                   "type": "integer",
@@ -531,7 +537,7 @@
                   ]
                 }
               },
-              "description": "Exactly one of jwks_url and jwks. The verified claims reach the consumer as JSON (`claims`)."
+              "description": "Exactly one of jwks_url and jwks; jwks_url needs audience (or allow_any_audience). The verified claims reach the consumer as JSON (`claims`)."
             }
           },
           "required": [
@@ -567,7 +573,7 @@
                 "key": {
                   "type": "string",
                   "pattern": "^(ip|header:.+)$",
-                  "description": "\"ip\" or \"header:<name>\"."
+                  "description": "\"ip\" (the client's address) or \"header:<name>\" (the header's raw value, unverified: only for a header a trusted proxy sets to a verified identity, since a client that varies it gets a fresh limit each time)."
                 },
                 "max_entries": {
                   "type": "integer",
@@ -766,7 +772,14 @@
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "propertyNames": {
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+            "not": {
+              "pattern": "^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg])$"
+            }
+          },
+          "description": "Not Connection or Transfer-Encoding: the server writes those."
         }
       }
     },
@@ -835,6 +848,14 @@
           "type": "boolean",
           "default": true,
           "description": "Close 1001 when the server drains."
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Pages of other origins that may open the socket, besides the request's own host (\"https://app.example.com\"); \"*\" for any. A browser handshake from any other origin gets 403."
         }
       },
       "required": [

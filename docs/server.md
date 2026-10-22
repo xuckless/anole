@@ -106,6 +106,22 @@ pub const std_options: std.Options = .{
 `anole.logFn` is still there for programs that set it; it only renames the
 scopes older builds used.
 
+A panic (a bug: an index out of bounds, an integer overflow, `unreachable`)
+stops the process. Zig's default handler prints it to standard error;
+`anole.panic` writes the message and the stack trace as one error line
+through the log function instead, so it lands wherever the logs go (a JSON
+collector, journald), then aborts. The examples declare it; leave the line
+out to keep Zig's default:
+
+```zig
+pub const panic = anole.panic;
+```
+
+At start the server logs which build it is. A `ReleaseFast` build gets a
+warning: Zig's safety checks are off there, so a bug that `ReleaseSafe` would
+stop at the faulty line can corrupt memory instead. `ReleaseSafe` is the
+recommended build for production.
+
 Do not set `std_options_debug_io = zio.debug_io`, as zio's own examples do.
 std.debug unwinds stack traces through that `Io`, and Debug builds capture
 traces inside allocator and task-pool locks, so a coroutine can be suspended
@@ -193,9 +209,9 @@ var app = try anole.Server(void).init(init.gpa, .{
 }, {});
 ```
 
-`http` has `address`, `port`, `h2c` and `proxy_protocol`. `https` has
-`address`, `port`, `cert`, `alpn_protocols`, `client_auth` and
-`proxy_protocol`. `cert` is one of:
+`http` has `address`, `port`, `h2c`, `proxy_protocol` and
+`proxy_protocol_from`. `https` has `address`, `port`, `cert`,
+`alpn_protocols`, `client_auth`, `proxy_protocol` and `proxy_protocol_from`. `cert` is one of:
 
 - `.{ .pem = .{ .cert = ..., .key = ... } }`: PEM text in memory, copied by
   `init`, for keys from a secret store or the environment.
@@ -205,7 +221,10 @@ var app = try anole.Server(void).init(init.gpa, .{
   (`cannot read the TLS certificate "cert.pem": FileNotFound`).
 - `.dev_self_signed`: a fresh P-256 key and certificate for `localhost`,
   `127.0.0.1` and `::1`, held only in memory. For development; clients need
-  `curl -k`.
+  `curl -k`. The certificate is its own CA (`CA:TRUE`), so a client can
+  trust it directly; never add it, or anything from `anole.tls.selfSigned`,
+  to a trust store outside development, since a CA certificate can vouch
+  for any name.
 
 `anole.Cert.fromFiles(cert_path, key_path)` and `.fromPem(cert, key)` build
 the first two: `.cert = .fromFiles("cert.pem", "key.pem")`.
@@ -232,6 +251,7 @@ or instead of those two. Each has:
 | `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
 | `proxy_protocol` | false | Every connection starts with a PROXY protocol header. |
+| `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty allows any peer. |
 
 A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
 or one of them. One with `http2 = false` gives a client that offers `h2`
@@ -480,8 +500,12 @@ Every connection is a file descriptor, and the process's soft open-file
 limit is often 1024 (256 on macOS), kept low for old programs that use
 `select`. So `init` raises the soft limit to the hard one, as Go does at
 startup: 524,288 under systemd by default, 1,048,576 in Docker, and on macOS
-`kern.maxfilesperproc` at most. (`raise_fd_limit = false` leaves it alone;
-processes the server starts inherit the raised limit.)
+`kern.maxfilesperproc` at most. (`raise_fd_limit = false` leaves it alone.)
+Processes your handlers start inherit the raised limit, as with Go; a
+program that still uses `select` (which cannot watch descriptors past 1023)
+can misbehave with it, so start such a program through a wrapper that lowers
+it again (`sh -c 'ulimit -n 1024; exec prog'`), or turn `raise_fd_limit` off
+and raise the limit in the service manager instead (`LimitNOFILE=`).
 
 `server.max_connections` follows the limit by default. When serving starts
 it is the soft limit less what other descriptors need:
@@ -556,10 +580,19 @@ handlers as HTTP/1.1.
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
 (64 KiB, also each stream's body buffer), `stream_window_reading` (1 MiB:
 the window and buffer from the handler's first read of the body),
-`connection_window` (16 MiB),
-`max_header_list_size` (64 KiB), `stream_reset_burst` and
-`stream_reset_rate` (rapid-reset protection), `max_continuations` (8) and
+`reading_window_budget` (16 MiB: what those raised buffers take at most per
+connection; past it a stream keeps `stream_window`), `connection_window`
+(16 MiB), `max_header_list_size` (64 KiB), `stream_reset_burst` and
+`stream_reset_rate` (rapid-reset protection), `refused_stream_burst` (100)
+and `refused_stream_rate` (10 a second: streams refused before a handler,
+past which the connection is closed), `max_continuations` (8) and
 `enable_connect_protocol` (on, for RFC 8441 WebSockets).
+
+Memory per HTTP/2 connection is per stream, too: besides the raised
+windows, each of up to `max_concurrent_streams` streams may hold a
+`stream_window` body buffer and, when its handler reads the whole body,
+up to `request.max_body_size`. Size memory for `max_connections` times
+that, or lower `max_concurrent_streams` or `max_body_size`.
 
 ## HTTP/3
 
@@ -578,7 +611,9 @@ same for it, and `http3` holds the settings; one HTTP/3 port per server.
 [Cores](#cores)), `enable_connect_protocol` (true: extended CONNECT, for RFC 9220
 WebSockets) and `webtransport` (false; `app.webtransport` turns it on). With `validate_address`, every new client must prove its address
 with a Retry first, which costs a round trip and resists floods from
-spoofed sources. `hq_interop_root` is for the QUIC interop runner only.
+spoofed sources. `hq_interop_root` is for the QUIC interop runner only: `init` refuses it
+with `error.HqInteropNotAllowed` unless the program's root file declares
+`pub const anole_hq_interop = true;`.
 
 Supported: QUIC v1 and v2, Retry, stateless reset, ECN, session resumption,
 0-RTT (opt-in, below), connection migration and NAT rebinding, key update,
@@ -612,11 +647,11 @@ does not stop the copy, so Anole does what RFC 8470 asks of a server:
   ```
 
 - Behind a proxy that takes early data itself (nginx's `ssl_early_data`),
-  requests arrive marked `Early-Data: 1` on any HTTP version. With HTTP/3
-  on (`http3`, or `listenTls`, which turns it on by default), the server
-  answers 425 to the unsafe ones on every route
+  requests arrive marked `Early-Data: 1` on any HTTP version. The server
+  answers 425 to the unsafe ones on every route, with or without HTTP/3
   (`anole.early_data.Guard`, RFC 8470 §5.1), since waiting cannot make them
-  safe. Without it, add the guard yourself: `app.use(anole.early_data.Guard{})`.
+  safe. The proxy must strip an `Early-Data` header a client sends on its
+  own, or the client can only cause itself 425s.
 
 Tickets are sealed with the same keys as every other ticket (see
 [TLS](#tls)): they rotate every two days and carry over a certificate
@@ -681,7 +716,10 @@ so HTTP/3 keeps one socket and one endpoint there, whatever `sockets` says.
 TLS is BoringSSL, built into your binary (`-Dtls=boringssl`, the default
 outside `minimal`).
 
-- TLS 1.2 and 1.3; nothing older.
+- TLS 1.2 and 1.3; nothing older. TLS 1.2 offers only suites with ECDHE key
+  exchange (forward secrecy) and an AEAD cipher: AES-GCM and
+  ChaCha20-Poly1305, no RSA key exchange and no CBC. TLS 1.3's suites are
+  all of that kind.
 - ALPN: the server picks by its own order (`alpn_protocols`). A client whose
   offer shares nothing with it gets no ALPN answer and HTTP/1.1, rather than
   a refusal.
@@ -691,6 +729,11 @@ outside `minimal`).
   restart, and do not carry over to another machine.
 - A handshake has the same deadline as a request (`timeout.request`). Failed
   handshakes are logged at `info`, since any client can cause them.
+- No revocation checking: neither the server (for client certificates under
+  `client_auth`) nor the clients consult CRLs or OCSP, and the server does
+  not staple OCSP responses. To revoke client certificates, issue them from
+  a CA you can drop and reload (see below), keep them short-lived, or check
+  `req.peerCertificate()` against your own list in a middleware.
 
 **Certificate reload.** `app.reloadCertificates()` loads every TLS
 listener's certificate and key again (from their files, for `.files`) and
@@ -703,6 +746,12 @@ systemd hears `RELOADING=1` and then `READY=1`.
   handshakes in progress included, keep the one they started with, which is
   freed when the last of them closes.
 - Session tickets issued before still resume: the ticket keys carry over.
+  Not when the reload changes `client_auth` (its CAs or its mode): a
+  resumed session's client certificate is not verified again, so sessions
+  from before such a reload never resume, on TCP or QUIC, and every client
+  goes through a full handshake and certificate check under the new CAs.
+  Removing a compromised CA and reloading takes effect for new connections
+  at once; connections already open stay until they close.
 - A reload that fails (a file missing, a key that does not match the
   certificate) returns the error, or logs it on SIGHUP, and the server goes
   on with the certificate it had.
@@ -797,7 +846,11 @@ protocol itself (no libsystemd): `READY=1` once the listeners are bound,
 `READY=1` from the new process once it serves, so systemd follows the main
 process to it, `READY=1` from the old one if the new one fails, and
 `STOPPING=1` when a drain to exit starts. The process that hands over never
-sends `STOPPING=1`, which would stop the service. A path starting with `@` is
+sends `STOPPING=1`, which would stop the service. The server keeps the socket
+for itself and takes `NOTIFY_SOCKET` out of the process's environment at
+`init` (its entry becomes `ANOLE_NOTIFY_SOCKET_TAKEN=1`), so programs your
+handlers start cannot report to systemd for the service; a restart hands it
+to the new process itself. A path starting with `@` is
 in Linux's abstract namespace.
 
 A service with every listener passed in, restarted with `systemctl reload`:
@@ -885,12 +938,24 @@ it), per listener: `.http = .{ .port = 8080, .proxy_protocol = true }`. Each
 connection must open with a valid header, read before TLS and within
 `timeout.read_header`, or it is closed. The header's address becomes
 `req.remote_address`, and v2's SSL field sets `req.secure`.
+Name the load balancers with `proxy_protocol_from`
+(`.proxy_protocol_from = &.{ "10.0.0.0/8", "2001:db8::/32" }`) and a
+connection from any other peer is closed before anything is read, so a
+client that reaches the port directly cannot claim another address.
 
 **`X-Forwarded-*`**, with `.server = .{ .trusted_proxy_hops = 1 }`. With `n`
 hops, `req.remote_address` is the `n`-th address from the right of
-`X-Forwarded-For` (with port 0), the nearest proxy's `X-Forwarded-Proto` sets
-`req.secure`, and its `X-Forwarded-Host` is what `req.host()` returns. The
-`Forwarded` header (RFC 7239) is not read.
+`X-Forwarded-For` (with port 0); entries left of it are the client's own and
+are not read, and a selected entry that is not an address gives `0.0.0.0`,
+never the proxy's address. The nearest proxy's `X-Forwarded-Proto` sets
+`req.secure` (`.trust_forwarded_proto = false` turns that off). Its
+`X-Forwarded-Host` is what `req.host()` returns only with
+`.trust_forwarded_host = true`: a proxy that passes the client's header
+through (nginx does unless told `proxy_set_header X-Forwarded-Host $host`)
+would let a client choose the host your links and redirects are built from.
+The proxy must set (overwrite) both headers on every request; append-only
+proxies are not enough for them. The `Forwarded` header (RFC 7239) is not
+read.
 
 Enable either only on a listener that nothing but the proxy can reach;
 otherwise clients write the header themselves and choose the address your

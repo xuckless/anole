@@ -104,14 +104,21 @@ pub const RequireJwt = struct {
             error.WrongIssuer,
             error.WrongAudience,
             error.TooOld,
+            error.MissingIssuedAt,
+            error.WrongType,
             => {
                 log.debug("bearer token refused: {t}", .{err});
                 return self.refuse(res, .invalid_token);
             },
-            // An HMAC secret too short to be safe: the server's
-            // configuration, which no token can get past.
-            error.WeakKey => {
-                log.err("bearer token not verified: the HMAC key is shorter than its hash (32 bytes for HS256, 48 for HS384, 64 for HS512)", .{});
+            // The server's configuration, which no token can get past: an
+            // HMAC secret too short to be safe, or a keyring with no
+            // audience to check.
+            error.WeakKey, error.AudienceRequired => |e| {
+                if (e == error.WeakKey) {
+                    log.err("bearer token not verified: the HMAC key is shorter than its hash (32 bytes for HS256, 48 for HS384, 64 for HS512)", .{});
+                } else {
+                    log.err("bearer token not verified: a keyring's policy needs .audience (this API's identifier at the provider), or .allow_any_audience = true when its keys sign for this application alone", .{});
+                }
                 res.status = .internal_server_error;
                 res.content_type = .text;
                 res.body = "500 Internal Server Error\n";

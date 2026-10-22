@@ -281,6 +281,17 @@ test "fake mongod: no server, a timeout and a bad connection string" {
     try testing.expectError(error.InvalidUri, mongodb.Client.init(gpa, io, .{ .url = "mongodb://host:99999/" }));
     try testing.expectError(error.Unsupported, mongodb.Client.init(gpa, io, .{ .url = "mongodb://host/?readPreference=secondary" }));
     try testing.expectError(error.Unsupported, mongodb.Client.init(gpa, io, .{ .url = "mongodb+srv://cluster.example.com/" }));
+    // TLS that the code asks for, which the URL would turn off or stop
+    // verifying: refused, not overridden.
+    for ([_][]const u8{
+        "mongodb://host/?tls=false",
+        "mongodb://host/?ssl=false",
+        "mongodb://host/?tlsInsecure=true",
+        "mongodb://host/?tlsAllowInvalidCertificates=true",
+        "mongodb://host/?tlsAllowInvalidHostnames=true",
+    }) |url| {
+        try testing.expectError(error.InvalidUri, mongodb.Client.init(gpa, io, .{ .url = url, .tls = .{} }));
+    }
 }
 
 test "fake mongod: coalesced and cached reads, invalidation" {

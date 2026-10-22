@@ -549,9 +549,14 @@ pub fn decodeRequest(
             try setField(arena, &root, &.{body}, value, false);
         }
     }
-    for (captures) |capture| {
-        var names: Names = .{};
-        const leaf = lookup(Req, capture.field, &names) orelse return invalid(diag, "a path variable names no field");
+    // Each variable's field as the message's own names, whichever spelling
+    // the template used, for the query parameters to be checked against.
+    var bound_names: [max_variables]Names = undefined;
+    if (captures.len > max_variables) return invalid(diag, "too many path variables");
+    for (captures, 0..) |capture, i| {
+        const names = &bound_names[i];
+        names.* = .{};
+        const leaf = lookup(Req, capture.field, names) orelse return invalid(diag, "a path variable names no field");
         const text = decodePath(arena, capture.raw, capture.multi) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidEscape => return invalid(diag, "malformed percent-encoding in the path"),
@@ -577,7 +582,7 @@ pub fn decodeRequest(
             // Not a field: ignored, like a cache-buster or a tracking tag.
             const leaf = lookup(Req, key, &names) orelse continue;
             // Fields the path or the body set are theirs.
-            if (bound(names.slice(), captures, body)) continue;
+            if (bound(names.slice(), bound_names[0..captures.len], body)) continue;
             const value = valueOf(leaf, text) orelse
                 return invalid(diag, try std.fmt.allocPrint(arena, "query parameter {s}: invalid value", .{key}));
             try setField(arena, &root, names.slice(), value, leaf.repeated);
@@ -596,15 +601,16 @@ fn decodeJson(comptime Req: type, arena: std.mem.Allocator, text: []const u8, di
 }
 
 /// Whether a field path is set by the path (a variable at it, above it or
-/// below it) or by the body field.
-fn bound(names: []const []const u8, captures: []const Capture, body: []const u8) bool {
+/// below it) or by the body field. Both sides are the message's own field
+/// names, as `lookup` resolves them, so the template and the query may
+/// each spell a field either way.
+fn bound(names: []const []const u8, variables: []const Names, body: []const u8) bool {
     if (body.len > 0 and std.mem.eql(u8, names[0], body)) return true;
-    for (captures) |capture| {
-        var it = std.mem.splitScalar(u8, capture.field, '.');
-        var i: usize = 0;
-        while (it.next()) |part| : (i += 1) {
-            if (i == names.len) return true;
-            if (!std.mem.eql(u8, part, names[i])) break;
+    for (variables) |variable| {
+        const parts = variable.slice();
+        const n = @min(parts.len, names.len);
+        for (parts[0..n], names[0..n]) |a, b| {
+            if (!std.mem.eql(u8, a, b)) break;
         } else return true;
     }
     return false;

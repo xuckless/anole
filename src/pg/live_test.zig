@@ -488,6 +488,43 @@ test "pg: live TLS as the URL asks, and a refused login" {
     try testing.expectStringStartsWith(detail.code, "28");
 }
 
+test "pg: live channel binding, and what a call sets for the session is reset" {
+    const url = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var c: db.Ctx = .{ .io = io, .arena = arena };
+
+    // SCRAM-SHA-256-PLUS: over TLS (the test server logs in with SCRAM and
+    // offers it there), never in plain text.
+    {
+        const bound = try open(io, .{ .url = try std.fmt.allocPrint(arena, "{s}&channel_binding=require", .{url}) });
+        defer bound.deinit();
+        if (bound.settings.sslmode == .disable) {
+            const level = quiet();
+            defer testing.log_level = level;
+            try testing.expectError(error.ServiceUnavailable, bound.exec(&c, "SELECT 1", .{}));
+            try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "channel_binding=require") != null);
+        } else {
+            try testing.expectEqual(@as(i64, 1), try bound.one(i64, &c, "SELECT 1::int8", .{}));
+        }
+    }
+
+    // One connection, used by one call and then the next.
+    for ([_]bool{ true, false }) |reset| {
+        const d = try open(io, .{ .max_connections = 1, .reset_session = reset });
+        defer d.deinit();
+        _ = try d.exec(&c, "SELECT set_config('anole.tenant', '7', false)", .{});
+        const seen = try d.one([]const u8, &c, "SELECT coalesce(current_setting('anole.tenant', true), '')", .{});
+        try testing.expectEqualStrings(if (reset) "" else "7", seen);
+        // the statement cache outlives the reset
+        for (0..3) |i| try testing.expectEqual(@as(i64, @intCast(i)), try d.one(i64, &c, "SELECT $1::int8", .{@as(i64, @intCast(i))}));
+    }
+}
+
 const AppState = struct {
     db: *pg.Client,
 };

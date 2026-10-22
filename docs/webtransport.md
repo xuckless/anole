@@ -124,6 +124,7 @@ closes it (code 0) if it is still open and lets go of every stream.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `allowed_origins` | `.same_origin` | The pages that may open the session (see [Origins](websocket.md#origins)). A browser's CONNECT from another origin gets 403. |
 | `timeout` | `.none` | Replaces the request timeout once the session is open. |
 | `close_on_drain` | true | Close the session (code 0) when the server starts to drain, right after DRAIN_WEBTRANSPORT_SESSION. |
 | `drain_reason` | `"server shutting down"` | The message of that close. |
@@ -148,6 +149,12 @@ writes.
 `release()` when you are done with a stream. A sending side not ended with
 `closeSend` is reset then, and a receiving side not read to its end is
 stopped. One task may read a stream while another writes it.
+
+The peer's streams count against its stream limit (100 unidirectional,
+and `max_streams_bidi` shared with requests) until the handler releases
+them, not only until they end: streams a handler never accepts hold that
+credit, and the peer cannot open more. Up to 100 streams each way wait to
+be accepted; past that new ones are refused.
 
 ## Datagrams
 

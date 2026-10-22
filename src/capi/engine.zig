@@ -89,13 +89,13 @@ pub const SlotState = enum(u32) {
 };
 
 fn pack(gen: u32, state: SlotState) u64 {
-    return (@as(u64, gen) << 32) | @intFromEnum(state);
+    return (@as(u64, gen) << 32) | @backingInt(state);
 }
 fn genOf(word: u64) u32 {
     return @intCast(word >> 32);
 }
 fn stateOf(word: u64) SlotState {
-    return @enumFromInt(@as(u32, @truncate(word)));
+    return @fromBackingInt(@intCast(@as(u32, @truncate(word))));
 }
 
 /// A handle as the consumer sees it: which executor, which slot, which
@@ -216,6 +216,9 @@ pub const Slot = struct {
 
 pub const no_slot = std.math.maxInt(u32);
 
+/// Records up to this size never wait for `Exec.record_bytes` to fall.
+const small_record = 1024;
+
 fn closeFd(fd: c_int) void {
     if (comptime builtin.os.tag == .windows) return;
     _ = std.c.close(fd);
@@ -285,7 +288,7 @@ fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     @memset(rec[@sizeOf(abi.Event)..], 0);
     const ev: *abi.Event = @ptrCast(rec.ptr);
-    ev.* = .{ .type = @intFromEnum(typ), .len = @intCast(n), .handle = handle };
+    ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = handle };
     return rec;
 }
 
@@ -328,6 +331,12 @@ pub const Exec = struct {
     done_head: std.atomic.Value(u32) = .init(no_slot),
     /// Commands (WebSocket sends, publishes), likewise.
     inbox: std.atomic.Value(?*Command) = .init(null),
+    /// Bytes of built records (WebSocket messages and the like) in the
+    /// ring: added by the executor, taken off by `poll`. Bounded by
+    /// `record_budget`, so a consumer that falls behind holds back the
+    /// sockets feeding it rather than the ring growing to its length in
+    /// whole messages.
+    record_bytes: std.atomic.Value(usize) = .init(0),
     ws: ws.ExecState = .{},
 
     fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
@@ -417,11 +426,23 @@ pub const Exec = struct {
 
     /// Queues an owned record for the consumer, waiting for room in the
     /// ring if `wait` (else dropping it when full: advisory events only).
+    /// A large record that waits also waits while the records already
+    /// queued pass `record_budget` bytes (one always fits in an empty
+    /// ring); small ones (events, `ANOLE_EV_SENT`) are bounded by the ring.
     pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
         const c = x.consumer orelse return freeRecord(rec.ptr);
-        while (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
-            if (!wait) return freeRecord(rec.ptr);
+        if (wait and rec.len > small_record) while (true) {
+            const queued = x.record_bytes.load(.acquire);
+            if (queued == 0 or queued + rec.len <= x.engine.record_budget) break;
+            // The consumer is behind: make sure it hears there is work.
+            c.wake();
             zio.yield() catch return freeRecord(rec.ptr);
+        };
+        _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
+        while (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
+            if (wait) if (zio.yield()) |_| continue else |_| {};
+            _ = x.record_bytes.fetchSub(rec.len, .monotonic);
+            return freeRecord(rec.ptr);
         }
         c.wake();
     }
@@ -606,6 +627,9 @@ pub const Engine = struct {
     ntimeouts: u8 = 1,
     inline_body_max: u32,
     stream_high_water: usize,
+    /// Bytes of built records each executor's ring may hold (see
+    /// `Exec.record_bytes`).
+    record_budget: usize = 0,
     rewake: i96,
     // Counters.
     requests: std.atomic.Value(u64) = .init(0),
@@ -618,6 +642,11 @@ pub const Engine = struct {
     websockets: std.atomic.Value(u64) = .init(0),
     ws_in: std.atomic.Value(u64) = .init(0),
     ws_out: std.atomic.Value(u64) = .init(0),
+    /// Publishes taken and not yet fanned out (`ws.publishLimits`), and
+    /// those refused for it.
+    publishing: std.atomic.Value(usize) = .init(0),
+    publish_bytes: std.atomic.Value(usize) = .init(0),
+    publish_dropped: std.atomic.Value(u64) = .init(0),
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa) else {},
 
@@ -639,6 +668,11 @@ pub const Engine = struct {
         const cfg = &e.config;
         e.inline_body_max = cfg.limits.inline_body_max;
         e.stream_high_water = cfg.limits.stream_high_water;
+        e.record_budget = @max(16 * @as(usize, cfg.limits.ws_high_water), 2 * @as(usize, cfg.limits.ws_max_message));
+        // A topic's subscriber gets as much queued as `anole_ws_send` lets
+        // wait for a socket; past it, publishes skip it, and one stuck that
+        // way is closed.
+        if (comptime features.websocket) e.rooms.options.max_queued_bytes = cfg.limits.ws_high_water;
         e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
         e.timeouts[0] = @as(i96, cfg.timeouts.request_ms) * std.time.ns_per_ms;
         // One per process: `respond` and the handlers find it here.
@@ -839,10 +873,19 @@ pub const Engine = struct {
                     .max_message_size = cfg.limits.ws_max_message,
                     .compression = wc.compression and features.compression,
                     .close_on_drain = wc.close_on_drain,
+                    .allowed_origins = wsOrigins(wc.origins),
                 } };
                 group.inner.addRouteWith(.get, rc.path, ws.handler, .{ .data = route });
             }
         }
+    }
+
+    /// A WebSocket route's `origins`: none is the same origin only, "*"
+    /// any.
+    fn wsOrigins(origins: []const []const u8) anole.websocket.Origins {
+        if (origins.len == 0) return .same_origin;
+        for (origins) |o| if (std.mem.eql(u8, o, "*")) return .any;
+        return .{ .list = origins };
     }
 
     fn watchReady(e: *Engine, app: *anole.App) void {
@@ -1512,8 +1555,11 @@ fn detachedAborted(ctx: *anyopaque) void {
             // for it (a copy, on the consumer's thread).
             .polling => std.atomic.spinLoopHint(),
             // The consumer is answering, or has: the capi task frees it.
+            // The request body may live in the request's memory, which
+            // goes once this returns: reads of it end now.
             .responding, .done, .streaming => {
                 s.orphan = true;
+                x.closePipe(&s.in, gen, si);
                 return;
             },
             .free, .expired => return,
@@ -1538,15 +1584,22 @@ fn finishDetached(x: *Exec, si: u32) void {
     const gen = genOf(w);
     x.unlink(si);
     if (stateOf(w) == .streaming or (stateOf(w) == .done and s.reply == .fd)) {
-        const group = d.attach();
-        placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) catch {
-            d.finish(error.SystemResources);
+        const spawned = if (d.attach()) |group| placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) else error.ConnectionClosed;
+        spawned catch {
+            // The connection is going (or no task could start): a stream
+            // the consumer is writing hears it is over.
+            if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, gen));
+            x.closePipe(&s.in, gen, si);
+            d.finish(error.ConnectionResetByPeer);
             x.release(si);
         };
         return;
     }
     s.detached = null;
     const result = applyAnswer(x, si, d.request, d.response);
+    // `finish` lets the request's memory go, which a streamed request body
+    // may still be read from: the reads end first.
+    x.closePipe(&s.in, gen, si);
     d.finish(result);
     x.release(si);
 }
@@ -1561,6 +1614,7 @@ fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
         streamAnswer(x, si, gen, d.request, d.response)
     else
         applyAnswer(x, si, d.request, d.response);
+    x.closePipe(&s.in, gen, si);
     d.finish(result);
     x.release(si);
     if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
@@ -1576,6 +1630,7 @@ fn expireDetached(x: *Exec, si: u32, w: u64) void {
     _ = x.engine.expired_count.fetchAdd(1, .monotonic);
     if (s.detached) |d| {
         s.detached = null;
+        x.closePipe(&s.in, gen, si);
         d.response.fail(.gateway_timeout, "the application did not answer in time");
         d.finish({});
     }
@@ -1765,7 +1820,7 @@ pub const Head = struct {
         @memset(out[pos..size_], 0);
         const rec: *align(1) abi.RequestEvent = @ptrCast(out.ptr);
         rec.* = .{
-            .ev = .{ .type = @intFromEnum(typ), .len = @intCast(size_), .handle = handle },
+            .ev = .{ .type = @backingInt(typ), .len = @intCast(size_), .handle = handle },
             .route_id = h.route_id,
             .method = methodCode(req.method),
             .version = req.version_major * 10 + req.version_minor,
@@ -1839,8 +1894,10 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
                     }
                     @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                     pos += ev.len;
+                    const len = ev.len;
                     freeRecord(rec);
                     x.ring.pop();
+                    _ = x.record_bytes.fetchSub(len, .release);
                     progressed = true;
                     continue;
                 }
@@ -1871,7 +1928,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
         if (e.phase.load(.acquire) == .stopped and !c.stopped_sent) {
             if (out.len < @sizeOf(abi.Event)) return error.TooBig;
             const hdr: *align(1) abi.Event = @ptrCast(out.ptr);
-            hdr.* = .{ .type = @intFromEnum(abi.EventType.stopped), .len = @sizeOf(abi.Event), .handle = 0 };
+            hdr.* = .{ .type = @backingInt(abi.EventType.stopped), .len = @sizeOf(abi.Event), .handle = 0 };
             c.stopped_sent = true;
             return @sizeOf(abi.Event);
         }
@@ -1954,6 +2011,9 @@ fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
     for (headers) |hd| {
         total += hd.name.len + hd.value.len;
         dusty.validateHeaderName(hd.name.slice()) catch return error.Invalid;
+        // Framing fields are the server's to write (`Response.header`
+        // refuses them): refused here rather than dropped later.
+        if (dusty.isReservedHeader(hd.name.slice())) return error.Invalid;
         dusty.validateHeaderValue(hd.value.slice()) catch return error.Invalid;
     }
     return total;
@@ -2035,7 +2095,7 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     const size: u64 = st.size;
     if (offset > size) return error.Invalid;
     const n = if (len == 0) size - offset else len;
-    if (offset + n > size) return error.Invalid;
+    if (n > size - offset) return error.Invalid;
     const x, const s, const h = try claim(e, hv);
     errdefer s.word.store(pack(h.gen, .out), .release);
     const dup = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
@@ -2141,8 +2201,11 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
     while (true) {
         const seq = s.in.seq.load(.acquire);
         s.in.acquire();
-        const state = stateOf(s.word.load(.acquire));
-        const mine = genOf(s.word.load(.acquire)) == h.gen and state != .free and state != .expired;
+        const word = s.word.load(.acquire);
+        const state = stateOf(word);
+        // Answered (`done`) is gone too: the body may live in the
+        // request's memory, which goes with the answer.
+        const mine = genOf(word) == h.gen and state != .free and state != .expired and state != .done;
         if (!mine) {
             s.in.release();
             return e.gone();

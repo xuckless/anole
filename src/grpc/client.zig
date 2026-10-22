@@ -41,6 +41,12 @@ pub const Channel = struct {
     /// The largest response message taken; a larger one ends the call
     /// with RESOURCE_EXHAUSTED.
     max_message_size: usize = 4 * 1024 * 1024,
+    /// The most response message bytes one call takes in all, each message
+    /// counted at its size plus 64: received messages live in the call's
+    /// arena, so this bounds what a long server stream holds. Past it the
+    /// call is canceled and ends with RESOURCE_EXHAUSTED.
+    /// `CallOptions.max_received_bytes` overrides it per call.
+    max_received_bytes: usize = 64 * 1024 * 1024,
 };
 
 /// Per call: deadline, metadata, compression.
@@ -52,6 +58,8 @@ pub const CallOptions = struct {
     metadata: []const h2.Header = &.{},
     /// Compress request messages (and accept compressed responses).
     compression: Compression = .identity,
+    /// The channel's `max_received_bytes` for this call, when set.
+    max_received_bytes: ?usize = null,
 };
 
 /// What `Client.unary` returns: the status, and the response message when
@@ -84,6 +92,10 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
         /// The call's deadline, when it has one: a call that ends without a
         /// status past it ended for that reason.
         deadline: ?std.Io.Clock.Timestamp = null,
+        /// The limit on response bytes for the call, and what it has
+        /// received so far.
+        max_received_bytes: usize = std.math.maxInt(usize),
+        received: usize = 0,
 
         /// The status for a call that ended abnormally: DEADLINE_EXCEEDED
         /// past the deadline (the server, or its proxy, reset it), else
@@ -133,7 +145,8 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
                 }
             }
             const encoding: Compression = if (self.stream.header("grpc-encoding")) |e| Compression.parse(e) orelse .identity else .identity;
-            const msg = frame.readMessage(self.stream.reader(), self.arena, self.channel.max_message_size, encoding) catch |err| {
+            // Read and inflated outside the arena, freed once decoded.
+            const msg = frame.readMessage(self.stream.reader(), server.scratch, self.channel.max_message_size, encoding) catch |err| {
                 self.status = switch (err) {
                     error.ReadFailed => self.ended(.init(.unavailable, "stream reset")),
                     error.MessageTooLarge => .init(.resource_exhausted, "message larger than the limit"),
@@ -144,6 +157,13 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
                 self.status = try statusFrom(self.arena, self.stream.trailers.items);
                 return null;
             };
+            defer server.scratch.free(msg.payload);
+            self.received +|= msg.payload.len + server.per_message_charge;
+            if (self.received > self.max_received_bytes) {
+                self.status = .init(.resource_exhausted, "response messages over the call's limit");
+                self.stream.cancel();
+                return null;
+            }
             var reader: std.Io.Reader = .fixed(msg.payload);
             return Resp.decode(&reader, self.arena) catch {
                 self.status = .init(.internal, "response did not decode");
@@ -245,6 +265,7 @@ pub fn open(comptime Req: type, comptime Resp: type, channel: *Channel, method_p
         .arena = arena,
         .compression = options.compression,
         .deadline = call_deadline,
+        .max_received_bytes = options.max_received_bytes orelse channel.max_received_bytes,
     };
 }
 

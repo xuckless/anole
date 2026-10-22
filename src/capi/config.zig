@@ -65,7 +65,7 @@ pub const Config = struct {
         /// The largest request body, inline or streamed: past it, 413.
         body_max: u64 = 1 << 20,
         /// Bodies up to this come inline in the request record; larger
-        /// ones are read with anole_req_read.
+        /// ones are read with anole_req_read. At most 1 GiB.
         inline_body_max: u32 = 64 * 1024,
         /// Requests handed to consumers and not yet answered, per executor;
         /// past it, 503.
@@ -77,7 +77,8 @@ pub const Config = struct {
         /// to go out answers ANOLE_BUSY.
         stream_high_water: u32 = 256 * 1024,
         ws_high_water: u32 = 1 << 20,
-        /// The largest WebSocket message, in or out (after inflating).
+        /// The largest WebSocket message, in or out (after inflating). At
+        /// most 1 GiB.
         ws_max_message: u32 = 1 << 20,
         /// Open connections at most; 0 follows the open-file limit.
         max_connections: u32 = 0,
@@ -141,7 +142,13 @@ pub const Config = struct {
         /// a JWK Set ({"keys": [...]}) given here.
         jwks: ?std.json.Value = null,
         issuer: ?[]const u8 = null,
+        /// Required in the token's `aud`. With `jwks_url` it must be set (a
+        /// provider's keys also sign tokens for its other clients), unless
+        /// `allow_any_audience`.
         audience: ?[]const u8 = null,
+        /// With `jwks_url` and no `audience`: only for keys that sign for
+        /// this application alone.
+        allow_any_audience: bool = false,
         leeway_s: i64 = 60,
         require_exp: bool = true,
         /// String claims a token must carry.
@@ -156,7 +163,9 @@ pub const Config = struct {
         window_ms: i64 = 60_000,
         /// How many at once; 0 means `limit`.
         burst: u32 = 0,
-        /// "ip" (the client's address) or "header:<name>".
+        /// "ip" (the client's address) or "header:<name>": the header's raw
+        /// value, unverified, so only for a header a trusted proxy sets to a
+        /// verified identity (a client that varies it gets a fresh limit).
         key: []const u8 = "ip",
         /// Keys remembered at most (least recently used out first).
         max_entries: u32 = 10_000,
@@ -219,6 +228,9 @@ pub const Config = struct {
         compression: bool = true,
         /// Close 1001 when the server drains.
         close_on_drain: bool = true,
+        /// Pages of other origins that may open the socket, besides the
+        /// request's own host ("https://app.example.com"); "*" for any.
+        origins: []const []const u8 = &.{},
     };
     pub const Cache = struct {
         /// When the answer's Cache-Control does not say.
@@ -232,6 +244,9 @@ pub const Config = struct {
 };
 
 pub const max_timeouts = 16;
+
+/// The most an inline body or a WebSocket message may be (one event each).
+pub const max_record_payload: u32 = 1 << 30;
 
 /// What `check` found wrong, for anole_last_error.
 pub const Problem = error{Config};
@@ -267,6 +282,10 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     if (cfg.executors > 256) return fail(why, "executors: at most 256", .{});
     if (cfg.limits.max_inflight == 0 or cfg.limits.max_inflight > 1 << 20) return fail(why, "limits.max_inflight: 1 to 1048576", .{});
     if (cfg.limits.inline_body_max > cfg.limits.body_max) return fail(why, "limits.inline_body_max is above limits.body_max", .{});
+    // Events carry their length in 32 bits: what goes inside one is bounded
+    // well below that (the request head comes on top of an inline body).
+    if (cfg.limits.inline_body_max > max_record_payload) return fail(why, "limits.inline_body_max: at most {d}", .{max_record_payload});
+    if (cfg.limits.ws_max_message > max_record_payload) return fail(why, "limits.ws_max_message: at most {d}", .{max_record_payload});
     var http3_listeners: usize = 0;
     for (cfg.listeners, 0..) |l, i| {
         if (l.tls) |t| {
@@ -300,7 +319,16 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (kinds != 1) return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket", .{i});
         if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
         if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
-        if (r.respond) |f| _ = http.Status.fromCode(f.status) catch return fail(why, "routes[{d}].respond.status {d} is not a status Anole knows", .{ i, f.status });
+        if (r.respond) |f| {
+            _ = http.Status.fromCode(f.status) catch return fail(why, "routes[{d}].respond.status {d} is not a status Anole knows", .{ i, f.status });
+            var it = f.headers.map.iterator();
+            while (it.next()) |h| {
+                const name = h.key_ptr.*;
+                http.core.validateHeaderName(name) catch return fail(why, "routes[{d}].respond.headers: \"{f}\" is not a header name", .{ i, std.zig.fmtString(name) });
+                if (http.core.isReservedHeader(name)) return fail(why, "routes[{d}].respond.headers: {s} is the server's to set", .{ i, name });
+                http.core.validateHeaderValue(h.value_ptr.*) catch return fail(why, "routes[{d}].respond.headers.{s}: the value holds CR, LF or NUL", .{ i, name });
+            }
+        }
         if (r.websocket != null) {
             if (comptime !features.websocket) return fail(why, "routes[{d}].websocket: WebSocket is not built in (-Dwebsocket)", .{i});
             if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: a websocket route is GET", .{i});
@@ -325,6 +353,8 @@ fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std
         .jwt => |j| {
             if (comptime !features.auth) return fail(why, "{s}[{d}].jwt: auth is not built in (-Dauth)", .{ where, i });
             if ((j.jwks_url == null) == (j.jwks == null)) return fail(why, "{s}[{d}].jwt: exactly one of jwks_url and jwks", .{ where, i });
+            if (j.jwks_url != null and j.audience == null and !j.allow_any_audience)
+                return fail(why, "{s}[{d}].jwt: jwks_url needs audience (this API's identifier at the provider), or allow_any_audience: true when the keys sign for this application alone", .{ where, i });
         },
         .rate_limit => |r| {
             if (!std.mem.eql(u8, r.key, "ip") and !std.mem.startsWith(u8, r.key, "header:"))
@@ -419,6 +449,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
             return app.middleware(anole.auth.RequireJwt.init(keys, .{
                 .issuer = c.issuer,
                 .audience = c.audience,
+                .allow_any_audience = c.allow_any_audience,
                 .leeway_seconds = c.leeway_s,
                 .require_exp = c.require_exp,
             }, .{ .required_claims = c.required_claims, .scopes = c.scopes, .realm = c.realm }));
@@ -505,12 +536,30 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"routes\": [{\"method\": \"FETCH\", \"path\": \"/x\", \"handler\": 1}]}",
         "{\"listeners\": []}",
         "{\"middleware\": [{\"rate_limit\": {\"key\": \"cookie\"}}]}",
+        // Framing fields are the server's; names and values must go on the wire.
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"Connection\": \"close\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"transfer-encoding\": \"chunked\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"x bad\": \"1\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"x-ok\": \"a\\r\\nb\"}}}]}",
+        // A provider's keys sign for its other clients too.
+        "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\"}}]}",
         "{\"limits\": {\"inline_body_max\": 10, \"body_max\": 5}}",
+        // A record carries its length in 32 bits.
+        "{\"limits\": {\"inline_body_max\": 4294967295, \"body_max\": 8589934592}}",
+        "{\"limits\": {\"ws_max_message\": 4294967295}}",
     };
     for (bad) |doc| {
         why.end = 0;
         try std.testing.expectError(error.Config, parse(a, doc, &why));
         try std.testing.expect(why.buffered().len > 0);
+    }
+
+    if (features.auth) {
+        why.end = 0;
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"audience\": \"api\"}}]}", &why);
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"allow_any_audience\": true}}]}", &why);
+        // Inline keys are the application's own: no audience needed.
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks\": {\"keys\": []}}}]}", &why);
     }
 }
 

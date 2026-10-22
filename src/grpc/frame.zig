@@ -230,19 +230,39 @@ pub fn readMessage(
     // A compressed message may only be larger once inflated; its wire form
     // is still held to a bound.
     if (compressed and length > max_message_size *| 2 +| 1024) return error.MessageTooLarge;
-    const wire = try allocator.alloc(u8, length);
-    reader.readSliceAll(wire) catch |err| {
-        allocator.free(wire);
-        return switch (err) {
-            error.EndOfStream => error.TruncatedFrame,
-            else => |e| e,
-        };
+    const wire = readPayload(reader, allocator, length) catch |err| return switch (err) {
+        error.EndOfStream => error.TruncatedFrame,
+        else => |e| e,
     };
     const payload = if (compressed) blk: {
         defer allocator.free(wire);
         break :blk try decompressGzip(allocator, wire, max_message_size);
     } else wire;
     return .{ .payload = payload, .consumed_bytes = header_size + length, .compressed = compressed };
+}
+
+/// Bytes a message's buffer may run ahead of the bytes that arrived.
+const read_chunk = 64 * 1024;
+
+/// The next `len` bytes of `reader`, allocated with `allocator`. The
+/// buffer grows with the bytes that arrive rather than with the length a
+/// frame header declares, so a peer that announces a large message and
+/// sends little of it holds little memory.
+fn readPayload(reader: *std.Io.Reader, allocator: std.mem.Allocator, len: usize) (std.Io.Reader.Error || std.mem.Allocator.Error)![]u8 {
+    if (len <= reader.bufferedLen()) {
+        const out = try allocator.alloc(u8, len);
+        reader.readSliceAll(out) catch unreachable; // already buffered
+        return out;
+    }
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    while (list.items.len < len) {
+        const n = @min(len - list.items.len, @max(reader.bufferedLen(), read_chunk));
+        try list.ensureUnusedCapacity(allocator, n);
+        try reader.readSliceAll(list.unusedCapacitySlice()[0..n]);
+        list.items.len += n;
+    }
+    return list.toOwnedSlice(allocator);
 }
 
 /// Inflates one gzip message, refusing it once it passes
@@ -272,6 +292,92 @@ pub fn decompressGzip(
     if (decompressed.len > max_message_size) return error.MessageTooLarge;
     if (input.seek != input.end) return error.MalformedCompressedMessage;
     return decompressed;
+}
+
+/// Fails every single allocation larger than `max`.
+const CappedAllocator = struct {
+    child: std.mem.Allocator = std.testing.allocator,
+    max: usize,
+
+    fn allocator(self: *CappedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (len > self.max) return null;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.max) return false;
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > self.max) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "readMessage: a declared length is not allocated before its bytes arrive" {
+    var capped: CappedAllocator = .{ .max = 256 * 1024 };
+    // 4 MiB declared, 3 bytes sent.
+    var reader: std.Io.Reader = .fixed("\x00\x00\x40\x00\x00abc");
+    try std.testing.expectError(error.TruncatedFrame, readMessage(&reader, capped.allocator(), 4 * 1024 * 1024, .identity));
+
+    // A whole message larger than the reader's buffer still arrives.
+    const gpa = std.testing.allocator;
+    const payload = try gpa.alloc(u8, 300_000);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+    const framed = try encode(gpa, payload);
+    defer gpa.free(framed);
+    var buffer: [64]u8 = undefined;
+    var stream: std.testing.Reader = .init(&buffer, &.{.{ .buffer = framed }});
+    stream.artificial_limit = .limited(1000);
+    const msg = (try readMessage(&stream.interface, gpa, 1 << 20, .identity)).?;
+    defer gpa.free(msg.payload);
+    try std.testing.expectEqualSlices(u8, payload, msg.payload);
+}
+
+test "fuzz: gRPC message frames read off a stream" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            if (input.len == 0) return;
+            // The first byte picks the limit, the compression and how many
+            // bytes the stream hands over at a time.
+            const max: usize = if (input[0] & 1 != 0) 64 else 4096;
+            const compression: Compression = if (input[0] & 2 != 0 and features.compression) .gzip else .identity;
+            var buffer: [32]u8 = undefined;
+            var stream: std.testing.Reader = .init(&buffer, &.{.{ .buffer = input[1..] }});
+            stream.artificial_limit = .limited(@as(usize, input[0] >> 2) + 1);
+            // Nothing larger than the input, or than a chunk ahead of it.
+            var capped: CappedAllocator = .{ .max = @max(read_chunk, max) + 64 * 1024 };
+            const gpa = capped.allocator();
+            while (true) {
+                const msg = readMessage(&stream.interface, gpa, max, compression) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return,
+                } orelse return;
+                defer gpa.free(msg.payload);
+                if (msg.payload.len > max) return error.OverLimit;
+            }
+        }
+    }.check, &.{
+        "\x00\x00\x00\x00\x00\x03abc\x00\x00\x00\x00\x00",
+        "\x04\x00\x00\x40\x00\x00abc",
+        "\xff\x00\x00\x00\x00\x02hi",
+        "\x02\x01\x00\x00\x00\x05\x1f\x8b\x08\x00\x00",
+        "\x00\x02\x00\x00\x00\x00",
+    });
 }
 
 test "frame round trips empty and binary payloads" {

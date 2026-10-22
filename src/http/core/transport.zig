@@ -131,6 +131,18 @@ pub const Transport = struct {
         }
     }
 
+    /// Whether the TLS layer, if there is one, saw the stream end without
+    /// close_notify: a reader that takes the end of the connection as the
+    /// end of a message cannot tell that end from a truncation by anyone on
+    /// the path. False on a plain connection, and on a TLS module that does
+    /// not say.
+    pub fn tlsEndedWithoutCloseNotify(self: Transport) bool {
+        if (!build_options.use_tls) return false;
+        const tls_reader = self.tls_reader orelse return false;
+        if (!@hasDecl(tls.Connection, "endedWithoutCloseNotify")) return false;
+        return tls_reader.conn.endedWithoutCloseNotify();
+    }
+
     /// The error type `getReadError` yields.
     pub const ReadError = @typeInfo(@TypeOf(checkReadError(undefined))).error_union.error_set;
 

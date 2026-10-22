@@ -7,6 +7,7 @@ const dusty = @import("dusty");
 const pb = @import("anole_transcode_pb");
 const grpc = @import("root.zig");
 const transcode = @import("transcode.zig");
+const grpc_server = @import("server.zig");
 const features = @import("build_options");
 
 const Library = pb.Library(grpc.Call, anyerror);
@@ -113,6 +114,42 @@ test "transcoding: requests that do not make a message" {
     try std.testing.expectError(error.InvalidArgument, transcode.decodeRequest(pb.GetBookRequest, a, "", "", &.{
         .{ .field = "name", .raw = "a%2", .multi = false },
     }, "", &diag));
+}
+
+test "transcoding: a query parameter never overrides a field the path sets, whichever name either uses" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The template names the field by its JSON name, the query by its proto
+    // name, and the other way around.
+    for ([_][2][]const u8{
+        .{ "bookId", "book_id=456" },
+        .{ "bookId", "bookId=456" },
+        .{ "book_id", "bookId=456" },
+        .{ "book_id", "book_id=456" },
+    }) |case| {
+        const r = try decode(pb.CreateBookRequest, a, "", "", &.{
+            .{ .field = case[0], .raw = "123", .multi = false },
+        }, case[1]);
+        try std.testing.expectEqualStrings("123", r.book_id);
+    }
+    // Nested: a variable at `author.name` binds the field below `author`.
+    const n = try decode(pb.GetBookRequest, a, "", "", &.{
+        .{ .field = "author.name", .raw = "ada", .multi = false },
+    }, "author.name=eve&author.born=1815");
+    try std.testing.expectEqualStrings("ada", n.author.?.name);
+    try std.testing.expectEqual(@as(i32, 1815), n.author.?.born);
+}
+
+test "transcoding: a Timestamp out of range is an invalid argument" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var diag: transcode.Diagnostic = .{};
+    for ([_][]const u8{ "since=2024-03-00T00:00:00Z", "since=2024-02-30T00:00:00Z", "since=2024-13-01T00:00:00Z" }) |query| {
+        try std.testing.expectError(error.InvalidArgument, transcode.decodeRequest(pb.GetBookRequest, a, "", "", &.{}, query, &diag));
+    }
+    try std.testing.expectError(error.InvalidArgument, transcode.decodeRequest(pb.GetBookRequest, a, "*", "{\"since\":\"2024-03-00T00:00:00Z\"}", &.{}, "", &diag));
 }
 
 test "transcoding: the response, whole or one field" {
@@ -536,6 +573,128 @@ test "transcoding: REST routes over HTTP/1.1 and HTTP/2" {
         defer conn.close();
         try exercise(conn, http2, arena);
     }
+}
+
+test "transcoding: the body is read under the request timeout, and must be JSON" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+        .timeout = .{ .request = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Library, impl);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    const port = server.address.ip.getPort();
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+
+    const book = "{\"title\":\"T\"}";
+    {
+        // A body that never arrives in full: the request timeout still
+        // ends the request.
+        const answer = try slowExchange(gpa, io, port, &.{
+            "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"title\"",
+        }, .zero, "\r\n\r\n", .fromSeconds(5));
+        gpa.free(answer);
+    }
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "Content-Type: text/plain\r\n", "415" },
+        .{ "Content-Type: application/x-www-form-urlencoded\r\n", "415" },
+        .{ "", "415" },
+        .{ "Content-Type: application/json; charset=utf-8\r\n", "200" },
+        .{ "Content-Type: Application/JSON\r\n", "200" },
+    }) |case| {
+        var buf: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(&buf, "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ case[0], book.len, book });
+        const answer = try slowExchange(gpa, io, port, &.{request}, .zero, "\r\n\r\n", .fromSeconds(5));
+        defer gpa.free(answer);
+        if (!std.mem.startsWith(u8, answer, "HTTP/1.1 ") or !std.mem.startsWith(u8, answer[9..], case[1])) {
+            std.debug.print("{s}: {s}\n", .{ case[0], answer });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+/// Sends `parts` over a new connection, waiting `pause` before each one
+/// after the first, then reads until `needle` arrives or the peer closes.
+/// Fails with `error.Timeout` when neither happens within `wait`.
+pub fn slowExchange(gpa: std.mem.Allocator, io: std.Io, port: u16, parts: []const []const u8, pause: std.Io.Duration, needle: []const u8, wait: std.Io.Duration) ![]u8 {
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    for (parts, 0..) |part, i| {
+        if (i > 0) try io.sleep(pause, .awake);
+        try writer.interface.writeAll(part);
+        try writer.interface.flush();
+    }
+    var read_buf: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const read = struct {
+        fn until(r: *std.Io.Reader, text: []const u8) !void {
+            while (std.mem.indexOf(u8, r.buffered(), text) == null) {
+                r.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    else => |e| return e,
+                };
+            }
+        }
+    }.until;
+    const bound: dusty.Deadline = .init(io, .{ .duration = .{ .raw = wait, .clock = .awake } });
+    try bound.run(read, .{ &reader.interface, needle });
+    return gpa.dupe(u8, reader.interface.buffered());
+}
+
+test "fuzz: request messages decoded as gRPC decodes them (protobuf and JSON)" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            if (input.len == 0) return;
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            // The first byte picks the codec and the message type.
+            const codec: grpc.Codec = if (input[0] & 1 != 0) .json else .proto;
+            const payload = input[1..];
+            switch (input[0] >> 1 & 1) {
+                0 => try roundTrip(pb.Book, arena, codec, payload),
+                else => try roundTrip(pb.GetBookRequest, arena, codec, payload),
+            }
+        }
+
+        /// Refusing the input is fine; running out of memory or crashing is
+        /// not. What decodes encodes again.
+        fn roundTrip(comptime T: type, arena: std.mem.Allocator, codec: grpc.Codec, payload: []const u8) !void {
+            const message = grpc_server.decodePayload(T, arena, codec, payload) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.DecodeFailed => return,
+            };
+            var out: std.Io.Writer.Allocating = .init(arena);
+            try message.encode(&out.writer, arena);
+            // JSON refuses what it cannot write (a Timestamp out of range),
+            // which it reports as OutOfMemory.
+            _ = message.jsonEncode(.{}, grpc_server.json_options, arena) catch {};
+        }
+    }.check, &.{
+        "\x00\x0a\x01a\x12\x01T\x18\x03\x20\x01\x2a\x01x\x32\x05\x0a\x03Ada\x42\x06\x08\x80\x92\xb8\xc3\x06\x5a\x03978",
+        "\x02\x0a\x04name\x4a\x02\x08\x01\x5a\x02\x01\x02",
+        "\x00\x6b\x6b\x6b\x6b\x6b\x6b\x6c\x6c\x6c\x6c\x6c\x6c",
+        "\x00\x0a\xff\xff\xff\xff\x07",
+        "\x00\x32\x80\x80\x80\x80\x08",
+        "\x01{\"name\":\"a\",\"published\":\"2024-03-00T00:00:00Z\",\"author\":{\"name\":\"x\"}}",
+        "\x03{\"since\":\"2024-02-29T23:59:60Z\",\"pages\":[1,2],\"big\":\"18446744073709551615\"}",
+        "\x01{\"isbn\":\"1\",\"printing\":2,\"tags\":[[[[[[[[]]]]]]]]}",
+    });
 }
 
 test "transcoding: off for a registration" {

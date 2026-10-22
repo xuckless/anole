@@ -62,8 +62,10 @@ pub const Detached = struct {
         /// The response will be written by a task from now on, which may
         /// wait (for the peer, for more body). Returns the group to spawn
         /// that task into, `.local` (the connection's, so the connection's
-        /// end cancels it). On the request's executor.
-        attach: *const fn (d: *Detached) *std.Io.Group,
+        /// end cancels it), or null once the connection's tasks are over
+        /// (the owner then calls `finish` with an error). On the request's
+        /// executor.
+        attach: *const fn (d: *Detached) ?*std.Io.Group,
         /// First thing in the attached task: the engine notes the task, to
         /// cancel it when the peer resets the stream.
         enter: *const fn (d: *Detached) void,
@@ -102,8 +104,9 @@ pub const Detached = struct {
 
     /// The response needs a task (a streamed body, a file): returns the
     /// group to spawn it into, `.local`. The task calls `enter` first and
-    /// `finish` last.
-    pub fn attach(d: *Detached) *std.Io.Group {
+    /// `finish` last. Null when the connection can take no more tasks: the
+    /// caller calls `finish` (with an error) itself.
+    pub fn attach(d: *Detached) ?*std.Io.Group {
         std.debug.assert(d.state == .detached);
         d.state = .attached;
         return d.engine.attach(d);

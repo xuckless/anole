@@ -25,6 +25,8 @@ const auth = anole.auth;
 /// Keeps the runtime's per-thread lines and the connection loops' debug
 /// lines out of a Debug build; info (startup lines, access log) stays.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const issuer = "anole-auth-example";
 const demo_password = "demo-password";
@@ -157,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
 
     // A demo HS256 key, pinned to that algorithm, and a token signed with it.
     var jwt_secret: [32]u8 = undefined;
-    io.random(&jwt_secret);
+    try io.randomSecure(&jwt_secret); // a long-lived secret: from the OS, never a fallback
     const jwt_keys = [_]auth.Key{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = &jwt_secret } }};
     const now = std.Io.Clock.real.now(io).toSeconds();
     var signer = auth.jwt.SigningMethodHS256.init(arena);

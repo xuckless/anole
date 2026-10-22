@@ -20,7 +20,15 @@
 //! is kept (0: not kept), else `Options.ttl`. `Vary` is honoured: each
 //! combination of the named request headers is kept apart (`Vary: *` is
 //! not kept). Requests that carry credentials (`Authorization`, `Cookie`,
-//! `X-API-Key`) neither read nor fill it unless `authenticated` says so.
+//! `X-API-Key`, a TLS client certificate) neither read nor fill it unless
+//! `authenticated` says so, and `cacheable` can refuse others.
+//!
+//! The cache cannot know every way an app tells users apart: a session in
+//! a header of its own, the client's address, a tenant in the `Host`. A
+//! route whose answer depends on any of those must name the header in
+//! `credential_headers` or refuse the request in `cacheable`, or one
+//! user's page is served to the next. Middleware after the cache (a
+//! route's own auth) is skipped on a hit: put authentication before it.
 //!
 //! The key is the method (GET for HEAD), the scheme, the `Host` and the
 //! target (path and query, as sent: `?a=1&b=2` and `?b=2&a=1` are two
@@ -70,8 +78,15 @@ pub const ResponseCache = struct {
         /// depend on who asks: the credentials are not part of the key,
         /// so one caller's answer is every caller's.
         authenticated: bool = false,
-        /// The request headers that count as credentials.
+        /// The request headers that count as credentials. Add any header
+        /// your app identifies users by (`X-Session-Token`, `X-Tenant`).
         credential_headers: []const []const u8 = &.{ "Authorization", "Cookie", "X-API-Key" },
+        /// Whether this request may be answered from the cache and its
+        /// answer kept, beyond the credentials check: return false for
+        /// requests whose answer depends on who asks in a way the key does
+        /// not see (the client's address, a claim set by earlier
+        /// middleware). Null: every request without credentials.
+        cacheable: ?*const fn (req: *const Request) bool = null,
         /// The cache's name in metrics (`name` label), one per cache.
         /// Null: the route's path for `anole.cached`, else "http".
         name: ?[]const u8 = null,
@@ -168,6 +183,7 @@ pub const ResponseCache = struct {
     pub fn execute(self: *ResponseCache, req: *Request, res: *Response, executor: anytype) !void {
         if (req.method != .get and req.method != .head) return executor.next();
         if (!self.options.authenticated and self.credentials(req)) return executor.next();
+        if (self.options.cacheable) |may| if (!may(req)) return executor.next();
         if (req.headers.get("Upgrade") != null) return executor.next();
         const local = self.locals.get(req.io) orelse return executor.next();
 
@@ -213,7 +229,8 @@ pub const ResponseCache = struct {
 
     fn credentials(self: *const ResponseCache, req: *const Request) bool {
         for (self.options.credential_headers) |name| if (req.headers.get(name) != null) return true;
-        return false;
+        // Mutual TLS: the client is whoever its certificate says.
+        return req.peerCertificate() != null;
     }
 
     /// The fresh response for `req`, through the route's `Vary` marker

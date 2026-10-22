@@ -79,28 +79,31 @@ const ForwardedForIterator = struct {
 
 /// Returns the address `trusted_proxy_hops` hops away from this server. The
 /// socket peer is hop zero, so hop one is the rightmost forwarded address.
-/// Rejecting the whole chain on malformed input fails closed to the peer.
+/// Only that entry is parsed: those left of it are whatever the client
+/// sent, and a malformed one there must not change the answer. A selected
+/// entry that is not an address names no client, and gives the unspecified
+/// address (0.0.0.0) rather than the proxy's. Null when the chain is
+/// shorter than the trusted hops: the peer stands.
 fn forwardedRemoteAddress(headers: *const Headers, trusted_proxy_hops: usize) ?std.Io.net.IpAddress {
     if (trusted_proxy_hops == 0) return null;
 
     var count: usize = 0;
     var counting = ForwardedForIterator.init(headers);
-    while (counting.next()) |text| {
-        if (text.len == 0) return null;
-        count += 1;
-    }
+    while (counting.next()) |_| count += 1;
     if (count < trusted_proxy_hops) return null;
 
     const wanted = count - trusted_proxy_hops;
     var index: usize = 0;
-    var selected: ?std.Io.net.IpAddress = null;
     var parsing = ForwardedForIterator.init(headers);
     while (parsing.next()) |text| : (index += 1) {
-        const address = std.Io.net.IpAddress.parse(text, 0) catch return null;
-        if (index == wanted) selected = address;
+        if (index != wanted) continue;
+        return std.Io.net.IpAddress.parse(text, 0) catch unknown_client;
     }
-    return selected;
+    unreachable;
 }
+
+/// What `remote_address` is when a trusted proxy's entry names no address.
+const unknown_client: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
 
 /// IPv4-mapped addresses, from a dual-stack socket or a forwarding
 /// header, are reported as IPv4 (`unmapIpv4`).
@@ -122,26 +125,39 @@ fn lastForwardedValue(headers: *const Headers, name: []const u8) ?[]const u8 {
     return if (value.len == 0) null else value;
 }
 
+/// What the server takes from forwarding headers: `ServerConfig`'s
+/// `trusted_proxy_hops`, `trust_forwarded_proto` and `trust_forwarded_host`.
+const Forwarding = struct {
+    hops: usize = 0,
+    proto: bool = true,
+    host: bool = false,
+
+    fn of(config: *const ServerConfig) Forwarding {
+        return .{ .hops = config.trusted_proxy_hops, .proto = config.trust_forwarded_proto, .host = config.trust_forwarded_host };
+    }
+};
+
 /// Applies what trusted proxies say about a request: its client address
 /// (`X-Forwarded-For`), whether the client's connection is TLS
-/// (`X-Forwarded-Proto`) and the host it asked for (`X-Forwarded-Host`).
-/// With no trusted hops, only the peer address applies.
-fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, trusted_proxy_hops: usize) void {
-    request.remote_address = remoteAddress(peer, &request.headers, trusted_proxy_hops);
+/// (`X-Forwarded-Proto`, unless turned off) and the host it asked for
+/// (`X-Forwarded-Host`, only when turned on). With no trusted hops, only
+/// the peer address applies.
+fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, forwarding: Forwarding) void {
+    request.remote_address = remoteAddress(peer, &request.headers, forwarding.hops);
     request.forwarded_host = null;
-    if (trusted_proxy_hops == 0) return;
-    if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
+    if (forwarding.hops == 0) return;
+    if (forwarding.proto) if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
         if (std.ascii.eqlIgnoreCase(proto, "https")) request.secure = true;
         if (std.ascii.eqlIgnoreCase(proto, "http")) request.secure = false;
-    }
-    if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
+    };
+    if (forwarding.host) if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
         // A host name or address with an optional port: nothing that could
         // break a URL or a log line built from it.
         const ok = host.len <= 255 and for (host) |ch| {
             if (!(std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, ".-:[]_", ch) != null)) break false;
         } else true;
         if (ok) request.forwarded_host = host;
-    }
+    };
 }
 
 /// Borrowed view of the client-certificate settings, handed to each accepted
@@ -212,6 +228,14 @@ const TlsMaterial = struct {
             .trust = if (comptime has_trust_store) (if (m.client_trust) |*t| t else null) else null,
             .mode = m.client_auth_mode,
         };
+    }
+
+    /// Whether `a` and `b` verify client certificates the same way: both
+    /// not at all, or the same mode against the same CAs.
+    fn sameClientAuth(a: *const TlsMaterial, b: *const TlsMaterial) bool {
+        const a_ca = if (a.client_ca) |*bundle| bundle else return b.client_ca == null;
+        const b_ca = if (b.client_ca) |*bundle| bundle else return false;
+        return a.client_auth_mode == b.client_auth_mode and std.mem.eql(u8, a_ca.bytes.items, b_ca.bytes.items);
     }
 
     fn release(m: *TlsMaterial, allocator: std.mem.Allocator) void {
@@ -679,6 +703,9 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// within a round trip, and the request deadline may be off.
 pub const linger_limit: usize = 64 * 1024;
 pub const linger_timeout: std.Io.Duration = .fromSeconds(1);
+/// How long an unread request body is drained for when `timeout.keepalive`
+/// is off.
+const drain_timeout_fallback: std.Io.Duration = .fromSeconds(10);
 
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
@@ -1466,7 +1493,10 @@ pub fn Server(comptime Ctx: type) type {
         /// What the TLS module must carry from a listener's old certificate
         /// to its new one, it does in `CertKeyPair.carryOver(new, old)`, if
         /// it declares that: BoringSSL's adapter keeps the session ticket
-        /// keys, so tickets issued before a reload still resume.
+        /// keys, so tickets issued before a reload still resume. Not when
+        /// the reload changes how client certificates are verified: a
+        /// resumed session's certificate is not verified again, so those
+        /// sessions must not outlive the policy that let them in.
         pub fn reloadTls(self: *Self) !void {
             if (!build_options.use_tls) return;
             const listeners = self.configuredListeners();
@@ -1488,7 +1518,9 @@ pub fn Server(comptime Ctx: type) type {
             for (self.active_listeners, loaded) |*l, *slot| {
                 const new = slot.* orelse continue;
                 const old = l.tls_material orelse continue;
-                if (comptime @hasDecl(tls.config.CertKeyPair, "carryOver")) new.auth.carryOver(&old.auth);
+                if (comptime @hasDecl(tls.config.CertKeyPair, "carryOver")) {
+                    if (TlsMaterial.sameClientAuth(new, old)) new.auth.carryOver(&old.auth);
+                }
                 l.tls_material = new;
                 slot.* = old;
             }
@@ -2101,6 +2133,10 @@ pub fn Server(comptime Ctx: type) type {
             // The PROXY protocol header comes first, ahead of TLS.
             var proxied: proxy_protocol.Header = .{};
             if (l.config.proxy_protocol) {
+                if (l.config.address == .ip and !proxy_protocol.trustedPeer(l.config.proxy_protocol_from, stream.socket.address)) {
+                    log.info("PROXY protocol: connection from {f} refused, not a trusted proxy", .{stream.socket.address});
+                    return .close;
+                }
                 defer timer.clear(self.io);
                 self.armDeadline(timer, earlier(
                     deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
@@ -2350,13 +2386,13 @@ pub fn Server(comptime Ctx: type) type {
         /// from `connection`, through the trusted proxies, for an engine
         /// other than the HTTP/1.x loop.
         pub fn applyForwarded(self: *const Self, request: *Request, connection: *const Connection) void {
-            applyForwardedFn(request, connection.peerAddress(), self.config.trusted_proxy_hops);
+            applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
         }
 
         /// `applyForwarded` for an engine with no `Connection` (HTTP/3 over
         /// UDP): the peer address is given directly.
         pub fn applyForwardedFrom(self: *const Self, request: *Request, peer: std.Io.net.IpAddress) void {
-            applyForwardedFn(request, peer, self.config.trusted_proxy_hops);
+            applyForwardedFn(request, peer, .of(&self.config));
         }
 
         /// Routes `req` and runs its handler, with the middleware, writing to
@@ -2405,6 +2441,29 @@ pub fn Server(comptime Ctx: type) type {
                 if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
                 return false;
             }
+        }
+
+        /// `discardBody` under a deadline of its own: the request's, or
+        /// `drainTimeout` from now if sooner. A handler may have lifted its
+        /// timeout (`Request.setTimeout`), or caught the cancel of one that
+        /// fired and returned, and the drain must not then wait on the peer
+        /// for good. A request already past its deadline is not drained:
+        /// the connection closes instead. Whether the connection can carry
+        /// on.
+        fn boundedDiscard(self: *Self, parser: *RequestParser, connection: *Connection, max: usize, timer: *Timer, request_deadline: ?std.Io.Clock.Timestamp) error{Canceled}!bool {
+            const now = std.Io.Clock.Timestamp.now(self.io, .awake);
+            if (request_deadline) |d| if (now.compare(.gte, d)) return false;
+            const own = now.addDuration(.{ .raw = drainTimeout(&self.config), .clock = .awake });
+            self.armDeadline(timer, earlier(request_deadline, own));
+            defer timer.clear(self.io);
+            return discardBody(parser, connection, max) catch |err| switch (err) {
+                error.Canceled => if (timer.fired()) false else error.Canceled,
+            };
+        }
+
+        /// The longest a left-over request body is drained for.
+        fn drainTimeout(config: *const ServerConfig) std.Io.Duration {
+            return config.timeout.keepalive orelse drain_timeout_fallback;
         }
 
         /// Runs the HTTP request loop over a connection: each request is
@@ -2651,7 +2710,7 @@ pub fn Server(comptime Ctx: type) type {
                 // or invalid chain fail closed instead of retaining the last
                 // request's forwarded address.
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
-                applyForwardedFn(&request, connection.peerAddress(), self.config.trusted_proxy_hops);
+                applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
 
                 var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
@@ -2674,6 +2733,22 @@ pub fn Server(comptime Ctx: type) type {
                         if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                         return .close;
                     };
+                }
+
+                // One Host, and none only before HTTP/1.1 (RFC 9112 §3.2).
+                if (self.config.request.require_host) {
+                    var hosts: usize = 0;
+                    var it = request.headers.iterator();
+                    while (it.next()) |h| {
+                        if (std.ascii.eqlIgnoreCase(h.key, "Host")) hosts += 1;
+                    }
+                    if (hosts > 1 or (hosts == 0 and !response.http10)) {
+                        response.status = .bad_request;
+                        response.keepalive = false;
+                        try response.write();
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        return .close;
+                    }
                 }
 
                 // Handle Expect header (100-continue)
@@ -2753,7 +2828,10 @@ pub fn Server(comptime Ctx: type) type {
                         break :blk n <= max;
                     };
                     if (drainable) {
-                        if (!try discardBody(&parser, connection, max)) response.keepalive = false;
+                        // A tighter deadline the handler set (gRPC's read
+                        // timeout) bounds the drain too; a lifted one does not.
+                        const drain_deadline = earlier(request_deadline, request._handler_deadline);
+                        if (!try self.boundedDiscard(&parser, connection, max, timer, drain_deadline)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
                     }
@@ -2849,11 +2927,20 @@ test "trusted proxy hops select X-Forwarded-For from the right" {
     const too_short = remoteAddress(peer, &headers, 4);
     try std.testing.expect(too_short.ip4.eql(peer.ip4));
 
-    // A malformed address anywhere in the chain makes its ordering
-    // ambiguous/untrustworthy and likewise falls back to the peer.
-    try headers.put("X-Forwarded-For", "not-an-address, 203.0.113.10");
-    const malformed = remoteAddress(peer, &headers, 2);
-    try std.testing.expect(malformed.ip4.eql(peer.ip4));
+    // Entries left of the selected one are the client's own; a malformed
+    // one there changes nothing.
+    _ = headers.remove("X-Forwarded-For");
+    try headers.add("X-Forwarded-For", "not-an-address, , 203.0.113.10");
+    try headers.add("X-Forwarded-For", "198.51.100.7");
+    const ignored = remoteAddress(peer, &headers, 2);
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 10 }, ignored.ip4.bytes);
+
+    // A malformed or empty selected entry names no client: the unspecified
+    // address, never the proxy's.
+    const bad = remoteAddress(peer, &headers, 3);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, bad.ip4.bytes);
+    const empty = remoteAddress(peer, &headers, 4);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, empty.ip4.bytes);
 }
 
 test "IPv4-mapped peers and forwarded addresses are reported as IPv4" {

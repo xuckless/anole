@@ -379,7 +379,8 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
    unless borrowed, the body are copied before this returns. Compression,
    the response cache and the access log run on Anole's side afterwards.
    Finishes the request. ANOLE_E_INVALID: a bad status, flag, header name
-   or value (nothing taken, the request is still owed); ANOLE_E_GONE. */
+   or value, or Connection / Transfer-Encoding, which the server writes
+   itself (nothing taken, the request is still owed); ANOLE_E_GONE. */
 ANOLE_API anole_status anole_respond(anole_req r, uint16_t status, const anole_header *headers, size_t nheaders,
                                      const void *body, size_t len, uint32_t flags);
 /* Sends `len` bytes of the open regular file `fd` from `offset` (len 0: to
@@ -429,7 +430,13 @@ ANOLE_API anole_status anole_ws_subscribe(anole_ws w, anole_str topic);
 ANOLE_API anole_status anole_ws_unsubscribe(anole_ws w, anole_str topic);
 /* Sends one message to every socket subscribed to `topic` but `except` (0:
    none), fanned out on Anole's threads; returns at once (topic and data
-   copied). */
+   copied). At most limits.ws_max_message bytes (else ANOLE_E_INVALID).
+   No subscriber holds a publish up: each has up to limits.ws_high_water
+   bytes queued for it, past which publishes skip it (and one stuck that way
+   for a second is closed). ANOLE_E_AGAIN: not sent, because too many
+   publishes are still being fanned out (at most 64 per executor and the
+   larger of 16 x limits.ws_high_water and 2 x limits.ws_max_message bytes);
+   no event follows, publish again later. */
 ANOLE_API anole_status anole_ws_publish(anole_server *s, anole_str topic, int type, const void *data, size_t len,
                                         anole_ws except);
 

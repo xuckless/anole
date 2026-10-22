@@ -13,6 +13,11 @@ zig build run-observe                  # port 8085, JSON access log
 zig build run-observe -- 9000 text     # another port, text access log
 ```
 
+The app's routes are on that port; `/metrics`, `/healthz`, `/readyz` and
+the `/maintenance` switch are on an `admin` listener on the next port
+(8086), bound to loopback, as [Keep them off the public
+port](#keep-them-off-the-public-port) describes.
+
 ## Wiring
 
 The server sets each one up in a line, and owns what it makes:
@@ -27,10 +32,14 @@ try health.addCheck("db", dbReady, &pool);
 // ... routes ...
 ```
 
-- `metrics(.{ .path, .http, .exclude })` returns the registry for metrics of
-  your own; `.http = false` leaves out the request metrics.
-- `health(.{ .healthz_path, .readyz_path })` returns the `Health` for
-  `addCheck`; readiness fails once the server drains.
+- `metrics(.{ .path, .http, .exclude, .listener })` returns the registry for
+  metrics of your own; `.http = false` leaves out the request metrics.
+- `health(.{ .healthz_path, .readyz_path, .listener })` returns the `Health`
+  for `addCheck`; readiness fails once the server drains.
+- `.listener` serves those routes only on the listener of that name (from
+  `Options.listeners`), and answers 404 on the others. Without it they are
+  on every listener, the public one included: see
+  [Keep them off the public port](#keep-them-off-the-public-port).
 - `tracing(.{ .endpoint, .service_name, .sample_all, .exclude, ... })`
   exports through the server's own client. The endpoint and the service
   name default to `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
@@ -71,6 +80,28 @@ try health.addCheck("db", dbReady, &pool);
 health.registerOn(void, app.router, app.server);
 ```
 
+### Keep them off the public port
+
+`/metrics` lists every route pattern, the error names handlers return and
+the databases the app uses, and `/readyz` names the check that fails. That
+is for your scraper and load balancer, not for the internet. Serve them on
+an internal listener:
+
+```zig
+var app = try anole.App.init(gpa, .{ .listeners = &.{
+    .{ .name = "public", .address = "0.0.0.0", .port = 8080 },
+    .{ .name = "admin", .address = "127.0.0.1", .port = 9090 }, // or a private interface
+} });
+_ = app.metrics(.{ .listener = "admin" });
+_ = app.health(.{ .listener = "admin" });
+```
+
+Otherwise keep the whole port private (a firewall, the proxy not routing
+those paths), or put an authentication middleware in front with `use`:
+global middleware runs before these routes. By hand,
+`registry.serveOnListener(Ctx, router, "/metrics", "admin")` and
+`Health.init(.{ .listener = "admin" })` do the same.
+
 `app.use` copies each middleware, so the copies must not point at values
 that move: keep the exporter, registry and health values alive for as long
 as the server runs. Add middleware before any route, as the router requires.
@@ -90,7 +121,8 @@ stores them in `req.id` and sends them back in `X-Request-Id`. Set
 `.header` to use another header name. Set `.trust_incoming = true` to keep
 an ID that arrives with the request; do this only behind a proxy that sets
 or strips the header, or clients choose their own IDs. An incoming ID is
-kept only if it is 1 to 128 visible ASCII characters.
+kept only if it is 1 to 128 letters, digits, `.`, `_`, `:` or `-`;
+anything else gets a fresh ID. The JSON access log escapes IDs either way.
 
 ## Access log
 
@@ -100,6 +132,10 @@ returns. Options:
 - `.format`: `.text` (default) or `.json`, one object per line.
 - `.file`: a `std.Io.File` to write to; stderr when null.
 - `.exclude`: paths not logged (see [Wiring](#wiring)).
+- `.log_query`: also log the query string (false). Off by default, because
+  queries carry OIDC `code` and `state`, password-reset tokens and API keys,
+  and logs keep them. `anole.middleware.Logger` has the same switch
+  (`Logger.initWith(.{ .log_query = true })`).
 
 Each line is a single write, so lines from concurrent requests do not
 interleave. The line is written straight to the file, not through
@@ -117,8 +153,8 @@ JSON, from the example:
 {"ts":1792333306429,"method":"GET","path":"/users/7","status":200,"duration_us":124,"client":"127.0.0.1:64388","route":"/users/:id","request_id":"9045897231062d793bd832ff5459f9e3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"3d4c9f621d6f31cc"}
 ```
 
-`ts` is Unix time in milliseconds. `path` is the raw target, query
-included. `route` appears only when a route matched. `request_id`,
+`ts` is Unix time in milliseconds. `path` is the raw target's path, the
+query left out unless `log_query` is set. `route` appears only when a route matched. `request_id`,
 `trace_id` and `span_id` appear only when the RequestId and tracing
 middleware are installed. A handler that returns `error.NotFound` is logged
 as the 404 it becomes. Any other error adds `error` and reports the status
@@ -315,7 +351,7 @@ A check is a `fn (ctx: ?*anyopaque) bool` plus a context pointer, added with
 `/readyz` request, so keep them cheap: read a flag that a background task
 keeps current rather than querying a database.
 
-From the example, after `POST /maintenance`:
+From the example, after `POST /maintenance` on its admin port:
 
 ```
 HTTP/1.1 503 Service Unavailable

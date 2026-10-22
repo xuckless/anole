@@ -19,6 +19,8 @@ pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsPath = @import("config.zig").TlsPath;
+/// A peer range for `Listener.proxy_protocol_from`.
+pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;
@@ -58,12 +60,16 @@ pub const ContentType = @import("http.zig").ContentType;
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
+pub const SessionCookieOpts = @import("cookie.zig").SessionCookieOpts;
 pub const validateCookieName = @import("cookie.zig").validateCookieName;
 pub const validateCookieValue = @import("cookie.zig").validateCookieValue;
 /// Whether a header name or value may go on the wire (the C ABI checks
 /// replies with them before they reach a `Response`).
 pub const validateHeaderName = @import("http.zig").validateHeaderName;
 pub const validateHeaderValue = @import("http.zig").validateHeaderValue;
+/// Response header names only the server writes (`Connection`,
+/// `Transfer-Encoding`), which `Response.header` refuses.
+pub const isReservedHeader = @import("response.zig").isReservedHeader;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
 /// `Request.locals`: per-request values a middleware hands to the handler.
 pub const Locals = @import("locals.zig").Locals;
@@ -112,6 +118,10 @@ pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;
 pub const WebSocketUpgradeOptions = @import("client.zig").WebSocketUpgradeOptions;
+pub const Redirect = @import("client.zig").Redirect;
+pub const RedirectAction = @import("client.zig").RedirectAction;
+pub const RedirectPolicy = @import("client.zig").RedirectPolicy;
+pub const isPrivateAddress = @import("client.zig").isPrivateAddress;
 
 test {
     std.testing.refAllDecls(@This());
@@ -125,6 +135,7 @@ comptime {
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");
+    _ = @import("client_redirect_test.zig");
     _ = @import("deadline.zig");
     _ = @import("cgroup.zig");
     _ = @import("somaxconn.zig");

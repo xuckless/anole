@@ -6,6 +6,7 @@
 //! (MIT).
 const std = @import("std");
 const c = @import("ngtcp2.zig").c;
+const dusty_tls = @import("anole_dusty_tls");
 
 const log = std.log.scoped(.anole_h3);
 
@@ -44,6 +45,10 @@ pub const ServerOptions = struct {
 /// its connections.
 pub const Context = struct {
     ctx: *c.SSL_CTX,
+    /// The session context its sessions are made in: the same for two
+    /// contexts exactly when they verify client certificates the same way
+    /// (`sameClientAuth`).
+    session_context: [32]u8,
 
     /// Everything a listener's handshakes share, built in one place: a
     /// certificate reload builds a new `Context` from new options.
@@ -55,8 +60,20 @@ pub const Context = struct {
         if (c.ngtcp2_crypto_boringssl_configure_server_context(ctx) != 0) return error.TlsSetupFailed;
         _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
         c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpn, @ptrCast(@constCast(if (options.hq_interop) &accept_h3_hq else &accept_h3)));
-        const sid_ctx = "anole h3";
-        _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
+        // A session resumes only under the client-auth policy it was made
+        // under (a resumed session's client certificate is not verified
+        // again): `options.client_auth` is part of the context.
+        var session_context: [32]u8 = @splat(0);
+        if (options.client_auth) |ca| {
+            var ca_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(ca.ca_der, &ca_digest, .{});
+            session_context = dusty_tls.clientAuthSessionContext("anole h3", @backingInt(ca.mode), ca_digest);
+            if (c.SSL_CTX_set_session_id_context(ctx, &session_context, session_context.len) != 1) return error.OutOfMemory;
+        } else {
+            const sid_ctx = "anole h3";
+            @memcpy(session_context[0..sid_ctx.len], sid_ctx);
+            if (c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
+        }
         try useIdentity(.ctx, ctx, options.cert_pem, options.key_pem);
         if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsKeyMismatch;
         if (options.client_auth) |ca| try requestClientCertificates(ctx, ca);
@@ -65,7 +82,13 @@ pub const Context = struct {
         // (`dusty_tls.installTicketKeys`), which a reload carries over, and
         // every connection of a listener, on any executor, shares them.
         if (options.early_data) c.SSL_CTX_set_early_data_enabled(ctx, 1);
-        return .{ .ctx = ctx };
+        return .{ .ctx = ctx, .session_context = session_context };
+    }
+
+    /// Whether the two verify client certificates the same way: both not
+    /// at all, or the same mode against the same CAs.
+    pub fn sameClientAuth(a: *const Context, b: *const Context) bool {
+        return std.mem.eql(u8, &a.session_context, &b.session_context);
     }
 
     /// Drops this reference to the context; connections still using it

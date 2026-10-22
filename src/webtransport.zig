@@ -38,6 +38,9 @@ const std = @import("std");
 const dusty = @import("dusty");
 const engine = @import("h3/webtransport.zig");
 const placement = dusty.placement;
+const origin = @import("origin.zig");
+/// Which pages may open a session (`AcceptOptions.allowed_origins`).
+pub const Origins = origin.Origins;
 
 /// A session: `acceptStream`, `acceptUniStream`, `openStream`,
 /// `openUniStream`, `receiveDatagram`, `sendDatagram`, `close`.
@@ -54,6 +57,13 @@ pub const Error = engine.Error;
 
 /// How `accept` (and `app.webtransportWith`) opens a session.
 pub const AcceptOptions = struct {
+    /// The pages that may open the session, by the CONNECT's `Origin`: by
+    /// default only the request's own host and port (`:authority`). A
+    /// browser request from anywhere else gets 403 (`error.Forbidden` from
+    /// `accept`); clients that send no `Origin` are not affected. List the
+    /// other sites (`.{ .list = &.{"https://app.example.com"} }`), or
+    /// `.any` for an endpoint that does not rely on cookies.
+    allowed_origins: Origins = .same_origin,
     /// Replaces the request's timeout once the session is open: a session
     /// outlives `timeout.request`.
     timeout: std.Io.Timeout = .none,
@@ -88,6 +98,7 @@ const ServerSession = struct {
 /// request's arena: `deinit` it before the handler returns.
 pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions) !?*Session {
     const connect = req.local(engine.Connect, engine.local_key) orelse return null;
+    if (!origin.allowed(req, options.allowed_origins)) return error.Forbidden;
     const self = try req.arena.create(ServerSession);
     self.* = .{ .session = undefined, .body = undefined, .out = undefined, .in_buf = undefined, .out_buf = undefined };
     res.status = .ok;

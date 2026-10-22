@@ -20,6 +20,9 @@ pub const Options = struct {
     /// Paths not logged: exact, or a prefix when the entry ends in `*`.
     /// `&anole.observe.probe_paths` leaves out health checks and scrapes.
     exclude: []const []const u8 = &.{},
+    /// Log the query string with the path. Off by default: queries carry
+    /// sign-in codes, reset tokens and API keys, which logs keep.
+    log_query: bool = false,
 };
 
 /// The access log middleware. Put it first among `use` calls (after
@@ -64,7 +67,7 @@ pub const AccessLog = struct {
     fn write(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, result: anyerror!void, start: std.Io.Clock.Timestamp) anyerror!void {
         const micros = start.durationTo(.now(req.io, .awake)).raw.toMicroseconds();
         const status = statusOf(req, res, result);
-        const line = format(req.arena, self.options.format, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
+        const line = formatLine(req.arena, .{ .format = self.options.format, .log_query = self.options.log_query }, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
         const file = self.options.file orelse std.Io.File.stderr();
         file.writeStreamingAll(req.io, line) catch |err| switch (err) {
             // The request's cancel (its deadline, the drain) is for what runs next.
@@ -82,8 +85,30 @@ pub const AccessLog = struct {
 pub const statusOf = common.statusOf;
 
 /// One log line for `req`, ending in a newline, in `arena`: what the
-/// middleware writes, for a logger of your own.
+/// middleware writes, for a logger of your own. The query is left out
+/// (`formatLine` with `log_query` keeps it).
 pub fn format(arena: std.mem.Allocator, fmt: Format, req: *const dusty.Request, status: u16, micros: i64, now_ms: i64, err: ?anyerror) ![]const u8 {
+    return formatLine(arena, .{ .format = fmt }, req, status, micros, now_ms, err);
+}
+
+/// `formatLine`'s settings.
+pub const LineOptions = struct {
+    format: Format = .text,
+    /// Keep the query string after the path.
+    log_query: bool = false,
+};
+
+/// `req`'s target as logged: the path, and the query only with
+/// `log_query`.
+pub fn target(req: *const dusty.Request, log_query: bool) []const u8 {
+    if (log_query) return req.url;
+    return if (std.mem.indexOfScalar(u8, req.url, '?')) |q| req.url[0..q] else req.url;
+}
+
+/// `format` with `LineOptions`.
+pub fn formatLine(arena: std.mem.Allocator, opts: LineOptions, req: *const dusty.Request, status: u16, micros: i64, now_ms: i64, err: ?anyerror) ![]const u8 {
+    const fmt = opts.format;
+    const path = target(req, opts.log_query);
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
     var mbuf: [16]u8 = undefined;
@@ -92,16 +117,18 @@ pub fn format(arena: std.mem.Allocator, fmt: Format, req: *const dusty.Request, 
     const addr = std.fmt.bufPrint(&abuf, "{f}", .{req.remote_address}) catch "?";
     switch (fmt) {
         .text => {
-            try w.print("{s} {s} {d} {d}us {s}", .{ method, req.url, status, micros, addr });
+            try w.print("{s} {s} {d} {d}us {s}", .{ method, path, status, micros, addr });
             if (req.id.len > 0) try w.print(" id={s}", .{req.id});
             if (req.trace_id.len > 0) try w.print(" trace={s}", .{req.trace_id});
             if (err) |e| try w.print(" error={t}", .{e});
         },
         .json => {
-            try w.print("{{\"ts\":{d},\"method\":\"{s}\",\"path\":{f},\"status\":{d},\"duration_us\":{d},\"client\":\"{s}\"", .{ now_ms, method, std.json.fmt(req.url, .{}), status, micros, addr });
+            try w.print("{{\"ts\":{d},\"method\":\"{s}\",\"path\":{f},\"status\":{d},\"duration_us\":{d},\"client\":\"{s}\"", .{ now_ms, method, std.json.fmt(path, .{}), status, micros, addr });
             if (req.route) |r| try w.print(",\"route\":{f}", .{std.json.fmt(r.path, .{})});
-            if (req.id.len > 0) try w.print(",\"request_id\":\"{s}\"", .{req.id});
-            if (req.trace_id.len > 0) try w.print(",\"trace_id\":\"{s}\",\"span_id\":\"{s}\"", .{ req.trace_id, req.span_id });
+            // Escaped: an ID may come from the client (RequestId's
+            // `trust_incoming`, or one set by the app).
+            if (req.id.len > 0) try w.print(",\"request_id\":{f}", .{std.json.fmt(req.id, .{})});
+            if (req.trace_id.len > 0) try w.print(",\"trace_id\":{f},\"span_id\":{f}", .{ std.json.fmt(req.trace_id, .{}), std.json.fmt(req.span_id, .{}) });
             if (err) |e| try w.print(",\"error\":\"{t}\"", .{e});
             try w.writeByte('}');
         },

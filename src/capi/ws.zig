@@ -31,7 +31,7 @@ const max_chunks = 4096;
 const State = enum(u32) { free, open };
 
 fn pack(gen: u32, state: State) u64 {
-    return (@as(u64, gen) << 32) | @intFromEnum(state);
+    return (@as(u64, gen) << 32) | @backingInt(state);
 }
 
 const OutMsg = struct {
@@ -95,6 +95,8 @@ pub const ExecState = struct {
     work: std.Io.Group = .init,
 
     fn slot(st: *ExecState, i: u32) ?*WsSlot {
+        // `i` may come from a made-up handle: past the table is no socket.
+        if (i / chunk_len >= max_chunks) return null;
         const c = st.chunks[i / chunk_len].load(.acquire) orelse return null;
         return &c[i % chunk_len];
     }
@@ -200,7 +202,7 @@ fn onMessage(_: ?*anyopaque, sock: *Socket, msg: websocket.Message) anyerror!voi
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     const ev: *abi.WsMessageEvent = @ptrCast(rec.ptr);
     ev.* = .{
-        .ev = .{ .type = @intFromEnum(abi.EventType.ws_message), .len = @intCast(n), .handle = s.handle(s.gen()) },
+        .ev = .{ .type = @backingInt(abi.EventType.ws_message), .len = @intCast(n), .handle = s.handle(s.gen()) },
         .route_id = s.route.id,
         .type = if (msg.type == .text) @intCast(abi.WS_TEXT) else @intCast(abi.WS_BINARY),
         .data = .{ .off = @sizeOf(abi.WsMessageEvent), .len = @intCast(msg.data.len) },
@@ -240,7 +242,7 @@ fn onClose(_: ?*anyopaque, sock: *Socket) void {
     sock.context = null;
     s.socket = null;
 
-    const code: u16 = if (sock.close_code) |c| @intFromEnum(c) else if (sock.end_error != null) 1006 else 1005;
+    const code: u16 = if (sock.close_code) |c| @backingInt(c) else if (sock.end_error != null) 1006 else 1005;
     if (newRecord(@sizeOf(abi.WsCloseEvent), .ws_close, s.handle(g))) |rec| {
         const ev: *abi.WsCloseEvent = @ptrCast(rec.ptr);
         ev.route_id = s.route.id;
@@ -257,7 +259,7 @@ fn newRecord(size: usize, typ: abi.EventType, h: u64) ![]align(8) u8 {
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     @memset(rec, 0);
     const ev: *abi.Event = @ptrCast(rec.ptr);
-    ev.* = .{ .type = @intFromEnum(typ), .len = @intCast(n), .handle = h };
+    ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = h };
     return rec;
 }
 
@@ -320,7 +322,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
             sent += m.data.len;
             if (m.owned) gpa.free(m.data) else x.postSent(s.handle(g), m.data);
         }
-        if (close_code) |c| sock.close(@enumFromInt(c), reason) catch {};
+        if (close_code) |c| sock.close(@fromBackingInt(@intCast(c)), reason) catch {};
         s.acquire();
         s.bytes -|= sent;
         const drained = s.want_event and s.bytes <= high / 2;
@@ -461,17 +463,32 @@ fn leaveTask(e: *Engine, sock: *Socket, c: *TopicCmd) std.Io.Cancelable!void {
 
 const PublishCmd = struct {
     cmd: Command,
+    engine: *Engine,
     except: u64,
     type: websocket.MessageType,
     topic: []u8,
     data: []u8,
 
     fn free(p: *PublishCmd) void {
+        _ = p.engine.publishing.fetchSub(1, .monotonic);
+        _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.data.len, .monotonic);
         gpa.free(p.topic);
         gpa.free(p.data);
         gpa.destroy(p);
     }
 };
+
+/// Publishes taken and not yet fanned out, at most: a member that stops
+/// reading holds up the publishes sending to it, and they must not pile up
+/// without end. Past either limit `publish` refuses (`error.Again`).
+pub fn publishLimits(e: *const Engine) struct { tasks: usize, bytes: usize } {
+    const hw: usize = e.config.limits.ws_high_water;
+    const max_msg: usize = e.config.limits.ws_max_message;
+    return .{
+        .tasks = 64 * @max(e.execs.len, 1),
+        .bytes = @max(16 * hw, 2 * max_msg),
+    };
+}
 
 var next_publisher: std.atomic.Value(usize) = .init(0);
 
@@ -482,12 +499,28 @@ pub fn publish(e: *Engine, topic: []const u8, typ: c_int, data: []const u8, exce
         abi.WS_BINARY => .binary,
         else => return error.Invalid,
     };
+    if (data.len > e.config.limits.ws_max_message) return error.Invalid;
     if (e.phase.load(.acquire) != .running) return error.Gone;
+    // Counted before anything is copied; `free` gives it back.
+    const lim = publishLimits(e);
+    const size = topic.len + data.len;
+    const tasks = e.publishing.fetchAdd(1, .monotonic);
+    const bytes = e.publish_bytes.fetchAdd(size, .monotonic);
+    if (tasks >= lim.tasks or bytes + size > lim.bytes) {
+        _ = e.publishing.fetchSub(1, .monotonic);
+        _ = e.publish_bytes.fetchSub(size, .monotonic);
+        _ = e.publish_dropped.fetchAdd(1, .monotonic);
+        return error.Again;
+    }
+    errdefer {
+        _ = e.publishing.fetchSub(1, .monotonic);
+        _ = e.publish_bytes.fetchSub(size, .monotonic);
+    }
     const p = try gpa.create(PublishCmd);
     errdefer gpa.destroy(p);
     const t = try gpa.dupe(u8, topic);
     errdefer gpa.free(t);
-    p.* = .{ .cmd = .{ .run = runPublish }, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data) };
+    p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data) };
     // Spread over the executors.
     const xi = next_publisher.fetchAdd(1, .monotonic) % e.execs.len;
     e.execs[xi].post(&p.cmd);

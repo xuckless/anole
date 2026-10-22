@@ -41,6 +41,28 @@ pub const default_max_message_size = 4 * 1024 * 1024;
 pub const RegisterOptions = struct {
     /// The largest request message, after decompression.
     max_message_size: usize = default_max_message_size,
+    /// The most request message bytes one call takes in all, each message
+    /// counted at its size plus 64. Decoded messages live in the call's
+    /// arena until the call ends, so this bounds what a client-streaming
+    /// or bidirectional call holds; past it the call fails with
+    /// RESOURCE_EXHAUSTED. Raise it for long streams of large messages
+    /// (an upload in chunks), or split them over several calls.
+    max_received_bytes: usize = 64 * 1024 * 1024,
+    /// How long a request message may take to arrive: from the start of
+    /// the call for unary and server-streaming methods (and for the whole
+    /// body of a Connect unary or gRPC-Web text call), and from its first
+    /// byte in a client- or bidirectional-streaming call, whose client may
+    /// pause between messages for as long as the call's deadline allows.
+    /// Past it the call fails with DEADLINE_EXCEEDED. Null: no limit but
+    /// the call's deadline.
+    read_timeout: ?std.Io.Duration = .fromSeconds(30),
+    /// The longest a call may run: a cap on the client's deadline
+    /// (`grpc-timeout`, `connect-timeout-ms`) and the deadline of a call
+    /// that sent none. Null (the default) lets a call without a client
+    /// deadline run as long as its handler does, as gRPC servers do; set
+    /// it to bound long-lived streams, which otherwise end only when the
+    /// client or the handler ends them.
+    max_call_duration: ?std.Io.Duration = null,
     /// Handed to every call of this registration as `Call.data`: state for
     /// handlers that serve more than one registration (`Health` keeps its
     /// registry here).
@@ -101,7 +123,10 @@ pub const Call = struct {
     /// `addTrailer` rather than writing to it.
     res: *dusty.Response,
     /// The call's arena (the request's): messages decoded for the handler
-    /// live here, and what the handler returns may too. Thread-safe.
+    /// live here, and what the handler returns may too. Not thread-safe
+    /// (over HTTP/1.1, for Connect, gRPC-Web and transcoded calls, it is
+    /// the connection's request arena): a task the handler starts needs
+    /// memory of its own.
     arena: std.mem.Allocator,
     /// The server's runtime, for the handler's own I/O.
     io: std.Io,
@@ -109,7 +134,9 @@ pub const Call = struct {
     ctx: ?*anyopaque,
     /// `RegisterOptions.data` of the registration that routed the call.
     data: ?*anyopaque = null,
-    /// When the client's grpc-timeout runs out, if it sent one.
+    /// When the call's deadline passes: the client's grpc-timeout (or
+    /// connect-timeout-ms), capped at the registration's
+    /// `max_call_duration`, or that alone; null without either.
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Set by `fail`, or left at OK.
     status: Code = .ok,
@@ -127,6 +154,12 @@ pub const Call = struct {
         /// The largest request message this call accepts
         /// (`RegisterOptions.max_message_size`).
         max_message_size: usize,
+        /// `RegisterOptions.max_received_bytes`, and what was received so
+        /// far against it.
+        max_received_bytes: usize = std.math.maxInt(usize),
+        received: usize = 0,
+        /// `RegisterOptions.read_timeout`.
+        read_timeout: ?std.Io.Duration = null,
         /// How the client compressed its messages (grpc-encoding).
         request_compression: Compression = .identity,
         /// How the response messages are compressed
@@ -184,9 +217,24 @@ pub const Call = struct {
         try self.res.header(name, value);
     }
 
-    /// Adds trailing metadata, sent with the status.
+    /// Adds trailing metadata, sent with the status. `name` is a metadata
+    /// key (lower-case letters, digits, `-`, `_` and `.`) and `value`
+    /// printable ASCII; under a `-bin` name, `value` is the base64 text, as
+    /// `metadata` returns it (`addBinaryTrailer` takes the bytes). Anything
+    /// else fails with `error.InvalidMetadata`, so a value from the client
+    /// cannot add lines to the trailers.
     pub fn addTrailer(self: *Call, name: []const u8, value: []const u8) !void {
+        if (!metadata_mod.isValidKey(name) or !validTrailerValue(name, value)) return error.InvalidMetadata;
         try self.impl.trailers.append(self.arena, .{ .key = name, .value = value });
+    }
+
+    /// Adds binary trailing metadata: `bytes` under a `-bin` name, base64
+    /// encoded (unpadded, as gRPC recommends).
+    pub fn addBinaryTrailer(self: *Call, name: []const u8, bytes: []const u8) !void {
+        if (!metadata_mod.isBinaryKey(name)) return error.InvalidMetadata;
+        const encoder = std.base64.standard_no_pad.Encoder;
+        const text = try self.arena.alloc(u8, encoder.calcSize(bytes.len));
+        return self.addTrailer(name, encoder.encode(text, bytes));
     }
 
     /// The client went away (reset the stream or closed the connection),
@@ -214,12 +262,26 @@ pub const Call = struct {
         return self.impl.codec;
     }
 
-    /// Whether the client's grpc-timeout has run out. False without one.
+    /// Whether the call's deadline has passed. False without one.
     pub fn deadlineExceeded(self: *const Call) bool {
         const d = self.deadline orelse return false;
         return std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d);
     }
 };
+
+/// Whether `value` may go out as trailing metadata under `name`: base64
+/// text for a `-bin` name, else printable ASCII.
+fn validTrailerValue(name: []const u8, value: []const u8) bool {
+    if (metadata_mod.isBinaryKey(name)) {
+        for (value) |ch| switch (ch) {
+            'A'...'Z', 'a'...'z', '0'...'9', '+', '/', '=' => {},
+            else => return false,
+        };
+        return true;
+    }
+    for (value) |ch| if (ch < 0x20 or ch > 0x7e) return false;
+    return true;
+}
 
 /// The four gRPC call shapes, told apart by a generated method's
 /// signature: one request or a queue of them, one response or a queue.
@@ -284,6 +346,10 @@ pub fn register(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service
 
 /// `register`, with options for this registration (a message size limit,
 /// data for the handlers).
+///
+/// The routes go on `router` itself: the router's own middleware
+/// (`router.use`) runs for them, but a group's (`router.group`) does not,
+/// even for transcoded REST routes whose paths start with its prefix.
 pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service: type, comptime impl: Service, options: RegisterOptions) void {
     // The routes hand it to each call; it lives as long as the router.
     const registration = router.arena.allocator().create(RegisterOptions) catch @panic("OOM");
@@ -361,6 +427,8 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         .data = options.data,
         .impl = .{
             .max_message_size = options.max_message_size,
+            .max_received_bytes = options.max_received_bytes,
+            .read_timeout = options.read_timeout,
             .protocol = kind.protocol,
             .codec = kind.codec,
         },
@@ -410,15 +478,11 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         timeout_ns = deadline.parseTimeout(value) catch
             return finish(&call, call.fail(.internal, "malformed grpc-timeout"));
     }
-    if (timeout_ns) |ns| {
-        const d = std.Io.Clock.Timestamp.now(req.io, .awake).addDuration(.{ .raw = .fromNanoseconds(@intCast(@min(ns, std.math.maxInt(i64)))), .clock = .awake });
-        call.deadline = d;
-        req.setTimeout(.{ .deadline = d });
-    } else {
-        // A call can outlive the server's request timeout; only the
-        // client's own deadline bounds it.
-        req.setTimeout(.none);
-    }
+    // A call can outlive the server's request timeout: the client's own
+    // deadline bounds it, and `max_call_duration`; reading the request
+    // messages is bounded by `read_timeout`.
+    setDeadline(&call, timeout_ns, options.max_call_duration);
+    defer boundTheRest(&call);
 
     if (is_get) call.impl.get_message = getMessage(&call) catch |err| return finish(&call, err);
 
@@ -539,6 +603,14 @@ fn finish(call: *Call, result: anyerror!void) !void {
         error.MessageTooLarge => {
             call.status = .resource_exhausted;
             call.status_message = "message larger than the limit";
+        },
+        error.CallLimitExceeded => {
+            call.status = .resource_exhausted;
+            call.status_message = "request messages over the call's limit";
+        },
+        error.ReadTimeout => {
+            call.status = .deadline_exceeded;
+            call.status_message = "request message not received in time";
         },
         error.DecodeFailed, error.TruncatedFrame, error.InvalidCompressedFlag, error.CompressionMismatch, error.MalformedCompressedMessage => {
             call.status = .internal;
@@ -686,6 +758,8 @@ pub fn serveTranscoded(
         .data = options.data,
         .impl = .{
             .max_message_size = options.max_message_size,
+            .max_received_bytes = options.max_received_bytes,
+            .read_timeout = options.read_timeout,
             .protocol = .http_json,
             .codec = .json,
         },
@@ -697,17 +771,27 @@ pub fn serveTranscoded(
     const streaming_request = comptime M.kind == .client_streaming or M.kind == .bidi_streaming;
     if (streaming_request) return finish(&call, call.fail(.unimplemented, unimplemented_streaming));
 
-    if (req.headers.get("grpc-timeout")) |value| {
-        const ns = deadline.parseTimeout(value) catch
-            return finish(&call, call.fail(.invalid_argument, "malformed grpc-timeout"));
-        const d = std.Io.Clock.Timestamp.now(req.io, .awake).addDuration(.{ .raw = .fromNanoseconds(@intCast(@min(ns, std.math.maxInt(i64)))), .clock = .awake });
-        call.deadline = d;
-        req.setTimeout(.{ .deadline = d });
-    } else {
-        req.setTimeout(.none);
-    }
+    const timeout_ns: ?u64 = if (req.headers.get("grpc-timeout")) |value|
+        deadline.parseTimeout(value) catch return finish(&call, call.fail(.invalid_argument, "malformed grpc-timeout"))
+    else
+        null;
 
-    const request = transcodedRequest(M.Request, body, &call, captures) catch |err| return finish(&call, err);
+    // The body is read under the server's request timeout, as on any
+    // route; the call's own deadline starts once the request is in.
+    defer boundTheRest(&call);
+    const request = transcodedRequest(M.Request, body, &call, captures) catch |err| {
+        // The body did not arrive (the request timed out, or the peer went
+        // away): nothing to answer, and the connection closes.
+        if (@as(anyerror, err) == error.ReadFailed or @as(anyerror, err) == error.Canceled) return err;
+        // Only a binding with a body can fail this way.
+        if (@as(anyerror, err) == error.UnsupportedMediaType) {
+            res.status = .unsupported_media_type;
+            res.body = try transcode.errorBody(call.arena, @backingInt(Code.invalid_argument), "the request body must be JSON (Content-Type: application/json)");
+            return;
+        }
+        return finish(&call, err);
+    };
+    setDeadline(&call, timeout_ns, options.max_call_duration);
     const result = switch (M.kind) {
         .unary => runTranscodedUnary(M, handler, response_body, &call, request),
         .server_streaming => runTranscodedStream(M, handler, response_body, &call, request),
@@ -725,11 +809,16 @@ fn transcodedRequest(comptime Req: type, comptime body: []const u8, call: *Call,
     if (body.len > 0) {
         var in_buf: [16 * 1024]u8 = undefined;
         var reader = try call.req.reader(&in_buf);
-        body_text = reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size + 1)) catch |err| switch (err) {
+        body_text = reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size +| 1)) catch |err| switch (err) {
             error.StreamTooLong => return error.MessageTooLarge,
             else => |e| return e,
         };
         if (body_text.len > call.impl.max_message_size) return error.MessageTooLarge;
+        // A body of another type is refused, so that a cross-site form or
+        // `text/plain` request, which browsers send without asking first,
+        // cannot reach the handler.
+        if (std.mem.trim(u8, body_text, " \t\r\n").len > 0 and !isJsonType(call.req.headers.get("content-type") orelse ""))
+            return error.UnsupportedMediaType;
     }
     const query = if (std.mem.indexOfScalar(u8, call.req.url, '?')) |q| call.req.url[q + 1 ..] else "";
     var diag: transcode.Diagnostic = .{};
@@ -737,6 +826,14 @@ fn transcodedRequest(comptime Req: type, comptime body: []const u8, call: *Call,
         error.InvalidArgument => call.fail(.invalid_argument, diag.message),
         error.OutOfMemory => error.OutOfMemory,
     };
+}
+
+/// Whether a Content-Type is JSON: `application/json` or a `+json` type,
+/// with any parameters.
+fn isJsonType(content_type: []const u8) bool {
+    const media = std.mem.trim(u8, content_type[0 .. std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len], " \t");
+    if (std.ascii.eqlIgnoreCase(media, "application/json")) return true;
+    return media.len > 5 and std.ascii.eqlIgnoreCase(media[media.len - 5 ..], "+json") and std.mem.indexOfScalar(u8, media, '/') != null;
 }
 
 fn runTranscodedUnary(comptime M: type, comptime handler: anytype, comptime response_body: []const u8, call: *Call, request: M.Request) !void {
@@ -801,42 +898,152 @@ fn percentEncode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     return out.items;
 }
 
-fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader) !?Req {
+/// Where request frames are read and inflated, to be freed as soon as
+/// they are decoded into the call's arena (the client's too).
+pub const scratch = if (@import("builtin").is_test)
+    std.testing.allocator
+else if (@import("builtin").single_threaded)
+    std.heap.page_allocator
+else
+    std.heap.smp_allocator;
+
+/// What a request message counts against `max_received_bytes` beyond its
+/// size: decoding allocates even for an empty one.
+pub const per_message_charge = 64;
+
+/// The next request message, or null at the end of the request. `streaming`
+/// for the reader of a client- or bidirectional-streaming call, whose
+/// client may wait before a message as long as it likes.
+fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader, streaming: bool) !?Req {
+    var owned: ?[]u8 = null;
+    defer if (owned) |p| scratch.free(p);
     const payload = switch (call.impl.protocol) {
         .connect => blk: {
             // The whole body is the one message (Connect GET: the query's).
             if (call.impl.unary_read) return null;
             call.impl.unary_read = true;
             if (call.impl.get_message) |message| break :blk message;
-            break :blk body.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size + 1)) catch |err| switch (err) {
-                error.StreamTooLong => return error.MessageTooLarge,
-                else => |e| return e,
-            };
+            break :blk try readWhole(call, &body.interface, call.impl.max_message_size +| 1, streaming);
         },
         .grpc_web_text => blk: {
             if (call.impl.text_input == null) {
-                const text = body.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size *| 2 +| 4096)) catch |err| switch (err) {
-                    error.StreamTooLong => return error.MessageTooLarge,
-                    else => |e| return e,
-                };
+                const text = try readWhole(call, &body.interface, call.impl.max_message_size *| 2 +| 4096, streaming);
                 call.impl.text_input = .fixed(try decodeBase64Chunks(call.arena, text));
             }
-            const msg = (try frame.readMessage(&call.impl.text_input.?, call.arena, call.impl.max_message_size, call.impl.request_compression)) orelse return null;
+            const msg = (try frame.readMessage(&call.impl.text_input.?, scratch, call.impl.max_message_size, call.impl.request_compression)) orelse return null;
+            owned = msg.payload;
             break :blk msg.payload;
         },
         else => blk: {
-            const msg = (try frame.readMessage(&body.interface, call.arena, call.impl.max_message_size, call.impl.request_compression)) orelse return null;
+            const msg = (try readFrame(call, &body.interface, streaming)) orelse return null;
+            owned = msg.payload;
             break :blk msg.payload;
         },
     };
     if (payload.len > call.impl.max_message_size) return error.MessageTooLarge;
-    switch (call.impl.codec) {
+    call.impl.received +|= payload.len + per_message_charge;
+    if (call.impl.received > call.impl.max_received_bytes) return error.CallLimitExceeded;
+    return try decodePayload(Req, call.arena, call.impl.codec, payload);
+}
+
+/// The next message frame off the body, read into `scratch` within the
+/// call's `read_timeout`.
+fn readFrame(call: *Call, reader: *std.Io.Reader, streaming: bool) !?frame.Decoder.DecodedMessage {
+    const timeout = call.impl.read_timeout orelse
+        return frame.readMessage(reader, scratch, call.impl.max_message_size, call.impl.request_compression);
+    if (streaming) {
+        // Waiting for the next message is not timed; its bytes are.
+        _ = reader.peekByte() catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
+    }
+    // A frame already whole in the buffer takes no waiting: no timer.
+    if (frameBuffered(reader)) return frame.readMessage(reader, scratch, call.impl.max_message_size, call.impl.request_compression);
+    const limit: dusty.Deadline = .init(call.io, .{ .duration = .{ .raw = timeout, .clock = .awake } });
+    return limit.run(frame.readMessage, .{ reader, scratch, call.impl.max_message_size, call.impl.request_compression }) catch |err| switch (err) {
+        error.Timeout => error.ReadTimeout,
+        else => |e| e,
+    };
+}
+
+/// Whether `reader` holds a whole message frame (header and payload).
+fn frameBuffered(reader: *std.Io.Reader) bool {
+    const buffered = reader.buffered();
+    if (buffered.len < frame.header_size) return false;
+    const length = std.mem.readInt(u32, buffered[1..5], .big);
+    return buffered.len - frame.header_size >= length;
+}
+
+/// The rest of the body, of at most `limit - 1` bytes, in the call's
+/// arena, read within the call's `read_timeout`.
+fn readWhole(call: *Call, reader: *std.Io.Reader, limit: usize, streaming: bool) ![]u8 {
+    const read = struct {
+        fn all(r: *std.Io.Reader, arena: std.mem.Allocator, max: usize) ![]u8 {
+            return r.allocRemaining(arena, .limited(max)) catch |err| switch (err) {
+                error.StreamTooLong => error.MessageTooLarge,
+                else => |e| e,
+            };
+        }
+    }.all;
+    const timeout = call.impl.read_timeout orelse return read(reader, call.arena, limit);
+    if (streaming) {
+        _ = reader.peekByte() catch |err| switch (err) {
+            error.EndOfStream => return &.{},
+            else => |e| return e,
+        };
+    }
+    const bound: dusty.Deadline = .init(call.io, .{ .duration = .{ .raw = timeout, .clock = .awake } });
+    return bound.run(read, .{ reader, call.arena, limit }) catch |err| switch (err) {
+        error.Timeout => error.ReadTimeout,
+        else => |e| e,
+    };
+}
+
+/// Once the call is done, what the server still does for the request
+/// (send the response, read what is left of the body) is bounded by
+/// `read_timeout` rather than by the call's deadline, or by none.
+fn boundTheRest(call: *Call) void {
+    const timeout = call.impl.read_timeout orelse return;
+    call.req.setTimeout(.{ .duration = .{ .raw = timeout, .clock = .awake } });
+}
+
+/// Sets the call's deadline: the client's (`client_ns`), capped at
+/// `max_call_duration`, or that alone. With neither, the request's own
+/// timeout is lifted: the call runs as long as its handler does.
+fn setDeadline(call: *Call, client_ns: ?u64, max_call_duration: ?std.Io.Duration) void {
+    var ns = client_ns;
+    if (max_call_duration) |max| {
+        const cap: u64 = @intCast(std.math.clamp(max.toNanoseconds(), 0, std.math.maxInt(i64)));
+        ns = if (ns) |n| @min(n, cap) else cap;
+    }
+    const n = ns orelse return call.req.setTimeout(.none);
+    const d = std.Io.Clock.Timestamp.now(call.io, .awake).addDuration(.{ .raw = .fromNanoseconds(@intCast(@min(n, std.math.maxInt(i64)))), .clock = .awake });
+    call.deadline = d;
+    call.req.setTimeout(.{ .deadline = d });
+}
+
+/// One request message's bytes decoded as `Req`, into `arena`, in `codec`:
+/// `error.DecodeFailed` for bytes that are not a `Req`. The result does
+/// not point into `payload`. Protobuf input nests at most zig-protobuf's
+/// `recursion_limit` deep; JSON input, `transcode.max_json_depth`.
+pub fn decodePayload(comptime Req: type, arena: std.mem.Allocator, codec: Codec, payload: []const u8) error{ DecodeFailed, OutOfMemory }!Req {
+    switch (codec) {
         .proto => {
             var reader: std.Io.Reader = .fixed(payload);
-            return Req.decode(&reader, call.arena) catch error.DecodeFailed;
+            return Req.decode(&reader, arena) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.DecodeFailed,
+            };
         },
         .json => {
-            const parsed = Req.jsonDecode(payload, .{ .ignore_unknown_fields = true }, call.arena) catch return error.DecodeFailed;
+            // Parsing into a message type that contains itself recurses
+            // once per level.
+            if (!transcode.jsonDepthWithin(payload, transcode.max_json_depth)) return error.DecodeFailed;
+            const parsed = Req.jsonDecode(payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }, arena) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.DecodeFailed,
+            };
             return parsed.value;
         },
     }
@@ -929,9 +1136,9 @@ fn writeBytes(call: *Call, bytes: []const u8) !void {
 }
 
 fn runUnary(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
-    const request = (try readRequest(M.Request, call, body)) orelse
+    const request = (try readRequest(M.Request, call, body, false)) orelse
         return call.fail(.unimplemented, "a unary call needs one request message");
-    if (try readRequest(M.Request, call, body) != null) return error.ExpectedUnaryMessage;
+    if (try readRequest(M.Request, call, body, false) != null) return error.ExpectedUnaryMessage;
     const response = try handler(call, request);
     try writeResponse(M.Response, call, response);
 }
@@ -939,9 +1146,9 @@ fn runUnary(comptime M: type, comptime handler: anytype, call: *Call, body: *dus
 const queue_len = 16;
 
 fn runServerStreaming(comptime M: type, comptime handler: anytype, call: *Call, body: *dusty.RequestBodyReader) !void {
-    const request = (try readRequest(M.Request, call, body)) orelse
+    const request = (try readRequest(M.Request, call, body, false)) orelse
         return call.fail(.unimplemented, "a server-streaming call needs one request message");
-    if (try readRequest(M.Request, call, body) != null) return error.ExpectedUnaryMessage;
+    if (try readRequest(M.Request, call, body, false) != null) return error.ExpectedUnaryMessage;
     var buf: [queue_len]M.Response = undefined;
     var responses: std.Io.Queue(M.Response) = .init(&buf);
     var group: std.Io.Group = .init;
@@ -977,7 +1184,7 @@ fn Tasks(comptime M: type, comptime handler: anytype) type {
         fn readRequests(call: *Call, body: *dusty.RequestBodyReader, requests: *std.Io.Queue(M.Request), result: *anyerror!void) std.Io.Cancelable!void {
             defer requests.close(call.io);
             while (true) {
-                const message = readRequest(M.Request, call, body) catch |err| {
+                const message = readRequest(M.Request, call, body, true) catch |err| {
                     result.* = err;
                     return;
                 } orelse return;
@@ -1062,6 +1269,31 @@ test "fuzz: Connect GET messages, base64 and gzip" {
         "\x07H4sIAAAAAAAA",
         "\x02\x1f\x8b\x08\x00",
     });
+}
+
+test "addTrailer refuses names and values that are not metadata" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
+    try call.addTrailer("x-ok", "a value: 1");
+    try call.addTrailer("x-empty", "");
+    try call.addTrailer("x-data-bin", "AAEC/w==");
+    try call.addBinaryTrailer("x-raw-bin", "\x00\r\n\xff");
+    for ([_][2][]const u8{
+        .{ "x-a", "one\r\ngrpc-status:0" },
+        .{ "x-a", "nul\x00" },
+        .{ "x-a", "caf\xc3\xa9" },
+        .{ "X-Upper", "v" },
+        .{ "x-a:b", "v" },
+        .{ "x-a\r\nb", "v" },
+        .{ "", "v" },
+        .{ "x-data-bin", "AA\r\n" },
+        .{ "x-data-bin", "not base64!" },
+    }) |case| try std.testing.expectError(error.InvalidMetadata, call.addTrailer(case[0], case[1]));
+    try std.testing.expectError(error.InvalidMetadata, call.addBinaryTrailer("x-text", "v"));
+    const items = call.impl.trailers.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings("AA0K/w", items[3].value);
 }
 
 test "percentEncode leaves printable ASCII and escapes the rest" {

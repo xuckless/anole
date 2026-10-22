@@ -237,14 +237,17 @@ struct consumer_state {
   on_event_fn on_event;
   pthread_t thread;
   atomic_int stopped;
+  atomic_int paused; /* tests: stop polling for a while */
+  atomic_int ws_big; /* tests: large WebSocket messages taken (not echoed) */
   int use_wait; /* anole_poll_wait instead of the fd */
-  _Alignas(8) unsigned char buf[256 * 1024];
+  _Alignas(8) unsigned char buf[1088 * 1024]; /* a 1000 KiB WebSocket message fits */
   /* for tests */
   anole_req held[64];
   atomic_int nheld;
   atomic_int sent, aborts, ws_open, ws_msgs, ws_closes, last_close_code;
   atomic_uintptr_t last_sent;
   atomic_ullong ws_handle;
+  atomic_ullong last_abort; /* the handle of the latest ANOLE_EV_ABORT */
   uint64_t batches, events;
   int spin_us; /* serve: CAPI_SPIN_US */
 };
@@ -276,6 +279,10 @@ static void *consumer_main(void *arg) {
   }
   int fd = anole_consumer_fd(cs->c);
   while (!atomic_load(&cs->stopped)) {
+    if (atomic_load(&cs->paused)) {
+      usleep(1000);
+      continue;
+    }
     struct pollfd p = {fd, POLLIN, 0};
     int pr = poll(&p, 1, 1000);
     if (pr < 0 && errno != EINTR) break;
@@ -379,9 +386,10 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
   }
   case R_HOLD:
   case R_SHORT: {
-    int i = atomic_fetch_add(&cs->nheld, 1);
+    int i = atomic_load(&cs->nheld);
     CHECK(i < 64);
     cs->held[i] = h;
+    atomic_store(&cs->nheld, i + 1); /* after the handle: wait_for(nheld) then reads it */
     break;
   }
   case R_USER: {
@@ -443,6 +451,7 @@ static void on_event(consumer_state *cs, const anole_event *ev) {
     break;
   }
   case ANOLE_EV_ABORT:
+    atomic_store(&cs->last_abort, ev->handle);
     atomic_fetch_add(&cs->aborts, 1);
     break;
   case ANOLE_EV_WS_OPEN: {
@@ -459,7 +468,9 @@ static void on_event(consumer_state *cs, const anole_event *ev) {
     const anole_ws_message_event *m = (const anole_ws_message_event *)ev;
     anole_str d = anole_event_str(m, m->data);
     atomic_fetch_add(&cs->ws_msgs, 1);
-    if (str_is(d, "bye")) {
+    if (d.len > 1000) {
+      atomic_fetch_add(&cs->ws_big, 1);
+    } else if (str_is(d, "bye")) {
       anole_str why = {"bye", 3};
       CHECK(anole_ws_close(ev->handle, 1000, why) == ANOLE_OK);
     } else if (str_is(d, "pub")) {
@@ -495,6 +506,49 @@ static void ws_send_frame(int fd, int opcode, const char *data, size_t len) {
   for (size_t i = 0; i < len; i++) payload[i] = (unsigned char)data[i] ^ hdr[2 + (i & 3)];
   CHECK(write(fd, hdr, 6) == 6);
   if (len) CHECK(write(fd, payload, len) == (ssize_t)len);
+}
+
+/* Writes binary frames of `len` bytes (zero mask) without blocking until the
+   server stops taking them for 500 ms or `max` are out; finishes a frame cut
+   short, blocking, once `paused` (the consumer's) is cleared. Returns the
+   frames sent; *accepted: the bytes the server took before it stopped. */
+static int ws_flood(int fd, size_t len, int max, size_t *accepted, atomic_int *paused) {
+  size_t flen = 14 + len;
+  unsigned char *f = calloc(1, flen);
+  CHECK(f);
+  f[0] = 0x82;
+  f[1] = 0x80 | 127;
+  for (int i = 0; i < 8; i++) f[2 + i] = (unsigned char)((uint64_t)len >> (56 - 8 * i));
+  for (size_t i = 0; i < len; i++) f[14 + i] = (unsigned char)(i * 31 + 7);
+  int fl = fcntl(fd, F_GETFL);
+  CHECK(fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0);
+  int sent = 0;
+  size_t off = 0;
+  double progress = now_ms();
+  while (sent < max) {
+    ssize_t n = write(fd, f + off, flen - off);
+    if (n > 0) {
+      off += (size_t)n;
+      progress = now_ms();
+      if (off == flen) {
+        sent++;
+        off = 0;
+      }
+      continue;
+    }
+    CHECK(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    if (now_ms() - progress > 500) break;
+    usleep(1000);
+  }
+  *accepted = (size_t)sent * flen + off;
+  atomic_store(paused, 0);
+  CHECK(fcntl(fd, F_SETFL, fl) == 0);
+  if (off > 0) {
+    CHECK(write(fd, f + off, flen - off) == (ssize_t)(flen - off));
+    sent++;
+  }
+  free(f);
+  return sent;
 }
 
 /* One frame from the server: its opcode, payload in out (NUL-terminated). */
@@ -807,6 +861,9 @@ static void test_main_server(void) {
       CHECK(anole_respond(h2, 200, &bad, 1, NULL, 0, 0) == ANOLE_E_INVALID);
       anole_header bad_value = {{"x-ok", 4}, {"a\r\nb", 4}};
       CHECK(anole_respond(h2, 200, &bad_value, 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      anole_header framing[] = {{{"Connection", 10}, {"close", 5}}, {{"transfer-encoding", 17}, {"chunked", 7}}};
+      CHECK(anole_respond(h2, 200, &framing[0], 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      CHECK(anole_respond(h2, 200, &framing[1], 1, NULL, 0, 0) == ANOLE_E_INVALID);
       CHECK(anole_respond(h2, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
       pthread_join(t, NULL);
       CHECK(b.r.status == 200);
@@ -848,13 +905,15 @@ static void test_main_server(void) {
 
   /* a client that leaves: ANOLE_EV_ABORT, and the handle is GONE */
   {
-    int ab0 = atomic_load(&cs.aborts);
     atomic_store(&cs.nheld, 0);
     int fd = dial(port);
     send_request(fd, "GET", "/hold", NULL, 0);
     CHECK(wait_for(&cs.nheld, 1));
     close(fd);
-    CHECK(wait_for(&cs.aborts, ab0 + 1));
+    /* This request's own ABORT: the deadline checks above may still have
+       theirs in flight. */
+    for (int i = 0; i < 1000 && atomic_load(&cs.last_abort) != cs.held[0]; i++) usleep(2000);
+    CHECK(atomic_load(&cs.last_abort) == cs.held[0]);
     CHECK(anole_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
   }
   printf("ok client gone\n");
@@ -891,6 +950,57 @@ static void test_main_server(void) {
     anole_str room = {"room", 4};
     CHECK(anole_ws_subscribe(atomic_load(&cs.ws_handle), room) == ANOLE_E_GONE);
     CHECK(anole_ws_close(atomic_load(&cs.ws_handle), 999, room) == ANOLE_E_INVALID);
+    /* a consumer that falls behind: the messages queued for it are bounded,
+       and the socket feeding it is held back (TCP backpressure) */
+    {
+      int big0 = atomic_load(&cs.ws_big);
+      atomic_store(&cs.paused, 1);
+      ws_connect(&c, port);
+      size_t accepted = 0;
+      int frames = ws_flood(c.fd, 1000 * 1024, 200, &accepted, &cs.paused);
+      CHECK(accepted < (size_t)48 << 20);
+      CHECK(wait_for(&cs.ws_open, 3));
+      for (int i = 0; i < 1000 && atomic_load(&cs.ws_big) < big0 + frames; i++) usleep(5000);
+      CHECK(atomic_load(&cs.ws_big) == big0 + frames);
+      close(c.fd);
+      CHECK(wait_for(&cs.ws_closes, 3));
+    }
+    /* a subscriber that stops reading holds up no publish: what is queued
+       for it is bounded (limits.ws_high_water), and another subscriber
+       still gets every publish */
+    {
+      static char chunk[60 * 1024]; /* fits a 16-bit frame length */
+      uint32_t x = 12345;
+      for (size_t i = 0; i < sizeof chunk; i++) {
+        x = x * 1103515245u + 12345u;
+        chunk[i] = (char)(x >> 24);
+      }
+      ws_connect(&c, port);
+      CHECK(wait_for(&cs.ws_open, 4));
+      for (int i = 0; i < 2000; i++) {
+        anole_status st = anole_ws_publish(s, room, ANOLE_WS_BINARY, chunk, sizeof chunk, 0);
+        CHECK(st == ANOLE_OK || st == ANOLE_E_AGAIN);
+        if (st == ANOLE_E_AGAIN) usleep(1000);
+      }
+      static conn_reader c2;
+      static char frame[64 * 1024];
+      ws_connect(&c2, port);
+      CHECK(wait_for(&cs.ws_open, 5));
+      int ok = 0;
+      for (int i = 0; i < 300 && !ok; i++) {
+        if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "after", 5, 0) == ANOLE_OK) ok = 1;
+        else usleep(10000);
+      }
+      CHECK(ok);
+      /* chunks still being fanned out may come first */
+      size_t n2 = 0;
+      int op;
+      while ((op = ws_read_frame(&c2, frame, sizeof frame, &n2)) == 2) {}
+      CHECK(op == 1 && strcmp(frame, "after") == 0);
+      close(c2.fd);
+      close(c.fd);
+      CHECK(wait_for(&cs.ws_closes, 5));
+    }
   }
   printf("ok websocket\n");
 

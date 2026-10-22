@@ -285,11 +285,14 @@ test "Status: reason phrases are RFC 9110's" {
 }
 
 /// An IMF-fixdate (RFC 9110 5.6.7), `Sun, 06 Nov 1994 08:49:37 GMT`, of
-/// `seconds` since the epoch. A time before 1970 is given as 1970.
+/// `seconds` since the epoch. A time before 1970 is given as 1970, and one
+/// after the year 9999 (which four digits cannot hold) as its last second.
 pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {
+    // 9999-12-31T23:59:59Z.
+    const last_second: i64 = 253402300799;
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(std.math.clamp(seconds, 0, last_second)) };
     const day = epoch_seconds.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -346,6 +349,11 @@ test "formatHttpDate: IMF-fixdate" {
     var buf: [29]u8 = undefined;
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", formatHttpDate(&buf, 784111777));
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", formatHttpDate(&buf, -5));
+    // A file time past the year 9999 (a stored mtime is anything) is
+    // given as the last second that fits.
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300799));
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300800));
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, std.math.maxInt(i64)));
 }
 
 test "Status: construct from llhttp_status_t" {
@@ -461,6 +469,23 @@ pub const Headers = struct {
         self.values[i] = value;
         self.hashes[i] = hashFn(name);
         self.len = i + 1;
+    }
+
+    /// Adds one field of an HTTP/2 or HTTP/3 request, as the HTTP/1.1
+    /// parser does: another entry for a repeated name, except `cookie`,
+    /// whose fields are joined onto the first one with "; " (RFC 9113
+    /// §8.2.3, RFC 9114 §4.2.1), in `allocator` (the request's arena).
+    pub fn addRequestField(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8) error{ TooManyHeaders, OutOfMemory }!void {
+        if (std.ascii.eqlIgnoreCase(name, "cookie")) {
+            const h = hashFn(name);
+            for (self.hashes[0..self.len], 0..) |hh, i| {
+                if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) {
+                    self.values[i] = try std.mem.concat(allocator, u8, &.{ self.values[i], "; ", value });
+                    return;
+                }
+            }
+        }
+        try self.add(name, value);
     }
 
     /// Returns the value of the first matching entry (case-insensitive), or null.
@@ -691,6 +716,29 @@ test "Headers: put replaces, add appends" {
     try std.testing.expectEqualStrings("c=3", it.next().?.value);
     try std.testing.expectEqualStrings("b=2", it.next().?.value);
     try std.testing.expectEqual(null, it.next());
+}
+
+test "Headers: addRequestField joins cookie crumbs and adds other repeats" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var headers = try Headers.init(a, 4);
+    try headers.addRequestField(a, "cookie", "a=1");
+    try headers.addRequestField(a, "accept", "text/html");
+    try headers.addRequestField(a, "Cookie", "b=2");
+    try headers.addRequestField(a, "accept", "application/json");
+    try headers.addRequestField(a, "cookie", "c=3");
+    try std.testing.expectEqualStrings("a=1; b=2; c=3", headers.get("cookie").?);
+    try std.testing.expectEqual(3, headers.count());
+    var it = headers.iterator();
+    _ = it.next();
+    try std.testing.expectEqualStrings("text/html", it.next().?.value);
+    try std.testing.expectEqualStrings("application/json", it.next().?.value);
+    try headers.addRequestField(a, "x", "y");
+    try std.testing.expectError(error.TooManyHeaders, headers.addRequestField(a, "z", "y"));
+    // A crumb joins even at capacity: it takes no entry.
+    try headers.addRequestField(a, "cookie", "d=4");
+    try std.testing.expectEqualStrings("a=1; b=2; c=3; d=4", headers.get("cookie").?);
 }
 
 test "Headers: error on overflow" {

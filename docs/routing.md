@@ -163,7 +163,7 @@ CSRF, auth and rate limits have their own namespaces (`anole.session`,
 | Middleware | What it does |
 | --- | --- |
 | `RequestId.init(.{})` | Sets `req.id` (128 random bits, hex) and sends it as `X-Request-Id`. `.header` renames it; `.trust_incoming = true` keeps a valid incoming one (only behind a proxy that sets or strips it). |
-| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path, status or error, time, client, request ID. |
+| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path (no query; `initWith(.{ .log_query = true })` logs it), status or error, time, client, request ID. |
 | `Compress.init()` | Sets `res.compress` on every response; see [Compression](#compression). |
 | `Cors.init(.{})` | CORS for browsers: any origin by default, preflights answered with 204; see [CORS](#cors). |
 | `ResponseCache` | Whole responses kept per executor and answered from memory; see [Response cache](#response-cache). |
@@ -218,6 +218,25 @@ its handler, for a while:
 app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed));
 ```
 
+> **A cached answer is served to everyone who asks for the same URL.** The
+> cache skips requests with `Authorization`, `Cookie`, `X-API-Key` or a TLS
+> client certificate, but it can't know every way your app tells users
+> apart. If a route's answer depends on a header of your own, the client's
+> address, or anything set by middleware before the cache, add that header
+> to `credential_headers`, or refuse those requests with `cacheable`;
+> otherwise one user's page goes to the next. Authentication that runs
+> after the cache is skipped on a hit, so put it before the cache.
+
+```zig
+// A session token in a header of the app's own.
+app.get("/me", anole.cached(.{ .ttl = .fromSeconds(5), .credential_headers = &.{ "Authorization", "Cookie", "X-API-Key", "X-Session-Token" } }, me));
+// Any per-request rule.
+fn anonymousOnly(req: *const anole.Request) bool {
+    return req.headers.get("X-Tenant") == null;
+}
+app.get("/news", anole.cached(.{ .ttl = .fromSeconds(5), .cacheable = anonymousOnly }, news));
+```
+
 One cache for several routes is `app.responseCache`, used through `with`,
 `group` or `use`, and invalidated when what it serves changes:
 
@@ -255,7 +274,8 @@ What is not:
   `no-cache` or `private`. Its `s-maxage`, else `max-age`, is how long it is
   kept (0: not at all); with neither, the cache's `ttl` (10 s by default).
 - Requests that carry credentials (`Authorization`, `Cookie`, `X-API-Key`;
-  `credential_headers`): they neither read the cache nor fill it.
+  `credential_headers`), or a TLS client certificate: they neither read the
+  cache nor fill it. Nor do requests `cacheable` returns false for.
   `.authenticated = true` lets them, for routes whose answer does not depend
   on who asks: the credentials are not part of the key.
 - `Vary: *`. Other `Vary` headers are honoured: each combination of the
@@ -281,9 +301,10 @@ When not to use it:
 
 - Pages that differ by who asks, unless the difference is in the URL or a
   `Vary` header: a session read from a cookie makes the request bypass the
-  cache, but a user identified some other way (a client certificate, a
-  header not in `credential_headers`) would get another user's page.
-  Add such headers to `credential_headers`, or keep the cache off the route.
+  cache, but a user identified some other way (a header not in
+  `credential_headers`, the client's address) would get another user's page.
+  Add such headers to `credential_headers`, refuse those requests in
+  `cacheable`, or keep the cache off the route.
 - Anything that must show a write at once, unless the write invalidates it.
 - Routes behind authorization middleware that runs after the cache (a
   route's own `with`, in a group whose cache comes first): a hit skips it.
@@ -312,7 +333,7 @@ log, metrics and tracing ([observability.md](observability.md)).
 | `id`, `trace_id`, `span_id` | Set by the request ID and tracing middleware. |
 | `setLocal(key, value)`, `local(T, key)` | Values a middleware hands to the handler for this request; see [Request locals](#request-locals). |
 | `route` | The matched route; `route.?.path` is its pattern. |
-| `arena` | An allocator freed after the response. |
+| `arena` | An allocator freed after the response. Not thread-safe: only the handler's task may use it. |
 | `io` | The server's `std.Io`; see [Async work](#async-work-in-handlers). |
 
 The body is read once, whole or as a stream:
@@ -384,7 +405,7 @@ res.body = "{\"id\":42}"; // must outlive the handler: a literal or res.arena
 | `render(content_type, template, args)` | A body from a template function or type. |
 | `writer()` | A buffered body writer; `end()` it before returning. |
 | `stream(buffer)` | Sends the headers now and streams the body; `end()` it. |
-| `startEventStream(buffer)` | Server-Sent Events: `send(data, .{ .event = ... })`. |
+| `startEventStream(buffer)` | Server-Sent Events: `send(data, .{ .event = ... })`. Every CR, LF or CRLF in `data` starts a new `data:` line, so data cannot add fields of its own; `event` and `id` with a CR or LF are refused. |
 | `sendFile(dir, path, options)` | A file as the body. |
 | `setCookie(name, value, options)` | Adds a `Set-Cookie`. |
 | `trailer(name, value)` | A trailer field after the body. |
@@ -506,7 +527,7 @@ Null disables a timeout.
 
 | Field | Default | Covers |
 | --- | --- | --- |
-| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. |
+| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. Over HTTP/2, a response still going out after its handler returned gets this long again (or `timeout.keepalive` when this is off) before the stream is reset, and any one write to a peer that stops reading is cut off after it. |
 | `timeout.read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). |
 | `timeout.keepalive` | 60 s | An idle connection between requests. |
 | `timeout.request_count` | none | Requests per keep-alive connection. |
@@ -524,6 +545,7 @@ req.setTimeout(.none); // a WebSocket or event stream
 | --- | --- | --- |
 | `max_body_size` | 1 MiB | `body()`, `bind()`, `json()` and forms fail: 413. Counted after decoding. |
 | `max_content_length` | none | A larger declared `Content-Length` is a 413 before the handler runs. Bounds streams too. |
+| `require_host` | true | An HTTP/1.1 request with no `Host`, or any with two, is a 400 (RFC 9112). |
 | `buffer_size` | 16 KiB | The request line and headers must fit: 431. |
 | `max_header_count` | 32 | Request headers: 431. |
 | `max_param_count`, `max_query_count` | 8, 32 | Path parameters and query values: 400. |
@@ -551,8 +573,9 @@ the client gets:
   stands for.
 - Request-body faults get a 4xx: `BodyTooBig` 413,
   `UnsupportedContentEncoding` 415, and 400 for `InvalidJsonBody` and
-  `MissingBody` (from `bind` and `json`) and a body that is not valid gzip or
-  zstd.
+  `MissingBody` (from `bind` and `json`), `IncompleteBody` (a body cut
+  short) and `MalformedBody` (broken chunked framing, or a body that is not
+  valid gzip or zstd). They are logged at `debug`, not `err`.
 - Anything else is logged at `err` and answered 500, and what the handler
   wrote is discarded. That includes `std.json`'s `SyntaxError` when the JSON
   was not the request's own (a config file, an upstream response).

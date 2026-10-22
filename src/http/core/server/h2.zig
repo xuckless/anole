@@ -231,6 +231,16 @@ pub fn Engine(comptime Ctx: type) type {
             writer_gone: bool = false,
             /// In `Registry`.
             node: std.DoublyLinkedList.Node = .{},
+            /// Streams whose handler is done with their response still
+            /// going out (`Stream.send_pending`).
+            send_pending: usize = 0,
+            /// What the streams' raised body buffers take
+            /// (`Http2.reading_window_budget`).
+            raised_bytes: usize = 0,
+            /// `refusedHead`'s token bucket: what is left, and the second
+            /// it was last refilled.
+            refused_tokens: u64 = 0,
+            refused_at: i64 = 0,
 
             /// Bumped (under the mutex) whenever the session may have output.
             /// The writer waits on it.
@@ -433,6 +443,15 @@ pub fn Engine(comptime Ctx: type) type {
 
             handler_done: bool = false,
             protocol_done: bool = false,
+            /// The handler let go with the response not all out: counted in
+            /// `Conn.send_pending`, and given `send_deadline` by the writer.
+            send_pending: bool = false,
+            /// When the rest of the response must be out by, else the
+            /// stream is reset (`sweepSends`).
+            send_deadline: ?std.Io.Clock.Timestamp = null,
+            /// The body buffer `raiseWindow` took from the connection's
+            /// `reading_window_budget`, given back when the stream is freed.
+            raised_bytes: usize = 0,
             /// Counted in the server's in-flight requests (by `startStream`)
             /// until it is freed.
             counted: bool = false,
@@ -463,7 +482,11 @@ pub fn Engine(comptime Ctx: type) type {
                 // Until the peer's ACK of SETTINGS, what is queued may be up
                 // to the default window, and the ACK still moves this one.
                 const acked = conn.ackedStreamWindow();
-                const buf = stream.arena.allocator().alloc(u8, @max(want, acked)) catch return;
+                const size: usize = @max(want, acked);
+                // The connection's raised windows share one budget; a stream
+                // past it reads at `stream_window`.
+                if (size > conn.config.reading_window_budget -| conn.raised_bytes) return;
+                const buf = stream.arena.allocator().alloc(u8, size) catch return;
                 var bigger: std.Io.Queue(u8) = .init(buf);
                 if (stream.body) |*q| {
                     // What is queued moves over, in order; nobody else gets
@@ -482,15 +505,16 @@ pub fn Engine(comptime Ctx: type) type {
                 if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want - pending) != 0) return;
                 stream.body = bigger;
                 stream.recv_window = want;
+                stream.raised_bytes = size;
+                conn.raised_bytes += size;
                 conn.kickWriter();
             }
 
-            /// A stream from the connection's spares (its arena reset, with
-            /// what it grew to kept), or a new one. Under the mutex.
+            /// A stream from the connection's spares (its arena trimmed when it
+            /// was released), or a new one. Under the mutex.
             fn create(conn: *Conn, id: i32) !*Stream {
                 if (conn.spare_streams.pop()) |stream| {
-                    var arena = stream.arena;
-                    _ = arena.reset(.{ .retain_with_limit = arena_retain_limit });
+                    const arena = stream.arena;
                     stream.* = .{ .conn = conn, .id = id, .arena = arena };
                     return stream;
                 }
@@ -508,12 +532,23 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Drops one side's hold, under the mutex. The second frees it.
             fn release(stream: *Stream, side: Side) void {
+                const conn = stream.conn;
                 switch (side) {
                     .handler => stream.handler_done = true,
                     .protocol => stream.protocol_done = true,
                 }
-                if (!(stream.handler_done and stream.protocol_done)) return;
-                const conn = stream.conn;
+                if (!stream.protocol_done) {
+                    // The response is still going out: from now on it is
+                    // bounded by the writer's send deadline.
+                    if (side == .handler and !stream.send_pending) {
+                        stream.send_pending = true;
+                        conn.send_pending += 1;
+                    }
+                    return;
+                }
+                if (!stream.handler_done) return;
+                if (stream.send_pending) conn.send_pending -= 1;
+                conn.raised_bytes -= stream.raised_bytes;
                 _ = conn.streams.remove(stream.id);
                 if (stream.counted) {
                     conn.open_streams -= 1;
@@ -525,6 +560,9 @@ pub fn Engine(comptime Ctx: type) type {
                     }
                 }
                 if (conn.spare_streams.items.len < max_spare_streams) {
+                    // Trimmed now, not on reuse: the budget above is given
+                    // back, so a spare must not keep a raised body window.
+                    _ = stream.arena.reset(.{ .retain_with_limit = arena_retain_limit });
                     if (conn.spare_streams.append(conn.allocator, stream)) |_| return else |_| {}
                 }
                 stream.destroy(conn.allocator);
@@ -577,6 +615,8 @@ pub fn Engine(comptime Ctx: type) type {
                 .allocator = server.allocator,
                 .config = server.config.http2,
                 .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
+                .refused_tokens = server.config.http2.refused_stream_burst,
+                .refused_at = std.Io.Clock.awake.now(server.io).toSeconds(),
             };
             defer conn.ready.deinit(conn.allocator);
             defer conn.awaiting.deinit(conn.allocator);
@@ -602,6 +642,9 @@ pub fn Engine(comptime Ctx: type) type {
                     // stream; the loop looks again.
                     if (stream.detached != null) {
                         abortDetached(stream);
+                        // Never attached by now (`conn.tasks` is null, and
+                        // attached tasks were joined): the abort let go.
+                        std.debug.assert(stream.detached == null);
                         continue;
                     }
                     // No handler task is left (a stream whose head never
@@ -617,7 +660,13 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             var group: std.Io.Group = .init;
-            defer group.cancel(conn.io);
+            defer {
+                group.cancel(conn.io);
+                // A canceled group takes tasks again: nothing may join it
+                // from here on (a detached response finished during the
+                // teardown would outlive the connection).
+                conn.tasks = null;
+            }
             conn.tasks = &group;
             // The writer and the streams stay on the connection's executor.
             try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
@@ -837,6 +886,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// or the buffer filled up) goes to `spill`, which the writer frees
         /// whenever it runs out of output, so an idle connection holds none.
         fn runWriter(conn: *Conn) !void {
+            const send_timeout = sendTimeout(conn);
             var spill: std.ArrayList(u8) = .empty;
             defer spill.deinit(conn.allocator);
             const writer = conn.connection.writer;
@@ -870,11 +920,17 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 if (writer.end > 0 or spill.items.len > 0) {
                     if (comptime @import("builtin").is_test) if (test_before_flush) |hook| try hook(conn.io);
+                    // A peer that stops reading must not hold the writer,
+                    // and with it every stream of the connection, for good.
+                    var write_timer: Timer = .init(null);
+                    defer write_timer.clear(conn.io);
+                    if (send_timeout) |d| write_timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
                     if (spill.items.len > 0) {
-                        writer.writeAll(spill.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
+                        writer.writeAll(spill.items) catch return writeFailed(conn, &write_timer);
                         spill.clearRetainingCapacity();
                     }
-                    writer.flush() catch return conn.connection.getWriteError() orelse error.Unexpected;
+                    writer.flush() catch return writeFailed(conn, &write_timer);
+                    write_timer.clear(conn.io);
                     conn.settleFinished(settled);
                     // The drain's final GOAWAY is on the wire now.
                     if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
@@ -928,8 +984,64 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.unlock();
                     continue;
                 }
-                try conn.io.futexWait(u32, &conn.write_gen.raw, gen);
+                // Responses whose handlers are done but that the peer is
+                // not taking (no window, or not reading) are bounded: past
+                // their deadline the stream is reset and freed.
+                switch (sweepSends(conn)) {
+                    .reset => continue,
+                    .none => try conn.io.futexWait(u32, &conn.write_gen.raw, gen),
+                    .until => |deadline| try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .deadline = deadline }),
+                }
             }
+        }
+
+        /// Why a write of the writer failed: its own timer firing is a
+        /// timeout, not the connection's cancel.
+        fn writeFailed(conn: *Conn, timer: *Timer) anyerror {
+            const cause = conn.connection.getWriteError() orelse return error.Unexpected;
+            if (cause == error.Canceled and timer.fired()) return error.WriteTimeout;
+            return cause;
+        }
+
+        /// How long a response may take to go out once its handler is
+        /// done: `timeout.request`, else `timeout.keepalive`; null when
+        /// both are off.
+        fn sendTimeout(conn: *const Conn) ?std.Io.Duration {
+            const t = conn.server.config.timeout;
+            return t.request orelse t.keepalive;
+        }
+
+        const Sweep = union(enum) { none, reset, until: std.Io.Clock.Timestamp };
+
+        /// Gives each stream waiting to send the rest of a finished
+        /// response its deadline, and resets those past it. Takes the
+        /// mutex.
+        fn sweepSends(conn: *Conn) Sweep {
+            conn.lock();
+            defer conn.unlock();
+            if (conn.send_pending == 0) return .none;
+            const limit = sendTimeout(conn) orelse return .none;
+            const now = std.Io.Clock.Timestamp.now(conn.io, .awake);
+            var next: ?std.Io.Clock.Timestamp = null;
+            var reset = false;
+            var it = conn.streams.valueIterator();
+            while (it.next()) |entry| {
+                const stream = entry.*;
+                if (!stream.send_pending or stream.reset) continue;
+                const deadline = stream.send_deadline orelse blk: {
+                    const d = now.addDuration(.{ .raw = limit, .clock = .awake });
+                    stream.send_deadline = d;
+                    break :blk d;
+                };
+                if (now.compare(.gte, deadline)) {
+                    log.debug("HTTP/2 stream {d}: response not taken in time, reset", .{stream.id});
+                    stream.reset = true;
+                    _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_CANCEL);
+                    reset = true;
+                } else if (next == null or deadline.compare(.lt, next.?)) next = deadline;
+            }
+            if (reset) return .reset;
+            return if (next) |d| .{ .until = d } else .none;
         }
 
         /// After the writer shut the send side: the peer, seeing the end,
@@ -1135,12 +1247,37 @@ pub fn Engine(comptime Ctx: type) type {
 
             request.headers = http.Headers.init(arena, server.config.request.max_header_count) catch return error.OutOfMemory;
             var too_many = false;
-            for (stream.headers.items) |f| request.headers.put(f.name, f.value) catch {
-                too_many = true;
-                break;
-            };
-            if (!too_many and request.headers.get("Host") == null and stream.authority.len > 0) {
-                request.headers.put("Host", stream.authority) catch {
+            // Repeated fields stay separate entries, as over HTTP/1.1,
+            // except cookie crumbs, joined into one (RFC 9113 §8.2.3).
+            var hosts: usize = 0;
+            var host_field: []const u8 = "";
+            for (stream.headers.items) |f| {
+                if (std.mem.eql(u8, f.name, "host")) {
+                    hosts += 1;
+                    host_field = f.value;
+                }
+                request.headers.addRequestField(arena, f.name, f.value) catch |err| switch (err) {
+                    error.TooManyHeaders => {
+                        too_many = true;
+                        break;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+            }
+            // One host, from `:authority` when it is there (RFC 9113
+            // §8.3.1): a `host` field naming another, or two of them, make
+            // the request ambiguous.
+            if (!too_many and (hosts > 1 or (hosts == 1 and stream.authority.len > 0 and
+                !std.ascii.eqlIgnoreCase(host_field, stream.authority))))
+            {
+                response.status = .bad_request;
+                {
+                    try response.write();
+                    return .done;
+                }
+            }
+            if (!too_many and hosts == 0 and stream.authority.len > 0) {
+                request.headers.add("Host", stream.authority) catch {
                     too_many = true;
                 };
             }
@@ -1160,9 +1297,9 @@ pub fn Engine(comptime Ctx: type) type {
                     response.content_type = .text;
                     response.body = "413 Content Too Large\n";
                     {
-                    try response.write();
-                    return .done;
-                }
+                        try response.write();
+                        return .done;
+                    }
                 };
             }
             server.applyForwarded(request, conn.connection);
@@ -1173,9 +1310,9 @@ pub fn Engine(comptime Ctx: type) type {
                 } else {
                     response.status = .expectation_failed;
                     {
-                    try response.write();
-                    return .done;
-                }
+                        try response.write();
+                        return .done;
+                    }
                 }
             }
 
@@ -1248,14 +1385,15 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// The response goes on from a task: its body writes may now wait
         /// for the peer, as a handler task's do.
-        fn detachedAttach(d: *Detached) *std.Io.Group {
+        fn detachedAttach(d: *Detached) ?*std.Io.Group {
             const ex = exchangeOf(d);
             const stream = ex.sink_state.stream;
             const conn = stream.conn;
             conn.lock();
             defer conn.unlock();
+            const tasks = conn.tasks orelse return null;
             stream.inline_mode = false;
-            return conn.tasks.?;
+            return tasks;
         }
 
         fn detachedEnter(d: *Detached) void {
@@ -2003,9 +2141,41 @@ pub fn Engine(comptime Ctx: type) type {
             if (stream.reset) stream.cancelHandler();
             // Reset with its response detached: the owner lets go now.
             if (stream.reset) abortDetached(stream);
+            // A stream whose head never completed (refused for its size,
+            // or by nghttp2's checks) has no handler and never will: free
+            // it now rather than with the connection. One waiting for its
+            // body to run inline (`await_body`) is let go by
+            // `startAwaiting`.
+            if (!stream.counted and !stream.await_body) {
+                stream.handler_done = true;
+                if (!conn.closing) refusedHead(conn, session);
+            }
             stream.release(.protocol);
             conn.kickWriter();
             return 0;
+        }
+
+        /// Counts a stream the server refused before it reached a handler.
+        /// Each costs the server the head it decoded but costs the peer
+        /// only a few bytes (the resets are the server's, which
+        /// `stream_reset_burst` does not count), so past
+        /// `refused_stream_burst`, refilled at `refused_stream_rate` a
+        /// second, the connection ends with GOAWAY(ENHANCE_YOUR_CALM).
+        /// Under the mutex.
+        fn refusedHead(conn: *Conn, session: ?*c.nghttp2_session) void {
+            const now = std.Io.Clock.awake.now(conn.io).toSeconds();
+            const burst = conn.config.refused_stream_burst;
+            if (now > conn.refused_at) {
+                const refill = std.math.mul(u64, @intCast(now - conn.refused_at), conn.config.refused_stream_rate) catch burst;
+                conn.refused_tokens = @min(burst, conn.refused_tokens +| refill);
+                conn.refused_at = now;
+            }
+            if (conn.refused_tokens > 0) {
+                conn.refused_tokens -= 1;
+                return;
+            }
+            log.debug("HTTP/2: too many refused streams, closing the connection", .{});
+            _ = c.nghttp2_session_terminate_session(session, c.NGHTTP2_ENHANCE_YOUR_CALM);
         }
 
         /// Data provider: takes what the handler queued without waiting.

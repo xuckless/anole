@@ -18,13 +18,37 @@ pub const Time = struct {
     }
 
     /// The instant `ms` milliseconds after the epoch (MongoDB's date).
+    /// Beyond what microseconds hold (about 292,000 years either way), the
+    /// end of the range; `fromMillisChecked` says so instead.
     pub fn fromMillis(ms: i64) Time {
-        return .{ .us = ms * std.time.us_per_ms };
+        return .{ .us = ms *| std.time.us_per_ms };
     }
 
-    /// The instant `s` seconds after the epoch (a Unix timestamp).
+    /// The instant `s` seconds after the epoch (a Unix timestamp). Beyond
+    /// what microseconds hold, the end of the range; `fromSecondsChecked`
+    /// says so instead.
     pub fn fromSeconds(s: i64) Time {
-        return .{ .us = s * std.time.us_per_s };
+        return .{ .us = s *| std.time.us_per_s };
+    }
+
+    /// As `fromMillis`, or `error.OutOfRange` beyond what it holds.
+    pub fn fromMillisChecked(ms: i64) error{OutOfRange}!Time {
+        return .{ .us = std.math.mul(i64, ms, std.time.us_per_ms) catch return error.OutOfRange };
+    }
+
+    /// As `fromSeconds`, or `error.OutOfRange` beyond what it holds: for
+    /// numbers read from storage, which may hold anything.
+    pub fn fromSecondsChecked(s: i64) error{OutOfRange}!Time {
+        return .{ .us = std.math.mul(i64, s, std.time.us_per_s) catch return error.OutOfRange };
+    }
+
+    /// A Julian day number (SQLite's `julianday()`), to the millisecond;
+    /// `error.OutOfRange` for one beyond what `Time` holds, or not a number.
+    pub fn fromJulianDay(days: f64) error{OutOfRange}!Time {
+        const ms = @round((days - 2440587.5) * 86400e3);
+        // NaN fails both comparisons; 9.2e15 ms is within i64 microseconds.
+        if (!(ms >= -9.2e15 and ms <= 9.2e15)) return error.OutOfRange;
+        return fromMillisChecked(@intFromFloat(ms));
     }
 
     /// Whole milliseconds, rounded down (MongoDB's date).
@@ -237,6 +261,22 @@ test "Time: format, and parse back" {
         const text = try std.fmt.bufPrint(&buf, "{f}", .{Time.fromMicros(us)});
         try testing.expectEqual(us, (try Time.parse(text)).us);
     }
+}
+
+test "Time: numbers beyond the range" {
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    try testing.expectError(error.OutOfRange, Time.fromSecondsChecked(max));
+    try testing.expectError(error.OutOfRange, Time.fromSecondsChecked(min));
+    try testing.expectError(error.OutOfRange, Time.fromMillisChecked(max / 10));
+    try testing.expectEqual(@as(i64, 5_000_000), (try Time.fromSecondsChecked(5)).us);
+    try testing.expectEqual(max, Time.fromSeconds(max).us);
+    try testing.expectEqual(min, Time.fromMillis(min).us);
+    for ([_]f64{ 1e300, -1e300, std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 1e13 }) |jd| {
+        try testing.expectError(error.OutOfRange, Time.fromJulianDay(jd));
+    }
+    try testing.expectEqual(@as(i64, 0), (try Time.fromJulianDay(2440587.5)).us);
+    try testing.expectEqual(@as(i64, 86_400_000_000), (try Time.fromJulianDay(2440588.5)).us);
 }
 
 test "Time: the forms databases print" {

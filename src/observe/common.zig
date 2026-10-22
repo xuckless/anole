@@ -7,7 +7,9 @@ const dusty = @import("dusty");
 /// Serves GET `path` with `handler(state, req, res)`. dusty's handlers carry
 /// no state of their own, so `state` rides in a middleware of the route's
 /// own, which answers and ends the chain; the global middleware still run
-/// first. `state` must outlive the router.
+/// first. `state` must outlive the router. With `listener`, only requests
+/// on the listener of that name (`req.listener.name`) are served; the
+/// others get 404, as if the route were not there.
 pub fn serve(
     comptime Ctx: type,
     router: *dusty.Router(Ctx),
@@ -15,17 +17,20 @@ pub fn serve(
     comptime T: type,
     state: *T,
     comptime handler: fn (*T, *dusty.Request, *dusty.Response) anyerror!void,
+    listener: ?[]const u8,
 ) void {
     const Bound = struct {
         state: *T,
+        listener: ?[]const u8,
 
         pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, _: anytype) !void {
+            if (self.listener) |name| if (!std.mem.eql(u8, req.listener.name, name)) return error.NotFound;
             return handler(self.state, req, res);
         }
     };
     const arena = router.arena.allocator();
     const bound = arena.create(Bound) catch @panic("OOM");
-    bound.* = .{ .state = state };
+    bound.* = .{ .state = state, .listener = listener };
     const chain = arena.alloc(dusty.Middleware(Ctx), 1) catch @panic("OOM");
     chain[0] = .init(bound);
     // Never reached: the middleware above answers.

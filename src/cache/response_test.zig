@@ -108,6 +108,21 @@ const Routes = struct {
         count(12);
         try res.print(.text, "shared {d}", .{ran(12)});
     }
+
+    /// Who asks, by a header of the app's own.
+    fn whoami(req: *Request, res: *Response) !void {
+        count(13);
+        try res.print(.text, "user {s}", .{req.headers.get("X-Session-Token") orelse "anonymous"});
+    }
+
+    fn noTenant(req: *const Request) bool {
+        return req.headers.get("X-Tenant") == null;
+    }
+
+    fn tenant(req: *Request, res: *Response) !void {
+        count(14);
+        try res.print(.text, "tenant {s}", .{req.headers.get("X-Tenant") orelse "none"});
+    }
 };
 
 const Got = struct {
@@ -265,6 +280,41 @@ test "ResponseCache: what is kept, Vary, HEAD, expiry, invalidation and metrics"
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, pages, registry });
+    try app.listen("127.0.0.1:0");
+    try checking.await(app.io());
+}
+
+test "ResponseCache: credential_headers and cacheable keep per-user answers out" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    const by_token = comptime ResponseCache.Options{ .ttl = .fromSeconds(60), .credential_headers = &.{ "Authorization", "Cookie", "X-API-Key", "X-Session-Token" } };
+    app.get("/whoami", handlers.cached(by_token, Routes.whoami));
+    app.get("/tenant", handlers.cached(.{ .ttl = .fromSeconds(60), .cacheable = Routes.noTenant }, Routes.tenant));
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io = a.io();
+            try a.waitReady();
+            var arena_state: std.heap.ArenaAllocator = .init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const port = a.addresses()[0].ip.getPort();
+
+            try testing.expectEqualStrings("user alice", (try fetch(io, arena, port, .get, "/whoami", &.{.{ "X-Session-Token", "alice" }})).body);
+            try testing.expectEqualStrings("user bob", (try fetch(io, arena, port, .get, "/whoami", &.{.{ "X-Session-Token", "bob" }})).body);
+            // Without the header the answer is everyone's, and kept.
+            _ = try fetch(io, arena, port, .get, "/whoami", &.{});
+            const before = ran(13);
+            try testing.expectEqualStrings("user anonymous", (try fetch(io, arena, port, .get, "/whoami", &.{})).body);
+            try testing.expectEqual(before, ran(13));
+
+            try testing.expectEqualStrings("tenant a", (try fetch(io, arena, port, .get, "/tenant", &.{.{ "X-Tenant", "a" }})).body);
+            try testing.expectEqualStrings("tenant b", (try fetch(io, arena, port, .get, "/tenant", &.{.{ "X-Tenant", "b" }})).body);
+            try testing.expectEqualStrings("tenant none", (try fetch(io, arena, port, .get, "/tenant", &.{})).body);
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }

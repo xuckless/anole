@@ -34,7 +34,8 @@ A `Key` has an optional `kid`, exactly one `alg`, and its `material`
 (`.hmac`, `.rsa` with big-endian `n` and `e`, `.p256`, `.p384` or `.ed25519`).
 It supports HS256/384/512, RS256/384/512, PS256/384/512, ES256, ES384 and
 EdDSA, all on Zig's `std.crypto`. `Policy` holds `issuer`, `audience`,
-`leeway_seconds` (60), `require_exp` (true) and `max_age_seconds`. `now` is
+`typ`, `leeway_seconds` (60), `require_exp` (true), `require_iat` (false),
+`max_age_seconds` and `allow_any_audience` (false). `now` is
 in Unix seconds, for example `std.Io.Clock.real.now(req.io).toSeconds()`.
 
 Each key verifies only its own algorithm. A token whose `alg` differs from
@@ -47,8 +48,18 @@ These defaults are enforced, not optional:
   and so does any `crit` header.
 - `exp` is required (`error.MissingExpiry`). Turn off `require_exp` only for
   tokens that really have no expiry.
-- `nbf` and `iat` are checked when present. `iss`, `aud` (a string or an
-  array) and `max_age_seconds` are checked when you set them in the policy.
+- `nbf` and `iat` are checked when present (`require_iat` makes `iat`
+  mandatory). `iss`, `aud` (a string or an array), the header's `typ` and
+  `max_age_seconds` are checked when you set them in the policy.
+- Set `issuer` and `audience` whenever the keys also sign tokens for
+  others, as an identity provider's do: without `audience`, a token the
+  provider issued to another application verifies too. A `Keyring` refuses
+  a policy without `audience` (`error.AudienceRequired`; `RequireJwt`
+  answers 500 and logs the fix) unless you set `allow_any_audience = true`
+  for keys that sign for this application alone.
+- `typ = "at+jwt"` accepts only RFC 9068 access tokens (case and an
+  `application/` prefix aside), so an ID token from the same provider is
+  not taken for one; use it when your provider marks its access tokens.
 - An HMAC comparison runs in constant time.
 - An HMAC secret shorter than its hash (32 bytes for HS256, 48 for HS384,
   64 for HS512, as RFC 7518 requires) verifies nothing: `verify` fails with
@@ -72,7 +83,7 @@ go there), and refuses the request as RFC 6750 says:
 | A token that does not verify, or misses a required claim | 401, `error="invalid_token"` (expired ones also get an `error_description`) |
 | A token without the required scopes | 403, `error="insufficient_scope"` |
 | The keyring could not fetch the keys | 503, so the client keeps its token |
-| The HMAC key is shorter than its hash (`error.WeakKey`) | 500, and an error in the log |
+| The HMAC key is shorter than its hash (`error.WeakKey`), or a keyring policy has no `audience` (`error.AudienceRequired`) | 500, and an error in the log |
 
 ```zig
 const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
@@ -144,6 +155,13 @@ token's `kid` is new, wait for that one fetch. If it fails, they get
 `error.JwksFetchFailed`. Requests the current keys can verify don't wait,
 and verification itself runs outside the lock.
 
+When the provider can't be reached, keys past their TTL stay in use for
+`stale_seconds` (a day), so an outage there doesn't fail every request at
+once. A failed fetch isn't retried for `retry_seconds` (5), doubling with
+each failure up to `max_retry_seconds` (300); meanwhile requests use the
+stale keys, or get `error.JwksFetchFailed` at once when there are none, and
+a warning is logged per failed fetch.
+
 ## OIDC sign-in (Google, Apple)
 
 `anole.auth.oidc` is a relying party. It is never a provider. It runs the
@@ -195,7 +213,10 @@ const id = rp.finish(req.arena, req.io, anole.client(req), callback, saved) catc
     return refuse(res);
 };
 for ([_][]const u8{ "oidc_state", "oidc_nonce", "oidc_verifier" }) |k| req.session.remove(k);
-try req.session.set("user", id.subject); // the stable account key
+// The stable account key is the pair (issuer, subject): look the account up
+// by both, never by subject alone, nor by email.
+const account = try accounts.findOrCreate(id.issuer, id.subject);
+try req.session.set("user", account.id);
 try anole.session.regenerate(req);       // a new session id for the signed-in session
 ```
 
@@ -203,9 +224,20 @@ try anole.session.regenerate(req);       // a new session id for the signed-in s
 `res.fail(.bad_request, "sign-in failed")`. Returning `error.BadRequest`
 from the handler gives the same status with the status line as the body.
 
-`Identity` holds `subject`, `email`, `email_verified`, `name`, every claim,
-and the access and refresh tokens. Key accounts on `subject`. Trust `email`
-only when `email_verified` is true.
+`Identity` holds `issuer`, `subject`, `email`, `email_verified`, `name`,
+every claim, and the access and refresh tokens. Key accounts on `issuer`
+and `subject` together: a `sub` is unique only within its issuer, so with
+two providers, or one whose tenants share keys, `sub` alone can name two
+people. Trust `email` only when `email_verified` is true, and never link an
+existing account by email alone.
+
+The checks go beyond the signature: `iat` must be present, `azp` must be
+your `client_id` whenever the token has one (and the token must have one
+when it names several audiences), and the token request doesn't follow
+redirects, so the code and client secret never go anywhere but the
+`token_endpoint`. `Provider.discover` refuses an issuer or endpoint that
+isn't `https://` (`error.InsecureEndpoint`); plain `http://` is accepted
+only on loopback, for a test provider on the same machine.
 
 The callback is a top-level navigation from the provider. Its `state` check
 is its CSRF protection, so don't put the CSRF middleware on that route.
@@ -235,8 +267,9 @@ const rp: anole.auth.oidc.RelyingParty = .{
 
 With `form_post`, the callback is a cross-site `POST`, so read `code` and
 `state` from `req.formData()`. Browsers don't send a `SameSite=Lax` cookie
-on that request. Set `cookie_opts.same_site = .none` on the session
-middleware, and keep `secure = true`. Apple sends `email_verified` as a
+on that request. Set `.cookie_opts = .{ .same_site = .none }` on the session
+middleware; the other attributes keep their defaults (`Secure`, `HttpOnly`,
+`Path=/`). Apple sends `email_verified` as a
 string; Anole reads it as a boolean. Apple sends the user's name only once,
 in a `user` form field on the first sign-in, so `Identity.name` is null for
 Apple.
@@ -258,8 +291,14 @@ a key (`error.SessionKeyMissing`, with the fix in the log), so a forgotten
 key never gives cookies anyone could forge or read. `Config` also has
 `cookie_name` (`anole_session`), `ttl_seconds` (24 h,
 renewed by each response that carries the session) and `cookie_opts`
-(`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`). Chrome, Firefox and curl
+(`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`; setting one field keeps
+the others' defaults). Chrome, Firefox and curl
 keep `Secure` cookies on `http://localhost`; anywhere else, serve over HTTPS.
+In production, name the cookie `__Host-anole_session` (`.cookie_name`): the
+browser then keeps it to this exact host and path `/`, so a sibling
+subdomain can't set or overwrite it. `init` refuses a `__Host-` name whose
+`cookie_opts` lack `Secure` or `Path=/`, or set a `Domain`
+(`error.CookiePrefixMismatch`).
 
 There are three ways to keep sessions:
 
@@ -292,8 +331,20 @@ var rs: anole.session.RedisStore = .{ .client = redis, .gpa = gpa }; // keys "an
 var sessions = try anole.session.Middleware.init(.{ .store = rs.store() });
 ```
 
-A store is a vtable of `load`, `save` and `destroy` (`anole.session.Store`),
-so you can bring your own.
+`MemoryStore` sweeps expired sessions as new ones are written and keeps at
+most `max_entries` (100,000; `MemoryStore.initOptions(gpa, io, .{
+.max_entries = n })`): past it, the session written longest ago is dropped,
+with a warning in the log.
+
+A store is a vtable of `load`, `save`, `destroy`, `update` and `touch`
+(`anole.session.Store`), so you can bring your own. After the handler, the
+middleware writes a session the request changed with `update`, and renews
+one it only read with `touch`; both must do nothing and return false when
+the session no longer exists (Redis `SET ... XX` and `EXPIRE`). That way a
+request still running when the user logged out, or when another request
+called `regenerate`, cannot bring the old session back. A store without
+`update` or `touch` gets `load` followed by `save`, which leaves a short
+window for that.
 
 ### A new session at sign-in
 
@@ -314,6 +365,10 @@ A sealed cookie has no ID. `regenerate` makes the middleware seal it afresh
 stays valid until it expires, but it holds only what the session held
 before the sign-in, and nobody can forge one with a user in it without the
 key.
+
+`regenerate` also drops the session's CSRF token, so a token handed out
+before the sign-in is refused after it; the next `csrf.token(req)` makes a
+new one.
 
 `regenerate` uses one of the session's 16 entries, under
 `anole.session.regenerate_key`, until the response is saved. The middleware
@@ -447,12 +502,16 @@ answers 429 with `Retry-After`.
 var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle_ms 300_000
 defer limiter.deinit();
 var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
-var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKey, .on_error = .deny });
+var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKeyOwner, .on_error = .deny });
 ```
 
-- `MemoryLimiter` is for one process. It holds at most `max_entries` keys,
-  dropping the least recently used one first, and forgets keys idle for
-  `idle_ms`.
+- `MemoryLimiter` is for one process. It holds at most `max_entries` keys
+  and forgets a key idle for `idle_ms` once its bucket is full again. When
+  the table is full, a new key takes the place of a least recently used
+  bucket that is full again, else of one that still has tokens; a throttled
+  bucket is never pushed out, so a flood of new keys can't refill it. If
+  every bucket near that end is throttled, new keys share one overflow
+  bucket until room frees up.
 - `RedisLimiter` (`.{ .client = redis, .gpa = gpa }` with `redis` from
   `app.redis(.{})`, keys `anole:rl:<key>`)
   is shared by every node. One Lua script refills and takes atomically, on
@@ -460,18 +519,34 @@ var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100
 - Your own limiter implements `anole.ratelimit.Limiter`: a vtable with
   `take(ptr, key, cost, policy) !Result`.
 
-The key is the client's address by default (`ratelimit.clientAddress`).
+The key is the client's address by default (`ratelimit.clientAddress`): an
+IPv4 address on its own, an IPv6 address by its /64 network, since one
+subscriber or host usually gets a whole /64 and could otherwise use a new
+address, and a fresh bucket, for every request.
+`.key = anole.ratelimit.clientAddressPrefix(56)` groups by another prefix
+(48 or 56 for providers that hand out larger blocks, 128 for each address
+alone).
 Behind a proxy, set `.server = .{ .trusted_proxy_hops = 1 }` in the server
 options so that the address comes from `X-Forwarded-For`, or turn on the
 listener's `proxy_protocol`.
 Otherwise every client shares the proxy's bucket. To limit by something
 else, such as an account or an API key, pass `.key`, a
 `fn (req: *anole.Request, buf: []u8) []const u8` that returns the key,
-written into `buf` (128 bytes) or pointing into the request:
+written into `buf` (128 bytes) or pointing into the request.
+
+Key only on an identity that was checked, never on a raw header: a client
+picks any header value it likes, and each new value is a fresh bucket. Put
+the rate limit after the authentication middleware and use what it
+verified (`anole.auth.apikey.owner(req)`, `anole.auth.subject(req)`),
+falling back to the client's address:
 
 ```zig
-fn byApiKey(req: *anole.Request, _: []u8) []const u8 {
-    return anole.auth.apikey.fromRequest(req) orelse "anonymous";
+// After anole.auth.apikey.Middleware, so the owner is a key that exists.
+fn byApiKeyOwner(req: *anole.Request, buf: []u8) []const u8 {
+    if (anole.auth.apikey.owner(req)) |owner| {
+        return std.fmt.bufPrint(buf, "key:{s}", .{owner}) catch owner;
+    }
+    return anole.ratelimit.clientAddress(req, buf);
 }
 ```
 

@@ -25,6 +25,9 @@ var no_buf: [0]u8 = .{};
 pub const EventWriter = struct {
     body: *StreamingBodyWriter,
     line_in_progress: bool,
+    /// The last write ended in a CR, so an LF that starts the next one
+    /// belongs to it (one CRLF line break, split across the writes).
+    pending_cr: bool = false,
     interface: std.Io.Writer,
     /// The real cause behind the generic `error.WriteFailed` that the
     /// `std.Io.Writer` interface has to return. An event long enough to
@@ -63,16 +66,29 @@ pub const EventWriter = struct {
         return total;
     }
 
+    /// CR, LF and CRLF each end a line, as they do for the peer's parser
+    /// (WHATWG HTML 9.2.6): data that could end one any other way would
+    /// start a line of its own that is not `data:`.
     fn writeLines(self: *EventWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
         const out = &self.body.interface;
         var rest = bytes;
-        while (std.mem.findScalar(u8, rest, '\n')) |idx| {
+        if (self.pending_cr) {
+            self.pending_cr = false;
+            if (rest[0] == '\n') rest = rest[1..];
+        }
+        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
             if (!self.line_in_progress) try out.writeAll("data: ");
-            const line_end = if (idx > 0 and rest[idx - 1] == '\r') idx - 1 else idx;
-            try out.writeAll(rest[0..line_end]);
+            try out.writeAll(rest[0..idx]);
             try out.writeAll("\n");
             self.line_in_progress = false;
-            rest = rest[idx + 1 ..];
+            var next = idx + 1;
+            if (rest[idx] == '\r') {
+                if (next == rest.len) {
+                    self.pending_cr = true;
+                } else if (rest[next] == '\n') next += 1;
+            }
+            rest = rest[next..];
         }
         if (rest.len > 0) {
             if (!self.line_in_progress) {
@@ -155,11 +171,15 @@ pub const EventStream = struct {
 
     fn sendEvent(w: *std.Io.Writer, data: []const u8, opts: Options) std.Io.Writer.Error!void {
         try sendFields(w, opts);
-        var it = std.mem.splitScalar(u8, data, '\n');
-        while (it.next()) |line| {
-            const stripped = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-            try w.print("data: {s}\n", .{stripped});
+        // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
+        var rest = data;
+        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
+            try w.print("data: {s}\n", .{rest[0..idx]});
+            var next = idx + 1;
+            if (rest[idx] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
+            rest = rest[next..];
         }
+        try w.print("data: {s}\n", .{rest});
         try w.writeAll("\n");
         // One event, one write: an event held back is an event the peer
         // has not had, and the next one may be a long way off.
@@ -441,8 +461,9 @@ pub const StreamingBodyWriter = struct {
     /// on the way to the framing.
     compressor: ?*StreamCompressor = null,
     /// Everything a write to the connection can fail with, resolved to its
-    /// cause rather than the `std.Io.Writer` sentinel.
-    pub const Error = Response.SendError;
+    /// cause rather than the `std.Io.Writer` sentinel, and
+    /// `ContentLengthMismatch` for a write past a declared Content-Length.
+    pub const Error = Response.SendError || error{ContentLengthMismatch};
 
     const vtable: std.Io.Writer.VTable = .{
         .drain = drain,
@@ -488,6 +509,16 @@ pub const StreamingBodyWriter = struct {
             try self.record(compressor.write(pending, data, splat));
             return w.consume(total);
         }
+
+        // Never past a declared length: the bytes after it would reach
+        // the peer (or a proxy reusing the connection) as the start of the
+        // next response. Nothing of this write goes out, and the
+        // connection is not reused.
+        if (self.res.content_length) |declared| if (!self.res.chunked and total > declared -| self.res.body_sent) {
+            self.res.keepalive = false;
+            self.err = error.ContentLengthMismatch;
+            return error.WriteFailed;
+        };
 
         try self.record(self.res.sendFramed(pending, data, splat, total));
         self.res.body_sent += total;
@@ -640,6 +671,12 @@ const StreamCompressor = struct {
         return w.consume(total);
     }
 };
+
+/// Framing fields the server writes itself (`Response.header` refuses
+/// them).
+pub fn isReservedHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or std.ascii.eqlIgnoreCase(name, "Connection");
+}
 
 /// Whether a response with this status carries a body at all. A 1xx, a
 /// 204 and a 304 do not, so a peer reads whatever follows their head as
@@ -946,21 +983,30 @@ pub const Response = struct {
     /// or the arena. Fails once the headers have gone out, on a name or
     /// value that is not valid on the wire, and past
     /// `ServerConfig.response.max_header_count`.
+    ///
+    /// `Transfer-Encoding` and `Connection` are the server's, which frames
+    /// the body and decides about keep-alive (`keepalive`): setting either
+    /// is `error.InvalidHeaderName`.
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
         if (self.headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
+        if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
         try self.putHeader(name, value);
     }
 
     /// Adds a header even if the response has one by that name already:
     /// for a field that may repeat or lists its values, such as `Vary`.
+    /// `Content-Length` never repeats: a second one replaces the first.
+    /// The names `header` refuses, this refuses too.
     pub fn addHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         if (self.headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
+        if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self.putHeader(name, value);
         if (!self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.add(name, value);
     }
@@ -1374,6 +1420,8 @@ pub const Response = struct {
         // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
         // WebSocket (RFC 8441), which a sink does not offer.
         if (self.sink != null) return null;
+        // RFC 6455 §4.2.1: a GET, with a key of 16 bytes in base64.
+        if (req.method != .get) return null;
         // Validate upgrade headers
         const upgrade = req.headers.get("Upgrade") orelse return null;
         if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
@@ -1385,6 +1433,7 @@ pub const Response = struct {
         if (!std.mem.eql(u8, version, "13")) return null;
 
         const key = req.headers.get("Sec-WebSocket-Key") orelse return null;
+        if (!WebSocket.validKey(key)) return null;
 
         // Compute accept key
         var accept_key: [28]u8 = undefined;
@@ -1393,7 +1442,7 @@ pub const Response = struct {
         // Send 101 Switching Protocols response
         self.status = .switching_protocols;
         try self.header("Upgrade", "websocket");
-        try self.header("Connection", "Upgrade");
+        try self.putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
         // The connection is a WebSocket's from here: small windows, and the
@@ -2354,6 +2403,55 @@ test "StreamingBodyWriter: reports a body that does not match the declared lengt
     try std.testing.expectError(error.ContentLengthMismatch, body.end());
 }
 
+test "StreamingBodyWriter: never writes past a declared Content-Length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "5");
+
+    var body_buf: [4]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hel");
+    // Past the length: refused, and nothing of it reaches the wire, which
+    // would carry the extra bytes as the start of the next response.
+    try std.testing.expectError(error.WriteFailed, body.interface.writeAll("lo, and then some"));
+    try std.testing.expectEqual(@as(?StreamingBodyWriter.Error, error.ContentLengthMismatch), body.err);
+    try std.testing.expect(!response.keepalive);
+    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "then") == null);
+}
+
+test "Response: framing headers are the server's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try std.testing.expectError(error.InvalidHeaderName, response.header("Transfer-Encoding", "chunked"));
+    try std.testing.expectError(error.InvalidHeaderName, response.addHeader("transfer-encoding", "chunked"));
+    try std.testing.expectError(error.InvalidHeaderName, response.header("Connection", "keep-alive"));
+    try std.testing.expectError(error.InvalidHeaderName, response.addHeader("Connection", "close"));
+    // A second Content-Length replaces the first rather than joining it.
+    try response.addHeader("Content-Length", "5");
+    try response.addHeader("Content-Length", "2");
+    response.body = "hi";
+    try response.write();
+    const written = conn_writer.buffered();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "Content-Length"));
+    try std.testing.expect(std.mem.endsWith(u8, written, "Content-Length: 2\r\n\r\nhi"));
+}
+
 test "StreamingBodyWriter: rejects a Content-Length it cannot parse" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3243,6 +3341,69 @@ test "EventWriter: splatBytesAll" {
     try ew.end();
 
     try std.testing.expectEqualStrings("data: ababab\n\n", try t.events());
+}
+
+test "EventStream: a bare CR in data is a line break, never the start of a field" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    try t.stream.send("hi\revent: admin\rid: 9\r\rdata: x\r\ny\nz", .{});
+
+    try std.testing.expectEqualStrings(
+        "data: hi\ndata: event: admin\ndata: id: 9\ndata: \ndata: data: x\ndata: y\ndata: z\n\n",
+        try t.events(),
+    );
+}
+
+test "EventWriter: a bare CR is a line break, and a CRLF split across writes is one" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    var ew = try t.stream.startSend(.{});
+    try ew.interface.writeAll("a\revent: x\r");
+    try ew.interface.writeAll("\nb\r");
+    try ew.interface.writeAll("c\r");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: a\ndata: event: x\ndata: b\ndata: c\n\n", try t.events());
+}
+
+test "fuzz: SSE data never adds a line that is not data" {
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var buf: [8192]u8 = undefined;
+            var t: TestEventStream = undefined;
+            try t.init(&buf);
+            defer t.deinit();
+            // What one event can expand to fits the test stream's buffers.
+            const data = input[0..@min(input.len, 64)];
+            const half = data.len / 2;
+            var ew = try t.stream.startSend(.{});
+            try ew.interface.writeAll(data[0..half]);
+            try ew.interface.writeAll(data[half..]);
+            try ew.end();
+            try t.stream.send(data, .{});
+            try expectOnlyData(try t.events());
+        }
+
+        /// Every line the WHATWG parser would see (CR, LF and CRLF end
+        /// one) is a `data:` line or the blank line ending an event.
+        fn expectOnlyData(out: []const u8) !void {
+            var i: usize = 0;
+            var start: usize = 0;
+            while (i < out.len) : (i += 1) {
+                if (out[i] != '\r' and out[i] != '\n') continue;
+                const line = out[start..i];
+                if (line.len > 0 and !std.mem.startsWith(u8, line, "data: ")) return error.InjectedField;
+                if (out[i] == '\r' and i + 1 < out.len and out[i + 1] == '\n') i += 1;
+                start = i + 1;
+            }
+        }
+    }.check, &.{ "", "a\rb", "a\r\nb\n", "\r\r\r", "x\revent: y\rid: 1\r\rdata: z" });
 }
 
 test "Response: resetBody replaces a half written body" {

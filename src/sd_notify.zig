@@ -31,12 +31,58 @@ const log = std.log.scoped(.anole);
 /// False on Windows, where there is no systemd to tell.
 pub const supported = builtin.os.tag != .windows;
 
-/// Sends `state` to the socket in `NOTIFY_SOCKET`, if there is one. Best
-/// effort: a failure is logged, never returned, as with `sd_notify`.
+/// Sends `state` to the socket in `NOTIFY_SOCKET` (or the one `take` kept),
+/// if there is one. Best effort: a failure is logged, never returned, as
+/// with `sd_notify`.
 pub fn notify(environ: std.process.Environ, state: []const u8) void {
     if (comptime !supported) return;
-    const path = environ.getPosix("NOTIFY_SOCKET") orelse return;
+    const path = environ.getPosix("NOTIFY_SOCKET") orelse taken() orelse return;
     send(path, state) catch |err| log.warn("sd_notify to {s}: {t}", .{ path, err });
+}
+
+// ---------------------------------------------------------------------------
+// Taking NOTIFY_SOCKET out of the environment
+
+/// What replaces the `NOTIFY_SOCKET` entry in the process's environment
+/// (`take`): an array of entries cannot shrink in place, and other code
+/// holds its length.
+pub const placeholder = "ANOLE_NOTIFY_SOCKET_TAKEN=1";
+
+var taken_buf: [128]u8 = undefined;
+var taken_len: usize = 0;
+
+/// The socket `take` kept, if any.
+pub fn taken() ?[]const u8 {
+    return if (taken_len > 0) taken_buf[0..taken_len] else null;
+}
+
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+/// Keeps `NOTIFY_SOCKET` for this process and takes it out of the
+/// environment that processes started from here inherit (handlers that run
+/// programs, the C library's own children), as `sd_notify(3)` does with
+/// `unset_environment`: under `NotifyAccess=all` any of them could otherwise
+/// tell systemd the service is stopping, or name another main process. A
+/// restart passes it on to the successor itself (`handoff.spawn`). Call once,
+/// early, with the process's real environment (`init.minimal.environ`),
+/// whose entry array it rewrites.
+pub fn take(environ: std.process.Environ) void {
+    if (comptime !supported) return;
+    const key = "NOTIFY_SOCKET=";
+    const entries = @constCast(environ.block.slice.ptr);
+    for (environ.block.slice, 0..) |entry, i| {
+        const e = std.mem.span(entry orelse break);
+        if (!std.mem.startsWith(u8, e, key)) continue;
+        const value = e[key.len..];
+        if (value.len > 0 and value.len <= taken_buf.len) {
+            @memcpy(taken_buf[0..value.len], value);
+            taken_len = value.len;
+        }
+        entries[i] = placeholder;
+    }
+    // The C library's environment, when it no longer shares the array
+    // (something called setenv since start).
+    if (std.c.getenv("NOTIFY_SOCKET") != null) _ = unsetenv("NOTIFY_SOCKET");
 }
 
 pub const SendError = error{ InvalidNotifySocket, Unsupported, SocketFailed, SendFailed };
@@ -142,6 +188,38 @@ const Listener = struct {
         _ = c.close(self.fd);
     }
 };
+
+test "sd_notify: take keeps the socket and takes NOTIFY_SOCKET out of the environment" {
+    if (comptime !supported) return error.SkipZigTest; // no systemd on Windows
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cwd_buf: [256]u8 = undefined;
+    if (c.getcwd(&cwd_buf, cwd_buf.len) == null) return error.SkipZigTest;
+    const cwd = std.mem.sliceTo(&cwd_buf, 0);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/.zig-cache/tmp/{s}/n", .{ cwd, tmp.sub_path });
+    if (path.len >= 104) return error.SkipZigTest;
+    const listener = try Listener.bind(path);
+    defer listener.close();
+
+    var entry_buf: [128]u8 = undefined;
+    const entry = try std.fmt.bufPrintSentinel(&entry_buf, "NOTIFY_SOCKET={s}", .{path}, 0);
+    // A writable array, as the process's own environment is.
+    var entries = [_:null]?[*:0]const u8{ "A=1", entry.ptr, "B=2" };
+    const environ: std.process.Environ = .{ .block = .{ .slice = &entries } };
+    take(environ);
+    defer taken_len = 0;
+    // Gone for anything that reads the environment (and so for children)...
+    try std.testing.expect(environ.getPosix("NOTIFY_SOCKET") == null);
+    try std.testing.expectEqualStrings(placeholder, std.mem.span(entries[1].?));
+    try std.testing.expectEqualStrings("A=1", std.mem.span(entries[0].?));
+    try std.testing.expectEqualStrings("B=2", std.mem.span(entries[2].?));
+    // ...but this process still reports.
+    try std.testing.expectEqualStrings(path, taken().?);
+    var buf: [64]u8 = undefined;
+    ready(environ, null);
+    try std.testing.expectEqualStrings("READY=1", try listener.receive(&buf));
+}
 
 test "sd_notify: a datagram to NOTIFY_SOCKET, by path and (Linux) by abstract name" {
     if (comptime !supported) return error.SkipZigTest; // no systemd on Windows

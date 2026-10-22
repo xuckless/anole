@@ -3,7 +3,482 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.1.1 (2026-10-22)
+
+### Security
+
+Changes that need action or alter behaviour are also collected under
+Breaking below.
+
+#### HTTP/3 and WebTransport
+
+- HTTP/3: long-header packets whose connection ID is longer than QUIC
+  allows (20 bytes), and Version Negotiation packets sent to the server,
+  are dropped before any lookup. Previously one such datagram could crash
+  the process. Every deployment with HTTP/3 on should upgrade; no
+  configuration change is needed.
+- HTTP/3 server: the request head's size (64 KiB, as advertised in
+  SETTINGS) and field count (`request.max_header_count`) are enforced as
+  the fields arrive; a larger head is answered 431. Before, the whole head
+  was kept in memory however large it was.
+- HTTP/3 server: cookie fields sent separately are joined with "; " and
+  other repeated request fields are all kept, as over HTTP/1.1. Before,
+  only the last of each was kept, which could drop or shadow a session
+  cookie.
+- WebTransport: a peer's stream that is reset before it names its session
+  is now freed. A peer's streams now hold its stream credit until the
+  handler releases them (before, credit came back as soon as a stream
+  ended, even if it was never accepted), and at most 100 streams each way
+  wait to be accepted per session. A peer that opens streams a handler
+  does not accept now waits for credit instead of growing server memory.
+- HTTP/3 server: a new connection that is given up right after its first
+  datagram (for example because that datagram also carried an error) no
+  longer frees state that a 0-RTT request started from the same datagram
+  still uses. Only servers with `early_data` on were affected.
+- HTTP/3 server: a request the client resets now keeps counting against
+  `max_streams_bidi` until its handler returns. Before, its stream credit
+  came back at once, so handlers of reset requests could pile up past the
+  limit (the HTTP/3 form of HTTP/2's "rapid reset").
+- HTTP/3: `http3.hq_interop_root` (the QUIC interop runner's HTTP/0.9 file
+  server, which bypasses the router and middleware) is refused with
+  `error.HqInteropNotAllowed` unless the program's root file declares
+  `pub const anole_hq_interop = true;`. Breaking only for programs that
+  set it.
+
+#### HTTP/2 and HTTP/1.1
+
+- HTTP/2: a stream refused before it reached a handler (a header list past
+  `max_header_list_size`, or one nghttp2 rejects) is freed when it closes;
+  it used to be kept until the connection ended, so one connection could
+  hold memory without bound. A peer whose streams keep being refused is
+  sent GOAWAY(ENHANCE_YOUR_CALM) past `http2.refused_stream_burst` (100,
+  refilled at `refused_stream_rate`, 10 a second).
+- HTTP/2: a response whose handler has returned must be sent within
+  `timeout.request` (or `timeout.keepalive` when that is off); a peer that
+  gives it no flow-control window gets the stream reset, and a connection
+  whose peer stops reading is closed after one write blocks that long.
+  Such streams used to be held, and graceful drains to wait, indefinitely.
+- HTTP/2: the raised body windows of one connection's streams share
+  `http2.reading_window_budget` (16 MiB), so a connection with many uploads
+  at once no longer takes 1 MiB per stream without bound. docs/server.md
+  now sizes HTTP/2 memory per stream.
+- HTTP/2: a request's repeated header fields are all kept (they used to
+  replace each other), and cookie fields sent separately are joined with
+  "; ", so no cookie is lost. `:authority` is the request's host; a `host`
+  field that names another host gets 400.
+- HTTP/1.1 requests without a `Host` field, and requests with two, get 400
+  (RFC 9112). `server.request.require_host = false` accepts them again.
+- A streamed response with a `Content-Length` no longer writes past that
+  length: the write fails with `ContentLengthMismatch` (now part of
+  `StreamingBodyWriter.Error`) and the connection is closed after the
+  response. **Breaking:** `res.header`/`res.addHeader` refuse
+  `Transfer-Encoding` and `Connection` (`error.InvalidHeaderName`); use
+  `res.keepalive = false` to close the connection. A second
+  `Content-Length` from `addHeader` replaces the first.
+- A request body with broken framing (chunked) or a corrupt gzip/deflate
+  coding is answered 400 and logged at `debug`, instead of 500 at `err`.
+  Reading it fails with the new `error.MalformedBody` (was the parser's
+  `InvalidChunkSize`/`ParseFailed`/... or zlib's `CorruptInput`).
+- HTTP/1.1: the rest of a request body a handler left unread is drained
+  only until the request's deadline, and at most `timeout.keepalive` (10 s
+  when that is off); a request already past its deadline is not drained
+  and its connection closes. A handler that lifted its timeout, or caught
+  the timeout's error and returned, let a slow client hold the connection
+  indefinitely.
+- Static files: a file modified after the year 9999 no longer crashes the
+  server while formatting `Last-Modified`; the date is capped at 9999.
+- `anole.Server` answers 425 Too Early to unsafe requests marked
+  `Early-Data: 1` on every server, not only when HTTP/3 is on, so a proxy
+  that accepts TLS early data in front of an HTTP/1.1 or HTTP/2 server no
+  longer gets replayable POSTs through. `app.use(anole.early_data.Guard{})`
+  is no longer needed (it is harmless).
+
+#### PROXY protocol and forwarding headers
+
+- PROXY protocol v2: a header whose TLV length is near 65535 is refused
+  instead of crashing the process (or, in ReleaseFast, reading past a
+  buffer). Only listeners with `proxy_protocol = true` were affected.
+- PROXY protocol listeners take `proxy_protocol_from`, a list of networks
+  in CIDR notation allowed to send the header; connections from other
+  peers are closed. Optional; recommended when the port is reachable by
+  more than the load balancer.
+- `trusted_proxy_hops`: only the selected `X-Forwarded-For` entry is parsed,
+  so a malformed entry the client added no longer makes the proxy's address
+  the client's; a selected entry that is not an address reports `0.0.0.0`.
+- **Breaking:** `X-Forwarded-Host` is honoured only with the new
+  `server.trust_forwarded_host = true`. `X-Forwarded-Proto` stays on with
+  `trusted_proxy_hops` and can be turned off with
+  `trust_forwarded_proto = false`. Make sure the proxy overwrites both.
+
+#### TLS
+
+- TLS listeners offer only ECDHE key exchange with AES-GCM or
+  ChaCha20-Poly1305 over TLS 1.2 (BoringSSL's default also allowed RSA key
+  exchange and CBC with SHA-1). TLS 1.2 clients that support none of these
+  can no longer connect. Docs now state that revocation (CRL, OCSP) is not
+  checked and that `.dev_self_signed` certificates are CAs for development
+  only.
+- Mutual TLS: a TLS session resumes only under the client-auth settings
+  (CAs and mode) it was verified under, on TCP and QUIC listeners, and a
+  certificate reload that changes them no longer carries the ticket keys
+  over. Removing a client CA and reloading now stops clients whose
+  certificates it vouched for from resuming with older sessions.
+
+#### Clients (HTTP, HTTP/2, HTTP/3, gRPC)
+
+- HTTP/2 client: a graceful GOAWAY from the server no longer ends the
+  connection at once; the streams it covers finish. A stream released
+  after a GOAWAY is reset and freed once the session has closed it, never
+  while the session can still reach it.
+- HTTP/2 and HTTP/3 clients: a response's header fields are bounded by the
+  new `ConnectOptions.max_header_list_size` (64 KiB, advertised to the
+  server), and at most five informational (1xx) responses may precede the
+  final one. Past either the stream fails with `error.HeadersTooLarge` or
+  `error.TooManyInterimResponses` (new members of `StreamError`). The HTTP/2
+  client also reads a final response that follows a 1xx correctly now.
+- HTTP client: a URL whose path or query holds a space, a control
+  character or a byte past 0x7f is refused with `error.InvalidUrl`, for
+  `fetch`, redirects, WebSocket upgrades and HTTP/2 alike, instead of being
+  written into the request line. Percent-encode such bytes; URLs that
+  carried raw UTF-8 now fail (breaking).
+- HTTP client redirects: across origins the `Referer` is only the origin
+  (browsers' default policy); a 307 or 308 that would carry the body to
+  another host is not followed, and its response is returned (breaking for
+  callers that relied on it; `ClientConfig.check_redirect` can allow it).
+  New: `ClientConfig.check_redirect` (follow, stop or fail each redirect)
+  and `ClientConfig.deny_private_addresses` (refuse loopback, private,
+  link-local and similar addresses, after DNS, on every hop). Redirects are
+  followed in a loop, so the stack no longer grows with `max_redirects`.
+- HTTPS client: a response body delimited by the end of the connection
+  (no Content-Length, not chunked) now fails with
+  `error.TlsConnectionTruncated` when the TLS connection ends without
+  close_notify, instead of being returned as complete.
+- TLS clients: the cache of trust stores built from CA bundles and the
+  HTTP/3 session-ticket cache are keyed by SHA-256 of their contents, so
+  two different CA sets or client identities can never share an entry.
+- gRPC client: a call takes at most `Channel.max_received_bytes` (64 MiB,
+  `CallOptions.max_received_bytes` per call) of response messages in all,
+  then is canceled with RESOURCE_EXHAUSTED, so a server streaming without
+  end cannot grow the caller's arena without bound. Response frames are read
+  and inflated outside the arena and freed once decoded. Behaviour change
+  for clients of streams that send more than 64 MiB.
+
+#### JSON, gRPC and transcoding
+
+- `anole.json.parse` / `readBody`: a whole-number float just past the range
+  of an integer field (such as `9223372036854775808.0` for an `i64`) is
+  refused as `error.Overflow` (400 from `readBody`) instead of stopping the
+  process. No configuration change.
+- `anole.json.parse`: input nested deeper than the new
+  `ParseOptions.max_depth` (128) fails with `error.NestingTooDeep`, which
+  only a type that contains itself can reach, and `YYJSON_READ_INSITU` in
+  `ParseOptions.flags` is ignored (the input is read-only). `json.Error`
+  gains `NestingTooDeep` (breaking for exhaustive switches).
+- gRPC, gRPC-Web, Connect and transcoded routes: protobuf decoding is
+  hardened (zig-protobuf with Anole's patches): messages and groups nest at
+  most 100 levels, string and bytes lengths are checked against the input
+  before memory is allocated for them, and Timestamps with an out-of-range
+  month, day or time are refused. Connect and gRPC-Web JSON request
+  messages nested deeper than 100 levels fail the call. Such requests fail
+  with INTERNAL (INVALID_ARGUMENT, 400, on transcoded routes) instead of
+  stopping the process or allocating up to 2 GiB. No configuration change.
+- JSON transcoding: a query parameter can no longer override a field the
+  path template sets when the template names it by its JSON name
+  (`{bookId}`) and the query by its proto name (`?book_id=`), or the other
+  way around. The path's value stands, as documented. No configuration
+  change.
+- gRPC: new per-registration limits (`RegisterOptions`). `read_timeout`
+  (default 30 s) bounds how long a request message may take to arrive,
+  which a call without `grpc-timeout` used not to bound at all;
+  `max_received_bytes` (default 64 MiB) bounds what one call receives in
+  all, since decoded messages stay in the call's arena; `max_call_duration`
+  (default none) caps every call. A message frame's memory now grows with the
+  bytes that arrive instead of being allocated in full from its 5-byte
+  header, and frames are freed once decoded. Transcoded routes read the body
+  under the server's request timeout before the call's deadline applies.
+  Behaviour change: a client-streaming call that receives more than 64 MiB
+  in all now fails with RESOURCE_EXHAUSTED; raise `max_received_bytes` for
+  such services.
+- JSON transcoding: a binding with a `body` answers 415 to a non-empty body
+  whose `Content-Type` is not `application/json` (or `+json`). Breaking for
+  clients that post JSON with another content type.
+- gRPC: `Call.addTrailer` refuses names that are not metadata keys and
+  values that are not printable ASCII (base64 text under a `-bin` name) with
+  `error.InvalidMetadata`, so client data echoed into a trailer cannot add
+  trailer lines in gRPC-Web. New `Call.addBinaryTrailer` encodes raw bytes.
+  Breaking for handlers that passed raw bytes or upper-case names.
+
+#### WebSocket and Server-Sent Events
+
+- **Breaking:** WebSocket and WebTransport handshakes from a browser page of
+  another origin are refused with 403. `UpgradeOptions.allowed_origins` and
+  `webtransport.AcceptOptions.allowed_origins` default to `.same_origin`
+  (the request's own host and port); list other origins with
+  `.{ .list = &.{"https://app.example.com"} }`, or `.any` for endpoints that
+  do not rely on cookies. Clients that send no `Origin` are not affected.
+  C ABI WebSocket routes take `"origins"`. Apps whose pages connect from
+  another origin must list it. See docs/websocket.md#origins.
+- WebSocket over HTTP/1.1: the handshake must be a GET with a
+  `Sec-WebSocket-Key` of 16 bytes in base64 (RFC 6455 §4.2.1); anything else
+  is not upgraded.
+- WebSocket over HTTP/1.1: a control frame whose header claims more than
+  125 bytes, or that is fragmented, is refused (close 1002) before its
+  payload is waited for, on callback sockets too; control-frame payloads no
+  longer take memory from the message being assembled. No configuration
+  change needed.
+- WebSocket over HTTP/2 and HTTP/3: RSV1 on a control frame or a
+  continuation is refused (close 1002) when permessage-deflate is in use; a
+  ping or pong over 125 bytes from the handler fails with
+  `error.LargeControlFrame`; a close goes out once even when two tasks
+  close at the same time, and a frame cut short ends sending.
+- WebSocket `Rooms`: a broadcast no longer waits for any member. It queues
+  the message once for every member, and each member's own task sends its
+  queue in order on the socket's executor. A member's queue is bounded
+  (`Rooms.Options.max_queued_bytes`, 1 MiB); a member whose send has been
+  stuck while its queue is full is closed (`on_full = .close`, the default,
+  after `close_after_ms`) or skips messages (`.drop`). `broadcast` now
+  returns for how many members the message was queued. New:
+  `Rooms.initOptions`. Joining a room twice is one membership, so one
+  `leave` always ends it.
+- permessage-deflate buffers no longer come from the request's arena, which
+  is not thread-safe over HTTP/1.1, so a broadcast compressing for a socket
+  from another executor cannot corrupt it. The docs now say that
+  `req.arena` and `call.arena` are not thread-safe.
+- Server-Sent Events: a bare CR in event data now ends a `data:` line, as
+  LF and CRLF already did (in `send` and in `startSend`'s writer, also when
+  a CRLF is split across two writes). Before, data relayed from one user
+  could add `event`, `id` or `retry` fields to the events other users got.
+  No configuration change needed.
+
+#### Sessions, cookies and auth
+
+- `setCookie` refuses a `path` or `domain` containing `;` or a control
+  character (`error.InvalidCookiePath`, `error.InvalidCookieDomain`), so a
+  value taken from a request cannot add cookie attributes.
+- Session cookies: `cookie_opts` of `anole.session.Config` and of
+  `anole.http.middleware.Session.Config` is now `SessionCookieOpts`, whose
+  every field defaults to the safe value. Setting one field (say
+  `.{ .same_site = .none }`) used to reset the others to plain cookie
+  defaults: no `HttpOnly`, no `Secure`, no `Path`. Breaking: the type
+  changed and has no `max_age` (the middleware sets it); struct literals
+  keep compiling.
+- `anole.http.middleware.Session` (the HMAC-signed cookie): every cookie
+  now carries a signed expiry (`max_age`, else the new `lifetime`, 24 h,
+  renewed while the session is in use), and the signature covers the
+  cookie's name. Cookies signed before this release are no longer accepted
+  (users sign in again); no configuration change needed.
+- Server-side sessions: a request that loaded a session before it was
+  destroyed (a logout, `regenerate` from another request) no longer writes
+  it back when it ends. The middleware now writes a session only when the
+  request changed it, and only if it still exists (`Store.update`, Redis
+  `SET ... XX`), and renews an unchanged one with `Store.touch` (Redis
+  `EXPIRE`). `Store.VTable` has the two new optional entries; a custom store
+  without them falls back to `load` + `save`, so implement them.
+- `MemoryStore` sweeps expired sessions as new ones are written, and holds
+  at most `max_entries` (100,000 by default, `MemoryStore.initOptions`);
+  before, sessions created and never seen again (anonymous visitors, CSRF
+  tokens on a login form) stayed in memory for good.
+- `anole.session.regenerate` also drops the session's CSRF token, so a
+  token from before a sign-in is not valid after it. Both session
+  middlewares refuse a `__Host-`/`__Secure-` cookie name that their
+  `cookie_opts` do not satisfy (`error.CookiePrefixMismatch`); docs/auth.md
+  recommends `__Host-anole_session` in production.
+- JWT: `Keyring.verify` (and so `RequireJwt` with a keyring) refuses a
+  policy without an `audience` (`error.AudienceRequired`, 500 from
+  `RequireJwt` with the fix in the log), since a provider's keys also sign
+  tokens for its other clients. Action needed if you verify keyring tokens
+  without an audience: set `.audience`, or `.allow_any_audience = true` for
+  keys that sign for your application alone. New `Policy.typ` (e.g.
+  `"at+jwt"`) checks the header's `typ`, and `Policy.require_iat` makes
+  `iat` mandatory.
+- JWKS `Keyring`: while the provider can't be reached, keys past their TTL
+  stay in use for `stale_seconds` (24 h), and failed fetches back off
+  (`retry_seconds` 5, doubling up to `max_retry_seconds` 300). Before, an
+  outage failed every request with 503 and turned each one into another
+  fetch. No configuration change needed.
+- OIDC: ID tokens must carry `iat`; `azp`, when present, must be the
+  `client_id` (before, it was checked only with several audiences); the
+  token request no longer follows redirects (a 307/308 would have carried
+  the code and client secret on); `Provider.discover` refuses non-`https`
+  issuers and endpoints (`error.InsecureEndpoint`, loopback `http` aside).
+  `Identity` gains `issuer`: key accounts on `(issuer, subject)`, as
+  docs/auth.md now says.
+- Rate limiting: `ratelimit.clientAddress` groups IPv6 clients by their /64
+  (`clientAddressPrefix(bits)` for another prefix), so a client with a
+  /64 no longer gets a bucket per address. `MemoryLimiter` never evicts a
+  throttled bucket to make room for a new key (a full table sends new keys
+  to a shared overflow bucket instead), and forgets an idle key only once
+  its bucket has refilled; before, a stream of fresh keys, or waiting
+  `idle_ms` on a long window, reset a client's limit. docs/auth.md's API key
+  example now keys on the verified owner, not the raw header. Rate-limit
+  keys of IPv6 clients change; no configuration change needed.
+- `auth.apikey.generate` and `session.devKey` take their bytes from the
+  operating system (`std.Io.randomSecure`) and fail rather than fall back
+  to a weaker source; `apikey.generate` can now return
+  `error.EntropyUnavailable`.
+
+#### Response cache, request IDs, logs and metrics
+
+- Response cache: requests with a TLS client certificate bypass it like
+  those with `Authorization`/`Cookie`/`X-API-Key`, and the new
+  `ResponseCache.Options.cacheable` predicate refuses others per route.
+  docs/routing.md now warns up front that an answer depending on anything
+  else (an app-specific header, the client's address) must be excluded
+  through `credential_headers` or `cacheable`. Check your cached routes.
+- `RequestId` with `trust_incoming` keeps an incoming ID only if it is 1 to
+  128 of `[A-Za-z0-9._:-]` (before: any visible ASCII), and the JSON access
+  log escapes `request_id`, `trace_id` and `span_id`: a client-chosen ID
+  could add or override fields in the JSON line.
+- Access logs (`observe.AccessLog`, `middleware.Logger`) leave the query
+  string out by default (`log_query = true` keeps it), since queries carry
+  sign-in codes, reset tokens and API keys. `access_log.format` drops it
+  too; `formatLine` takes the option. Log consumers that parsed the query
+  out of `path` need `log_query`.
+- `app.metrics(.{ .listener = "admin" })`, `app.health(.{ .listener = ... })`
+  (and `Registry.serveOnListener`, `Health.Options.listener`) serve
+  `/metrics`, `/healthz` and `/readyz` on one named listener only, 404
+  elsewhere. Without it they are on every listener, as before;
+  docs/observability.md now says how to keep them off the public port,
+  since they name routes, errors, databases and failing checks.
+
+#### Databases
+
+- **PostgreSQL connects to a remote server with `verify-full` when no
+  `sslmode` is given (breaking).** A server on this machine (loopback, Unix
+  socket) still gets `prefer`. Action: a server reached by a name or
+  address its certificate does not carry, or signed by a private CA, now
+  fails to connect; set `sslrootcert` (or `Options.tls.ca`), or set
+  `sslmode` explicitly (`require` encrypts without checking, `disable`
+  sends plain text). The log says which.
+- **PostgreSQL sends the password in clear text or as MD5 only to a
+  verified server or one on this machine (breaking).** Action, only for a
+  server that still asks for `password` or `md5` over the network: move
+  it to SCRAM-SHA-256, verify it, or allow the method with
+  `require_auth=md5`. `require_auth` and `channel_binding` (SCRAM-SHA-256-PLUS,
+  used whenever the server offers it over TLS) are new URL parameters.
+- PostgreSQL connections are reset when they go back to the pool, so
+  session settings, roles, temporary tables and advisory locks from one
+  request never reach another (`Options.reset_session`, on; no extra round
+  trip). No action needed.
+- A CA set in code (`tls.ca` for PostgreSQL and Redis, `Options.tls` for
+  MongoDB) can no longer be switched off by the URL or the environment:
+  `sslmode=disable|allow|prefer`, `ssl_cert_reqs=none`, `tls=false` and
+  `tlsInsecure`/`tlsAllowInvalid*` are refused there, and logged as
+  warnings everywhere else.
+- The PostgreSQL client checks message lengths and every value of a
+  result row before decoding it, refuses `LISTEN` channel names over 63
+  bytes, and checks SCRAM's server nonce and iteration count; MongoDB's
+  SCRAM caps the iteration count at one million, and Redis refuses replies
+  nested deeper than 32 levels. A malformed answer now fails the call and
+  closes the connection instead of crashing the process. No action needed.
+- A date or time column beyond what `anole.db.Time` holds (PostgreSQL and
+  SQLite) fails that read instead of crashing. No action needed.
+- SQLite limits expression depth to 1000 again (it was unlimited), and a
+  `file:` path is a SQLite URI only with `Options.uri = true` (breaking
+  for paths that relied on it; action: set `.uri = true`).
+- A database URL whose password holds `/` or `?` no longer shows the
+  password in logs, and MongoDB's connection-string errors no longer quote
+  parts of the string. No action needed, but percent-encode such
+  passwords.
+- `exec` with no arguments runs every statement in its SQL (PostgreSQL,
+  SQLite); the docs now say so: never build that SQL from input.
+
+#### Process, startup, CI and examples
+
+- With `ServerOptions.process` set, the server keeps systemd's `NOTIFY_SOCKET`
+  for itself and takes it out of the environment that programs started by
+  handlers inherit (a restart passes it to the new process). Sockets
+  inherited through `LISTEN_FDS` are checked to be listening TCP/unix (or,
+  for `h3`, UDP) sockets; anything else stops the start with
+  `error.InheritedSocketMismatch`. A CPU quota that does not fit 32 bits no
+  longer stops the start.
+- `anole.panic` (`pub const panic = anole.panic;` in the root file; the
+  examples and libanole use it): a panic is written as one error line with
+  its stack trace through the log function, then the process aborts. The
+  server logs its build mode at start and warns when it is ReleaseFast or
+  ReleaseSmall; `addApp` warns at build time for those modes (the build is
+  not refused).
+- CI: a Release checks workflow runs h2spec, Autobahn, the HTTP/3 checks,
+  the QUIC interop runner, gRPC interop and the C ABI suite against
+  ReleaseFast builds, and the bundled C libraries under sanitizers, at every
+  release tag. Actions are pinned by commit; downloads in the sanitizer
+  script and the Python test packages are checked by hash.
+- Examples model the safe patterns: `examples/rest` (and the
+  getting-started guide) read the API key from `API_KEY`, keep its SHA-256
+  and compare in constant time instead of a hard-coded key compared with
+  `std.mem.eql`; `examples/observe` serves `/metrics`, the health routes and
+  its `/maintenance` switch on a loopback-only admin listener (the next
+  port) instead of the public one.
+
+#### C ABI (code new since 0.1.0, listed above under C ABI)
+
+- C ABI: a made-up WebSocket handle, a file length past the end of the file
+  (`anole_respond_fd`), and a request body read after the request was
+  answered are now refused (`ANOLE_E_GONE` / `ANOLE_E_INVALID`) instead of
+  reaching memory they should not. No configuration change needed.
+- C ABI: publishes still being fanned out to a topic are bounded (64 per
+  executor, and the larger of 16 x `limits.ws_high_water` and
+  2 x `limits.ws_max_message` bytes); past that `anole_ws_publish` returns
+  `ANOLE_E_AGAIN` and sends nothing. A publish larger than
+  `limits.ws_max_message` is refused (`ANOLE_E_INVALID`). Bindings should
+  handle `ANOLE_E_AGAIN` from publish. Topics use `Rooms`' per-member
+  queues (above), each bounded by `limits.ws_high_water`, so a subscriber
+  that stops reading holds up no publish.
+- C ABI configuration: `limits.inline_body_max` and `limits.ws_max_message`
+  are capped at 1 GiB (larger values are a configuration error).
+- C ABI configuration: a `jwt` middleware with `jwks_url` needs `audience`
+  (or `allow_any_audience: true` for keys that sign for this application
+  alone); without it the configuration is refused.
+- C ABI configuration: a fixed (`respond`) route's headers are checked when
+  the configuration is read: `Connection` and `Transfer-Encoding` (the
+  server's own) and invalid names or values are refused there, instead of
+  failing every request to the route.
+- C ABI: replies and trailers naming `Connection` or `Transfer-Encoding`
+  are refused with `ANOLE_E_INVALID` (the request is still owed), instead
+  of those headers being dropped without a word.
+- C ABI: WebSocket messages waiting for a consumer are bounded per executor
+  in bytes (the larger of 16 x `limits.ws_high_water` and
+  2 x `limits.ws_max_message`), not only in count, so clients cannot make a
+  slow consumer's queue hold `limits.queue` whole messages.
+
+### Breaking
+
+Each item is described under Security above.
+
+- Server: `res.header`/`res.addHeader` refuse `Transfer-Encoding` and
+  `Connection` (use `res.keepalive = false`); HTTP/1.1 requests without
+  exactly one `Host` get 400 (`request.require_host = false` restores the
+  old behaviour); `X-Forwarded-Host` needs `trust_forwarded_host = true`;
+  a malformed request body reads as `error.MalformedBody`.
+- `http3.hq_interop_root` needs `pub const anole_hq_interop = true;` in the
+  root file.
+- TLS 1.2 listeners accept only ECDHE with AES-GCM or ChaCha20-Poly1305.
+- HTTP client: URLs with raw spaces, control characters or non-ASCII bytes
+  in the path or query fail with `error.InvalidUrl`; a 307/308 that would
+  carry the body to another host is not followed. `StreamError` gains
+  `HeadersTooLarge` and `TooManyInterimResponses`.
+- JSON: `json.Error` gains `NestingTooDeep`.
+- gRPC: a call receives at most 64 MiB in all on the server
+  (`RegisterOptions.max_received_bytes`) and on the client
+  (`Channel.max_received_bytes`); `Call.addTrailer` refuses invalid
+  metadata (use `addBinaryTrailer` for raw bytes); transcoded bindings with
+  a `body` answer 415 to a non-JSON `Content-Type`.
+- WebSocket and WebTransport: handshakes from another origin get 403 unless
+  listed in `allowed_origins`; `Rooms.broadcast` returns the number of
+  members it queued for.
+- Sessions: signed session cookies from 0.1.0 are refused (users sign in
+  again); `cookie_opts` is now `SessionCookieOpts`; custom session stores
+  should implement `Store.VTable.update` and `touch`.
+- Auth: a JWKS `Keyring` policy needs an `audience` (or
+  `allow_any_audience = true`); OIDC discovery refuses non-`https`
+  endpoints; `apikey.generate` can return `error.EntropyUnavailable`;
+  rate-limit keys of IPv6 clients are their /64.
+- Logs: access logs leave the query string out unless `log_query = true`;
+  incoming request IDs outside `[A-Za-z0-9._:-]` are replaced.
+- Databases: PostgreSQL defaults to `sslmode=verify-full` for remote servers
+  and sends clear-text or MD5 passwords only to a verified or local server;
+  SQLite treats `file:` paths as URIs only with `Options.uri = true`.
+- `examples/rest` reads its API key from the `API_KEY` environment variable.
 
 ### C ABI (ABI 0.1)
 

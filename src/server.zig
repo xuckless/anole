@@ -132,7 +132,8 @@ pub const Options = struct {
     /// Raise the soft open-file limit to the hard one when the server is
     /// made, as Go does at startup: every connection is a file descriptor,
     /// and the soft limit is often 1024. `server.max_connections` follows
-    /// the limit by default. Processes started from here inherit it.
+    /// the limit by default. Processes started from here inherit it (see
+    /// docs/server.md, "Many connections", for programs that use `select`).
     raise_fd_limit: bool = true,
     /// HTTP/2 settings, for h2c and h2 over TLS. 250 concurrent streams per
     /// connection by default.
@@ -208,8 +209,13 @@ pub const Options = struct {
         h2c: bool = features.http2,
         /// Every connection starts with a PROXY protocol header (v1 or v2)
         /// from a load balancer in front, which gives the client's real
-        /// address. Only for a port nothing else can reach.
+        /// address. Only for a port nothing else can reach, or with
+        /// `proxy_protocol_from` naming the load balancers.
         proxy_protocol: bool = false,
+        /// With `proxy_protocol`: the peers allowed to connect, in CIDR
+        /// notation ("10.0.0.0/8", "2001:db8::/32", "192.0.2.7"); a
+        /// connection from anywhere else is closed unread. Empty: any peer.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
     /// `Options.http3`: HTTP/3 over QUIC beside the TLS listener.
@@ -237,7 +243,9 @@ pub const Options = struct {
         /// handshake completes, which a replayed flight never does.
         early_data: bool = false,
         /// QUIC interop runner tests only: also speak "hq-interop"
-        /// (HTTP/0.9), serving the files under this directory.
+        /// (HTTP/0.9), serving the files under this directory. Refused
+        /// (`error.HqInteropNotAllowed`) unless the program's root file
+        /// declares `pub const anole_hq_interop = true;`.
         hq_interop_root: ?[]const u8 = null,
         /// UDP sockets on Linux, each served on an executor of its own,
         /// with the kernel steering each connection's datagrams to its
@@ -272,6 +280,8 @@ pub const Options = struct {
         client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
         /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
+        /// As `Http.proxy_protocol_from`.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
     /// A listener in `listeners`: where, plain or TLS, and what it speaks.
@@ -306,6 +316,8 @@ pub const Options = struct {
         http3: bool = false,
         /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
+        /// As `Http.proxy_protocol_from`.
+        proxy_protocol_from: []const []const u8 = &.{},
 
         /// `Listener.tls`.
         pub const Tls = struct {
@@ -446,6 +458,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             client_registered: bool,
             metrics: ?*observe.metrics.Registry = null,
             metrics_path: []const u8 = "",
+            metrics_listener: ?[]const u8 = null,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -627,6 +640,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
+            // systemd's notify socket is this process's to use, not its
+            // children's: kept, and taken out of the environment.
+            if (opts.process) |p| sd_notify.take(p.environ);
             // Before anything opens a socket, and before `run` works out
             // the connection cap from it.
             if (opts.raise_fd_limit) if (http.fd_limit.raiseSoftLimit()) |r| {
@@ -702,10 +718,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
-            // get 425 Too Early, on every route. Now, before any route, and
-            // for `listenTls` too, which turns HTTP/3 on later.
+            // get 425 Too Early, on every route, with HTTP/3 or without:
+            // a TLS-terminating proxy can forward the mark to any listener.
+            // Now, before any route.
             const h3_possible = features.http3 and (opts.http3 != null or opts.listen_tls_http3 or anyHttp3(opts.listeners));
-            if (h3_possible) {
+            {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
                 self.router.use(http.Middleware(Ctx).init(guard));
@@ -745,6 +762,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .port = h.port,
                 .http2 = h.h2c and features.http2,
                 .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol_from = h.proxy_protocol_from,
             } });
             if (opts.https) |h| try specs.append(a, .{ .name = "https", .listener = .{
                 .address = h.address,
@@ -752,6 +770,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .tls = .{ .cert = h.cert, .alpn_protocols = h.alpn_protocols, .client_auth = h.client_auth },
                 .http3 = opts.http3 != null,
                 .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol_from = h.proxy_protocol_from,
             } });
             for (opts.listeners) |l| {
                 var name = l.name orelse if (l.unix) |path|
@@ -785,6 +804,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     try why.print("two listeners are named \"{s}\"", .{spec.name});
                     return error.DuplicateListenerName;
                 };
+                for (l.proxy_protocol_from) |text| {
+                    _ = http.ProxyNetwork.parse(text) catch {
+                        try why.print("listener \"{s}\": proxy_protocol_from \"{s}\" is not an address or a network in CIDR notation", .{ spec.name, text });
+                        return error.InvalidProxyNetwork;
+                    };
+                }
                 if (!l.http1 and !l.http2) {
                     try why.print("listener \"{s}\" speaks neither HTTP/1.1 nor HTTP/2", .{spec.name});
                     return error.NoProtocols;
@@ -913,6 +938,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .socket_per_acceptor = per_core_sockets and address == .ip,
                     .ipv6_only = ipv6_only,
                     .proxy_protocol = l.proxy_protocol,
+                    .proxy_protocol_from = from: {
+                        const nets = try a.alloc(http.ProxyNetwork, l.proxy_protocol_from.len);
+                        for (l.proxy_protocol_from, nets) |text, *net| net.* = http.ProxyNetwork.parse(text) catch return error.InvalidProxyNetwork;
+                        break :from nets;
+                    },
                     .tls = config,
                     .fd = fd,
                 };
@@ -942,6 +972,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 // listeners), with the predecessor's secret.
                 var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
                 const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.len, &h3_buf) else &.{};
+                for (h3_fds) |fd| handoff.checkInherited(fd, .datagram, true) catch |err| {
+                    std.log.scoped(.anole).err("inherited fd {any} for HTTP/3 is not a UDP socket", .{fd});
+                    return err;
+                };
                 const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
                 // The UDP socket follows the TCP listener's address, "" (dual-stack) included.
                 const udp_host = q.address orelse l.address;
@@ -1021,7 +1055,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Null outside hand-off mode (dusty binds).
         fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
             if (!handoff_mode) return null;
-            if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
+            if (inherited) |inh| if (inh.find(name, index)) |fd| {
+                handoff.checkInherited(fd, .listener, address == .ip) catch |err| {
+                    std.log.scoped(.anole).err("inherited fd {any} for listener \"{s}\" is not a listening {s} socket", .{ fd, name, if (address == .ip) "TCP" else "unix" });
+                    return err;
+                };
+                return fd;
+            };
             switch (address) {
                 .ip => |ip| {
                     // SO_REUSEPORT would share the port with whoever has it.
@@ -1615,7 +1655,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const extras = self.extras;
             if (extras.routes_added) return;
             extras.routes_added = true;
-            if (extras.metrics) |r| r.serveOn(Ctx, self.router, extras.metrics_path);
+            if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
             if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
         }
 
@@ -1642,6 +1682,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             http: bool = true,
             /// Paths the HTTP metrics leave out.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Serve `path` only on the listener of this name
+            /// (`Options.Listener.name`, an internal port the scraper
+            /// reaches), 404 on the others. Null: on every listener,
+            /// public ones included, and the metrics name routes, errors
+            /// and databases; then keep the port private or put auth
+            /// middleware in front (global `use` middleware runs first).
+            listener: ?[]const u8 = null,
         };
 
         /// Prometheus metrics at `/metrics`, with the HTTP request counts,
@@ -1656,6 +1703,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             r.* = .init(self.gpa, self.rt.io());
             self.extras.metrics = r;
             self.extras.metrics_path = opts.path;
+            self.extras.metrics_listener = opts.listener;
             if (opts.http) self.use(observe.metrics.HttpMetrics.init(r, .{ .exclude = opts.exclude }) catch @panic("OOM"));
             return r;
         }
@@ -1942,6 +1990,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// thread that called `init`.
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
+            logBuildMode();
             self.addHelperRoutes();
             self.startConnectors() catch |err| return self.failStart(err);
             const rt_io = self.rt.io();
@@ -2055,6 +2104,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     else => log.err("SIGHUP: certificate reload failed, keeping the current one: {t}", .{err}),
                 }
                 if (self.process) |p| sd_notify.ready(p.environ, null);
+            }
+        }
+
+        /// Which build this is; a loud word for ReleaseFast, which has none
+        /// of Zig's safety checks (docs/server.md recommends ReleaseSafe).
+        fn logBuildMode() void {
+            const log = std.log.scoped(.anole);
+            const name = switch (builtin.mode) {
+                .debug => "Debug",
+                .safe => "ReleaseSafe",
+                .fast => "ReleaseFast",
+                .small => "ReleaseSmall",
+            };
+            switch (builtin.mode) {
+                .fast, .small => log.warn("built with {s}: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production", .{name}),
+                .debug, .safe => log.info("{s} build", .{name}),
             }
         }
 

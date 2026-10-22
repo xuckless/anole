@@ -71,6 +71,8 @@ const Client = struct {
     in_len: usize = 0,
     /// DATA frames received.
     data_frames: usize = 0,
+    /// The `origin` header to send, if any.
+    origin: ?[]const u8 = null,
 
     fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
@@ -129,9 +131,11 @@ const Client = struct {
             nv(":path", "/chat"),
             nv(":authority", "localhost"),
             nv("sec-websocket-version", "13"),
+            nv("origin", self.origin orelse ""),
         };
+        const n: usize = if (self.origin != null) nva.len else nva.len - 1;
         var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = self }, .read_callback = provide };
-        self.stream_id = c.nghttp2_submit_request2(self.session, null, &nva, nva.len, &provider, self);
+        self.stream_id = c.nghttp2_submit_request2(self.session, null, &nva, n, &provider, self);
         if (self.stream_id < 0) return error.Http2Submit;
         try self.pumpUntil(struct {
             fn f(cl: *Client) bool {
@@ -551,4 +555,31 @@ test "WebSocket over HTTP/2: an answer held for a batch goes out while the handl
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("wait", try client.nextFrame(&op, &buf));
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+}
+
+test "WebSocket over HTTP/2: a page from another origin gets 403, one from the same origin its socket" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    var future = try startEcho(&server, io);
+    defer future.cancel(io) catch {};
+
+    var evil: Client = undefined;
+    try evil.init(io, server.address.ip);
+    defer evil.deinit();
+    evil.origin = "https://evil.example";
+    try evil.open();
+    try std.testing.expectEqual(@as(u16, 403), evil.status);
+
+    var own: Client = undefined;
+    try own.init(io, server.address.ip);
+    defer own.deinit();
+    own.origin = "http://localhost";
+    try own.open();
+    try std.testing.expectEqual(@as(u16, 200), own.status);
 }

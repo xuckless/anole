@@ -1,13 +1,17 @@
 //! A JSON REST API: users kept in memory, behind an API key.
 //!
+//! The key comes from the environment, never from source; the server keeps
+//! only its SHA-256 and compares in constant time:
+//!
+//!   export API_KEY=$(openssl rand -base64 32)
 //!   zig build run-rest                 # every interface, port 3000
 //!   zig build run-rest -- 127.0.0.1:4000
 //!
-//!   curl -H 'X-Api-Key: secret' -d '{"name":"Ada","email":"ada@example.com"}' localhost:3000/api/users
-//!   curl -H 'X-Api-Key: secret' 'localhost:3000/api/users?limit=10'
-//!   curl -H 'X-Api-Key: secret' localhost:3000/api/users/1
-//!   curl -H 'X-Api-Key: secret' -X PUT -d '{"name":"Ada L.","email":"ada@example.com"}' localhost:3000/api/users/1
-//!   curl -H 'X-Api-Key: secret' -X DELETE localhost:3000/api/users/1
+//!   curl -H "X-Api-Key: $API_KEY" -d '{"name":"Ada","email":"ada@example.com"}' localhost:3000/api/users
+//!   curl -H "X-Api-Key: $API_KEY" 'localhost:3000/api/users?limit=10'
+//!   curl -H "X-Api-Key: $API_KEY" localhost:3000/api/users/1
+//!   curl -H "X-Api-Key: $API_KEY" -X PUT -d '{"name":"Ada L.","email":"ada@example.com"}' localhost:3000/api/users/1
+//!   curl -H "X-Api-Key: $API_KEY" -X DELETE localhost:3000/api/users/1
 //!
 //! tests/rest_test.zig serves the same routes and checks each one.
 const std = @import("std");
@@ -15,6 +19,8 @@ const anole = @import("anole");
 
 /// Keeps the runtime's per-thread lines out of a Debug build.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const User = struct { id: u64, name: []const u8, email: []const u8 };
 const NewUser = struct { name: []const u8, email: []const u8 };
@@ -22,6 +28,8 @@ const NewUser = struct { name: []const u8, email: []const u8 };
 /// Shared by every handler, on every executor: hence the lock.
 pub const Store = struct {
     gpa: std.mem.Allocator,
+    /// The API key's SHA-256 (`keyDigest`): the key itself is not kept.
+    api_key_digest: [32]u8,
     mutex: std.Io.Mutex = .init,
     users: std.AutoArrayHashMapUnmanaged(u64, User) = .empty,
     next_id: u64 = 1,
@@ -95,11 +103,19 @@ fn remove(store: *Store, req: *anole.Request, res: *anole.Response) !void {
     res.status = .no_content;
 }
 
+/// The SHA-256 of an API key, which is what `Store` keeps.
+pub fn keyDigest(key: []const u8) [32]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &d, .{});
+    return d;
+}
+
 /// Middleware as a function: answer (or return an error), or go on with
-/// `next.call()`.
-fn requireKey(req: *anole.Request, res: *anole.Response, next: anole.Next) !void {
+/// `next.call()`. Digests of the same length compared in constant time:
+/// how long the check takes says nothing about the key.
+fn requireKey(store: *Store, req: *anole.Request, res: *anole.Response, next: anole.Next) !void {
     const key = req.headers.get("X-Api-Key") orelse return error.Unauthorized;
-    if (!std.mem.eql(u8, key, "secret")) return res.fail(.forbidden, "wrong API key");
+    if (!std.crypto.timing_safe.eql([32]u8, keyDigest(key), store.api_key_digest)) return res.fail(.forbidden, "wrong API key");
     return next.call();
 }
 
@@ -114,7 +130,15 @@ pub fn routes(app: *anole.Server(Store)) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var store: Store = .{ .gpa = init.gpa };
+    const api_key = init.environ_map.get("API_KEY") orelse {
+        std.log.err("set API_KEY (for example: export API_KEY=$(openssl rand -base64 32))", .{});
+        return error.NoApiKey;
+    };
+    if (api_key.len < 16) {
+        std.log.err("API_KEY is too short to be a secret: use 16 random characters or more", .{});
+        return error.WeakApiKey;
+    }
+    var store: Store = .{ .gpa = init.gpa, .api_key_digest = keyDigest(api_key) };
     defer store.deinit();
     // Error answers as {"error":"..."}; error.NotFound is a 404, and so on.
     var app = try anole.Server(Store).init(init.gpa, .{ .errors = .json }, &store);

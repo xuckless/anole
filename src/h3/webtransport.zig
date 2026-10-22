@@ -145,6 +145,11 @@ pub const Limits = struct {
     /// on the way, or its handler not yet accepting), on one connection.
     /// Past it, such streams are refused.
     buffered_streams: usize = 32,
+    /// A session's streams from the peer that its handler has not
+    /// accepted yet, each way. Past it, new ones are refused. The peer's
+    /// stream credit comes back only as streams are released, so this
+    /// bounds what a handler that accepts slowly (or never) holds.
+    incoming_streams: usize = 100,
     /// Datagrams kept for a session's handler, and their bytes; past
     /// either, new ones are dropped (datagrams are unreliable). A burst of
     /// small ones (a client's requests, say) arrives faster than any
@@ -384,6 +389,9 @@ pub const Core = struct {
             s.recv_err = error.StreamReset;
             s.reset_code = fromHttp3Error(code);
         }
+        // Reset before it said its session: no use to anyone. Refused
+        // both ways, so QUIC closes it and it is freed.
+        if (!s.prefix_done) s.disown(error_id);
         core.host.kick();
         return true;
     }
@@ -413,16 +421,12 @@ pub const Core = struct {
             _ = core.orphans.swapRemove(i);
             s.user_done = true;
         }
+        // A peer's stream no session took (its prefix never completed):
+        // nobody else will let go of it.
+        if (!s.local and s.session == null) s.user_done = true;
         if (!s.in_fin and s.recv_err == null and s.kind != .uni_out) s.recv_err = error.StreamReset;
         if (!s.fin_sent and s.send_err == null and s.kind != .uni_in) s.send_err = error.StreamReset;
         s.dequeue();
-        // The peer may open another in its place.
-        if (core.isPeers(stream_id)) {
-            if (isUni(stream_id))
-                _ = c.ngtcp2_conn_extend_max_streams_uni(core.q, 1)
-            else
-                _ = c.ngtcp2_conn_extend_max_streams_bidi(core.q, 1);
-        }
         s.maybeFree();
         core.host.kick();
         return true;
@@ -683,12 +687,13 @@ pub const Session = struct {
     /// A stream of this session, to its queue. Locked.
     fn deliver(self: *Session, s: *Stream) void {
         const gpa = self.core.gpa;
+        const queue = if (s.kind == .bidi) &self.incoming_bidi else &self.incoming_uni;
+        if (queue.items.len >= self.core.limits.incoming_streams) return s.disown(error_buffered_stream_rejected);
         s.session = self;
         self.members.append(gpa, s) catch {
             s.session = null;
             return s.disown(error_buffered_stream_rejected);
         };
-        const queue = if (s.kind == .bidi) &self.incoming_bidi else &self.incoming_uni;
         queue.append(gpa, s) catch {
             _ = self.members.pop();
             s.session = null;
@@ -812,6 +817,40 @@ pub const Session = struct {
             core.host.kick();
             return s;
         }
+    }
+
+    /// Tests only: opens a stream of `kind` that starts with `head`
+    /// instead of a whole prefix, held by nobody. Returns its ID, for
+    /// `testReset`.
+    pub fn testOpenRaw(self: *Session, kind: Stream.Kind, head: []const u8) !i64 {
+        if (!@import("builtin").is_test) @compileError("tests only");
+        const core = self.core;
+        core.host.lock();
+        defer core.host.unlock();
+        var id: i64 = -1;
+        const rv = if (kind == .bidi)
+            c.ngtcp2_conn_open_bidi_stream(core.q, &id, null)
+        else
+            c.ngtcp2_conn_open_uni_stream(core.q, &id, null);
+        if (rv != 0) return error.StreamIdBlocked;
+        const s = try Stream.create(core, id, kind, true);
+        s.user_done = true;
+        _ = try s.out.write(core.gpa, head);
+        try core.streams.put(core.gpa, id, s);
+        s.enqueue();
+        core.host.kick();
+        return id;
+    }
+
+    /// Tests only: resets a `testOpenRaw` stream's sending side.
+    pub fn testReset(self: *Session, id: i64) void {
+        if (!@import("builtin").is_test) @compileError("tests only");
+        const core = self.core;
+        core.host.lock();
+        defer core.host.unlock();
+        if (core.streams.get(id)) |s| s.send_err = error.StreamReset;
+        _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, id, 0);
+        core.host.kick();
     }
 
     /// A stream this side opened: the type (or signal) and the session ID
@@ -1119,6 +1158,15 @@ pub const Stream = struct {
             if (std.mem.indexOfScalar(*Stream, session.members.items, s)) |i| _ = session.members.swapRemove(i);
         }
         s.dequeue();
+        // The peer may open another in its place: only now, so streams
+        // waiting to be accepted count against its limit.
+        const core = s.core;
+        if (!s.local and !core.closed) {
+            if (Core.isUni(s.id))
+                _ = c.ngtcp2_conn_extend_max_streams_uni(core.q, 1)
+            else
+                _ = c.ngtcp2_conn_extend_max_streams_bidi(core.q, 1);
+        }
         s.free();
     }
 

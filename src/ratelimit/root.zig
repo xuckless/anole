@@ -97,8 +97,9 @@ fn step(tokens: *f64, last_ms: *i64, now_ms: i64, cost: u32, policy: Policy) Res
     };
 }
 
-/// Buckets in this process: bounded, least recently used out first, and
-/// idle ones dropped after `idle_ms`.
+/// Buckets in this process: bounded, and a bucket is forgotten only when
+/// that loses nothing (it is full again), or as a last resort one that
+/// still has tokens; a throttled bucket is never pushed out by new keys.
 pub const MemoryLimiter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -108,19 +109,38 @@ pub const MemoryLimiter = struct {
     lru: std.DoublyLinkedList = .{},
     max_entries: usize,
     idle_ms: i64,
+    /// Shared by new keys while the table is full of buckets that cannot
+    /// go: a flood of fresh keys then shares one limit.
+    overflow: struct { tokens: f64 = -1, last_ms: i64 = 0 } = .{},
 
     const Bucket = struct {
         key: []u8,
         tokens: f64,
         last_ms: i64,
+        /// The policy's numbers at the last take, to tell when it is full.
+        capacity: f64,
+        rate: f64,
         node: std.DoublyLinkedList.Node = .{},
+
+        fn tokensAt(b: *const Bucket, now_ms: i64) f64 {
+            const elapsed: f64 = @floatFromInt(@max(0, now_ms - b.last_ms));
+            return @min(b.capacity, b.tokens + elapsed * b.rate);
+        }
     };
+
+    /// How far from the least recently used end a new key looks for a
+    /// bucket to replace.
+    const victim_scan = 16;
 
     /// `MemoryLimiter` settings.
     pub const Options = struct {
-        /// At most this many keys; past it, the least recently used is dropped.
+        /// At most this many keys. Past it, a new key replaces the least
+        /// recently used bucket that is full again, else one that still
+        /// has tokens; when every bucket near that end is throttled, new
+        /// keys share one overflow bucket instead.
         max_entries: usize = 10_000,
-        /// A key unseen this long is forgotten (its bucket would be full).
+        /// A key unseen this long is forgotten, once its bucket is full
+        /// again (forgetting an emptier one would refill it).
         idle_ms: i64 = 300_000,
     };
 
@@ -168,20 +188,25 @@ pub const MemoryLimiter = struct {
     pub fn takeAt(self: *MemoryLimiter, key: []const u8, cost: u32, policy: Policy, now_ms: i64) !Result {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        // The least recently used end is where idle buckets collect.
+        // The least recently used end is where idle buckets collect; one
+        // that is full again holds nothing worth keeping.
         while (self.lru.last) |n| {
             const b: *Bucket = @fieldParentPtr("node", n);
-            if (now_ms - b.last_ms <= self.idle_ms) break;
+            if (now_ms - b.last_ms <= self.idle_ms or b.tokensAt(now_ms) < b.capacity) break;
             self.removeLocked(b);
         }
         const bucket = self.buckets.get(key) orelse blk: {
             if (self.buckets.count() >= self.max_entries) {
-                const oldest: *Bucket = @fieldParentPtr("node", self.lru.last.?);
-                self.removeLocked(oldest);
+                const victim = self.victimLocked(now_ms) orelse {
+                    // Every bucket in reach is still counting down.
+                    if (self.overflow.tokens < 0) self.overflow = .{ .tokens = policy.capacity(), .last_ms = now_ms };
+                    return step(&self.overflow.tokens, &self.overflow.last_ms, now_ms, cost, policy);
+                };
+                self.removeLocked(victim);
             }
             const b = try self.gpa.create(Bucket);
             errdefer self.gpa.destroy(b);
-            b.* = .{ .key = try self.gpa.dupe(u8, key), .tokens = policy.capacity(), .last_ms = now_ms };
+            b.* = .{ .key = try self.gpa.dupe(u8, key), .tokens = policy.capacity(), .last_ms = now_ms, .capacity = policy.capacity(), .rate = policy.ratePerMs() };
             errdefer self.gpa.free(b.key);
             try self.buckets.put(self.gpa, b.key, b);
             self.lru.prepend(&b.node);
@@ -189,7 +214,29 @@ pub const MemoryLimiter = struct {
         };
         self.lru.remove(&bucket.node);
         self.lru.prepend(&bucket.node);
+        bucket.capacity = policy.capacity();
+        bucket.rate = policy.ratePerMs();
         return step(&bucket.tokens, &bucket.last_ms, now_ms, cost, policy);
+    }
+
+    /// The bucket a new key may replace: near the least recently used end,
+    /// one that is full again, else one that still has a token; null when
+    /// all of those are throttled.
+    fn victimLocked(self: *MemoryLimiter, now_ms: i64) ?*Bucket {
+        var spare: ?*Bucket = null;
+        var node = self.lru.last;
+        var seen: usize = 0;
+        while (node) |n| : ({
+            node = n.prev;
+            seen += 1;
+        }) {
+            if (seen == victim_scan) break;
+            const b: *Bucket = @fieldParentPtr("node", n);
+            const tokens = b.tokensAt(now_ms);
+            if (tokens >= b.capacity) return b;
+            if (spare == null and tokens >= 1) spare = b;
+        }
+        return spare;
     }
 };
 
@@ -255,15 +302,61 @@ pub const RedisLimiter = if (features.redis) struct {
 /// pointing into the request.
 pub const KeyFn = *const fn (req: *dusty.Request, buf: []u8) []const u8;
 
-/// The client's address (as trusted proxies report it), without the port.
+/// The client's address (as trusted proxies report it), without the
+/// port: an IPv4 address on its own, an IPv6 one by its /64 network
+/// ("2001:db8:1:2::/64"), the block one subscriber or host typically gets,
+/// so a client cannot step out of its bucket by changing the low bits.
+/// `clientAddressPrefix` chooses another IPv6 prefix.
 pub fn clientAddress(req: *dusty.Request, buf: []u8) []const u8 {
-    var addr = req.remote_address;
-    addr.setPort(0);
-    var w: std.Io.Writer = .fixed(buf);
-    w.print("{f}", .{addr}) catch return "?";
+    return addressKey(req.remote_address, 64, buf);
+}
+
+/// `clientAddress` with IPv6 addresses grouped by their first
+/// `ipv6_prefix_bits` bits instead of 64 (128: each address alone; 56 or
+/// 48 for providers that hand out larger blocks):
+/// `.key = anole.ratelimit.clientAddressPrefix(56)`.
+pub fn clientAddressPrefix(comptime ipv6_prefix_bits: u8) KeyFn {
+    if (ipv6_prefix_bits > 128) @compileError("an IPv6 prefix is at most 128 bits");
+    return struct {
+        fn key(req: *dusty.Request, buf: []u8) []const u8 {
+            return addressKey(req.remote_address, ipv6_prefix_bits, buf);
+        }
+    }.key;
+}
+
+fn addressKey(address: std.Io.net.IpAddress, ipv6_prefix_bits: u8, buf: []u8) []const u8 {
+    var formatted: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&formatted);
+    var grouped = false;
+    switch (address) {
+        .ip4 => |a| w.print("{f}", .{std.Io.net.IpAddress{ .ip4 = .{ .bytes = a.bytes, .port = 0 } }}) catch return "?",
+        .ip6 => |a| {
+            const mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std.mem.eql(u8, a.bytes[0..12], &mapped_prefix)) {
+                // An IPv4 client on a dual-stack socket: its IPv4 address.
+                w.print("{d}.{d}.{d}.{d}:0", .{ a.bytes[12], a.bytes[13], a.bytes[14], a.bytes[15] }) catch return "?";
+            } else {
+                var net: std.Io.net.Ip6Address = .{ .port = 0, .bytes = a.bytes };
+                for (&net.bytes, 0..) |*b, i| {
+                    const first_bit = i * 8;
+                    if (first_bit >= ipv6_prefix_bits) {
+                        b.* = 0;
+                    } else if (first_bit + 8 > ipv6_prefix_bits) {
+                        const keep: u4 = @intCast(ipv6_prefix_bits - first_bit);
+                        b.* &= @truncate(@as(u16, 0xff00) >> keep);
+                    }
+                }
+                w.print("{f}", .{std.Io.net.IpAddress{ .ip6 = net }}) catch return "?";
+                grouped = ipv6_prefix_bits < 128;
+            }
+        },
+    }
     const text = w.buffered();
-    // "1.2.3.4:0" / "[::1]:0"
-    return text[0 .. std.mem.lastIndexOfScalar(u8, text, ':') orelse text.len];
+    // "1.2.3.4:0" / "[2001:db8::]:0"
+    var host = text[0 .. std.mem.lastIndexOfScalar(u8, text, ':') orelse text.len];
+    if (host.len >= 2 and host[0] == '[') host = host[1 .. host.len - 1];
+    if (grouped) return std.fmt.bufPrint(buf, "{s}/{d}", .{ host, ipv6_prefix_bits }) catch "?";
+    return std.fmt.bufPrint(buf, "{s}", .{host}) catch "?";
 }
 
 /// What `Middleware` does when the limiter fails (Redis is down, say).
@@ -368,7 +461,8 @@ test "token bucket: burst, refill over time, retry-after" {
 test "MemoryLimiter: bounded by LRU eviction, idle keys dropped" {
     var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 3, .idle_ms = 1000 });
     defer l.deinit();
-    const policy: Policy = .{ .limit = 2, .window_ms = 60_000 };
+    // Full again within a second, so idle buckets may go.
+    const policy: Policy = .{ .limit = 2, .window_ms = 1000 };
     _ = try l.takeAt("a", 1, policy, 0);
     _ = try l.takeAt("b", 1, policy, 1);
     _ = try l.takeAt("c", 1, policy, 2);
@@ -520,4 +614,57 @@ test "redis: live rate limiter (RedisLimiter)" {
     const denied = try l.take("t", 1, policy);
     try std.testing.expect(!denied.allowed);
     try std.testing.expect(denied.retry_after_seconds >= 1);
+}
+
+test "clientAddress: IPv6 clients share their /64, IPv4 clients are one address each" {
+    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var a: [128]u8 = undefined;
+    var b: [128]u8 = undefined;
+    req.remote_address = try std.Io.net.IpAddress.parse("2001:db8:1:2:aaaa:bbbb:cccc:dddd", 443);
+    const first = clientAddress(&req, &a);
+    req.remote_address = try std.Io.net.IpAddress.parse("2001:db8:1:2::1", 80);
+    try std.testing.expectEqualStrings(first, clientAddress(&req, &b));
+    req.remote_address = try std.Io.net.IpAddress.parse("2001:db8:1:3::1", 80);
+    try std.testing.expect(!std.mem.eql(u8, first, clientAddress(&req, &b)));
+    req.remote_address = try std.Io.net.IpAddress.parse("192.0.2.7", 80);
+    try std.testing.expectEqualStrings("192.0.2.7", clientAddress(&req, &a));
+    req.remote_address = try std.Io.net.IpAddress.parse("192.0.2.8", 80);
+    try std.testing.expectEqualStrings("192.0.2.8", clientAddress(&req, &a));
+    // Another prefix, each address alone, and IPv4 on a dual-stack socket.
+    req.remote_address = try std.Io.net.IpAddress.parse("2001:db8:1:2ff::1", 80);
+    try std.testing.expectEqualStrings("2001:db8:1:200::/56", clientAddressPrefix(56)(&req, &a));
+    try std.testing.expectEqualStrings("2001:db8:1:2f0::/60", clientAddressPrefix(60)(&req, &a));
+    try std.testing.expectEqualStrings("2001:db8:1:2ff::1", clientAddressPrefix(128)(&req, &a));
+    req.remote_address = try std.Io.net.IpAddress.parse("::ffff:192.0.2.9", 80);
+    try std.testing.expectEqualStrings("192.0.2.9", clientAddress(&req, &a));
+}
+
+test "MemoryLimiter: new keys never push out a throttled bucket" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 4 });
+    defer l.deinit();
+    const policy: Policy = .{ .limit = 2, .window_ms = 3_600_000 };
+    _ = try l.takeAt("attacker", 1, policy, 0);
+    _ = try l.takeAt("attacker", 1, policy, 0);
+    try std.testing.expect(!(try l.takeAt("attacker", 1, policy, 0)).allowed);
+    // A flood of fresh keys, each throttled in turn.
+    var buf: [16]u8 = undefined;
+    for (0..1000) |i| {
+        const k = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        _ = try l.takeAt(k, 2, policy, 1);
+    }
+    try std.testing.expect(l.count() <= 4);
+    try std.testing.expect(!(try l.takeAt("attacker", 1, policy, 2)).allowed);
+}
+
+test "MemoryLimiter: an idle bucket is forgotten only once it is full again" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .idle_ms = 1000 });
+    defer l.deinit();
+    // One an hour: idle for longer than idle_ms, still empty.
+    const policy: Policy = .{ .limit = 1, .window_ms = 3_600_000 };
+    try std.testing.expect((try l.takeAt("a", 1, policy, 0)).allowed);
+    _ = try l.takeAt("b", 1, policy, 10_000);
+    try std.testing.expect(!(try l.takeAt("a", 1, policy, 10_000)).allowed);
+    // A whole window later it is full, and may go.
+    _ = try l.takeAt("c", 1, policy, 3_700_000);
+    try std.testing.expect((try l.takeAt("a", 1, policy, 3_700_000)).allowed);
 }
