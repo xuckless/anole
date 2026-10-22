@@ -155,16 +155,13 @@ pub const Redacted = struct {
     pub fn format(self: Redacted, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var text = self.text;
         // The userinfo's password: from the first ':' after "//" to the
-        // authority's last '@'. The password may hold a '/' or a '?' (a URL
-        // that does not parse, logged as such), so the '@' is the last one
-        // before the query when there is one there, else the last one of
-        // all: at worst more is hidden than the password, never less.
+        // last '@' of the whole text. A password with an unencoded '/', '?'
+        // or '@' (a URL that does not parse, logged as such) has no
+        // reliable end, so a query holding an '@' is hidden too: more than
+        // the password at worst, never less.
         if (std.mem.indexOf(u8, text, "//")) |slashes| {
             const start = slashes + 2;
-            const first_q = std.mem.indexOfScalarPos(u8, text, start, '?') orelse text.len;
-            const at_rel = std.mem.lastIndexOfScalar(u8, text[start..first_q], '@') orelse
-                std.mem.lastIndexOfScalar(u8, text[start..], '@');
-            if (at_rel) |r| {
+            if (std.mem.lastIndexOfScalar(u8, text[start..], '@')) |r| {
                 const at = start + r;
                 if (std.mem.indexOfScalarPos(u8, text[0..at], start, ':')) |c| {
                     try w.writeAll(text[0 .. c + 1]);
@@ -308,7 +305,8 @@ test "redacted: no password in what is printed" {
         .{ "postgres://app:pa/ss@db/main", "postgres://app:***@db/main" },
         .{ "postgres://app:pa?ss@db/main?sslmode=require", "postgres://app:***@db/main?sslmode=require" },
         .{ "postgres://app:pa/s?s@db/main?x=1", "postgres://app:***@db/main?x=1" },
-        .{ "postgres://app:pa/ss@db/main?email=a@b", "postgres://app:***@db/main?email=a@b" },
+        .{ "postgres://app:pa/ss@db/main?email=a@b", "postgres://app:***@b" },
+        .{ "postgres://app:a@b?c@db/main", "postgres://app:***@db/main" },
         .{ "sqlite:data/app.db", "sqlite:data/app.db" },
         .{ "not a url at all", "not a url at all" },
     }) |case| {
@@ -325,4 +323,27 @@ test "env: from the C environment, or from an Environ" {
     try testing.expect(env(null, "PATH") != null);
     // Windows reads the C library's environment whatever it is given.
     if (comptime @import("builtin").os.tag != .windows) try testing.expect(env(.empty, "PATH") == null);
+}
+
+test "fuzz: redacted never shows the password" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            // The input is the password, whatever bytes it holds; a short one
+            // may also be a piece of the rest of the URL.
+            if (input.len < 6) return;
+            var text_buf: [512]u8 = undefined;
+            var out_buf: [1024]u8 = undefined;
+            for ([_][2][]const u8{
+                .{ "postgres://app:", "@db.example/main?sslmode=require" },
+                .{ "mongodb://app:", "@h1:27017,h2/admin?authSource=admin&email=a@b" },
+                .{ "rediss://default:", "@cache:6380/0" },
+            }) |parts| {
+                const text = std.fmt.bufPrint(&text_buf, "{s}{s}{s}", .{ parts[0], input, parts[1] }) catch return;
+                const out = std.fmt.bufPrint(&out_buf, "{f}", .{redacted(text)}) catch return;
+                const scaffold = std.fmt.bufPrint(out_buf[out.len..], "{s}***{s}", .{ parts[0], parts[1] }) catch return;
+                if (std.mem.indexOf(u8, scaffold, input) != null) continue;
+                if (std.mem.indexOf(u8, out, input) != null) return error.PasswordShown;
+            }
+        }
+    }.check, &.{ "hunter2", "pa/ss?x", "a@b?c", "p@ss/w?rd", "x?y=z&password=1" });
 }
