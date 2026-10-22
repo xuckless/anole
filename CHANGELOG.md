@@ -22,6 +22,11 @@ breaking changes are listed anyway.
   defaults: no `HttpOnly`, no `Secure`, no `Path`. Breaking: the type
   changed and has no `max_age` (the middleware sets it); struct literals
   keep compiling.
+- `anole.http.middleware.Session` (the HMAC-signed cookie): every cookie
+  now carries a signed expiry (`max_age`, else the new `lifetime`, 24 h,
+  renewed while the session is in use), and the signature covers the
+  cookie's name. Cookies signed before this release are no longer accepted
+  (users sign in again); no configuration change needed.
 
 ### C ABI (ABI 0.1)
 

@@ -94,10 +94,18 @@ pub const Config = struct {
     /// bytes from your secret store. `init` refuses a shorter one, or one
     /// of zeros, with `error.WeakSessionKey`.
     secret_key: []const u8,
+    /// Also signed into the cookie: a cookie signed under one name is no
+    /// session under another.
     cookie_name: []const u8 = "session",
     /// How long the cookie lasts, renewed on every response while the
-    /// session has data; null for a browser-session cookie.
+    /// session has data; null for a browser-session cookie. It is also the
+    /// expiry signed into the cookie.
     max_age: ?std.Io.Duration = null,
+    /// With `max_age` null: how long a signed cookie is honoured after it
+    /// was last signed, whatever the browser keeps. Renewed while the
+    /// session is in use (once half of it has passed), so an idle or
+    /// copied cookie stops working. 24 hours by default.
+    lifetime: std.Io.Duration = .fromSeconds(24 * 3600),
     /// Path "/", HttpOnly, Secure and SameSite=Lax by default, each kept
     /// unless set here (`.{ .same_site = .none }` changes only that one).
     cookie_opts: SessionCookieOpts = .{},
@@ -132,17 +140,25 @@ test "init: a key shorter than 32 bytes, or of zeros, is refused" {
 
 pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
     const cookie_value = req.cookies().get(self.config.cookie_name);
+    // When the loaded cookie stops being honoured; 0 for none loaded.
+    var expires_at: u32 = 0;
     if (cookie_value) |raw| {
-        self.load(req.arena, &req.session, raw, req.io) catch |err| switch (err) {
+        expires_at = self.loadExpiry(req.arena, &req.session, raw, req.io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => |e| log.debug("session load failed: {}", .{e}),
+            else => |e| blk: {
+                log.debug("session load failed: {}", .{e});
+                break :blk 0;
+            },
         };
     }
 
     try executor.next();
 
-    // Re-sign if modified, or if max_age is set and session has data (sliding expiry)
-    const should_set = req.session.modified or (self.config.max_age != null and req.session.len > 0);
+    // Re-sign if modified, or the session has data and its expiry should
+    // slide: on every response with max_age (the cookie's Max-Age is
+    // renewed too), else once half the lifetime has passed.
+    const should_set = req.session.modified or (req.session.len > 0 and
+        (self.config.max_age != null or self.needsRenewal(expires_at, unixSeconds(req.io))));
 
     if (should_set) {
         const result = if (req.session.len == 0) blk: {
@@ -162,20 +178,52 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
     }
 }
 
+/// Version 2 signs the cookie's name and always carries an expiry;
+/// version 1 cookies (unbound to a name, possibly without an expiry) are
+/// refused.
 const Header = packed struct(u64) {
-    version: u8 = 1,
+    version: u8 = 2,
     _reserved: u24 = 0,
     expires_at: u32 = 0,
 };
+
+fn unixSeconds(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
+/// Whether a cookie expiring at `expires_at` has less than half of
+/// `lifetime` left at `now`.
+fn needsRenewal(self: *const Session, expires_at: u32, now: i64) bool {
+    const half = @divTrunc(self.config.lifetime.toSeconds(), 2);
+    return @as(i64, expires_at) - now < half;
+}
+
+/// The MAC over a cookie: the name (so it does not verify under another),
+/// the header and the payload.
+fn mac(self: *const Session, header: []const u8, payload: []const u8, out: *[sig_size]u8) void {
+    var h = HmacSha256.init(self.config.secret_key);
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(self.config.cookie_name.len), .little);
+    h.update(&len);
+    h.update(self.config.cookie_name);
+    h.update(header);
+    h.update(payload);
+    h.final(out);
+}
 
 const header_size = @sizeOf(Header);
 const sig_size = HmacSha256.mac_length;
 const overhead = header_size + sig_size;
 
 /// Load a signed cookie value into a SessionData.
+fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, raw: []const u8, io: std.Io) !void {
+    _ = try self.loadExpiry(arena, session, raw, io);
+}
+
+/// Load a signed cookie value into a SessionData, and return its expiry.
 /// Decodes the base64, verifies HMAC, then parses entries.
 /// Format: base64url([Header: 8 bytes][signature: 32 bytes][key\0value\0...])
-fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, raw: []const u8, io: std.Io) !void {
+fn loadExpiry(self: *const Session, arena: std.mem.Allocator, session: *SessionData, raw: []const u8, io: std.Io) !u32 {
     const decoded_len = base64url.Decoder.calcSizeForSlice(raw) catch return error.InvalidEncoding;
     if (decoded_len < overhead) return error.InvalidEncoding;
     const decoded = try arena.alloc(u8, decoded_len);
@@ -183,24 +231,18 @@ fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, r
 
     // Read and check header
     const header: Header = @bitCast(std.mem.readInt(u64, decoded[0..header_size], .little));
-    if (header.version != 1) return error.UnsupportedVersion;
+    if (header.version != 2) return error.UnsupportedVersion;
 
-    // Verify signature (covers header + payload)
+    // Verify signature (covers the name, header and payload)
     const sig = decoded[header_size..][0..sig_size];
     const payload = decoded[overhead..];
 
-    var mac = HmacSha256.init(self.config.secret_key);
-    mac.update(decoded[0..header_size]);
-    mac.update(payload);
     var expected: [sig_size]u8 = undefined;
-    mac.final(&expected);
+    self.mac(decoded[0..header_size], payload, &expected);
     if (!std.crypto.timing_safe.eql([sig_size]u8, sig.*, expected)) return error.InvalidSignature;
 
-    // Check expiry
-    if (header.expires_at != 0) {
-        const now: u32 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
-        if (header.expires_at < now) return error.Expired;
-    }
+    // Check expiry: every cookie has one.
+    if (@as(i64, header.expires_at) < unixSeconds(io)) return error.Expired;
 
     // Parse null-separated key\0value pairs
     var it = std.mem.splitScalar(u8, payload, 0);
@@ -210,6 +252,7 @@ fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, r
         session.entries[session.len] = .{ .key = key, .value = val };
         session.len += 1;
     }
+    return header.expires_at;
 }
 
 /// Serialize session entries, sign, and base64-encode.
@@ -224,12 +267,10 @@ fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const S
     // Build raw buffer: [header][signature][payload]
     const raw = try arena.alloc(u8, overhead + payload_size);
 
-    // Write header
-    const expires_at: u32 = if (self.config.max_age) |ma| blk: {
-        const expires_ns = now.addDuration(ma).nanoseconds;
-        const expires_s: i64 = @intCast(@divTrunc(expires_ns, std.time.ns_per_s));
-        break :blk @intCast(@min(expires_s, std.math.maxInt(u32)));
-    } else 0;
+    // Write header: the expiry is max_age's, else the lifetime's.
+    const expires_ns = now.addDuration(self.config.max_age orelse self.config.lifetime).nanoseconds;
+    const expires_s: i64 = @intCast(@divTrunc(expires_ns, std.time.ns_per_s));
+    const expires_at: u32 = @intCast(std.math.clamp(expires_s, 0, std.math.maxInt(u32)));
 
     const header = Header{ .expires_at = expires_at };
     std.mem.writeInt(u64, raw[0..header_size], @bitCast(header), .little);
@@ -247,12 +288,8 @@ fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const S
         pos += 1;
     }
 
-    // Sign header + payload
-    const payload = raw[overhead..];
-    var mac = HmacSha256.init(self.config.secret_key);
-    mac.update(raw[0..header_size]);
-    mac.update(payload);
-    mac.final(raw[header_size..][0..sig_size]);
+    // Sign the name, header and payload
+    self.mac(raw[0..header_size], raw[overhead..], raw[header_size..][0..sig_size]);
 
     // Base64-encode
     const enc_len = base64url.Encoder.calcSize(raw.len);
@@ -480,4 +517,38 @@ test "Config: setting one cookie_opts field keeps the secure defaults of the oth
     try testing.expect(session.config.cookie_opts.http_only);
     try testing.expect(session.config.cookie_opts.secure);
     try testing.expectEqualStrings("/", session.config.cookie_opts.path);
+}
+
+test "Session: a cookie signed for one name does not load under another" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const key = "test-secret-key-that-is-long-enough";
+    const a = Session{ .config = .{ .secret_key = key, .cookie_name = "a_session" } };
+    const b = Session{ .config = .{ .secret_key = key, .cookie_name = "b_session" } };
+    var s = SessionData{};
+    try s.set("user_id", "42");
+    const signed = try a.signSession(arena.allocator(), &s, .now(std.testing.io, .real));
+    var s2 = SessionData{};
+    try testing.expectError(error.InvalidSignature, b.load(arena.allocator(), &s2, signed, std.testing.io));
+}
+
+test "Session: without max_age a signed cookie still expires" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const session = Session{ .config = .{ .secret_key = "test-secret-key-that-is-long-enough" } };
+    var s = SessionData{};
+    try s.set("user_id", "42");
+    // Signed in 1970: long expired, whatever the cookie's own lifetime.
+    const signed = try session.signSession(arena.allocator(), &s, .fromNanoseconds(1000 * std.time.ns_per_s));
+    var s2 = SessionData{};
+    try testing.expectError(error.Expired, session.load(arena.allocator(), &s2, signed, std.testing.io));
+}
+
+test "Session: an unchanged session is signed again once half its lifetime has passed" {
+    const session = Session{ .config = .{ .secret_key = "test-secret-key-that-is-long-enough", .lifetime = .fromSeconds(100) } };
+    try testing.expect(!session.needsRenewal(1_000_100, 1_000_000));
+    try testing.expect(!session.needsRenewal(1_000_100, 1_000_049));
+    try testing.expect(session.needsRenewal(1_000_100, 1_000_051));
+    // Nothing loaded: a session made now is signed when it gets data.
+    try testing.expect(session.needsRenewal(0, 1_000_000));
 }
