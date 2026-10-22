@@ -889,6 +889,23 @@ pub fn build(b: *std.Build) void {
             capi_test_step.dependOn(&run_consumer.step);
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
+            // The gRPC suite (tests/capi/grpc.c): its own process, as one
+            // anole_server is allowed per process.
+            if (features.grpc) {
+                const grpc_c = b.addExecutable(.{
+                    .name = "capi-grpc",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                grpc_c.root_module.addCSourceFile(.{ .file = b.path("tests/capi/grpc.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                grpc_c.root_module.addIncludePath(b.path("include"));
+                grpc_c.root_module.linkLibrary(static_lib);
+                const run_grpc_c = b.addRunArtifact(grpc_c);
+                run_grpc_c.stdio = .inherit;
+                run_grpc_c.has_side_effects = true;
+                capi_test_step.dependOn(&run_grpc_c.step);
+                b.step("capi-grpc", "Build the C gRPC consumer (tests/capi/grpc.c)").dependOn(&b.addInstallArtifact(grpc_c, .{}).step);
+            }
+
             // capi-test-asan: the C suite built by the system C compiler
             // with AddressSanitizer and UBSan (Zig ships no ASan runtime);
             // libanole itself keeps Zig's own safety checks.

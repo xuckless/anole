@@ -1297,8 +1297,14 @@ fn writeBytesWith(call: *Call, bytes: []const u8, allocator: std.mem.Allocator) 
     try call.impl.write_mutex.lock(call.io);
     defer call.impl.write_mutex.unlock(call.io);
     call.impl.started = true;
+    if (call.impl.buffer == null and call.impl.out == null and call.impl.out_buf.len == 0) {
+        // No stream was set up (a call refused or failed before it could
+        // be, as `begin` does): the body is collected and sent whole.
+        const b = try call.arena.create(std.ArrayList(u8));
+        b.* = .empty;
+        call.impl.buffer = b;
+    }
     if (call.impl.buffer) |b| return b.appendSlice(call.arena, data);
-    std.debug.assert(call.impl.out_buf.len > 0);
     if (call.impl.out == null) call.impl.out = try call.res.stream(call.impl.out_buf);
     const out = &call.impl.out.?;
     out.interface.writeAll(data) catch return out.err orelse error.WriteFailed;
