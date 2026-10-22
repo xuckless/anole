@@ -618,6 +618,11 @@ pub const Engine = struct {
     websockets: std.atomic.Value(u64) = .init(0),
     ws_in: std.atomic.Value(u64) = .init(0),
     ws_out: std.atomic.Value(u64) = .init(0),
+    /// Publishes taken and not yet fanned out (`ws.publishLimits`), and
+    /// those refused for it.
+    publishing: std.atomic.Value(usize) = .init(0),
+    publish_bytes: std.atomic.Value(usize) = .init(0),
+    publish_dropped: std.atomic.Value(u64) = .init(0),
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa) else {},
 

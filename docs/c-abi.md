@@ -265,8 +265,11 @@ connection ended without a close). `anole_ws_send` queues a message
 (`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WS_DRAIN`),
 `anole_ws_close` sends a close. Topics are Anole's: `anole_ws_subscribe`,
 `anole_ws_unsubscribe`, and `anole_ws_publish(server, topic, ...)` fans out
-on Anole's threads without entering the language. A drain closes sockets with
-1001.
+on Anole's threads without entering the language. Publishes still being fanned
+out are bounded (64 per executor, and the larger of 16 x `limits.ws_high_water`
+and 2 x `limits.ws_max_message` bytes), because a subscriber that stops reading
+holds up every publish sending to it: past the bound `anole_ws_publish` answers
+`ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
 ## Lifecycle
 

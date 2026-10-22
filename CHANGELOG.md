@@ -11,6 +11,12 @@ breaking changes are listed anyway.
   (`anole_respond_fd`), and a request body read after the request was
   answered are now refused (`ANOLE_E_GONE` / `ANOLE_E_INVALID`) instead of
   reaching memory they should not. No configuration change needed.
+- C ABI: publishes still being fanned out to a topic are bounded (64 per
+  executor, and the larger of 16 x `limits.ws_high_water` and
+  2 x `limits.ws_max_message` bytes); past that `anole_ws_publish` returns
+  `ANOLE_E_AGAIN` and sends nothing. A publish larger than
+  `limits.ws_max_message` is refused (`ANOLE_E_INVALID`). Bindings should
+  handle `ANOLE_E_AGAIN` from publish.
 
 ### C ABI (ABI 0.1)
 

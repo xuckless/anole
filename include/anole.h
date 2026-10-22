@@ -429,7 +429,11 @@ ANOLE_API anole_status anole_ws_subscribe(anole_ws w, anole_str topic);
 ANOLE_API anole_status anole_ws_unsubscribe(anole_ws w, anole_str topic);
 /* Sends one message to every socket subscribed to `topic` but `except` (0:
    none), fanned out on Anole's threads; returns at once (topic and data
-   copied). */
+   copied). At most limits.ws_max_message bytes (else ANOLE_E_INVALID).
+   ANOLE_E_AGAIN: not sent, because too many publishes are still being
+   fanned out (a subscriber that does not read holds them up; at most 64 per
+   executor and the larger of 16 x limits.ws_high_water and
+   2 x limits.ws_max_message bytes); no event follows, publish again later. */
 ANOLE_API anole_status anole_ws_publish(anole_server *s, anole_str topic, int type, const void *data, size_t len,
                                         anole_ws except);
 

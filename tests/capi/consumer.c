@@ -891,6 +891,33 @@ static void test_main_server(void) {
     anole_str room = {"room", 4};
     CHECK(anole_ws_subscribe(atomic_load(&cs.ws_handle), room) == ANOLE_E_GONE);
     CHECK(anole_ws_close(atomic_load(&cs.ws_handle), 999, room) == ANOLE_E_INVALID);
+    /* a subscriber that stops reading: publishes held up by it are bounded */
+    {
+      static char chunk[64 * 1024];
+      uint32_t x = 12345;
+      for (size_t i = 0; i < sizeof chunk; i++) {
+        x = x * 1103515245u + 12345u;
+        chunk[i] = (char)(x >> 24);
+      }
+      ws_connect(&c, port);
+      CHECK(wait_for(&cs.ws_open, 3));
+      int refused = 0;
+      for (int i = 0; i < 8000 && !refused; i++) {
+        anole_status st = anole_ws_publish(s, room, ANOLE_WS_BINARY, chunk, sizeof chunk, 0);
+        CHECK(st == ANOLE_OK || st == ANOLE_E_AGAIN);
+        if (st == ANOLE_E_AGAIN) refused = 1;
+      }
+      CHECK(refused);
+      close(c.fd);
+      CHECK(wait_for(&cs.ws_closes, 3));
+      /* the held-up publishes end with the socket */
+      int ok = 0;
+      for (int i = 0; i < 300 && !ok; i++) {
+        if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "x", 1, 0) == ANOLE_OK) ok = 1;
+        else usleep(10000);
+      }
+      CHECK(ok);
+    }
   }
   printf("ok websocket\n");
 

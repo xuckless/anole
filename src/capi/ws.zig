@@ -463,17 +463,32 @@ fn leaveTask(e: *Engine, sock: *Socket, c: *TopicCmd) std.Io.Cancelable!void {
 
 const PublishCmd = struct {
     cmd: Command,
+    engine: *Engine,
     except: u64,
     type: websocket.MessageType,
     topic: []u8,
     data: []u8,
 
     fn free(p: *PublishCmd) void {
+        _ = p.engine.publishing.fetchSub(1, .monotonic);
+        _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.data.len, .monotonic);
         gpa.free(p.topic);
         gpa.free(p.data);
         gpa.destroy(p);
     }
 };
+
+/// Publishes taken and not yet fanned out, at most: a member that stops
+/// reading holds up the publishes sending to it, and they must not pile up
+/// without end. Past either limit `publish` refuses (`error.Again`).
+pub fn publishLimits(e: *const Engine) struct { tasks: usize, bytes: usize } {
+    const hw: usize = e.config.limits.ws_high_water;
+    const max_msg: usize = e.config.limits.ws_max_message;
+    return .{
+        .tasks = 64 * @max(e.execs.len, 1),
+        .bytes = @max(16 * hw, 2 * max_msg),
+    };
+}
 
 var next_publisher: std.atomic.Value(usize) = .init(0);
 
@@ -484,12 +499,28 @@ pub fn publish(e: *Engine, topic: []const u8, typ: c_int, data: []const u8, exce
         abi.WS_BINARY => .binary,
         else => return error.Invalid,
     };
+    if (data.len > e.config.limits.ws_max_message) return error.Invalid;
     if (e.phase.load(.acquire) != .running) return error.Gone;
+    // Counted before anything is copied; `free` gives it back.
+    const lim = publishLimits(e);
+    const size = topic.len + data.len;
+    const tasks = e.publishing.fetchAdd(1, .monotonic);
+    const bytes = e.publish_bytes.fetchAdd(size, .monotonic);
+    if (tasks >= lim.tasks or bytes + size > lim.bytes) {
+        _ = e.publishing.fetchSub(1, .monotonic);
+        _ = e.publish_bytes.fetchSub(size, .monotonic);
+        _ = e.publish_dropped.fetchAdd(1, .monotonic);
+        return error.Again;
+    }
+    errdefer {
+        _ = e.publishing.fetchSub(1, .monotonic);
+        _ = e.publish_bytes.fetchSub(size, .monotonic);
+    }
     const p = try gpa.create(PublishCmd);
     errdefer gpa.destroy(p);
     const t = try gpa.dupe(u8, topic);
     errdefer gpa.free(t);
-    p.* = .{ .cmd = .{ .run = runPublish }, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data) };
+    p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data) };
     // Spread over the executors.
     const xi = next_publisher.fetchAdd(1, .monotonic) % e.execs.len;
     e.execs[xi].post(&p.cmd);
