@@ -1,11 +1,12 @@
-//! `anole_db_*`: the configuration's databases (SQLite in ABI 0.1), queried
+//! `anole_db_*`: the configuration's databases (SQLite, PostgreSQL), queried
 //! without blocking the caller. A call copies the statement and its
 //! parameters into a command for one of the consumer's executors; the
 //! executor's capi task starts a task for it there, which runs the
-//! statement through `anole.sqlite` (readers on the blocking pool, writes
-//! on the database's writer thread, coalescing and the result cache as the
-//! options ask) and queues the answer as one `ANOLE_EV_DB_RESULT` record on
-//! the ring that feeds the consumer.
+//! statement through the connector (`anole.sqlite`: readers on the blocking
+//! pool, writes on the database's writer thread; `anole.pg`: the executor's
+//! own pool), with coalescing and the result cache as the options ask, and
+//! queues the answer as one `ANOLE_EV_DB_RESULT` record on the ring that
+//! feeds the consumer.
 const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
@@ -23,7 +24,9 @@ const Command = engine.Command;
 const db = anole.db;
 const sqlite = if (features.sqlite) anole.sqlite else struct {
     pub const Client = void;
-    pub const Value = void;
+};
+const pg = if (features.postgres) anole.pg else struct {
+    pub const Client = void;
 };
 
 const log = std.log.scoped(.anole);
@@ -32,8 +35,16 @@ const log = std.log.scoped(.anole);
 pub const Db = struct {
     engine: *Engine,
     config: config_mod.Config.Database,
-    /// Set when the server starts; null before and after.
-    client: std.atomic.Value(?*sqlite.Client) = .init(null),
+    /// The connector, set when the server starts.
+    client: Client = .none,
+    /// Whether queries may be queued: from the start until the stop.
+    open: std.atomic.Value(bool) = .init(false),
+};
+
+const Client = union(enum) {
+    none,
+    sqlite: *sqlite.Client,
+    postgres: *pg.Client,
 };
 
 /// Per executor: the tasks of the queries it runs, canceled at the stop.
@@ -48,9 +59,18 @@ pub const ExecState = struct {
 /// Opens every configured database on `app` (from the server's main
 /// thread, before the listeners open) and runs its `init` script.
 pub fn open(e: *Engine, app: *anole.App) !void {
-    if (comptime !features.sqlite) return;
     for (e.dbs) |*d| {
-        const sq = d.config.sqlite.?;
+        if (d.config.postgres) |p| {
+            if (comptime features.postgres) try openPostgres(d, app, p) else unreachable;
+        } else {
+            if (comptime features.sqlite) try openSqlite(d, app, d.config.sqlite.?) else unreachable;
+        }
+        d.open.store(true, .release);
+    }
+}
+
+fn openSqlite(d: *Db, app: *anole.App, sq: config_mod.Config.Sqlite) !void {
+    {
         const client = try app.sqlite(anole.sqlite.Options{
             .path = sq.path,
             .name = d.config.name,
@@ -67,13 +87,49 @@ pub fn open(e: *Engine, app: *anole.App) !void {
             log.err("databases \"{s}\": init failed: {t}", .{ d.config.name, err });
             return err;
         };
-        d.client.store(client, .release);
+        d.client = .{ .sqlite = client };
     }
+}
+
+fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
+    const ms = std.Io.Duration.fromMilliseconds;
+    const client = try app.postgres(anole.pg.Options{
+        .url = p.url,
+        .name = d.config.name,
+        .max_connections = p.max_connections,
+        .acquire_timeout = ms(p.acquire_timeout_ms),
+        .connect_timeout = if (p.connect_timeout_ms > 0) ms(p.connect_timeout_ms) else null,
+        .statement_cache_size = p.statement_cache_size,
+        .max_lifetime = if (p.max_lifetime_ms > 0) ms(p.max_lifetime_ms) else null,
+        .idle_timeout = if (p.idle_timeout_ms > 0) ms(p.idle_timeout_ms) else null,
+        .sslmode = if (p.sslmode) |m| switch (config_mod.sslMode(m).?) {
+            inline else => |t| @field(anole.pg.SslMode, @tagName(t)),
+        } else null,
+        .tls = .{ .ca = if (p.ca_file) |f| .{ .file = .{ .path = f } } else if (p.ca_pem) |pem| .{ .pem = pem } else null },
+        .connect_at_start = p.connect_at_start,
+        .application_name = p.application_name,
+        .reset_session = p.reset_session,
+        .cache = .{
+            .max_entries = d.config.cache.max_entries,
+            .max_bytes = std.math.cast(usize, d.config.cache.max_bytes) orelse std.math.maxInt(usize),
+        },
+    });
+    d.client = .{ .postgres = client };
+    const script = p.init orelse return;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var ctx: db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
+    _ = client.exec(&ctx, script, .{}) catch |err| {
+        if (db.lastError(&ctx)) |detail| {
+            log.err("databases \"{s}\": init failed: {f}", .{ d.config.name, detail });
+        } else log.err("databases \"{s}\": init failed: {t}", .{ d.config.name, err });
+        return err;
+    };
 }
 
 /// The databases are closed with the server: no new query from now on.
 pub fn close(e: *Engine) void {
-    for (e.dbs) |*d| d.client.store(null, .release);
+    for (e.dbs) |*d| d.open.store(false, .release);
 }
 
 pub fn find(e: *Engine, name: []const u8) ?*Db {
@@ -97,7 +153,7 @@ const Query = struct {
     cache_ttl_ms: u32,
     sql: []const u8,
     tag: ?[]const u8,
-    params: []const sqlite.Value,
+    params: []const db.Value,
     /// Everything above points into this.
     arena: std.heap.ArenaAllocator,
 
@@ -115,27 +171,28 @@ const Query = struct {
 
 /// Queues `sql` for `c` (`anole_db_query`, `anole_db_exec`).
 pub fn submit(d: *Db, c: *Consumer, verb: Verb, sql: []const u8, params: []const abi.DbValue, opts: abi.DbOptions, user_data: u64) QueryError!void {
-    if (comptime !features.sqlite) return error.Unsupported;
+    if (comptime !features.sqlite and !features.postgres) return error.Unsupported;
     const e = d.engine;
     if (c.engine != e) return error.Invalid;
     switch (e.phase.load(.acquire)) {
         .running, .draining => {},
         else => return error.State,
     }
-    if (d.client.load(.acquire) == null) return error.State;
+    if (!d.open.load(.acquire)) return error.State;
     if (c.execs.items.len == 0) return error.State;
-    for (params) |p| if (p.type > abi.DB_BLOB) return error.Invalid;
+    for (params) |p| if (p.type > abi.DB_BOOL) return error.Invalid;
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const values = try a.alloc(sqlite.Value, params.len);
+    const values = try a.alloc(db.Value, params.len);
     for (params, values) |p, *v| v.* = switch (p.type) {
         abi.DB_NULL => .null,
         abi.DB_INT => .{ .int = p.v.i },
         abi.DB_FLOAT => .{ .float = p.v.f },
         abi.DB_TEXT => .{ .text = try a.dupe(u8, p.v.s.slice()) },
         abi.DB_BLOB => .{ .blob = try a.dupe(u8, p.v.s.slice()) },
+        abi.DB_BOOL => .{ .bool = p.v.i != 0 },
         else => unreachable,
     };
     const q = try a.create(Query);
@@ -158,16 +215,20 @@ pub fn submit(d: *Db, c: *Consumer, verb: Verb, sql: []const u8, params: []const
 }
 
 pub fn invalidate(d: *Db, tag: []const u8) error{State}!void {
-    if (comptime !features.sqlite) return error.State;
-    const client = d.client.load(.acquire) orelse return error.State;
-    if (tag.len == 0) client.cache.invalidate(.all) else client.cache.invalidate(.{ .tag = tag });
+    if (!d.open.load(.acquire)) return error.State;
+    const cache = switch (d.client) {
+        .none => return error.State,
+        .sqlite => |client| if (comptime features.sqlite) &client.cache else unreachable,
+        .postgres => |client| if (comptime features.postgres) &client.cache else unreachable,
+    };
+    if (tag.len == 0) cache.invalidate(.all) else cache.invalidate(.{ .tag = tag });
 }
 
 /// On the executor: runs the statement and queues the answer.
 fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
     defer q.free();
     const e = x.engine;
-    const client = q.d.client.load(.acquire) orelse return;
+    if (!q.d.open.load(.acquire)) return;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var ctx: db.Ctx = .{ .io = e.io, .arena = arena.allocator() };
@@ -182,15 +243,20 @@ fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
         .tag = q.tag,
         .keep_empty = q.flags & abi.DB_DROP_EMPTY == 0,
     };
-    const with = client.with(options);
     var answer: Answer = .{ .user_data = q.user_data };
-    switch (q.verb) {
-        .query => if (with.table(&ctx, q.sql, q.params)) |t| {
-            answer.table = t;
-        } else |err| answer.failed(&ctx, err),
-        .exec => if (with.run(&ctx, q.sql, q.params)) |ch| {
-            answer.changes = ch;
-        } else |err| answer.failed(&ctx, err),
+    switch (q.d.client) {
+        .none => return,
+        inline .sqlite, .postgres => |client, kind| if (comptime @field(features, @tagName(kind))) {
+            const with = client.with(options);
+            switch (q.verb) {
+                .query => if (with.table(&ctx, q.sql, q.params)) |t| {
+                    answer.table = t;
+                } else |err| answer.failed(&ctx, err),
+                .exec => if (with.run(&ctx, q.sql, q.params)) |ch| {
+                    answer.changes = ch;
+                } else |err| answer.failed(&ctx, err),
+            }
+        } else unreachable,
     }
     if (db.lastSource(&ctx)) |src| answer.source = switch (src) {
         .database => abi.DB_FROM_DATABASE,
@@ -215,8 +281,8 @@ const Answer = struct {
     http_status: u16 = 0,
     error_class: abi.DbErrorClass = .none,
     source: u8 = abi.DB_FROM_DATABASE,
-    table: ?sqlite.Table = null,
-    changes: ?sqlite.Changes = null,
+    table: ?db.Table = null,
+    changes: ?db.Changes = null,
     message: []const u8 = "",
     code: []const u8 = "",
     constraint: []const u8 = "",
@@ -295,14 +361,16 @@ const Answer = struct {
             for (t.columns, 0..) |n, i| names[i] = w.put(n);
             const cells: [*]abi.DbCell = @ptrCast(@alignCast(rec.ptr + cells_off));
             var k: usize = 0;
-            for (t.rows) |row| for (row) |v| {
+            for (t.rows) |row| for (row, 0..) |v, col| {
                 cells[k] = switch (v) {
                     .null => .{ .type = abi.DB_NULL, .v = .{ .i = 0 } },
                     .int => |n| .{ .type = abi.DB_INT, .v = .{ .i = n } },
                     .float => |f| .{ .type = abi.DB_FLOAT, .v = .{ .f = f } },
+                    .bool => |b| .{ .type = abi.DB_BOOL, .v = .{ .i = @intFromBool(b) } },
                     .text => |s| .{ .type = abi.DB_TEXT, .v = .{ .s = w.put(s) } },
                     .blob => |s| .{ .type = abi.DB_BLOB, .v = .{ .s = w.put(s) } },
                 };
+                if (col < t.types.len) cells[k].db_type = t.types[col];
                 k += 1;
             };
         }

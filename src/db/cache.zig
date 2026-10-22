@@ -56,7 +56,7 @@ pub const Shape = enum {
     optional,
     /// A slice of rows (`all`): empty with none.
     all,
-    /// Rows under run-time column names (`anole.sqlite.Table`): empty with
+    /// Rows under run-time column names (`anole.db.Table`): empty with
     /// no row.
     table,
 };

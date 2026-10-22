@@ -92,7 +92,9 @@ pub const Config = struct {
     pub const Database = struct {
         /// What `anole_db_find` looks it up by: unique, 1-255 bytes.
         name: []const u8,
+        /// Exactly one of `sqlite` and `postgres`.
         sqlite: ?Sqlite = null,
+        postgres: ?Postgres = null,
         /// The bounds of the answers kept for queries with cache_ttl_ms,
         /// over every executor.
         cache: CacheBounds = .{},
@@ -110,6 +112,45 @@ pub const Config = struct {
         statement_cache: u32 = 64,
         /// Run on every connection as it opens: "PRAGMA cache_size = -20000".
         pragmas: []const []const u8 = &.{},
+        /// SQL run once at start, before the listeners open: a schema.
+        init: ?[]const u8 = null,
+    };
+
+    /// A PostgreSQL database, as `anole.pg.Options` (docs/database.md).
+    pub const Postgres = struct {
+        /// postgres://user:password@host:port/database?params. Null:
+        /// DATABASE_URL, else libpq's variables (PGHOST, PGUSER...).
+        url: ?[]const u8 = null,
+        /// libpq's sslmode: disable, allow, prefer, require, verify-ca,
+        /// verify-full. Null: the URL's, else PGSSLMODE, else verify-full
+        /// for a server on another host and prefer on this machine.
+        sslmode: ?[]const u8 = null,
+        /// The CA certificates (PEM) the server's certificate is checked
+        /// against, as a file or as the PEM text: with one, the certificate
+        /// is always checked (verify-full unless sslmode says verify-ca).
+        /// Null: the URL's sslrootcert, else the system's store.
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        /// Connections in all, split between the executors. Null: the URL's
+        /// pool_max_conns, else twice the executors, at least 4.
+        max_connections: ?u32 = null,
+        /// How long a query waits for a connection when all are busy.
+        acquire_timeout_ms: u32 = 5000,
+        /// How long opening a connection may take; 0: no limit.
+        connect_timeout_ms: u32 = 10_000,
+        /// Statements each connection keeps prepared; 0 behind PgBouncer
+        /// before 1.21 in transaction mode.
+        statement_cache_size: u16 = 256,
+        /// Connections older than this are closed; 0: no limit.
+        max_lifetime_ms: u32 = 60 * 60 * 1000,
+        /// Connections idle this long are closed; 0: no limit.
+        idle_timeout_ms: u32 = 30 * 60 * 1000,
+        /// Open a connection per executor at start, and fail the start if
+        /// that fails.
+        connect_at_start: bool = false,
+        application_name: ?[]const u8 = null,
+        /// Reset each connection's session when a query gives it back.
+        reset_session: bool = true,
         /// SQL run once at start, before the listeners open: a schema.
         init: ?[]const u8 = null,
     };
@@ -306,6 +347,16 @@ pub fn parse(arena: std.mem.Allocator, json: []const u8, why: *std.Io.Writer) Pr
     return cfg;
 }
 
+/// libpq's sslmode names ("verify-full"), as `anole.pg.SslMode`'s tags.
+pub const SslMode = enum { disable, allow, prefer, require, verify_ca, verify_full };
+
+pub fn sslMode(text: []const u8) ?SslMode {
+    var buf: [16]u8 = undefined;
+    if (text.len > buf.len) return null;
+    for (text, buf[0..text.len]) |ch, *o| o.* = if (ch == '-') '_' else ch;
+    return std.meta.stringToEnum(SslMode, buf[0..text.len]);
+}
+
 fn fail(why: *std.Io.Writer, comptime fmt: []const u8, args: anytype) Problem {
     why.print("config: " ++ fmt, args) catch {};
     return error.Config;
@@ -348,9 +399,21 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
         for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
             return fail(why, "databases[{d}].name \"{s}\" is taken", .{ i, d.name });
-        const sq = d.sqlite orelse return fail(why, "databases[{d}]: sqlite (the one kind in ABI 0.1)", .{i});
-        if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
-        if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
+        if ((d.sqlite == null) == (d.postgres == null)) return fail(why, "databases[{d}]: exactly one of sqlite and postgres", .{i});
+        if (d.sqlite) |sq| {
+            if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
+            if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
+        }
+        if (d.postgres) |p| {
+            if (comptime !features.postgres) return fail(why, "databases[{d}].postgres: PostgreSQL is not built in (-Dpostgres)", .{i});
+            if (p.sslmode) |m| {
+                if (sslMode(m) == null) return fail(why, "databases[{d}].postgres.sslmode \"{s}\": one of disable, allow, prefer, require, verify-ca, verify-full", .{ i, m });
+                if (p.url) |u| if (std.mem.indexOf(u8, u, "sslmode=") != null)
+                    return fail(why, "databases[{d}].postgres: sslmode is given twice, in the url and beside it", .{i});
+            }
+            if (p.ca_file != null and p.ca_pem != null) return fail(why, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
+            if (p.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].postgres.max_connections: at least 1", .{i});
+        }
     }
     try checkMiddleware(cfg.middleware, "middleware", why);
     var timeouts: [max_timeouts]u32 = undefined;
@@ -590,6 +653,12 @@ test "parse: the defaults, a full document, and what is refused" {
         // A record carries its length in 32 bits.
         "{\"limits\": {\"inline_body_max\": 4294967295, \"body_max\": 8589934592}}",
         "{\"limits\": {\"ws_max_message\": 4294967295}}",
+        // A database is one kind, named once, with a known sslmode given once.
+        "{\"databases\": [{\"name\": \"d\"}]}",
+        "{\"databases\": [{\"name\": \"d\", \"sqlite\": {\"path\": \"x\"}, \"postgres\": {}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"sslmode\": \"maybe\"}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"sslmode\": \"disable\", \"url\": \"postgres://h/d?sslmode=require\"}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
     };
     for (bad) |doc| {
         why.end = 0;
@@ -597,6 +666,11 @@ test "parse: the defaults, a full document, and what is refused" {
         try std.testing.expect(why.buffered().len > 0);
     }
 
+    if (features.postgres) {
+        why.end = 0;
+        const p = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://db.internal/app\", \"sslmode\": \"verify-ca\", \"ca_pem\": \"-----BEGIN CERTIFICATE-----\"}}]}", &why);
+        try std.testing.expectEqual(SslMode.verify_ca, sslMode(p.databases[0].postgres.?.sslmode.?).?);
+    }
     if (features.auth) {
         why.end = 0;
         _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"audience\": \"api\"}}]}", &why);

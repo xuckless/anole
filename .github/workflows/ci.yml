@@ -490,7 +490,7 @@ jobs:
         run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh
 
   postgres:
-    name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256)
+    name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256; the C ABI's suite)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -510,7 +510,7 @@ jobs:
       # server's certificate: the script starts the server itself, with a
       # CA made for the run.
       - name: Tests against a live server
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh
 
   mongodb:

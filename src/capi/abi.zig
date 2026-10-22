@@ -162,6 +162,7 @@ pub const DB_INT: u32 = 1;
 pub const DB_FLOAT: u32 = 2;
 pub const DB_TEXT: u32 = 3;
 pub const DB_BLOB: u32 = 4;
+pub const DB_BOOL: u32 = 5;
 
 pub const DbValue = extern struct {
     type: u32,
@@ -222,7 +223,8 @@ pub const DbResultEvent = extern struct {
 
 pub const DbCell = extern struct {
     type: u32,
-    reserved: u32 = 0,
+    /// PostgreSQL: the column's type OID; 0 otherwise.
+    db_type: u32 = 0,
     v: extern union { i: i64, f: f64, s: Span },
 };
 

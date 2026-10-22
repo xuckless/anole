@@ -17,6 +17,18 @@ breaking changes are listed anyway.
   answer and the database's detail. `anole.sqlite`'s `table` and `run`
   are the Zig side: rows and parameters known only at run time
   (`anole.sqlite.Value`).
+- `anole_db_*` with PostgreSQL: a `"postgres"` database (`url`, `sslmode`,
+  `ca_file`/`ca_pem`, pool bounds and timeouts, `init`), the same calls,
+  options, answers and error classes. TLS is checked by default
+  (verify-full for a server on another host); a CA given in the
+  configuration can't be turned off by the URL. Cells come in PostgreSQL's
+  text format but for bool, integers, floats and bytea, each with its
+  column's type OID (`anole_db_cell.db_type`, formerly `reserved`) for a
+  binding's own type parsers; `ANOLE_DB_BOOL` is a new value and cell type.
+  `timeout_ms` cancels the statement on the server.
+- `anole.db.Value`, `Table` and `Changes` are shared by the SQL connectors
+  (`anole.sqlite`'s are now these); `anole.pg` gains `table` and `run` for
+  rows and parameters known only at run time, and `Options.sslmode`.
 
 ## 0.1.1 (2026-10-22)
 
