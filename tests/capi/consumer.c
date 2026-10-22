@@ -944,7 +944,7 @@ static void test_main_server(void) {
     CHECK(anole_req_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
     /* Every error answer sets its own text: none is left over from an earlier call. */
-    CHECK(str_has(anole_last_error(), "invalid"));
+    CHECK(str_has(anole_last_error(), "flag"));
     CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(str_has(anole_last_error(), "stale"));
     CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (have_websocket ? ANOLE_E_INVALID : ANOLE_E_UNSUPPORTED)); /* wrong kind */

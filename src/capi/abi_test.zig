@@ -56,6 +56,7 @@ test "anole.h: every struct the header declares is in abi.records" {
 }
 
 test "anole.h: every ANOLE_ constant in the header is in abi.zig, and the reverse" {
+    @setEvalBranchQuota(1_000_000);
     const eq = std.testing.expectEqual;
     try eq(abi.version_major, c.ANOLE_ABI_VERSION_MAJOR);
     try eq(abi.version_minor, c.ANOLE_ABI_VERSION_MINOR);

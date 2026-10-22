@@ -314,7 +314,7 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
     // This server's log callback, or stderr (a later server without one
     // does not inherit an earlier one's).
     if (o.log) |f| {
-        if (engine.gpa.create(LogTarget)) |t| {
+        if (std.heap.c_allocator.create(LogTarget)) |t| {
             t.* = .{ .f = f, .ud = o.log_ud };
             log_target.store(t, .release);
         } else |_| log_target.store(null, .release);
@@ -476,7 +476,7 @@ export fn anole_server_destroy(s: ?*anyopaque) void {
     const e = engineOf(s) orelse return;
     e.destroy();
     // No log callback runs again.
-    if (log_target.swap(null, .acq_rel)) |t| engine.gpa.destroy(@constCast(t));
+    if (log_target.swap(null, .acq_rel)) |t| std.heap.c_allocator.destroy(@constCast(t));
 }
 
 export fn anole_server_stats(s: ?*anyopaque, out: ?*abi.Stats) i32 {

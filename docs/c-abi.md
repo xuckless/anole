@@ -10,8 +10,13 @@ whoever writes one, or uses Anole from C.
 
 The contract is [`include/anole.h`](../include/anole.h): every function
 there says who owns what and for how long. The configuration's schema is
-[`include/anole.schema.json`](../include/anole.schema.json). This is ABI
-**0.2**: it changes before 1.0 (see [What comes next](#what-comes-next)).
+[`include/anole.schema.json`](../include/anole.schema.json), and every
+record, constant, event and handle kind is described by
+[`include/anole.abi.json`](../include/anole.abi.json), which bindings
+generate their parsers from. This guide describes the ABI that ships with
+the Anole release it belongs to; `ANOLE_ABI_VERSION` in `anole.h` is the
+number, and the ABI changes before 1.0 (see
+[What comes next](#what-comes-next)).
 
 ## Building and linking
 
@@ -45,7 +50,7 @@ HTTP/2, HTTP/3 or WebSocket. `anole_has_feature("http3")` says what is in.
 On Windows (a development target), `zig build capi` makes `anole.dll` and its
 import library (COFF cannot merge objects into one); define `ANOLE_SHARED`
 before including `anole.h`. There is no doorbell fd and no
-`anole_respond_fd` there.
+`anole_req_respond_fd` there.
 
 ## The model
 
@@ -64,7 +69,7 @@ before including `anole.h`. There is no doorbell fd and no
   shared out among the consumers at start (executor *e* feeds consumer
   *e* mod *M*).
 - **The consumer drains a batch** with `anole_poll` into its own buffer, and
-  answers with `anole_respond` (or a stream, or a file). The answer goes into
+  answers with `anole_req_respond` (or a stream, or a file). The answer goes into
   the slot and onto the executor's done list; the executor is woken once per
   burst, not once per answer.
 - **HTTP/2 and HTTP/3 requests need no task.** A request that arrived whole
@@ -78,13 +83,106 @@ before including `anole.h`. There is no doorbell fd and no
   the late answer gets `ANOLE_E_GONE`. One sweeper per executor checks them,
   no timer per request.
 
+## Rules
+
+Fourteen rules, the same ones `anole.h` states at its top.
+
+**Threads**
+
+1. Any function may be called from any thread, except: `anole_poll` and
+   `anole_poll_wait` never overlap on one consumer (a shared consumer
+   serializes them); nothing is called from inside the wake or log
+   callbacks; blocking functions are never called on an Anole thread;
+   `anole_server_destroy` overlaps nothing on its server.
+2. Calls on one handle are memory-safe from any thread. Serialize them
+   anyway: overlapping answer calls on one handle may answer
+   `ANOLE_E_GONE`. Cleanup calls may race anything; at most one takes effect.
+3. Blocking: `anole_server_open`, `anole_server_start`, `anole_server_wait`,
+   `anole_server_destroy`, `anole_poll_wait`; `anole_req_read`,
+   `anole_req_stream_write_wait` and `anole_grpc_send_wait` with a timeout
+   other than 0; briefly (file I/O) `anole_server_reload_tls` and
+   `anole_req_respond_fd`. Everything else returns in microseconds.
+4. Consumers attach before `anole_server_open` / `anole_server_start`;
+   executor *e* feeds consumer *e* mod *M*, and start refuses a consumer that
+   would get none (`ConsumerWithoutExecutor`).
+5. Wake: at least once, may repeat. After any wake, poll until 0.
+6. Shared consumers: any thread may get any event (route by handle); exactly
+   one gets `ANOLE_EV_STOPPED`, after which `anole_poll_wait` returns 0
+   everywhere.
+7. One server per process. `fork` only before `anole_server_create` or after
+   `anole_server_destroy`; a child cannot use its parent's server (its calls
+   answer `ANOLE_E_STATE`, and it may create its own). In embedded mode
+   Anole installs no signal handlers and its threads block asynchronous
+   signals, so a host's SIGCHLD or SIGINT handler never runs on them.
+
+**Lifetimes**
+
+8. `anole_server`, `anole_consumer` and `anole_db` pointers live until
+   `anole_server_destroy` returns; after it no callback runs again.
+9. Handles: a request from its event to its answer, `ANOLE_EV_ABORT` or
+   `ANOLE_EV_STOPPED`; a gRPC call to `anole_grpc_finish` or abort; a
+   WebSocket to `ANOLE_EV_WS_CLOSE`; a WebTransport session to
+   `ANOLE_EV_WT_CLOSE`; a WebTransport stream to `anole_handle_release` or
+   its session's end. Events for a handle that is already over may still be
+   queued.
+10. Answer and data calls on an over handle answer `ANOLE_E_GONE` (counted in
+    `anole_stats.gone`). **Cleanup calls** (`anole_handle_release`,
+    `anole_req_abort`, `anole_ws_close`, `anole_ws_unsubscribe`,
+    `anole_wt_close`, `anole_wt_stream_reset`, `anole_wt_stream_stop`)
+    answer `ANOLE_OK` on a handle that is already over (answered, expired,
+    aborted, closed by either side, released, from a destroyed server, with
+    no server at all), do nothing, set no error and are not counted, so
+    finalizers and `finally` blocks can call them blindly. 0, or a handle of
+    another kind than the call takes, is `ANOLE_E_INVALID` everywhere
+    (token `WrongHandleKind`): that is misuse, not a race.
+
+**Ownership**
+
+11. Everything passed in is copied before the call returns, except bodies
+    passed with `ANOLE_BODY_BORROW`.
+12. Records live in the caller's 8-byte aligned buffer; `len` covers the
+    padding; copy what you keep before the next poll. Skip types you do not
+    know; types that create an obligation come only when the configuration
+    asks for them. A record's fixed part may grow at its end in a later ABI
+    version, and its arrays are reached through offsets in it
+    (`spans_off`, `metadata_off`), never through `sizeof`.
+13. Strings returned: `anole_version` and `anole_last_error_name` are static;
+    `anole_last_error` is thread-local text for logs, set with the name and
+    `anole_last_errno` by every call that returns < 0.
+14. Options structs start with `size = sizeof` as compiled. Bytes past what
+    the library knows, reserved fields and unknown flag bits must be 0, or
+    the call answers `ANOLE_E_INVALID` (`UnknownField`, `ReservedNotZero`,
+    `UnknownFlag`).
+
+### Notes for binding authors
+
+- A handle is a `uint64_t`; JavaScript Numbers hold 53 bits and BigInt
+  allocates, so anole-node may carry a handle as two `u32` halves (low at
+  `ev+8`, high at `ev+12`; every supported target is little-endian) and pass
+  both back to the addon. The generation is not shortened to fit 53 bits.
+- `anole_str` and `anole_span` are passed by value; ctypes, cffi's ABI mode
+  and `bun:ffi` handle struct-by-value poorly, so prototype bindings as C
+  extensions (as anole-node and anole-py are).
+- An `ArrayBuffer` and a `bytearray` are 8-byte aligned enough for the poll
+  buffer.
+- Check the library at load with `ANOLE_ABI_COMPATIBLE(anole_abi_version())`:
+  before 1.0 both numbers must match; from 1.0 the major must match and the
+  minor must be at least the header's.
+- Generate parsers and constants from `anole.abi.json` (and config types from
+  `anole.schema.json`), pinned to the Anole tag, and check in CI that what
+  you regenerated is what you committed. Do not write a layout by hand.
+- For `anole_poll`'s `ANOLE_E_TOOBIG`: keep a steady buffer (256 KiB serves
+  requests and messages up to the defaults) and, when it happens, poll once
+  into a one-off buffer of at least the `len` the answer put in the first
+  `anole_event` (type `ANOLE_EV_NONE`).
+
 ## Threads and the wake contract
 
 Every function may be called from any thread unless it says otherwise. A
 handle is meant for the thread that polled it; another thread may use it
 with the binding's own synchronization (calls on one handle must not
 overlap). `anole_poll` on one consumer must not overlap with itself, except
-on a shared consumer (`ANOLE_CONSUMER_SHARED`), which serializes polls and
+on a shared consumer (`ANOLE_CONSUMER_F_SHARED`), which serializes polls and
 returns one event per call.
 
 A consumer is woken one of three ways:
@@ -119,7 +217,7 @@ for (;;) {
 }
 ```
 
-`ANOLE_POLL_NOARM` leaves the doorbell disarmed on a 0 return, for a consumer
+`ANOLE_POLL_F_NOARM` leaves the doorbell disarmed on a 0 return, for a consumer
 that spins a few microseconds before sleeping; it must end with a plain poll.
 
 ## Events and records
@@ -127,42 +225,92 @@ that spins a few microseconds before sleeping; it must end with a plain poll.
 Every record starts with `anole_event` (`type`, `len`, `handle`); records are
 8-byte aligned and `len` covers the payload and padding, so a binding skips
 the types (and the trailing fields) it does not know. Strings inside a record
-are `anole_span`s (offset from the record's start, length).
+are `anole_span`s (offset from the record's start, length). The fixed part of
+a record may grow at its end in a later ABI version; arrays (headers,
+parameters, metadata) are reached through the offset stored in the record.
 
-| Event | Record | Handle |
-| --- | --- | --- |
-| `ANOLE_EV_REQUEST` | `anole_request_event`, then header spans, parameter spans, bytes | `anole_req` |
-| `ANOLE_EV_BODY` | `anole_event`: more request body (after `ANOLE_E_AGAIN`) | `anole_req` |
-| `ANOLE_EV_ABORT` | `anole_event`: the client left (or the drain cut it, or the deadline passed); nothing more is owed | `anole_req`, `anole_grpc_call` |
-| `ANOLE_EV_WRITABLE` | `anole_event`: a stream that took `ANOLE_BUSY` has room | `anole_req`, `anole_grpc_call` |
-| `ANOLE_EV_SENT` | `anole_sent_event`: a borrowed body is no longer read | any |
-| `ANOLE_EV_WS_OPEN` | `anole_request_event` of the upgrade request | `anole_ws` |
-| `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` |
-| `ANOLE_EV_WS_CLOSE` | `anole_ws_close_event`: the socket is done | `anole_ws` |
-| `ANOLE_EV_WS_DRAIN` | `anole_event`: a socket that took `ANOLE_BUSY` has room | `anole_ws` |
-| `ANOLE_EV_DB_RESULT` | `anole_db_result_event`, then column names, cells, bytes | 0 (`user_data`) |
-| `ANOLE_EV_STOPPED` | `anole_event`: the server stopped; the consumer's last event | 0 |
-| `ANOLE_EV_GRPC_CALL` | `anole_grpc_call_event`, then metadata spans, bytes | `anole_grpc_call` |
-| `ANOLE_EV_GRPC_MESSAGE` | `anole_grpc_message_event`, then the message | `anole_grpc_call` |
-| `ANOLE_EV_GRPC_HALF_CLOSE` | `anole_event`: the client sent its last message | `anole_grpc_call` |
+| Event | Record | Handle | Obligation |
+| --- | --- | --- | --- |
+| `ANOLE_EV_NONE` (0) | `anole_event`, written by `ANOLE_E_TOOBIG` only: `len` is the size the next record needs | 0 | none |
+| `ANOLE_EV_REQUEST` | `anole_request_event`, then header spans, parameter spans, bytes | `anole_req` | an answer: respond, respond_fd, stream_end, fail, abort or handle_release |
+| `ANOLE_EV_BODY` | `anole_event`: more request body (after `ANOLE_E_AGAIN`) | `anole_req` | none |
+| `ANOLE_EV_ABORT` | `anole_abort_event`: why (`reason`) and what the client was sent (`status`); nothing more is owed | `anole_req`, `anole_grpc_call` | ends it |
+| `ANOLE_EV_WRITABLE` | `anole_event`: a stream, call, WebSocket or WebTransport stream that took `ANOLE_BUSY` has room | `anole_req`, `anole_grpc_call`, `anole_ws`, `anole_wt_stream` | none |
+| `ANOLE_EV_SENT` | `anole_sent_event`: a borrowed body is no longer read | any (may be stale) | none |
+| `ANOLE_EV_WS_OPEN` | `anole_request_event` of the upgrade request | `anole_ws` | none |
+| `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` | none |
+| `ANOLE_EV_WS_CLOSE` | `anole_ws_close_event`: the socket is done | `anole_ws` | ends the socket |
+| (9) | retired: was `ANOLE_EV_WS_DRAIN`; WebSockets use `ANOLE_EV_WRITABLE` | | |
+| `ANOLE_EV_DB_RESULT` | `anole_db_result_event`, then column names, cells, bytes | 0 (`user_data`) | none |
+| `ANOLE_EV_STOPPED` | `anole_event`: the server stopped; the consumer's last event | 0 | none |
+| `ANOLE_EV_GRPC_CALL` | `anole_grpc_call_event`, then metadata spans, bytes | `anole_grpc_call` | `anole_grpc_finish` (or `anole_handle_release`) |
+| `ANOLE_EV_GRPC_MESSAGE` | `anole_grpc_message_event`, then the message | `anole_grpc_call` | none |
+| `ANOLE_EV_GRPC_HALF_CLOSE` | `anole_event`: the client sent its last message | `anole_grpc_call` | none |
+| `ANOLE_EV_WT_OPEN` | `anole_request_event` of the CONNECT | `anole_wt` | none |
+| `ANOLE_EV_WT_CLOSE` | `anole_wt_close_event` | `anole_wt` | ends the session |
+| `ANOLE_EV_WT_DRAIN` | `anole_event`: the session is draining | `anole_wt` | none |
+| `ANOLE_EV_WT_STREAM` | `anole_wt_stream_event`: the peer opened a stream | `anole_wt_stream` | release (`anole_handle_release`) |
+| `ANOLE_EV_WT_DATA` | `anole_wt_data_event`, then the bytes | `anole_wt_stream` | none |
+| `ANOLE_EV_WT_STREAM_RESET` | `anole_wt_code_event`: the peer reset its sending side | `anole_wt_stream` | none |
+| `ANOLE_EV_WT_STREAM_STOP` | `anole_wt_code_event`: the peer asked this side to stop sending | `anole_wt_stream` | none |
+| `ANOLE_EV_WT_DATAGRAM` | `anole_wt_datagram_event`, then the bytes | `anole_wt` | none |
+| `ANOLE_EV_WS_UPGRADE` (40) | `anole_request_event`: a WebSocket upgrade the consumer accepts or refuses; only with `"accept": "consumer"` | `anole_req` | accept or a refusing answer |
+| `ANOLE_EV_DRAINING` (41) | `anole_event`: the drain started | 0 | none |
 
-Types 15-39 are reserved (more gRPC, WebTransport, more database events).
+The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
+20-29 WebTransport; 30-39 database; 40-49 HTTP and WebSocket additions;
+50-63 core additions; 64-255 new areas, sixteen per area; 256 and up are
+never used by Anole (0x80000000 and up are free for a binding's own
+synthetic events in its dispatch loop). Three rules go with them: a consumer
+**skips types it does not know** (`ev.len`); an event that creates an
+obligation is sent **only when the configuration asked** for the feature that
+produces it, so a binding built for this version never receives an
+obligation it cannot meet from a later Anole fed its own configuration; and
+numbers are **never reused**.
 
-A request record carries the route's `handler` id, the method (an enum and
-the name as sent), the HTTP version (11, 20, 30), the raw path and query, the
-headers (names lower-cased, order and duplicates kept), the route parameters,
-the client's address (proxies applied), the listener's name, the request ID
-(the `request_id` middleware) and a verified JWT's claims as JSON (the `jwt`
-middleware). The record's bytes belong to the caller's buffer: copy what you
-keep.
+`ANOLE_EV_ABORT`'s `reason` is one of `ANOLE_ABORT_CLIENT` (the client closed
+the connection or cancelled the stream), `ANOLE_ABORT_DEADLINE` (the timeout
+passed: the client got `status`, 504, or gRPC `DEADLINE_EXCEEDED`),
+`ANOLE_ABORT_BODY` (the request body broke a limit or its framing: 413 or
+400, or gRPC `RESOURCE_EXHAUSTED` / `INTERNAL`), `ANOLE_ABORT_DRAIN` (the
+drain's deadline cut it) or `ANOLE_ABORT_SERVER` (Anole could not go on).
+`ANOLE_E_TOOBIG` from `anole_poll` writes an `ANOLE_EV_NONE` header whose
+`len` is the size the next record needs, so a binding allocates once instead
+of doubling.
+
+A request record (128 bytes, then variable parts) carries the route's
+`handler` id, the method (an enum and the name as sent), the HTTP version
+(11, 20, 30), the raw path and query, the headers (names lower-cased, order
+and duplicates kept; their spans start at `spans_off`, then the route
+parameters' spans: `anole_request_spans(r)`), the client's address (proxies
+applied), the listener's name, the request ID (the `request_id` middleware),
+a verified JWT's claims as JSON (the `jwt` middleware), the client's
+certificate as a span (`peer_cert`, mutual TLS), `timeout_us` (the time left
+before Anole answers 504, -1 when no deadline applies) and, for
+`ANOLE_EV_WS_OPEN`, the selected `subprotocol`. A gRPC call record (104 bytes)
+likewise has `metadata_off` (`anole_grpc_metadata(c)`) and `peer_cert`; both
+helpers and `anole_record_spans` read the offset from the record. The
+record's bytes belong to the caller's buffer: copy what you keep.
 
 ## Handles
 
 `anole_req`, `anole_ws`, `anole_grpc_call`, `anole_wt` and `anole_wt_stream`
-are 64-bit and generation-checked: a handle that
-was answered, expired, aborted, made up, or belongs to another kind gets
-`ANOLE_E_GONE`, never another request. Treat the bits as opaque; 0 is never a
-handle.
+are 64-bit and generation-checked: an answer or data call on a handle that
+was answered, expired, aborted or made up gets `ANOLE_E_GONE`, never another
+request; a cleanup call gets `ANOLE_OK`; a handle that is 0 or of another
+kind than the call takes gets `ANOLE_E_INVALID` (rule 10). Treat the bits as
+opaque; 0 is never a handle. The kinds (published in `anole.abi.json` for
+diagnostics) are: 1 request, 2 websocket, 3 grpc_call, 4 wt_session,
+5 wt_stream, 6 db_tx (a database transaction; `anole_handle_release` rolls an
+open one back), 7 reserved for a per-query handle, 8-15 reserved.
+
+`anole_handle_release(h)` ends any handle, whatever its kind, the way the
+application giving up would: an unanswered request gets
+`anole_req_fail(r, 500)` and a stream under way is cut short; a WebSocket
+closes with 1001; a gRPC call finishes with `UNKNOWN`
+("Application error processing RPC"); a WebTransport session closes with
+code 0; a WebTransport stream resets what it has not ended and stops what it
+has not read, and is let go. It is the one call a finalizer needs.
 
 ## Who owns what
 
@@ -170,28 +318,34 @@ handle.
 | --- | --- |
 | `anole_server_options`, its `config_json` | the caller; read (and copied) during `anole_server_create` |
 | strings and headers passed in (`anole_str`, `anole_header`) | the caller; read during the call |
-| a response body passed to `anole_respond` | copied before the call returns |
+| a response body passed to `anole_req_respond` | copied before the call returns |
 | a body passed with `ANOLE_BODY_BORROW` | the caller's, unchanged until `ANOLE_EV_SENT` for it (which also comes when the client is gone) |
-| the fd passed to `anole_respond_fd` | the caller's; Anole duplicates it and may be closed at once |
+| the fd passed to `anole_req_respond_fd` | the caller's; Anole duplicates it and may be closed at once |
 | the poll buffer and the records in it | the caller's |
 | `anole_last_error()`'s text | Anole's, valid until the next `anole_*` call on the thread |
-| `anole_version()`'s text | static |
-| a request handle | valid from `ANOLE_EV_REQUEST` until it is answered (`anole_respond`, `anole_respond_fd`, `anole_stream_end`, `anole_release`), expires or is aborted |
+| `anole_version()`'s and `anole_last_error_name()`'s text | static |
+| `anole_listener_info`'s strings | Anole's, valid until `anole_server_destroy` |
+| a request handle | valid from `ANOLE_EV_REQUEST` until it is answered (`anole_req_respond`, `anole_req_respond_fd`, `anole_req_stream_end`, `anole_req_fail`, `anole_req_abort`, `anole_handle_release`), expires or is aborted |
 | a WebSocket handle | from `ANOLE_EV_WS_OPEN` until `ANOLE_EV_WS_CLOSE` |
-| a consumer | until `anole_server_destroy` |
+| a gRPC call handle | from `ANOLE_EV_GRPC_CALL` until `anole_grpc_finish` or abort |
+| a WebTransport session and its streams | the session from `ANOLE_EV_WT_OPEN` to `ANOLE_EV_WT_CLOSE`; a stream until `anole_handle_release` or its session's end |
+| a gRPC message passed with `ANOLE_BODY_BORROW` | the caller's, until `ANOLE_EV_SENT` |
+| a database answer (`ANOLE_EV_DB_RESULT`'s rows and bytes) | in the record, which is the caller's buffer |
+| a consumer, a database | until `anole_server_destroy` |
 
 ## Status codes
 
 `>= 0` is success: `ANOLE_OK`, or `ANOLE_BUSY` (taken, but past the
-high-water mark: wait for `ANOLE_EV_WRITABLE` or `ANOLE_EV_WS_DRAIN`).
+high-water mark: wait for `ANOLE_EV_WRITABLE` on that handle).
 Negative codes mean nothing was done unless the function says otherwise,
-and each sets `anole_last_error` (the code's own text, or a more specific
-one):
+and each sets `anole_last_error` (text for logs, not API), `anole_last_error_name`
+(a stable token, below) and `anole_last_errno` (the OS error behind it, 0
+when it did not come from the OS):
 
 | Code | Meaning |
 | --- | --- |
-| `ANOLE_E_INVALID` | a bad argument: status, header name or value (`Connection` and `Transfer-Encoding` included: the server writes those), flag, size (a request is still owed) |
-| `ANOLE_E_GONE` | the handle was answered, expired, aborted, is stale or of another kind |
+| `ANOLE_E_INVALID` | a bad argument: status, header name or value (`Connection` and `Transfer-Encoding` included: the server writes those), flag, size, a handle that is 0 or of another kind (a request is still owed) |
+| `ANOLE_E_GONE` | an answer or data call on a handle that was answered, expired, aborted or is stale |
 | `ANOLE_E_AGAIN` | nothing now; an event follows (`anole_req_read` with timeout 0) |
 | `ANOLE_E_NOMEM` | out of memory |
 | `ANOLE_E_CONFIG` | the configuration is wrong; `anole_last_error` says what and where |
@@ -201,6 +355,88 @@ one):
 | `ANOLE_E_SYSTEM` | the OS refused (a port in use, a certificate that will not load) |
 | `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
 | `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
+
+### Error tokens
+
+`anole_last_error_name()` is a stable token for the same error: a specific
+name from this table (also `error_names` in `anole.abi.json`), or, when
+there is none, the code's own name (`Invalid`, `Gone`, `Again`, `NoMemory`,
+`Config`, `State`, `Unsupported`, `TooBig`, `System`, `Timeout`, `Database`).
+Bindings may switch on it; tokens are only ever added.
+
+| Token | Code | From |
+| --- | --- | --- |
+| `WrongHandleKind` | `ANOLE_E_INVALID` | 0, or a handle of another kind |
+| `UnknownFlag`, `UnknownField`, `ReservedNotZero` | `ANOLE_E_INVALID` | a flag bit, a non-zero byte past an options struct or a reserved field the library does not know |
+| `SyntaxError`, `UnknownKey`, `MissingKey`, `InvalidValue` | `ANOLE_E_CONFIG` | `anole_server_create` |
+| `RouteConflict` | `ANOLE_E_CONFIG` | `anole_server_start` |
+| `OneServerPerProcess` | `ANOLE_E_STATE` | `anole_server_create` |
+| `NoConsumer`, `ConsumerWithoutExecutor` | `ANOLE_E_STATE` | `anole_server_open` / `anole_server_start` |
+| `NotRunning`, `NoTlsListener` | `ANOLE_E_STATE` | reload, publish |
+| `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
+| `AddressInUse`, `AddressNotAvailable`, `AccessDenied`, `TooManyOpenFiles`, `SystemResources` | `ANOLE_E_SYSTEM` | binds, threads, files (errno set) |
+| `CertificateFileUnreadable`, `KeyFileUnreadable`, `ClientCaFileUnreadable` | `ANOLE_E_SYSTEM` | TLS files (errno set) |
+| `InvalidCertificate`, `InvalidKey`, `KeyMismatch`, `InvalidClientCa` | `ANOLE_E_INVALID` from a reload, `ANOLE_E_CONFIG` from start | TLS contents |
+| `DatabaseUnavailable` | `ANOLE_E_SYSTEM` | `connect_at_start` failed |
+| `Unexpected` | `ANOLE_E_SYSTEM` | anything not named (the text has the Zig error) |
+
+The member names of `anole.ServerError` and `anole.TlsLoadError` are tokens
+verbatim (`FileNotFound`, `InvalidListenAddress`, ...; the full list is
+`error_names`).
+
+### What each call returns
+
+Every call may also return `ANOLE_E_INVALID` for a NULL pointer it needs, and
+`ANOLE_E_UNSUPPORTED` when its feature is compiled out. Cleanup calls are
+marked (C): they answer `ANOLE_OK` on an object that is already over.
+
+| Function | Returns besides OK |
+| --- | --- |
+| `anole_server_create` | `ANOLE_E_INVALID` (options), `ANOLE_E_CONFIG`, `ANOLE_E_STATE` (`OneServerPerProcess`), `ANOLE_E_NOMEM` |
+| `anole_server_open` | `ANOLE_E_STATE` (`State`, `NoConsumer`, `ConsumerWithoutExecutor`), `ANOLE_E_SYSTEM` (`DatabaseUnavailable`, `SystemResources`), `ANOLE_E_NOMEM` |
+| `anole_server_start` | as open, plus `ANOLE_E_CONFIG` (`RouteConflict`, TLS contents), `ANOLE_E_SYSTEM` (`AddressInUse`, `AccessDenied`, `AddressNotAvailable`, `TooManyOpenFiles`, the file tokens) |
+| `anole_server_listener_count` | the count (0 for no server) |
+| `anole_server_listener` | `ANOLE_E_INVALID` (index, size) |
+| `anole_server_set_ready` | `ANOLE_E_INVALID` (`UnknownCheck`) |
+| `anole_server_drain` | `ANOLE_E_STATE` (before start) |
+| `anole_server_wait` | `ANOLE_E_TIMEOUT` |
+| `anole_server_reload_tls` | `ANOLE_E_STATE` (`NotRunning`, `NoTlsListener`), `ANOLE_E_SYSTEM` (file tokens), `ANOLE_E_INVALID` (content tokens, one argument), `ANOLE_E_NOMEM` |
+| `anole_server_stats` | `ANOLE_E_INVALID` (size) |
+| `anole_server_destroy` | (no result) |
+| `anole_consumer_attach` | `ANOLE_E_STATE`, `ANOLE_E_UNSUPPORTED` (Windows, no wake), `ANOLE_E_SYSTEM`, `ANOLE_E_NOMEM` |
+| `anole_consumer_fd` | -1 with a callback, for a shared consumer, on Windows |
+| `anole_consumer_set_wake` | `ANOLE_E_UNSUPPORTED` (Windows, NULL wake), `ANOLE_E_SYSTEM` (fd) |
+| `anole_poll`, `anole_poll_wait` | `ANOLE_E_INVALID` (alignment, flags), `ANOLE_E_TOOBIG` |
+| `anole_handle_release` (C) | `ANOLE_E_INVALID` (`WrongHandleKind`) |
+| `anole_req_read` | `ANOLE_E_AGAIN`, `ANOLE_E_TIMEOUT`, `ANOLE_E_GONE`, `ANOLE_E_INVALID` |
+| `anole_req_respond` | `ANOLE_E_INVALID` (status, header, flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_req_respond_fd` | `ANOLE_E_INVALID` (fd, range), `ANOLE_E_SYSTEM` (dup), `ANOLE_E_GONE`, `ANOLE_E_NOMEM`, `ANOLE_E_UNSUPPORTED` (Windows) |
+| `anole_req_stream_start` | `ANOLE_E_INVALID`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_req_stream_write` | `ANOLE_BUSY`, `ANOLE_E_INVALID` (flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_req_stream_write_wait` | `ANOLE_E_TIMEOUT`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_req_stream_end` | `ANOLE_E_INVALID` (trailer), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_req_fail` | `ANOLE_E_INVALID` (status, message), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_req_abort` (C) | `ANOLE_E_INVALID` (`WrongHandleKind`) |
+| `anole_ws_send` | `ANOLE_BUSY`, `ANOLE_E_INVALID` (type, size, flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_ws_close` (C) | `ANOLE_E_INVALID` (code, reason), `ANOLE_E_NOMEM` |
+| `anole_ws_subscribe` | `ANOLE_E_INVALID` (topic), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_ws_unsubscribe` (C) | `ANOLE_E_INVALID` (topic), `ANOLE_E_NOMEM` |
+| `anole_ws_publish` | `ANOLE_E_INVALID`, `ANOLE_E_AGAIN`, `ANOLE_E_STATE` (`NotRunning`), `ANOLE_E_NOMEM` |
+| `anole_grpc_send_headers` | `ANOLE_E_INVALID` (metadata), `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_grpc_send` | `ANOLE_BUSY`, `ANOLE_E_INVALID`, `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_grpc_send_wait` | `ANOLE_E_TIMEOUT`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_grpc_finish` | `ANOLE_E_INVALID` (code, message, trailers), `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_grpc_read` | `ANOLE_E_INVALID` (n == 0), `ANOLE_E_STATE`, `ANOLE_E_GONE` |
+| `anole_grpc_health_set` | `ANOLE_E_INVALID`, `ANOLE_E_STATE` (health off) |
+| `anole_wt_open_stream` | `ANOLE_E_INVALID` (flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_wt_stream_write` | `ANOLE_BUSY`, `ANOLE_E_INVALID` (flags, direction, after end), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_wt_stream_reset`, `anole_wt_stream_stop` (C) | `ANOLE_E_INVALID` (direction) |
+| `anole_wt_send_datagram` | `ANOLE_E_INVALID` (flags), `ANOLE_E_TOOBIG`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_wt_max_datagram` | `ANOLE_E_GONE` |
+| `anole_wt_close` (C) | `ANOLE_E_INVALID` (reason), `ANOLE_E_NOMEM` |
+| `anole_db_find` | `ANOLE_E_INVALID` |
+| `anole_db_query`, `anole_db_exec` | `ANOLE_E_INVALID` (value, options, flags, reserved), `ANOLE_E_STATE`, `ANOLE_E_NOMEM` |
+| `anole_db_invalidate` | `ANOLE_E_STATE`, `ANOLE_E_NOMEM` |
 
 ## Configuration
 
@@ -278,22 +514,25 @@ that client certificates must chain to as `client_ca_file` or
 
 The HTTP/3 endpoint follows the settings of the listener with `http3`.
 A request whose client presented a certificate has `ANOLE_REQ_PEER_CERT`
-in its flags; `anole_request_peer_cert(r)` returns it (DER, verified,
-the leaf only) from the record, which holds it at `r->peer_cert` as a
-little-endian `uint32_t` length followed by the bytes. The same goes for
-`ANOLE_EV_WS_OPEN` and `ANOLE_EV_WT_OPEN`.
+in its flags; `anole_event_str(r, r->peer_cert)` returns it (DER, verified,
+the leaf only): `peer_cert` is a plain span into the record, empty when
+there is none. The same goes for `ANOLE_EV_WS_OPEN`, `ANOLE_EV_WT_OPEN` and
+the gRPC call record (`ANOLE_GRPC_CALL_PEER_CERT`).
 
 Certificates change without a restart:
-`anole_server_reload_certificates(s)` reads every TLS listener's sources
-again; `anole_server_reload_tls(s, flags, cert, cert_len, key, key_len)`
-swaps in new ones for every TLS listener (and HTTP/3), as file paths or, with
-`ANOLE_TLS_PEM`, as PEM text, and they become what later reloads read.
-Handshakes under way finish on the old certificate, and session tickets
-issued before still resume. A certificate that does not load leaves the old
-one in place (`ANOLE_E_INVALID`, or `ANOLE_E_SYSTEM` for a file that cannot
-be read). With `ANOLE_SERVER_SIGNALS`, SIGHUP does the same as
-`anole_server_reload_certificates`. A reload changes the server's own
-certificate only; the client CAs stay those of the configuration.
+`anole_server_reload_tls(s, flags, cert, key)` (both `anole_str`) with both
+empty reads every TLS listener's sources again; with both set it swaps in
+new ones for every TLS listener (and HTTP/3), as file paths or, with
+`ANOLE_TLS_F_PEM`, as PEM text, and they become what later empty-argument
+reloads read. Handshakes under way finish on the old certificate, and session
+tickets issued before still resume. A certificate that does not load leaves
+the old one in place (`ANOLE_E_INVALID`: `InvalidCertificate`, `InvalidKey`,
+`KeyMismatch`, or only one of the two given; `ANOLE_E_SYSTEM` for a file that
+cannot be read: `CertificateFileUnreadable`, `KeyFileUnreadable`, with
+`anole_last_errno`; `ANOLE_E_STATE`: `NotRunning`, `NoTlsListener`). With
+`ANOLE_SERVER_F_SIGNALS`, SIGHUP does the same as the empty reload. A reload
+changes the server's own certificate only; it re-reads the client CA source
+the configuration names (`client_ca_file` again; `client_ca_pem` as given).
 
 Behind a proxy, `trusted_proxy_hops` says how many proxies in front to
 trust for `X-Forwarded-For` (the client's address in `remote_addr`), with
@@ -303,8 +542,16 @@ listener's `proxy_protocol` expects a PROXY protocol (v1 or v2) header on
 every connection; `proxy_protocol_from` limits who may send one
 (addresses or CIDR networks).
 
-`anole_server_port(s, i)` reports listener *i*'s bound port (port 0 picks a
-free one); *i* = the number of listeners gives the HTTP/3 UDP port.
+`anole_server_listener_count(s)` and `anole_server_listener(s, i, &info)` describe the
+configuration's listeners, in order, from `anole_server_create` to
+`anole_server_destroy`: `name`, `address` (`"127.0.0.1:8080"`, `"[::]:8443"`,
+`"unix:/run/app.sock"`: the bound one once listening), `port` (the real one
+for port 0), `udp_port` (HTTP/3's, 0 when the listener serves none), `flags`
+(`ANOLE_LISTENER_F_TLS`, `_HTTP1`, `_HTTP2`, `_HTTP3`, `_UNIX`,
+`_PROXY_PROTOCOL`), `state` (`ANOLE_LISTENER_PENDING`, `_LISTENING`,
+`_FAILED`, `_CLOSED`) and, when start failed binding it, `error_name` and
+`error_errno`. Node's `server.address()` and an EADDRINUSE error are built
+from it.
 
 ## Requests
 
@@ -316,17 +563,37 @@ thread. A body past `limits.body_max` ends the request with 413.
 
 ## Responses
 
-- `anole_respond(r, status, headers, n, body, len, flags)`: the whole answer.
+- `anole_req_respond(r, status, headers, n, body, len, flags)`: the whole answer.
   The body is copied, or borrowed with `ANOLE_BODY_BORROW` (bindings borrow
   bodies above 64 KiB and copy small ones). Compression, the response cache
   and the access log run on Anole's side afterwards.
-- `anole_respond_fd(r, status, headers, n, fd, offset, len)`: part of a
+- `anole_req_respond_fd(r, status, headers, n, fd, offset, len)`: part of a
   regular file, sent by Anole (`sendfile` where it can).
-- `anole_stream_start`, `anole_stream_write` (or `anole_stream_write_wait`
-  for a thread that may block), `anole_stream_end` with trailers: a streamed
+- `anole_req_stream_start`, `anole_req_stream_write` (or `anole_req_stream_write_wait`
+  for a thread that may block), `anole_req_stream_end` with trailers: a streamed
   answer. `ANOLE_BUSY` past `limits.stream_high_water`; wait for
   `ANOLE_EV_WRITABLE`. The deadline no longer applies once a stream started.
-- `anole_release(r)`: give up; the client gets 500, or a cut-short stream.
+- `anole_req_fail(r, status, message)`: an error answer in the server's
+  configured error format (the same body Anole's own 404, 413 and 504
+  have): status 400-599, or 0 for 500; `message` (UTF-8, at most 4096
+  bytes, copied) is the detail.
+- `anole_req_abort(r)`: drop the request without an answer (Zig's
+  `res.abort()`): HTTP/1.1 closes the connection, HTTP/2 resets the stream
+  (CANCEL), HTTP/3 cancels it (`H3_REQUEST_CANCELLED`); a stream under way is
+  cut short. A cleanup call.
+- `anole_handle_release(h)`: the generic cleanup (see Handles).
+
+`ANOLE_BODY_BORROW` is bit 0 of every send-type call's flags: a call that
+answers `>= 0` produces exactly one `ANOLE_EV_SENT` for that (data, len),
+zero length included, even when the client goes away first; a call that
+answers `< 0` took nothing and produces none. The record is built by the
+call itself, which answers `ANOLE_E_NOMEM` and takes nothing if it cannot,
+and it is never lost to a full queue. Where borrowing pays: HTTP/1.1 whole
+bodies, streamed writes, WebSocket sends. Whole bodies answered over HTTP/2
+and HTTP/3, and WebTransport writes and datagrams, are copied by Anole all
+the same (`ANOLE_EV_SENT` then comes early). `ANOLE_EV_STOPPED` releases
+everything still borrowed: after it, and after `anole_server_destroy`
+returns, no borrowed memory is read and no `ANOLE_EV_SENT` comes.
 
 ## WebSocket
 
@@ -338,7 +605,8 @@ connection ended without a close). Messages waiting for a consumer that is
 behind are bounded per executor by bytes as well as by `limits.queue` (the
 larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`):
 past that, the sockets feeding it are not read until it catches up. `anole_ws_send` queues a message
-(`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WS_DRAIN`),
+(`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WRITABLE` with the
+socket as `ev.handle`),
 `anole_ws_close` sends a close. Topics are Anole's: `anole_ws_subscribe`,
 `anole_ws_unsubscribe`, and `anole_ws_publish(server, topic, ...)` fans out
 on Anole's threads without entering the language. A publish waits for no
@@ -363,18 +631,18 @@ CONNECT):
 
 ```c
 case ANOLE_EV_WT_OPEN:      /* anole_request_event: the CONNECT; ev.handle is the anole_wt */
-case ANOLE_EV_WT_STREAM:    /* the peer opened a stream: ev.handle, its session, ANOLE_WT_UNI */
-case ANOLE_EV_WT_DATA:      /* bytes of a stream in order, ANOLE_WT_FIN with the last */
+case ANOLE_EV_WT_STREAM:    /* the peer opened a stream: ev.handle, its session, ANOLE_WT_F_UNI */
+case ANOLE_EV_WT_DATA:      /* bytes of a stream in order, ANOLE_WT_F_FIN with the last */
 case ANOLE_EV_WT_DATAGRAM:  /* one datagram of the session */
 case ANOLE_EV_WT_STREAM_RESET: case ANOLE_EV_WT_STREAM_STOP: /* the peer's code */
 case ANOLE_EV_WT_DRAIN:     /* the server (or the peer) is draining */
 case ANOLE_EV_WT_CLOSE:     /* code, reason, which side; the session and its streams are stale */
 
 anole_wt_stream s;
-anole_wt_open_stream(w, 0 /* or ANOLE_WT_UNI */, &s);   /* the handle is good at once */
-anole_wt_stream_write(s, data, len, ANOLE_WT_FIN);       /* ANOLE_BUSY: wait for ANOLE_EV_WRITABLE */
-anole_wt_stream_release(s);                              /* the end above still goes out */
-anole_wt_send_datagram(w, buf, n);
+anole_wt_open_stream(w, 0 /* or ANOLE_WT_F_UNI */, &s);   /* the handle is good at once */
+anole_wt_stream_write(s, data, len, ANOLE_WT_F_FIN);       /* ANOLE_BUSY: wait for ANOLE_EV_WRITABLE */
+anole_handle_release(s);                              /* the end above still goes out */
+anole_wt_send_datagram(w, buf, n, 0);
 anole_wt_close(w, 0, (anole_str){"bye", 3});
 ```
 
@@ -389,11 +657,11 @@ anole_wt_close(w, 0, (anole_str){"bye", 3});
   binding's one borrowing helper works here as everywhere):
   `limits.stream_high_water` bytes waiting answers `ANOLE_BUSY`, then
   `ANOLE_EV_WRITABLE` comes for the stream.
-- Every stream must be released (`anole_wt_stream_release`) or go with
+- Every stream must be released (`anole_handle_release`) or go with
   its session: the peer may open a new stream only as earlier ones are
   released. A release resets a sending side not ended with
-  `ANOLE_WT_FIN` and stops a receiving side not read to its end; one
-  written with `ANOLE_WT_FIN` first sends everything. Once the session
+  `ANOLE_WT_F_FIN` and stops a receiving side not read to its end; one
+  written with `ANOLE_WT_F_FIN` first sends everything. Once the session
   is over its streams answer `ANOLE_E_GONE`, release too, and that can
   come before `ANOLE_EV_WT_CLOSE` is read: the peer may close at any
   time. Release a stream before an answer after which the peer may
@@ -429,9 +697,9 @@ PostgreSQL, Redis and MongoDB are the kinds:
 ```c
 anole_db *db;
 anole_db_find(s, (anole_str){"main", 4}, &db);
-anole_db_value p[] = {{ANOLE_DB_TEXT, 0, {.s = {"milk", 4}}}};
+anole_db_value p[] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = {"milk", 4}}}};
 anole_db_exec(db, consumer, sql_insert, p, 1, NULL, /*user_data*/ 7);
-anole_db_options o = {sizeof o, ANOLE_DB_COALESCE, 0, /*cache_ttl_ms*/ 5000, 0, {"notes", 5}};
+anole_db_options o = {sizeof o, ANOLE_DB_F_COALESCE, 0, /*cache_ttl_ms*/ 5000, 0, {"notes", 5}};
 anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
 /* later, from anole_poll: ANOLE_EV_DB_RESULT with user_data 7, then 8 */
 ```
@@ -451,7 +719,7 @@ anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
   several statements.
 - Options (`anole_db_options`, or NULL):
   - `timeout_ms` interrupts the statement (`ANOLE_E_TIMEOUT`, 504).
-  - `ANOLE_DB_COALESCE`: identical reads in flight at once on one executor
+  - `ANOLE_DB_F_COALESCE`: identical reads in flight at once on one executor
     share one run.
   - `cache_ttl_ms`: the answer is kept per executor and served from memory
     (`source` says whether it was). `cache_tag` names a group of kept
@@ -465,7 +733,7 @@ anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
     504, 500).
   - The database's message, its code and the constraint are in the record,
     for logs. Don't send them to clients.
-- Queries can be queued from `anole_server_start` until the server stops.
+- Queries can be queued from `anole_server_open` (or `anole_server_start`) until the server stops.
   Queries still running at the stop get no answer.
 
 ### PostgreSQL
@@ -501,9 +769,9 @@ database:
   parameter's type: a timestamptz as text (`"2026-10-22T10:00:00Z"`), an
   array literal (`"{1,2}"`), a number for a text parameter. A value
   PostgreSQL can't parse fails the query (`ANOLE_E_DB`, SQLSTATE 22P02).
-- Cells: `bool` is `ANOLE_DB_BOOL`; `int2`, `int4`, `int8`, `oid` are
-  `ANOLE_DB_INT`; `float4`, `float8` are `ANOLE_DB_FLOAT`; `bytea` is
-  `ANOLE_DB_BLOB`; every other type is `ANOLE_DB_TEXT` in PostgreSQL's text
+- Cells: `bool` is `ANOLE_DB_TYPE_BOOL`; `int2`, `int4`, `int8`, `oid` are
+  `ANOLE_DB_TYPE_INT`; `float4`, `float8` are `ANOLE_DB_TYPE_FLOAT`; `bytea` is
+  `ANOLE_DB_TYPE_BLOB`; every other type is `ANOLE_DB_TYPE_TEXT` in PostgreSQL's text
   format, as psql prints it: `numeric` exactly (`"12.50"`), timestamps as
   the session prints them (`"2026-10-22 10:00:00+00"`), JSON as its text,
   arrays as `"{1,2}"`. Every cell carries its column's type OID in
@@ -519,7 +787,7 @@ database:
   constraint's name; the classes are those of `anole.db`
   (`ANOLE_DB_ERR_UNIQUE` for 23505, `SERIALIZATION` for 40001,
   `UNAVAILABLE` when no connection could be had...).
-- `ANOLE_DB_WRITE` means nothing here (any connection runs any
+- `ANOLE_DB_F_WRITE` means nothing here (any connection runs any
   statement).
 
 ### Redis
@@ -534,10 +802,10 @@ The same calls with a `"redis"` database (Redis or Valkey), on
 ```
 
 ```c
-anole_db_value p[] = {{ANOLE_DB_TEXT, 0, {.s = {"user:7", 6}}},
-                      {ANOLE_DB_BLOB, 0, {.s = {data, len}}},
-                      {ANOLE_DB_TEXT, 0, {.s = {"EX", 2}}},
-                      {ANOLE_DB_INT, 0, {.i = 60}}};
+anole_db_value p[] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = {"user:7", 6}}},
+                      {ANOLE_DB_TYPE_BLOB, 0, {.s = {data, len}}},
+                      {ANOLE_DB_TYPE_TEXT, 0, {.s = {"EX", 2}}},
+                      {ANOLE_DB_TYPE_INT, 0, {.i = 60}}};
 anole_db_exec(db, consumer, (anole_str){"SET", 3}, p, 4, NULL, 1);
 anole_db_query(db, consumer, (anole_str){"GET", 3}, p, 1, &cached, 2);
 ```
@@ -550,12 +818,12 @@ anole_db_query(db, consumer, (anole_str){"GET", 3}, p, 1, &cached, 2);
 - `anole_db_query` answers with the whole reply. Replies are trees (an
   array of arrays, a map), so they are not forced into rows: the cells are
   the reply in preorder, `ncolumns` is 0 and `nrows` is the number of
-  cells. `ANOLE_DB_ARRAY` (`i` items follow, each a whole subtree) and
-  `ANOLE_DB_MAP` (`i` key, value pairs follow) are the inner nodes; bulk
-  strings are `ANOLE_DB_BLOB` (bytes: a binding decodes UTF-8 by default
+  cells. `ANOLE_DB_TYPE_ARRAY` (`i` items follow, each a whole subtree) and
+  `ANOLE_DB_TYPE_MAP` (`i` key, value pairs follow) are the inner nodes; bulk
+  strings are `ANOLE_DB_TYPE_BLOB` (bytes: a binding decodes UTF-8 by default
   and offers the bytes, as ioredis and redis-py do); status replies
-  (`"OK"`) are `ANOLE_DB_TEXT`; integers `ANOLE_DB_INT`; nil
-  `ANOLE_DB_NULL`; `ANOLE_DB_ERROR` is an error reply inside another
+  (`"OK"`) are `ANOLE_DB_TYPE_TEXT`; integers `ANOLE_DB_TYPE_INT`; nil
+  `ANOLE_DB_TYPE_NULL`; `ANOLE_DB_TYPE_ERROR` is an error reply inside another
   (EXEC's). A binding rebuilds the reply with one recursive walk; for a
   flat reply (`GET`, `LRANGE`) it reads the cells after the first. Why
   the same record rather than one of its own: one event, one parser and
@@ -564,7 +832,7 @@ anole_db_query(db, consumer, (anole_str){"GET", 3}, p, 1, &cached, 2);
 - `anole_db_exec` runs the command for its effect: no cells, and
   `changes` holds the reply when it is an integer (`DEL`, `INCR`,
   `RPUSH`...).
-- `ANOLE_DB_COALESCE` and `cache_ttl_ms` apply only to commands that just
+- `ANOLE_DB_F_COALESCE` and `cache_ttl_ms` apply only to commands that just
   read (`GET`, `MGET`, `HGETALL`, `LRANGE`, `ZRANGE`... as
   `anole.redis.read_commands`); others run as they are. `timeout_ms`
   closes the connection the command waits on (a blocking pop, say).
@@ -589,10 +857,10 @@ The same calls with a `"mongodb"` database, on `anole.mongodb`:
 
 ```c
 /* filter and options: BSON documents the binding encoded */
-anole_db_value p[] = {{ANOLE_DB_BLOB, 0, {.s = {filter, filter_len}}},
-                      {ANOLE_DB_BLOB, 0, {.s = {options, options_len}}}};
+anole_db_value p[] = {{ANOLE_DB_TYPE_BLOB, 0, {.s = {filter, filter_len}}},
+                      {ANOLE_DB_TYPE_BLOB, 0, {.s = {options, options_len}}}};
 anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
-/* ANOLE_EV_DB_RESULT: a row per document, each cell ANOLE_DB_BSON */
+/* ANOLE_EV_DB_RESULT: a row per document, each cell ANOLE_DB_TYPE_BSON */
 ```
 
 - `sql` names the operation and the collection, and optionally another
@@ -603,7 +871,7 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
   `deleteMany`, and `runCommand` (a database's; `sql` is `"runCommand"` or
   `"runCommand <database>"`, the escape hatch for everything else:
   indexes, `findAndModify`, `distinct`, admin commands).
-- The parameters are BSON documents (`ANOLE_DB_BLOB`), in the order the
+- The parameters are BSON documents (`ANOLE_DB_TYPE_BLOB`), in the order the
   drivers' methods take them: `find(filter, options)`, `insertOne(doc)`,
   `insertMany(doc, doc, ...)`, `updateOne(filter, update, options)` (the
   update may be a pipeline: an array), `aggregate(pipeline, options)` (a
@@ -615,8 +883,8 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
   option, a missing or extra document, or a parameter that is not valid
   BSON is answered with `http_status` 400 and the reason in `error`.
 - Answers have one column, `"document"`. `find`, `findOne` and `aggregate`
-  give a row per document, its cell `ANOLE_DB_BSON` (the document's
-  bytes); `countDocuments` one `ANOLE_DB_INT`; the writes one BSON row
+  give a row per document, its cell `ANOLE_DB_TYPE_BSON` (the document's
+  bytes); `countDocuments` one `ANOLE_DB_TYPE_INT`; the writes one BSON row
   with the driver's result (`{insertedId}`, `{insertedCount,
   insertedIds}`, `{matchedCount, modifiedCount, upsertedId}`,
   `{deletedCount}`); `runCommand` the server's reply. `anole_db_exec`
@@ -632,7 +900,7 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
   would spend time converting what the binding converts again.
 - The reads are cursors drained to the end within `limits.db_result_max`;
   use `limit` (and `skip` or a range filter) to page. `timeout_ms` bounds
-  the call and goes to the server as `maxTimeMS`. `ANOLE_DB_COALESCE` and
+  the call and goes to the server as `maxTimeMS`. `ANOLE_DB_F_COALESCE` and
   `cache_ttl_ms` apply to `find`, `findOne`, `countDocuments` and an
   `aggregate` that does not end in `$out` or `$merge`.
 - Errors carry MongoDB's code in `error_code` (`"11000"` for a duplicate
@@ -695,7 +963,7 @@ request message (`ANOLE_GRPC_CALL_MESSAGE`). The consumer answers:
 - `anole_grpc_send_headers`: initial metadata, before the first message.
 - `anole_grpc_send`: a response message. A unary or client-streaming
   call keeps its one message until `anole_grpc_finish`; with
-  `ANOLE_GRPC_SEND_FINISH` it is sent with OK at once (a unary answer in
+  `ANOLE_GRPC_F_FINISH` it is sent with OK at once (a unary answer in
   one call). For server and bidirectional streaming each message goes out
   in order, and `ANOLE_BUSY` past `limits.stream_high_water` waits for
   `ANOLE_EV_WRITABLE`, as a streamed response does. `ANOLE_BODY_BORROW`
@@ -749,31 +1017,67 @@ gRPC client.
 anole_server_options o = { sizeof o, { json, strlen(json) } };
 anole_server *s;   anole_server_create(&o, &s);
 anole_consumer *c; anole_consumer_options co = { sizeof co, wake, ud, 0 };
-anole_consumer_attach(s, &co, &c);   /* before start */
-anole_server_start(s);               /* returns once listening */
+anole_consumer_attach(s, &co, &c);   /* before open/start */
+anole_server_open(s);                /* optional: threads and databases, no listener */
+/* ... startup work in the language: migrations, lifespan, Next.js prepare ... */
+anole_server_start(s);               /* returns once listening (opens first if needed) */
+anole_server_set_ready(s, name, 1);  /* observe.health.checks */
 /* ... poll and answer ... */
 anole_server_drain(s);               /* stop accepting, finish what is in flight */
 /* keep polling until ANOLE_EV_STOPPED */
 anole_server_destroy(s);
 ```
 
+`anole_server_open` starts Anole's threads and opens the configuration's
+databases (`connect_at_start` included) without binding a listener, so
+`anole_db_*` calls work from there and answers go to the consumers. An ASGI
+server calls it, runs `lifespan.startup`, then `anole_server_start`; on
+`lifespan.startup.failed` it destroys. Both `open` and `start` block until
+done. After a failure the server may only be destroyed.
+
+`observe.health.checks` names readiness flags: each starts not ready, so
+`/readyz` answers 503 naming it until `anole_server_set_ready(s, name, 1)`;
+any thread, any number of times. `observe.health.listener` serves the health
+routes on one listener only.
+
+`anole_server_destroy` on a server that was not drained drains it and
+answers every request, call and stream still owed by a consumer at once (503
+and a reset or close; nothing more is posted to consumers), so it does not
+wait for answers that cannot come and may run on a consumer's own thread (a
+Node environment cleanup hook, Python `atexit`). It still waits for Anole's
+own in-flight work (static files, native routes) up to `timeouts.shutdown_ms`,
+then joins Anole's threads. It must not overlap any other call on its server,
+consumers, databases or handles. After it returns no callback runs again and
+no pointer from the server is valid; handles stay safe to pass.
+
 One server per process. By default Anole installs no signal handlers (the
-host process owns its signals); `ANOLE_SERVER_SIGNALS` asks for SIGINT and
-SIGTERM (drain) and SIGHUP (reload certificates), for a standalone C program.
-`anole_server_reload_certificates` and `anole_server_reload_tls` reload TLS
-certificates on demand (see TLS).
+host process owns its signals) and its threads block asynchronous signals;
+`ANOLE_SERVER_F_SIGNALS` asks for SIGINT and SIGTERM (drain) and SIGHUP
+(reload certificates), for a standalone C program. A forked child cannot use
+its parent's server: its calls on the parent's pointers answer
+`ANOLE_E_STATE`, cleanup calls on its handles answer `ANOLE_OK`, and it may
+create a server of its own.
+`anole_consumer_set_wake(c, wake, ud)` replaces a consumer's wake (a
+callback, or NULL for the doorbell fd), for a restarted worker or a new event
+loop taking over; once it returns the old callback is not called again.
 `anole_server_stats` reports counters (requests, detached, in flight,
 expired, aborted, refused, wakes and re-wakes, WebSockets); options structs
 and the stats struct start with their `size`, so an older header keeps
-working against a newer library.
+working against a newer library, and one larger than the library knows is
+accepted only when every byte past what it knows is 0.
 
 Logs go to stderr, or to `anole_server_options.log` (called on Anole's
 threads; it must not block or enter the language), filtered by `log_level`.
+The callback belongs to its server: it is set by `anole_server_create`,
+cleared by `anole_server_destroy`, and a later server without one logs to
+stderr.
 
 ## Testing
 
 `zig build capi-test` (part of `zig build test`) checks `anole.h` through
-translate-c against the Zig side (every struct's layout, every constant),
+translate-c against the Zig side (every struct's layout, every constant, in
+both directions), that `include/anole.abi.json` is what `zig build
+capi-abi-json` generates, that this guide names every event and function,
 and runs the C suites (`tests/capi/consumer.c`, and `tests/capi/grpc.c`
 for gRPC over gRPC-Web and HTTP/2) against `libanole.a`. `zig build
 capi-grpc` builds `capi-grpc-interop` (`tests/capi/grpc_interop.c`,
@@ -790,15 +1094,46 @@ server in C and its client in Zig (`tests/capi/wt_client.zig`, built with
 the suite and passed to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
 
+## From ABI 0.6
+
+| 0.6 | 0.7 |
+| --- | --- |
+| `anole_respond(r, ...)` | `anole_req_respond(r, ...)` |
+| `anole_respond_fd(r, ..., int fd, ...)` | `anole_req_respond_fd(r, ..., intptr_t fd, ...)` |
+| `anole_stream_start/write/write_wait/end` | `anole_req_stream_start/write/write_wait/end` |
+| `anole_release(r)` | `anole_req_fail(r, 0, (anole_str){0})` (500) or `anole_handle_release(r)` (finalizers) |
+| (none) | `anole_req_abort(r)` |
+| `anole_wt_stream_release(s)` | `anole_handle_release(s)` |
+| `anole_server_port(s, i, &port)` | `anole_server_listener(s, i, &info)`; `info.port`, `info.udp_port` |
+| `anole_server_reload_certificates(s)` | `anole_server_reload_tls(s, 0, (anole_str){0}, (anole_str){0})` |
+| `anole_server_reload_tls(s, f, c, cl, k, kl)` | `anole_server_reload_tls(s, f, (anole_str){c, cl}, (anole_str){k, kl})` |
+| `anole_wt_send_datagram(w, d, n)` | `anole_wt_send_datagram(w, d, n, 0)` |
+| `ANOLE_EV_WS_DRAIN` | `ANOLE_EV_WRITABLE` (`ev.handle` the socket) |
+| `ANOLE_EV_ABORT` read as `anole_event` | `anole_abort_event` (`reason`, `status`) |
+| `anole_request_spans(r)` = `r + 1` | the same helper, now reading `r->spans_off` |
+| `anole_request_peer_cert(r)` | `anole_event_str(r, r->peer_cert)` |
+| gRPC metadata at `c + 1` | `anole_grpc_metadata(c)` (`c->metadata_off`) |
+| `ANOLE_DB_INT`, ... | `ANOLE_DB_TYPE_INT`, ...; `ANOLE_DB_WRITE`... are `ANOLE_DB_F_*` |
+| `ANOLE_GRPC_OK`... | `ANOLE_GRPC_STATUS_OK`...; `ANOLE_GRPC_UNARY`... are `ANOLE_GRPC_KIND_*`; `ANOLE_GRPC_SEND_FINISH` is `ANOLE_GRPC_F_FINISH` |
+| `ANOLE_WT_UNI`, `ANOLE_WT_FIN` | `ANOLE_WT_F_UNI`, `ANOLE_WT_F_FIN` (values kept) |
+| `ANOLE_TLS_PEM`, `ANOLE_SERVER_SIGNALS`, `ANOLE_CONSUMER_SHARED`, `ANOLE_POLL_NOARM` | `ANOLE_TLS_F_PEM`, `ANOLE_SERVER_F_SIGNALS`, `ANOLE_CONSUMER_F_SHARED`, `ANOLE_POLL_F_NOARM` |
+| `major ==` / `minor >=` checks | `ANOLE_ABI_COMPATIBLE(anole_abi_version())` |
+| enum-valued parameters as `int` | `uint32_t`; `anole_consumer_fd` returns `intptr_t`; `anole_has_feature` returns `int32_t` |
+
 ## What comes next
 
 ABI 0.1 was the request/response and WebSocket core, plus `anole_db_*` with
 SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server, 0.3 MongoDB through
 `anole_db_*`, 0.4 WebTransport, and 0.5 the TLS extras (mutual TLS, the
 client certificate in requests, certificate reload). 0.6 makes bit 0 of every
-send-type call's flags `ANOLE_BODY_BORROW`, so `ANOLE_WT_FIN` moved from 1 to
-2 (a binding built against 0.5 that passes 1 to end a WebTransport stream now
-borrows instead; rebuild against the new header). Next is the freeze, ABI
-1.0, before the bindings ship.
+send-type call's flags `ANOLE_BODY_BORROW`, so `ANOLE_WT_F_FIN` moved from 1 to
+2. 0.7 is the hardening release: records that grow (`spans_off`,
+`metadata_off`), one allocation table for events and handle kinds,
+`anole_abi.json`'s generated parsers, one cleanup rule and
+`anole_handle_release`, the `anole_req_` names and the constant families,
+stable error tokens, `anole_server_open`, `anole_listener_info`, abort
+reasons, the SENT contract and a poll that never drops an event. Before 1.0
+every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
+The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 
 Auth beyond the configured `jwt` middleware comes later.
