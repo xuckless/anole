@@ -7,7 +7,7 @@ const zio = @import("zio");
 
 /// Whether the injected `zio` can arm a timer against the running task. The
 /// stub says so by declaring `is_stub`; the real package does not.
-pub const have_auto_cancel = !@hasDecl(zio, "is_stub");
+pub const have_auto_cancel = !placement.is_stub;
 
 /// A deadline one task publishes and another waits on.
 ///

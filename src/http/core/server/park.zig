@@ -36,10 +36,7 @@ const zio = @import("zio");
 
 /// The `zio` in use has the completion queue and placement: not the core's
 /// test stub. Not Windows.
-pub const supported = @import("builtin").os.tag != .windows and !@hasDecl(zio, "is_stub") and @hasDecl(zio, "CompletionQueue") and
-    @hasDecl(zio, "ev") and @hasDecl(zio.ev, "NetPoll") and @hasDecl(zio.ev, "Async") and
-    @hasDecl(zio, "Group") and @hasDecl(zio.Group, "spawnInto") and
-    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio, "currentTask");
+pub const supported = @import("builtin").os.tag != .windows and !placement.is_stub;
 
 const NetPoll = if (supported) zio.ev.NetPoll else void;
 /// A zio task, as `zio.currentTask` returns it.

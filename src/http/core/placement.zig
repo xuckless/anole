@@ -20,10 +20,32 @@
 const std = @import("std");
 const zio = @import("zio");
 
-/// A zio with the placement API (it arrived after 0.18).
-const have_zio = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Placement") and
-    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo") and
-    @hasDecl(zio, "Group") and @hasDecl(zio.Group, "spawnInto");
+/// The core's own tests build against a stub of zio.
+pub const is_stub = @hasDecl(zio, "is_stub");
+
+// Anole always builds against xuckless/zio, branch `anole`. A zio without the
+// fork's declarations would silently lose placement, parking, task cancel and
+// per-executor pools, so it is a compile error.
+comptime {
+    if (!is_stub) {
+        const why = " (Anole needs xuckless/zio branch `anole`, pinned in build.zig.zon; see MAINTAINING.md)";
+        for (.{ "Placement", "Group", "AutoCancel", "currentTask", "Event", "Runtime" }) |name|
+            if (!@hasDecl(zio, name)) @compileError("this zio has no `zio." ++ name ++ "`" ++ why);
+        if (!@hasDecl(zio.Runtime, "fromIo")) @compileError("this zio has no `zio.Runtime.fromIo`" ++ why);
+        if (!@hasDecl(zio.Runtime, "currentExecutor")) @compileError("this zio has no `zio.Runtime.currentExecutor`" ++ why);
+        if (!@hasField(zio.Runtime, "executors")) @compileError("this zio's Runtime has no `executors`" ++ why);
+        if (!@hasDecl(zio.Group, "spawnInto")) @compileError("this zio has no `zio.Group.spawnInto`" ++ why);
+        if (!@hasField(zio.AutoCancel, "task")) @compileError("this zio's AutoCancel has no `task`" ++ why);
+        if (@import("builtin").os.tag != .windows) {
+            if (!@hasDecl(zio, "CompletionQueue")) @compileError("this zio has no `zio.CompletionQueue`" ++ why);
+            if (!@hasDecl(zio, "ev") or !@hasDecl(zio.ev, "NetPoll") or !@hasDecl(zio.ev, "Async"))
+                @compileError("this zio has no `zio.ev.NetPoll`/`Async`" ++ why);
+        }
+    }
+}
+
+/// A zio with the placement API.
+const have_zio = !is_stub;
 
 pub const Where = union(enum) {
     /// The executor of the calling task.
@@ -77,7 +99,7 @@ pub fn concurrent(
 /// pools). Null off zio, or off an executor of `io`'s runtime (a thread of
 /// its blocking pool, say).
 pub fn currentExecutor(io: std.Io) ?usize {
-    if (comptime !have_zio or !@hasDecl(zio.Runtime, "currentExecutor")) return null;
+    if (comptime !have_zio) return null;
     const rt = zio.Runtime.fromIo(io) orelse return null;
     return rt.currentExecutor() orelse null;
 }
@@ -92,10 +114,7 @@ pub fn executorCount(io: std.Io) ?usize {
 
 /// zio can cancel one task: the type behind the task an `AutoCancel` arms
 /// against has a non-blocking `cancel`.
-const have_task_cancel = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Runtime") and
-    @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio, "AutoCancel") and
-    @hasField(zio.AutoCancel, "task") and
-    @hasDecl(@typeInfo(@typeInfo(@FieldType(zio.AutoCancel, "task")).optional.child).pointer.child, "cancel");
+const have_task_cancel = !is_stub;
 
 /// A running task that another task can cancel by itself, without its
 /// group. Void where that is not possible (not zio): `currentTask` returns
@@ -108,14 +127,7 @@ pub const Task = if (have_task_cancel) @typeInfo(@FieldType(zio.AutoCancel, "tas
 pub fn currentTask(io: std.Io) ?Task {
     if (comptime !have_task_cancel) return null;
     if (zio.Runtime.fromIo(io) == null) return null;
-    if (comptime @hasDecl(zio, "currentTask")) return zio.currentTask();
-    // An older zio has no public "current task", but an armed `AutoCancel` records
-    // the task it will cancel. Armed far out and cleared at once: the timer
-    // never fires.
-    var probe: zio.AutoCancel = .init;
-    probe.set(.fromSeconds(365 * 24 * 3600));
-    defer probe.clear();
-    return probe.task;
+    return zio.currentTask();
 }
 
 /// Asks `task` to stop: its next cancelable wait (or the one it is in)
@@ -125,9 +137,7 @@ pub fn cancelTask(task: Task) void {
 }
 
 /// zio's executors record the task each one runs.
-const have_current_task = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Runtime") and
-    @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio.Runtime, "currentExecutor") and
-    @hasField(zio.Runtime, "executors");
+const have_current_task = !is_stub;
 
 /// A number that tells the calling task from any other task running at the
 /// same time, never 0: who is asking, when a WebSocket decides whether a
@@ -160,8 +170,7 @@ test "taskId: the same task gets the same answer, another task another" {
     try std.testing.expect(other.await(io) != mine);
 }
 
-const have_zio_event = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Event") and
-    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo");
+const have_zio_event = !is_stub;
 
 /// A flag one task waits on and others set, like `std.Io.Event`. On zio it
 /// is zio's own event, which keeps its waiter inline: `std.Io.Event`'s
