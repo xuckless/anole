@@ -349,46 +349,53 @@ pub fn buildRoutes(e: *Engine, app: *anole.App, global_ok: bool) !void {
         x.grpc.len = 0;
     }
     var bindings: std.ArrayList(*Binding) = .empty;
-    for (e.grpc.services) |*svc| for (svc.methods) |*m| {
-        const whole = m.kind == .unary or m.kind == .server_streaming;
-        m.detachable = whole and svc.cfg.no_wait and global_ok;
-        const route_options: dusty.RouteOptions = .{ .data = m, .no_wait = m.detachable };
-        app.router.addRouteWith(.post, m.path, handler, route_options);
-        if (noSideEffects(m)) app.router.addRouteWith(.get, m.path, handler, route_options);
-        // google.api.http, with descriptors.
-        if (!svc.cfg.transcode or m.input == null) continue;
-        const sch = e.grpc.schema.?;
-        const desc = sch.service(svc.name).?;
-        const dm = for (desc.methods) |*d| {
-            if (std.mem.eql(u8, d.name, m.name)) break d;
-        } else unreachable;
-        for (dm.rules) |rule| {
-            const b = try a.create(Binding);
-            const where = try std.fmt.allocPrint(a, "{s}.{s} ({s})", .{ svc.name, m.name, rule.pattern });
-            b.* = .{
-                .method = m,
-                .rule = rule,
-                .template = transcode.Template.parse(rule.pattern) catch {
-                    log.err("google.api.http on {s}: invalid path template", .{where});
+    for (e.grpc.services) |*svc| {
+        // The service's own middleware, after the global ones.
+        var chain: std.ArrayList(http.Middleware(void)) = .empty;
+        for (svc.cfg.middleware) |mw| try chain.append(a, try config_mod.middleware(app, a, mw));
+        const group = app.with(chain.items);
+        const svc_ok = global_ok and config_mod.neverWaits(svc.cfg.middleware);
+        for (svc.methods) |*m| {
+            const whole = m.kind == .unary or m.kind == .server_streaming;
+            m.detachable = whole and svc.cfg.no_wait and svc_ok;
+            const route_options: dusty.RouteOptions = .{ .data = m, .no_wait = m.detachable };
+            group.inner.addRouteWith(.post, m.path, handler, route_options);
+            if (noSideEffects(m)) group.inner.addRouteWith(.get, m.path, handler, route_options);
+            // google.api.http, with descriptors.
+            if (!svc.cfg.transcode or m.input == null) continue;
+            const sch = e.grpc.schema.?;
+            const desc = sch.service(svc.name).?;
+            const dm = for (desc.methods) |*d| {
+                if (std.mem.eql(u8, d.name, m.name)) break d;
+            } else unreachable;
+            for (dm.rules) |rule| {
+                const b = try a.create(Binding);
+                const where = try std.fmt.allocPrint(a, "{s}.{s} ({s})", .{ svc.name, m.name, rule.pattern });
+                b.* = .{
+                    .method = m,
+                    .rule = rule,
+                    .template = transcode.Template.parse(rule.pattern) catch {
+                        log.err("google.api.http on {s}: invalid path template", .{where});
+                        return error.InvalidTemplate;
+                    },
+                    .options = m.options,
+                };
+                b.options.data = b;
+                var why_buf: [256]u8 = undefined;
+                var why: std.Io.Writer = .fixed(&why_buf);
+                schema.checkRule(m.input.?, m.output.?, rule, &b.template, where, &why) catch {
+                    log.err("{s}", .{why.buffered()});
                     return error.InvalidTemplate;
-                },
-                .options = m.options,
-            };
-            b.options.data = b;
-            var why_buf: [256]u8 = undefined;
-            var why: std.Io.Writer = .fixed(&why_buf);
-            schema.checkRule(m.input.?, m.output.?, rule, &b.template, where, &why) catch {
-                log.err("{s}", .{why.buffered()});
-                return error.InvalidTemplate;
-            };
-            for (bindings.items) |other| if (other.rule.method == rule.method and other.template.sameShape(&b.template)) {
-                log.err("google.api.http on {s}: {t} matches the same paths as {s}.{s} ({s})", .{ where, rule.method, other.method.service.name, other.method.name, other.rule.pattern });
-                return error.InvalidTemplate;
-            };
-            try bindings.append(a, b);
-            transcode.addBinding(void, app.router, rule.method, &b.template, serveTranscoded, &b.options, where, m.detachable and m.kind == .unary);
+                };
+                for (bindings.items) |other| if (other.rule.method == rule.method and other.template.sameShape(&b.template)) {
+                    log.err("google.api.http on {s}: {t} matches the same paths as {s}.{s} ({s})", .{ where, rule.method, other.method.service.name, other.method.name, other.rule.pattern });
+                    return error.InvalidTemplate;
+                };
+                try bindings.append(a, b);
+                transcode.addBinding(void, group.inner, rule.method, &b.template, serveTranscoded, &b.options, where, m.detachable and m.kind == .unary);
+            }
         }
-    };
+    }
     if (cfg.health) {
         const health = app.grpcHealth();
         for (e.grpc.services) |svc| try health.set(svc.name, .SERVING);

@@ -358,10 +358,13 @@ pub fn register(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service
 /// `register`, with options for this registration (a message size limit,
 /// data for the handlers).
 ///
-/// The routes go on `router` itself: the router's own middleware
-/// (`router.use`) runs for them, but a group's (`router.group`) does not,
-/// even for transcoded REST routes whose paths start with its prefix.
-pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Service: type, comptime impl: Service, options: RegisterOptions) void {
+/// `target` is the `*dusty.Router(Ctx)` or a `dusty.Router(Ctx).Group`
+/// (`app.group(...)`): the routes run behind the router's middleware and,
+/// for a group, the group's. The gRPC paths (`/pkg.Service/Method`) and
+/// the transcoded REST paths come from the proto, so a group's prefix does
+/// not apply to them.
+pub fn registerWith(comptime Ctx: type, target: anytype, comptime Service: type, comptime impl: Service, options: RegisterOptions) void {
+    const router = routerOf(Ctx, target);
     // The routes hand it to each call; it lives as long as the router.
     const registration = router.arena.allocator().create(RegisterOptions) catch @panic("OOM");
     registration.* = options;
@@ -385,12 +388,30 @@ pub fn registerWith(comptime Ctx: type, router: *dusty.Router(Ctx), comptime Ser
             }
         }.h;
         const route_options: dusty.RouteOptions = .{ .data = registration, .no_wait = options.no_wait and M.kind == .unary };
-        router.addRouteWith(.post, path, route, route_options);
-        if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) router.addRouteWith(.get, path, route, route_options);
+        addRoute(Ctx, target, .post, path, route, route_options);
+        if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) addRoute(Ctx, target, .get, path, route, route_options);
         if (comptime transcode.annotated(Service, name)) {
-            if (options.transcode) transcode.registerMethod(Ctx, router, Service, name, M, handler, registration);
+            if (options.transcode) transcode.registerMethod(Ctx, target, Service, name, M, handler, registration);
         }
     }
+}
+
+/// The router behind a registration target: a `*dusty.Router(Ctx)`, or a
+/// `dusty.Router(Ctx).Group`.
+pub fn routerOf(comptime Ctx: type, target: anytype) *dusty.Router(Ctx) {
+    const R = dusty.Router(Ctx);
+    return if (@TypeOf(target) == *R) target else if (@TypeOf(target) == R.Group) target.router else @compileError("a gRPC service is registered on a *Router or a Router.Group");
+}
+
+/// The middleware a route registered on `target` runs: the router's, and
+/// the group's after them.
+pub fn chainOf(comptime Ctx: type, target: anytype) []const dusty.Middleware(Ctx) {
+    return if (@TypeOf(target) == *dusty.Router(Ctx)) target.middlewares else target.chain();
+}
+
+/// Registers a route on `target` as given: a group's prefix is not added.
+pub fn addRoute(comptime Ctx: type, target: anytype, method: ?dusty.Method, path: []const u8, handler: dusty.Router(Ctx).Handler, opts: dusty.RouteOptions) void {
+    if (@TypeOf(target) == *dusty.Router(Ctx)) target.addRouteWith(method, path, handler, opts) else target.addRouteUnprefixed(method, path, handler, opts);
 }
 
 /// Whether the method is marked `option idempotency_level =

@@ -475,6 +475,9 @@ pub const Config = struct {
         /// Unary and server-streaming calls that arrive whole run on the
         /// protocol's reader, detached (as `no_wait` routes do).
         no_wait: bool = true,
+        /// After the global ones; runs for the service's gRPC paths and its
+        /// transcoded routes, as a route's `middleware` does.
+        middleware: []const Middleware = &.{},
     };
     pub const GrpcMethod = struct {
         name: []const u8,
@@ -717,6 +720,8 @@ fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
         if (svc.name.len == 0 or svc.name.len > 255) return fail(why, "grpc.services[{d}].name: 1-255 bytes", .{i});
         for (g.services[0..i]) |other| if (std.mem.eql(u8, other.name, svc.name)) return fail(why, "grpc.services[{d}]: {s} twice", .{ i, svc.name });
         if (svc.max_message_size == 0 or svc.max_message_size > max_record_payload) return fail(why, "grpc.services[{d}].max_message_size: 1 to {d}", .{ i, max_record_payload });
+        var mw_buf: [48]u8 = undefined;
+        try checkMiddleware(svc.middleware, std.fmt.bufPrint(&mw_buf, "grpc.services[{d}].middleware", .{i}) catch "grpc.services[].middleware", why);
         if (svc.methods == null and !descriptors) return fail(why, "grpc.services[{d}]: methods, or the descriptors (descriptor_set)", .{i});
         const methods = svc.methods orelse continue;
         if (methods.len > std.math.maxInt(u16)) return fail(why, "grpc.services[{d}].methods: too many", .{i});

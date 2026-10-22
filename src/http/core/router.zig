@@ -201,7 +201,7 @@ pub fn Router(comptime Ctx: type) type {
 
         /// A conflict: a panic, or under `record_conflicts` the message
         /// (the first one) and the route left out.
-        fn conflicted(self: *Self, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+        pub fn conflicted(self: *Self, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
             if (!self.record_conflicts) std.debug.panic(fmt, args);
             if (self.conflict == null) self.conflict = try std.fmt.allocPrint(self.arena.allocator(), fmt, args);
         }
@@ -737,6 +737,19 @@ pub fn Router(comptime Ctx: type) type {
             /// the group's prefix and middleware, with `opts`.
             pub fn addRouteWith(g: Group, method: ?Method, path: []const u8, handler: Handler, opts: RouteOptions) void {
                 g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), opts) catch @panic("OOM");
+            }
+
+            /// Registers `handler` behind the group's middleware at `path` as
+            /// given: the prefix is not added (paths fixed elsewhere, such as
+            /// gRPC's).
+            pub fn addRouteUnprefixed(g: Group, method: ?Method, path: []const u8, handler: Handler, opts: RouteOptions) void {
+                g.router.insertRoute(path, method, handler, g.mergeMiddlewares(), opts) catch @panic("OOM");
+            }
+
+            /// The middleware a route of this group runs: the router's, then
+            /// the group's.
+            pub fn chain(g: Group) []const Middleware(Ctx) {
+                return g.mergeMiddlewares();
             }
 
             pub fn get(g: Group, path: []const u8, handler: Handler) void {
