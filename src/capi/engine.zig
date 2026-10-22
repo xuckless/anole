@@ -832,6 +832,8 @@ pub const Engine = struct {
             .ip => |ip| ip.getPort(),
             else => 0,
         }) catch {};
+        // After the listeners: HTTP/3's UDP port, when one serves it.
+        if (app.http3Address()) |q| e.ports.append(gpa, q.getPort()) catch {};
         e.started.set(threadedIo());
     }
 
@@ -2132,4 +2134,9 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
             tio.futexWaitTimeout(u32, &s.in.seq.raw, seq, .{ .deadline = d }) catch {};
         } else tio.futexWaitUncancelable(u32, &s.in.seq.raw, seq);
     }
+}
+
+test {
+    _ = config_mod;
+    _ = @import("engine_test.zig");
 }

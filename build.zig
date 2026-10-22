@@ -496,6 +496,13 @@ pub fn build(b: *std.Build) void {
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
     }
 
+    // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
+    // HTTP/3 detached answers, the configuration parser).
+    {
+        const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: the defaults" }, .use_llvm = use_llvm });
+        b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
+    }
+
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
     // nghttp2, zlib-ng, zstd and Brotli. Part of `test`, and `core-test` alone.

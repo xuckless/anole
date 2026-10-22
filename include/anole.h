@@ -149,7 +149,8 @@ ANOLE_API anole_status anole_server_create(const anole_server_options *options, 
    attach before this. */
 ANOLE_API anole_status anole_server_start(anole_server *s);
 /* The bound port of listener i, in configuration order (the real one when
-   port 0 was asked for). ANOLE_E_INVALID past the last. */
+   port 0 was asked for); i = the number of listeners: the HTTP/3 (UDP)
+   port, when a listener serves HTTP/3. ANOLE_E_INVALID past the last. */
 ANOLE_API anole_status anole_server_port(anole_server *s, uint32_t i, uint16_t *out);
 /* Stops accepting and drains: HTTP/2 and HTTP/3 GOAWAY, WebSockets close
    1001, requests in flight finish within timeouts.shutdown_ms. Returns at

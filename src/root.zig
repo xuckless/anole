@@ -310,6 +310,7 @@ test {
     _ = ratelimit;
     _ = auth;
     _ = observe;
+    _ = capi;
 }
 
 test "feature constraints hold" {
