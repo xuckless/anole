@@ -599,6 +599,41 @@ test "pg: live channel binding, and what a call sets for the session is reset" {
     }
 }
 
+test "pg: .auto misses a role switch inside a function; .always resets it" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    {
+        const setup = try open(io, .{ .max_connections = 1 });
+        defer setup.deinit();
+        _ = try setup.exec(&c, "DROP ROLE IF EXISTS anole_b", .{});
+        _ = try setup.exec(&c, "CREATE ROLE anole_b", .{});
+        _ = try setup.exec(&c, "CREATE OR REPLACE FUNCTION anole_pg_switch_role() RETURNS text LANGUAGE sql AS $$ SELECT set_config('role', 'anole_b', false) $$", .{});
+    }
+    defer {
+        const cleanup = open(io, .{ .max_connections = 1 }) catch null;
+        if (cleanup) |d| {
+            _ = d.exec(&c, "DROP FUNCTION IF EXISTS anole_pg_switch_role()", .{}) catch {};
+            _ = d.exec(&c, "DROP ROLE IF EXISTS anole_b", .{}) catch {};
+            d.deinit();
+        }
+    }
+    for ([_]pg.Options.ResetSession{ .auto, .always }) |mode| {
+        const d = try open(io, .{ .max_connections = 1, .reset_session = mode });
+        defer d.deinit();
+        const login = try d.one([]const u8, &c, "SELECT session_user::text", .{});
+        _ = try d.one([]const u8, &c, "SELECT anole_pg_switch_role()", .{});
+        const now = try d.one([]const u8, &c, "SELECT current_user::text", .{});
+        // the documented limit of .auto: `role` is not a reported setting
+        try testing.expectEqualStrings(if (mode == .auto) "anole_b" else login, now);
+    }
+}
+
 const AppState = struct {
     db: *pg.Client,
 };

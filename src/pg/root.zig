@@ -162,7 +162,9 @@ pub const Options = struct {
         /// and `LOAD` close the connection instead. The limit: what a
         /// server-side function does is not in the SQL, so `SELECT
         /// my_function()` that runs `set_config(..., false)` or `SET ROLE`
-        /// inside leaves it for the next call; use `.always` then.
+        /// inside leaves it for the next call; use `.always` then. Not reported,
+        /// so not caught: a role set inside a function (`role` is not a
+        /// reported setting).
         auto,
         /// Reset on every release (`DISCARD ALL` but for the prepared
         /// statements and `UNLISTEN`).

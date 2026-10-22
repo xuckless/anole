@@ -220,9 +220,9 @@ pub const Config = struct {
 
     /// A MongoDB deployment, as `anole.mongodb.Options` (docs/database.md).
     pub const Mongodb = struct {
-        /// mongodb:// or mongodb+srv:// connection string; its options win
-        /// over the fields below. Null: MONGODB_URI, else
-        /// mongodb://localhost:27017.
+        /// A mongodb:// connection string; its options win over the fields
+        /// below. mongodb+srv:// is not supported yet (list the hosts with
+        /// mongodb://). Null: MONGODB_URI, else mongodb://localhost:27017.
         url: ?[]const u8 = null,
         /// The database operations name no other for. Null: the URL's
         /// path, else "test".

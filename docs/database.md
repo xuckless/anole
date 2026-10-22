@@ -331,9 +331,13 @@ try tx.commit(req); // under the request's deadline, like every call
   The limit of `.auto`: what a server-side function or trigger does is not
   in the statement's text, so `SELECT my_function()` whose body runs
   `set_config(..., false)`, `SET ROLE` or `CREATE TEMP TABLE` leaves that
-  for the next request (a changed `TimeZone` or role is still caught,
-  since the server reports it). If your functions change session state,
-  use `.always`.
+  for the next request (a changed `TimeZone`, `DateStyle`, `application_name`
+  or superuser status is still caught, since the server reports those; a
+  role switch between two ordinary roles is not: PostgreSQL does not report
+  `role`, so a function that runs `SET ROLE` or `set_config('role', ..., false)`
+  leaves the next request running as that role). If your functions change
+  session state, or your app switches roles for row-level security, use
+  `.always`, or switch roles only with `SET LOCAL ROLE` inside a transaction.
 
 ### Observability
 
@@ -583,7 +587,9 @@ The connection string takes the standard options; these are honoured:
 | `retryWrites`, `retryReads` | on by default |
 | `w`, `journal`, `wTimeoutMS`, `readConcernLevel` | the write and read concerns of every call |
 
-Not yet: `mongodb+srv://`, read preferences other than `primary`,
+Not yet: `mongodb+srv://` (it needs a DNS SRV lookup; use the standard
+`mongodb://host1,host2,host3/?replicaSet=...&tls=true` string, which MongoDB
+Atlas shows under Connect > Drivers when you pick an older driver version), read preferences other than `primary`,
 `loadBalanced`, compression, and the GSSAPI, AWS and OIDC mechanisms; the
 client refuses them at start rather than ignore them. `anole.mongodb.Options`
 has the same settings as fields, plus `tls.ca` and `tls.client_certificate`

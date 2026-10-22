@@ -249,7 +249,7 @@ pub const Client = struct {
     /// The URL's options and `opts`, checked and made into settings.
     fn configure(self: *Client, arena: std.mem.Allocator, cs: uri.ConnectionString, credential: ?uri.Credential, opts: Options) !void {
         if (cs.scheme == .mongodb_srv) {
-            log.warn("mongodb: mongodb+srv:// is not supported yet; list the hosts with mongodb://", .{});
+            log.warn("mongodb: mongodb+srv:// needs a DNS SRV lookup, which Anole does not do yet: use the standard connection string (mongodb://host1,host2,host3/?replicaSet=...&tls=true), which MongoDB Atlas shows under Connect > Drivers when you pick an older driver version", .{});
             return error.Unsupported;
         }
         if (cs.boolean("loadBalanced") orelse false) {

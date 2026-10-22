@@ -1725,7 +1725,7 @@
           "anyOf": [
             {
               "type": "string",
-              "description": "mongodb:// or mongodb+srv:// connection string; its options win over the fields below. Null: MONGODB_URI, else mongodb://localhost:27017."
+              "description": "A mongodb:// connection string; its options win over the fields below. mongodb+srv:// is not supported yet (list the hosts with mongodb://). Null: MONGODB_URI, else mongodb://localhost:27017."
             },
             {
               "type": "null"
