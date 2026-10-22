@@ -816,6 +816,17 @@ pub const WebSocket = struct {
         try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true, .now));
     }
 
+    /// Whether `key` is a `Sec-WebSocket-Key` as RFC 6455 §4.1 has it: 16
+    /// bytes in base64 (24 characters, padding included).
+    pub fn validKey(key: []const u8) bool {
+        if (key.len != 24) return false;
+        var raw: [18]u8 = undefined;
+        const len = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+        if (len != 16) return false;
+        std.base64.standard.Decoder.decode(raw[0..len], key) catch return false;
+        return true;
+    }
+
     /// Compute Sec-WebSocket-Accept value from client key
     pub fn computeAcceptKey(client_key: []const u8, out: *[28]u8) void {
         var hasher = std.crypto.hash.Sha1.init(.{});
@@ -2055,4 +2066,13 @@ test "fuzz: a peer's frames, read as a callback socket and as a reading task do"
         "\x00\x09\x80\x00\x00\x00\x00",
         "\x05" ++ maskedFrame(0x8, "\x03\xe8bye"),
     });
+}
+
+test "WebSocket: validKey takes 16 bytes in base64 and nothing else" {
+    try std.testing.expect(WebSocket.validKey("dGhlIHNhbXBsZSBub25jZQ=="));
+    try std.testing.expect(!WebSocket.validKey(""));
+    try std.testing.expect(!WebSocket.validKey("dGhlIHNhbXBsZSBub25jZQ"));
+    try std.testing.expect(!WebSocket.validKey("dGhlIHNhbXBsZSBub25jZQ=")); // 23
+    try std.testing.expect(!WebSocket.validKey("dGhlIHNhbXBsZSBub25j!!=="));
+    try std.testing.expect(!WebSocket.validKey("dGhlIHNhbXBsZSBub25jZXM=")); // 17 bytes
 }

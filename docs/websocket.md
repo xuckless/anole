@@ -154,12 +154,49 @@ Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `allowed_origins` | `.same_origin` | The pages that may open the socket (see [Origins](#origins)). |
 | `max_message_size` | 16 MiB | The largest message `receive` assembles, measured after inflating. |
 | `timeout` | `.none` | Replaces the request timeout once the socket is open. |
 | `compression` | on with `-Dcompression` | Accept permessage-deflate when the client offers it. |
 | `deflate` | see below | Compressor settings. |
 | `close_on_drain` | true | Send close 1001 when the server starts to drain (see [Shutdown](#shutdown)). |
 | `drain_reason` | `"server shutting down"` | The reason in that close frame. |
+
+### Origins
+
+A browser sends the page's cookies with a WebSocket handshake whatever page
+opens it, and a WebSocket is not subject to CORS. Without a check, any site
+a logged-in user visits could open a socket to your server in that user's
+name and read what it receives. So `upgrade` (and `app.ws`,
+`app.wsCallbacks`, and WebTransport's `accept`) looks at the handshake's
+`Origin` header and by default lets through only pages on the request's
+own host and port, as `Host` names it (over HTTP/2 and HTTP/3,
+`:authority`; behind a trusted proxy, `X-Forwarded-Host`). The scheme is not
+compared, so a proxy that terminates TLS does not get in the way. Anything
+else gets 403 Forbidden: `upgrade` fails with `error.Forbidden`, which the
+server answers as 403 when the handler returns it.
+
+Clients that send no `Origin` (command-line tools, servers, mobile apps) are
+not affected: only browsers send it, and only they add credentials on their
+own.
+
+To let pages of other origins connect, list them, as the browser writes
+them (scheme, host, and the port unless it is the default):
+
+```zig
+var ws = (try anole.websocket.upgrade(req, res, .{
+    .allowed_origins = .{ .list = &.{ "https://app.example.com", "http://localhost:5173" } },
+})) orelse return res.fail(.bad_request, "");
+```
+
+`app.wsWith(path, handler, .{ .allowed_origins = ... })` takes the same
+options. `.any` lets every page in; use it only for an endpoint that does
+not trust cookies or other credentials the browser adds itself, such as one
+that authenticates with a token in its first message. The C ABI's WebSocket
+routes take `"origins": ["https://app.example.com"]` (or `["*"]`).
+
+The HTTP core's own `res.upgradeWebSocket` does not check `Origin`; check it
+yourself if you call it directly.
 
 ## Receiving and sending
 

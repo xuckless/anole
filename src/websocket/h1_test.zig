@@ -347,3 +347,36 @@ test "WebSocket over HTTP/1.1: permessage-deflate keeps its buffers out of the r
     }
     try std.testing.expect(deflate_apart.load(.acquire));
 }
+
+test "WebSocket over HTTP/1.1: the handshake needs a GET, a proper key and, from a browser, the same origin" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    server.router.post("/ws", echo);
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    const rest = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n";
+    const key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    var line: [64]u8 = undefined;
+    const cases = [_]struct { head: []const u8, status: []const u8 }{
+        // No Origin: not a browser.
+        .{ .head = "GET /ws HTTP/1.1\r\nHost: x\r\n" ++ rest ++ key ++ "\r\n", .status = "HTTP/1.1 101" },
+        .{ .head = "GET /ws HTTP/1.1\r\nHost: x\r\nOrigin: http://x\r\n" ++ rest ++ key ++ "\r\n", .status = "HTTP/1.1 101" },
+        .{ .head = "GET /ws HTTP/1.1\r\nHost: x:8080\r\nOrigin: https://x:8080\r\n" ++ rest ++ key ++ "\r\n", .status = "HTTP/1.1 101" },
+        .{ .head = "GET /ws HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\n" ++ rest ++ key ++ "\r\n", .status = "HTTP/1.1 403" },
+        .{ .head = "GET /ws HTTP/1.1\r\nHost: x\r\nOrigin: null\r\n" ++ rest ++ key ++ "\r\n", .status = "HTTP/1.1 403" },
+        .{ .head = "POST /ws HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n" ++ rest ++ key ++ "\r\n", .status = "HTTP/1.1 400" },
+        .{ .head = "GET /ws HTTP/1.1\r\nHost: x\r\n" ++ rest ++ "Sec-WebSocket-Key: short\r\n\r\n", .status = "HTTP/1.1 400" },
+    };
+    for (cases) |case| {
+        const got = try handshake(io, server.address.ip, case.head, &line);
+        std.testing.expect(std.mem.startsWith(u8, got, case.status)) catch |err| {
+            std.debug.print("{s} -> {s}\n", .{ case.head, got });
+            return err;
+        };
+    }
+}

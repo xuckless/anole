@@ -839,10 +839,19 @@ pub const Engine = struct {
                     .max_message_size = cfg.limits.ws_max_message,
                     .compression = wc.compression and features.compression,
                     .close_on_drain = wc.close_on_drain,
+                    .allowed_origins = wsOrigins(wc.origins),
                 } };
                 group.inner.addRouteWith(.get, rc.path, ws.handler, .{ .data = route });
             }
         }
+    }
+
+    /// A WebSocket route's `origins`: none is the same origin only, "*"
+    /// any.
+    fn wsOrigins(origins: []const []const u8) anole.websocket.Origins {
+        if (origins.len == 0) return .same_origin;
+        for (origins) |o| if (std.mem.eql(u8, o, "*")) return .any;
+        return .{ .list = origins };
     }
 
     fn watchReady(e: *Engine, app: *anole.App) void {

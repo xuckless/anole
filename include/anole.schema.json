@@ -835,6 +835,14 @@
           "type": "boolean",
           "default": true,
           "description": "Close 1001 when the server drains."
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Pages of other origins that may open the socket, besides the request's own host (\"https://app.example.com\"); \"*\" for any. A browser handshake from any other origin gets 403."
         }
       },
       "required": [

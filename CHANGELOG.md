@@ -7,6 +7,17 @@ breaking changes are listed anyway.
 
 ### Security
 
+- **Breaking:** WebSocket and WebTransport handshakes from a browser page of
+  another origin are refused with 403. `UpgradeOptions.allowed_origins` and
+  `webtransport.AcceptOptions.allowed_origins` default to `.same_origin`
+  (the request's own host and port); list other origins with
+  `.{ .list = &.{"https://app.example.com"} }`, or `.any` for endpoints that
+  do not rely on cookies. Clients that send no `Origin` are not affected.
+  C ABI WebSocket routes take `"origins"`. Apps whose pages connect from
+  another origin must list it. See docs/websocket.md#origins.
+- WebSocket over HTTP/1.1: the handshake must be a GET with a
+  `Sec-WebSocket-Key` of 16 bytes in base64 (RFC 6455 §4.2.1); anything else
+  is not upgraded.
 - WebSocket over HTTP/1.1: a control frame whose header claims more than
   125 bytes, or that is fragmented, is refused (close 1002) before its
   payload is waited for, on callback sockets too; control-frame payloads no

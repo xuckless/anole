@@ -612,3 +612,19 @@ const Frames = struct {
         }
     }
 };
+
+test "WebTransport: a session from a page of another origin is refused" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    try std.testing.expectError(error.WebTransportRefused, conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://evil.example" }));
+    // The connection serves the next one, from the same origin.
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
+    defer session.deinit();
+    try session.close(0, "");
+}

@@ -74,6 +74,9 @@ const codec = @import("anole_websocket_codec").server;
 /// The message layer over an HTTP/2 or HTTP/3 stream. Internal: its
 /// `receive` hands over messages still compressed; `Socket` inflates.
 const H2Socket = @import("h2_socket.zig").H2Socket;
+const origin = @import("../origin.zig");
+/// Which pages may open a socket (`UpgradeOptions.allowed_origins`).
+pub const Origins = origin.Origins;
 
 /// The HTTP core's WebSocket over an HTTP/1.1 connection (`Socket.conn.h1`).
 pub const WebSocket = dusty.WebSocket;
@@ -95,8 +98,15 @@ pub const Client = dusty.WebSocketClient;
 
 /// How `upgrade` (and `app.wsWith`) accepts a socket. The defaults suit
 /// most handlers: dusty's message limit, no timeout, compression when
-/// built in, close 1001 on drain.
+/// built in, close 1001 on drain, pages from the same origin only.
 pub const UpgradeOptions = struct {
+    /// The pages that may open the socket, by the handshake's `Origin`:
+    /// by default only the request's own host and port. A browser request
+    /// from anywhere else gets 403 (`error.Forbidden` from `upgrade`).
+    /// Clients that send no `Origin` (not browsers) are not affected. List
+    /// the other sites that may connect (`.{ .list = &.{"https://app.example.com"} }`),
+    /// or `.any` for an endpoint that does not rely on cookies.
+    allowed_origins: Origins = .same_origin,
     /// The largest message `receive` assembles (after inflating). A bigger
     /// one fails `receive` with `error.MessageTooLarge`, and the peer gets
     /// close 1009 first.
@@ -374,7 +384,12 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         if (!(features.http2 or features.http3) or !std.ascii.eqlIgnoreCase(req.protocol.?, "websocket")) return null;
         const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
         if (!std.mem.eql(u8, version, "13")) return null;
+    } else {
+        const up = req.headers.get("Upgrade") orelse return null;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, up, " \t"), "websocket")) return null;
     }
+    // A WebSocket handshake from here: from a page that may open it?
+    if (!origin.allowed(req, options.allowed_origins)) return error.Forbidden;
 
     // What lives as long as the socket.
     const alloc = if (h2) req.arena else owner orelse req.arena;
@@ -1104,6 +1119,7 @@ test {
     _ = @import("h2_fuzz_test.zig");
     if (features.http2) _ = @import("h2_test.zig");
     if (features.compression) _ = @import("deflate.zig");
+    _ = origin;
 }
 
 test "WebSocket accept key matches RFC 6455 section 1.3" {

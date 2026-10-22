@@ -1374,6 +1374,8 @@ pub const Response = struct {
         // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
         // WebSocket (RFC 8441), which a sink does not offer.
         if (self.sink != null) return null;
+        // RFC 6455 §4.2.1: a GET, with a key of 16 bytes in base64.
+        if (req.method != .get) return null;
         // Validate upgrade headers
         const upgrade = req.headers.get("Upgrade") orelse return null;
         if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
@@ -1385,6 +1387,7 @@ pub const Response = struct {
         if (!std.mem.eql(u8, version, "13")) return null;
 
         const key = req.headers.get("Sec-WebSocket-Key") orelse return null;
+        if (!WebSocket.validKey(key)) return null;
 
         // Compute accept key
         var accept_key: [28]u8 = undefined;

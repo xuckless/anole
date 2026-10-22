@@ -219,6 +219,9 @@ pub const Config = struct {
         compression: bool = true,
         /// Close 1001 when the server drains.
         close_on_drain: bool = true,
+        /// Pages of other origins that may open the socket, besides the
+        /// request's own host ("https://app.example.com"); "*" for any.
+        origins: []const []const u8 = &.{},
     };
     pub const Cache = struct {
         /// When the answer's Cache-Control does not say.
