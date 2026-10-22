@@ -3791,6 +3791,32 @@ test "Server: X-Forwarded-Host is ignored unless trusted, X-Forwarded-Proto when
     try std.testing.expect(std.mem.endsWith(u8, no_proto, "203.0.113.9:0 secure=false host=internal:8080"));
 }
 
+test "Server: an HTTP/1.1 request needs exactly one Host" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    const none = try rawAll(io, &server, "GET /who HTTP/1.1\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, none, "HTTP/1.1 400 "));
+    const two = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, two, "HTTP/1.1 400 "));
+    const one = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, one, "host=a.example"));
+    // HTTP/1.0 had no Host requirement.
+    const old = try rawAll(io, &server, "GET /who HTTP/1.0\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, old, " 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, old, "host=-"));
+}
+
 test "Server: forwarding headers are ignored without trusted hops" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});

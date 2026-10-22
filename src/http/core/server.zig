@@ -2696,6 +2696,22 @@ pub fn Server(comptime Ctx: type) type {
                     };
                 }
 
+                // One Host, and none only before HTTP/1.1 (RFC 9112 §3.2).
+                if (self.config.request.require_host) {
+                    var hosts: usize = 0;
+                    var it = request.headers.iterator();
+                    while (it.next()) |h| {
+                        if (std.ascii.eqlIgnoreCase(h.key, "Host")) hosts += 1;
+                    }
+                    if (hosts > 1 or (hosts == 0 and !response.http10)) {
+                        response.status = .bad_request;
+                        response.keepalive = false;
+                        try response.write();
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        return .close;
+                    }
+                }
+
                 // Handle Expect header (100-continue)
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {

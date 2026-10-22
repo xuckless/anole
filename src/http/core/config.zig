@@ -500,6 +500,11 @@ pub const ServerConfig = struct {
         /// and before any 100 Continue. Unlike `max_body_size` this bounds
         /// streamed bodies too. Null leaves it to `max_body_size`.
         max_content_length: ?usize = null,
+        /// An HTTP/1.1 request without a `Host` field, or any request with
+        /// more than one, is answered 400 (RFC 9112 §3.2), so every part
+        /// of the server and any cache in front agree on the host. False
+        /// accepts them, for old clients that omit it.
+        require_host: bool = true,
         /// Undo `Content-Encoding` on request bodies. A coding we cannot
         /// undo fails the read with `error.UnsupportedContentEncoding`
         /// rather than handing the handler bytes it would misread.

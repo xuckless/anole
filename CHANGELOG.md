@@ -25,6 +25,8 @@ breaking changes are listed anyway.
   replace each other), and cookie fields sent separately are joined with
   "; ", so no cookie is lost. `:authority` is the request's host; a `host`
   field that names another host gets 400.
+- HTTP/1.1 requests without a `Host` field, and requests with two, get 400
+  (RFC 9112). `server.request.require_host = false` accepts them again.
 
 ### C ABI (ABI 0.1)
 
