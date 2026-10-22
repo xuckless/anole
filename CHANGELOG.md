@@ -80,6 +80,60 @@ breaking changes are listed anyway.
   can no longer connect. Docs now state that revocation (CRL, OCSP) is not
   checked and that `.dev_self_signed` certificates are CAs for development
   only.
+- HTTP/2: a stream refused before it reached a handler (a header list past
+  `max_header_list_size`, or one nghttp2 rejects) is freed when it closes;
+  it used to be kept until the connection ended, so one connection could
+  hold memory without bound. A peer whose streams keep being refused is
+  sent GOAWAY(ENHANCE_YOUR_CALM) past `http2.refused_stream_burst` (100,
+  refilled at `refused_stream_rate`, 10 a second).
+- HTTP/2: a response whose handler has returned must be sent within
+  `timeout.request` (or `timeout.keepalive` when that is off); a peer that
+  gives it no flow-control window gets the stream reset, and a connection
+  whose peer stops reading is closed after one write blocks that long.
+  Such streams used to be held, and graceful drains to wait, indefinitely.
+- HTTP/2: the raised body windows of one connection's streams share
+  `http2.reading_window_budget` (16 MiB), so a connection with many uploads
+  at once no longer takes 1 MiB per stream without bound. docs/server.md
+  now sizes HTTP/2 memory per stream.
+- PROXY protocol v2: a header whose TLV length is near 65535 is refused
+  instead of crashing the process (or, in ReleaseFast, reading past a
+  buffer). Only listeners with `proxy_protocol = true` were affected.
+- PROXY protocol listeners take `proxy_protocol_from`, a list of networks
+  in CIDR notation allowed to send the header; connections from other
+  peers are closed. Optional; recommended when the port is reachable by
+  more than the load balancer.
+- `trusted_proxy_hops`: only the selected `X-Forwarded-For` entry is parsed,
+  so a malformed entry the client added no longer makes the proxy's address
+  the client's; a selected entry that is not an address reports `0.0.0.0`.
+- **Breaking:** `X-Forwarded-Host` is honoured only with the new
+  `server.trust_forwarded_host = true`. `X-Forwarded-Proto` stays on with
+  `trusted_proxy_hops` and can be turned off with
+  `trust_forwarded_proto = false`. Make sure the proxy overwrites both.
+- HTTP/2: a request's repeated header fields are all kept (they used to
+  replace each other), and cookie fields sent separately are joined with
+  "; ", so no cookie is lost. `:authority` is the request's host; a `host`
+  field that names another host gets 400.
+- HTTP/1.1 requests without a `Host` field, and requests with two, get 400
+  (RFC 9112). `server.request.require_host = false` accepts them again.
+- Static files: a file modified after the year 9999 no longer crashes the
+  server while formatting `Last-Modified`; the date is capped at 9999.
+- A streamed response with a `Content-Length` no longer writes past that
+  length: the write fails with `ContentLengthMismatch` (now part of
+  `StreamingBodyWriter.Error`) and the connection is closed after the
+  response. **Breaking:** `res.header`/`res.addHeader` refuse
+  `Transfer-Encoding` and `Connection` (`error.InvalidHeaderName`); use
+  `res.keepalive = false` to close the connection. A second
+  `Content-Length` from `addHeader` replaces the first.
+- A request body with broken framing (chunked) or a corrupt gzip/deflate
+  coding is answered 400 and logged at `debug`, instead of 500 at `err`.
+- HTTP/1.1: the rest of a request body a handler left unread is drained
+  only until the request's deadline, and at most `timeout.keepalive` (10 s
+  when that is off); a request already past its deadline is not drained
+  and its connection closes. A handler that lifted its timeout, or caught
+  the timeout's error and returned, let a slow client hold the connection
+  indefinitely.
+  Reading it fails with the new `error.MalformedBody` (was the parser's
+  `InvalidChunkSize`/`ParseFailed`/... or zlib's `CorruptInput`).
 
 ### C ABI (ABI 0.1)
 

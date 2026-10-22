@@ -441,8 +441,9 @@ pub const StreamingBodyWriter = struct {
     /// on the way to the framing.
     compressor: ?*StreamCompressor = null,
     /// Everything a write to the connection can fail with, resolved to its
-    /// cause rather than the `std.Io.Writer` sentinel.
-    pub const Error = Response.SendError;
+    /// cause rather than the `std.Io.Writer` sentinel, and
+    /// `ContentLengthMismatch` for a write past a declared Content-Length.
+    pub const Error = Response.SendError || error{ContentLengthMismatch};
 
     const vtable: std.Io.Writer.VTable = .{
         .drain = drain,
@@ -488,6 +489,16 @@ pub const StreamingBodyWriter = struct {
             try self.record(compressor.write(pending, data, splat));
             return w.consume(total);
         }
+
+        // Never past a declared length: the bytes after it would reach
+        // the peer (or a proxy reusing the connection) as the start of the
+        // next response. Nothing of this write goes out, and the
+        // connection is not reused.
+        if (self.res.content_length) |declared| if (!self.res.chunked and total > declared -| self.res.body_sent) {
+            self.res.keepalive = false;
+            self.err = error.ContentLengthMismatch;
+            return error.WriteFailed;
+        };
 
         try self.record(self.res.sendFramed(pending, data, splat, total));
         self.res.body_sent += total;
@@ -640,6 +651,11 @@ const StreamCompressor = struct {
         return w.consume(total);
     }
 };
+
+/// Framing fields the server writes itself (`Response.header`).
+fn isReservedHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or std.ascii.eqlIgnoreCase(name, "Connection");
+}
 
 /// Whether a response with this status carries a body at all. A 1xx, a
 /// 204 and a 304 do not, so a peer reads whatever follows their head as
@@ -946,21 +962,30 @@ pub const Response = struct {
     /// or the arena. Fails once the headers have gone out, on a name or
     /// value that is not valid on the wire, and past
     /// `ServerConfig.response.max_header_count`.
+    ///
+    /// `Transfer-Encoding` and `Connection` are the server's, which frames
+    /// the body and decides about keep-alive (`keepalive`): setting either
+    /// is `error.InvalidHeaderName`.
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
         if (self.headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
+        if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
         try self.putHeader(name, value);
     }
 
     /// Adds a header even if the response has one by that name already:
     /// for a field that may repeat or lists its values, such as `Vary`.
+    /// `Content-Length` never repeats: a second one replaces the first.
+    /// The names `header` refuses, this refuses too.
     pub fn addHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         if (self.headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
+        if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self.putHeader(name, value);
         if (!self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.add(name, value);
     }
@@ -1393,7 +1418,7 @@ pub const Response = struct {
         // Send 101 Switching Protocols response
         self.status = .switching_protocols;
         try self.header("Upgrade", "websocket");
-        try self.header("Connection", "Upgrade");
+        try self.putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
         // The connection is a WebSocket's from here: small windows, and the
@@ -2352,6 +2377,55 @@ test "StreamingBodyWriter: reports a body that does not match the declared lengt
     var body = try response.stream(&body_buf);
     try body.interface.writeAll("short");
     try std.testing.expectError(error.ContentLengthMismatch, body.end());
+}
+
+test "StreamingBodyWriter: never writes past a declared Content-Length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "5");
+
+    var body_buf: [4]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hel");
+    // Past the length: refused, and nothing of it reaches the wire, which
+    // would carry the extra bytes as the start of the next response.
+    try std.testing.expectError(error.WriteFailed, body.interface.writeAll("lo, and then some"));
+    try std.testing.expectEqual(@as(?StreamingBodyWriter.Error, error.ContentLengthMismatch), body.err);
+    try std.testing.expect(!response.keepalive);
+    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "then") == null);
+}
+
+test "Response: framing headers are the server's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try std.testing.expectError(error.InvalidHeaderName, response.header("Transfer-Encoding", "chunked"));
+    try std.testing.expectError(error.InvalidHeaderName, response.addHeader("transfer-encoding", "chunked"));
+    try std.testing.expectError(error.InvalidHeaderName, response.header("Connection", "keep-alive"));
+    try std.testing.expectError(error.InvalidHeaderName, response.addHeader("Connection", "close"));
+    // A second Content-Length replaces the first rather than joining it.
+    try response.addHeader("Content-Length", "5");
+    try response.addHeader("Content-Length", "2");
+    response.body = "hi";
+    try response.write();
+    const written = conn_writer.buffered();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "Content-Length"));
+    try std.testing.expect(std.mem.endsWith(u8, written, "Content-Length: 2\r\n\r\nhi"));
 }
 
 test "StreamingBodyWriter: rejects a Content-Length it cannot parse" {

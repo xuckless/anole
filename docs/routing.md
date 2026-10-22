@@ -506,7 +506,7 @@ Null disables a timeout.
 
 | Field | Default | Covers |
 | --- | --- | --- |
-| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. |
+| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. Over HTTP/2, a response still going out after its handler returned gets this long again (or `timeout.keepalive` when this is off) before the stream is reset, and any one write to a peer that stops reading is cut off after it. |
 | `timeout.read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). |
 | `timeout.keepalive` | 60 s | An idle connection between requests. |
 | `timeout.request_count` | none | Requests per keep-alive connection. |
@@ -524,6 +524,7 @@ req.setTimeout(.none); // a WebSocket or event stream
 | --- | --- | --- |
 | `max_body_size` | 1 MiB | `body()`, `bind()`, `json()` and forms fail: 413. Counted after decoding. |
 | `max_content_length` | none | A larger declared `Content-Length` is a 413 before the handler runs. Bounds streams too. |
+| `require_host` | true | An HTTP/1.1 request with no `Host`, or any with two, is a 400 (RFC 9112). |
 | `buffer_size` | 16 KiB | The request line and headers must fit: 431. |
 | `max_header_count` | 32 | Request headers: 431. |
 | `max_param_count`, `max_query_count` | 8, 32 | Path parameters and query values: 400. |
@@ -551,8 +552,9 @@ the client gets:
   stands for.
 - Request-body faults get a 4xx: `BodyTooBig` 413,
   `UnsupportedContentEncoding` 415, and 400 for `InvalidJsonBody` and
-  `MissingBody` (from `bind` and `json`) and a body that is not valid gzip or
-  zstd.
+  `MissingBody` (from `bind` and `json`), `IncompleteBody` (a body cut
+  short) and `MalformedBody` (broken chunked framing, or a body that is not
+  valid gzip or zstd). They are logged at `debug`, not `err`.
 - Anything else is logged at `err` and answered 500, and what the handler
   wrote is discarded. That includes `std.json`'s `SyntaxError` when the JSON
   was not the request's own (a config file, an upstream response).

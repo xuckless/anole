@@ -193,9 +193,9 @@ var app = try anole.Server(void).init(init.gpa, .{
 }, {});
 ```
 
-`http` has `address`, `port`, `h2c` and `proxy_protocol`. `https` has
-`address`, `port`, `cert`, `alpn_protocols`, `client_auth` and
-`proxy_protocol`. `cert` is one of:
+`http` has `address`, `port`, `h2c`, `proxy_protocol` and
+`proxy_protocol_from`. `https` has `address`, `port`, `cert`,
+`alpn_protocols`, `client_auth`, `proxy_protocol` and `proxy_protocol_from`. `cert` is one of:
 
 - `.{ .pem = .{ .cert = ..., .key = ... } }`: PEM text in memory, copied by
   `init`, for keys from a secret store or the environment.
@@ -235,6 +235,7 @@ or instead of those two. Each has:
 | `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
 | `proxy_protocol` | false | Every connection starts with a PROXY protocol header. |
+| `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty allows any peer. |
 
 A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
 or one of them. One with `http2 = false` gives a client that offers `h2`
@@ -559,10 +560,19 @@ handlers as HTTP/1.1.
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
 (64 KiB, also each stream's body buffer), `stream_window_reading` (1 MiB:
 the window and buffer from the handler's first read of the body),
-`connection_window` (16 MiB),
-`max_header_list_size` (64 KiB), `stream_reset_burst` and
-`stream_reset_rate` (rapid-reset protection), `max_continuations` (8) and
+`reading_window_budget` (16 MiB: what those raised buffers take at most per
+connection; past it a stream keeps `stream_window`), `connection_window`
+(16 MiB), `max_header_list_size` (64 KiB), `stream_reset_burst` and
+`stream_reset_rate` (rapid-reset protection), `refused_stream_burst` (100)
+and `refused_stream_rate` (10 a second: streams refused before a handler,
+past which the connection is closed), `max_continuations` (8) and
 `enable_connect_protocol` (on, for RFC 8441 WebSockets).
+
+Memory per HTTP/2 connection is per stream, too: besides the raised
+windows, each of up to `max_concurrent_streams` streams may hold a
+`stream_window` body buffer and, when its handler reads the whole body,
+up to `request.max_body_size`. Size memory for `max_connections` times
+that, or lower `max_concurrent_streams` or `max_body_size`.
 
 ## HTTP/3
 
@@ -904,12 +914,24 @@ it), per listener: `.http = .{ .port = 8080, .proxy_protocol = true }`. Each
 connection must open with a valid header, read before TLS and within
 `timeout.read_header`, or it is closed. The header's address becomes
 `req.remote_address`, and v2's SSL field sets `req.secure`.
+Name the load balancers with `proxy_protocol_from`
+(`.proxy_protocol_from = &.{ "10.0.0.0/8", "2001:db8::/32" }`) and a
+connection from any other peer is closed before anything is read, so a
+client that reaches the port directly cannot claim another address.
 
 **`X-Forwarded-*`**, with `.server = .{ .trusted_proxy_hops = 1 }`. With `n`
 hops, `req.remote_address` is the `n`-th address from the right of
-`X-Forwarded-For` (with port 0), the nearest proxy's `X-Forwarded-Proto` sets
-`req.secure`, and its `X-Forwarded-Host` is what `req.host()` returns. The
-`Forwarded` header (RFC 7239) is not read.
+`X-Forwarded-For` (with port 0); entries left of it are the client's own and
+are not read, and a selected entry that is not an address gives `0.0.0.0`,
+never the proxy's address. The nearest proxy's `X-Forwarded-Proto` sets
+`req.secure` (`.trust_forwarded_proto = false` turns that off). Its
+`X-Forwarded-Host` is what `req.host()` returns only with
+`.trust_forwarded_host = true`: a proxy that passes the client's header
+through (nginx does unless told `proxy_set_header X-Forwarded-Host $host`)
+would let a client choose the host your links and redirects are built from.
+The proxy must set (overwrite) both headers on every request; append-only
+proxies are not enough for them. The `Forwarded` header (RFC 7239) is not
+read.
 
 Enable either only on a listener that nothing but the proxy can reach;
 otherwise clients write the header themselves and choose the address your

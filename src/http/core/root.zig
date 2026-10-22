@@ -19,6 +19,8 @@ pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsPath = @import("config.zig").TlsPath;
+/// A peer range for `Listener.proxy_protocol_from`.
+pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;

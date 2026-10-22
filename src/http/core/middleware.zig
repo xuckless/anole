@@ -228,7 +228,8 @@ pub const ErrorAnswer = struct { status: http.Status, body: []const u8 };
 ///   the standard 4xx and 5xx codes count.
 /// - The request faults this server's own helpers return: `BodyTooBig`
 ///   (413), `UnsupportedContentEncoding` (415), `InvalidJsonBody`,
-///   `MissingBody`, `InvalidZstd` and `IncompleteBody` (400).
+///   `MissingBody`, `InvalidZstd`, `IncompleteBody` and `MalformedBody`
+///   (a request body whose framing or coding is broken) (400).
 ///
 /// Any other error is the server's: a `SyntaxError` from parsing something
 /// other than the request body is a 500, not a 400.
@@ -236,7 +237,7 @@ pub fn errorStatus(err: anyerror) ?http.Status {
     return switch (err) {
         error.BodyTooBig => .payload_too_large,
         error.UnsupportedContentEncoding => .unsupported_media_type,
-        error.InvalidZstd, error.IncompleteBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
+        error.InvalidZstd, error.IncompleteBody, error.MalformedBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
         else => status_errors.get(@errorName(err)),
     };
 }

@@ -6,6 +6,7 @@ const std = @import("std");
 const ContentType = @import("http.zig").ContentType;
 const HttpRequest = @import("request.zig").Request;
 const HttpResponse = @import("response.zig").Response;
+const proxy_protocol = @import("proxy_protocol.zig");
 
 /// How the server's own error answers (a 404, a 500, `Response.fail`) are
 /// written. `ServerConfig.errors`.
@@ -182,8 +183,14 @@ pub const Listener = struct {
     /// `Timeout.read_header`.
     ///
     /// Only for a listener that nothing but the proxy can reach, since
-    /// whoever connects chooses the address the header claims.
+    /// whoever connects chooses the address the header claims; or name
+    /// the proxies in `proxy_protocol_from`.
     proxy_protocol: bool = false,
+    /// With `proxy_protocol`: the peers allowed to connect and send the
+    /// header (`proxy_protocol.Network.parse("10.0.0.0/8")`). A connection
+    /// from anywhere else is closed before anything is read. Empty trusts
+    /// every peer. Ignored on a unix socket listener.
+    proxy_protocol_from: []const proxy_protocol.Network = &.{},
     /// An already listening socket to serve instead of binding `address`:
     /// one handed over by systemd socket activation (`LISTEN_FDS`) or by
     /// the process this one replaces. `address` should still say what it
@@ -289,7 +296,23 @@ pub const ServerConfig = struct {
     /// Only enable this when the server is unreachable except through that
     /// many trusted proxies. Otherwise a client can supply the header itself
     /// and choose the address reported to handlers.
+    ///
+    /// Only the selected entry is read; the ones left of it are the
+    /// client's own. One that is not an address gives `remote_address`
+    /// 0.0.0.0, never the proxy's address.
     trusted_proxy_hops: usize = 0,
+    /// With `trusted_proxy_hops`: the last `X-Forwarded-Proto` value sets
+    /// `Request.secure`. The nearest proxy must set (overwrite) the header
+    /// on every request, as nginx does only with `proxy_set_header
+    /// X-Forwarded-Proto $scheme`; otherwise the client's own value passes
+    /// through.
+    trust_forwarded_proto: bool = true,
+    /// With `trusted_proxy_hops`: the last `X-Forwarded-Host` value is what
+    /// `Request.host` returns. Off by default: a proxy that does not
+    /// overwrite the header lets a client choose the host that links,
+    /// redirects and cache keys are built from. Turn it on only when the
+    /// nearest proxy sets the header on every request.
+    trust_forwarded_host: bool = false,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
@@ -385,6 +408,18 @@ pub const ServerConfig = struct {
         /// 6.5 MB/s at 10 ms), while one that never reads holds only
         /// `stream_window`. No larger than `stream_window`: stays as is.
         stream_window_reading: u31 = 1024 * 1024,
+        /// The most memory the raised windows (`stream_window_reading`) of
+        /// one connection's streams take at once: 16 streams reading at
+        /// the default. A stream whose handler reads past it keeps
+        /// `stream_window`, and reads at that pace.
+        ///
+        /// What else a connection's streams can hold: up to
+        /// `max_concurrent_streams` body buffers of `stream_window`, and
+        /// for each handler that reads its whole body (`Request.body`) up
+        /// to `Request.max_body_size`. Size memory for `max_connections`
+        /// times that, or lower `max_concurrent_streams` and
+        /// `max_body_size`.
+        reading_window_budget: usize = 16 * 1024 * 1024,
         /// Request body bytes in flight across all streams of a
         /// connection. It holds no memory of its own (the streams' body
         /// buffers do), so it is generous: several uploads at once share
@@ -400,6 +435,13 @@ pub const ServerConfig = struct {
         stream_reset_rate: u64 = 33,
         /// CONTINUATION frames allowed after one HEADERS (CVE-2024-28182).
         max_continuations: usize = 8,
+        /// Streams the server may refuse before they reach a handler (a
+        /// header list past `max_header_list_size`, or one nghttp2's checks
+        /// reject) in a burst, refilled at `refused_stream_rate` per
+        /// second, before the connection is closed with
+        /// GOAWAY(ENHANCE_YOUR_CALM).
+        refused_stream_burst: u64 = 100,
+        refused_stream_rate: u64 = 10,
         /// Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441), so a
         /// client may open a WebSocket, or another protocol, on a stream
         /// with an extended CONNECT. Such a request reaches the router as a
@@ -421,6 +463,12 @@ pub const ServerConfig = struct {
         /// response. TLS handshakes use the same timeout as a separate phase.
         /// Defaults to 30 seconds; set to null for long-lived handlers, or
         /// replace it from a handler with `Request.setTimeout`.
+        ///
+        /// HTTP/2 also bounds what follows the handler with it (or with
+        /// `keepalive` when this is null): a response not all sent this
+        /// long after its handler returned (a peer that gives no flow
+        /// control window) is reset, and a single write the peer does not
+        /// read for this long closes the connection.
         ///
         /// Costs a second task per connection on any backend but zio, so on
         /// `std.Io.Threaded` setting either timeout means two threads per
@@ -477,6 +525,11 @@ pub const ServerConfig = struct {
         /// and before any 100 Continue. Unlike `max_body_size` this bounds
         /// streamed bodies too. Null leaves it to `max_body_size`.
         max_content_length: ?usize = null,
+        /// An HTTP/1.1 request without a `Host` field, or any request with
+        /// more than one, is answered 400 (RFC 9112 §3.2), so every part
+        /// of the server and any cache in front agree on the host. False
+        /// accepts them, for old clients that omit it.
+        require_host: bool = true,
         /// Undo `Content-Encoding` on request bodies. A coding we cannot
         /// undo fails the read with `error.UnsupportedContentEncoding`
         /// rather than handing the handler bytes it would misread.
