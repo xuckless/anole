@@ -18,6 +18,8 @@ const Answerer = struct {
     stop: std.atomic.Value(bool) = .init(false),
     held: std.atomic.Value(u64) = .init(0),
     aborts: std.atomic.Value(u32) = .init(0),
+    /// The handle of the most recent ABORT event.
+    last_abort: std.atomic.Value(u64) = .init(0),
     sent: std.atomic.Value(u32) = .init(0),
     failures: std.atomic.Value(u32) = .init(0),
     file_path: []const u8,
@@ -47,9 +49,10 @@ const Answerer = struct {
     fn handle(self: *Answerer, rec: []const u8) !void {
         const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
         const e = self.e;
-        switch (@as(abi.EventType, @enumFromInt(ev.type))) {
+        switch (@as(abi.EventType, @fromBackingInt(@intCast(ev.type)))) {
             .request => {},
             .abort => {
+                self.last_abort.store(ev.handle, .release);
                 _ = self.aborts.fetchAdd(1, .monotonic);
                 return;
             },
@@ -123,7 +126,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
 
         fn get(conn: *client.ClientConnection, arena: std.mem.Allocator, method: []const u8, path: []const u8, body: ?[]const u8) !struct { u16, []const u8, *client.Stream } {
             const s = try conn.request(&.{
-                .{ .name = ":method", .value = method }, .{ .name = ":path", .value = path },
+                .{ .name = ":method", .value = method },                                .{ .name = ":path", .value = path },
                 .{ .name = ":scheme", .value = if (proto == .h2) "http" else "https" }, .{ .name = ":authority", .value = "localhost" },
             }, if (proto == .h2) .{ .body_bytes = body } else .{ .body = body != null });
             if (proto == .h3) if (body) |b| {
@@ -153,7 +156,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             const d0 = a.e.stats().detached;
             var streams: [24]*client.Stream = undefined;
             for (&streams, 0..) |*st, i| st.* = try conn.request(&.{
-                .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = try std.fmt.allocPrint(arena, "/hello/{d}", .{i}) },
+                .{ .name = ":method", .value = "GET" },                                 .{ .name = ":path", .value = try std.fmt.allocPrint(arena, "/hello/{d}", .{i}) },
                 .{ .name = ":scheme", .value = if (proto == .h2) "http" else "https" }, .{ .name = ":authority", .value = "localhost" },
             }, .{});
             for (streams, 0..) |st, i| {
@@ -228,9 +231,8 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             // and the handle is gone.
             {
                 a.held.store(0, .release);
-                const aborts0 = a.aborts.load(.acquire);
                 const s = try conn.request(&.{
-                    .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/hold" },
+                    .{ .name = ":method", .value = "GET" },                                 .{ .name = ":path", .value = "/hold" },
                     .{ .name = ":scheme", .value = if (proto == .h2) "http" else "https" }, .{ .name = ":authority", .value = "localhost" },
                 }, .{});
                 var held: u64 = 0;
@@ -242,7 +244,12 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 try std.testing.expect(held != 0);
                 s.cancel();
                 s.release();
-                try waitFor(io, &a.aborts, aborts0 + 1);
+                // Wait for this stream's ABORT: a late one from an earlier
+                // step can arrive first.
+                for (0..1000) |_| {
+                    if (a.last_abort.load(.acquire) == held) break;
+                    try io.sleep(.fromMilliseconds(2), .awake);
+                } else return error.TimedOut;
                 try std.testing.expectError(error.Gone, engine.respond(a.e, held, 200, &.{}, "", false));
             }
         }
