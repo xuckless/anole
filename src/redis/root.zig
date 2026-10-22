@@ -454,6 +454,15 @@ pub const Client = struct {
             log.err("redis: {f} needs TLS, which this build leaves out (-Dtls=none)", .{s});
             return error.TlsNotBuilt;
         }
+        if (s.tls and !s.verify) {
+            // The URL often comes from the environment: it may not stop the
+            // checks of a CA the code gives.
+            if (opts.tls.ca != null) {
+                log.warn("redis: the URL turns certificate checks off (ssl_cert_reqs=none), but Options.tls.ca asks for them; take it out of the URL", .{});
+                return error.InvalidDatabaseUrl;
+            }
+            log.warn("redis: ssl_cert_reqs=none: the server's certificate is not checked, so whoever is between this process and {s} can read and change everything", .{s.host});
+        }
         self.stream_options = .{
             .host = s.host,
             .port = s.port,
@@ -2335,6 +2344,9 @@ test "redis: a server that cannot be reached is a 503, and /readyz says so" {
     try testing.expectError(error.ServiceUnavailable, client.get(&c, "k"));
     try testing.expectStringStartsWith(db.lastError(&c).?.message, "cannot connect to redis://127.0.0.1:");
     try testing.expect(!Client.ping(client, io));
+
+    // A URL may not turn off the checks of a CA the code gives.
+    if (has_tls) try testing.expectError(error.InvalidDatabaseUrl, Client.init(gpa, io, .{ .url = "rediss://cache.example.com?ssl_cert_reqs=none", .environ = .empty, .tls = .{ .ca = .system } }));
 }
 
 test "redis: a pool per executor" {
