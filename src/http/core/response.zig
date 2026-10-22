@@ -1320,10 +1320,12 @@ pub const Response = struct {
 
     /// Detaches the response from the handler (see `Detached`): the handler
     /// returns, and `finish` on the result, later and on this request's
-    /// executor, writes the response. The request and the response stay
-    /// valid until then. `owner.abort` runs instead if the request goes
-    /// away first. `error.Unsupported` when `canDetach` is false; the
-    /// handler then answers as usual (waiting, if it must).
+    /// executor, writes the response. The engine moves the request and
+    /// the response to memory that lives until then: from here on, use
+    /// `d.request` and `d.response` (`req` and `self` go when the handler
+    /// returns). `owner.abort` runs instead if the request goes away
+    /// first. `error.Unsupported` when `canDetach` is false; the handler
+    /// then answers as usual (waiting, if it must).
     pub fn detach(self: *Response, req: *Request, owner: Detached.Owner) error{ Unsupported, OutOfMemory }!*Detached {
         if (!self.canDetach()) return error.Unsupported;
         const d = try self.arena.create(Detached);
@@ -1335,6 +1337,10 @@ pub const Response = struct {
             .owner = owner,
         };
         self.detached = d;
+        d.engine_ctx = d.engine.relocate(d) catch |err| {
+            self.detached = null;
+            return err;
+        };
         return d;
     }
 

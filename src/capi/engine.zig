@@ -98,10 +98,26 @@ fn stateOf(word: u64) SlotState {
     return @enumFromInt(@as(u32, @truncate(word)));
 }
 
+/// A handle as the consumer sees it: which executor, which slot, which
+/// generation of it, and which kind of thing (a function given a handle of
+/// another kind answers `ANOLE_E_GONE`, never acts on the wrong object).
 pub const Handle = packed struct(u64) {
-    gen: u32,
+    gen: u28,
+    kind: Kind,
     slot: u24,
     exec: u8,
+
+    /// Room for what ABI 0.x adds before it freezes: gRPC calls, WebTransport
+    /// sessions and streams, database queries.
+    pub const Kind = enum(u4) {
+        request = 1,
+        websocket = 2,
+        grpc_call = 3,
+        wt_session = 4,
+        wt_stream = 5,
+        db_query = 6,
+        _,
+    };
 
     pub fn encode(h: Handle) u64 {
         return @bitCast(h);
@@ -110,6 +126,13 @@ pub const Handle = packed struct(u64) {
         return @bitCast(v);
     }
 };
+
+/// Generations count 1..max_gen and wrap to 1 (0 is never valid).
+pub const max_gen: u32 = std.math.maxInt(u28);
+
+pub fn nextGen(gen: u32) u32 {
+    return if (gen >= max_gen) 1 else gen + 1;
+}
 
 const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
@@ -353,7 +376,7 @@ pub const Exec = struct {
             s.fd = -1;
         }
         if (s.borrowed) |b| {
-            x.postSent(Handle.encode(.{ .gen = gen, .slot = @intCast(i), .exec = x.index }), b);
+            x.postSent(x.handleOf(i, gen), b);
             s.borrowed = null;
         }
         if (s.bytes.capacity > Slot.keep_capacity) {
@@ -370,7 +393,7 @@ pub const Exec = struct {
         s.claims = "";
         _ = x.engine.inflight.fetchSub(1, .monotonic);
         // 0 is skipped so that no handle is ever 0.
-        const next = if (gen == std.math.maxInt(u32)) 1 else gen + 1;
+        const next = nextGen(gen);
         s.word.store(pack(next, .free), .release);
         s.next_free = x.free_head;
         x.free_head = i;
@@ -430,7 +453,7 @@ pub const Exec = struct {
     }
 
     fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
-        return Handle.encode(.{ .gen = gen, .slot = @intCast(i), .exec = x.index });
+        return Handle.encode(.{ .gen = @intCast(gen), .kind = .request, .slot = @intCast(i), .exec = x.index });
     }
 };
 
@@ -1049,22 +1072,39 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
         },
         else => {},
     }
+    // On a reader a full ring (the consumer far behind) is refused at
+    // once: nothing here may wait. Only this executor pushes onto its
+    // ring, and nothing below yields before the push, so room now is room
+    // then.
+    if (detach and x.ring.full()) {
+        _ = e.busy_count.fetchAdd(1, .monotonic);
+        res.fail(.service_unavailable, "the application is behind");
+        return;
+    }
     const si = x.alloc() orelse {
         _ = e.busy_count.fetchAdd(1, .monotonic);
         res.fail(.service_unavailable, "too many requests in flight");
         return;
     };
+    const s = &x.slots[si];
+    // Detached, the request and response move off the reader's stack:
+    // the slot keeps the moved ones.
+    const d: ?*Detached = if (detach) res.detach(req, .{ .abort = detachedAborted, .ctx = s }) catch |err| {
+        x.free_head = si;
+        return err;
+    } else null;
+    const r = if (d) |dd| dd.request else req;
     _ = e.inflight.fetchAdd(1, .monotonic);
     _ = e.requests.fetchAdd(1, .monotonic);
-    const s = &x.slots[si];
     const gen = genOf(s.word.load(.monotonic));
-    s.req = req;
+    s.req = r;
     s.route = route;
-    s.flags = if (req.secure) abi.REQ_SECURE else 0;
-    if (anole.early_data.isEarly(req)) s.flags |= abi.REQ_EARLY_DATA;
-    s.content_length = if (req.content_length) |l| l else std.math.maxInt(u64);
-    s.remote_len = remoteText(req, &s.remote);
-    s.claims = claimsOf(req);
+    s.flags = if (r.secure) abi.REQ_SECURE else 0;
+    if (anole.early_data.isEarly(r)) s.flags |= abi.REQ_EARLY_DATA;
+    s.content_length = if (r.content_length) |l| l else std.math.maxInt(u64);
+    s.remote_len = remoteText(r, &s.remote);
+    s.claims = claimsOf(r);
+    s.detached = d;
     s.body = "";
     s.event.reset();
     s.pump_event.reset();
@@ -1098,7 +1138,8 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     // wait for room, up to the deadline; on a reader, refuse instead.
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
-        if (detach or s.timed_out) {
+        std.debug.assert(d == null);
+        if (s.timed_out) {
             x.unlink(si);
             x.release(si);
             _ = e.busy_count.fetchAdd(1, .monotonic);
@@ -1112,8 +1153,7 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     }
     x.consumer.?.wake();
 
-    if (detach) {
-        s.detached = res.detach(req, .{ .abort = detachedAborted, .ctx = s }) catch unreachable;
+    if (d != null) {
         _ = e.detached_count.fetchAdd(1, .monotonic);
         return;
     }
@@ -1882,7 +1922,7 @@ pub const CHeader = abi.Header;
 
 fn slotOf(e: *Engine, hv: u64) ?struct { *Exec, *Slot, Handle } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.exec >= e.execs.len) return null;
+    if (h.gen == 0 or h.kind != .request or h.exec >= e.execs.len) return null;
     const x = &e.execs[h.exec];
     if (h.slot >= x.slots.len) return null;
     return .{ x, &x.slots[h.slot], h };

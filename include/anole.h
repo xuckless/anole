@@ -108,7 +108,10 @@ ANOLE_API anole_str anole_version(void);
    "compression", "brotli", "auth", "sqlite". */
 ANOLE_API int anole_has_feature(anole_str name);
 
-/* 64-bit, generation-checked; 0 is never valid. */
+/* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
+   (a request, a WebSocket; gRPC calls, WebTransport sessions and streams
+   and database queries later), and a function given a handle of another
+   kind answers ANOLE_E_GONE. The bits are Anole's: treat them as opaque. */
 typedef uint64_t anole_req; /* one request: from ANOLE_EV_REQUEST until answered */
 typedef uint64_t anole_ws;  /* one WebSocket: from ANOLE_EV_WS_OPEN until ANOLE_EV_WS_CLOSE */
 typedef struct anole_server anole_server;     /* opaque */
@@ -227,8 +230,11 @@ enum anole_event_type {
   ANOLE_EV_WS_MESSAGE = 7, /* anole_ws_message_event */
   ANOLE_EV_WS_CLOSE = 8,   /* anole_ws_close_event: the handle is stale from now on */
   ANOLE_EV_WS_DRAIN = 9,   /* anole_event: a WebSocket that took ANOLE_BUSY has room */
-  ANOLE_EV_DB_RESULT = 10, /* reserved for anole_db_* */
+  ANOLE_EV_DB_RESULT = 10, /* reserved for anole_db_* (SQLite, PostgreSQL, Redis, MongoDB) */
   ANOLE_EV_STOPPED = 11    /* anole_event: the server stopped; the consumer's last event */
+  /* Reserved before ABI 1.0: 12-19 gRPC calls (their own handle kind),
+     20-29 WebTransport sessions, streams and datagrams, 30-39 more
+     database events. A consumer skips types it does not know (ev.len). */
 };
 
 /* Every event starts with this. Records are 8-byte aligned and `len`

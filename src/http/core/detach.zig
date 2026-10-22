@@ -46,6 +46,14 @@ pub const Detached = struct {
 
     /// What the engine (HTTP/2, HTTP/3) provides.
     pub const Engine = struct {
+        /// Moves the request and the response off the stack they were made
+        /// on (the reader's: a request that is not detached costs no
+        /// allocation and stays in warm memory) into memory that lives as
+        /// long as the request, setting `d.request` and `d.response` to
+        /// the moved ones. Returns the new `engine_ctx`. From `detach`, on
+        /// the request's executor; the handler and every middleware go on
+        /// with the old pair, which `detached` still marks.
+        relocate: *const fn (d: *Detached) error{OutOfMemory}!*anyopaque,
         /// Ends the exchange: writes `d.response` when `result` is not an
         /// error, else handles the error as a handler's (a reset, a 500),
         /// then lets the engine free the request. On the request's

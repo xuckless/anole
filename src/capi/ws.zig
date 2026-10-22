@@ -81,7 +81,7 @@ pub const WsSlot = struct {
         return s.word.load(.acquire) == pack(g, .open);
     }
     fn handle(s: *const WsSlot, g: u32) u64 {
-        return Handle.encode(.{ .gen = g, .slot = @intCast(s.index), .exec = s.exec.index });
+        return Handle.encode(.{ .gen = @intCast(g), .kind = .websocket, .slot = @intCast(s.index), .exec = s.exec.index });
     }
 };
 
@@ -141,7 +141,7 @@ pub const ExecState = struct {
 
 fn slotOf(e: *Engine, hv: u64) ?struct { *WsSlot, u32 } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.exec >= e.execs.len) return null;
+    if (h.gen == 0 or h.kind != .websocket or h.exec >= e.execs.len) return null;
     const s = e.execs[h.exec].ws.slot(h.slot) orelse return null;
     return .{ s, h.gen };
 }
@@ -217,7 +217,7 @@ fn onClose(_: ?*anyopaque, sock: *Socket) void {
     const e = x.engine;
     const g = s.gen();
     // Stale from here: the consumer's calls get ANOLE_E_GONE.
-    const next = if (g == std.math.maxInt(u32)) 1 else g + 1;
+    const next = engine.nextGen(g);
     s.acquire();
     s.word.store(pack(next, .free), .release);
     s.release();

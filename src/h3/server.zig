@@ -2268,8 +2268,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer timer.clear();
                 if (!inline_mode) if (server.config.timeout.request) |d| setTimeout(&timer, io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
+                // On the stack (warm, no allocation); `detachedRelocate`
+                // moves it to the stream's arena if the handler detaches.
                 var on_stack: Exchange = undefined;
-                const ex: *Exchange = if (inline_mode) try arena.create(Exchange) else &on_stack;
+                const ex: *Exchange = &on_stack;
                 const request = &ex.request;
                 request.* = .{
                     .arena = arena,
@@ -2422,10 +2424,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
                     else => |e| return e,
                 };
-                if (response.detached != null) {
+                if (response.detached) |d| {
+                    // Finished later, from the moved copy.
                     detached = true;
                     conn.lock();
-                    s.detached = ex;
+                    s.detached = exchangeOf(d);
                     conn.unlock();
                     return .detached;
                 }
@@ -2509,7 +2512,23 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`dusty.Detached`).
-        const detach_engine: dusty.Detached.Engine = .{ .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+        const detach_engine: dusty.Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+
+        /// The exchange, from the endpoint's stack into the stream's
+        /// arena, its pointers into itself moved along.
+        fn detachedRelocate(d: *dusty.Detached) error{OutOfMemory}!*anyopaque {
+            const old = exchangeOf(d);
+            const ex = try old.response.arena.create(Exchange);
+            ex.* = old.*;
+            ex.request.response = &ex.response;
+            ex.response.request = &ex.request;
+            ex.request.body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response.sink = ex.sink_state.sink();
+            ex.response.detach_ctx = ex;
+            d.request = &ex.request;
+            d.response = &ex.response;
+            return ex;
+        }
 
         fn exchangeOf(d: *dusty.Detached) *Exchange {
             return @ptrCast(@alignCast(d.engine_ctx));

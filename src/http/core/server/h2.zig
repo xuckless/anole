@@ -418,6 +418,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// handler's hold on the stream goes when it is finished or
             /// aborted.
             detached: ?*Exchange = null,
+
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
             /// Or a whole body in memory (`StreamSink.complete`), which the
@@ -1076,8 +1077,10 @@ pub fn Engine(comptime Ctx: type) type {
             defer timer.clear(io);
             if (!inline_mode) if (server.config.timeout.request) |d| timer.set(io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
+            // On the stack (warm, no allocation); `detachedRelocate` moves
+            // it to the stream's arena if the handler detaches.
             var on_stack: Exchange = undefined;
-            const ex: *Exchange = if (inline_mode) try arena.create(Exchange) else &on_stack;
+            const ex: *Exchange = &on_stack;
             const request = &ex.request;
             request.* = .{
                 .arena = arena,
@@ -1183,12 +1186,12 @@ pub fn Engine(comptime Ctx: type) type {
                 error.WriteFailed => return sink_state.writeErr() orelse error.Unexpected,
                 else => |e| return e,
             };
-            if (response.detached != null) {
-                // Finished later (`detach_engine`); the stream is held till
-                // then.
+            if (response.detached) |d| {
+                // Finished later (`detach_engine`), from the moved copy;
+                // the stream is held till then.
                 detached = true;
                 conn.lock();
-                stream.detached = ex;
+                stream.detached = exchangeOf(d);
                 conn.unlock();
                 return .detached;
             }
@@ -1198,7 +1201,23 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`Detached`).
-        const detach_engine: Detached.Engine = .{ .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+        const detach_engine: Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+
+        /// The exchange, from the reader's stack into the stream's arena,
+        /// its pointers into itself moved along.
+        fn detachedRelocate(d: *Detached) error{OutOfMemory}!*anyopaque {
+            const old = exchangeOf(d);
+            const ex = try old.response.arena.create(Exchange);
+            ex.* = old.*;
+            ex.request.response = &ex.response;
+            ex.response.request = &ex.request;
+            ex.request.body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response.sink = ex.sink_state.sink();
+            ex.response.detach_ctx = ex;
+            d.request = &ex.request;
+            d.response = &ex.response;
+            return ex;
+        }
 
         fn exchangeOf(d: *Detached) *Exchange {
             return @ptrCast(@alignCast(d.engine_ctx));
