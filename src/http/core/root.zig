@@ -57,6 +57,10 @@ pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 pub const validateCookieName = @import("cookie.zig").validateCookieName;
 pub const validateCookieValue = @import("cookie.zig").validateCookieValue;
+/// Whether a header name or value may go on the wire (the C ABI checks
+/// replies with them before they reach a `Response`).
+pub const validateHeaderName = @import("http.zig").validateHeaderName;
+pub const validateHeaderValue = @import("http.zig").validateHeaderValue;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
 /// `Request.locals`: per-request values a middleware hands to the handler.
 pub const Locals = @import("locals.zig").Locals;

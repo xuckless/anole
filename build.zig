@@ -742,6 +742,40 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&bench.step);
     }
 
+    // capi: libanole, the C ABI (include/anole.h) as a static and a shared
+    // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
+    {
+        const capi_mod = b.createModule(.{
+            .root_source_file = b.path("src/capi/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            // Linked into shared objects (a Node addon, a Python extension).
+            .pic = true,
+            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+        });
+        const capi_step = b.step("capi", "Build libanole (static and shared, only anole_* exported) and install include/anole.h");
+        const zig_lib = b.addLibrary(.{ .name = "anole_zig", .linkage = .static, .root_module = capi_mod });
+        zig_lib.bundle_compiler_rt = true;
+        zig_lib.bundle_ubsan_rt = true;
+        // Zig's static library holds only the Zig code: the C libraries are
+        // archives of their own. tools/capi-pack.sh links them all into one
+        // object whose only global symbols are anole_*, archives it as
+        // libanole.a and links libanole.{dylib,so} from it.
+        // capi-zig: only the Zig part (no packing), e.g. to check that it
+        // cross-compiles (-Dtarget=x86_64-windows-gnu).
+        b.step("capi-zig", "Build only the Zig part of libanole (libanole_zig.a, not self-contained)").dependOn(&b.addInstallArtifact(zig_lib, .{}).step);
+        const pack = b.addSystemCommand(&.{"sh"});
+        pack.addFileArg(b.path("tools/capi-pack.sh"));
+        const out_dir = pack.addOutputDirectoryArg("capi");
+        pack.addArtifactArg(zig_lib);
+        var seen: std.AutoArrayHashMapUnmanaged(*std.Build.Step.Compile, void) = .empty;
+        collectArchives(b, capi_mod, &seen);
+        for (seen.keys()) |lib| pack.addArtifactArg(lib);
+        capi_step.dependOn(&b.addInstallDirectory(.{ .source_dir = out_dir, .install_dir = .lib, .install_subdir = "" }).step);
+        capi_step.dependOn(&b.addInstallHeaderFile(b.path("include/anole.h"), "anole.h").step);
+    }
+
     // tls-public-check: outbound HTTPS against public hosts (needs the network).
     if (features.tls == .boringssl) {
         const public_check = b.addExecutable(.{
@@ -1424,4 +1458,23 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         if (o.for_test) mod.addImport("anole_h3_layout", o.c.h3_layout.?);
     }
     return mod;
+}
+
+/// Every static library linked into `mod` or the modules it imports
+/// (transitively), for tools/capi-pack.sh.
+fn collectArchives(b: *std.Build, mod: *std.Build.Module, seen: *std.AutoArrayHashMapUnmanaged(*std.Build.Step.Compile, void)) void {
+    var visited: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    collectArchivesFrom(b, mod, seen, &visited);
+}
+
+fn collectArchivesFrom(b: *std.Build, mod: *std.Build.Module, seen: *std.AutoArrayHashMapUnmanaged(*std.Build.Step.Compile, void), visited: *std.AutoHashMapUnmanaged(*std.Build.Module, void)) void {
+    if ((visited.getOrPut(b.allocator, mod) catch @panic("OOM")).found_existing) return;
+    for (mod.link_objects.items) |lo| switch (lo) {
+        .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
+            if (!(seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing)
+                collectArchivesFrom(b, c.root_module, seen, visited);
+        },
+        else => {},
+    };
+    for (mod.import_table.values()) |m| collectArchivesFrom(b, m, seen, visited);
 }
