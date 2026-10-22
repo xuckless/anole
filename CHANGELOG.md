@@ -52,6 +52,31 @@ breaking changes are listed anyway.
   no `.note.GNU-stack`); glibc 2.41 refuses to load such an extension.
   The note is added when libanole is packed.
 
+### Clients
+
+- The server's client (`anole.client(req)`, `app.client()`) no longer
+  closes and redials connections when many handlers call one upstream at
+  once. Its pool kept 8 idle connections in all, so with 32 requests in
+  flight to one host every round closed the rest and dialed them again;
+  the connections' buffers churning through the allocator grew a server's
+  memory without end (Sharkbench's web workload: 19 to 39 MB in a few
+  minutes, at a steady 33k req/s). Now:
+  - Each executor has a pool of its own, as the database connectors do,
+    so a connection stays on the executor whose requests use it.
+  - `ClientConfig.max_idle_per_host` (256) bounds the idle connections to
+    one host and `max_idle_connections` (1024, was 8 and a `u8`) those in
+    all, per executor's pool. A pool never holds more than were in flight
+    at once.
+  - `ClientConfig.idle_timeout` (90 s, as Go and hyper) closes connections
+    that sat idle that long, from a task per pool that runs only while
+    connections are idle; a shorter `Keep-Alive: timeout` still wins.
+  - A pooled connection's arena keeps at most 32 KiB of its last response
+    (it kept all of it, however big).
+  - `ServerOptions.client` sets the server's client's `ClientConfig` (the
+    pool, timeout, CAs, HTTP/2); it had only the defaults.
+  - `Client.dials` counts the connections a client opened. Breaking:
+    `client.pool` is now `client.pool()` (the calling executor's pool).
+
 ## 0.1.1 (2026-10-22)
 
 ### Security

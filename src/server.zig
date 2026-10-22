@@ -192,6 +192,12 @@ pub const Options = struct {
     /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
     /// replaced by the fields above.
     server: http.ServerConfig = .{},
+    /// The server's outbound HTTP client (`app.client()`,
+    /// `anole.client(req)`): its pool of idle connections
+    /// (`max_idle_per_host`, 256 per executor; `max_idle_connections`,
+    /// 1024 per executor; `idle_timeout`, 90 s), its timeout (30 s), the
+    /// CAs it trusts (`tls`), redirects and size limits.
+    client: http.ClientConfig = .{},
 
     /// `Options.http`: a cleartext listener.
     pub const Http = struct {
@@ -694,7 +700,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer if (pool) |p| p.deinit();
 
             const extras = try a.create(Extras);
-            extras.* = .{ .client = http.Client.init(gpa, rt_io, .{}), .client_entry = undefined, .client_registered = false };
+            extras.* = .{ .client = http.Client.init(gpa, rt_io, opts.client), .client_entry = undefined, .client_registered = false };
             extras.client_entry = .{ .rt = rt, .client = &extras.client };
             extras.client_registered = client_mod.register(&extras.client_entry);
             errdefer {

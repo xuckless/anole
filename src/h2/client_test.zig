@@ -534,7 +534,7 @@ test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout,
         try std.testing.expect(response.headers().get("content-length") != null);
     }
     // The same connection, from the pool.
-    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
     {
         const big = try gpa.alloc(u8, 300 * 1024);
         defer gpa.free(big);
@@ -544,7 +544,7 @@ test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout,
         try std.testing.expectEqual(.ok, response.status());
         try std.testing.expect(std.mem.eql(u8, big, (try response.body()).?));
     }
-    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
     {
         var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{ .method = .head });
         defer response.deinit();

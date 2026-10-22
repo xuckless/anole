@@ -35,6 +35,7 @@ const ContentType = http.ContentType;
 const ContentEncoding = http.ContentEncoding;
 
 const WebSocket = @import("websocket.zig").WebSocket;
+const placement = @import("placement.zig");
 
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
@@ -100,8 +101,28 @@ pub const ClientConfig = struct {
     max_redirects: u8 = 10,
     /// Maximum response body size in bytes.
     max_response_size: usize = 10_485_760, // 10MB
-    /// Maximum idle connections to keep in pool (0 = no pooling).
-    max_idle_connections: u8 = 8,
+    /// Idle connections kept for reuse, in all, by each executor's pool
+    /// (one pool per executor on zio, one in all elsewhere); 0 turns
+    /// pooling off. Past it, the connection idle longest is closed.
+    max_idle_connections: u16 = 1024,
+    /// Idle connections kept for reuse to one host (scheme, host and port,
+    /// or unix socket), by each executor's pool; 0 turns pooling off.
+    ///
+    /// Generous on purpose: when many requests fan in to one upstream,
+    /// every connection beyond this that comes back is closed and the next
+    /// request dials again, which costs a handshake, a socket in TIME_WAIT
+    /// and memory churn on every round. Idle connections are only ever as
+    /// many as were busy at once, and `idle_timeout` closes them after a
+    /// burst. (Go's MaxIdleConnsPerHost of 2 is the cautionary tale; hyper
+    /// and reqwest keep no per-host limit.)
+    max_idle_per_host: u16 = 256,
+    /// How long a pooled connection may sit unused before it is closed:
+    /// by the pool's own task (one per executor, only while connections
+    /// are idle), or when it is next looked at. A shorter `Keep-Alive:
+    /// timeout=N` from the server wins. Null keeps idle connections until
+    /// the server closes them or the pool evicts them. 90 s, as Go's
+    /// IdleConnTimeout and hyper's default.
+    idle_timeout: ?std.Io.Duration = .fromSeconds(90),
     /// Buffer size (bytes) for reading the response head: the status line
     /// and all headers. This is also the limit on it -- parsed header names
     /// and values are slices into this buffer rather than copies, so the head
@@ -364,7 +385,7 @@ fn uriPath(uri: Uri) []const u8 {
     return path;
 }
 
-/// Pool of idle connections for reuse.
+/// Pool of idle connections for reuse: one per executor (`Client.pools`).
 ///
 /// `acquire`/`release` are safe to call from multiple tasks running in
 /// parallel: `idle`/`idle_len` are guarded by `mutex`, and the critical
@@ -375,29 +396,58 @@ fn uriPath(uri: Uri) []const u8 {
 ///
 /// A connection released with its response body unread is handed to a task
 /// in `drains`, which discards the rest of the body and then releases it.
-/// `deinit` cancels those tasks, so they close their connections instead.
+/// While connections that can expire are idle, a task in `reaper` (`reap`)
+/// closes them as they do. `deinit` cancels both, so a drain closes its
+/// connection instead.
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex,
+    /// Oldest first: a released connection goes to the end, `acquire`
+    /// takes the newest that matches, and eviction the oldest.
     idle: std.DoublyLinkedList,
     idle_len: usize,
-    max_idle: u8,
+    max_idle: u16,
+    max_idle_per_host: u16,
+    idle_timeout: ?std.Io.Duration,
+    /// Whether `reap` is running or about to (guarded by `mutex`).
+    reaping: bool = false,
     drains: std.Io.Group = .init,
+    reaper: std.Io.Group = .init,
 
     /// Bounds on the unread body a background drain discards to keep a
     /// connection, the same as Go's net/http.
     const drain_max_bytes = 256 << 10;
     const drain_timeout: std.Io.Duration = .fromMilliseconds(50);
+    /// The shortest `reap` sleeps, so expiries close together are closed
+    /// in one round.
+    const reap_min_sleep: std.Io.Duration = .fromMilliseconds(10);
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_idle: u8) ConnectionPool {
+    /// `ClientConfig`'s pool settings.
+    pub const Limits = struct {
+        max_idle: u16 = 1024,
+        max_idle_per_host: u16 = 256,
+        idle_timeout: ?std.Io.Duration = .fromSeconds(90),
+
+        pub fn fromConfig(config: ClientConfig) Limits {
+            return .{
+                .max_idle = config.max_idle_connections,
+                .max_idle_per_host = config.max_idle_per_host,
+                .idle_timeout = config.idle_timeout,
+            };
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, limits: Limits) ConnectionPool {
         return .{
             .allocator = allocator,
             .io = io,
             .mutex = .init,
             .idle = .{},
             .idle_len = 0,
-            .max_idle = max_idle,
+            .max_idle = limits.max_idle,
+            .max_idle_per_host = limits.max_idle_per_host,
+            .idle_timeout = limits.idle_timeout,
         };
     }
 
@@ -405,13 +455,41 @@ pub const ConnectionPool = struct {
         // A drain that completes during the cancel releases its connection
         // into `idle`; a canceled one closes its own.
         self.drains.cancel(self.io);
+        self.reaper.cancel(self.io);
 
         // Close and free all idle connections
-        while (self.idle.popFirst()) |node| {
-            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", node));
-            conn.deinit();
-            self.allocator.destroy(conn);
+        while (self.idle.popFirst()) |node| destroy(self, fromNode(node));
+    }
+
+    /// Whether released connections are kept at all.
+    pub fn pooling(self: *const ConnectionPool) bool {
+        return self.max_idle != 0 and self.max_idle_per_host != 0;
+    }
+
+    fn fromNode(node: *std.DoublyLinkedList.Node) *Connection {
+        return @alignCast(@fieldParentPtr("pool_node", node));
+    }
+
+    fn destroy(self: *ConnectionPool, conn: *Connection) void {
+        conn.deinit();
+        self.allocator.destroy(conn);
+    }
+
+    /// When idle `conn` is due to be closed: at the server's `Keep-Alive`
+    /// timeout or `idle_timeout` after it was pooled, whichever is first;
+    /// null for never.
+    fn expiry(self: *const ConnectionPool, conn: *const Connection) ?std.Io.Timestamp {
+        var at = conn.idle_deadline;
+        if (self.idle_timeout) |timeout| {
+            const ours = conn.pooled_at.addDuration(timeout);
+            if (at == null or ours.nanoseconds < at.?.nanoseconds) at = ours;
         }
+        return at;
+    }
+
+    fn expired(self: *const ConnectionPool, conn: *const Connection, now: std.Io.Timestamp) bool {
+        const at = self.expiry(conn) orelse return false;
+        return now.nanoseconds >= at.nanoseconds;
     }
 
     /// Try to acquire an existing connection for the given host:port, protocol, and optional unix socket path.
@@ -421,7 +499,7 @@ pub const ConnectionPool = struct {
 
         // Connections found expired along the way. They are already out of the
         // pool and owned by us, so they get closed after the lock is dropped.
-        var expired: std.DoublyLinkedList = .{};
+        var expired_list: std.DoublyLinkedList = .{};
 
         const found = found: {
             self.mutex.lockUncancelable(io);
@@ -430,19 +508,16 @@ pub const ConnectionPool = struct {
             // Search from end (most recently used)
             var node = self.idle.last;
             while (node) |n| {
-                const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
+                const conn = fromNode(n);
                 node = n.prev;
 
                 if (conn.matches(remote_host, remote_port, protocol, unix_socket_path)) {
                     self.idle.remove(n);
                     self.idle_len -= 1;
 
-                    // Check if connection has expired due to idle timeout
-                    if (conn.idle_deadline) |deadline| {
-                        if (now.nanoseconds >= deadline.nanoseconds) {
-                            expired.append(n);
-                            continue;
-                        }
+                    if (self.expired(conn, now)) {
+                        expired_list.append(n);
+                        continue;
                     }
 
                     break :found conn;
@@ -451,60 +526,76 @@ pub const ConnectionPool = struct {
             break :found null;
         };
 
-        while (expired.popFirst()) |n| {
-            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
-            conn.deinit();
-            self.allocator.destroy(conn);
-        }
+        while (expired_list.popFirst()) |n| self.destroy(fromNode(n));
 
         return found;
     }
 
-    /// Release a connection back to the pool, or close it if pool is full or connection is closing.
+    /// Release a connection back to the pool, or close it if the pool is
+    /// off or the connection is closing. A full pool (in all, or for the
+    /// connection's host) closes its oldest idle connection to make room.
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
         // Don't pool connections that are closing
-        if (conn.closing or self.max_idle == 0) {
-            conn.deinit();
-            self.allocator.destroy(conn);
+        if (conn.closing or !self.pooling()) {
+            self.destroy(conn);
             return;
         }
 
         // Reset before taking the lock; it only touches this connection.
         conn.reset() catch {
-            conn.deinit();
-            self.allocator.destroy(conn);
+            self.destroy(conn);
             return;
         };
+        conn.pooled_at = std.Io.Timestamp.now(self.io, .awake);
 
+        var start_reaper = false;
         const evicted: ?*Connection = evicted: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            // If pool is full, evict the oldest connection
-            var old: ?*Connection = null;
-            if (self.idle_len >= self.max_idle) {
-                if (self.idle.popFirst()) |old_node| {
-                    old = @alignCast(@fieldParentPtr("pool_node", old_node));
-                    self.idle_len -= 1;
-                }
+            // The oldest idle connection to the same place, and whether
+            // the host already has its fill.
+            var same: usize = 0;
+            var oldest_same: ?*std.DoublyLinkedList.Node = null;
+            var node = self.idle.first;
+            while (node) |n| : (node = n.next) {
+                const other = fromNode(n);
+                if (!other.matches(conn.host(), conn.port, conn.protocol, conn.unixPath())) continue;
+                if (oldest_same == null) oldest_same = n;
+                same += 1;
+                if (same >= self.max_idle_per_host) break;
+            }
+
+            var old: ?*std.DoublyLinkedList.Node = null;
+            if (same >= self.max_idle_per_host) {
+                old = oldest_same;
+            } else if (self.idle_len >= self.max_idle) {
+                old = self.idle.first;
+            }
+            if (old) |n| {
+                self.idle.remove(n);
+                self.idle_len -= 1;
             }
 
             self.idle.append(&conn.pool_node);
             self.idle_len += 1;
-            break :evicted old;
+
+            if (!self.reaping and self.expiry(conn) != null) {
+                self.reaping = true;
+                start_reaper = true;
+            }
+            break :evicted if (old) |n| fromNode(n) else null;
         };
 
         // Closing suspends, so it must happen outside the critical section.
-        if (evicted) |old| {
-            old.deinit();
-            self.allocator.destroy(old);
-        }
+        if (evicted) |old| self.destroy(old);
+        if (start_reaper) self.startReaper();
     }
 
     /// Hands `conn` to a background drain, or returns false if no task
     /// could be had for it, in which case the caller still owns it.
     fn startDrain(self: *ConnectionPool, conn: *Connection) bool {
-        self.drains.concurrent(self.io, drain, .{ self, conn }) catch return false;
+        placement.concurrent(&self.drains, self.io, .local, drain, .{ self, conn }) catch return false;
         return true;
     }
 
@@ -529,6 +620,48 @@ pub const ConnectionPool = struct {
             error.ReadFailed => return body_reader.err orelse error.Unexpected,
         };
         return conn.parser.isBodyComplete();
+    }
+
+    /// Starts `reap`, on this executor. Without a task for it, idle
+    /// connections still expire when `acquire` comes across them.
+    fn startReaper(self: *ConnectionPool) void {
+        placement.concurrent(&self.reaper, self.io, .local, reap, .{self}) catch {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.reaping = false;
+        };
+    }
+
+    /// Closes idle connections as they expire, sleeping until the next one
+    /// does, and ends when none left can (`release` starts it again).
+    fn reap(self: *ConnectionPool) std.Io.Cancelable!void {
+        while (true) {
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            var expired_list: std.DoublyLinkedList = .{};
+            const next: ?std.Io.Timestamp = next: {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                var soonest: ?std.Io.Timestamp = null;
+                var node = self.idle.first;
+                while (node) |n| {
+                    node = n.next;
+                    const at = self.expiry(fromNode(n)) orelse continue;
+                    if (now.nanoseconds >= at.nanoseconds) {
+                        self.idle.remove(n);
+                        self.idle_len -= 1;
+                        expired_list.append(n);
+                    } else if (soonest == null or at.nanoseconds < soonest.?.nanoseconds) {
+                        soonest = at;
+                    }
+                }
+                if (soonest == null) self.reaping = false;
+                break :next soonest;
+            };
+            while (expired_list.popFirst()) |n| self.destroy(fromNode(n));
+            const at = next orelse return;
+            const wait = now.durationTo(at);
+            try self.io.sleep(if (wait.nanoseconds < reap_min_sleep.nanoseconds) reap_min_sleep else wait, .awake);
+        }
     }
 };
 
@@ -589,7 +722,11 @@ pub const Connection = struct {
     // Keep-Alive tracking
     request_count: u16 = 0,
     keep_alive: KeepAliveParams = .{},
+    /// When the server's `Keep-Alive: timeout` says the idle connection
+    /// goes, if it said.
     idle_deadline: ?std.Io.Timestamp = null,
+    /// When it last went back to the pool (`ConnectionPool.idle_timeout`).
+    pooled_at: std.Io.Timestamp = .{ .nanoseconds = 0 },
 
     // When the handshake picked "h2": the session, which reads and writes the
     // connection from then on, and the stream of the request in flight.
@@ -626,6 +763,7 @@ pub const Connection = struct {
         self.request_count = 0;
         self.keep_alive = .{};
         self.idle_deadline = null;
+        self.pooled_at = .{ .nanoseconds = 0 };
 
         // Store host for connection pooling
         const len: u8 = @intCast(@min(remote_host.len, self.host_buffer.len));
@@ -803,9 +941,15 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
+    /// What a pooled connection's arena keeps of what a response took
+    /// (the head's copies, a body read whole): enough for the usual JSON
+    /// answer to come and go without the allocator, while one big body
+    /// does not stay with the connection for as long as it is pooled.
+    const arena_retain_limit = 32 * 1024;
+
     pub fn reset(self: *Connection) !void {
         // Reset for reuse (connection pooling)
-        _ = self.arena.reset(.retain_capacity);
+        _ = self.arena.reset(.{ .retain_with_limit = arena_retain_limit });
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.reset();
         try self.parser.init(&self.parsed_response, self.max_response_headers);
@@ -911,7 +1055,7 @@ pub const Connection = struct {
         // was read through a decoder: what the decoder holds was already
         // counted. A failed read leaves no such guarantee.
         if (!self.parser.isBodyComplete()) {
-            const drainable = !self.closing and self.pool.max_idle != 0 and
+            const drainable = !self.closing and self.pool.pooling() and
                 !self.parser.hasFailed() and self.getReadError() == null and
                 (self.parsed_response.content_length orelse 0) <= ConnectionPool.drain_max_bytes;
             if (drainable and self.pool.startDrain(self)) return;
@@ -1094,11 +1238,23 @@ pub const ClientResponse = struct {
 /// Connections are freed and reset from background tasks as well as from
 /// requests, so `allocator` must be thread-safe whenever `io` runs tasks in
 /// parallel.
+///
+/// On zio each executor has a pool of its own (`pools`), as `anole.db`'s
+/// connectors do: a request takes and gives back connections on its own
+/// executor, so a connection stays on one thread, and no lock is contended
+/// across them. Elsewhere there is one pool.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     config: ClientConfig,
-    pool: ConnectionPool,
+    /// One per executor of `io`'s runtime, up to `max_pools` (executors
+    /// past it share, by index modulo); the first `pool_count` are used.
+    pools: [max_pools]ConnectionPool,
+    pool_count: usize,
+    /// Connections opened so far (each a dial, and a handshake for
+    /// HTTPS): with requests steady, it should stop growing once the
+    /// pools hold what is busy at once.
+    dials: std.atomic.Value(u64),
     tls_state: TlsState,
     tls_lock: std.Io.RwLock,
     tls_loaded: std.atomic.Value(bool),
@@ -1112,12 +1268,18 @@ pub const Client = struct {
         client_cert: ?tls.config.CertKeyPair = null,
     };
 
+    /// The most pools a client has.
+    pub const max_pools = 64;
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
+        const limits: ConnectionPool.Limits = .fromConfig(config);
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
-            .pool = ConnectionPool.init(allocator, io, config.max_idle_connections),
+            .pools = @splat(ConnectionPool.init(allocator, io, limits)),
+            .pool_count = @min(@max(placement.executorCount(io) orelse 1, 1), max_pools),
+            .dials = .init(0),
             .tls_state = .{},
             .tls_lock = .init,
             .tls_loaded = std.atomic.Value(bool).init(false),
@@ -1175,7 +1337,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.pool.deinit();
+        for (self.pools[0..self.pool_count]) |*p| p.deinit();
         self.tls_state.ca_bundle.deinit(self.allocator);
         if (comptime has_trust_store) if (self.tls_state.trust) |*t| t.deinit();
         if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
@@ -1218,6 +1380,13 @@ pub const Client = struct {
         }
     }
 
+    /// The pool of the executor the calling task runs on: the first one
+    /// off zio's executors (`std.Io.Threaded`, a blocking-pool thread).
+    pub fn pool(self: *Client) *ConnectionPool {
+        const index = placement.currentExecutor(self.io) orelse 0;
+        return &self.pools[index % self.pool_count];
+    }
+
     fn defaultTimeout(self: *const Client) std.Io.Timeout {
         const duration = self.config.timeout orelse return .none;
         return .{ .duration = .{ .raw = duration, .clock = .awake } };
@@ -1235,11 +1404,12 @@ pub const Client = struct {
         // (e.g. the WebSocket upgrade path) must pass false.
         advertise_http2: bool,
     ) !*Connection {
-        if (self.pool.acquire(host, port, protocol, unix_socket_path)) |conn| {
+        const p = self.pool();
+        if (p.acquire(host, port, protocol, unix_socket_path)) |conn| {
             if (advertise_http2 or conn.http_version != .http_2) return conn;
             // An HTTP/2 connection cannot carry what this is for (a
             // WebSocket upgrade); it stays for the next fetch.
-            self.pool.release(conn);
+            p.release(conn);
         }
         return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
     }
@@ -1269,7 +1439,7 @@ pub const Client = struct {
         try conn.init(
             self.allocator,
             self.io,
-            &self.pool,
+            self.pool(),
             stream,
             host,
             port,
@@ -1280,6 +1450,7 @@ pub const Client = struct {
             unix_socket_path,
             advertise_http2,
         );
+        _ = self.dials.fetchAdd(1, .monotonic);
         return conn;
     }
 
@@ -1378,12 +1549,12 @@ pub const Client = struct {
         // after that release to avoid releasing the connection twice.
         const advertise_http2 = has_h2_client and self.config.http2 and state.protocol == .https;
         var reused = true;
-        var conn = self.pool.acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
+        var conn = self.pool().acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
             reused = false;
             break :blk try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
         };
         var conn_released = false;
-        errdefer if (!conn_released) self.pool.release(conn);
+        errdefer if (!conn_released) conn.pool.release(conn);
 
         var lost = false;
         self.sendRequest(conn, state, host, &lost) catch |err| {
@@ -1391,7 +1562,7 @@ pub const Client = struct {
             // picked up. Retried on a new one under the same conditions as
             // Go's net/http.
             if (!lost or !reused or !isReplayable(state.options)) return err;
-            self.pool.release(conn);
+            conn.pool.release(conn);
             conn_released = true;
             conn = try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
             conn_released = false;
@@ -1467,7 +1638,7 @@ pub const Client = struct {
                     .fail => return error.RedirectRefused,
                 }
 
-                if (!conn.parser.shouldKeepAlive() or self.pool.max_idle == 0) conn.closing = true;
+                if (!conn.parser.shouldKeepAlive() or !conn.pool.pooling()) conn.closing = true;
 
                 // Drain small redirect bodies (up to 2KB) so the connection can
                 // be returned to the pool rather than closed.
@@ -1485,7 +1656,7 @@ pub const Client = struct {
                     };
                     if (!conn.parser.isBodyComplete()) conn.closing = true;
                 }
-                self.pool.release(conn);
+                conn.pool.release(conn);
                 conn_released = true;
 
                 // Strip sensitive headers when:
@@ -3176,8 +3347,8 @@ test "Connection.release: the Keep-Alive timeout is in seconds" {
         _ = try resp.body();
     }
 
-    try std.testing.expectEqual(1, client.pool.idle_len);
-    const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool.idle.first.?));
+    try std.testing.expectEqual(1, client.pool().idle_len);
+    const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool().idle.first.?));
     const now = std.Io.Timestamp.now(io, .awake);
     const left = conn.idle_deadline.?.nanoseconds - now.nanoseconds;
     // Five seconds, less however long the release took to get here.
