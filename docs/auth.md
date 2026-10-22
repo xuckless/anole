@@ -213,7 +213,10 @@ const id = rp.finish(req.arena, req.io, anole.client(req), callback, saved) catc
     return refuse(res);
 };
 for ([_][]const u8{ "oidc_state", "oidc_nonce", "oidc_verifier" }) |k| req.session.remove(k);
-try req.session.set("user", id.subject); // the stable account key
+// The stable account key is the pair (issuer, subject): look the account up
+// by both, never by subject alone, nor by email.
+const account = try accounts.findOrCreate(id.issuer, id.subject);
+try req.session.set("user", account.id);
 try anole.session.regenerate(req);       // a new session id for the signed-in session
 ```
 
@@ -221,9 +224,20 @@ try anole.session.regenerate(req);       // a new session id for the signed-in s
 `res.fail(.bad_request, "sign-in failed")`. Returning `error.BadRequest`
 from the handler gives the same status with the status line as the body.
 
-`Identity` holds `subject`, `email`, `email_verified`, `name`, every claim,
-and the access and refresh tokens. Key accounts on `subject`. Trust `email`
-only when `email_verified` is true.
+`Identity` holds `issuer`, `subject`, `email`, `email_verified`, `name`,
+every claim, and the access and refresh tokens. Key accounts on `issuer`
+and `subject` together: a `sub` is unique only within its issuer, so with
+two providers, or one whose tenants share keys, `sub` alone can name two
+people. Trust `email` only when `email_verified` is true, and never link an
+existing account by email alone.
+
+The checks go beyond the signature: `iat` must be present, `azp` must be
+your `client_id` whenever the token has one (and the token must have one
+when it names several audiences), and the token request doesn't follow
+redirects, so the code and client secret never go anywhere but the
+`token_endpoint`. `Provider.discover` refuses an issuer or endpoint that
+isn't `https://` (`error.InsecureEndpoint`); plain `http://` is accepted
+only on loopback, for a test provider on the same machine.
 
 The callback is a top-level navigation from the provider. Its `state` check
 is its CSRF protection, so don't put the CSRF middleware on that route.

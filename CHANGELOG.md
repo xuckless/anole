@@ -65,6 +65,13 @@ breaking changes are listed anyway.
   (`retry_seconds` 5, doubling up to `max_retry_seconds` 300). Before, an
   outage failed every request with 503 and turned each one into another
   fetch. No configuration change needed.
+- OIDC: ID tokens must carry `iat`; `azp`, when present, must be the
+  `client_id` (before, it was checked only with several audiences); the
+  token request no longer follows redirects (a 307/308 would have carried
+  the code and client secret on); `Provider.discover` refuses non-`https`
+  issuers and endpoints (`error.InsecureEndpoint`, loopback `http` aside).
+  `Identity` gains `issuer`: key accounts on `(issuer, subject)`, as
+  docs/auth.md now says.
 
 ### C ABI (ABI 0.1)
 
