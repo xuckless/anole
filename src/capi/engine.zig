@@ -40,6 +40,7 @@ const features = anole.features;
 const http = anole.http;
 const zio = anole.zio;
 const placement = dusty.placement;
+const server_mod = @import("../server.zig");
 const Detached = dusty.Detached;
 const Pipe = pipe_mod.Pipe;
 const Chunk = pipe_mod.Chunk;
@@ -135,7 +136,10 @@ pub const Handle = packed struct(u64) {
         grpc_call = 3,
         wt_session = 4,
         wt_stream = 5,
-        db_query = 6,
+        /// A database transaction (an `anole_handle_release` rolls it back).
+        db_tx = 6,
+        /// Reserved for a per-query handle.
+        db_query = 7,
         _,
     };
 
@@ -163,7 +167,7 @@ var next_first_gen: u32 = 1;
 
 pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
-const Reply = enum { respond, release, fd };
+const Reply = enum { respond, fail, abort, fd };
 
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
@@ -200,7 +204,13 @@ pub const Slot = struct {
     body_len: u32 = 0,
     /// `ANOLE_BODY_BORROW`: the consumer's own memory.
     borrowed: ?[]const u8 = null,
-    /// A file to send (`anole_respond_fd`; POSIX only).
+    /// The `ANOLE_EV_SENT` record that goes with `borrowed`, allocated by
+    /// the call that borrowed (so a full queue or a failed allocation can
+    /// never lose it); posted when the slot is released.
+    borrowed_sent: ?[]align(8) u8 = null,
+    /// `anole_req_fail`: the detail text is in `bytes` after the headers.
+    fail_len: u32 = 0,
+    /// A file to send (`anole_req_respond_fd`; POSIX only).
     fd: c_int = -1,
     fd_offset: u64 = 0,
     fd_len: u64 = 0,
@@ -222,6 +232,9 @@ pub const Slot = struct {
     orphan: bool = false,
     /// The sweeper's verdict for a waiting task.
     timed_out: bool = false,
+    /// `destroy` on a server not drained: this request is answered 503 and
+    /// the consumer hears nothing more.
+    abandoned: bool = false,
     /// The request body failed (too large, cut short): the answer.
     body_error: ?http.Status = null,
     deadline: i96 = 0,
@@ -282,7 +295,7 @@ const Ring = struct {
         while (h != r.tail.raw) : (h += 1) if (r.buf[h & r.mask].rec) |rec| freeRecord(rec);
         gpa.free(r.buf);
     }
-    /// Producer. False when full.
+    /// Producer: only the ring's executor (SPSC). False when full.
     pub fn push(r: *Ring, e: Entry) bool {
         const tail = r.tail.raw;
         if (tail - r.head.load(.acquire) == r.buf.len) return false;
@@ -293,7 +306,7 @@ const Ring = struct {
         return true;
     }
     pub fn full(r: *Ring) bool {
-        return r.tail.raw - r.head.load(.acquire) == r.buf.len;
+        return r.tail.raw - r.head.load(.seq_cst) == r.buf.len;
     }
     /// Consumer.
     fn peek(r: *Ring) ?Entry {
@@ -302,25 +315,55 @@ const Ring = struct {
         return r.buf[head & r.mask];
     }
     fn pop(r: *Ring) void {
-        r.head.store(r.head.raw + 1, .release);
+        // seq_cst: pairs with a waiter's `room_waiters` increment (Dekker).
+        r.head.store(r.head.raw + 1, .seq_cst);
     }
     fn isEmpty(r: *Ring) bool {
         return r.head.load(.acquire) == r.tail.load(.seq_cst);
     }
 };
 
-fn freeRecord(rec: [*]align(8) u8) void {
+/// Every record has a hidden 8-byte link word in front of it: the overflow
+/// list threads through it, so queueing a record never allocates.
+const link_bytes = 8;
+
+fn linkOf(rec: [*]align(8) u8) *?[*]align(8) u8 {
+    const base: [*]align(8) u8 = @alignCast(rec - link_bytes);
+    return @ptrCast(base);
+}
+
+/// `n` bytes (already a multiple of 8) for a record, with its link word.
+pub fn allocRecord(n: usize) ![]align(8) u8 {
+    const all = try gpa.alignedAlloc(u8, .@"8", n + link_bytes);
+    const rec: []align(8) u8 = @alignCast(all[link_bytes..]);
+    linkOf(rec.ptr).* = null;
+    return rec;
+}
+
+pub fn freeRecord(rec: [*]align(8) u8) void {
     const ev: *const abi.Event = @ptrCast(rec);
-    gpa.free(rec[0..ev.len]);
+    const base: [*]align(8) u8 = @alignCast(rec - link_bytes);
+    gpa.free(base[0 .. ev.len + link_bytes]);
 }
 
 /// A record of `size` bytes (rounded up), its header filled in.
 pub fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     const n = abi.alignUp(size);
-    const rec = try gpa.alignedAlloc(u8, .@"8", n);
+    const rec = try allocRecord(n);
     @memset(rec[@sizeOf(abi.Event)..], 0);
     const ev: *abi.Event = @ptrCast(rec.ptr);
     ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = handle };
+    return rec;
+}
+
+/// An `ANOLE_EV_SENT` record for a body about to be borrowed, built by the
+/// call that borrows it (so `ANOLE_E_NOMEM` means nothing was taken); the
+/// handle is filled in when it is posted (`Exec.postSentRec`).
+pub fn newSent(data: []const u8) ![]align(8) u8 {
+    const rec = try newRecord(@sizeOf(abi.SentEvent), .sent, 0);
+    const ev: *abi.SentEvent = @ptrCast(rec.ptr);
+    ev.data = @intFromPtr(data.ptr);
+    ev.len = data.len;
     return rec;
 }
 
@@ -369,6 +412,19 @@ pub const Exec = struct {
     /// sockets feeding it rather than the ring growing to its length in
     /// whole messages.
     record_bytes: std.atomic.Value(usize) = .init(0),
+    /// Records and events that did not go onto the ring (it was full, or the
+    /// poster is not this executor): a stack any thread pushes onto, taken
+    /// whole by `poll` into a private FIFO. Never dropped.
+    overflow: std.atomic.Value(?[*]align(8) u8) = .init(null),
+    ovf_head: ?[*]align(8) u8 = null,
+    ovf_tail: ?[*]align(8) u8 = null,
+    /// Executor tasks that need room in the ring wait on this futex word;
+    /// `poll` bumps it after it takes anything, when `room_waiters` says
+    /// someone waits.
+    room: std.atomic.Value(u32) = .init(0),
+    room_waiters: std.atomic.Value(u32) = .init(0),
+    /// Tests: returns from the futex wait.
+    room_wakeups: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
     ws: ws.ExecState = .{},
     grpc: grpc.ExecState = .{},
     wt: wt.ExecState = .{},
@@ -425,10 +481,11 @@ pub const Exec = struct {
             closeFd(s.fd);
             s.fd = -1;
         }
-        if (s.borrowed) |b| {
-            x.postSent(x.handleOf(i, gen), b);
-            s.borrowed = null;
+        if (s.borrowed_sent) |rec| {
+            x.postSentRec(x.handleOf(i, gen), rec);
+            s.borrowed_sent = null;
         }
+        s.borrowed = null;
         if (s.bytes.capacity > Slot.keep_capacity) {
             s.bytes.clearAndFree(gpa);
             s.headers.clearAndFree(gpa);
@@ -439,6 +496,7 @@ pub const Exec = struct {
         }
         s.detached = null;
         s.orphan = false;
+        s.abandoned = false;
         s.body_error = null;
         s.claims = "";
         if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
@@ -467,44 +525,149 @@ pub const Exec = struct {
         p.notifyBlocked();
     }
 
-    /// Queues an owned record for the consumer, waiting for room in the
-    /// ring if `wait` (else dropping it when full: advisory events only).
-    /// A large record that waits also waits while the records already
-    /// queued pass `record_budget` bytes (one always fits in an empty
-    /// ring); small ones (events, `ANOLE_EV_SENT`) are bounded by the ring.
+    /// Queues an owned record for the consumer. On this executor's own
+    /// tasks the ring takes it; `wait` parks the task on the room futex
+    /// while the ring is full (a large record also while the records
+    /// already queued pass `record_budget` bytes: one always fits in an
+    /// empty ring). Everywhere else (another thread, or no `wait` and a
+    /// full ring) it goes onto the overflow list: nothing is ever dropped,
+    /// and nothing spins.
     pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
         const c = x.consumer orelse return freeRecord(rec.ptr);
-        if (wait and rec.len > small_record) while (true) {
-            const queued = x.record_bytes.load(.acquire);
-            if (queued == 0 or queued + rec.len <= x.engine.record_budget) break;
-            // The consumer is behind: make sure it hears there is work.
-            c.wake();
-            zio.yield() catch return freeRecord(rec.ptr);
-        };
+        if (!x.onThisExecutor()) {
+            x.pushOverflow(rec);
+            return c.wake();
+        }
+        if (wait) {
+            const need: usize = if (rec.len > small_record) rec.len else 0;
+            while (!x.hasRoom(need)) x.waitRoom(need, null) catch return freeRecord(rec.ptr);
+            _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
+            const pushed = x.ring.push(.{ .handle = 0, .rec = rec.ptr });
+            std.debug.assert(pushed);
+            return c.wake();
+        }
         _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
-        while (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
-            if (wait) if (zio.yield()) |_| continue else |_| {};
+        if (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
             _ = x.record_bytes.fetchSub(rec.len, .monotonic);
-            return freeRecord(rec.ptr);
+            x.pushOverflow(rec);
         }
         c.wake();
     }
 
-    /// A small advisory event (`ANOLE_EV_ABORT`, `_BODY`, `_WRITABLE`,
-    /// `_WS_DRAIN`).
+    fn onThisExecutor(x: *const Exec) bool {
+        const i = placement.currentExecutor(x.engine.io) orelse return false;
+        return i == x.index;
+    }
+
+    /// The ring can take one more entry (and, for a large record of `need`
+    /// bytes, the queued records fit the budget).
+    fn hasRoom(x: *Exec, need: usize) bool {
+        if (x.ring.full()) return false;
+        if (need == 0) return true;
+        const queued = x.record_bytes.load(.seq_cst);
+        return queued == 0 or queued + need <= x.engine.record_budget;
+    }
+
+    /// Waits (a task of this executor) until `poll` has made room, or until
+    /// `deadline` (awake clock, ns). The caller re-checks its own condition.
+    pub fn waitRoom(x: *Exec, need: usize, deadline: ?i96) error{ Canceled, Timeout }!void {
+        const seen = x.room.load(.acquire);
+        _ = x.room_waiters.fetchAdd(1, .seq_cst);
+        defer _ = x.room_waiters.fetchSub(1, .monotonic);
+        // Announced: look again (Dekker with the consumer's pop and
+        // `signalRoom`).
+        if (x.hasRoom(need)) return;
+        // The consumer is behind: make sure it hears there is work.
+        if (x.consumer) |c| c.wake();
+        const io = x.engine.io;
+        const t: std.Io.Timeout = if (deadline) |d| .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } } else .none;
+        io.futexWaitTimeout(u32, &x.room.raw, seen, t) catch return error.Canceled;
+        if (comptime builtin.is_test) _ = x.room_wakeups.fetchAdd(1, .monotonic);
+        if (deadline) |d| if (std.Io.Clock.awake.now(io).nanoseconds >= d) return error.Timeout;
+    }
+
+    /// Consumer side: after `poll` took anything from this executor's ring.
+    pub fn signalRoom(x: *Exec) void {
+        if (x.room_waiters.load(.seq_cst) != 0) {
+            _ = x.room.fetchAdd(1, .release);
+            x.engine.io.futexWake(u32, &x.room.raw, std.math.maxInt(u32));
+        }
+    }
+
+    /// Any thread.
+    fn pushOverflow(x: *Exec, rec: []align(8) u8) void {
+        const lw = linkOf(rec.ptr);
+        var old = x.overflow.load(.monotonic);
+        while (true) {
+            lw.* = old;
+            old = x.overflow.cmpxchgWeak(old, rec.ptr, .seq_cst, .monotonic) orelse break;
+        }
+    }
+
+    /// Consumer side: moves the overflow stack, oldest first, onto the
+    /// private FIFO.
+    fn takeOverflow(x: *Exec) void {
+        var list = x.overflow.swap(null, .acquire);
+        var rev: ?[*]align(8) u8 = null;
+        while (list) |r| {
+            const next = linkOf(r).*;
+            linkOf(r).* = rev;
+            rev = r;
+            list = next;
+        }
+        while (rev) |r| {
+            const next = linkOf(r).*;
+            linkOf(r).* = null;
+            if (x.ovf_tail) |t| linkOf(t).* = r else x.ovf_head = r;
+            x.ovf_tail = r;
+            rev = next;
+        }
+    }
+
+    /// Anything the consumer has not taken from this executor (consumer
+    /// side: it knows its private FIFO).
+    fn hasPending(x: *Exec) bool {
+        return !x.ring.isEmpty() or x.overflow.load(.seq_cst) != null or x.ovf_head != null;
+    }
+
+    /// The engine's end: records nobody polled.
+    fn freeOverflow(x: *Exec) void {
+        x.takeOverflow();
+        while (x.ovf_head) |rec| {
+            x.ovf_head = linkOf(rec).*;
+            freeRecord(rec);
+        }
+        x.ovf_tail = null;
+    }
+
+    /// The same for any thread: the ring and the overflow stack.
+    fn hasPendingShared(x: *Exec) bool {
+        return !x.ring.isEmpty() or x.overflow.load(.seq_cst) != null;
+    }
+
+    /// A small advisory event (`ANOLE_EV_BODY`, `_WRITABLE`, `_WS_DRAIN`):
+    /// never dropped.
     pub fn postEvent(x: *Exec, typ: abi.EventType, handle: u64) void {
         const rec = newRecord(@sizeOf(abi.Event), typ, handle) catch return;
         x.postRecord(rec, false);
     }
 
-    /// `ANOLE_EV_SENT` for a borrowed body: it must arrive, so it waits for
-    /// room when it can.
-    pub fn postSent(x: *Exec, handle: u64, data: []const u8) void {
-        const rec = newRecord(@sizeOf(abi.SentEvent), .sent, handle) catch return;
-        const ev: *abi.SentEvent = @ptrCast(rec.ptr);
-        ev.data = @intFromPtr(data.ptr);
-        ev.len = data.len;
-        x.postRecord(rec, placement.currentExecutor(x.engine.io) != null);
+    /// `ANOLE_EV_ABORT`: why the request or call `handle` is over, and what
+    /// the client was sent.
+    pub fn postAbort(x: *Exec, handle: u64, reason: u16, status: u16) void {
+        const rec = newRecord(@sizeOf(abi.AbortEvent), .abort, handle) catch return;
+        const ev: *abi.AbortEvent = @ptrCast(rec.ptr);
+        ev.reason = reason;
+        ev.status = status;
+        x.postRecord(rec, false);
+    }
+
+    /// `ANOLE_EV_SENT` for a borrowed body, from the record the borrowing
+    /// call built: never allocates, never dropped.
+    pub fn postSentRec(x: *Exec, handle: u64, rec: []align(8) u8) void {
+        const ev: *abi.Event = @ptrCast(rec.ptr);
+        ev.handle = handle;
+        x.postRecord(rec, false);
     }
 
     pub fn post(x: *Exec, cmd: *Command) void {
@@ -524,13 +687,22 @@ pub const Exec = struct {
 
 pub const WakeFn = abi.WakeFn;
 
+/// What a consumer's doorbell does: a callback, or (null) the fd.
+/// Replaced by `anole_consumer_set_wake`; old targets live until destroy.
+pub const WakeTarget = struct { f: ?WakeFn, ud: ?*anyopaque };
+
 /// Windows has no pollable doorbell fd: consumers there pass a callback.
 const have_fd = builtin.os.tag != .windows;
 
 pub const Consumer = struct {
     engine: *Engine,
-    wake_fn: ?WakeFn,
-    wake_ud: ?*anyopaque,
+    target: std.atomic.Value(*const WakeTarget),
+    /// Wake calls under way (`setWake` waits for them to finish).
+    ringing: std.atomic.Value(u32) = .init(0),
+    targets: std.ArrayList(*WakeTarget) = .empty,
+    target_lock: std.atomic.Mutex = .unlocked,
+    /// Debug builds: a non-shared consumer's poll is running.
+    in_poll: std.atomic.Value(bool) = .init(false),
     shared: bool,
     /// Anole's own doorbell when the consumer gave no callback: an eventfd
     /// (Linux) or a pipe (elsewhere).
@@ -563,10 +735,15 @@ pub const Consumer = struct {
     }
 
     fn ring(c: *Consumer) void {
+        // Announced before the target is read, so `setWake` cannot return
+        // while an old callback is about to run.
+        _ = c.ringing.fetchAdd(1, .seq_cst);
+        defer _ = c.ringing.fetchSub(1, .seq_cst);
+        const t = c.target.load(.seq_cst);
         _ = c.wakes.fetchAdd(1, .monotonic);
         _ = c.bell.fetchAdd(1, .release);
         if (c.waiters.load(.acquire) > 0) threadedIo().futexWake(u32, &c.bell.raw, std.math.maxInt(u32));
-        if (c.wake_fn) |f| return f(c.wake_ud);
+        if (t.f) |f| return f(t.ud);
         if (have_fd and c.fd_write >= 0) {
             if (comptime builtin.os.tag == .linux) {
                 const one: u64 = 1;
@@ -617,11 +794,38 @@ pub const Consumer = struct {
         }
     }
 
+    /// `anole_consumer_set_wake`: a callback, or null for the doorbell fd
+    /// (opened now if it was not). Once it returns the old callback is not
+    /// called again. The new wake fires once if events are pending.
+    pub fn setWake(c: *Consumer, f: ?WakeFn, ud: ?*anyopaque) !void {
+        if (f == null and (c.shared or !have_fd)) return error.Unsupported;
+        if (f == null and c.fd_read < 0) try c.openFd();
+        const t = try gpa.create(WakeTarget);
+        errdefer gpa.destroy(t);
+        t.* = .{ .f = f, .ud = ud };
+        while (!c.target_lock.tryLock()) std.atomic.spinLoopHint();
+        c.targets.append(gpa, t) catch |err| {
+            c.target_lock.unlock();
+            return err;
+        };
+        c.target_lock.unlock();
+        c.target.store(t, .seq_cst);
+        while (c.ringing.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+        // Armed again, and rung if anything waits.
+        c.awake.store(false, .seq_cst);
+        for (c.execs.items) |x| if (x.hasPendingShared()) {
+            c.wake();
+            break;
+        };
+    }
+
     fn deinit(c: *Consumer) void {
         if (have_fd) {
             if (c.fd_read >= 0) closeFd(c.fd_read);
             if (c.fd_write >= 0 and c.fd_write != c.fd_read) closeFd(c.fd_write);
         }
+        for (c.targets.items) |t| gpa.destroy(t);
+        c.targets.deinit(gpa);
         c.execs.deinit(gpa);
     }
 };
@@ -646,9 +850,30 @@ pub const Route = struct {
 // ---------------------------------------------------------------------------
 // The engine: one per process.
 
-pub const Phase = enum(u8) { created, starting, running, draining, stopped, failed };
+pub const Phase = enum(u8) { created, opening, open, starting, running, draining, stopped, failed };
 
 pub var global: ?*Engine = null;
+
+/// One listener of the configuration, as `anole_server_listener` shows it.
+pub const ListenerState = struct {
+    name: []const u8,
+    /// The configured address text; the bound one once listening.
+    cfg_address: []const u8,
+    bound_buf: [96]u8 = undefined,
+    bound_len: u8 = 0,
+    port: u16 = 0,
+    udp_port: u16 = 0,
+    flags: u32,
+    /// `abi.LISTENER_*`; the fields above and below are written before the
+    /// store that makes them visible.
+    state: std.atomic.Value(u32) = .init(abi.LISTENER_PENDING),
+    error_errno: i32 = 0,
+    error_name: []const u8 = "",
+
+    pub fn address(l: *const ListenerState, st: u32) []const u8 {
+        return if (st == abi.LISTENER_PENDING or l.bound_len == 0) l.cfg_address else l.bound_buf[0..l.bound_len];
+    }
+};
 
 /// Tests: runs inside a control call (drain, reload) once it holds the
 /// server, before it calls into it.
@@ -684,7 +909,21 @@ pub const Engine = struct {
     /// The runtime's Io, for waking executor tasks from consumer threads
     /// (zio's wakes work from any thread).
     io: std.Io = undefined,
-    ports: std.ArrayList(u16) = .empty,
+    /// The configuration's listeners, in order.
+    listeners: []ListenerState = &.{},
+    /// The listener whose socket could not be bound (a failed start).
+    failed_listener: ?usize = null,
+    /// Readiness flags of `observe.health.checks` (`anole_server_set_ready`).
+    ready: []std.atomic.Value(bool) = &.{},
+    /// Set by the main thread once the databases are open and the routes
+    /// are built (or failed): `open` waits for it.
+    opened: std.Io.Event = .unset,
+    /// Set by `start` (or `destroy`, with `abandon`): the main thread binds
+    /// the listeners (or tears down).
+    go: std.Io.Event = .unset,
+    /// `destroy` was called on a server that is not drained: everything a
+    /// consumer still owes is answered 503 at once.
+    abandon: std.atomic.Value(bool) = .init(false),
     /// One capi task per executor.
     tasks: std.Io.Group = .init,
     /// The timeout of each deadline list.
@@ -756,6 +995,12 @@ pub const Engine = struct {
         e.timeouts[0] = if (cfg.timeouts.request_ms) |ms| @as(i96, ms) * std.time.ns_per_ms else no_deadline;
         e.dbs = try a.alloc(db.Db, cfg.databases.len);
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
+        e.listeners = try a.alloc(ListenerState, cfg.listeners.len);
+        for (cfg.listeners, e.listeners) |l, *ls| ls.* = try listenerState(a, l);
+        if (cfg.observe.health) |h| {
+            e.ready = try a.alloc(std.atomic.Value(bool), h.checks.len);
+            for (e.ready) |*r| r.* = .init(false);
+        }
         // One per process: `respond` and the handlers find it here.
         global = e;
         return e;
@@ -782,19 +1027,46 @@ pub const Engine = struct {
         if (e.consumers.items.len >= 256) return error.State;
         const c = try gpa.create(Consumer);
         errdefer gpa.destroy(c);
-        c.* = .{ .engine = e, .wake_fn = wake_fn, .wake_ud = wake_ud, .shared = shared };
+        const t = try gpa.create(WakeTarget);
+        errdefer gpa.destroy(t);
+        t.* = .{ .f = wake_fn, .ud = wake_ud };
+        c.* = .{ .engine = e, .target = .init(t), .shared = shared };
+        try c.targets.append(gpa, t);
         if (wake_fn == null and !shared and have_fd) try c.openFd();
         errdefer c.deinit();
         try e.consumers.append(gpa, c);
         return c;
     }
 
-    pub fn start(e: *Engine) !void {
-        if (e.phase.cmpxchgStrong(.created, .starting, .acq_rel, .acquire) != null) return error.State;
+    /// Starts Anole's threads and opens the databases, binding nothing
+    /// (`anole_server_open`).
+    pub fn open(e: *Engine) !void {
+        if (e.consumers.items.len == 0 and e.needsConsumer()) {
+            e.setWhy("routes name handlers but no consumer is attached");
+            return error.NoConsumer;
+        }
+        if (e.phase.cmpxchgStrong(.created, .opening, .acq_rel, .acquire) != null) return error.State;
         e.thread = std.Thread.spawn(.{}, mainThread, .{e}) catch |err| {
             e.phase.store(.failed, .release);
             return err;
         };
+        e.opened.waitUncancelable(threadedIo());
+        if (e.start_error) |err| {
+            e.thread.?.join();
+            e.thread = null;
+            return err;
+        }
+    }
+
+    /// Binds the listeners; opens first when `open` was not called.
+    pub fn start(e: *Engine) !void {
+        switch (e.phase.load(.acquire)) {
+            .created => try e.open(),
+            .open => {},
+            else => return error.State,
+        }
+        if (e.phase.cmpxchgStrong(.open, .starting, .acq_rel, .acquire) != null) return error.State;
+        e.go.set(e.io);
         e.started.waitUncancelable(threadedIo());
         if (e.start_error) |err| {
             e.thread.?.join();
@@ -806,6 +1078,11 @@ pub const Engine = struct {
     /// The anole main thread: owns the runtime (it becomes executor 0),
     /// serves until `drain`, then frees the server.
     fn mainThread(e: *Engine) void {
+        // Embedded: the host owns the process's signals; Anole's threads
+        // (this one, and the executors, databases and pools it starts)
+        // take none.
+        if (!e.signals) blockSignals();
+        server_mod.failed_listener_index = null;
         const cfg = e.config;
         const a = e.arena.allocator();
         // Anole's own backstop, past the consumer deadline.
@@ -866,6 +1143,14 @@ pub const Engine = struct {
         e.io = app.io();
         const nexec = app.rt.executors.items.len;
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
+        // Executor e feeds consumer e mod M: one past the executors would
+        // never get an event.
+        if (e.consumers.items.len > nexec) {
+            var w: std.Io.Writer = .fixed(&e.start_why);
+            w.print("{d} consumers but only {d} executors: consumer {d} would get no events", .{ e.consumers.items.len, nexec, nexec }) catch {};
+            e.start_why_len = w.end;
+            return e.failStartDeinit(&app, error.ConsumerWithoutExecutor);
+        }
         e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
         // The routes come from the configuration: a conflict between them
         // is ANOLE_E_CONFIG, not a panic in the host process. Those Anole
@@ -881,27 +1166,47 @@ pub const Engine = struct {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
         };
-        var watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
+        // The databases connect now (`connect_at_start` included): the
+        // consumers can query before anything listens.
+        app.startConnectors() catch |err| {
             e.tasks.cancel(app.io());
+            db.close(e);
             return e.failStartDeinit(&app, err);
         };
-        // Control calls may reach the server from here until `run` returns.
-        _ = e.ctl.fetchAnd(~ctl_closed, .release);
-        e.phase.store(.running, .release);
-        const result = app.run();
+        e.phase.store(.open, .release);
+        e.opened.set(threadedIo());
+        e.go.waitUncancelable(app.io());
+        var result: anyerror!void = {};
+        var watcher: ?std.Io.Future(void) = null;
+        if (!e.abandon.load(.acquire)) {
+            watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
+                e.tasks.cancel(app.io());
+                db.close(e);
+                return e.failStartDeinit(&app, err);
+            };
+            // Control calls may reach the server from here until `run` returns.
+            _ = e.ctl.fetchAnd(~ctl_closed, .release);
+            e.phase.store(.running, .release);
+            result = app.run();
+        }
         e.closeControl(app.io());
-        watcher.cancel(app.io());
+        if (watcher) |*w| w.cancel(app.io());
         e.tasks.cancel(app.io());
         if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
         for (e.execs) |*x| x.db.cancel(app.io());
         db.close(e);
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
+                e.noteFailedListener(app.failedListenerIndex(), err);
                 e.start_error = err;
                 e.started.set(threadedIo());
             } else if (e.start_error == null) log.err("server stopped: {t}", .{err});
         }
         e.phase.store(.stopped, .release);
+        for (e.listeners) |*l| {
+            const st = l.state.load(.acquire);
+            if (st == abi.LISTENER_LISTENING or st == abi.LISTENER_PENDING) l.state.store(abi.LISTENER_CLOSED, .release);
+        }
         e.app = null;
         app.deinit();
         if (comptime features.websocket) e.rooms.deinit();
@@ -966,7 +1271,11 @@ pub const Engine = struct {
         const a = e.arena.allocator();
         const M = http.Middleware(void);
         if (cfg.observe.metrics) |m| _ = app.metrics(.{ .path = m.path });
-        if (cfg.observe.health) |h| _ = app.health(.{ .healthz_path = h.live, .readyz_path = h.ready });
+        if (cfg.observe.health) |hc| {
+            const h = app.health(.{ .healthz_path = hc.live, .readyz_path = hc.ready, .listener = hc.listener });
+            // Each check starts not ready, until `anole_server_set_ready`.
+            for (hc.checks, e.ready) |name, *flag| try h.addCheck(name, readyFn, flag);
+        }
         for (cfg.middleware) |m| app.use(try config_mod.middleware(app, a, m));
         const global_ok = config_mod.neverWaits(cfg.middleware);
         if (comptime features.grpc) try grpc.buildRoutes(e, app, global_ok);
@@ -1029,6 +1338,11 @@ pub const Engine = struct {
         }
     }
 
+    fn readyFn(ctx: ?*anyopaque) bool {
+        const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+        return flag.load(.acquire);
+    }
+
     /// A WebSocket route's `origins`: none is the same origin only, "*"
     /// any.
     fn wtOrigins(origins: []const []const u8) anole.webtransport.Origins {
@@ -1052,22 +1366,49 @@ pub const Engine = struct {
     fn watchReady(e: *Engine, app: *anole.App) void {
         app.waitReady() catch |err| {
             if (err == error.RouteConflict) if (app.router.conflict) |why| e.setWhy(why);
+            e.noteFailedListener(app.failedListenerIndex(), err);
             e.start_error = err;
             e.started.set(threadedIo());
             return;
         };
-        for (app.addresses()) |addr| e.ports.append(gpa, switch (addr) {
-            .ip => |ip| ip.getPort(),
-            else => 0,
-        }) catch {};
-        // After the listeners: HTTP/3's UDP port, when one serves it.
-        if (app.http3Address()) |q| e.ports.append(gpa, q.getPort()) catch {};
+        for (app.addresses(), 0..) |addr, i| {
+            if (i >= e.listeners.len) break;
+            const l = &e.listeners[i];
+            var w: std.Io.Writer = .fixed(&l.bound_buf);
+            switch (addr) {
+                .ip => |ip| {
+                    l.port = ip.getPort();
+                    w.print("{f}", .{ip}) catch {};
+                },
+                else => w.print("unix:{s}", .{l.cfg_address}) catch {},
+            }
+            l.bound_len = @intCast(w.end);
+        }
+        // HTTP/3's UDP port, on the listener that serves it.
+        if (app.http3Address()) |q| for (e.config.listeners, e.listeners) |lc, *l| {
+            if (lc.http3) l.udp_port = q.getPort();
+        };
+        for (e.listeners) |*l| l.state.store(abi.LISTENER_LISTENING, .release);
         e.started.set(threadedIo());
     }
 
+    /// A start that failed binding listener `index` (or none known): its
+    /// state turns FAILED with the reason.
+    fn noteFailedListener(e: *Engine, index: ?usize, err: anyerror) void {
+        const i = index orelse return;
+        if (i >= e.listeners.len) return;
+        e.failed_listener = i;
+        const l = &e.listeners[i];
+        l.error_name = errorName(err);
+        l.error_errno = errorErrno(err);
+        l.state.store(abi.LISTENER_FAILED, .release);
+    }
+
     fn failStart(e: *Engine, err: anyerror) void {
+        e.noteFailedListener(server_mod.failed_listener_index, err);
         e.start_error = err;
         e.phase.store(.failed, .release);
+        e.opened.set(threadedIo());
         e.started.set(threadedIo());
     }
 
@@ -1139,7 +1480,7 @@ pub const Engine = struct {
         switch (e.phase.load(.acquire)) {
             .running => {},
             .draining, .stopped => return,
-            .created, .starting, .failed => return error.State,
+            .created, .opening, .open, .starting, .failed => return error.State,
         }
         // None: `run` returned (a signal, an error), and the server stops
         // on its own.
@@ -1179,7 +1520,22 @@ pub const Engine = struct {
 
     pub fn destroy(e: *Engine) void {
         if (e.thread) |t| {
-            if (e.phase.load(.acquire) == .running) e.drain() catch {};
+            switch (e.phase.load(.acquire)) {
+                // Opened, never started: the main thread skips `run`.
+                .open => {
+                    e.abandon.store(true, .release);
+                    e.go.set(e.io);
+                },
+                // Not drained: what consumers still owe is answered 503 at
+                // once (the capi tasks), so this does not wait for answers
+                // that cannot come (it may run on a consumer's own thread).
+                .running, .draining => {
+                    e.abandon.store(true, .release);
+                    for (e.execs) |*x| x.kick.set(e.io);
+                    e.drain() catch {};
+                },
+                else => {},
+            }
             t.join();
         }
         // The next server's handles start past every one handed out here.
@@ -1192,6 +1548,7 @@ pub const Engine = struct {
         if (global == e) global = null;
         for (e.execs) |*x| {
             for (x.slots) |*s| {
+                if (s.borrowed_sent) |r| freeRecord(r.ptr);
                 s.bytes.deinit(gpa);
                 s.headers.deinit(gpa);
                 s.trailers.deinit(gpa);
@@ -1202,6 +1559,7 @@ pub const Engine = struct {
             }
             gpa.free(x.slots);
             x.ring.deinit();
+            x.freeOverflow();
             // Commands nobody ran.
             var cmd = x.inbox.swap(null, .acquire);
             while (cmd) |c| {
@@ -1220,7 +1578,6 @@ pub const Engine = struct {
             gpa.destroy(c);
         }
         e.consumers.deinit(gpa);
-        e.ports.deinit(gpa);
         e.arena.deinit();
         gpa.destroy(e);
         // Debug builds: everything the engine allocated is freed by now
@@ -1254,11 +1611,121 @@ pub const Engine = struct {
         };
     }
 
+    /// `anole_server_set_ready`.
+    pub fn setReady(e: *Engine, name: []const u8, ready: bool) error{UnknownCheck}!void {
+        const checks = (e.config.observe.health orelse return error.UnknownCheck).checks;
+        for (checks, e.ready) |c, *flag| if (std.mem.eql(u8, c, name)) {
+            flag.store(ready, .release);
+            return;
+        };
+        return error.UnknownCheck;
+    }
+
+    /// The bound TCP port of listener `i`; `i` = the number of listeners:
+    /// the HTTP/3 (UDP) port, when a listener serves it. 0 before.
+    pub fn port(e: *const Engine, i: usize) u16 {
+        if (i < e.listeners.len) return e.listeners[i].port;
+        if (i == e.listeners.len) for (e.listeners) |l| if (l.udp_port != 0) return l.udp_port;
+        return 0;
+    }
+
+    /// A handle error as an answer call reports it: over is `Gone`
+    /// (counted).
+    pub fn badHandle(e: *Engine, err: HandleError) AnswerError {
+        return switch (err) {
+            error.WrongKind => error.WrongKind,
+            error.Over => e.gone(),
+        };
+    }
+
+    /// Why a client-side end happens: the drain's deadline cut it, or the
+    /// client left.
+    pub fn clientReason(e: *const Engine) u16 {
+        return if (e.phase.load(.acquire) == .draining) abi.ABORT_DRAIN else abi.ABORT_CLIENT;
+    }
+
     pub fn gone(e: *Engine) error{Gone} {
         _ = e.gone_count.fetchAdd(1, .monotonic);
         return error.Gone;
     }
 };
+
+fn listenerState(a: std.mem.Allocator, l: Config.Listener) !ListenerState {
+    var flags: u32 = 0;
+    if (l.tls != null) flags |= abi.LISTENER_F_TLS;
+    if (l.http1) flags |= abi.LISTENER_F_HTTP1;
+    if (l.http2 and features.http2) flags |= abi.LISTENER_F_HTTP2;
+    if (l.http3) flags |= abi.LISTENER_F_HTTP3;
+    if (l.unix != null) flags |= abi.LISTENER_F_UNIX;
+    if (l.proxy_protocol) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
+    const scheme = if (l.tls != null) "https" else "http";
+    const name: []const u8 = l.name orelse if (l.unix) |path|
+        try std.fmt.allocPrint(a, "unix-{s}", .{path})
+    else
+        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port });
+    // "127.0.0.1:8080", "[::]:8443", "unix:/run/app.sock".
+    const address: []const u8 = if (l.unix) |path|
+        try std.fmt.allocPrint(a, "unix:{s}", .{path})
+    else if (l.address.len == 0)
+        try std.fmt.allocPrint(a, "[::]:{d}", .{l.port})
+    else if (std.mem.indexOfScalar(u8, l.address, ':') != null)
+        try std.fmt.allocPrint(a, "[{s}]:{d}", .{ l.address, l.port })
+    else
+        try std.fmt.allocPrint(a, "{s}:{d}", .{ l.address, l.port });
+    return .{ .name = name, .cfg_address = address, .flags = flags };
+}
+
+/// Embedded mode: every asynchronous signal is blocked on Anole's threads
+/// (the ones a crash raises stay deliverable), so a host's SIGCHLD, SIGINT
+/// or profiler handler runs on the host's threads only.
+fn blockSignals() void {
+    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return;
+    var set: std.c.sigset_t = undefined;
+    var old: std.c.sigset_t = undefined;
+    _ = std.c.sigfillset(&set);
+    inline for (.{ "SEGV", "BUS", "FPE", "ILL", "TRAP", "SYS", "ABRT" }) |name| {
+        if (comptime @hasDecl(std.c.SIG, name)) _ = std.c.sigdelset(&set, @field(std.c.SIG, name));
+    }
+    _ = std.c.pthread_sigmask(std.c.SIG.BLOCK, &set, &old);
+}
+
+/// The stable token of a start or TLS failure (`anole_last_error_name`):
+/// the error's own name when it is one of `abi.error_names`.
+pub fn errorName(err: anyerror) []const u8 {
+    const name = @errorName(err);
+    for (abi.error_names) |t| if (std.mem.eql(u8, t, name)) return t;
+    return switch (err) {
+        error.PermissionDenied => "AccessDenied",
+        error.AddressUnavailable => "AddressNotAvailable",
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => "TooManyOpenFiles",
+        error.TlsInvalidCertificate => "InvalidCertificate",
+        error.TlsInvalidPrivateKey => "InvalidKey",
+        error.TlsKeyMismatch => "KeyMismatch",
+        else => "Unexpected",
+    };
+}
+
+/// The OS error behind a failure, for `anole_last_errno`; 0 when it did not
+/// come from the OS.
+pub fn errorErrno(err: anyerror) i32 {
+    if (comptime builtin.os.tag == .windows) return 0;
+    const E = std.posix.E;
+    const code: E = switch (err) {
+        error.AddressInUse => .ADDRINUSE,
+        error.AddressNotAvailable, error.AddressUnavailable => .ADDRNOTAVAIL,
+        error.AccessDenied, error.PermissionDenied => .ACCES,
+        error.FileNotFound => .NOENT,
+        error.ProcessFdQuotaExceeded => .MFILE,
+        error.SystemFdQuotaExceeded => .NFILE,
+        error.SystemResources, error.OutOfMemory => .NOMEM,
+        error.ConnectionRefused => .CONNREFUSED,
+        error.NetworkUnreachable => .NETUNREACH,
+        error.IsDir => .ISDIR,
+        error.NotDir => .NOTDIR,
+        else => return 0,
+    };
+    return @intFromEnum(code);
+}
 
 // ---------------------------------------------------------------------------
 // The handler for consumer routes (on executors)
@@ -1327,6 +1794,10 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     const x = &e.execs[xi];
     if (x.consumer == null) {
         res.fail(.service_unavailable, "no consumer");
+        return;
+    }
+    if (e.abandon.load(.acquire)) {
+        res.fail(.service_unavailable, "the server is stopping");
         return;
     }
     const detach = res.canDetach() and route.detachable;
@@ -1405,16 +1876,19 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        if (s.timed_out) {
+        if (s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
             x.unlink(si);
             x.release(si);
             _ = e.busy_count.fetchAdd(1, .monotonic);
             res.fail(.service_unavailable, "the application is behind");
             return;
         }
-        zio.yield() catch {
-            canceled = true;
-            break;
+        x.waitRoom(0, s.deadline) catch |err| switch (err) {
+            error.Canceled => {
+                canceled = true;
+                break;
+            },
+            error.Timeout => continue,
         };
     }
     x.consumer.?.wake();
@@ -1461,9 +1935,20 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
             },
             .queued, .out => {
                 if (canceled or s.timed_out or s.body_error != null) {
+                    // Why it is over, for the consumer that saw it.
+                    var reason: u16 = abi.ABORT_BODY;
+                    var status: u16 = if (s.body_error) |b| @intCast(@backingInt(b)) else 0;
+                    if (canceled) {
+                        reason = e.clientReason();
+                        status = 0;
+                    } else if (s.timed_out) {
+                        reason = abi.ABORT_DEADLINE;
+                        status = 504;
+                    }
                     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
-                        // The consumer saw it: it hears that it is over.
-                        if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
+                        // The consumer saw it: it hears that it is over
+                        // (not when the server is going away under it).
+                        if (stateOf(w) == .out and !s.abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
                         break .expired;
                     }
                     continue;
@@ -1482,7 +1967,12 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
     switch (outcome) {
         .expired => {
             const body_error = s.body_error;
+            const abandoned = s.abandoned;
             x.release(si);
+            if (abandoned and !canceled) {
+                res.fail(.service_unavailable, "the server is stopping");
+                return;
+            }
             if (canceled) {
                 _ = e.aborted_count.fetchAdd(1, .monotonic);
                 return error.Canceled;
@@ -1524,9 +2014,17 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
 /// The consumer's answer (`done`) into `res`.
 fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void {
     const s = &x.slots[si];
-    if (s.reply == .release) {
-        res.fail(.internal_server_error, "");
-        return;
+    switch (s.reply) {
+        // `res.fail` may keep its message: it goes in the request's arena.
+        .fail => {
+            const detail = try req.arena.dupe(u8, s.bytes.items[0..s.fail_len]);
+            res.fail(http.Status.fromCode(s.status) catch .internal_server_error, detail);
+            return;
+        },
+        // HTTP/1.1 closes the connection, HTTP/2 resets the stream
+        // (CANCEL), HTTP/3 cancels it (H3_REQUEST_CANCELLED).
+        .abort => return res.abort(),
+        else => {},
     }
     res.status = http.Status.fromCode(s.status) catch .internal_server_error;
     try applyHeaders(s, req, res);
@@ -1551,7 +2049,7 @@ fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void
             };
             s.fd = -1;
         },
-        .release => unreachable,
+        .fail, .abort => unreachable,
     }
 }
 
@@ -1648,7 +2146,7 @@ fn releaseChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
 pub fn dropChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
     switch (ch.owner) {
         .pipe => gpa.free(ch.data),
-        .consumer => x.postSent(x.handleOf(si, gen), ch.data),
+        .consumer => if (ch.sent) |r| x.postSentRec(x.handleOf(si, gen), r),
         .request => {},
     }
 }
@@ -1661,7 +2159,7 @@ fn streamGone(x: *Exec, si: u32, gen: u32) void {
     const failed = s.out.failed;
     s.out.release();
     x.closePipe(&s.out, gen, si);
-    if (!failed) x.postEvent(.abort, x.handleOf(si, gen));
+    if (!failed) x.postAbort(x.handleOf(si, gen), x.engine.clientReason(), 0);
 }
 
 /// Reads the rest of a request body into the slot's pipe, `limits.body_max`
@@ -1770,7 +2268,7 @@ pub fn detachedAborted(ctx: *anyopaque) void {
         switch (stateOf(w)) {
             .queued, .out => {
                 if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) continue;
-                if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
+                if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), e.clientReason(), 0);
                 x.release(si);
                 return;
             },
@@ -1811,7 +2309,7 @@ fn finishDetached(x: *Exec, si: u32) void {
         spawned catch {
             // The connection is going (or no task could start): a stream
             // the consumer is writing hears it is over.
-            if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, gen));
+            if (stateOf(w) == .streaming) x.postAbort(x.handleOf(si, gen), abi.ABORT_CLIENT, 0);
             x.closePipe(&s.in, gen, si);
             d.finish(error.ConnectionResetByPeer);
             x.release(si);
@@ -1846,18 +2344,69 @@ fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
 /// A detached request past its deadline: 504 now. The consumer, if it saw
 /// it, hears it is over.
 fn expireDetached(x: *Exec, si: u32, w: u64) void {
+    endDetached(x, si, w, false);
+}
+
+/// A detached request ended by the sweeper: 504 at its deadline, or 503
+/// when the server is being destroyed (`abandon`: the consumer hears
+/// nothing more).
+fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
-    if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
-    _ = x.engine.expired_count.fetchAdd(1, .monotonic);
+    if (!abandoning) {
+        if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), abi.ABORT_DEADLINE, 504);
+        _ = x.engine.expired_count.fetchAdd(1, .monotonic);
+    }
     if (s.detached) |d| {
         s.detached = null;
         x.closePipe(&s.in, gen, si);
-        d.response.fail(.gateway_timeout, "the application did not answer in time");
+        if (abandoning)
+            d.response.fail(.service_unavailable, "the server is stopping")
+        else
+            d.response.fail(.gateway_timeout, "the application did not answer in time");
         d.finish({});
     }
     x.release(si);
+}
+
+/// `destroy` on a server not drained: every request and call a consumer
+/// still owes is answered at once (503, UNAVAILABLE; streams are cut) and
+/// the consumer hears nothing more. Run by the capi task while `abandon`
+/// is set.
+fn abandonAll(x: *Exec) void {
+    const io = x.engine.io;
+    for (x.slots, 0..) |*s, i| {
+        const si: u32 = @intCast(i);
+        const w = s.word.load(.acquire);
+        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
+            grpc.abandon(x, si, w);
+            continue;
+        };
+        switch (stateOf(w)) {
+            .queued, .out => {
+                if (s.orphan) {
+                    if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
+                    x.release(si);
+                } else if (s.detached != null) {
+                    endDetached(x, si, w, true);
+                } else if (!s.abandoned) {
+                    x.unlink(si);
+                    s.abandoned = true;
+                    s.timed_out = true;
+                    s.event.set(io);
+                }
+            },
+            .streaming => {
+                s.out.acquire();
+                s.out.failed = true;
+                s.out.exec_waiting = false;
+                s.out.release();
+                s.event.set(io);
+            },
+            else => {},
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1869,6 +2418,7 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
     const io = e.io;
     while (true) {
         x.kick.reset();
+        if (e.abandon.load(.acquire)) abandonAll(x);
         // Answers: wake their tasks (local wakes, no syscalls), or finish
         // detached requests here.
         var list = x.done_head.swap(no_slot, .acquire);
@@ -1888,7 +2438,7 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
             s.drained.store(true, .release);
             if (s.orphan) {
                 const w = s.word.load(.acquire);
-                if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, genOf(w)));
+                if (stateOf(w) == .streaming) x.postAbort(x.handleOf(si, genOf(w)), abi.ABORT_CLIENT, 0);
                 x.release(si);
             } else if (s.detached != null) {
                 if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
@@ -1925,7 +2475,7 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
                     .queued, .out => {
                         if (s.orphan) {
                             if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
-                            if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, genOf(w)));
+                            if (stateOf(w) == .out) x.postAbort(x.handleOf(si, genOf(w)), abi.ABORT_CLIENT, 0);
                             x.release(si);
                         } else if (s.detached != null) {
                             expireDetached(x, si, w);
@@ -1953,11 +2503,11 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
             any_out = true;
         };
         // Requests out: also watch for a lost doorbell, every rewake_ms.
-        if (e.rewake > 0 and (any_out or !x.ring.isEmpty())) if (x.consumer) |c| {
-            if (!x.ring.isEmpty() and c.awake.load(.acquire) and now - c.last_poll.load(.monotonic) > e.rewake) c.rewake();
+        if (e.rewake > 0 and (any_out or x.hasPendingShared())) if (x.consumer) |c| {
+            if (x.hasPendingShared() and c.awake.load(.acquire) and now - c.last_poll.load(.monotonic) > e.rewake) c.rewake();
             until = @min(until, now + e.rewake);
         };
-        x.idle = !any_out and x.ring.isEmpty();
+        x.idle = !any_out and !x.hasPendingShared();
         x.kick.waitTimeout(io, .{ .duration = .{ .raw = .{ .nanoseconds = @max(until - now, 0) }, .clock = .awake } }) catch |err| switch (err) {
             error.Timeout => {},
             error.Canceled => return error.Canceled,
@@ -2000,6 +2550,12 @@ pub const Head = struct {
     content_length: u64 = std.math.maxInt(u64),
     remote: []const u8 = "",
     claims: []const u8 = "",
+    /// When Anole answers 504 (awake clock, ns) and the clock when the
+    /// record is built; no deadline: `timeout_us` is -1.
+    deadline: ?i96 = null,
+    now: i96 = 0,
+    /// ANOLE_EV_WS_OPEN: the selected subprotocol.
+    subprotocol: []const u8 = "",
 
     pub fn size(h: Head) usize {
         const req = h.req;
@@ -2007,13 +2563,12 @@ pub const Head = struct {
         const nh = req.headers.len;
         n += nh * 2 * @sizeOf(abi.Span);
         n += req.params.count() * 2 * @sizeOf(abi.Span);
-        n += methodName(req).len + req.url.len + h.body.len + h.remote.len + req.listener.name.len + req.id.len + h.claims.len;
+        n += methodName(req).len + req.url.len + h.body.len + h.remote.len + req.listener.name.len + req.id.len + h.claims.len + h.subprotocol.len;
         for (req.headers.keys[0..nh], req.headers.values[0..nh]) |k, v| n += k.len + v.len;
         var it = req.params.map.iterator();
         while (it.next()) |kv| n += kv.key_ptr.len + kv.value_ptr.len;
-        // Mutual TLS: the client's certificate last, a u32 length then the
-        // DER, 4-aligned.
-        if (req.peerCertificate()) |der| n = std.mem.alignForward(usize, n, 4) + 4 + der.len;
+        // Mutual TLS: the client's certificate (DER) last.
+        if (req.peerCertificate()) |der| n += der.len;
         return abi.alignUp(n);
     }
 
@@ -2023,8 +2578,9 @@ pub const Head = struct {
         const size_ = out.len;
         const nh = req.headers.len;
         const np = req.params.count();
-        const spans: [*]align(1) abi.Span = @ptrCast(out[@sizeOf(abi.RequestEvent)..].ptr);
-        var pos: usize = @sizeOf(abi.RequestEvent) + (nh + np) * 2 * @sizeOf(abi.Span);
+        const spans_off: usize = @sizeOf(abi.RequestEvent);
+        const spans: [*]align(1) abi.Span = @ptrCast(out[spans_off..].ptr);
+        var pos: usize = spans_off + (nh + np) * 2 * @sizeOf(abi.Span);
         const put = struct {
             fn f(buf: []u8, p: *usize, s: []const u8, lower: bool) abi.Span {
                 const at = p.*;
@@ -2058,15 +2614,9 @@ pub const Head = struct {
         const listener = put(out, &pos, req.listener.name, false);
         const id = put(out, &pos, req.id, false);
         const claims = put(out, &pos, h.claims, false);
-        var peer_cert: u32 = 0;
-        if (req.peerCertificate()) |der| {
-            const at = std.mem.alignForward(usize, pos, 4);
-            @memset(out[pos..at], 0);
-            std.mem.writeInt(u32, out[at..][0..4], @intCast(der.len), .little);
-            @memcpy(out[at + 4 ..][0..der.len], der);
-            pos = at + 4 + der.len;
-            peer_cert = @intCast(at);
-        }
+        const subprotocol = put(out, &pos, h.subprotocol, false);
+        var peer_cert: abi.Span = .{};
+        if (req.peerCertificate()) |der| peer_cert = put(out, &pos, der, false);
         std.debug.assert(abi.alignUp(pos) == size_);
         @memset(out[pos..size_], 0);
         const rec: *align(1) abi.RequestEvent = @ptrCast(out.ptr);
@@ -2075,7 +2625,7 @@ pub const Head = struct {
             .route_id = h.route_id,
             .method = methodCode(req.method),
             .version = req.version_major * 10 + req.version_minor,
-            .flags = h.flags | if (peer_cert != 0) abi.REQ_PEER_CERT else 0,
+            .flags = h.flags | if (peer_cert.len != 0) abi.REQ_PEER_CERT else 0,
             .method_name = method_name,
             .path = path,
             .query = query,
@@ -2086,8 +2636,11 @@ pub const Head = struct {
             .claims = claims,
             .nheaders = @intCast(nh),
             .nparams = @intCast(np),
-            .peer_cert = peer_cert,
+            .spans_off = @intCast(spans_off),
             .content_length = h.content_length,
+            .peer_cert = peer_cert,
+            .timeout_us = if (h.deadline) |d| @intCast(@divTrunc(@max(d - h.now, 0), std.time.ns_per_us)) else -1,
+            .subprotocol = subprotocol,
         };
         return size_;
     }
@@ -2098,8 +2651,10 @@ pub const Head = struct {
     }
 };
 
-fn headOf(s: *const Slot) Head {
+fn headOf(s: *const Slot, now: i96) Head {
     return .{
+        .deadline = if (s.linked) s.deadline else null,
+        .now = now,
         .req = s.req,
         .route_id = s.route.id,
         .body = s.body,
@@ -2114,20 +2669,27 @@ pub const PollError = error{TooBig};
 
 /// Drains up to `out.len` bytes of events (one event for a shared
 /// consumer). 0: nothing pending, and the doorbell is armed again (unless
-/// `!arm`).
-pub fn poll(c: *Consumer, out: []u8, arm: bool) PollError!usize {
+/// `!arm`). On `error.TooBig`, `need` is the size of the record that did
+/// not fit.
+pub fn poll(c: *Consumer, out: []u8, arm: bool, need: *u32) PollError!usize {
     if (c.shared) {
         c.poll_lock.lockUncancelable(threadedIo());
         defer c.poll_lock.unlock(threadedIo());
-        return pollLocked(c, out, arm, true);
+        return pollLocked(c, out, arm, true, need);
     }
-    return pollLocked(c, out, arm, false);
+    if (comptime builtin.mode == .debug) {
+        if (c.in_poll.swap(true, .acq_rel)) @panic("anole_poll overlapped on one consumer");
+    }
+    defer if (comptime builtin.mode == .debug) c.in_poll.store(false, .release);
+    return pollLocked(c, out, arm, false, need);
 }
 
-fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
+fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollError!usize {
     const e = c.engine;
-    if (e.phase.load(.acquire) != .created and e.phase.load(.acquire) != .starting)
-        c.last_poll.store(@intCast(std.Io.Clock.awake.now(e.io).nanoseconds), .monotonic);
+    const phase = e.phase.load(.acquire);
+    const now: i96 = std.Io.Clock.awake.now(e.io).nanoseconds;
+    if (phase != .created and phase != .opening and phase != .open and phase != .starting)
+        c.last_poll.store(@intCast(now), .monotonic);
     var pos: usize = 0;
     var rechecked = false;
     outer: while (true) {
@@ -2135,12 +2697,17 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
         var i: usize = 0;
         while (i < c.execs.items.len) : (i += 1) {
             const x = c.execs.items[(c.next_exec + i) % c.execs.items.len];
+            var popped = false;
+            defer if (popped) x.signalRoom();
             while (x.ring.peek()) |entry| {
                 if (one and pos > 0) break :outer;
                 if (entry.rec) |rec| {
                     const ev: *const abi.Event = @ptrCast(rec);
                     if (ev.len > out.len - pos) {
-                        if (pos == 0) return error.TooBig;
+                        if (pos == 0) {
+                            need.* = ev.len;
+                            return error.TooBig;
+                        }
                         c.next_exec = (c.next_exec + i) % c.execs.items.len;
                         break :outer;
                     }
@@ -2149,7 +2716,8 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
                     const len = ev.len;
                     freeRecord(rec);
                     x.ring.pop();
-                    _ = x.record_bytes.fetchSub(len, .release);
+                    popped = true;
+                    _ = x.record_bytes.fetchSub(len, .seq_cst);
                     progressed = true;
                     continue;
                 }
@@ -2159,26 +2727,55 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
                 if (s.word.cmpxchgStrong(queued, pack(h.gen, .polling), .acquire, .monotonic) != null) {
                     // Expired (or reused since): skip it.
                     x.ring.pop();
+                    popped = true;
                     continue;
                 }
                 const is_grpc = features.grpc and h.kind == .grpc_call;
-                const size = if (is_grpc) grpc.recordSize(s) else headOf(s).size();
+                const size = if (is_grpc) grpc.recordSize(s) else headOf(s, now).size();
                 if (size > out.len - pos) {
                     s.word.store(queued, .release);
-                    if (pos == 0) return error.TooBig;
+                    if (pos == 0) {
+                        need.* = @intCast(size);
+                        return error.TooBig;
+                    }
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size]) else headOf(s).encode(.request, entry.handle, out[pos..][0..size]);
+                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(.request, entry.handle, out[pos..][0..size]);
                 s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
+                popped = true;
+                progressed = true;
+            }
+            // Records that did not fit the ring (or came from another
+            // thread), oldest first.
+            x.takeOverflow();
+            while (x.ovf_head) |rec| {
+                if (one and pos > 0) break :outer;
+                const ev: *const abi.Event = @ptrCast(rec);
+                if (ev.len > out.len - pos) {
+                    if (pos == 0) {
+                        need.* = ev.len;
+                        return error.TooBig;
+                    }
+                    c.next_exec = (c.next_exec + i) % c.execs.items.len;
+                    break :outer;
+                }
+                @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
+                pos += ev.len;
+                x.ovf_head = linkOf(rec).*;
+                if (x.ovf_head == null) x.ovf_tail = null;
+                freeRecord(rec);
                 progressed = true;
             }
         }
         c.next_exec = (c.next_exec + 1) % @max(c.execs.items.len, 1);
         if (pos > 0 or progressed) break;
         if (e.phase.load(.acquire) == .stopped and !c.stopped_sent) {
-            if (out.len < @sizeOf(abi.Event)) return error.TooBig;
+            if (out.len < @sizeOf(abi.Event)) {
+                need.* = @sizeOf(abi.Event);
+                return error.TooBig;
+            }
             const hdr: *align(1) abi.Event = @ptrCast(out.ptr);
             hdr.* = .{ .type = @backingInt(abi.EventType.stopped), .len = @sizeOf(abi.Event), .handle = 0 };
             c.stopped_sent = true;
@@ -2191,7 +2788,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
         c.awake.store(false, .seq_cst);
         rechecked = true;
         var any = false;
-        for (c.execs.items) |x| if (!x.ring.isEmpty()) {
+        for (c.execs.items) |x| if (x.hasPending()) {
             any = true;
         };
         if (!any) break;
@@ -2204,12 +2801,12 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
 }
 
 /// `poll`, blocking up to `timeout_ms` (< 0: for ever) for an event.
-pub fn pollWait(c: *Consumer, out: []u8, timeout_ms: i32) PollError!usize {
+pub fn pollWait(c: *Consumer, out: []u8, timeout_ms: i32, need: *u32) PollError!usize {
     const tio = threadedIo();
     const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms < 0) null else std.Io.Clock.Timestamp.now(tio, .awake).addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
     while (true) {
         const seq = c.bell.load(.acquire);
-        const n = try poll(c, out, true);
+        const n = try poll(c, out, true, need);
         if (n > 0) return n;
         if (c.stopped_sent) return 0;
         _ = c.waiters.fetchAdd(1, .acq_rel);
@@ -2225,31 +2822,42 @@ pub fn pollWait(c: *Consumer, out: []u8, timeout_ms: i32) PollError!usize {
 // ---------------------------------------------------------------------------
 // Consumer side: answers (any thread)
 
-pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again, State, TooBig };
+/// `Over` and `WrongKind` come from a handle: the object is over (an answer
+/// call turns it into `Gone`, a cleanup call into success), or the handle is
+/// 0 or of another kind (`ANOLE_E_INVALID` everywhere).
+pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again, State, TooBig, Over, WrongKind, System };
+pub const HandleError = error{ WrongKind, Over };
 
 pub const CHeader = abi.Header;
 
-fn slotOf(e: *Engine, hv: u64) ?struct { *Exec, *Slot, Handle } {
+fn slotOf(e: *Engine, hv: u64) HandleError!struct { *Exec, *Slot, Handle } {
     return slotOfKind(e, hv, .request);
 }
 
 /// The slot a handle of `kind` names, if it could be one: the generation
 /// is the caller's to check (a stale handle finds its slot moved on).
-pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) ?struct { *Exec, *Slot, Handle } {
+pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *Exec, *Slot, Handle } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.kind != kind or h.exec >= e.execs.len) return null;
+    if (hv == 0 or h.gen == 0 or h.kind != kind) return error.WrongKind;
+    if (h.exec >= e.execs.len) return error.Over;
     const x = &e.execs[h.exec];
-    if (h.slot >= x.slots.len) return null;
+    if (h.slot >= x.slots.len) return error.Over;
     const s = &x.slots[h.slot];
-    if (s.kind.load(.acquire) != @backingInt(kind)) return null;
+    if (s.kind.load(.acquire) != @backingInt(kind)) return error.Over;
     return .{ x, s, h };
 }
 
-/// Claims slot `hv` for an answer: `out` to `responding`.
-fn claim(e: *Engine, hv: u64) error{Gone}!struct { *Exec, *Slot, Handle } {
-    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return e.gone();
+/// Claims slot `hv` for an answer: `out` to `responding`. `Over` when it is
+/// no longer owed.
+fn claimOrOver(e: *Engine, hv: u64) HandleError!struct { *Exec, *Slot, Handle } {
+    const x, const s, const h = try slotOf(e, hv);
+    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return error.Over;
     return .{ x, s, h };
+}
+
+/// An answer call's claim: over is `Gone`.
+fn claim(e: *Engine, hv: u64) AnswerError!struct { *Exec, *Slot, Handle } {
+    return claimOrOver(e, hv) catch |err| return e.badHandle(err);
 }
 
 /// Hands slot `si` to its executor (`done` or `streaming`).
@@ -2303,15 +2911,19 @@ fn checkStatus(status: u16) error{Invalid}!void {
 pub fn respond(e: *Engine, hv: u64, status: u16, headers: []const CHeader, body: []const u8, borrow: bool) AnswerError!void {
     try checkStatus(status);
     _ = try checkHeaders(headers);
+    if (!borrow and body.len > std.math.maxInt(u32)) return error.Invalid;
+    // The SENT record first: a call that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try newSent(body) else null;
+    errdefer if (sent) |r| freeRecord(r.ptr);
     const x, const s, const h = try claim(e, hv);
     errdefer s.word.store(pack(h.gen, .out), .release);
     try storeHeaders(&s.headers, &s.bytes, headers, if (borrow) 0 else body.len);
     s.body_off = @intCast(s.bytes.items.len);
     if (borrow) {
         s.borrowed = body;
+        s.borrowed_sent = sent;
         s.body_len = 0;
     } else {
-        if (body.len > std.math.maxInt(u32)) return error.Invalid;
         s.borrowed = null;
         s.body_len = @intCast(body.len);
         s.bytes.appendSliceAssumeCapacity(body);
@@ -2321,8 +2933,33 @@ pub fn respond(e: *Engine, hv: u64, status: u16, headers: []const CHeader, body:
     handBack(x, s, h, .done);
 }
 
-pub fn release(e: *Engine, hv: u64) AnswerError!void {
-    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
+/// An error answer in the server's configured error format: status 400-599
+/// (0: 500), `message` the detail (at most 4096 bytes, copied). An answer
+/// call.
+pub fn fail(e: *Engine, hv: u64, status: u16, message: []const u8) AnswerError!void {
+    return failWith(e, hv, status, message, true);
+}
+
+fn failWith(e: *Engine, hv: u64, status_in: u16, message: []const u8, counted: bool) AnswerError!void {
+    const status: u16 = if (status_in == 0) 500 else status_in;
+    if (status < 400 or status > 599) return error.Invalid;
+    if (message.len > 4096) return error.Invalid;
+    try checkStatus(status);
+    const x, const s, const h = if (counted) try claim(e, hv) else try claimOrOver(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    s.headers.clearRetainingCapacity();
+    s.bytes.clearRetainingCapacity();
+    try s.bytes.appendSlice(gpa, message);
+    s.fail_len = @intCast(message.len);
+    s.reply = .fail;
+    s.status = status;
+    handBack(x, s, h, .done);
+}
+
+/// Drops the request without an answer (`res.abort()`); a stream under way
+/// is cut short. A cleanup call: `error.Over` when it is already over.
+pub fn abort(e: *Engine, hv: u64) AnswerError!void {
+    const x, const s, const h = try slotOf(e, hv);
     // A stream under way: cut it short.
     if (s.out.gen == h.gen) {
         s.out.acquire();
@@ -2336,12 +2973,56 @@ pub fn release(e: *Engine, hv: u64) AnswerError!void {
         }
         s.out.release();
     }
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return e.gone();
-    s.reply = .release;
+    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return error.Over;
+    s.reply = .abort;
     s.headers.clearRetainingCapacity();
     s.bytes.clearRetainingCapacity();
     handBack(x, s, h, .done);
 }
+
+/// `anole_handle_release`: ends whatever the handle is, the way the
+/// application giving up would. A cleanup call.
+pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
+    const h = Handle.decode(hv);
+    if (hv == 0) return error.WrongKind;
+    switch (h.kind) {
+        .request => {
+            _, const s, const hh = try slotOf(e, hv);
+            // A stream under way is cut short; otherwise the client gets 500.
+            if (s.out.gen == hh.gen) {
+                s.out.acquire();
+                const streaming = s.out.live(hh.gen) and !s.out.ended;
+                s.out.release();
+                if (streaming) return abort(e, hv);
+            }
+            return failWith(e, hv, 0, "", false);
+        },
+        .websocket => {
+            if (comptime !features.websocket) return error.Over;
+            return ws.close(e, hv, 1001, "");
+        },
+        .grpc_call => {
+            if (comptime !features.grpc) return error.Over;
+            return grpc.release(e, hv);
+        },
+        .wt_session => {
+            if (comptime !features.http3) return error.Over;
+            return wt.close(e, hv, 0, "");
+        },
+        .wt_stream => {
+            if (comptime !features.http3) return error.Over;
+            return wt.streamOp(e, hv, .release, 0);
+        },
+        // Database transactions: rolled back by the database layer (the
+        // handle kind is allocated; no transaction exists yet).
+        .db_tx => return error.Over,
+        .db_query, _ => return error.WrongKind,
+    }
+}
+
+/// The OS error behind the last `Invalid`/`System` answer of `respondFd`
+/// on this thread (`anole_last_errno`).
+pub threadlocal var engine_errno: i32 = 0;
 
 pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd: c_int, offset: u64, len: u64) AnswerError!void {
     if (comptime builtin.os.tag == .windows) return error.Unsupported;
@@ -2349,8 +3030,16 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     _ = try checkHeaders(headers);
     // A regular file, and how much of it.
     if (fd < 0) return error.Invalid;
+    // A descriptor that is none (std treats EBADF from fstat as a bug).
+    if (std.c.fcntl(fd, std.c.F.GETFD) < 0) {
+        engine_errno = std.c._errno().*;
+        return error.Invalid;
+    }
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    const st = file.stat(threadedIo()) catch return error.Invalid;
+    const st = file.stat(threadedIo()) catch {
+        engine_errno = @intFromEnum(std.posix.E.BADF);
+        return error.Invalid;
+    };
     if (st.kind != .file) return error.Invalid;
     const size: u64 = st.size;
     if (offset > size) return error.Invalid;
@@ -2359,7 +3048,10 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     const x, const s, const h = try claim(e, hv);
     errdefer s.word.store(pack(h.gen, .out), .release);
     const dup = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
-    if (dup < 0) return error.Invalid;
+    if (dup < 0) {
+        engine_errno = std.c._errno().*;
+        return error.System;
+    }
     errdefer closeFd(dup);
     try storeHeaders(&s.headers, &s.bytes, headers, 0);
     s.reply = .fd;
@@ -2387,16 +3079,24 @@ pub fn streamStart(e: *Engine, hv: u64, status: u16, headers: []const CHeader) A
 
 /// `ANOLE_BUSY` is `true`.
 pub fn streamWrite(e: *Engine, hv: u64, data: []const u8, borrow: bool) AnswerError!bool {
-    _, const s, const h = slotOf(e, hv) orelse return e.gone();
-    if (data.len == 0) return false;
-    const owned: ?[]u8 = if (borrow) null else try gpa.dupe(u8, data);
+    const x, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
+    // The SENT record first: a call that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try newSent(data) else null;
+    errdefer if (sent) |r| freeRecord(r.ptr);
+    const owned: ?[]u8 = if (borrow or data.len == 0) null else try gpa.dupe(u8, data);
     errdefer if (owned) |o| gpa.free(o);
     s.out.acquire();
     if (!s.out.live(h.gen) or s.out.ended or s.out.failed) {
         s.out.release();
         return e.gone();
     }
-    s.out.push(.{ .data = owned orelse data, .owner = if (borrow) .consumer else .pipe }) catch |err| {
+    if (data.len == 0) {
+        // Nothing to queue; a borrowed empty write is already "sent".
+        s.out.release();
+        if (sent) |r| x.postSentRec(hv, r);
+        return false;
+    }
+    s.out.push(.{ .data = owned orelse data, .owner = if (borrow) .consumer else .pipe, .sent = sent }) catch |err| {
         s.out.release();
         return err;
     };
@@ -2412,7 +3112,7 @@ pub fn streamWrite(e: *Engine, hv: u64, data: []const u8, borrow: bool) AnswerEr
 /// Waits (a blocking consumer thread) for the stream to fall below the
 /// high-water mark, then writes `data` (copied).
 pub fn streamWriteWait(e: *Engine, hv: u64, data: []const u8, timeout_ms: i32) AnswerError!void {
-    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    _, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     const tio = threadedIo();
     const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms < 0) null else std.Io.Clock.Timestamp.now(tio, .awake).addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
     while (true) {
@@ -2435,7 +3135,7 @@ pub fn streamWriteWait(e: *Engine, hv: u64, data: []const u8, timeout_ms: i32) A
 
 pub fn streamEnd(e: *Engine, hv: u64, trailers: []const CHeader) AnswerError!void {
     _ = try checkHeaders(trailers);
-    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    _, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     s.out.acquire();
     if (!s.out.live(h.gen) or s.out.ended or s.out.failed) {
         s.out.release();
@@ -2455,7 +3155,7 @@ pub fn streamEnd(e: *Engine, hv: u64, trailers: []const CHeader) AnswerError!voi
 /// Copies request body bytes out; 0 at the end. `error.Again` with
 /// `timeout_ms` 0 and nothing there (an `ANOLE_EV_BODY` follows).
 pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usize {
-    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
+    const x, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     const tio = threadedIo();
     const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms <= 0) null else std.Io.Clock.Timestamp.now(tio, .awake).addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
     while (true) {

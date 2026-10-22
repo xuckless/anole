@@ -109,6 +109,11 @@ threadlocal var server_on_thread: bool = false;
 /// A length of time: `.fromSeconds(30)`, `.fromMilliseconds(250)`.
 pub const Duration = std.Io.Duration;
 
+/// The index (in the options' listeners) of the listener whose UDP socket
+/// could not be bound, on the thread that was starting (`init` fails and
+/// leaves no server to ask); the C ABI reads it.
+pub threadlocal var failed_listener_index: ?usize = null;
+
 /// `anole.ServerOptions`: everything `App.init` and `Server(Ctx).init`
 /// take. Every field has a default, so `.{}` is a working server (its
 /// listener named later by `listen` or `listenTls`).
@@ -1128,7 +1133,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 // The UDP socket follows the TCP listener's address, "" (dual-stack) included.
                 const udp_host = q.address orelse l.address;
                 const udp_bind = try address_mod.resolve(udp_host, q.port orelse l.port, udp_host.len == 0 and dual.get());
-                const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
+                const ep = h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
                     .address = udp_bind.ip,
                     .ipv6_only = udp_bind.ipv6_only,
                     .cert_pem = cs.pem.cert,
@@ -1152,7 +1157,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
                     else
                         std.math.maxInt(u32),
-                });
+                }) catch |err| {
+                    failed_listener_index = at;
+                    return err;
+                };
                 errdefer ep.deinit();
                 endpoint = ep;
                 // Named in the TLS listener's startup line.
@@ -1860,8 +1868,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return out;
         }
 
-        /// Hands the databases what the app observes with, once.
-        fn startConnectors(self: *Self) !void {
+        /// Hands the databases what the app observes with, once (`run` does
+        /// it too): the C ABI opens them before anything listens.
+        pub fn startConnectors(self: *Self) !void {
             const extras = self.extras;
             if (extras.connectors_started) return;
             extras.connectors_started = true;
@@ -2207,6 +2216,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// a port in use) rather than waiting for good.
         pub fn waitReady(self: *Self) errors.ServerError!void {
             self.server.waitReady(self.rt.io()) catch |err| return errors.toServerError(err);
+        }
+
+        /// After a start that failed binding: the index (in the options'
+        /// listeners) of the listener that could not be bound.
+        pub fn failedListenerIndex(self: *const Self) ?usize {
+            return self.server.start_error_listener;
         }
 
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and

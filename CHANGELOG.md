@@ -94,6 +94,109 @@ Server options, TLS and errors (API hardening; see
 - `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
   from the environment; it used to need `.process`.
 
+### Breaking (C ABI 0.7)
+
+The migration table is in [docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)
+and docs/c-abi.md ("From ABI 0.6").
+
+- Before 1.0 a library serves only code built against the same ABI version,
+  major and minor: compare with `ANOLE_ABI_COMPATIBLE(anole_abi_version())`.
+  The header used to say a newer minor was enough, which was never true
+  under 0.x. Options structs larger than the library knows are refused
+  unless the extra bytes are 0, unknown flag bits are refused on every call
+  (`anole_db_options.flags` was not checked), and reserved fields in
+  `anole_db_value` and `anole_db_options` must be 0.
+- Cleanup calls (`anole_handle_release`, `anole_req_abort`, `anole_ws_close`,
+  `anole_ws_unsubscribe`, `anole_wt_close`, `anole_wt_stream_reset`,
+  `anole_wt_stream_stop`) now return `ANOLE_OK` on a handle whose object is
+  already over, closed or released, set no error and are not counted in
+  `anole_stats.gone`, so finalizers and `finally` blocks can call them
+  blindly. Answer and data calls keep `ANOLE_E_GONE`. A handle of the wrong
+  kind, or 0, is now `ANOLE_E_INVALID` on every call (was `ANOLE_E_GONE`).
+  New `anole_handle_release(h)` ends any handle the way the application
+  giving up would; it replaces `anole_wt_stream_release`.
+- Request calls share the `anole_req_` prefix every other family already had:
+  `anole_respond` -> `anole_req_respond`, `anole_respond_fd` ->
+  `anole_req_respond_fd` (the fd is an `intptr_t`), `anole_stream_start/write/
+  write_wait/end` -> `anole_req_stream_*`. `anole_release` is gone:
+  `anole_req_fail(r, status, message)` answers an error in the server's
+  configured error format (status 0 for 500), `anole_req_abort(r)` drops the
+  request without an answer (Zig's `res.abort()`), and `anole_handle_release(h)`
+  is the generic cleanup. Constants are grouped by family (`ANOLE_DB_TYPE_*`,
+  `ANOLE_DB_F_*`, `ANOLE_GRPC_STATUS_*`, `ANOLE_GRPC_KIND_*`,
+  `ANOLE_GRPC_F_FINISH`, `ANOLE_WT_F_*`, `ANOLE_TLS_F_PEM`,
+  `ANOLE_SERVER_F_SIGNALS`, `ANOLE_CONSUMER_F_SHARED`, `ANOLE_POLL_F_NOARM`).
+  `anole_server_port`'s "one past the last is the HTTP/3 port" is replaced by
+  `anole_server_listener(s, i, &info)`, which also gives the address, the UDP
+  port, the protocols and, when start failed, which listener and why.
+  `anole_server_reload_tls` takes `anole_str` and, with both empty, does what
+  `anole_server_reload_certificates` did (removed). WebSockets signal room
+  with `ANOLE_EV_WRITABLE`, as every other handle does; `ANOLE_EV_WS_DRAIN`
+  (9) is gone. `anole_wt_send_datagram` takes `flags`. Enum-valued parameters
+  are `uint32_t`.
+- Request records are 128 bytes: `spans_off` says where the header spans
+  start (`anole_request_spans` reads it), `peer_cert` is a plain span
+  (`anole_request_peer_cert` is gone: `anole_event_str(r, r->peer_cert)`),
+  and `timeout_us` and `subprotocol` are new. gRPC call records are 104
+  bytes with `metadata_off` (`anole_grpc_metadata(c)`) and `peer_cert`. A
+  record's fixed part may now grow at its end; arrays are reached through
+  offsets, never `sizeof`.
+- `ANOLE_EV_ABORT` now carries an `anole_abort_event`: why
+  (`ANOLE_ABORT_CLIENT`, `_DEADLINE`, `_BODY`, `_DRAIN`, `_SERVER`) and what
+  the client was sent.
+- Event types and handle kinds have one frozen allocation table (docs/c-abi.md,
+  `anole.abi.json`): consumers skip types they do not know, obligations come
+  only when the configuration asks, numbers are never reused. 40
+  `ANOLE_EV_WS_UPGRADE` and 41 `ANOLE_EV_DRAINING` are allocated; handle kind
+  6 is a database transaction.
+
+### Added
+
+- `include/anole.abi.json`, generated from `src/capi/abi.zig`
+  (`zig build capi-abi-json`; checked by `capi-test`): every record with
+  offsets, every constant by family, events, handle kinds and error tokens,
+  for generated parsers in anole-node and anole-py. `include/anole.schema.json`
+  carries `x-anole-abi` and a per-release `$id`.
+- `anole_last_error_name()` gives a stable token for the last error
+  (`AddressInUse`, `KeyMismatch`, `UnknownKey`...; the full list is in
+  docs/c-abi.md and `anole.abi.json`) and `anole_last_errno()` the OS error
+  behind it, so bindings can raise `EADDRINUSE` or `OSError(errno)` without
+  parsing text. `anole_ws_publish` on a server that is not running answers
+  `ANOLE_E_STATE` (was `E_GONE`); a failed `dup` in `anole_req_respond_fd` is
+  `ANOLE_E_SYSTEM` (was `E_INVALID`).
+- `ANOLE_E_TOOBIG` from `anole_poll` and `anole_poll_wait` now writes an
+  `ANOLE_EV_NONE` header whose `len` is the size the next record needs, so a
+  binding allocates once instead of doubling.
+- `anole_server_open` starts Anole's threads and opens the databases without
+  listening, for startup work before traffic (`anole_server_start` still
+  opens by itself). `observe.health.checks` declares readiness checks that
+  keep `/readyz` at 503 until `anole_server_set_ready` marks them ready;
+  `observe.health.listener` serves the health routes on one listener only.
+  `anole_server_destroy` on a server that was not drained no longer waits
+  for answers only its caller could give: it answers what consumers still owe
+  with 503 at once, so it can run on a consumer's thread (Node cleanup hooks,
+  Python `atexit`). The log callback belongs to its server and is cleared by
+  `anole_server_destroy`.
+- In embedded mode Anole's threads block asynchronous signals, so a host's
+  SIGCHLD or SIGINT handler never runs on them. A forked child no longer
+  inherits a usable server: calls on the parent's server answer
+  `ANOLE_E_STATE`, and the child may create its own. `anole_server_start`
+  refuses a configuration with more consumers than executors (one would
+  never get an event). `anole_consumer_set_wake` lets a restarted worker or a
+  new event loop take over a consumer.
+
+### Fixed
+
+- C ABI: `ANOLE_EV_SENT` follows every borrowing call that returned `>= 0`,
+  exactly once, zero-length writes included, and is never lost to a full
+  queue or a failed allocation (the record is allocated by the call, which
+  answers `ANOLE_E_NOMEM` and takes nothing if it cannot). Borrowing calls
+  that fail never produce one. On HTTP/2 and HTTP/3 a borrowed whole-response
+  body is copied (documented).
+- C ABI executors no longer spin a core at 100% while a consumer's queue is
+  full: they sleep until the consumer polls. Events (`ANOLE_EV_ABORT`,
+  `_WRITABLE`, `_BODY`, `_SENT`) are no longer dropped when the queue is full.
+
 ## 0.1.3 (2026-10-22)
 
 ### Security

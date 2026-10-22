@@ -18,8 +18,10 @@ const Answerer = struct {
     stop: std.atomic.Value(bool) = .init(false),
     held: std.atomic.Value(u64) = .init(0),
     aborts: std.atomic.Value(u32) = .init(0),
-    /// The handle of the most recent ABORT event.
+    /// The handle of the most recent ABORT event, and why.
     last_abort: std.atomic.Value(u64) = .init(0),
+    last_abort_reason: std.atomic.Value(u32) = .init(0),
+    last_abort_status: std.atomic.Value(u32) = .init(0),
     sent: std.atomic.Value(u32) = .init(0),
     failures: std.atomic.Value(u32) = .init(0),
     late_reads: std.atomic.Value(u32) = .init(0),
@@ -29,8 +31,9 @@ const Answerer = struct {
 
     fn run(self: *Answerer) void {
         var buf: [256 * 1024]u8 align(8) = undefined;
+        var need: u32 = 0;
         while (!self.stop.load(.acquire)) {
-            const n = engine.pollWait(self.c, &buf, 50) catch unreachable;
+            const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
             var off: usize = 0;
             while (off < n) {
                 const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
@@ -53,6 +56,9 @@ const Answerer = struct {
         switch (@as(abi.EventType, @fromBackingInt(@intCast(ev.type)))) {
             .request => {},
             .abort => {
+                const ab: *const abi.AbortEvent = @ptrCast(@alignCast(rec.ptr));
+                self.last_abort_reason.store(ab.reason, .release);
+                self.last_abort_status.store(ab.status, .release);
                 self.last_abort.store(ev.handle, .release);
                 _ = self.aborts.fetchAdd(1, .monotonic);
                 return;
@@ -93,7 +99,7 @@ const Answerer = struct {
                 _ = try engine.streamWrite(e, h, big[0..1000], true);
                 try engine.streamEnd(e, h, &.{.{ .name = .of("x-t"), .value = .of("done") }});
             },
-            // anole_respond_fd is not on Windows (std.c.open does not exist there).
+            // anole_req_respond_fd is not on Windows (std.c.open does not exist there).
             4 => if (comptime builtin.os.tag == .windows) {
                 try engine.respond(e, h, 200, text, "world", false);
             } else {
@@ -104,6 +110,8 @@ const Answerer = struct {
             },
             5 => self.held.store(h, .release),
             6 => try engine.respond(e, h, 200, text, &big, true),
+            // anole_req_abort: the stream is reset, the connection stays.
+            8 => try engine.abort(e, h),
             // Reads the body, answers, and checks the answered handle is
             // gone for reads too (the body may live in the request's
             // memory, which goes with the answer).
@@ -135,6 +143,7 @@ const routes =
     \\  {"method": "GET", "path": "/hold", "handler": 5},
     \\  {"method": "GET", "path": "/borrow", "handler": 6},
     \\  {"method": "GET", "path": "/short", "handler": 5, "timeout_ms": 100},
+    \\  {"method": "GET", "path": "/abort", "handler": 8},
     \\  {"method": "POST", "path": "/late", "handler": 7}
     \\]
 ;
@@ -224,7 +233,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 const forged_ws: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 2) << 28) | 1;
                 if (comptime features.websocket) {
                     try std.testing.expectError(error.Gone, engine.ws.send(a.e, forged_ws, abi.WS_TEXT, "x", false));
-                    try std.testing.expectError(error.Gone, engine.ws.close(a.e, forged_ws, 1000, ""));
+                    try std.testing.expectError(error.Over, engine.ws.close(a.e, forged_ws, 1000, ""));
                     try std.testing.expectError(error.Gone, engine.ws.subscribe(a.e, forged_ws, "t", true));
                 }
                 if (comptime builtin.os.tag != .windows) {
@@ -275,6 +284,29 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 const h = a.held.load(.acquire);
                 try std.testing.expect(h != 0);
                 try std.testing.expectError(error.Gone, engine.respond(a.e, h, 200, &.{}, "", false));
+                // The consumer hears why: the deadline, with the 504 sent.
+                for (0..1000) |_| {
+                    if (a.last_abort.load(.acquire) == h) break;
+                    try io.sleep(.fromMilliseconds(2), .awake);
+                } else return error.TimedOut;
+                try std.testing.expectEqual(@as(u32, abi.ABORT_DEADLINE), a.last_abort_reason.load(.acquire));
+                try std.testing.expectEqual(@as(u32, 504), a.last_abort_status.load(.acquire));
+            }
+
+            step = "abort";
+            // anole_req_abort: this stream is reset (CANCEL / H3_REQUEST_CANCELLED)
+            // and the connection serves the next request.
+            {
+                const s = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },                                 .{ .name = ":path", .value = "/abort" },
+                    .{ .name = ":scheme", .value = if (proto == .h2) "http" else "https" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer s.release();
+                if (s.waitHead()) |_| return error.AbortedRequestAnswered else |_| {}
+                const status, const out, const s2 = try get(conn, arena, "GET", "/hello/9", null);
+                defer s2.release();
+                try std.testing.expectEqual(@as(u16, 200), status);
+                try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "hello /hello/9 {d}", .{version}), out);
             }
 
             step = "reset";
@@ -302,6 +334,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                     try io.sleep(.fromMilliseconds(2), .awake);
                 } else return error.TimedOut;
                 try std.testing.expectError(error.Gone, engine.respond(a.e, held, 200, &.{}, "", false));
+                try std.testing.expectEqual(@as(u32, abi.ABORT_CLIENT), a.last_abort_reason.load(.acquire));
             }
         }
 
@@ -351,7 +384,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             defer rt.deinit();
             const io = rt.io();
             // HTTP/3's UDP port comes after the listeners'.
-            var f = try io.concurrent(check, .{ &a, e.ports.items[if (proto == .h2) 0 else 1], io });
+            var f = try io.concurrent(check, .{ &a, e.port(if (proto == .h2) 0 else 1), io });
             try f.await(io);
             try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
 
@@ -405,8 +438,9 @@ const WtAnswerer = struct {
 
     fn run(self: *WtAnswerer) void {
         var buf: [256 * 1024]u8 align(8) = undefined;
+        var need: u32 = 0;
         while (!self.stop.load(.acquire)) {
-            const n = engine.pollWait(self.c, &buf, 50) catch unreachable;
+            const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
             var off: usize = 0;
             while (off < n) {
                 const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
@@ -450,18 +484,18 @@ const WtAnswerer = struct {
             },
             .wt_stream => {
                 const se: *const abi.WtStreamEvent = @ptrCast(@alignCast(rec.ptr));
-                try self.streams.put(alloc, h, .{ .uni = se.flags & abi.WT_UNI != 0, .session = se.session });
+                try self.streams.put(alloc, h, .{ .uni = se.flags & abi.WT_F_UNI != 0, .session = se.session });
             },
             .wt_data => {
                 const de: *const abi.WtDataEvent = @ptrCast(@alignCast(rec.ptr));
                 const ent = self.streams.getPtr(h) orelse return error.UnknownStream;
                 const data = str(rec, de.data);
-                const fin = de.flags & abi.WT_FIN != 0;
+                const fin = de.flags & abi.WT_F_FIN != 0;
                 if (ent.uni) {
                     try ent.got.appendSlice(alloc, data);
                     if (fin) {
                         var out: [64]u8 = undefined;
-                        try engine.wt.sendDatagram(e, ent.session, try std.fmt.bufPrint(&out, "uni:{d}", .{ent.got.items.len}));
+                        try engine.wt.sendDatagram(e, ent.session, try std.fmt.bufPrint(&out, "uni:{d}", .{ent.got.items.len}), false);
                         try self.forget(h);
                     }
                 } else {
@@ -475,7 +509,7 @@ const WtAnswerer = struct {
             .wt_datagram => {
                 const de: *const abi.WtDatagramEvent = @ptrCast(@alignCast(rec.ptr));
                 var out: [256]u8 = undefined;
-                try engine.wt.sendDatagram(e, h, try std.fmt.bufPrint(&out, "echo:{s}", .{str(rec, de.data)}));
+                try engine.wt.sendDatagram(e, h, try std.fmt.bufPrint(&out, "echo:{s}", .{str(rec, de.data)}), false);
             },
             .wt_stream_reset => {
                 const ce: *const abi.WtCodeEvent = @ptrCast(@alignCast(rec.ptr));
@@ -498,7 +532,7 @@ const WtAnswerer = struct {
                 self.close_by.store(ce.by, .release);
                 // The session and its streams are gone for every call.
                 if (engine.wt.openStream(e, h, false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
-                if (engine.wt.sendDatagram(e, h, "x")) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                if (engine.wt.sendDatagram(e, h, "x", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
                 var it = self.streams.iterator();
                 while (it.next()) |kv| if (kv.value_ptr.session == h) {
                     if (engine.wt.write(e, kv.key_ptr.*, "x", false, false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
@@ -618,11 +652,12 @@ fn wtCheck(a: *WtAnswerer, port: u16, io: std.Io, keep: *?*anole.webtransport.Se
         const forged_session: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 4) << 28) | 1;
         const forged_stream: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 5) << 28) | 1;
         try std.testing.expectError(error.Gone, engine.wt.openStream(a.e, forged_session, false));
-        try std.testing.expectError(error.Gone, engine.wt.close(a.e, forged_session, 0, ""));
+        try std.testing.expectError(error.Over, engine.wt.close(a.e, forged_session, 0, ""));
         try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false, false));
-        try std.testing.expectError(error.Gone, engine.wt.streamOp(a.e, forged_stream, .release, 0));
-        // A request handle is not a session.
-        try std.testing.expectError(error.Gone, engine.wt.sendDatagram(a.e, 1, "x"));
+        try std.testing.expectError(error.Over, engine.wt.streamOp(a.e, forged_stream, .release, 0));
+        // A request handle is not a session, and 0 is no handle: misuse.
+        try std.testing.expectError(error.WrongKind, engine.wt.sendDatagram(a.e, 1, "x", false));
+        try std.testing.expectError(error.WrongKind, engine.wt.sendDatagram(a.e, 0, "x", false));
     }
 
     step = "a session left open for the drain";
@@ -680,7 +715,7 @@ test "capi engine: WebTransport sessions, streams both ways, datagrams, close, d
     const io = rt.io();
     var second: ?*anole.webtransport.Session = null;
     var conn: ?*anole.h3.ClientConnection = null;
-    var f = try io.concurrent(wtCheck, .{ &a, e.ports.items[1], io, &second, &conn });
+    var f = try io.concurrent(wtCheck, .{ &a, e.port(1), io, &second, &conn });
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), e.stats().wt_sessions);
@@ -707,8 +742,9 @@ const PeerAnswerer = struct {
 
     fn run(self: *PeerAnswerer) void {
         var buf: [64 * 1024]u8 align(8) = undefined;
+        var need: u32 = 0;
         while (!self.stop.load(.acquire)) {
-            const n = engine.pollWait(self.c, &buf, 50) catch unreachable;
+            const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
             var off: usize = 0;
             while (off < n) {
                 const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
@@ -726,13 +762,11 @@ const PeerAnswerer = struct {
         if (@as(abi.EventType, @fromBackingInt(@intCast(ev.type))) != .request) return;
         const r: *const abi.RequestEvent = @ptrCast(@alignCast(rec.ptr));
         const has = r.flags & abi.REQ_PEER_CERT != 0;
-        if (has != (r.peer_cert != 0)) return error.FlagAndOffsetDisagree;
+        if (has != (r.peer_cert.len != 0)) return error.FlagAndSpanDisagree;
         var body: []const u8 = "none";
-        if (r.peer_cert != 0) {
-            if (r.peer_cert % 4 != 0 or r.peer_cert + 4 > rec.len) return error.BadOffset;
-            const len = std.mem.readInt(u32, rec[r.peer_cert..][0..4], .little);
-            if (r.peer_cert + 4 + len > rec.len) return error.BadLength;
-            body = rec[r.peer_cert + 4 ..][0..len];
+        if (r.peer_cert.len != 0) {
+            if (r.peer_cert.off + r.peer_cert.len > rec.len) return error.BadSpan;
+            body = rec[r.peer_cert.off..][0..r.peer_cert.len];
         }
         try engine.respond(self.e, ev.handle, 200, &.{}, body, false);
     }
@@ -802,9 +836,9 @@ const TlsCheck = struct {
     fn run(e: *engine.Engine, io: std.Io, server: *const anole.tls.Pem, client: *const anole.tls.Pem, next: *const anole.tls.Pem, dir_path: []const u8) !void {
         var step: []const u8 = "require";
         errdefer std.debug.print("tls check failed at {s}\n", .{step});
-        const required = e.ports.items[0];
-        const requested = e.ports.items[1];
-        const quic = e.ports.items[2];
+        const required = e.port(0);
+        const requested = e.port(1);
+        const quic = e.port(2);
         var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io).toSeconds(), client.cert);
         defer bundle.deinit(alloc);
         const der = bundle.bytes.items;
@@ -1092,4 +1126,243 @@ test "parse: proxy, request, response, http2, errors groups reach ServerOptions"
     try std.testing.expectEqual(anole.http.ErrorFormat.text, cfg.errors);
     try e.drain();
     try std.testing.expect(e.wait(5000));
+}
+
+// ---------------------------------------------------------------------------
+// Rings, rooms and records (C ABI 0.7)
+
+/// An engine with one executor, a consumer and a ring of `queue` entries,
+/// started, for the tests that post records straight onto its ring.
+fn ringEngine(comptime queue: u32) !struct { *engine.Engine, *engine.Consumer } {
+    const json = std.fmt.comptimePrint(
+        \\{{"executors": 1, "limits": {{"queue": {d}}}, "timeouts": {{"shutdown_ms": 200}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "routes": [{{"path": "/x", "handler": 1}}]}}
+    , .{queue});
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    errdefer e.destroy();
+    const c = try e.attach(null, null, false);
+    try e.start();
+    return .{ e, c };
+}
+
+/// Counts what a poll returns, by event type.
+fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32, timeout_ms: u64) !void {
+    var buf: [64 * 1024]u8 align(8) = undefined;
+    var need: u32 = 0;
+    var total: u32 = 0;
+    const tio = engine.threadedIo();
+    var waited: u64 = 0;
+    while (total < want) {
+        const n = engine.poll(c, &buf, true, &need) catch return error.TooBig;
+        if (n == 0) {
+            if (waited >= timeout_ms) return error.TimedOut;
+            try std.Io.sleep(tio, .fromMilliseconds(5), .awake);
+            waited += 5;
+            continue;
+        }
+        var off: usize = 0;
+        while (off < n) {
+            const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+            if (ev.type < counts.len) counts[ev.type] += 1;
+            total += 1;
+            off += ev.len;
+        }
+    }
+}
+
+fn postMany(x: *engine.Exec, n: u32, posted: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+    for (0..n) |_| {
+        const rec = engine.newRecord(@sizeOf(abi.Event), .writable, 7) catch return;
+        x.postRecord(rec, true);
+        _ = posted.fetchAdd(1, .release);
+    }
+}
+
+test "capi engine: a full ring parks the executor on the room futex" {
+    const e, const c = try ringEngine(2);
+    defer e.destroy();
+    const x = &e.execs[0];
+    var posted: std.atomic.Value(u32) = .init(0);
+    // One executor: the task runs on it.
+    var f = try e.io.concurrent(postMany, .{ x, 8, &posted });
+    // The consumer does not poll: two fit the ring, the task waits.
+    const tio = engine.threadedIo();
+    try std.Io.sleep(tio, .fromMilliseconds(300), .awake);
+    try std.testing.expectEqual(@as(u32, 2), posted.load(.acquire));
+    // Parked on the futex, not spinning on a yield (that gave thousands).
+    try std.testing.expect(x.room_wakeups.load(.monotonic) < 10);
+    // Polling makes room, and all eight arrive.
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 8, 3000);
+    try f.await(e.io);
+    try std.testing.expectEqual(@as(u32, 8), counts[@backingInt(abi.EventType.writable)]);
+}
+
+fn postAdvisory(x: *engine.Exec) std.Io.Cancelable!void {
+    // The ring fills with records that wait for room...
+    for (0..2) |_| x.postRecord(engine.newRecord(@sizeOf(abi.Event), .body, 1) catch return, true);
+    // ...and these must still arrive: nothing is dropped for a full ring.
+    for (0..4) |i| x.postAbort(100 + i, abi.ABORT_CLIENT, 0);
+    for (0..2) |i| x.postEvent(.writable, 200 + i);
+}
+
+test "capi engine: advisory events are never dropped" {
+    const e, const c = try ringEngine(2);
+    defer e.destroy();
+    const x = &e.execs[0];
+    var f = try e.io.concurrent(postAdvisory, .{x});
+    // From another thread too: the overflow list takes it.
+    x.postEvent(.writable, 300);
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 9, 3000);
+    try f.await(e.io);
+    try std.testing.expectEqual(@as(u32, 2), counts[@backingInt(abi.EventType.body)]);
+    try std.testing.expectEqual(@as(u32, 4), counts[@backingInt(abi.EventType.abort)]);
+    try std.testing.expectEqual(@as(u32, 3), counts[@backingInt(abi.EventType.writable)]);
+}
+
+fn postSentMany(x: *engine.Exec, n: u32) std.Io.Cancelable!void {
+    for (0..n) |i| {
+        const rec = engine.newSent("data") catch return;
+        x.postSentRec(1000 + i, rec);
+    }
+}
+
+test "capi engine: SENT is never lost to a full ring" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    const x = &e.execs[0];
+    var f = try e.io.concurrent(postSentMany, .{ x, 64 });
+    // The consumer does not poll while all 64 are posted.
+    try std.Io.sleep(engine.threadedIo(), .fromMilliseconds(200), .awake);
+    try f.await(e.io);
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 64, 3000);
+    try std.testing.expectEqual(@as(u32, 64), counts[@backingInt(abi.EventType.sent)]);
+}
+
+fn getStatus(io: std.Io, port: u16, path: []const u8) !u16 {
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    try s.waitHead();
+    return s.status;
+}
+
+fn readyzCheck(io: std.Io, e: *engine.Engine) !void {
+    const pub_port = e.port(0);
+    const admin_port = e.port(1);
+    // The check starts not ready; the routes are on the admin listener only.
+    try std.testing.expectEqual(@as(u16, 503), try getStatus(io, admin_port, "/readyz"));
+    try std.testing.expectEqual(@as(u16, 200), try getStatus(io, admin_port, "/healthz"));
+    try std.testing.expectEqual(@as(u16, 404), try getStatus(io, pub_port, "/readyz"));
+    try e.setReady("app", true);
+    try std.testing.expectEqual(@as(u16, 200), try getStatus(io, admin_port, "/readyz"));
+    try std.testing.expectError(error.UnknownCheck, e.setReady("nope", true));
+    try e.setReady("app", false);
+    try std.testing.expectEqual(@as(u16, 503), try getStatus(io, admin_port, "/readyz"));
+}
+
+test "capi engine: /readyz honours readiness checks and the health listener" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    const json =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200},
+        \\ "listeners": [{"name": "public", "address": "127.0.0.1", "port": 0},
+        \\               {"name": "admin", "address": "127.0.0.1", "port": 0}],
+        \\ "observe": {"health": {"checks": ["app"], "listener": "admin"}}}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(readyzCheck, .{ io, e });
+    try f.await(io);
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+}
+
+test "capi engine: a request cut by the drain's deadline aborts with reason DRAIN" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    const json = "{\"executors\": 2, \"timeouts\": {\"request_ms\": 10000, \"shutdown_ms\": 200}," ++
+        "\"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}]," ++ routes ++ "}";
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    try e.start();
+    var a: Answerer = .{ .e = e, .c = c, .file_path = "" };
+    const t = try std.Thread.spawn(.{}, Answerer.run, .{&a});
+    defer {
+        a.stop.store(true, .release);
+        t.join();
+    }
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(drainCheck, .{ &a, e, e.port(0), io });
+    try f.await(io);
+    try std.testing.expect(e.wait(5000));
+}
+
+fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
+    defer conn.close();
+    a.held.store(0, .release);
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/hold" },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    var held: u64 = 0;
+    for (0..500) |_| {
+        held = a.held.load(.acquire);
+        if (held != 0) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(held != 0);
+    // The drain's deadline (shutdown_ms) cuts the request nobody answered.
+    try e.drain();
+    for (0..1500) |_| {
+        if (a.last_abort.load(.acquire) == held) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    } else return error.TimedOut;
+    try std.testing.expectEqual(@as(u32, abi.ABORT_DRAIN), a.last_abort_reason.load(.acquire));
+}
+
+test "capi: every ServerError and TlsLoadError name is an ABI error token" {
+    // The server design's named error sets (`anole.ServerError`,
+    // `anole.TlsLoadError`): their member names are the tokens verbatim.
+    if (comptime !@hasDecl(anole, "ServerError")) return error.SkipZigTest;
+    inline for (.{ anole.ServerError, anole.TlsLoadError }) |Set| {
+        const names = @typeInfo(Set).error_set.error_names.?;
+        inline for (names) |name| {
+            var found = false;
+            for (abi.error_names) |t| found = found or std.mem.eql(u8, t, name);
+            if (!found) {
+                std.debug.print("{s} is not in abi.error_names\n", .{name});
+                return error.NotAToken;
+            }
+        }
+    }
 }

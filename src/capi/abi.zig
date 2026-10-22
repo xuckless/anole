@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 6;
+pub const version_minor: u32 = 7;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -39,21 +39,21 @@ pub const Header = extern struct {
     value: Str,
 };
 
-pub const SERVER_SIGNALS: u32 = 1;
+pub const SERVER_F_SIGNALS: u32 = 1;
 
-pub const LOG_ERROR: i32 = 1;
-pub const LOG_WARN: i32 = 2;
-pub const LOG_INFO: i32 = 3;
-pub const LOG_DEBUG: i32 = 4;
+pub const LOG_ERROR: u32 = 1;
+pub const LOG_WARN: u32 = 2;
+pub const LOG_INFO: u32 = 3;
+pub const LOG_DEBUG: u32 = 4;
 
-pub const LogFn = *const fn (ud: ?*anyopaque, level: c_int, scope: Str, msg: Str) callconv(.c) void;
+pub const LogFn = *const fn (ud: ?*anyopaque, level: u32, scope: Str, msg: Str) callconv(.c) void;
 pub const WakeFn = *const fn (ud: ?*anyopaque) callconv(.c) void;
 
 pub const ServerOptions = extern struct {
     size: usize,
     config_json: Str,
     flags: u32,
-    log_level: i32,
+    log_level: u32,
     log: ?LogFn,
     log_ud: ?*anyopaque,
 };
@@ -76,7 +76,7 @@ pub const Stats = extern struct {
     wt_datagrams_dropped: u64 = 0,
 };
 
-pub const CONSUMER_SHARED: u32 = 1;
+pub const CONSUMER_F_SHARED: u32 = 1;
 
 pub const ConsumerOptions = extern struct {
     size: usize,
@@ -86,6 +86,7 @@ pub const ConsumerOptions = extern struct {
 };
 
 pub const EventType = enum(u32) {
+    none = 0,
     request = 1,
     body = 2,
     abort = 3,
@@ -94,7 +95,6 @@ pub const EventType = enum(u32) {
     ws_open = 6,
     ws_message = 7,
     ws_close = 8,
-    ws_drain = 9,
     db_result = 10,
     stopped = 11,
     grpc_call = 12,
@@ -108,6 +108,10 @@ pub const EventType = enum(u32) {
     wt_stream_reset = 25,
     wt_stream_stop = 26,
     wt_datagram = 27,
+    /// http-realtime: a WebSocket upgrade the consumer accepts or refuses.
+    ws_upgrade = 40,
+    /// http-realtime: the drain started.
+    draining = 41,
 };
 
 pub const Event = extern struct {
@@ -128,7 +132,55 @@ pub const REQ_EARLY_DATA: u16 = 8;
 /// The client presented a certificate (mutual TLS): `peer_cert` is set.
 pub const REQ_PEER_CERT: u16 = 16;
 /// anole_server_reload_tls: the two arguments are PEM text, not paths.
-pub const TLS_PEM: u32 = 1;
+pub const TLS_F_PEM: u32 = 1;
+
+pub const METHOD_OTHER: u8 = 0;
+pub const METHOD_GET: u8 = 1;
+pub const METHOD_HEAD: u8 = 2;
+pub const METHOD_POST: u8 = 3;
+pub const METHOD_PUT: u8 = 4;
+pub const METHOD_DELETE: u8 = 5;
+pub const METHOD_CONNECT: u8 = 6;
+pub const METHOD_OPTIONS: u8 = 7;
+pub const METHOD_TRACE: u8 = 8;
+pub const METHOD_PATCH: u8 = 9;
+
+pub const ABORT_CLIENT: u16 = 1;
+pub const ABORT_DEADLINE: u16 = 2;
+pub const ABORT_BODY: u16 = 3;
+pub const ABORT_DRAIN: u16 = 4;
+pub const ABORT_SERVER: u16 = 5;
+
+/// ANOLE_EV_ABORT.
+pub const AbortEvent = extern struct {
+    ev: Event,
+    reason: u16,
+    status: u16,
+    reserved: u32 = 0,
+};
+
+pub const LISTENER_F_TLS: u32 = 1;
+pub const LISTENER_F_HTTP1: u32 = 2;
+pub const LISTENER_F_HTTP2: u32 = 4;
+pub const LISTENER_F_HTTP3: u32 = 8;
+pub const LISTENER_F_UNIX: u32 = 16;
+pub const LISTENER_F_PROXY_PROTOCOL: u32 = 32;
+pub const LISTENER_PENDING: u32 = 0;
+pub const LISTENER_LISTENING: u32 = 1;
+pub const LISTENER_FAILED: u32 = 2;
+pub const LISTENER_CLOSED: u32 = 3;
+
+pub const ListenerInfo = extern struct {
+    size: usize,
+    name: Str = .{},
+    address: Str = .{},
+    port: u16 = 0,
+    udp_port: u16 = 0,
+    flags: u32 = 0,
+    state: u32 = 0,
+    error_errno: i32 = 0,
+    error_name: Str = .{},
+};
 
 pub const RequestEvent = extern struct {
     ev: Event,
@@ -146,10 +198,16 @@ pub const RequestEvent = extern struct {
     claims: Span,
     nheaders: u16,
     nparams: u16,
-    /// Mutual TLS: the offset of the client's certificate in the record, a
-    /// little-endian u32 length then the DER; 0 when there is none.
-    peer_cert: u32 = 0,
+    /// Where the header spans start (then the parameter spans).
+    spans_off: u32,
     content_length: u64,
+    /// Mutual TLS: the client's certificate (DER), empty when none.
+    peer_cert: Span = .{},
+    /// Time left before Anole answers 504, measured when polled; -1 when
+    /// no deadline applies.
+    timeout_us: i64 = -1,
+    /// ANOLE_EV_WS_OPEN: the selected subprotocol.
+    subprotocol: Span = .{},
 };
 
 pub const SentEvent = extern struct {
@@ -158,8 +216,8 @@ pub const SentEvent = extern struct {
     len: u64,
 };
 
-pub const WS_TEXT: c_int = 1;
-pub const WS_BINARY: c_int = 2;
+pub const WS_TEXT: u32 = 1;
+pub const WS_BINARY: u32 = 2;
 
 pub const WsMessageEvent = extern struct {
     ev: Event,
@@ -177,9 +235,9 @@ pub const WsCloseEvent = extern struct {
 };
 
 /// `anole_wt_open_stream`'s flag and ANOLE_EV_WT_STREAM's: one-way.
-pub const WT_UNI: u32 = 1;
+pub const WT_F_UNI: u32 = 1;
 /// `anole_wt_stream_write`'s flag and ANOLE_EV_WT_DATA's: the end.
-pub const WT_FIN: u32 = 2;
+pub const WT_F_FIN: u32 = 2;
 pub const WT_CLOSED_LOCAL: u32 = 0;
 pub const WT_CLOSED_PEER: u32 = 1;
 pub const WT_CLOSED_CONNECTION: u32 = 2;
@@ -220,19 +278,19 @@ pub const WtCloseEvent = extern struct {
     reason: Span,
 };
 
-pub const DB_NULL: u32 = 0;
-pub const DB_INT: u32 = 1;
-pub const DB_FLOAT: u32 = 2;
-pub const DB_TEXT: u32 = 3;
-pub const DB_BLOB: u32 = 4;
-pub const DB_BOOL: u32 = 5;
+pub const DB_TYPE_NULL: u32 = 0;
+pub const DB_TYPE_INT: u32 = 1;
+pub const DB_TYPE_FLOAT: u32 = 2;
+pub const DB_TYPE_TEXT: u32 = 3;
+pub const DB_TYPE_BLOB: u32 = 4;
+pub const DB_TYPE_BOOL: u32 = 5;
 /// Cells of a Redis reply only: `v.i` items (an array), or `v.i` pairs
 /// (a map) follow; an error reply inside another (EXEC's), as text.
-pub const DB_ARRAY: u32 = 6;
-pub const DB_MAP: u32 = 7;
-pub const DB_ERROR: u32 = 8;
+pub const DB_TYPE_ARRAY: u32 = 6;
+pub const DB_TYPE_MAP: u32 = 7;
+pub const DB_TYPE_ERROR: u32 = 8;
 /// A BSON document (MongoDB): its bytes in the span.
-pub const DB_BSON: u32 = 9;
+pub const DB_TYPE_BSON: u32 = 9;
 
 pub const DbValue = extern struct {
     type: u32,
@@ -240,10 +298,10 @@ pub const DbValue = extern struct {
     v: extern union { i: i64, f: f64, s: Str },
 };
 
-pub const DB_WRITE: u32 = 1;
-pub const DB_COALESCE: u32 = 2;
-pub const DB_NO_PREPARE: u32 = 4;
-pub const DB_DROP_EMPTY: u32 = 8;
+pub const DB_F_WRITE: u32 = 1;
+pub const DB_F_COALESCE: u32 = 2;
+pub const DB_F_NO_PREPARE: u32 = 4;
+pub const DB_F_DROP_EMPTY: u32 = 8;
 
 pub const DbOptions = extern struct {
     size: usize,
@@ -298,15 +356,15 @@ pub const DbCell = extern struct {
     v: extern union { i: i64, f: f64, s: Span },
 };
 
-pub const POLL_NOARM: u32 = 1;
+pub const POLL_F_NOARM: u32 = 1;
 pub const BODY_BORROW: u32 = 1;
 
 // ---- gRPC ----------------------------------------------------------------
 
-pub const GRPC_UNARY: u8 = 0;
-pub const GRPC_SERVER_STREAMING: u8 = 1;
-pub const GRPC_CLIENT_STREAMING: u8 = 2;
-pub const GRPC_BIDI_STREAMING: u8 = 3;
+pub const GRPC_KIND_UNARY: u8 = 0;
+pub const GRPC_KIND_SERVER_STREAMING: u8 = 1;
+pub const GRPC_KIND_CLIENT_STREAMING: u8 = 2;
+pub const GRPC_KIND_BIDI_STREAMING: u8 = 3;
 
 pub const GRPC_PROTOCOL_GRPC: u8 = 0;
 pub const GRPC_PROTOCOL_GRPC_WEB: u8 = 1;
@@ -316,19 +374,38 @@ pub const GRPC_PROTOCOL_CONNECT_STREAM: u8 = 4;
 pub const GRPC_PROTOCOL_HTTP_JSON: u8 = 5;
 
 pub const GRPC_CALL_MESSAGE: u16 = 1;
+pub const GRPC_CALL_PEER_CERT: u16 = 2;
 pub const GRPC_CALL_SECURE: u16 = 4;
 pub const GRPC_CALL_EARLY_DATA: u16 = 8;
 pub const GRPC_CALL_JSON: u16 = 16;
 pub const GRPC_CALL_COMPRESSED: u16 = 32;
 
-pub const GRPC_SEND_FINISH: u32 = 2;
+pub const GRPC_F_FINISH: u32 = 2;
 
-pub const GRPC_HEALTH_UNKNOWN: c_int = 0;
-pub const GRPC_HEALTH_SERVING: c_int = 1;
-pub const GRPC_HEALTH_NOT_SERVING: c_int = 2;
+pub const GRPC_STATUS_OK: u32 = 0;
+pub const GRPC_STATUS_CANCELLED: u32 = 1;
+pub const GRPC_STATUS_UNKNOWN: u32 = 2;
+pub const GRPC_STATUS_INVALID_ARGUMENT: u32 = 3;
+pub const GRPC_STATUS_DEADLINE_EXCEEDED: u32 = 4;
+pub const GRPC_STATUS_NOT_FOUND: u32 = 5;
+pub const GRPC_STATUS_ALREADY_EXISTS: u32 = 6;
+pub const GRPC_STATUS_PERMISSION_DENIED: u32 = 7;
+pub const GRPC_STATUS_RESOURCE_EXHAUSTED: u32 = 8;
+pub const GRPC_STATUS_FAILED_PRECONDITION: u32 = 9;
+pub const GRPC_STATUS_ABORTED: u32 = 10;
+pub const GRPC_STATUS_OUT_OF_RANGE: u32 = 11;
+pub const GRPC_STATUS_UNIMPLEMENTED: u32 = 12;
+pub const GRPC_STATUS_INTERNAL: u32 = 13;
+pub const GRPC_STATUS_UNAVAILABLE: u32 = 14;
+pub const GRPC_STATUS_DATA_LOSS: u32 = 15;
+pub const GRPC_STATUS_UNAUTHENTICATED: u32 = 16;
 
-/// ANOLE_EV_GRPC_CALL: followed by `anole_span metadata[2 * nmetadata]`,
-/// then the bytes the spans point into.
+pub const GRPC_HEALTH_UNKNOWN: u32 = 0;
+pub const GRPC_HEALTH_SERVING: u32 = 1;
+pub const GRPC_HEALTH_NOT_SERVING: u32 = 2;
+
+/// ANOLE_EV_GRPC_CALL: followed, at `metadata_off`, by
+/// `anole_span metadata[2 * nmetadata]`, then the bytes the spans point into.
 pub const GrpcCallEvent = extern struct {
     ev: Event,
     route_id: u32,
@@ -347,24 +424,29 @@ pub const GrpcCallEvent = extern struct {
     id: Span,
     claims: Span,
     timeout_us: i64,
+    metadata_off: u32,
+    reserved2: u32 = 0,
+    peer_cert: Span = .{},
 };
 
 /// ANOLE_EV_GRPC_MESSAGE: one request message, followed by its bytes.
 pub const GrpcMessageEvent = extern struct {
     ev: Event,
     route_id: u32,
-    flags: u32 = 0,
+    reserved: u32 = 0,
     data: Span,
 };
 
 comptime {
     std.debug.assert(@sizeOf(Event) == 16);
     std.debug.assert(@sizeOf(Span) == 8);
-    std.debug.assert(@sizeOf(RequestEvent) == 104);
+    std.debug.assert(@sizeOf(RequestEvent) == 128);
+    std.debug.assert(@sizeOf(AbortEvent) == 24);
+    std.debug.assert(@sizeOf(ListenerInfo) == 72);
     std.debug.assert(@sizeOf(SentEvent) == 32);
     std.debug.assert(@sizeOf(WsMessageEvent) == 32);
     std.debug.assert(@sizeOf(WsCloseEvent) == 32);
-    std.debug.assert(@sizeOf(GrpcCallEvent) == 88);
+    std.debug.assert(@sizeOf(GrpcCallEvent) == 104);
     std.debug.assert(@sizeOf(GrpcMessageEvent) == 32);
     std.debug.assert(@sizeOf(DbValue) == 24);
     std.debug.assert(@sizeOf(DbOptions) == 40);
@@ -383,3 +465,223 @@ pub const record_align = 8;
 pub fn alignUp(n: usize) usize {
     return (n + record_align - 1) & ~@as(usize, record_align - 1);
 }
+
+// ---- the machine-readable description (include/anole.abi.json) -------------
+//
+// tools/capi_abi_json.zig turns these tables, and the constants and records
+// above, into the committed `include/anole.abi.json`. This file stays the
+// single source.
+
+/// Every extern struct `anole.h` declares, in header order.
+pub const records = .{
+    .{ "anole_str", Str },
+    .{ "anole_header", Header },
+    .{ "anole_server_options", ServerOptions },
+    .{ "anole_stats", Stats },
+    .{ "anole_consumer_options", ConsumerOptions },
+    .{ "anole_event", Event },
+    .{ "anole_span", Span },
+    .{ "anole_request_event", RequestEvent },
+    .{ "anole_abort_event", AbortEvent },
+    .{ "anole_sent_event", SentEvent },
+    .{ "anole_ws_message_event", WsMessageEvent },
+    .{ "anole_ws_close_event", WsCloseEvent },
+    .{ "anole_grpc_call_event", GrpcCallEvent },
+    .{ "anole_grpc_message_event", GrpcMessageEvent },
+    .{ "anole_wt_stream_event", WtStreamEvent },
+    .{ "anole_wt_data_event", WtDataEvent },
+    .{ "anole_wt_code_event", WtCodeEvent },
+    .{ "anole_wt_datagram_event", WtDatagramEvent },
+    .{ "anole_wt_close_event", WtCloseEvent },
+    .{ "anole_listener_info", ListenerInfo },
+    .{ "anole_db_value", DbValue },
+    .{ "anole_db_options", DbOptions },
+    .{ "anole_db_cell", DbCell },
+    .{ "anole_db_result_event", DbResultEvent },
+};
+
+/// A variable part of a record, reached through an offset or a span in it.
+pub const ArrayInfo = struct {
+    record: []const u8,
+    name: []const u8,
+    /// Exactly one of the three: the field holding the offset, the array it
+    /// follows, or the span field holding it.
+    at: ?[]const u8 = null,
+    after: ?[]const u8 = null,
+    span: ?[]const u8 = null,
+    item: []const u8,
+    count: []const u8,
+};
+
+pub const arrays = [_]ArrayInfo{
+    .{ .record = "anole_request_event", .name = "headers", .at = "spans_off", .item = "anole_span", .count = "2*nheaders" },
+    .{ .record = "anole_request_event", .name = "params", .after = "headers", .item = "anole_span", .count = "2*nparams" },
+    .{ .record = "anole_grpc_call_event", .name = "metadata", .at = "metadata_off", .item = "anole_span", .count = "2*nmetadata" },
+    .{ .record = "anole_db_result_event", .name = "columns", .span = "columns", .item = "anole_span", .count = "ncolumns" },
+    .{ .record = "anole_db_result_event", .name = "cells", .span = "cells", .item = "anole_db_cell", .count = "nrows*ncolumns" },
+};
+
+pub const HandleKindInfo = struct { kind: u8, name: []const u8, c_type: []const u8 };
+
+/// The kind lives in bits 28-31 of a handle (`engine.Handle`). 7 is
+/// reserved for a per-query handle; 8-15 are reserved.
+pub const handle_kinds = [_]HandleKindInfo{
+    .{ .kind = 1, .name = "request", .c_type = "anole_req" },
+    .{ .kind = 2, .name = "websocket", .c_type = "anole_ws" },
+    .{ .kind = 3, .name = "grpc_call", .c_type = "anole_grpc_call" },
+    .{ .kind = 4, .name = "wt_session", .c_type = "anole_wt" },
+    .{ .kind = 5, .name = "wt_stream", .c_type = "anole_wt_stream" },
+    .{ .kind = 6, .name = "db_tx", .c_type = "anole_db_tx" },
+};
+
+pub const EventInfo = struct {
+    type: u32,
+    name: []const u8,
+    record: []const u8,
+    /// Handle kind names (`handle_kinds`); empty: ev.handle is 0.
+    handles: []const []const u8 = &.{},
+    /// What the consumer owes for the event, if anything.
+    obligation: ?[]const u8 = null,
+};
+
+pub const events = [_]EventInfo{
+    .{ .type = 0, .name = "ANOLE_EV_NONE", .record = "anole_event" },
+    .{ .type = 1, .name = "ANOLE_EV_REQUEST", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "answer" },
+    .{ .type = 2, .name = "ANOLE_EV_BODY", .record = "anole_event", .handles = &.{"request"} },
+    .{ .type = 3, .name = "ANOLE_EV_ABORT", .record = "anole_abort_event", .handles = &.{ "request", "grpc_call" } },
+    .{ .type = 4, .name = "ANOLE_EV_WRITABLE", .record = "anole_event", .handles = &.{ "request", "grpc_call", "websocket", "wt_stream" } },
+    .{ .type = 5, .name = "ANOLE_EV_SENT", .record = "anole_sent_event", .handles = &.{ "request", "websocket", "grpc_call", "wt_stream", "wt_session" } },
+    .{ .type = 6, .name = "ANOLE_EV_WS_OPEN", .record = "anole_request_event", .handles = &.{"websocket"} },
+    .{ .type = 7, .name = "ANOLE_EV_WS_MESSAGE", .record = "anole_ws_message_event", .handles = &.{"websocket"} },
+    .{ .type = 8, .name = "ANOLE_EV_WS_CLOSE", .record = "anole_ws_close_event", .handles = &.{"websocket"} },
+    .{ .type = 10, .name = "ANOLE_EV_DB_RESULT", .record = "anole_db_result_event" },
+    .{ .type = 11, .name = "ANOLE_EV_STOPPED", .record = "anole_event" },
+    .{ .type = 12, .name = "ANOLE_EV_GRPC_CALL", .record = "anole_grpc_call_event", .handles = &.{"grpc_call"}, .obligation = "finish" },
+    .{ .type = 13, .name = "ANOLE_EV_GRPC_MESSAGE", .record = "anole_grpc_message_event", .handles = &.{"grpc_call"} },
+    .{ .type = 14, .name = "ANOLE_EV_GRPC_HALF_CLOSE", .record = "anole_event", .handles = &.{"grpc_call"} },
+    .{ .type = 20, .name = "ANOLE_EV_WT_OPEN", .record = "anole_request_event", .handles = &.{"wt_session"} },
+    .{ .type = 21, .name = "ANOLE_EV_WT_CLOSE", .record = "anole_wt_close_event", .handles = &.{"wt_session"} },
+    .{ .type = 22, .name = "ANOLE_EV_WT_DRAIN", .record = "anole_event", .handles = &.{"wt_session"} },
+    .{ .type = 23, .name = "ANOLE_EV_WT_STREAM", .record = "anole_wt_stream_event", .handles = &.{"wt_stream"}, .obligation = "release" },
+    .{ .type = 24, .name = "ANOLE_EV_WT_DATA", .record = "anole_wt_data_event", .handles = &.{"wt_stream"} },
+    .{ .type = 25, .name = "ANOLE_EV_WT_STREAM_RESET", .record = "anole_wt_code_event", .handles = &.{"wt_stream"} },
+    .{ .type = 26, .name = "ANOLE_EV_WT_STREAM_STOP", .record = "anole_wt_code_event", .handles = &.{"wt_stream"} },
+    .{ .type = 27, .name = "ANOLE_EV_WT_DATAGRAM", .record = "anole_wt_datagram_event", .handles = &.{"wt_session"} },
+    .{ .type = 40, .name = "ANOLE_EV_WS_UPGRADE", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "accept or answer" },
+    .{ .type = 41, .name = "ANOLE_EV_DRAINING", .record = "anole_event" },
+};
+
+pub const EventRange = struct { from: u32, to: u32, use: []const u8 };
+
+pub const event_ranges = [_]EventRange{
+    .{ .from = 0, .to = 0, .use = "none: only the header written on ANOLE_E_TOOBIG" },
+    .{ .from = 1, .to = 11, .use = "core (9 retired)" },
+    .{ .from = 12, .to = 19, .use = "gRPC" },
+    .{ .from = 20, .to = 29, .use = "WebTransport" },
+    .{ .from = 30, .to = 39, .use = "database" },
+    .{ .from = 40, .to = 49, .use = "HTTP and WebSocket additions" },
+    .{ .from = 50, .to = 63, .use = "core additions" },
+    .{ .from = 64, .to = 255, .use = "new areas, a block of 16 per area" },
+    .{ .from = 256, .to = 0x7FFFFFFF, .use = "never used" },
+    .{ .from = 0x80000000, .to = 0xFFFFFFFF, .use = "never used by Anole: free for a binding's own synthetic events" },
+};
+
+pub const ConstantGroup = struct { prefix: []const u8, group: []const u8 };
+
+/// Longest matching prefix wins. A constant matching none fails the
+/// generator, so a new prefix must be named here.
+pub const constant_groups = [_]ConstantGroup{
+    .{ .prefix = "ANOLE_E_", .group = "status" },
+    .{ .prefix = "ANOLE_OK", .group = "status" },
+    .{ .prefix = "ANOLE_BUSY", .group = "status" },
+    .{ .prefix = "ANOLE_EV_", .group = "event" },
+    .{ .prefix = "ANOLE_ABORT_", .group = "abort_reason" },
+    .{ .prefix = "ANOLE_LOG_", .group = "log_level" },
+    .{ .prefix = "ANOLE_SERVER_F_", .group = "server_flag" },
+    .{ .prefix = "ANOLE_CONSUMER_F_", .group = "consumer_flag" },
+    .{ .prefix = "ANOLE_POLL_F_", .group = "poll_flag" },
+    .{ .prefix = "ANOLE_BODY_", .group = "body_flag" },
+    .{ .prefix = "ANOLE_TLS_F_", .group = "tls_flag" },
+    .{ .prefix = "ANOLE_LISTENER_F_", .group = "listener_flag" },
+    .{ .prefix = "ANOLE_LISTENER_", .group = "listener_state" },
+    .{ .prefix = "ANOLE_METHOD_", .group = "method" },
+    .{ .prefix = "ANOLE_REQ_", .group = "req_flag" },
+    .{ .prefix = "ANOLE_WS_", .group = "ws_type" },
+    .{ .prefix = "ANOLE_GRPC_KIND_", .group = "grpc_kind" },
+    .{ .prefix = "ANOLE_GRPC_PROTOCOL_", .group = "grpc_protocol" },
+    .{ .prefix = "ANOLE_GRPC_CALL_", .group = "grpc_call_flag" },
+    .{ .prefix = "ANOLE_GRPC_F_", .group = "grpc_send_flag" },
+    .{ .prefix = "ANOLE_GRPC_STATUS_", .group = "grpc_status" },
+    .{ .prefix = "ANOLE_GRPC_HEALTH_", .group = "grpc_health" },
+    .{ .prefix = "ANOLE_WT_F_", .group = "wt_flag" },
+    .{ .prefix = "ANOLE_WT_CLOSED_", .group = "wt_closed_by" },
+    .{ .prefix = "ANOLE_DB_TYPE_", .group = "db_type" },
+    .{ .prefix = "ANOLE_DB_F_", .group = "db_flag" },
+    .{ .prefix = "ANOLE_DB_FROM_", .group = "db_source" },
+    .{ .prefix = "ANOLE_DB_ERR_", .group = "db_error_class" },
+    .{ .prefix = "ANOLE_ABI_", .group = "abi" },
+};
+
+/// The tokens `anole_last_error_name` returns (sorted). Tokens are only
+/// ever added. The member names of `anole.ServerError` and
+/// `anole.TlsLoadError` are tokens verbatim.
+pub const error_names = [_][]const u8{
+    "AccessDenied",
+    "AddressInUse",
+    "AddressNotAvailable",
+    "Again",
+    "CertificateFileUnreadable",
+    "ClientCaFileUnreadable",
+    "Config",
+    "ConsumerWithoutExecutor",
+    "Database",
+    "DatabaseUnavailable",
+    "DuplicateListenerName",
+    "FileNotFound",
+    "Gone",
+    "HqInteropNotAllowed",
+    "Http2NotBuilt",
+    "Http3NeedsHttps",
+    "Http3NeedsTls",
+    "Http3NotBuilt",
+    "InheritedSocketMismatch",
+    "Invalid",
+    "InvalidCertificate",
+    "InvalidClientCa",
+    "InvalidKey",
+    "InvalidListenAddress",
+    "InvalidListenerName",
+    "InvalidProxyNetwork",
+    "InvalidValue",
+    "KeyFileUnreadable",
+    "KeyMismatch",
+    "ListenersAlreadySet",
+    "MissingKey",
+    "NoConsumer",
+    "NoMemory",
+    "NoProtocols",
+    "NoTlsListener",
+    "NotRunning",
+    "OneServerPerProcess",
+    "OutOfMemory",
+    "ReservedNotZero",
+    "RouteConflict",
+    "ServerAlreadyOnThread",
+    "SeveralHttp3Listeners",
+    "State",
+    "SyntaxError",
+    "System",
+    "SystemResources",
+    "Timeout",
+    "TlsNotBuilt",
+    "TooBig",
+    "TooManyListeners",
+    "TooManyOpenFiles",
+    "Unexpected",
+    "UnknownCheck",
+    "UnknownField",
+    "UnknownFlag",
+    "UnknownKey",
+    "Unsupported",
+    "WrongHandleKind",
+};

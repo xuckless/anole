@@ -46,7 +46,7 @@ pub const Config = struct {
         /// "127.0.0.1" (this machine), "" (every interface, IPv6 and IPv4),
         /// "0.0.0.0", "::".
         address: []const u8 = "127.0.0.1",
-        /// 0 picks a free port (`anole_server_port`).
+        /// 0 picks a free port (`anole_server_listener`).
         port: u16 = 8080,
         /// A unix domain socket at this path instead of address and port.
         unix: ?[]const u8 = null,
@@ -65,7 +65,7 @@ pub const Config = struct {
     };
 
     pub const Tls = struct {
-        /// PEM files, read at start (and by anole_server_reload_certificates).
+        /// PEM files, read at start (and by anole_server_reload_tls with both arguments empty).
         cert_file: ?[]const u8 = null,
         key_file: ?[]const u8 = null,
         /// Or PEM text.
@@ -368,6 +368,12 @@ pub const Config = struct {
     pub const Health = struct {
         live: []const u8 = "/healthz",
         ready: []const u8 = "/readyz",
+        /// Readiness flags (at most 16, 1-64 bytes, unique): each starts not
+        /// ready, so /readyz answers 503 naming it until the consumer calls
+        /// anole_server_set_ready.
+        checks: []const []const u8 = &.{},
+        /// Serve both routes only on this listener (404 on the others).
+        listener: ?[]const u8 = null,
     };
 
     pub const Route = struct {
@@ -519,6 +525,11 @@ pub const max_record_payload: u32 = 1 << 30;
 /// What `check` found wrong, for anole_last_error.
 pub const Problem = error{Config};
 
+/// The token for the last `parse` problem on this thread
+/// (`anole_last_error_name`): SyntaxError, UnknownKey, MissingKey or
+/// InvalidValue.
+pub threadlocal var last_problem: []const u8 = "InvalidValue";
+
 pub fn methodOf(name: []const u8) ?http.Method {
     var buf: [16]u8 = undefined;
     if (name.len == 0 or name.len > buf.len) return null;
@@ -533,8 +544,15 @@ pub fn parse(arena: std.mem.Allocator, json: []const u8, why: *std.Io.Writer) Pr
     scanner.enableDiagnostics(&diag);
     const cfg = std.json.parseFromTokenSourceLeaky(Config, arena, &scanner, .{ .allocate = .alloc_always }) catch |err| {
         why.print("config: {t} at line {d} column {d}", .{ err, diag.getLine(), diag.getColumn() }) catch {};
+        last_problem = switch (err) {
+            error.SyntaxError, error.UnexpectedEndOfInput => "SyntaxError",
+            error.UnknownField => "UnknownKey",
+            error.MissingField => "MissingKey",
+            else => "InvalidValue",
+        };
         return error.Config;
     };
+    last_problem = "InvalidValue";
     try check(cfg, why);
     return cfg;
 }
@@ -628,6 +646,19 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (d.mongodb) |m| {
             if (comptime !features.mongodb) return fail(why, "databases[{d}].mongodb: MongoDB is not built in (-Dmongodb)", .{i});
             if (m.ca_file != null and m.ca_pem != null) return fail(why, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
+        }
+    }
+    if (cfg.observe.health) |h| {
+        if (h.checks.len > 16) return fail(why, "observe.health.checks: at most 16", .{});
+        for (h.checks, 0..) |name, i| {
+            if (name.len == 0 or name.len > 64) return fail(why, "observe.health.checks[{d}]: 1-64 bytes", .{i});
+            for (h.checks[0..i]) |other| if (std.mem.eql(u8, other, name))
+                return fail(why, "observe.health.checks[{d}] \"{s}\" is listed twice", .{ i, name });
+        }
+        if (h.listener) |ln| {
+            var found = false;
+            for (cfg.listeners) |l| found = found or (l.name != null and std.mem.eql(u8, l.name.?, ln));
+            if (!found) return fail(why, "observe.health.listener \"{s}\" names no listener (listeners[].name)", .{ln});
         }
     }
     try checkMiddleware(cfg.middleware, "middleware", why);

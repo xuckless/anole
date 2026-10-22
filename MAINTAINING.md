@@ -298,7 +298,10 @@ by hand.
    the same version in build.zig.zon's `.version` and in the MongoDB
    client's handshake metadata (`driver_version` in
    src/mongodb/connection.zig), and point the install snippets (README.md,
-   docs/getting-started.md) at the new tag.
+   docs/getting-started.md) at the new tag. Set the new tag in
+   `include/anole.schema.json`'s `$id` (`.../blob/vX.Y.Z/...`; a test checks
+   it against `.version`) and run `zig build capi-abi-json` when the C ABI
+   changed (`include/anole.abi.json` is checked fresh by `capi-test`).
 2. Make sure CI is green on the commit, including the `consumer` job, which
    builds a fresh project that adds Anole with `zig fetch --save`.
 3. Tag it `vX.Y.Z` and push the tag. Users then add it with
