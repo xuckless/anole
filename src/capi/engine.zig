@@ -47,6 +47,9 @@ pub const Config = config_mod.Config;
 pub const ws = if (features.websocket) @import("ws.zig") else struct {
     pub const ExecState = struct {
         pub fn deinit(_: *ExecState) void {}
+        pub fn maxGen(_: *const ExecState) u32 {
+            return 0;
+        }
     };
 };
 /// gRPC services implemented by consumers (`anole_grpc_*`).
@@ -60,6 +63,9 @@ pub const grpc = if (features.grpc) @import("grpc.zig") else struct {
 pub const wt = if (features.http3) @import("wt.zig") else struct {
     pub const ExecState = struct {
         pub fn deinit(_: *ExecState) void {}
+        pub fn maxGen(_: *const ExecState) u32 {
+            return 0;
+        }
     };
 };
 pub const pipe = pipe_mod;
@@ -147,6 +153,13 @@ pub const max_gen: u32 = std.math.maxInt(u28);
 pub fn nextGen(gen: u32) u32 {
     return if (gen >= max_gen) 1 else gen + 1;
 }
+
+/// The generation every slot of the next server starts at (requests,
+/// WebSockets, WebTransport): past every generation a server before it in
+/// this process handed out, so a handle kept from a destroyed server is
+/// stale on the next one too, where the same slot may hold another request.
+/// Set by `destroy`, read by `create` (one server at a time).
+var next_first_gen: u32 = 1;
 
 pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
@@ -655,6 +668,8 @@ pub const Engine = struct {
     start_why_len: usize = 0,
     stopped: std.Io.Event = .unset,
     app: ?*anole.App = null,
+    /// The generation its slots start at (`next_first_gen` at create).
+    first_gen: u32 = 1,
     /// The runtime's Io, for waking executor tasks from consumer threads
     /// (zio's wakes work from any thread).
     io: std.Io = undefined,
@@ -710,6 +725,7 @@ pub const Engine = struct {
             .inline_body_max = 0,
             .stream_high_water = 0,
             .rewake = 0,
+            .first_gen = next_first_gen,
         };
         errdefer e.arena.deinit();
         const a = e.arena.allocator();
@@ -1040,7 +1056,7 @@ pub const Engine = struct {
             const slots = try gpa.alloc(Slot, per);
             errdefer gpa.free(slots);
             x.* = .{ .engine = e, .index = @intCast(i), .slots = slots, .free_head = 0, .ring = try Ring.init(queue) };
-            for (x.slots, 0..) |*s, j| s.* = .{ .next_free = if (j + 1 < per) @intCast(j + 1) else no_slot };
+            for (x.slots, 0..) |*s, j| s.* = .{ .word = .init(pack(e.first_gen, .free)), .next_free = if (j + 1 < per) @intCast(j + 1) else no_slot };
             made += 1;
             if (e.consumers.items.len > 0) {
                 const c = e.consumers.items[i % e.consumers.items.len];
@@ -1088,6 +1104,13 @@ pub const Engine = struct {
             if (e.phase.load(.acquire) == .running) e.drain() catch {};
             t.join();
         }
+        // The next server's handles start past every one handed out here.
+        var last = e.first_gen;
+        for (e.execs) |*x| {
+            for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
+            last = @max(last, x.ws.maxGen(), x.wt.maxGen());
+        }
+        next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
             for (x.slots) |*s| {

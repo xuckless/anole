@@ -107,6 +107,7 @@ pub const ExecState = struct {
             const c = try gpa.create(Chunk);
             const base = st.nchunks * chunk_len;
             for (c, 0..) |*s, j| s.* = .{
+                .word = .init(pack(x.engine.first_gen, .free)),
                 .exec = x,
                 .index = @intCast(base + j),
                 .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
@@ -118,6 +119,15 @@ pub const ExecState = struct {
         const s = st.slot(st.free_head).?;
         st.free_head = s.next_free;
         return s;
+    }
+
+    /// The highest generation of any slot (`Engine.destroy`).
+    pub fn maxGen(st: *const ExecState) u32 {
+        var max: u32 = 0;
+        for (st.chunks[0..st.nchunks]) |*cv| {
+            for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
+        }
+        return max;
     }
 
     pub fn deinit(st: *ExecState) void {

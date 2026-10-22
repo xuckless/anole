@@ -5,6 +5,17 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- C ABI: handle generations started at 1 again for every server, so after
+  `anole_server_destroy` and a new `anole_server_create` in the same
+  process, a handle kept from the first server (a late answer, a WebSocket
+  send, a WebTransport write) was valid against whatever the second server
+  held in the same slot: it could answer another client's request with a
+  response meant for someone else. The slots of each new server now start
+  past every generation an earlier server handed out, so such a handle is
+  `ANOLE_E_GONE`.
+
 ### Fixed
 
 - C ABI: two routes of the configuration that the router cannot tell

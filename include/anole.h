@@ -26,7 +26,9 @@
  *    by handle.
  *  - Handles (anole_req, anole_ws) are 64-bit and generation-checked: a
  *    stale, finished or made-up handle gets ANOLE_E_GONE, never undefined
- *    behaviour.
+ *    behaviour, and so does one kept from a destroyed server once the next
+ *    server of the process runs (its slots start past every generation the
+ *    earlier ones handed out).
  *  - Anole enforces deadlines: a request not answered within its timeout
  *    gets 504 from Anole, and a late answer gets ANOLE_E_GONE.
  *

@@ -79,6 +79,7 @@ fn Table(comptime T: type) type {
                 const c = try gpa.create(Chunk);
                 const base = t.nchunks * chunk_len;
                 for (c, 0..) |*s, j| s.* = .{
+                    .word = .init(pack(x.engine.first_gen, .free)),
                     .exec = x,
                     .index = @intCast(base + j),
                     .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
@@ -97,6 +98,14 @@ fn Table(comptime T: type) type {
             defer t.lock.unlock();
             s.next_free = t.free_head;
             t.free_head = s.index;
+        }
+
+        fn maxGen(t: *const Self) u32 {
+            var max: u32 = 0;
+            for (t.chunks[0..t.nchunks]) |*cv| {
+                for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
+            }
+            return max;
         }
 
         fn deinit(t: *Self) void {
@@ -244,6 +253,11 @@ pub const StreamSlot = struct {
 pub const ExecState = struct {
     sessions: Table(SessionSlot) = .{},
     streams: Table(StreamSlot) = .{},
+
+    /// The highest generation of any slot (`Engine.destroy`).
+    pub fn maxGen(st: *const ExecState) u32 {
+        return @max(st.sessions.maxGen(), st.streams.maxGen());
+    }
 
     pub fn deinit(st: *ExecState) void {
         st.sessions.deinit();

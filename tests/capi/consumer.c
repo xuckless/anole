@@ -1136,6 +1136,69 @@ static void test_main_server(void) {
   current_server = NULL;
 }
 
+/* Polls `c` until a request arrives; its handle. */
+static anole_req next_request(anole_consumer *c) {
+  static _Alignas(8) unsigned char buf[64 * 1024];
+  for (int i = 0; i < 100; i++) {
+    int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      if (ev->type == ANOLE_EV_REQUEST) return ev->handle;
+      off += ev->len;
+    }
+  }
+  CHECK(!"no request arrived");
+  return 0;
+}
+
+/* A handle from a destroyed server is ANOLE_E_GONE on the next one, even
+   where the new server's request sits in the same slot (test suites create
+   and destroy a server per test; a late answer from one test must not land
+   on the next one's request). */
+static void test_stale_across_servers(void) {
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                     "\"timeouts\":{\"shutdown_ms\":200},"
+                     "\"routes\":[{\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1}]}";
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  anole_req old = 0;
+  for (int round = 0; round < 2; round++) {
+    anole_server *s = make_server(json);
+    anole_consumer *c = NULL;
+    CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+    CHECK(anole_server_start(s) == ANOLE_OK);
+    uint16_t port = 0;
+    CHECK(anole_server_port(s, 0, &port) == ANOLE_OK);
+    conn_reader cr = {0};
+    cr.fd = dial(port);
+    send_request(cr.fd, "GET", "/hold", NULL, 0);
+    anole_req h = next_request(c);
+    if (round == 0) {
+      /* Left unanswered: the drain cuts it. */
+      old = h;
+      CHECK(anole_server_drain(s) == ANOLE_OK);
+      CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+      anole_server_destroy(s);
+      close(cr.fd);
+      continue;
+    }
+    /* The old handle, as a late answer from the first server's test would
+       send it: refused, and the new request untouched. */
+    CHECK(anole_respond(old, 200, text_plain, 1, "old", 3, 0) == ANOLE_E_GONE);
+    CHECK(anole_respond(h, 200, text_plain, 1, "new", 3, 0) == ANOLE_OK);
+    response r;
+    response_init(&r);
+    read_response(&cr, &r, 0);
+    CHECK(r.status == 200 && strcmp(r.body, "new") == 0);
+    response_free(&r);
+    close(cr.fd);
+    CHECK(anole_server_drain(s) == ANOLE_OK);
+    CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+    anole_server_destroy(s);
+  }
+  printf("ok stale handles across servers: ANOLE_E_GONE\n");
+}
+
 /* A second server: a shared consumer on anole_poll_wait threads, max_inflight
    503, and a drain that cuts a request waiting past shutdown_ms. */
 static void test_shared_consumer(void) {
@@ -2260,6 +2323,7 @@ static int run_tests(void) {
   test_basics();
   test_route_conflicts();
   test_main_server();
+  test_stale_across_servers();
   test_shared_consumer();
   test_db();
   test_db_postgres();
