@@ -154,8 +154,7 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 
 - **zio**: after a change, run its suite in both scheduling modes
   (`./check.sh` and `./check.sh --scheduling pinned` in the fork; Anole
-  runs pinned). Its changes: the pinned mode's run queue (`pinned-fifo`), and
-  accepting on a busy executor (`accept-now`: a direct accept with its own
+  runs pinned). Its changes include accepting on a busy executor (`accept-now`: a direct accept with its own
   budget, and spawn backpressure every 64 spawns instead of on every one).
   The bench suite's `conns` and `raw` scenarios measure both.
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
