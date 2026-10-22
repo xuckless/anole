@@ -696,3 +696,256 @@ test "capi engine: WebTransport sessions, streams both ways, datagrams, close, d
     try std.testing.expectEqual(@as(u64, 0), e.stats().wt_sessions);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
 }
+
+/// A consumer for the TLS test: answers every request with the client's
+/// certificate from the record (the DER), or "none".
+const PeerAnswerer = struct {
+    e: *engine.Engine,
+    c: *engine.Consumer,
+    stop: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn run(self: *PeerAnswerer) void {
+        var buf: [64 * 1024]u8 align(8) = undefined;
+        while (!self.stop.load(.acquire)) {
+            const n = engine.pollWait(self.c, &buf, 50) catch unreachable;
+            var off: usize = 0;
+            while (off < n) {
+                const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+                self.handle(buf[off..][0..ev.len]) catch |err| {
+                    std.debug.print("peer answer failed: {t}\n", .{err});
+                    _ = self.failures.fetchAdd(1, .monotonic);
+                };
+                off += ev.len;
+            }
+        }
+    }
+
+    fn handle(self: *PeerAnswerer, rec: []const u8) !void {
+        const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
+        if (@as(abi.EventType, @fromBackingInt(@intCast(ev.type))) != .request) return;
+        const r: *const abi.RequestEvent = @ptrCast(@alignCast(rec.ptr));
+        const has = r.flags & abi.REQ_PEER_CERT != 0;
+        if (has != (r.peer_cert != 0)) return error.FlagAndOffsetDisagree;
+        var body: []const u8 = "none";
+        if (r.peer_cert != 0) {
+            if (r.peer_cert % 4 != 0 or r.peer_cert + 4 > rec.len) return error.BadOffset;
+            const len = std.mem.readInt(u32, rec[r.peer_cert..][0..4], .little);
+            if (r.peer_cert + 4 + len > rec.len) return error.BadLength;
+            body = rec[r.peer_cert + 4 ..][0..len];
+        }
+        try engine.respond(self.e, ev.handle, 200, &.{}, body, false);
+    }
+};
+
+const tls_testing = if (features.tls == .boringssl) @import("../tls/testing.zig") else struct {};
+
+const TlsCheck = struct {
+    const h2 = anole.h2;
+    const h3 = anole.h3;
+
+    fn h2Get(io: std.Io, port: u16, ca: []const u8, client: ?*const anole.tls.Pem) ![]u8 {
+        const conn = try h2.ClientConnection.connect(alloc, io, .{
+            .host = "localhost",
+            .port = port,
+            .tls = .{
+                .ca = .{ .pem = ca },
+                .client_certificate = if (client) |p| .{ .pem = .{ .cert = p.cert, .key = p.key } } else null,
+            },
+        });
+        defer conn.close();
+        const s = try conn.request(&.{
+            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/peer" },
+            .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+        }, .{});
+        defer s.release();
+        try s.waitHead();
+        if (s.status != 200) return error.UnexpectedStatus;
+        return s.reader().allocRemaining(alloc, .unlimited);
+    }
+
+    fn h3Get(io: std.Io, port: u16, ca: []const u8, client: ?*const anole.tls.Pem) ![]u8 {
+        const conn = try h3.ClientConnection.connect(alloc, io, .{
+            .host = "localhost",
+            .address = try .parseIp4("127.0.0.1", port),
+            .port = port,
+            .tls = .{
+                .ca = .{ .pem = ca },
+                .client_certificate = if (client) |p| .{ .pem = .{ .cert = p.cert, .key = p.key } } else null,
+            },
+            .connect_timeout = .fromSeconds(3),
+        });
+        defer conn.close();
+        const s = try conn.request(&.{
+            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/peer" },
+            .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+        }, .{});
+        defer s.release();
+        try s.waitHead();
+        if (s.status != 200) return error.UnexpectedStatus;
+        return s.reader().allocRemaining(alloc, .unlimited);
+    }
+
+    /// Waits (up to 3 s) until the TCP listener at `port` serves the
+    /// certificate `ca` names.
+    fn waitServes(io: std.Io, port: u16, ca: []const u8, client: *const anole.tls.Pem) !void {
+        for (0..300) |_| {
+            if (h2Get(io, port, ca, client)) |body| {
+                alloc.free(body);
+                return;
+            } else |_| {}
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.NotReloaded;
+    }
+
+    fn run(e: *engine.Engine, io: std.Io, server: *const anole.tls.Pem, client: *const anole.tls.Pem, next: *const anole.tls.Pem, dir_path: []const u8) !void {
+        var step: []const u8 = "require";
+        errdefer std.debug.print("tls check failed at {s}\n", .{step});
+        const required = e.ports.items[0];
+        const requested = e.ports.items[1];
+        const quic = e.ports.items[2];
+        var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io).toSeconds(), client.cert);
+        defer bundle.deinit(alloc);
+        const der = bundle.bytes.items;
+
+        // "require": refused without a certificate; with one, the record
+        // carries it.
+        if (h2Get(io, required, server.cert, null)) |body| {
+            alloc.free(body);
+            return error.ServedWithoutClientCertificate;
+        } else |_| {}
+        {
+            const body = try h2Get(io, required, server.cert, client);
+            defer alloc.free(body);
+            try std.testing.expectEqualSlices(u8, der, body);
+        }
+        // A certificate no client CA signed is refused.
+        if (h2Get(io, required, server.cert, next)) |body| {
+            alloc.free(body);
+            return error.ServedWithUnknownCertificate;
+        } else |_| {}
+
+        step = "request";
+        {
+            const body = try h2Get(io, requested, server.cert, null);
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings("none", body);
+        }
+        {
+            const body = try h2Get(io, requested, server.cert, client);
+            defer alloc.free(body);
+            try std.testing.expectEqualSlices(u8, der, body);
+        }
+
+        step = "http3";
+        if (h3Get(io, quic, server.cert, null)) |body| {
+            alloc.free(body);
+            return error.ServedWithoutClientCertificate;
+        } else |_| {}
+        {
+            const body = try h3Get(io, quic, server.cert, client);
+            defer alloc.free(body);
+            try std.testing.expectEqualSlices(u8, der, body);
+        }
+
+        step = "reload from PEM";
+        try e.setCertificate(.{ .pem = .{ .cert = next.cert, .key = next.key } });
+        try waitServes(io, required, next.cert, client);
+        {
+            const body = try h3Get(io, quic, next.cert, client);
+            defer alloc.free(body);
+            try std.testing.expectEqualSlices(u8, der, body);
+        }
+        if (h2Get(io, requested, server.cert, client)) |body| {
+            alloc.free(body);
+            return error.OldCertificateServed;
+        } else |_| {}
+
+        step = "reload from files";
+        const cert_path = try std.fs.path.join(alloc, &.{ dir_path, "server.pem" });
+        defer alloc.free(cert_path);
+        const key_path = try std.fs.path.join(alloc, &.{ dir_path, "server.key" });
+        defer alloc.free(key_path);
+        try e.setCertificate(.{ .files = .{ .cert_path = cert_path, .key_path = key_path } });
+        try waitServes(io, requested, server.cert, client);
+        // A bad one leaves the certificate in place.
+        try std.testing.expect(std.meta.isError(e.setCertificate(.{ .pem = .{ .cert = "not a certificate", .key = next.key } })));
+        try waitServes(io, requested, server.cert, client);
+
+        if (comptime builtin.os.tag != .windows) {
+            step = "SIGHUP";
+            // The files now hold the other certificate; SIGHUP reads them.
+            var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+            defer dir.close(io);
+            try dir.writeFile(io, .{ .sub_path = "server.pem", .data = next.cert });
+            try dir.writeFile(io, .{ .sub_path = "server.key", .data = next.key });
+            try std.posix.raise(.HUP);
+            try waitServes(io, required, next.cert, client);
+        }
+    }
+};
+
+test "capi engine: mutual TLS (require, request, HTTP/3), the client certificate in records, certificate reload and SIGHUP" {
+    if (comptime !features.http3 or !features.http2) return error.SkipZigTest;
+    var server = try anole.tls.selfSigned(alloc, .{});
+    defer server.deinit(alloc);
+    var client = try anole.tls.selfSigned(alloc, .{});
+    defer client.deinit(alloc);
+    var next = try anole.tls.selfSigned(alloc, .{});
+    defer next.deinit(alloc);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io0 = std.testing.io;
+    try tmp.dir.writeFile(io0, .{ .sub_path = "server.pem", .data = server.cert });
+    try tmp.dir.writeFile(io0, .{ .sub_path = "server.key", .data = server.key });
+    try tmp.dir.writeFile(io0, .{ .sub_path = "client-ca.pem", .data = client.cert });
+    const dir_path = try tmp.dir.realPathFileAlloc(io0, ".", alloc);
+    defer alloc.free(dir_path);
+
+    // Files for the listener that SIGHUP rereads; PEM text for the other
+    // one and for the client CA of the first. Paths go through JSON's
+    // escaping too (Windows' backslashes).
+    const cert_file = try std.fs.path.join(alloc, &.{ dir_path, "server.pem" });
+    defer alloc.free(cert_file);
+    const key_file = try std.fs.path.join(alloc, &.{ dir_path, "server.key" });
+    defer alloc.free(key_file);
+    const ca_file = try std.fs.path.join(alloc, &.{ dir_path, "client-ca.pem" });
+    defer alloc.free(ca_file);
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 2, "timeouts": {{"request_ms": 3000, "shutdown_ms": 1000}},
+        \\ "listeners": [
+        \\   {{"address": "127.0.0.1", "port": 0, "http3": true, "tls": {{"cert_file": {f}, "key_file": {f},
+        \\     "client_auth": "require", "client_ca_pem": {f}}}}},
+        \\   {{"address": "127.0.0.1", "port": 0, "tls": {{"cert_pem": {f}, "key_pem": {f},
+        \\     "client_auth": "request", "client_ca_file": {f}}}}}],
+        \\ "routes": [{{"method": "GET", "path": "/peer", "handler": 1}}]}}
+    , .{ std.json.fmt(cert_file, .{}), std.json.fmt(key_file, .{}), std.json.fmt(client.cert, .{}), std.json.fmt(server.cert, .{}), std.json.fmt(server.key, .{}), std.json.fmt(ca_file, .{}) });
+    defer alloc.free(json);
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, builtin.os.tag != .windows, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    try e.start();
+
+    var a: PeerAnswerer = .{ .e = e, .c = c };
+    const t = try std.Thread.spawn(.{}, PeerAnswerer.run, .{&a});
+    defer {
+        a.stop.store(true, .release);
+        t.join();
+    }
+
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(TlsCheck.run, .{ e, io, &server, &client, &next, dir_path });
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+}

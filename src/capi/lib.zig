@@ -242,8 +242,33 @@ export fn anole_server_reload_certificates(s: ?*anyopaque) i32 {
     clearError();
     const e = engineOf(s) orelse return abi.E_INVALID;
     e.reloadCertificates() catch |err| return switch (err) {
-        error.State => fail(abi.E_STATE, "anole_server_reload_certificates", err),
+        error.State, error.NoTlsListener => fail(abi.E_STATE, "anole_server_reload_certificates", err),
         else => fail(abi.E_SYSTEM, "anole_server_reload_certificates", err),
+    };
+    return abi.OK;
+}
+
+export fn anole_server_reload_tls(s: ?*anyopaque, flags: u32, cert: ?[*]const u8, cert_len: usize, key: ?[*]const u8, key_len: usize) i32 {
+    clearError();
+    const e = engineOf(s) orelse return abi.E_INVALID;
+    if (flags & ~abi.TLS_PEM != 0) return abi.E_INVALID;
+    const c = cert orelse {
+        if (key != null) return abi.E_INVALID;
+        return anole_server_reload_certificates(s);
+    };
+    const k = key orelse return abi.E_INVALID;
+    if (cert_len == 0 or key_len == 0) return abi.E_INVALID;
+    const cs = c[0..cert_len];
+    const ks = k[0..key_len];
+    const source: anole.Cert = if (flags & abi.TLS_PEM != 0)
+        .{ .pem = .{ .cert = cs, .key = ks } }
+    else
+        .{ .files = .{ .cert_path = cs, .key_path = ks } };
+    e.setCertificate(source) catch |err| return switch (err) {
+        error.State, error.NoTlsListener => fail(abi.E_STATE, "anole_server_reload_tls", err),
+        error.OutOfMemory => fail(abi.E_NOMEM, "anole_server_reload_tls", err),
+        error.FileNotFound, error.AccessDenied => fail(abi.E_SYSTEM, "anole_server_reload_tls", err),
+        else => fail(abi.E_INVALID, "anole_server_reload_tls", err),
     };
     return abi.OK;
 }

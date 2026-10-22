@@ -789,6 +789,8 @@ pub const Engine = struct {
         server_cfg.request.max_body_size = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize);
         server_cfg.request.max_content_length = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize);
         server_cfg.trusted_proxy_hops = cfg.trusted_proxy_hops;
+        server_cfg.trust_forwarded_proto = cfg.trust_forwarded_proto;
+        server_cfg.trust_forwarded_host = cfg.trust_forwarded_host;
         if (cfg.limits.max_connections > 0) server_cfg.max_connections = cfg.limits.max_connections;
         const listeners = buildListeners(a, cfg) catch |err| return e.failStart(err);
         var app = anole.App.init(gpa, .{
@@ -867,6 +869,7 @@ pub const Engine = struct {
                 .http2 = l.http2 and features.http2,
                 .http3 = l.http3,
                 .proxy_protocol = l.proxy_protocol,
+                .proxy_protocol_from = l.proxy_protocol_from,
             };
             if (l.tls) |t| {
                 if (comptime features.tls != .boringssl) return error.Unsupported;
@@ -878,6 +881,13 @@ pub const Engine = struct {
                     else
                         .fromPem(t.cert_pem.?, t.key_pem.?),
                     .alpn_protocols = t.alpn,
+                    .client_auth = switch (config_mod.clientAuth(t.client_auth).?) {
+                        .none => null,
+                        inline .request, .require => |m| .{
+                            .ca = if (t.client_ca_file) |f| .{ .file = .{ .path = f } } else .{ .pem = t.client_ca_pem.? },
+                            .mode = @field(http.ServerConfig.Tls.ClientAuth.Mode, @tagName(m)),
+                        },
+                    },
                 };
             }
         }
@@ -1043,6 +1053,15 @@ pub const Engine = struct {
         if (e.phase.load(.acquire) != .running) return error.State;
         const app = e.app orelse return error.State;
         try app.reloadCertificates();
+    }
+
+    /// Swaps every TLS listener's certificate (HTTP/3 too) for `cert`;
+    /// handshakes under way keep the old one. On success later reloads
+    /// (and SIGHUP) read from it.
+    pub fn setCertificate(e: *Engine, cert: anole.Cert) !void {
+        if (e.phase.load(.acquire) != .running) return error.State;
+        const app = e.app orelse return error.State;
+        try app.setCertificate(cert);
     }
 
     pub fn destroy(e: *Engine) void {
@@ -1865,6 +1884,9 @@ pub const Head = struct {
         for (req.headers.keys[0..nh], req.headers.values[0..nh]) |k, v| n += k.len + v.len;
         var it = req.params.map.iterator();
         while (it.next()) |kv| n += kv.key_ptr.len + kv.value_ptr.len;
+        // Mutual TLS: the client's certificate last, a u32 length then the
+        // DER, 4-aligned.
+        if (req.peerCertificate()) |der| n = std.mem.alignForward(usize, n, 4) + 4 + der.len;
         return abi.alignUp(n);
     }
 
@@ -1909,6 +1931,15 @@ pub const Head = struct {
         const listener = put(out, &pos, req.listener.name, false);
         const id = put(out, &pos, req.id, false);
         const claims = put(out, &pos, h.claims, false);
+        var peer_cert: u32 = 0;
+        if (req.peerCertificate()) |der| {
+            const at = std.mem.alignForward(usize, pos, 4);
+            @memset(out[pos..at], 0);
+            std.mem.writeInt(u32, out[at..][0..4], @intCast(der.len), .little);
+            @memcpy(out[at + 4 ..][0..der.len], der);
+            pos = at + 4 + der.len;
+            peer_cert = @intCast(at);
+        }
         std.debug.assert(abi.alignUp(pos) == size_);
         @memset(out[pos..size_], 0);
         const rec: *align(1) abi.RequestEvent = @ptrCast(out.ptr);
@@ -1917,7 +1948,7 @@ pub const Head = struct {
             .route_id = h.route_id,
             .method = methodCode(req.method),
             .version = req.version_major * 10 + req.version_minor,
-            .flags = h.flags,
+            .flags = h.flags | if (peer_cert != 0) abi.REQ_PEER_CERT else 0,
             .method_name = method_name,
             .path = path,
             .query = query,
@@ -1928,6 +1959,7 @@ pub const Head = struct {
             .claims = claims,
             .nheaders = @intCast(nh),
             .nparams = @intCast(np),
+            .peer_cert = peer_cert,
             .content_length = h.content_length,
         };
         return size_;

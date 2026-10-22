@@ -37,6 +37,16 @@
       "default": 0,
       "description": "Proxies in front whose X-Forwarded-For (and PROXY protocol) Anole trusts for the client's address."
     },
+    "trust_forwarded_proto": {
+      "type": "boolean",
+      "default": true,
+      "description": "With trusted_proxy_hops: the last X-Forwarded-Proto value says whether the request is secure."
+    },
+    "trust_forwarded_host": {
+      "type": "boolean",
+      "default": false,
+      "description": "With trusted_proxy_hops: the last X-Forwarded-Host value is the request's host (only when every proxy in front sets it)."
+    },
     "middleware": {
       "type": "array",
       "items": {
@@ -132,6 +142,14 @@
           "type": "boolean",
           "default": false,
           "description": "Connections start with a PROXY protocol header."
+        },
+        "proxy_protocol_from": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "With proxy_protocol: the proxies allowed to send one (addresses or CIDR networks); empty: any peer."
         }
       }
     },
@@ -194,6 +212,38 @@
                 "type": "string"
               },
               "description": "ALPN protocols in order; default h2, http/1.1."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_auth": {
+          "type": "string",
+          "enum": [
+            "none",
+            "request",
+            "require"
+          ],
+          "default": "none",
+          "description": "Mutual TLS: \"request\" asks for a client certificate and checks one that is sent; \"require\" refuses a client without one. Also over HTTP/3. Requests carry the certificate (ANOLE_REQ_PEER_CERT)."
+        },
+        "client_ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "PEM file of the CAs client certificates must chain to (with client_auth request or require)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same CAs as PEM text, instead of client_ca_file."
             },
             {
               "type": "null"
