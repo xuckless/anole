@@ -705,7 +705,7 @@ test "Client: WebSocket upgrade" {
 
     server.router.get("/ws", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            var ws = try res.upgradeWebSocket(req) orelse {
+            var ws = try res._upgradeWebSocket(req) orelse {
                 res.status = .bad_request;
                 return;
             };

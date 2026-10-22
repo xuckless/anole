@@ -479,7 +479,7 @@ pub const Middleware = struct {
             }
             // A new id, which only a cookie can hand out: none is stored
             // once the response has started.
-            if (res.headers_written) return error.HeadersAlreadySent;
+            if (res._headers_written) return error.HeadersAlreadySent;
             const session_id = try newId(req.arena, req.io);
             try store.save(session_id, try serialize(req.arena, &req.session), ttl);
             return res.setCookie(self.config.cookie_name, session_id, opts);
@@ -691,7 +691,7 @@ test "MemoryStore: capped at max_entries, and update/touch never bring a session
 }
 
 test "regenerate drops the CSRF token, and __Host- names are checked" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     try req.session.set(csrf_key, "old-token");
     try req.session.set("user", "alice");
     try regenerate(&req);

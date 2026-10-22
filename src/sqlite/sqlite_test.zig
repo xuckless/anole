@@ -316,7 +316,7 @@ test "sqlite: constraint errors become statuses; ErrorMap moves them" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     // On a request: what lastError keeps lives in its locals.
-    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = testing.io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = testing.io, ._parser = undefined, ._transport = undefined };
 
     _ = try db.exec(&req,
         \\CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, age INTEGER CHECK (age >= 0));
@@ -670,7 +670,7 @@ test "sqlite: transactions: commit, rollback, deinit, and transaction() retried 
     defer db.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = io, ._parser = undefined, ._transport = undefined };
     _ = try db.exec(&req, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL CHECK (balance >= 0))", .{});
     _ = try db.exec(&req, "INSERT INTO accounts VALUES (1, 100), (2, 0)", .{});
 

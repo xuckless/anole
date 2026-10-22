@@ -332,7 +332,7 @@ test "Server: an upgraded connection keeps what came with the handshake, and its
         echoed: bool = false,
 
         fn handle(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var ws = try res.upgradeWebSocket(req) orelse {
+            var ws = try res._upgradeWebSocket(req) orelse {
                 res.status = .bad_request;
                 return;
             };
@@ -417,7 +417,7 @@ test "Server: WebSocket echo" {
         }
 
         fn handleWebSocket(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var ws = try res.upgradeWebSocket(req) orelse {
+            var ws = try res._upgradeWebSocket(req) orelse {
                 res.status = .bad_request;
                 return;
             };
@@ -3302,13 +3302,13 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
     var cap: Capture = .{};
     cap.w = .fixed(&cap.buf);
 
-    var req: dusty.Request = .{ .arena = arena, .io = io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, .io = io, ._parser = undefined, ._transport = undefined };
     req.headers = try dusty.Headers.init(arena, 8);
     req.method = .get;
     req.url = "/users/42";
-    var res = try dusty.Response.initSink(arena, io, cap.sink(), 16);
-    req.response = &res;
-    res.request = &req;
+    var res = try dusty.Response._initSink(arena, io, cap.sink(), 16);
+    req._response = &res;
+    res._request = &req;
 
     try server.dispatch(&req, &res);
     try res.write();

@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         // Docker reaches the host through its gateway, not loopback.
         .http = .{ .address = "0.0.0.0", .port = port },
-        .server = .{ .timeout = .{ .idle_park = if (callbacks) .fromMilliseconds(1) else .fromSeconds(1) } },
+        .timeouts = .{ .idle_park = if (callbacks) .fromMilliseconds(1) else .fromSeconds(1) },
     }, {});
     defer app.deinit();
     if (callbacks) app.wsCallbacks("/", Echo) else app.get("/", echo);

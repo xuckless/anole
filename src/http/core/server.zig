@@ -2377,10 +2377,10 @@ pub fn Server(comptime Ctx: type) type {
         /// Applies `ServerConfig.response` to a response the server built,
         /// for every engine.
         pub fn configureResponse(self: *const Self, res: *Response) void {
-            res.send_date = self.config.response.date;
-            res.default_content_type = self.config.response.default_content_type;
-            res.brotli_quality = self.config.response.brotli_quality;
-            res.error_format = self.config.errors;
+            res._send_date = self.config.response.date;
+            res._default_content_type = self.config.response.default_content_type;
+            res._brotli_quality = self.config.response.brotli_quality;
+            res._error_format = self.config.errors;
             res._write_timeout = self.config.timeout.write;
         }
 
@@ -2515,14 +2515,14 @@ pub fn Server(comptime Ctx: type) type {
                 // The pooled arena, once a request has arrived.
                 .arena = undefined,
                 .io = self.io,
-                .transport = connection.transport(),
-                .parser = undefined,
-                .config = self.config.request,
+                ._transport = connection.transport(),
+                ._parser = undefined,
+                ._config = self.config.request,
                 .remote_address = connection.peerAddress(),
                 .listener = l.config,
                 .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
                 .drain = &self.draining,
-                .drain_hooks = &self.drain_hooks,
+                ._drain_hooks = &self.drain_hooks,
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
@@ -2532,7 +2532,7 @@ pub fn Server(comptime Ctx: type) type {
             try parser.init(&request);
             defer parser.deinit();
 
-            request.parser = &parser;
+            request._parser = &parser;
 
             while (true) {
                 // Nothing buffered means the next request has not begun.
@@ -2720,13 +2720,13 @@ pub fn Server(comptime Ctx: type) type {
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
                 applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
 
-                var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
+                var response = try Response._init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
                 defer response.deinit();
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
-                response.request = &request;
-                request.response = &response;
+                response._request = &request;
+                request._response = &response;
 
                 // A body declared longer than allowed is refused unread
                 // (and before any 100 Continue): 413, and the connection
@@ -2763,7 +2763,7 @@ pub fn Server(comptime Ctx: type) type {
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                         // RFC 9110 10.1.1: ignored in an HTTP/1.0 request.
-                        request.expects_continue = !response.http10;
+                        request._expects_continue = !response.http10;
                     } else {
                         // Unknown Expect value - return 417
                         response.status = .expectation_failed;
@@ -2828,7 +2828,7 @@ pub fn Server(comptime Ctx: type) type {
                         // to drain, and a read would wait for it. A
                         // peer that sent the body anyway is not waiting, and
                         // its body is drained like any other.
-                        if (request.expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
+                        if (request._expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
                         // What the wire carried, which is what there is left
                         // to throw away -- and still readable after decoding
                         // took the header off.
@@ -2884,7 +2884,7 @@ pub fn Server(comptime Ctx: type) type {
                 // holds none while it waits to answer.
                 connection.releaseWriteBuffer();
                 parser.reset();
-                request.reset();
+                request._reset();
                 buffers.?.resetArena();
                 connection.rewindReader();
             }

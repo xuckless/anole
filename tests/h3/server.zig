@@ -30,7 +30,7 @@ fn slow(req: *http.Request, res: *http.Response) !void {
 /// GET /download?n=BYTES: that many bytes, streamed.
 fn download(req: *http.Request, res: *http.Response) !void {
     const n = std.fmt.parseInt(usize, req.query.get("n") orelse "0", 10) catch 0;
-    var w = res.writer();
+    var w = try res.writer();
     var chunk: [16 * 1024]u8 = undefined;
     for (&chunk, 0..) |*b, i| b.* = @truncate(i);
     var left = n;
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
         .http = null,
         .https = .{ .address = address, .port = port, .cert = .dev_self_signed },
         .http3 = .{ .validate_address = retry, .early_data = early_data },
-        .server = .{ .timeout = .{ .shutdown = drain } },
+        .timeouts = .{ .shutdown = drain },
     }, {});
     defer app.deinit();
     app.get("/download", download);

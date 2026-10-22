@@ -635,7 +635,7 @@ pub const Client = struct {
                 if (reply == .err) return self.serverError(&ctx, conn, reply.err);
             }
         }
-        if (ctx.request) |req| if (req.drain_hooks) |hooks| {
+        if (ctx.request) |req| if (req._drain_hooks) |hooks| {
             sub.hooks = hooks;
             hooks.add(ctx.io, &sub.hook);
         };

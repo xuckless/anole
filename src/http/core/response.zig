@@ -453,9 +453,9 @@ pub const BodyWriter = struct {
     pub fn end(self: *BodyWriter) Error!void {
         // Idempotent, so `defer body.end() catch {}` alongside an explicit
         // `end` on the success path is harmless rather than a second body.
-        if (!self.res.body_writer_open) return;
-        self.res.body_writer_open = false;
-        self.res.body_writer_buffering = false;
+        if (!self.res._body_writer_open) return;
+        self.res._body_writer_open = false;
+        self.res._body_writer_buffering = false;
         // Cannot fail: see `flush`.
         self.interface.flush() catch unreachable;
         // A write that failed was reported then; the body is not complete
@@ -541,7 +541,7 @@ pub const StreamingBodyWriter = struct {
         // the peer (or a proxy reusing the connection) as the start of the
         // next response. Nothing of this write goes out, and the
         // connection is not reused.
-        if (self.res.content_length) |declared| if (!self.res.chunked and total > declared -| self.res.body_sent) {
+        if (self.res.content_length) |declared| if (!self.res._chunked and total > declared -| self.res.body_sent) {
             self.res.keepalive = false;
             self.err = error.ContentLengthMismatch;
             return error.WriteFailed;
@@ -569,12 +569,12 @@ pub const StreamingBodyWriter = struct {
         const res = self.res;
         // Idempotent: a second `end` must not write a second terminator,
         // which the peer would read as the start of the next message.
-        if (!res.body_writer_open) return;
-        res.body_writer_open = false;
+        if (!res._body_writer_open) return;
+        res._body_writer_open = false;
         // From here the bytes already sent are the response, whatever
         // happens next, so `write` must not add a terminator or a body to
         // them.
-        res.written = true;
+        res._written = true;
         // If this does not finish cleanly the body is not framed the way
         // its headers promised, and the connection cannot carry another
         // response.
@@ -588,7 +588,7 @@ pub const StreamingBodyWriter = struct {
         } else {
             try res.resolve(self.interface.flush());
         }
-        if (res.chunked and res.sendsBody()) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
+        if (res._chunked and res.sendsBody()) try res.resolve(res._conn.?.writer.writeAll("0\r\n\r\n"));
         try res.resolve(res.finish(res.bodyOut()));
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
@@ -647,7 +647,7 @@ const StreamCompressor = struct {
             // `Response.deinit` for a body never ended (`brotli_encoder`).
             .br => if (build_options.use_brotli) {
                 self.coder = .{ .br = undefined };
-                try self.coder.br.init(&self.out, &.{}, .{ .quality = res.brotli_quality });
+                try self.coder.br.init(&self.out, &.{}, .{ .quality = res._brotli_quality });
                 res.brotli_encoder = self.coder.br.state;
             } else unreachable,
             else => self.coder = .{ .gzip = try .init(res.arena, &self.out, &.{}, .gzip, options) },
@@ -746,7 +746,7 @@ pub const Response = struct {
     headers: http.Headers = .{},
     /// Most headers the response can carry (`ServerConfig.response
     /// .max_header_count`).
-    max_headers: usize = 64,
+    _max_headers: usize = 64,
     /// The `Content-Type` sent, when the handler sets it by name; `json`,
     /// `print` and the others set it for you.
     content_type: ?http.ContentType = null,
@@ -756,41 +756,41 @@ pub const Response = struct {
     body_buffer: BodyBuffer = .{},
     /// The HTTP/1.x connection the response is written to. Unused, and
     /// undefined, when `sink` is set.
-    conn: *Connection,
+    _conn: ?*Connection = null,
     /// Set for a response that goes to a protocol engine rather than out as
     /// HTTP/1.x bytes: an HTTP/2 stream. See `initSink`.
-    sink: ?Sink = null,
+    _sink: ?Sink = null,
     /// The connection's `Io`, for files.
     io: std.Io = undefined,
     /// Send a `Date` header (RFC 9110 6.6.1) unless the handler set one.
     /// Set by the server from `ServerConfig.response.date`.
-    send_date: bool = false,
+    _send_date: bool = false,
     /// The Content-Type a buffered body goes out with when the handler set
     /// neither `content_type` nor the header. Set by the server from
     /// `ServerConfig.response.default_content_type`.
-    default_content_type: ?http.ContentType = null,
+    _default_content_type: ?http.ContentType = null,
     /// How `fail` and the server's own error answers are written. Set by
     /// the server from `ServerConfig.errors`.
-    error_format: ErrorFormat = .auto,
+    _error_format: ErrorFormat = .auto,
     /// Trailer fields, sent after the body. Only a `sink` carries them
     /// (HTTP/2 does, for gRPC status among others); over HTTP/1.x they are
     /// dropped.
     trailers: ?http.Headers = null,
-    written: bool = false,
-    headers_written: bool = false,
+    _written: bool = false,
+    _headers_written: bool = false,
     keepalive: bool = true,
-    chunked: bool = false,
-    streaming: bool = false,
+    _chunked: bool = false,
+    _streaming: bool = false,
     /// The request was a HEAD, so the headers go out describing the body
     /// a GET would have sent, and the body itself does not. Set by the
     /// server; a handler writes its body either way and does not have to
     /// know.
     head: bool = false,
     /// A body writer was handed out and has not been ended yet.
-    body_writer_open: bool = false,
+    _body_writer_open: bool = false,
     /// The open body writer is a `BodyWriter`, whose length the response
     /// only learns when it ends.
-    body_writer_buffering: bool = false,
+    _body_writer_buffering: bool = false,
     /// The request was HTTP/1.0, so the peer does not understand chunked
     /// encoding. Set by the server.
     http10: bool = false,
@@ -802,7 +802,7 @@ pub const Response = struct {
     body_sent: usize = 0,
     /// The request this answers, when the server built the pair. Set by the
     /// server.
-    request: ?*Request = null,
+    _request: ?*Request = null,
     /// From the engine: `timeouts.write`. Once a stream or file body has
     /// started, each write the peer does not take within it ends the
     /// response (`error.WriteTimeout`).
@@ -831,7 +831,7 @@ pub const Response = struct {
     /// Brotli's quality, 0 to 11, when `compress` picks `br`. Set by the
     /// server from `ServerConfig.response.brotli_quality`; a handler may
     /// change it for its own response before the headers go out.
-    brotli_quality: u4 = 5,
+    _brotli_quality: u4 = 5,
     /// A streamed body's Brotli encoder until the body ends: freed by
     /// `deinit` if it never does. Held here, not only in the compressor,
     /// which lives in the arena: the server may reset that before `deinit`.
@@ -842,11 +842,11 @@ pub const Response = struct {
     /// Set by an engine that can finish this response with no task waiting
     /// for it (HTTP/2 and HTTP/3 requests that run on the reader): see
     /// `detach`.
-    detach_engine: ?*const Detached.Engine = null,
-    detach_ctx: ?*anyopaque = null,
+    _detach_engine: ?*const Detached.Engine = null,
+    _detach_ctx: ?*anyopaque = null,
     /// A middleware that is not detach-safe ran (`Detached`): `detach` is
     /// refused.
-    detach_blocked: bool = false,
+    _detach_blocked: bool = false,
     /// Set by `detach`.
     detached: ?*Detached = null,
 
@@ -889,27 +889,26 @@ pub const Response = struct {
     /// handlers get theirs. The body buffer's first segment is taken once
     /// a body is written (`writer`), so a response whose body is a slice
     /// takes none.
-    pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
+    pub fn _init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .conn = conn,
+            ._conn = conn,
             .io = conn.io,
             .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
-            .max_headers = max_headers,
+            ._max_headers = max_headers,
         };
     }
 
     /// A response written to `sink` instead of a connection. Framing,
     /// keep-alive and the status line are the sink's business: the response
     /// hands over the head, the body bytes and the end.
-    pub fn initSink(arena: std.mem.Allocator, io: std.Io, sink: Sink, max_headers: usize) !Response {
+    pub fn _initSink(arena: std.mem.Allocator, io: std.Io, sink: Sink, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .conn = undefined,
-            .sink = sink,
+            ._sink = sink,
             .io = io,
             .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
-            .max_headers = max_headers,
+            ._max_headers = max_headers,
         };
     }
 
@@ -917,7 +916,7 @@ pub const Response = struct {
     /// past `max_headers`, or without the memory for a bigger table.
     fn headerRoom(self: *Response, n: usize) bool {
         while (self.headers.keys.len - self.headers.len < n) {
-            if (!self.headers.grow(self.arena, self.max_headers)) return false;
+            if (!self.headers.grow(self.arena, self._max_headers)) return false;
         }
         return true;
     }
@@ -951,23 +950,23 @@ pub const Response = struct {
 
     /// Whether the peer went away, so a failure is not the handler's fault.
     pub fn peerGone(self: *Response) bool {
-        if (self.sink) |sink| return sink.peerGone();
-        return self.conn.peerGone();
+        if (self._sink) |sink| return sink.peerGone();
+        return self._conn.?.peerGone();
     }
 
     /// Where body bytes go: the sink's writer, or the connection, which
     /// takes its write buffer now.
     fn bodyOut(self: *Response) *std.Io.Writer {
-        if (self.sink) |sink| return sink.body();
-        self.conn.prepareWrite();
-        return self.conn.writer;
+        if (self._sink) |sink| return sink.body();
+        self._conn.?.prepareWrite();
+        return self._conn.?.writer;
     }
 
     /// Ends the message on `w`: a flush for HTTP/1.x; for a sink, a flush
     /// of its body writer and then the end, with any trailers.
     fn finish(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.flush();
-        if (self.sink) |sink| try sink.end(if (self.trailers) |*t| t else null);
+        if (self._sink) |sink| try sink.end(if (self.trailers) |*t| t else null);
     }
 
     /// Closes a file body that `write` never got to send.
@@ -1051,7 +1050,7 @@ pub const Response = struct {
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
-        if (self.headers_written) return error.HeadersAlreadySent;
+        if (self._headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
@@ -1063,7 +1062,7 @@ pub const Response = struct {
     /// `Content-Length` never repeats: a second one replaces the first.
     /// The names `header` refuses, this refuses too.
     pub fn addHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
-        if (self.headers_written) return error.HeadersAlreadySent;
+        if (self._headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
         if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
@@ -1079,7 +1078,7 @@ pub const Response = struct {
     /// Call `end` on the result before returning from the handler.
     pub fn writer(self: *Response) http.MisuseError!BodyWriter {
         try self.startBody();
-        self.body_writer_buffering = true;
+        self._body_writer_buffering = true;
         // Without the memory, the first write fails the same way.
         self.body_buffer.reserveFirst(self.arena) catch {};
         return .init(self);
@@ -1114,23 +1113,23 @@ pub const Response = struct {
             }
         else
             null;
-        self.headers_written = true;
+        self._headers_written = true;
 
         if (compression != .off) self.addVary();
         if (compression.isCoding()) self.markCompressed(compression);
         if (declared) |len| {
             self.content_length = len;
-        } else if (self.sink != null) {
+        } else if (self._sink != null) {
             // The protocol under a sink frames the body itself.
-            self.streaming = true;
+            self._streaming = true;
         } else if (self.http10) {
             // Chunked encoding came with HTTP/1.1. Before it, a body of
             // unknown length ends when the connection does. A response
             // that sends no body needs no such end.
-            self.streaming = true;
+            self._streaming = true;
             if (self.sendsBody()) self.keepalive = false;
         } else {
-            self.chunked = true;
+            self._chunked = true;
         }
         try self.resolve(self.sendHeaderAlone(self.bodyOut()));
         self.liftDeadline();
@@ -1139,21 +1138,21 @@ pub const Response = struct {
 
     /// A body can be started: no writer open, no head sent, no body set.
     fn checkBodyNotStarted(self: *const Response) http.MisuseError!void {
-        if (self.body_writer_open) return error.BodyWriterOpen;
-        if (self.headers_written) return error.HeadersAlreadySent;
+        if (self._body_writer_open) return error.BodyWriterOpen;
+        if (self._headers_written) return error.HeadersAlreadySent;
         if (self.body.len != 0 or self.body_buffer.len() != 0) return error.BodyAlreadySet;
     }
 
     fn startBody(self: *Response) http.MisuseError!void {
         try self.checkBodyNotStarted();
-        self.body_writer_open = true;
+        self._body_writer_open = true;
     }
 
     /// Throws away the body written so far. Not while a body writer is
     /// open: its unflushed bytes are its own, and it would put them back.
     pub fn clearWriter(self: *Response) void {
         // A buffering writer is open: its bytes are its own.
-        if (self.body_writer_buffering) return;
+        if (self._body_writer_buffering) return;
         self.body_buffer.clear();
     }
 
@@ -1166,11 +1165,11 @@ pub const Response = struct {
     /// wire the framing is already promised and the body cannot be
     /// swapped.
     pub fn resetBody(self: *Response) error{HeadersAlreadySent}!void {
-        if (self.headers_written) return error.HeadersAlreadySent;
+        if (self._headers_written) return error.HeadersAlreadySent;
         // An open writer is abandoned with the body: `end` on it does
         // nothing once it is no longer the open one.
-        self.body_writer_open = false;
-        self.body_writer_buffering = false;
+        self._body_writer_open = false;
+        self._body_writer_buffering = false;
         self.clearWriter();
         self.body = "";
         self.closeFile();
@@ -1198,7 +1197,7 @@ pub const Response = struct {
     pub fn jsonWith(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
-        if (self.body_writer_buffering) return error.BodyWriterOpen;
+        if (self._body_writer_buffering) return error.BodyWriterOpen;
         const json_formatter = std.json.fmt(value, options);
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
@@ -1217,7 +1216,7 @@ pub const Response = struct {
     /// Does nothing once the headers are on the wire: a started response
     /// cannot become another.
     pub fn fail(self: *Response, status: http.Status, message: []const u8) void {
-        if (self.headers_written) return;
+        if (self._headers_written) return;
         self.resetBody() catch return;
         self.status = status;
         if (self.answersJson()) {
@@ -1234,12 +1233,12 @@ pub const Response = struct {
     /// Whether `fail` answers in JSON: always or never by `error_format`,
     /// else when the request's `Accept` names JSON, or it sent JSON itself.
     fn answersJson(self: *const Response) bool {
-        switch (self.error_format) {
+        switch (self._error_format) {
             .json => return true,
             .text => return false,
             .auto => {},
         }
-        const req = self.request orelse return false;
+        const req = self._request orelse return false;
         if (req.headers.get("Accept")) |accept| {
             if (std.ascii.findIgnoreCase(accept, "json") != null) return true;
         }
@@ -1392,7 +1391,7 @@ pub const Response = struct {
     /// .{ .path = "/", .max_age = .fromSeconds(86400) })`. Fails once the
     /// headers have gone out, or on a name or value a cookie cannot carry.
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
-        if (self.headers_written) return error.HeadersAlreadySent;
+        if (self._headers_written) return error.HeadersAlreadySent;
         const serialized = try serializeCookie(self.arena, name, value, opts);
         try http.validateHeaderValue(serialized);
         if (!self.headerRoom(1)) return error.TooManyHeaders;
@@ -1422,7 +1421,7 @@ pub const Response = struct {
     /// Whether `detach` would work: the engine supports it, nothing has
     /// gone out, and every middleware the request passed is detach-safe.
     pub fn canDetach(self: *const Response) bool {
-        return self.detach_engine != null and !self.detach_blocked and self.detached == null and !self.headers_written;
+        return self._detach_engine != null and !self._detach_blocked and self.detached == null and !self._headers_written;
     }
 
     /// Whether the handler detached the response (`detach`): a detach-safe
@@ -1446,8 +1445,8 @@ pub const Response = struct {
         d.* = .{
             .request = req,
             .response = self,
-            .engine = self.detach_engine.?,
-            .engine_ctx = self.detach_ctx.?,
+            .engine = self._detach_engine.?,
+            .engine_ctx = self._detach_ctx.?,
             .owner = owner,
         };
         self.detached = d;
@@ -1473,21 +1472,21 @@ pub const Response = struct {
     /// handler returns, rather than closing it: for a protocol the request
     /// upgraded to that serves the connection without a task of its own
     /// while it is idle (a WebSocket with callbacks). Over HTTP/1.1 only,
-    /// after the 101 went out (`upgradeWebSocket`). From then on, whatever
+    /// after the 101 went out (`_upgradeWebSocket`). From then on, whatever
     /// the handler does, `adopter.release` runs when the connection closes.
     /// The request and this response end with the handler.
     pub fn adopt(self: *Response, adopter: *Adopter) error{Unsupported}!void {
-        if (self.sink != null or self.status != .switching_protocols or !self.headers_written) return error.Unsupported;
-        self.conn.adopter = adopter;
+        if (self._sink != null or self.status != .switching_protocols or !self._headers_written) return error.Unsupported;
+        self._conn.?.adopter = adopter;
     }
 
     /// Upgrades an HTTP/1.1 connection to a WebSocket, or returns null when
     /// the request is not a valid upgrade. HTTP/1.1 only: `app.ws` and
     /// `anole.websocket.upgrade` also cover HTTP/2 and HTTP/3.
-    pub fn upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
+    pub fn _upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
         // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
         // WebSocket (RFC 8441), which a sink does not offer.
-        if (self.sink != null) return null;
+        if (self._sink != null) return null;
         // RFC 6455 §4.2.1: a GET, with a key of 16 bytes in base64.
         if (req.method != .get) return null;
         // Validate upgrade headers
@@ -1512,21 +1511,21 @@ pub const Response = struct {
         try self.header("Upgrade", "websocket");
         try self.putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
-        self.streaming = true;
+        self._streaming = true;
         // The connection is a WebSocket's from here: small windows, and the
         // request buffers' other pages back to the OS, the 101 included. It
         // cannot serve another request after that.
-        self.conn.shrinkForUpgrade();
+        self._conn.?.shrinkForUpgrade();
         errdefer self.keepalive = false;
         try self.writeHeader();
-        self.conn.finishUpgrade();
+        self._conn.?.finishUpgrade();
         // The connection is the WebSocket's now, and whatever the peer sends
         // after the session is not an HTTP request.
         self.keepalive = false;
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
-        return WebSocket.init(req.io, self.conn.transport(), self.arena, seed);
+        return WebSocket.init(req.io, self._conn.?.transport(), self.arena, seed);
     }
 
     /// Turns the sentinel a `std.Io.Writer` reports into the cause the
@@ -1538,10 +1537,10 @@ pub const Response = struct {
     fn resolve(self: *Response, result: std.Io.Writer.Error!void) SendError!void {
         result catch |err| switch (err) {
             error.WriteFailed => {
-                const cause: SendError = if (self.sink) |sink|
+                const cause: SendError = if (self._sink) |sink|
                     (sink.writeError() orelse error.Unexpected)
                 else
-                    (self.conn.getWriteError() orelse error.Unexpected);
+                    (self._conn.?.getWriteError() orelse error.Unexpected);
                 // A write that was canceled after its own deadline passed
                 // was the write timeout's doing (the cancel stays pending
                 // for the engine, which closes the connection or the stream).
@@ -1560,7 +1559,7 @@ pub const Response = struct {
     /// (a stream, a file): from now each write has `timeouts.write` instead.
     /// A deadline the handler set itself is kept.
     fn liftDeadline(self: *Response) void {
-        const req = self.request orelse return;
+        const req = self._request orelse return;
         if (req._deadline_from_handler or self._stream_mode) return;
         req._applyDeadline(.none);
         self._stream_mode = true;
@@ -1570,7 +1569,7 @@ pub const Response = struct {
     fn armWrite(self: *Response) void {
         if (!self._stream_mode) return;
         const d = self._write_timeout orelse return;
-        const req = self.request orelse return;
+        const req = self._request orelse return;
         self._write_deadline = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake });
         req._applyDeadline(.{ .duration = .{ .raw = d, .clock = .awake } });
     }
@@ -1578,7 +1577,7 @@ pub const Response = struct {
     /// Stops timing it.
     fn disarmWrite(self: *Response) void {
         if (!self._stream_mode) return;
-        const req = self.request orelse return;
+        const req = self._request orelse return;
         if (self._write_deadline == null) return;
         self._write_deadline = null;
         req._applyDeadline(.none);
@@ -1635,7 +1634,7 @@ pub const Response = struct {
         if (!(build_options.use_zlib or build_options.use_zstd or build_options.use_brotli) or !self.compress) return .off;
         if (self.file != null) return .off;
         // A tunnel (RFC 8441), not a representation.
-        if (self.request) |r| if (r.protocol != null) return .off;
+        if (self._request) |r| if (r.protocol != null) return .off;
         const not_modified = self.status == .not_modified;
         if (!not_modified and !statusHasBody(self.status)) return .off;
         if (self.status == .partial_content) return .off;
@@ -1654,7 +1653,7 @@ pub const Response = struct {
         if (!self.variesByAcceptEncoding()) needed += 1;
         if (!self.headerRoom(needed)) return .off;
 
-        const request = self.request orelse return .identity;
+        const request = self._request orelse return .identity;
         // The client's q-values first; on a tie, zstd, then Brotli, then
         // gzip. zstd compresses about as well as gzip at a third of the
         // time; Brotli at quality 5 is 10-15% smaller than either on JSON
@@ -1744,7 +1743,7 @@ pub const Response = struct {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
         var z: brotli_io.Compress = undefined;
-        try z.init(&out.interface, &.{}, .{ .quality = self.brotli_quality, .lgwin = brotli_io.windowFor(len), .size_hint = len });
+        try z.init(&out.interface, &.{}, .{ .quality = self._brotli_quality, .lgwin = brotli_io.windowFor(len), .size_hint = len });
         defer z.deinit();
         if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&z.writer) else try z.writer.writeAll(self.body);
         try z.finish();
@@ -1785,7 +1784,7 @@ pub const Response = struct {
         total: usize,
     ) std.Io.Writer.Error!void {
         const out = self.bodyOut();
-        if (self.chunked) {
+        if (self._chunked) {
             // 16 hex digits covers any usize, plus the CRLF.
             var size_buf: [18]u8 = undefined;
             try out.writeAll(std.fmt.bufPrint(&size_buf, "{x}\r\n", .{total}) catch unreachable);
@@ -1793,7 +1792,7 @@ pub const Response = struct {
         try out.writeAll(pending);
         for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
         try out.splatBytesAll(data[data.len - 1], splat);
-        if (self.chunked) try out.writeAll("\r\n");
+        if (self._chunked) try out.writeAll("\r\n");
         try out.flush();
     }
 
@@ -1801,9 +1800,9 @@ pub const Response = struct {
     /// or a protocol upgrade. A buffered body goes out with its headers in
     /// `write`, once its length is known.
     fn writeHeader(self: *Response) WriteError!void {
-        if (self.headers_written) return;
+        if (self._headers_written) return;
         try self.applyContentType();
-        self.headers_written = true;
+        self._headers_written = true;
         return self.resolve(self.sendHeaderAlone(self.bodyOut()));
     }
 
@@ -1820,7 +1819,7 @@ pub const Response = struct {
     /// The header block on the wire. Reports the sentinel, as anything
     /// writing to a `std.Io.Writer` does; the public entry point resolves it.
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (self.sink) |sink| {
+        if (self._sink) |sink| {
             try self.addSinkDate();
             return sink.head(self.status, &self.headers, self.headLength());
         }
@@ -1832,7 +1831,7 @@ pub const Response = struct {
         try w.writeByte(' ');
         try w.writeAll(self.status.phrase());
         try w.writeAll("\r\n");
-        if (self.send_date and self.headers.get("Date") == null) {
+        if (self._send_date and self.headers.get("Date") == null) {
             try w.writeAll("Date: ");
             try w.writeAll(http.currentHttpDate(self.io));
             try w.writeAll("\r\n");
@@ -1861,9 +1860,9 @@ pub const Response = struct {
         // and RFC 9110 §8.6 forbid both headers on a 1xx or 204; a HEAD
         // still reports the length its GET would have.
         if (statusHasBody(self.status)) {
-            if (self.chunked) {
+            if (self._chunked) {
                 try w.writeAll("Transfer-Encoding: chunked\r\n");
-            } else if (!self.streaming) {
+            } else if (!self._streaming) {
                 // Write Content-Length if not manually set (skip for streaming responses like SSE)
                 const has_content_length = self.headers.get("Content-Length") != null;
                 if (!has_content_length) {
@@ -1882,24 +1881,24 @@ pub const Response = struct {
     /// out, and the body. The server calls it after the handler; a
     /// second call does nothing.
     pub fn write(self: *Response) WriteError!void {
-        if (self.written) {
+        if (self._written) {
             return;
         }
         // An upgrade's 101 went out with it, and the connection is the
         // upgraded protocol's: its writer is not this response's to flush.
-        if (self.status == .switching_protocols and self.sink == null and self.conn.upgraded) {
-            self.written = true;
+        if (self.status == .switching_protocols and self._sink == null and self._conn.?.upgraded) {
+            self._written = true;
             return;
         }
         // A handler that failed part way through may never have called
         // `end`. Its buffer is gone, so whatever it held is lost either
         // way; recover rather than take the process down, and make sure a
         // started body is still framed correctly.
-        if (self.body_writer_open) {
-            self.body_writer_open = false;
+        if (self._body_writer_open) {
+            self._body_writer_open = false;
             // A body writer that was never ended goes out as far as it was
             // last flushed, framed to match.
-            self.body_writer_buffering = false;
+            self._body_writer_buffering = false;
             // Streaming under way with a declared length: whatever the
             // writer still held is gone with the handler's buffer, so the
             // body is short. Nothing can make it match the length we
@@ -1908,7 +1907,7 @@ pub const Response = struct {
             // needs no such care: `sendBody` terminates it, and a
             // truncated but well framed body is one the peer can finish,
             // though a gzipped one will not decode to the end.
-            if (self.headers_written and !self.chunked) {
+            if (self._headers_written and !self._chunked) {
                 if (self.content_length) |declared| {
                     if (self.body_sent != declared) self.keepalive = false;
                 }
@@ -1917,15 +1916,15 @@ pub const Response = struct {
             // and is still good, so leave it be: an error handler that
             // built a replacement has already cleared it.
         }
-        self.written = true;
+        self._written = true;
         defer self.closeFile();
 
         // Already false for a chunked response: the streaming writer
         // settled the headers when it sent them.
-        const send_header = !self.headers_written;
+        const send_header = !self._headers_written;
         if (send_header) {
             try self.applyContentType();
-            if (self.default_content_type) |default| {
+            if (self._default_content_type) |default| {
                 if (self.file == null and self.bodyLen() > 0 and self.headers.get("Content-Type") == null) {
                     try self.header("Content-Type", default.toContentType());
                 }
@@ -1935,14 +1934,14 @@ pub const Response = struct {
             if (compression.isCoding()) {
                 if (self.status == .not_modified) self.markCompressed(compression) else self.compressBody(compression);
             }
-            self.headers_written = true;
+            self._headers_written = true;
         }
 
         // A length promised by a Content-Length the handler set itself: a
         // body of another length cannot be framed as promised, and the
         // connection cannot carry another response after it.
         // A streamed body is the streaming writer's to account for.
-        if (self.sendsBody() and !self.chunked and !self.streaming and self.content_length == null) {
+        if (self.sendsBody() and !self._chunked and !self._streaming and self.content_length == null) {
             if (try self.declaredLength()) |declared| {
                 if (self.bodyLen() != declared) {
                     self.keepalive = false;
@@ -1959,7 +1958,7 @@ pub const Response = struct {
             return self.resolve(self.finish(self.bodyOut()));
         }
         // A whole body in memory goes to a sink that takes it in one call.
-        if (send_header) if (self.sink) |sink| if (sink.canComplete()) {
+        if (send_header) if (self._sink) |sink| if (sink.canComplete()) {
             return self.resolve(self.completeSink(sink));
         };
         return self.resolve(self.sendBody(self.bodyOut(), send_header));
@@ -1994,7 +1993,7 @@ pub const Response = struct {
     /// thread and short-lived, and the sink may send the head from another
     /// task.
     fn addSinkDate(self: *Response) std.Io.Writer.Error!void {
-        if (self.send_date and self.headers.get("Date") == null) {
+        if (self._send_date and self.headers.get("Date") == null) {
             const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
             self.putHeader("Date", date) catch {};
         }
@@ -2049,7 +2048,7 @@ pub const Response = struct {
     /// `copyBody` takes its bytes. Null for any other: a file, a stream,
     /// a body writer still open, or headers already sent.
     pub fn memoryBodyLen(self: *const Response) ?usize {
-        if (self.file != null or self.headers_written or self.body_writer_open or self.streaming or self.chunked) return null;
+        if (self.file != null or self._headers_written or self._body_writer_open or self._streaming or self._chunked) return null;
         return self.bodyLen();
     }
 
@@ -2077,7 +2076,7 @@ pub const Response = struct {
     /// sentinel, as anything writing to a `std.Io.Writer` does; `write`
     /// resolves it.
     fn sendBody(self: *Response, w: *std.Io.Writer, send_header: bool) std.Io.Writer.Error!void {
-        if (self.chunked) {
+        if (self._chunked) {
             // A streaming writer sent the headers; all that is left is the
             // terminator, which is body framing and so is not sent for a
             // HEAD either.
@@ -2106,7 +2105,7 @@ pub const Response = struct {
     /// no body.
     fn headLength(self: *const Response) ?usize {
         if (!statusHasBody(self.status)) return null;
-        if (self.streaming or self.chunked) return self.content_length;
+        if (self._streaming or self._chunked) return self.content_length;
         return self.bodyLen();
     }
 };
@@ -2153,7 +2152,7 @@ test "Response: body used when buffer is empty" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "body content";
 
     // Don't write to buffer
@@ -2173,7 +2172,7 @@ test "Response: write() with body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "Hello World";
 
     try response.write();
@@ -2194,7 +2193,7 @@ test "Response: write() only writes once" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "First";
 
     try response.write();
@@ -2218,7 +2217,7 @@ test "Response: writeHeader() basic" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.status = .created;
     try response.header("X-Custom", "value");
     response.body = "Hello";
@@ -2243,7 +2242,7 @@ test "Response: writeHeader() only writes once" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "Test";
 
     try response.writeHeader();
@@ -2267,7 +2266,7 @@ test "Response: write() after writeHeader() doesn't duplicate headers" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "Body content";
 
     // Write headers first
@@ -2297,7 +2296,7 @@ test "Response: keepalive defaults to true" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try std.testing.expectEqual(true, response.keepalive);
 
     response.body = "test";
@@ -2318,7 +2317,7 @@ test "Response: Connection close header when keepalive is false" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.keepalive = false;
     response.body = "test";
 
@@ -2337,8 +2336,8 @@ test "Response: chunked flag defaults to false" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const response = try Response.init(arena.allocator(), &connection, 32);
-    try std.testing.expectEqual(false, response.chunked);
+    const response = try Response._init(arena.allocator(), &connection, 32);
+    try std.testing.expectEqual(false, response._chunked);
 }
 
 test "BodyWriter: sends nothing until the response is written" {
@@ -2351,7 +2350,7 @@ test "BodyWriter: sends nothing until the response is written" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body = try response.writer();
     try body.interface.writeAll("Hello, ");
@@ -2360,7 +2359,7 @@ test "BodyWriter: sends nothing until the response is written" {
 
     // The headers are still open: nothing has gone out yet.
     try std.testing.expectEqual(@as(usize, 0), conn_writer.end);
-    try std.testing.expect(!response.headers_written);
+    try std.testing.expect(!response._headers_written);
     try response.header("X-Late", "still allowed");
 
     try response.write();
@@ -2368,7 +2367,7 @@ test "BodyWriter: sends nothing until the response is written" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 13") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Late: still allowed") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "Hello, World!"));
-    try std.testing.expect(!response.chunked);
+    try std.testing.expect(!response._chunked);
 }
 
 test "BodyWriter: a body larger than one write still arrives whole" {
@@ -2381,7 +2380,7 @@ test "BodyWriter: a body larger than one write still arrives whole" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body = try response.writer();
     for (0..100) |i| try body.interface.print("{d},", .{i});
@@ -2390,7 +2389,7 @@ test "BodyWriter: a body larger than one write still arrives whole" {
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.endsWith(u8, written, "97,98,99,"));
-    try std.testing.expect(!response.chunked);
+    try std.testing.expect(!response._chunked);
 }
 
 test "StreamingBodyWriter: sends the headers immediately and chunks the body" {
@@ -2403,11 +2402,11 @@ test "StreamingBodyWriter: sends the headers immediately and chunks the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
-    try std.testing.expect(response.headers_written);
+    try std.testing.expect(response._headers_written);
     // Too late for anyone to change them now.
     try std.testing.expectError(error.HeadersAlreadySent, response.header("X-Late", "no"));
 
@@ -2437,7 +2436,7 @@ test "StreamingBodyWriter: writes between flushes are framed as one chunk" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2460,7 +2459,7 @@ test "StreamingBodyWriter: an empty flush does not terminate the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2488,7 +2487,7 @@ test "StreamingBodyWriter: a declared Content-Length streams without chunk frami
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [4]u8 = undefined;
@@ -2497,7 +2496,7 @@ test "StreamingBodyWriter: a declared Content-Length streams without chunk frami
     try body.interface.writeAll("world");
     try body.end();
 
-    try std.testing.expect(!response.chunked);
+    try std.testing.expect(!response._chunked);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\n" ++
             "Content-Length: 11\r\n" ++
@@ -2517,7 +2516,7 @@ test "StreamingBodyWriter: reports a body that does not match the declared lengt
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [64]u8 = undefined;
@@ -2536,7 +2535,7 @@ test "StreamingBodyWriter: never writes past a declared Content-Length" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "5");
 
     var body_buf: [4]u8 = undefined;
@@ -2560,7 +2559,7 @@ test "Response: framing headers are the server's" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.InvalidHeaderName, response.header("Transfer-Encoding", "chunked"));
     try std.testing.expectError(error.InvalidHeaderName, response.addHeader("transfer-encoding", "chunked"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("Connection", "keep-alive"));
@@ -2585,7 +2584,7 @@ test "StreamingBodyWriter: rejects a Content-Length it cannot parse" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     // A proxy can forward whatever an upstream sent.
     try response.header("Content-Length", "99999999999999999999999999");
 
@@ -2605,7 +2604,7 @@ test "StreamingBodyWriter: stream reports the real error, not error.WriteFailed"
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body_buf: [64]u8 = undefined;
     try std.testing.expectError(error.ConnectionResetByPeer, response.stream(&body_buf));
 }
@@ -2624,7 +2623,7 @@ test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
         var connection: Connection = undefined;
         connection.initWriterForTesting(&conn_writer);
 
-        var response = try Response.init(arena.allocator(), &connection, 32);
+        var response = try Response._init(arena.allocator(), &connection, 32);
         var body_buf: [64]u8 = undefined;
         var body = try response.stream(&body_buf);
         try body.interface.writeAll("hello");
@@ -2639,7 +2638,7 @@ test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
     try body.interface.writeAll("hello");
@@ -2662,7 +2661,7 @@ test "Response: write reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "hello";
 
     try std.testing.expectError(error.ConnectionResetByPeer, response.write());
@@ -2679,7 +2678,7 @@ test "Response: writeHeader reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.ConnectionResetByPeer, response.writeHeader());
 }
 
@@ -2695,7 +2694,7 @@ test "Response: a write that recorded no cause reports Unexpected" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "hello";
 
     try std.testing.expectError(error.Unexpected, response.write());
@@ -2716,7 +2715,7 @@ test "Response: no std.Io.Writer sentinel escapes the public write API" {
         ErrorSetOf(Response.write),
         ErrorSetOf(Response.stream),
         ErrorSetOf(Response.startEventStream),
-        ErrorSetOf(Response.upgradeWebSocket),
+        ErrorSetOf(Response._upgradeWebSocket),
         EventStream.Error,
         EventWriter.Error,
     }) |Set| {
@@ -2736,7 +2735,7 @@ test "BodyWriter: end is idempotent" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body = try response.writer();
     try body.interface.writeAll("hello");
@@ -2758,7 +2757,7 @@ test "StreamingBodyWriter: end does not write a second terminator" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2785,7 +2784,7 @@ test "Response: an abandoned buffered body goes out as far as it was flushed" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body = try response.writer();
     try body.interface.writeAll("hello");
@@ -2809,7 +2808,7 @@ test "Response: an abandoned short body closes the connection" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [64]u8 = undefined;
@@ -2834,7 +2833,7 @@ test "Response: an abandoned chunked body is still terminated" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2858,7 +2857,7 @@ test "StreamingBodyWriter: a failed end does not let write add to the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [64]u8 = undefined;
@@ -2886,7 +2885,7 @@ test "StreamingBodyWriter: a failed end does not leave a second terminator" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2909,7 +2908,7 @@ test "Response: json() with simple object" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.json(.{ .name = "Alice", .age = 30 });
 
     var body_buf: [256]u8 = undefined;
@@ -2932,7 +2931,7 @@ test "Response: json() writes complete response" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.status = .created;
     try response.json(.{ .id = 123, .message = "Created" });
     try response.write();
@@ -2960,7 +2959,7 @@ test "Response: json() with array" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     const items = [_]i32{ 1, 2, 3, 4, 5 };
     try response.json(items);
 
@@ -2979,7 +2978,7 @@ test "Response: json() with nested object" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.json(.{
         .user = .{
             .name = "Bob",
@@ -3011,7 +3010,7 @@ const TestEventStream = struct {
         self.arena = .init(std.testing.allocator);
         self.conn_writer = .fixed(buf);
         self.connection.initWriterForTesting(&self.conn_writer);
-        self.response = try Response.init(self.arena.allocator(), &self.connection, 32);
+        self.response = try Response._init(self.arena.allocator(), &self.connection, 32);
         self.stream = try self.response.startEventStream(&self.event_buf);
         self.header_end = self.conn_writer.end;
     }
@@ -3104,7 +3103,7 @@ test "Response: startEventStream" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
 
@@ -3152,7 +3151,7 @@ test "EventStream: send reports the real error, not error.WriteFailed" {
         var probe_writer: std.Io.Writer = .fixed(&probe);
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
-        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        var probe_res = try Response._init(arena.allocator(), &probe_conn, 32);
         var event_buf: [4096]u8 = undefined;
         _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
@@ -3164,7 +3163,7 @@ test "EventStream: send reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
 
@@ -3181,7 +3180,7 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
         var probe_writer: std.Io.Writer = .fixed(&probe);
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
-        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        var probe_res = try Response._init(arena.allocator(), &probe_conn, 32);
         var event_buf: [4096]u8 = undefined;
         _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
@@ -3193,7 +3192,7 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
 
@@ -3213,7 +3212,7 @@ test "EventWriter: an event too long for the buffer reports the real error" {
         var probe_writer: std.Io.Writer = .fixed(&probe);
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
-        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        var probe_res = try Response._init(arena.allocator(), &probe_conn, 32);
         var event_buf: [4096]u8 = undefined;
         _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
@@ -3225,7 +3224,7 @@ test "EventWriter: an event too long for the buffer reports the real error" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
     var w = try stream.startSend(.{});
@@ -3253,7 +3252,7 @@ test "Response: setCookie basic" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.setCookie("session", "abc123", .{});
     response.body = "OK";
 
@@ -3273,7 +3272,7 @@ test "Response: setCookie with options" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.setCookie("auth", "token123", .{
         .path = "/",
         .http_only = true,
@@ -3298,7 +3297,7 @@ test "Response: header() rejects CRLF in value" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.InvalidHeaderValue, response.header("Location", "/ok\r\nX-Evil: 1"));
     try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\nbaz"));
     try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\x00baz"));
@@ -3314,7 +3313,7 @@ test "Response: header() rejects invalid name" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.InvalidHeaderName, response.header("", "value"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("X-Bad\r\n", "value"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("X: Bad", "value"));
@@ -3331,7 +3330,7 @@ test "Response: setCookie rejects a value that would inject a header" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     // Caught as a bad cookie value now, which is the earlier and narrower
     // of the two checks -- CRLF is not a cookie-octet in the first place.
     try std.testing.expectError(error.InvalidCookieValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
@@ -3538,7 +3537,7 @@ test "Response: resetBody replaces a half written body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.content_type = .json;
     var body = try response.writer();
     try body.interface.writeAll("{\"half\":");
@@ -3569,7 +3568,7 @@ test "Response: resetBody drops the headers that described the old body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     // Set directly rather than through `content_type`, which is the case
     // clearing that field alone does not cover.
     try response.header("Content-Type", "application/json");
@@ -3604,7 +3603,7 @@ test "Response: a stream to an HTTP/1.0 peer is delimited by closing, not chunke
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.http10 = true;
     var stream_buf: [64]u8 = undefined;
     var body = try response.stream(&stream_buf);
@@ -3630,7 +3629,7 @@ test "Response: a HEAD streamed to an HTTP/1.0 peer keeps the connection" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.http10 = true;
     response.head = true;
     var stream_buf: [64]u8 = undefined;
@@ -3656,7 +3655,7 @@ test "Response: a kept HTTP/1.0 connection is announced with Connection: keep-al
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.http10 = true;
     response.body = "hello";
     try response.write();
@@ -3676,7 +3675,7 @@ test "Response: an HTTP/1.1 response that keeps the connection sends no Connecti
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.body = "hello";
     try response.write();
 
@@ -3695,7 +3694,7 @@ test "BodyWriter: a body over many segments goes out whole, with its length" {
     var expected: [10_000]u8 = undefined;
     for (&expected, 0..) |*b, i| b.* = @intCast('a' + i % 26);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     // Short writes, as an encoder makes, crossing every segment boundary.
     var i: usize = 0;
@@ -3722,7 +3721,7 @@ test "BodyWriter: a body of more segments than one vectored write takes goes out
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     var chunk: [1000]u8 = undefined;
     for (0..total / chunk.len) |i| {
@@ -3753,7 +3752,7 @@ test "BodyWriter: a write bigger than any segment, and a long splat" {
     connection.initWriterForTesting(&conn_writer);
 
     const big: [100 * 1024]u8 = @splat('x');
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     try body.interface.writeAll("<");
     try body.interface.writeAll(&big);
@@ -3782,7 +3781,7 @@ test "BodyWriter: rebase keeps the bytes it was asked to preserve" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     const head: [500]u8 = @splat('h');
     try body.interface.writeAll(&head);
@@ -3820,7 +3819,7 @@ test "BodyWriter: a file streamed into the body arrives whole" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     const file = try tmp.dir.openFile(io, "body.txt", .{});
     defer file.close(io);
@@ -3845,7 +3844,7 @@ test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     try body.interface.writeAll("abc");
     const slice = try body.interface.writableSliceGreedyPreserve(100, 1000);
@@ -3868,7 +3867,7 @@ test "Response: json is refused while a body writer is open" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     try body.interface.writeAll("[");
     try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }));
@@ -3888,7 +3887,7 @@ test "BodyWriter: resetBody after several segments leaves only the replacement" 
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     var body = try response.writer();
     try body.interface.splatByteAll('y', 300);
     try body.interface.splatByteAll('z', 5000);
@@ -3915,7 +3914,7 @@ test "Response: a handler's own Content-Length must match the buffered body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "10");
     response.body = "hello";
     try std.testing.expectError(error.ContentLengthMismatch, response.write());
@@ -3932,7 +3931,7 @@ test "Response: a handler's Content-Length that is not a number is refused" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.header("Content-Length", "five");
     response.body = "hello";
     try std.testing.expectError(error.InvalidContentLength, response.write());
@@ -3948,7 +3947,7 @@ test "Response: a 204 carries no Content-Length and no body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.status = .no_content;
     // A handler's mistake, which must not reach the wire.
     response.body = "hello";
@@ -3970,7 +3969,7 @@ test "Response: a 204 streamed is neither chunked nor terminated" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.status = .no_content;
     var stream_buf: [64]u8 = undefined;
     var body = try response.stream(&stream_buf);
@@ -3994,7 +3993,7 @@ test "Response: a 304 sends no body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.status = .not_modified;
     response.body = "hello";
     try response.write();
@@ -4014,7 +4013,7 @@ test "Response: a HEAD reports the length but sends no body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.head = true;
     response.content_type = .text;
     response.body = "hello";
@@ -4038,7 +4037,7 @@ test "Response: a HEAD sends no body written through the writer" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.head = true;
     var body = try response.writer();
     try body.interface.writeAll("hello");
@@ -4060,7 +4059,7 @@ test "Response: a streamed HEAD sends the framing headers and nothing after" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.head = true;
 
     var body_buf: [64]u8 = undefined;
@@ -4087,7 +4086,7 @@ test "Response: a streamed HEAD still checks a declared length" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.head = true;
     try response.header("Content-Length", "5");
 
@@ -4113,7 +4112,7 @@ test "Response: a HEAD event stream sends the headers and no events" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     response.head = true;
 
     var event_buf: [4096]u8 = undefined;
@@ -4134,7 +4133,7 @@ test "Response: a HEAD event stream sends the headers and no events" {
 }
 
 fn testGzipRequest(arena: std.mem.Allocator) !Request {
-    var request: Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var request: Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     request.headers = try http.Headers.init(arena, 4);
     try request.headers.put("Accept-Encoding", "gzip");
     return request;
@@ -4150,8 +4149,8 @@ test "Response: a stream refused at the headers leaves nothing for the error res
     connection.initWriterForTesting(&conn_writer);
 
     var request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 2);
-    response.request = &request;
+    var response = try Response._init(arena.allocator(), &connection, 2);
+    response._request = &request;
     response.compress = true;
     response.content_type = .text;
     try response.header("X-A", "1");
@@ -4183,8 +4182,8 @@ test "Response: compress without room for its headers sends the body as it is" {
     connection.initWriterForTesting(&conn_writer);
 
     var request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 1);
-    response.request = &request;
+    var response = try Response._init(arena.allocator(), &connection, 1);
+    response._request = &request;
     response.compress = true;
     response.body = &@as([300]u8, @splat('a'));
     try response.write();
@@ -4206,8 +4205,8 @@ test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
     connection.initWriterForTesting(&conn_writer);
 
     var request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 8);
-    response.request = &request;
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    response._request = &request;
     response.compress = true;
     try response.header("ETag", "\"v1\"");
     try response.header("Accept-Ranges", "bytes");
@@ -4231,8 +4230,8 @@ test "Response: a 304 gets the Vary and ETag of a gzipped 200, without its codin
     connection.initWriterForTesting(&conn_writer);
 
     var request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 8);
-    response.request = &request;
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    response._request = &request;
     response.compress = true;
     response.status = .not_modified;
     try response.header("ETag", "\"v1\"");
@@ -4255,7 +4254,7 @@ test "Response: variesByAcceptEncoding matches whole names, and *" {
         .{ "X-Accept-Encoding-Hint", false },
     };
     for (cases) |case| {
-        var response = try Response.init(arena.allocator(), &connection, 2);
+        var response = try Response._init(arena.allocator(), &connection, 2);
         try response.header("Vary", case[0]);
         try std.testing.expectEqual(case[1], response.variesByAcceptEncoding());
     }
@@ -4273,8 +4272,8 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     connection.initWriterForTesting(&conn_writer);
 
     var request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(failing.allocator(), &connection, 8);
-    response.request = &request;
+    var response = try Response._init(failing.allocator(), &connection, 8);
+    response._request = &request;
     response.compress = true;
     failing.fail_index = failing.alloc_index;
 
@@ -4313,11 +4312,11 @@ test "Response: Accept-Encoding picks zstd, br or gzip by q-value, then in that 
         .{ "", .identity },
     };
     for (cases) |case| {
-        var request: Request = .{ .arena = arena.allocator(), .parser = undefined, .transport = undefined };
+        var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
         request.headers = try http.Headers.init(arena.allocator(), 4);
         try request.headers.put("Accept-Encoding", case[0]);
-        var response = try Response.init(arena.allocator(), &connection, 8);
-        response.request = &request;
+        var response = try Response._init(arena.allocator(), &connection, 8);
+        response._request = &request;
         response.compress = true;
         std.testing.expectEqual(case[1], response.negotiateCompression()) catch |err| {
             std.debug.print("Accept-Encoding: {s}\n", .{case[0]});
@@ -4327,7 +4326,7 @@ test "Response: Accept-Encoding picks zstd, br or gzip by q-value, then in that 
 }
 
 fn testBrRequest(arena: std.mem.Allocator) !Request {
-    var request: Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var request: Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     request.headers = try http.Headers.init(arena, 4);
     try request.headers.put("Accept-Encoding", "gzip, br");
     return request;
@@ -4356,11 +4355,11 @@ test "Response: a buffered body goes out as br, at the configured quality" {
         var connection: Connection = undefined;
         connection.initWriterForTesting(&conn_writer);
         var request = try testBrRequest(arena.allocator());
-        var response = try Response.init(arena.allocator(), &connection, 8);
+        var response = try Response._init(arena.allocator(), &connection, 8);
         defer response.deinit();
-        response.request = &request;
+        response._request = &request;
         response.compress = true;
-        response.brotli_quality = quality;
+        response._brotli_quality = quality;
         response.content_type = .json;
         response.body = body;
         try response.write();
@@ -4388,9 +4387,9 @@ test "Response: a streamed body goes out as br, each flush decodable" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
     var request = try testBrRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 8);
+    var response = try Response._init(arena.allocator(), &connection, 8);
     defer response.deinit();
-    response.request = &request;
+    response._request = &request;
     response.compress = true;
     response.content_type = .text;
 
@@ -4436,8 +4435,8 @@ test "Response.deinit frees the Brotli encoder of a stream never ended" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
     var request = try testBrRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 8);
-    response.request = &request;
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    response._request = &request;
     response.compress = true;
     var stream_buf: [64]u8 = undefined;
     var w = try response.stream(&stream_buf);
@@ -4478,13 +4477,13 @@ test "Response: render calls a function or a template type" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.render(.html, test_templates.greeting, .{ "hi", 3 });
     var body_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("<p>hi x3</p>", try testBody(&response, &body_buf));
     try std.testing.expectEqual(.html, response.content_type);
 
-    var page = try Response.init(arena.allocator(), &connection, 32);
+    var page = try Response._init(arena.allocator(), &connection, 32);
     page.content_type = .xml;
     try page.render(null, test_templates.Page, .{"Title"});
     try std.testing.expectEqualStrings("<h1>Title</h1>", try testBody(&page, &body_buf));
@@ -4513,12 +4512,12 @@ test "Response: encode finds the writer, the allocator and the value by type" {
     connection.initWriterForTesting(&conn_writer);
     var body_buf: [256]u8 = undefined;
 
-    var first = try Response.init(arena.allocator(), &connection, 32);
+    var first = try Response._init(arena.allocator(), &connection, 32);
     try first.encode(.json, test_encoders.valueFirst, 42);
     try std.testing.expectEqualStrings("[42]", try testBody(&first, &body_buf));
     try std.testing.expectEqual(.json, first.content_type);
 
-    var second = try Response.init(arena.allocator(), &connection, 32);
+    var second = try Response._init(arena.allocator(), &connection, 32);
     try second.encode(.msgpack, test_encoders.writerFirst, @as(u32, 7));
     try std.testing.expectEqualStrings("<7>", try testBody(&second, &body_buf));
     try std.testing.expectEqual(.msgpack, second.content_type);
@@ -4533,7 +4532,7 @@ test "Response: a failed render can be replaced" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.Broken, response.render(.html, test_templates.failing, .{}));
     try response.render(.html, test_templates.Page, .{"Fallback"});
     var body_buf: [256]u8 = undefined;
@@ -4549,7 +4548,7 @@ test "Response: print formats the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.print(.text, "{s} x{d}", .{ "hi", 3 });
     try response.write();
 
@@ -4622,7 +4621,7 @@ test "Response sink: a buffered body goes to the sink with its length, and no HT
     var ts: TestSink = undefined;
     ts.init();
 
-    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
     try response.print(.text, "hello {s}", .{"sink"});
     try response.write();
 
@@ -4640,7 +4639,7 @@ test "Response sink: a streamed body is unframed, of unknown length, and ends on
     var ts: TestSink = undefined;
     ts.init();
 
-    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
     var buf: [8]u8 = undefined;
     var body = try response.stream(&buf);
     try std.testing.expectEqual(@as(usize, 1), ts.heads);
@@ -4651,7 +4650,7 @@ test "Response sink: a streamed body is unframed, of unknown length, and ends on
     try response.write(); // the server's call after the handler: nothing more
 
     try std.testing.expectEqualStrings("hello streamed world", ts.body());
-    try std.testing.expect(!response.chunked);
+    try std.testing.expect(!response._chunked);
     try std.testing.expectEqual(@as(usize, 1), ts.ends);
 }
 
@@ -4661,7 +4660,7 @@ test "Response sink: trailers reach the end of the message" {
     var ts: TestSink = undefined;
     ts.init();
 
-    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
     response.body = "payload";
     try response.trailer("grpc-status", "0");
     try response.write();
@@ -4676,7 +4675,7 @@ test "Response sink: a HEAD reports the length and sends no body" {
     var ts: TestSink = undefined;
     ts.init();
 
-    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
     response.head = true;
     response.body = "not sent";
     try response.write();
@@ -4692,7 +4691,7 @@ test "Response sink: 204 announces no length" {
     var ts: TestSink = undefined;
     ts.init();
 
-    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
     response.status = .no_content;
     try response.write();
 
@@ -4707,13 +4706,13 @@ test "Response sink: no WebSocket upgrade over a sink" {
     var ts: TestSink = undefined;
     ts.init();
 
-    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
-    var request: Request = .{ .arena = arena.allocator(), .parser = undefined, .transport = undefined, .headers = try http.Headers.init(arena.allocator(), 8) };
+    var response = try Response._initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined, .headers = try http.Headers.init(arena.allocator(), 8) };
     try request.headers.put("Upgrade", "websocket");
     try request.headers.put("Connection", "Upgrade");
     try request.headers.put("Sec-WebSocket-Version", "13");
     try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
-    try std.testing.expect((try response.upgradeWebSocket(&request)) == null);
+    try std.testing.expect((try response._upgradeWebSocket(&request)) == null);
     try std.testing.expectEqual(@as(usize, 0), ts.heads);
 }
 

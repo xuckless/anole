@@ -34,6 +34,6 @@ pub const detach_safe = true;
 pub fn execute(self: *const Compress, req: *Request, res: *Response, next: anytype) !void {
     _ = req;
     res.compress = true;
-    if (self.brotli_quality) |q| res.brotli_quality = q;
+    if (self.brotli_quality) |q| res._brotli_quality = q;
     return next.call();
 }

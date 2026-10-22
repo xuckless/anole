@@ -56,7 +56,7 @@
 //! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
 //! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
 //! upgrades with `upgrade` here, not the core's HTTP/1.1-only
-//! `res.upgradeWebSocket`, or turn `http2.enable_connect_protocol` (and
+//! `anole.websocket.upgrade`, or turn `http2.enable_connect_protocol` (and
 //! `http3.enable_connect_protocol`) off.
 //!
 //! permessage-deflate (RFC 7692) is accepted when offered and
@@ -464,7 +464,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
                 // send (`Rooms`). The server's allocator there; over HTTP/2
                 // and HTTP/3 the stream's arena is a `std.heap.ArenaAllocator`
                 // over the server's allocator, which is thread-safe.
-                d.* = .init(accepted.config, options.deflate, if (h2) req.arena else res.conn.allocator);
+                d.* = .init(accepted.config, options.deflate, if (h2) req.arena else res._conn.?.allocator);
                 deflate = d;
             }
         }
@@ -489,7 +489,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     } else {
         const ws = try alloc.create(WebSocket);
         errdefer if (owner != null) alloc.destroy(ws);
-        ws.* = (try res.upgradeWebSocket(req)) orelse {
+        ws.* = (try res._upgradeWebSocket(req)) orelse {
             if (owner != null) alloc.destroy(ws);
             if (comptime features.compression) if (owner != null) if (deflate) |d| alloc.destroy(d);
             return null;
@@ -502,7 +502,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         socket.conn = .{ .h1 = ws };
     }
     req.setDeadline(options.timeout);
-    if (options.close_on_drain) if (req.drain_hooks) |hooks| {
+    if (options.close_on_drain) if (req._drain_hooks) |hooks| {
         const watch = try alloc.create(DrainWatch);
         watch.* = .{
             .hooks = hooks,
@@ -710,7 +710,7 @@ const H1Callbacks = struct {
     const window_len = 2048;
 
     fn open(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
-        const gpa = res.conn.allocator;
+        const gpa = res._conn.?.allocator;
         const self = try gpa.create(H1Callbacks);
         errdefer gpa.destroy(self);
         var socket = (try openSocket(req, res, options, gpa)) orelse {

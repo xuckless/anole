@@ -67,7 +67,7 @@ pub fn excluded(req: *const dusty.Request, list: []const []const u8) bool {
 /// the 101, so a WebSocket reads the same on both. An app's own
 /// `uncaughtError` may still choose another.
 pub fn statusOf(req: *const dusty.Request, res: *const dusty.Response, result: anytype) u16 {
-    if (result) |_| {} else |err| if (!res.headers_written) {
+    if (result) |_| {} else |err| if (!res._headers_written) {
         const status = dusty.errorStatus(err) orelse return 500;
         return @intCast(@backingInt(status));
     }
@@ -77,8 +77,8 @@ pub fn statusOf(req: *const dusty.Request, res: *const dusty.Response, result: a
 }
 
 test "statusOf: status-named errors as sent, a stray SyntaxError as 500" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
-    var res: dusty.Response = .{ .arena = std.testing.allocator, .conn = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
+    var res: dusty.Response = .{ .arena = std.testing.allocator, ._conn = undefined };
     const E = error{ Unauthorized, TooManyRequests, InvalidJsonBody, SyntaxError, OutOfMemory };
     const cases = [_]struct { E, u16 }{
         .{ error.Unauthorized, 401 },
@@ -97,7 +97,7 @@ test "statusOf: status-named errors as sent, a stray SyntaxError as 500" {
 }
 
 test "excluded: exact paths, prefixes, the query aside" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     const list: []const []const u8 = &.{ "/healthz", "/internal/*" };
     req.url = "/healthz";
     try std.testing.expect(excluded(&req, list));

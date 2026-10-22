@@ -242,7 +242,7 @@ pub const RequestParser = struct {
         // table starts small (`parseHeaders`) and grows to the limit.
         const headers = &self.request.headers;
         headers.add(self.state.header_field, self.state.header_value) catch {
-            if (!headers.grow(self.request.arena, self.request.config.max_header_count)) return -1;
+            if (!headers.grow(self.request.arena, self.request._config.max_header_count)) return -1;
             headers.add(self.state.header_field, self.state.header_value) catch return -1;
         };
 
@@ -256,7 +256,7 @@ pub const RequestParser = struct {
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
 
-        self.request.applyEntityHeaders();
+        self.request._applyEntityHeaders();
 
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
@@ -803,20 +803,20 @@ pub fn BodyReader(comptime Parser: type) type {
         fn streamFramed(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             // Send 100 Continue on first body read if client expects it
             if (self.request) |req| {
-                if (req.expects_continue) {
-                    if (req.response) |res| {
+                if (req._expects_continue) {
+                    if (req._response) |res| {
                         // A final response has started, and 100 can no
                         // longer precede it. The peer may still be holding
                         // the body, so the flag stays.
-                        if (!res.headers_written) {
-                            req.expects_continue = false;
+                        if (!res._headers_written) {
+                            req._expects_continue = false;
                             // A write, on a read: the caller asked for the body
                             // and this is what unblocks the peer from sending it.
-                            if (res.sink) |sink| {
+                            if (res._sink) |sink| {
                                 sink.interim(.@"continue") catch
                                     return self.fail(sink.writeError() orelse error.Unexpected);
                             } else {
-                                sendContinue(res.conn.writer) catch
+                                sendContinue(res._conn.?.writer) catch
                                     return self.fail(self.transport.getWriteError() orelse error.Unexpected);
                             }
                         }
@@ -1010,8 +1010,8 @@ test "RequestParser: basic" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
         // Allocated by `parseHeaders`, which this test goes around.
         .headers = try Headers.init(arena.allocator(), 32),
     };

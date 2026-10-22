@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         .https = if (anole.features.tls != .none) .{ .port = tls_port, .cert = .dev_self_signed } else null,
         // Open sockets hold a graceful shutdown until they close or this
         // runs out (30 s by default); then they are cut.
-        .server = .{ .timeout = .{ .shutdown = .fromSeconds(5) } },
+        .timeouts = .{ .shutdown = .fromSeconds(5) },
     }, &state);
     defer app.deinit();
 

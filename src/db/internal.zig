@@ -249,7 +249,7 @@ test "fail and lastError: on a Ctx and on a request, copied into the arena" {
         try std.fmt.bufPrint(&buf, "{f}", .{detail}),
     );
 
-    var req: dusty.Request = .{ .arena = arena, .io = testing.io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, .io = testing.io, ._parser = undefined, ._transport = undefined };
     try testing.expect(db.lastError(&req) == null);
     const lost = fail(&req, .{}, .{ .system = .postgresql, .class = .serialization, .code = "40001", .message = "could not serialize access" });
     try testing.expectEqual(error.Conflict, lost);

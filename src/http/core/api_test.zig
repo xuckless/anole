@@ -267,13 +267,13 @@ test "locals: a middleware hands typed values to the handler, per request" {
 }
 
 test "locals: reset with the request on a keep-alive connection" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     req.arena = arena.allocator();
     try req.setLocal("k", @as(u32, 1));
     try std.testing.expectEqual(@as(u32, 1), req.local(u32, "k").?);
-    req.reset();
+    req._reset();
     try std.testing.expect(req.local(u32, "k") == null);
 }
 

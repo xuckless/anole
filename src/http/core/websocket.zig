@@ -9,7 +9,7 @@ const placement = @import("placement.zig");
 const log = std.log.scoped(.anole);
 
 /// An established WebSocket connection (RFC 6455). Obtained from
-/// `Response.upgradeWebSocket` on the server side and `Client.connectWebSocket`
+/// `Response._upgradeWebSocket` on the server side and `Client.connectWebSocket`
 /// on the client side; call `deinit` when done.
 ///
 /// One task may call `receive`; any number of tasks may send concurrently.

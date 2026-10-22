@@ -383,7 +383,7 @@ const Handlers = struct {
     /// it to, which returns credit for all of them, then stops while the
     /// peer fills the whole window again, then reads the rest.
     fn stall(req: *dusty.Request, res: *dusty.Response) !void {
-        const raw = req.body_source.?.reader;
+        const raw = req._body_source.?.reader;
         var hash: std.hash.Wyhash = .init(0);
         var n: usize = 0;
         while (n < stall_credit) n += try takeBody(raw, &hash, stall_credit - n);

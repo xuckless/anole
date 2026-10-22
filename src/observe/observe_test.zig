@@ -114,7 +114,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
 test "access log: text and JSON lines" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    var req: dusty.Request = .{ .arena = arena_state.allocator(), .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/a\"b";
     req.id = "rid";
@@ -131,7 +131,7 @@ test "access log: a request ID cannot add JSON fields" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/x";
     req.id = "x\",\"status\":200,\"y\":\"\\";
@@ -371,7 +371,7 @@ test "access log: the query is left out unless log_query" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/callback?code=secret-code&state=s";
     const json = try observe.access_log.format(arena, .json, &req, 200, 1, 0, null);

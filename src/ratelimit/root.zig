@@ -665,7 +665,7 @@ test "redis: live rate limiter (RedisLimiter)" {
 }
 
 test "clientAddress: IPv6 clients share their /64, IPv4 clients are one address each" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     var a: [128]u8 = undefined;
     var b: [128]u8 = undefined;
     req.remote_address = try std.Io.net.IpAddress.parse("2001:db8:1:2:aaaa:bbbb:cccc:dddd", 443);

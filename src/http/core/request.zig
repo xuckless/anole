@@ -120,7 +120,7 @@ pub const Request = struct {
     /// The server's drain callbacks (`DrainHooks`): what a long-lived
     /// request registers with instead of keeping a task waiting on `drain`.
     /// Null in a request the server did not build.
-    drain_hooks: ?*DrainHooks = null,
+    _drain_hooks: ?*DrainHooks = null,
 
     /// Freed in one go once the response has gone out: for anything the
     /// handler builds for this request.
@@ -143,13 +143,13 @@ pub const Request = struct {
     _deadline_from_handler: bool = false,
 
     // Body reading support
-    parser: *RequestParser,
-    transport: Transport,
+    _parser: *RequestParser,
+    _transport: Transport,
     /// Set by a protocol engine that delivers the body itself, unframed (an
     /// HTTP/2 stream), in place of `parser` and `transport`, which are then
     /// unused.
-    body_source: ?BodySource = null,
-    config: ServerConfig.Request = .{},
+    _body_source: ?BodySource = null,
+    _config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
     // Set up on the first body read that calls for decoding, and kept so a
@@ -168,8 +168,8 @@ pub const Request = struct {
     locals: Locals = .{},
 
     // 100-continue support
-    response: ?*Response = null,
-    expects_continue: bool = false,
+    _response: ?*Response = null,
+    _expects_continue: bool = false,
 
     /// The host the client asked for: `X-Forwarded-Host` from a trusted
     /// proxy, else `Host` (which HTTP/2's `:authority` fills).
@@ -189,13 +189,13 @@ pub const Request = struct {
 
     /// Clears the request for reuse on the same connection. Called by
     /// the server between requests; not for handlers.
-    pub fn reset(self: *Request) void {
+    pub fn _reset(self: *Request) void {
         const arena = self.arena;
         const io = self.io;
-        const parser = self.parser;
-        const transport = self.transport;
-        const cfg = self.config;
-        const res = self.response;
+        const parser = self._parser;
+        const transport = self._transport;
+        const cfg = self._config;
+        const res = self._response;
         const timeout_context = self._timeout_context;
         const set_timeout = self._set_timeout;
         // Belongs to the connection, not the request, so it outlives the
@@ -204,20 +204,20 @@ pub const Request = struct {
         const listener = self.listener;
         const secure = self.secure;
         const drain = self.drain;
-        const drain_hooks = self.drain_hooks;
+        const drain_hooks = self._drain_hooks;
         const peer_certificate = self.peer_certificate;
         self.* = .{
             .arena = arena,
             .io = io,
-            .parser = parser,
-            .transport = transport,
-            .config = cfg,
-            .response = res,
+            ._parser = parser,
+            ._transport = transport,
+            ._config = cfg,
+            ._response = res,
             .remote_address = addr,
             .listener = listener,
             .secure = secure,
             .drain = drain,
-            .drain_hooks = drain_hooks,
+            ._drain_hooks = drain_hooks,
             .peer_certificate = peer_certificate,
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,
@@ -227,7 +227,7 @@ pub const Request = struct {
     /// Fills `content_type`, `content_encoding` and `content_length` from
     /// the headers. The HTTP/1.x parser calls it when the head is complete;
     /// another protocol engine calls it once it has the headers.
-    pub fn applyEntityHeaders(self: *Request) void {
+    pub fn _applyEntityHeaders(self: *Request) void {
         if (self.headers.get("Content-Type")) |content_type| {
             self.content_type = http.ContentType.fromContentType(content_type);
         }
@@ -282,7 +282,7 @@ pub const Request = struct {
     /// One per body. `body` takes it if you have not, so a handler that
     /// streams cannot then ask for the body whole.
     pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
-        return self.readerLimited(buffer, self.config.max_body_size);
+        return self.readerLimited(buffer, self._config.max_body_size);
     }
 
     /// `reader` with a limit of your own: the most bytes the body may bring
@@ -290,9 +290,9 @@ pub const Request = struct {
     /// limit reading fails with `error.BodyTooBig` (a 413). `reader` stops
     /// at `limits.body_max`, chunked bodies too.
     pub fn readerLimited(self: *Request, buffer: []u8, limit: ?usize) !RequestBodyReader {
-        var r = RequestBodyReader.init(self.parser, self.transport, buffer);
+        var r = RequestBodyReader.init(self._parser, self._transport, buffer);
         r.body_limit = limit;
-        r.raw = self.body_source;
+        r.raw = self._body_source;
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
@@ -309,7 +309,7 @@ pub const Request = struct {
         r.request = self;
         if (self._decode) |decode| {
             r.decode = decode;
-        } else if (self.config.decompress) {
+        } else if (self._config.decompress) {
             try r.startDecoding(self.arena, self.content_encoding);
             if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
@@ -343,7 +343,7 @@ pub const Request = struct {
         // Nothing to stage: `allocRemaining` streams straight into the arena.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
-        const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
+        const result = r.interface.allocRemaining(self.arena, .limited(self._config.max_body_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             // The interface can only say that a read failed; the reader
             // holds what it was.
@@ -473,7 +473,7 @@ pub const Request = struct {
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
-            if (self._fd.count() >= self.config.max_form_count) {
+            if (self._fd.count() >= self._config.max_form_count) {
                 return error.TooManyFormFields;
             }
 
@@ -564,7 +564,7 @@ pub const Request = struct {
                 break;
             }
 
-            if (self._mfd.count() >= self.config.max_multiform_count) {
+            if (self._mfd.count() >= self._config.max_multiform_count) {
                 return error.TooManyMultiFormFields;
             }
 
@@ -828,7 +828,7 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
     // by the next one, so the headers are allocated for each: room for
     // most heads, grown to `max_header_count` for one with more, so that an
     // ordinary request takes little of its arena.
-    parser.request.headers = try http.Headers.init(parser.request.arena, @min(parser.request.config.max_header_count, initial_header_room));
+    parser.request.headers = try http.Headers.init(parser.request.arena, @min(parser.request._config.max_header_count, initial_header_room));
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {
         const buffered = reader.buffered();
@@ -911,8 +911,8 @@ test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
     var req: Request = .{
         .arena = std.testing.allocator,
         .io = std.testing.io,
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
         ._timeout_context = &probe,
         ._set_timeout = Probe.set,
     };
@@ -937,14 +937,14 @@ test "Request.peerCertificate: belongs to the connection, so it outlives reset" 
     var req: Request = .{
         .arena = std.testing.allocator,
         .io = std.testing.io,
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(@as(?[]const u8, null), req.peerCertificate());
     const der = "\x30\x82\x01\x00";
     req.peer_certificate = der;
     req.url = "/a";
-    req.reset();
+    req._reset();
     try std.testing.expectEqualStrings(der, req.peerCertificate().?);
     try std.testing.expectEqualStrings("", req.url);
 }
@@ -985,14 +985,14 @@ test "Request.body: basic POST" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1035,14 +1035,14 @@ test "Request.body: a gzip request body is decoded" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1068,14 +1068,14 @@ test "Request.body: a chunked gzip body is unwrapped by both layers" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1144,14 +1144,14 @@ test "Request.body: a chunked trailer split across a buffer wrap is dropped, not
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &source.interface, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &source.interface, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&source.interface, &parser);
 
@@ -1170,14 +1170,14 @@ test "Request: decoding takes the headers that described the encoded body" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1208,15 +1208,15 @@ test "Request: decoding off leaves the headers alone" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
-        .config = .{ .decompress = false },
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
+        ._config = .{ .decompress = false },
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
     _ = try req.body();
@@ -1236,15 +1236,15 @@ test "Request.body: decoding off yields what the wire carried" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
-        .config = .{ .decompress = false },
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
+        ._config = .{ .decompress = false },
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1265,14 +1265,14 @@ test "Request.body: a compressed body cut short is a bad body, not a departed pe
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1293,14 +1293,14 @@ test "Request.body: a coding we cannot undo is refused rather than guessed at" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1318,14 +1318,14 @@ test "Request.body: a body read that failed before it started can be asked for a
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1349,14 +1349,14 @@ test "Request: a streaming read resolves through the reader it hands out" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1380,14 +1380,14 @@ test "Request.body: a body cut short is IncompleteBody, not a failed read" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1406,14 +1406,14 @@ test "Request.body: a chunked body cut short is IncompleteBody" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1430,14 +1430,14 @@ test "Request.body: framing the parser rejects is reported as itself" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1454,14 +1454,14 @@ test "Request.body: large body over 128 bytes" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1479,14 +1479,14 @@ test "Request.cookies: parse cookies from header" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1505,14 +1505,14 @@ test "Request.formData: basic key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1530,14 +1530,14 @@ test "Request.formData: URL-encoded key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1554,14 +1554,14 @@ test "Request.formData: entry with no value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1578,14 +1578,14 @@ test "Request.multiFormData: basic key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1603,14 +1603,14 @@ test "Request.multiFormData: entry with filename" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1641,14 +1641,14 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1678,14 +1678,14 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1701,12 +1701,12 @@ test "Request.body: a body source delivers the body without the HTTP/1 parser" {
     defer arena.deinit();
 
     var source: std.Io.Reader = .fixed("unframed body bytes");
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
     req.headers = try http.Headers.init(arena.allocator(), 4);
     try req.headers.put("content-type", "application/json");
     try req.headers.put("content-length", "19");
-    req.applyEntityHeaders();
-    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+    req._applyEntityHeaders();
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
 
     try std.testing.expectEqual(http.ContentType.json, req.content_type.?);
     try std.testing.expectEqual(@as(?usize, 19), req.content_length);
@@ -1720,11 +1720,11 @@ test "Request.body: a gzip body from a body source is decoded" {
 
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
     var source: std.Io.Reader = .fixed(gzip_hello);
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
     req.headers = try http.Headers.init(arena.allocator(), 4);
     try req.headers.put("content-encoding", "gzip");
-    req.applyEntityHeaders();
-    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+    req._applyEntityHeaders();
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
 
     try std.testing.expectEqualStrings("hello", (try req.body()).?);
 }
@@ -1764,16 +1764,16 @@ test "Request.body: 100 Continue goes through the response's sink" {
         }
     };
     var probe: Probe = .{};
-    var res = try Response.initSink(arena.allocator(), std.testing.io, probe.sink(), 8);
+    var res = try Response._initSink(arena.allocator(), std.testing.io, probe.sink(), 8);
 
     var source: std.Io.Reader = .fixed("data");
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
     req.headers = try http.Headers.init(arena.allocator(), 4);
-    req.body_source = .{ .reader = &source, .err = noBodySourceError };
-    req.expects_continue = true;
-    req.response = &res;
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
+    req._expects_continue = true;
+    req._response = &res;
 
     try std.testing.expectEqualStrings("data", (try req.body()).?);
     try std.testing.expectEqual(http.Status.@"continue", probe.interim.?);
-    try std.testing.expect(!req.expects_continue);
+    try std.testing.expect(!req._expects_continue);
 }

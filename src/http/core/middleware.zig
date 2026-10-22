@@ -122,7 +122,7 @@ pub fn Chain(comptime Ctx: type) type {
                     // The connection is asked, not the error: a handler
                     // can return an `EndOfStream` of its own.
                     if (self.res.peerGone()) return err;
-                    if (self.res.headers_written) {
+                    if (self.res._headers_written) {
                         // The response already started (e.g. streaming/chunked
                         // body or a WebSocket upgrade), so headers were sent
                         // with framing that doesn't account for an error body.
@@ -151,7 +151,7 @@ pub fn Chain(comptime Ctx: type) type {
             if (self.index < self.middlewares.len) {
                 const mw = self.middlewares[self.index];
                 self.index += 1;
-                if (!mw.detach_safe) self.res.detach_blocked = true;
+                if (!mw.detach_safe) self.res._detach_blocked = true;
                 return mw.execute(self.req, self.res, self);
             }
 
@@ -175,7 +175,7 @@ pub fn Chain(comptime Ctx: type) type {
         }
 
         fn handleMethodNotAllowed(self: *Self, allow: []const u8) !void {
-            if (!self.res.headers_written) self.res.resetBody() catch {};
+            if (!self.res._headers_written) self.res.resetBody() catch {};
             try self.res.header("Allow", allow);
             if (comptime Ctx != void and @hasDecl(Ctx, "methodNotAllowed")) {
                 try self.ctx.methodNotAllowed(self.req, self.res);
@@ -190,7 +190,7 @@ pub fn Chain(comptime Ctx: type) type {
             // of the 404. Unlike the error path, nothing has checked the
             // headers yet: a middleware that started streaming has already
             // committed the framing, so there is nothing to replace.
-            if (!self.res.headers_written) self.res.resetBody() catch {};
+            if (!self.res._headers_written) self.res.resetBody() catch {};
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
                 try self.ctx.notFound(self.req, self.res);
             } else {
@@ -414,7 +414,7 @@ fn testHandler(req: *Request, res: *Response) !void {
 
 /// A request with a method and a path, which the error log reads.
 fn testRequest() Request {
-    return .{ .arena = undefined, .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
+    return .{ .arena = undefined, ._transport = undefined, ._parser = undefined, .method = .get, .url = "/test" };
 }
 
 fn makeTestResponse(conn: *Connection) Response {
@@ -424,12 +424,12 @@ fn makeTestResponse(conn: *Connection) Response {
         .headers = .{},
         .content_type = null,
         .arena = undefined,
-        .conn = conn,
-        .written = false,
-        .headers_written = false,
+        ._conn = conn,
+        ._written = false,
+        ._headers_written = false,
         .keepalive = true,
-        .chunked = false,
-        .streaming = false,
+        ._chunked = false,
+        ._streaming = false,
     };
 }
 
@@ -675,7 +675,7 @@ test "Executor: error after headers written propagates instead of rewriting the 
     var res = makeTestResponse(&connection);
     // Simulate a response that already started (e.g. a streamed/chunked body
     // or a WebSocket upgrade) before the handler failed.
-    res.headers_written = true;
+    res._headers_written = true;
 
     var chain = Chain(void){
         .req = &req,
@@ -835,8 +835,8 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined, .method = .get, .url = "/test" };
+    var res = try Response._init(arena.allocator(), &connection, 32);
 
     var chain = Chain(void){
         .req = &req,
@@ -885,8 +885,8 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined, .method = .get, .url = "/test" };
+    var res = try Response._init(arena.allocator(), &connection, 32);
 
     var mw = WritingMiddleware{};
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
