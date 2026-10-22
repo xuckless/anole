@@ -134,6 +134,10 @@ pub const Request = struct {
     // module does not depend on the server's backend-specific timer type.
     _timeout_context: ?*anyopaque = null,
     _set_timeout: ?*const fn (*anyopaque, std.Io, std.Io.Timeout) void = null,
+    /// The last deadline the handler set with `setTimeout`, on the awake
+    /// clock; null for none (or `.none`). The rest of an unread body is
+    /// drained no later than this.
+    _handler_deadline: ?std.Io.Clock.Timestamp = null,
 
     // Body reading support
     parser: *RequestParser,
@@ -240,6 +244,10 @@ pub const Request = struct {
     /// spawned by the handler.
     pub fn setTimeout(self: *Request, timeout: std.Io.Timeout) void {
         const set = self._set_timeout orelse return;
+        self._handler_deadline = if (timeout.toDurationFromNow(self.io)) |d|
+            std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d.raw, .clock = .awake })
+        else
+            null;
         set(self._timeout_context.?, self.io, timeout);
     }
 

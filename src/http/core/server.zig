@@ -2828,7 +2828,10 @@ pub fn Server(comptime Ctx: type) type {
                         break :blk n <= max;
                     };
                     if (drainable) {
-                        if (!try self.boundedDiscard(&parser, connection, max, timer, request_deadline)) response.keepalive = false;
+                        // A tighter deadline the handler set (gRPC's read
+                        // timeout) bounds the drain too; a lifted one does not.
+                        const drain_deadline = earlier(request_deadline, request._handler_deadline);
+                        if (!try self.boundedDiscard(&parser, connection, max, timer, drain_deadline)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
                     }
