@@ -218,6 +218,25 @@ its handler, for a while:
 app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed));
 ```
 
+> **A cached answer is served to everyone who asks for the same URL.** The
+> cache skips requests with `Authorization`, `Cookie`, `X-API-Key` or a TLS
+> client certificate, but it can't know every way your app tells users
+> apart. If a route's answer depends on a header of your own, the client's
+> address, or anything set by middleware before the cache, add that header
+> to `credential_headers`, or refuse those requests with `cacheable`;
+> otherwise one user's page goes to the next. Authentication that runs
+> after the cache is skipped on a hit, so put it before the cache.
+
+```zig
+// A session token in a header of the app's own.
+app.get("/me", anole.cached(.{ .ttl = .fromSeconds(5), .credential_headers = &.{ "Authorization", "Cookie", "X-API-Key", "X-Session-Token" } }, me));
+// Any per-request rule.
+fn anonymousOnly(req: *const anole.Request) bool {
+    return req.headers.get("X-Tenant") == null;
+}
+app.get("/news", anole.cached(.{ .ttl = .fromSeconds(5), .cacheable = anonymousOnly }, news));
+```
+
 One cache for several routes is `app.responseCache`, used through `with`,
 `group` or `use`, and invalidated when what it serves changes:
 
@@ -255,7 +274,8 @@ What is not:
   `no-cache` or `private`. Its `s-maxage`, else `max-age`, is how long it is
   kept (0: not at all); with neither, the cache's `ttl` (10 s by default).
 - Requests that carry credentials (`Authorization`, `Cookie`, `X-API-Key`;
-  `credential_headers`): they neither read the cache nor fill it.
+  `credential_headers`), or a TLS client certificate: they neither read the
+  cache nor fill it. Nor do requests `cacheable` returns false for.
   `.authenticated = true` lets them, for routes whose answer does not depend
   on who asks: the credentials are not part of the key.
 - `Vary: *`. Other `Vary` headers are honoured: each combination of the
@@ -281,9 +301,10 @@ When not to use it:
 
 - Pages that differ by who asks, unless the difference is in the URL or a
   `Vary` header: a session read from a cookie makes the request bypass the
-  cache, but a user identified some other way (a client certificate, a
-  header not in `credential_headers`) would get another user's page.
-  Add such headers to `credential_headers`, or keep the cache off the route.
+  cache, but a user identified some other way (a header not in
+  `credential_headers`, the client's address) would get another user's page.
+  Add such headers to `credential_headers`, refuse those requests in
+  `cacheable`, or keep the cache off the route.
 - Anything that must show a write at once, unless the write invalidates it.
 - Routes behind authorization middleware that runs after the cache (a
   route's own `with`, in a group whose cache comes first): a hit skips it.

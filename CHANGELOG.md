@@ -72,6 +72,12 @@ breaking changes are listed anyway.
   issuers and endpoints (`error.InsecureEndpoint`, loopback `http` aside).
   `Identity` gains `issuer`: key accounts on `(issuer, subject)`, as
   docs/auth.md now says.
+- Response cache: requests with a TLS client certificate bypass it like
+  those with `Authorization`/`Cookie`/`X-API-Key`, and the new
+  `ResponseCache.Options.cacheable` predicate refuses others per route.
+  docs/routing.md now warns up front that an answer depending on anything
+  else (an app-specific header, the client's address) must be excluded
+  through `credential_headers` or `cacheable`. Check your cached routes.
 
 ### C ABI (ABI 0.1)
 
