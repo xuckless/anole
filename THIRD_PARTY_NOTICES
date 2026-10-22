@@ -133,7 +133,7 @@ pg.zig (PostgreSQL client)
             read, LISTEN channel names bounded, SCRAM nonce and iteration
             count checked, allowed login methods (require_auth) and SCRAM
             channel binding, and an optional session reset on release)
-  Pinned:   commit 6ffefc88696ec34441297d4b898cc3d9279c844c of the fork
+  Pinned:   commit 003c011cc2461fdd21efa9a7a08108bad3199a36 of the fork
   Linked:   -Dpostgres=true
 
 buffer.zig (byte buffers; a dependency of pg.zig)
@@ -168,7 +168,7 @@ zig-protobuf (protobuf runtime and protoc-gen-zig; protoc release zips)
             e9e18c7 plus security patches: decoding bounds message nesting
             depth and checks length-delimited fields against the input
             before allocating; Timestamp fields validated)
-  Pinned:   commit e9e18c7664b8c950e5fc679259c968dd66ccc48b
+  Pinned:   commit ef23c279af0dcb12cce9eee39838c14f5955c75f of the fork
   Linked:   -Dgrpc=true (protoc and protoc-gen-zig run at build time only,
             for `zig build gen-proto`; protoc is Google's BSD-3-Clause
             release binary, pinned by hash in zig-protobuf's build.zig.zon)
@@ -179,7 +179,7 @@ websocket-zig (sans-IO WebSocket frame codec, for WebSocket over HTTP/2)
   Fork:     https://github.com/xuckless/websocket-zig, branch anole (ported to
             Zig 0.17; the libxev example dropped; a security patch refusing
             RSV1 on control frames and continuations)
-  Pinned:   commit 4bd0e5c4f46466ded5478afb0db3a2f72a264ae8
+  Pinned:   commit 065fac7e8b6c53e845335ccccf5a40f435d5ff30
   Linked:   -Dwebsocket=true
 
 zlib.zig (std.Io wrapper over the zlib API; its src/root.zig only)
