@@ -306,7 +306,7 @@ per executor, and the larger of 16 x `limits.ws_high_water` and
 `anole_db_*` runs SQL without blocking the caller, for event-loop consumers
 (Node, asyncio). A database is configured with the server and opened at
 start, before the listeners, with its `init` script (SQL). SQLite,
-PostgreSQL and Redis are the kinds so far:
+PostgreSQL, Redis and MongoDB are the kinds:
 
 ```json
 "databases": [
@@ -467,6 +467,70 @@ anole_db_query(db, consumer, (anole_str){"GET", 3}, p, 1, &cached, 2);
   (`MULTI`/`EXEC`, `WATCH`) goes in one `EVAL` script for now; pub/sub is
   not part of `anole_db_*` (WebSocket topics cover fan-out to clients).
 
+### MongoDB
+
+The same calls with a `"mongodb"` database, on `anole.mongodb`:
+
+```json
+"databases": [
+  { "name": "docs", "mongodb": { "url": "mongodb://app:secret@db1,db2,db3/?replicaSet=rs0", "database": "shop" } }
+]
+```
+
+```c
+/* filter and options: BSON documents the binding encoded */
+anole_db_value p[] = {{ANOLE_DB_BLOB, 0, {.s = {filter, filter_len}}},
+                      {ANOLE_DB_BLOB, 0, {.s = {options, options_len}}}};
+anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
+/* ANOLE_EV_DB_RESULT: a row per document, each cell ANOLE_DB_BSON */
+```
+
+- `sql` names the operation and the collection, and optionally another
+  database than the configured one: `"find orders"`, `"aggregate events
+  analytics"`. The operations are the drivers' methods of the same name:
+  `find`, `findOne`, `aggregate`, `countDocuments`, `insertOne`,
+  `insertMany`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`,
+  `deleteMany`, and `runCommand` (a database's; `sql` is `"runCommand"` or
+  `"runCommand <database>"`, the escape hatch for everything else:
+  indexes, `findAndModify`, `distinct`, admin commands).
+- The parameters are BSON documents (`ANOLE_DB_BLOB`), in the order the
+  drivers' methods take them: `find(filter, options)`, `insertOne(doc)`,
+  `insertMany(doc, doc, ...)`, `updateOne(filter, update, options)` (the
+  update may be a pipeline: an array), `aggregate(pipeline, options)` (a
+  BSON array of stages; a document whose values are the stages works too),
+  `deleteOne(filter, options)`, `runCommand(command)`. Options go under
+  the command's own names, as the Node driver spells them: `sort`,
+  `projection`, `limit`, `skip`, `batchSize`, `hint`, `collation`,
+  `comment`, `allowDiskUse`, `let`, `upsert`, `arrayFilters`. An unknown
+  option, a missing or extra document, or a parameter that is not valid
+  BSON is answered with `http_status` 400 and the reason in `error`.
+- Answers have one column, `"document"`. `find`, `findOne` and `aggregate`
+  give a row per document, its cell `ANOLE_DB_BSON` (the document's
+  bytes); `countDocuments` one `ANOLE_DB_INT`; the writes one BSON row
+  with the driver's result (`{insertedId}`, `{insertedCount,
+  insertedIds}`, `{matchedCount, modifiedCount, upsertedId}`,
+  `{deletedCount}`); `runCommand` the server's reply. `anole_db_exec`
+  answers with no rows and `changes`: the documents inserted, modified
+  (and upserted) or deleted, or for a read their count.
+- Why BSON both ways, not JSON: Anole passes the bytes it gets from the
+  server, with no conversion, and a binding decodes them with the BSON
+  library its ecosystem already uses (`bson` on npm, the one the official
+  Node driver uses; `bson` from PyMongo, in C), so documents come out as
+  the types users of the official drivers know: ObjectId, Date, Long,
+  Decimal128, Binary. JSON would lose int64 precision in JavaScript,
+  dates and ObjectIds would need Extended JSON wrappers anyway, and Anole
+  would spend time converting what the binding converts again.
+- The reads are cursors drained to the end within `limits.db_result_max`;
+  use `limit` (and `skip` or a range filter) to page. `timeout_ms` bounds
+  the call and goes to the server as `maxTimeMS`. `ANOLE_DB_COALESCE` and
+  `cache_ttl_ms` apply to `find`, `findOne`, `countDocuments` and an
+  `aggregate` that does not end in `$out` or `$merge`.
+- Errors carry MongoDB's code in `error_code` (`"11000"` for a duplicate
+  key: `ANOLE_DB_ERR_UNIQUE`, 409); no primary or an unreachable server is
+  `ANOLE_DB_ERR_UNAVAILABLE` (503). Retryable reads and writes are retried
+  once, as the drivers do.
+- Transactions and change streams are not part of the ABI yet.
+
 ## gRPC
 
 A `"grpc"` section serves gRPC services whose methods the consumer
@@ -615,11 +679,11 @@ routes with native ones.
 ## What comes next
 
 ABI 0.1 was the request/response and WebSocket core, plus `anole_db_*` with
-SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server. Before the ABI
-freezes (1.0) and the bindings ship, these come as their own pull requests;
-their event types and handle kinds are reserved already:
+SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server, and 0.3 MongoDB
+through `anole_db_*`. Before the ABI freezes (1.0) and the bindings ship,
+these come as their own pull requests; their event types and handle kinds
+are reserved already:
 
-- MongoDB through `anole_db_*`.
 - WebTransport: sessions, streams and datagrams.
 - TLS extras: mutual TLS and the client certificate in the request,
   certificate reload per listener.

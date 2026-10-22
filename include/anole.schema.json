@@ -919,6 +919,16 @@
             }
           ]
         },
+        "mongodb": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Mongodb"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cache": {
           "type": "object",
           "additionalProperties": false,
@@ -941,7 +951,7 @@
       "required": [
         "name"
       ],
-      "description": "A database for anole_db_*: exactly one of sqlite, postgres and redis."
+      "description": "A database for anole_db_*: exactly one of sqlite, postgres, redis and mongodb."
     },
     "Sqlite": {
       "type": "object",
@@ -1217,6 +1227,85 @@
         }
       },
       "description": "A Redis or Valkey server (anole.redis; docs/database.md)."
+    },
+    "Mongodb": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "mongodb:// or mongodb+srv:// connection string; its options win over the fields below. Null: MONGODB_URI, else mongodb://localhost:27017."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "database": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The database operations name no other for. Null: the URL's path, else \"test\"."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file of the CA certificates the server's certificate is checked against; turns TLS on."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 100,
+          "description": "Connections at most, split between the executors (maxPoolSize; 0: no limit)."
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long an operation waits for a pooled connection."
+        },
+        "server_selection_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "How long an operation waits for a server it can use (a primary)."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "TCP connect and TLS handshake."
+        }
+      },
+      "description": "A MongoDB deployment (anole.mongodb; docs/database.md)."
     },
     "Cache": {
       "type": "object",

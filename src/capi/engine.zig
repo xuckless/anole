@@ -674,6 +674,11 @@ pub const Engine = struct {
     publishing: std.atomic.Value(usize) = .init(0),
     publish_bytes: std.atomic.Value(usize) = .init(0),
     publish_dropped: std.atomic.Value(u64) = .init(0),
+    /// `anole_ws_subscribe` calls taken, and those applied on the socket's
+    /// executor (or dropped): a publish waits for the ones taken before it,
+    /// so it reaches a socket that subscribed before it was called.
+    topic_changes: std.atomic.Value(u32) = .init(0),
+    topic_changes_done: std.atomic.Value(u32) = .init(0),
     /// The configuration's databases (`anole_db *`).
     dbs: []db.Db = &.{},
     /// WebSocket topics, shared by every executor.

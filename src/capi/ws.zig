@@ -409,7 +409,28 @@ pub fn subscribe(e: *Engine, hv: u64, topic: []const u8, join: bool) engine.Answ
         gpa.destroy(c);
         return error.OutOfMemory;
     }, .join = join };
+    _ = e.topic_changes.fetchAdd(1, .acq_rel);
     s.exec.post(&c.cmd);
+}
+
+/// One `subscribe` is applied (or dropped): publishes taken after it may go.
+fn topicChangeDone(e: *Engine) void {
+    _ = e.topic_changes_done.fetchAdd(1, .acq_rel);
+    // Once stopped, the commands left are run by `destroy`, with no task
+    // left to wake (nor a runtime to wake it with).
+    if (e.phase.load(.acquire) == .stopped) return;
+    e.io.futexWake(u32, &e.topic_changes_done.raw, std.math.maxInt(u32));
+}
+
+/// Waits until every `subscribe` taken before `want` was counted is
+/// applied: joins and leaves run on each socket's executor, a publish on
+/// any, and one must not overtake the other.
+fn awaitTopicChanges(e: *Engine, want: u32) std.Io.Cancelable!void {
+    while (true) {
+        const done = e.topic_changes_done.load(.acquire);
+        if (@as(i32, @bitCast(done -% want)) >= 0) return;
+        try e.io.futexWait(u32, &e.topic_changes_done.raw, done);
+    }
 }
 
 fn runTopic(cmd: *Command, x: *Exec) void {
@@ -419,8 +440,13 @@ fn runTopic(cmd: *Command, x: *Exec) void {
     if (found == null or !found.?[0].live(found.?[1]) or found.?[0].socket == null or e.phase.load(.acquire) == .stopped) {
         gpa.free(c.topic);
         gpa.destroy(c);
+        topicChangeDone(e);
         return;
     }
+    // Every way out below counts the change done, the leave once its task
+    // has left.
+    var counted = false;
+    defer if (!counted) topicChangeDone(e);
     const s = found.?[0];
     if (c.join) {
         for (s.topics.items) |t| if (std.mem.eql(u8, t, c.topic)) {
@@ -448,7 +474,9 @@ fn runTopic(cmd: *Command, x: *Exec) void {
             e.rooms.leave(own, s.socket.?);
             gpa.free(own);
             gpa.destroy(c);
+            return;
         };
+        counted = true;
         return;
     };
     gpa.free(c.topic);
@@ -456,6 +484,7 @@ fn runTopic(cmd: *Command, x: *Exec) void {
 }
 
 fn leaveTask(e: *Engine, sock: *Socket, c: *TopicCmd) std.Io.Cancelable!void {
+    defer topicChangeDone(e);
     e.rooms.leave(c.topic, sock);
     gpa.free(c.topic);
     gpa.destroy(c);
@@ -468,6 +497,8 @@ const PublishCmd = struct {
     type: websocket.MessageType,
     topic: []u8,
     data: []u8,
+    /// `Engine.topic_changes` when it was taken.
+    after: u32,
 
     fn free(p: *PublishCmd) void {
         _ = p.engine.publishing.fetchSub(1, .monotonic);
@@ -520,7 +551,7 @@ pub fn publish(e: *Engine, topic: []const u8, typ: c_int, data: []const u8, exce
     errdefer gpa.destroy(p);
     const t = try gpa.dupe(u8, topic);
     errdefer gpa.free(t);
-    p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data) };
+    p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data), .after = e.topic_changes.load(.acquire) };
     // Spread over the executors.
     const xi = next_publisher.fetchAdd(1, .monotonic) % e.execs.len;
     e.execs[xi].post(&p.cmd);
@@ -534,6 +565,7 @@ fn runPublish(cmd: *Command, x: *Exec) void {
 
 fn publishTask(e: *Engine, p: *PublishCmd) std.Io.Cancelable!void {
     defer p.free();
+    try awaitTopicChanges(e, p.after);
     // Only compared, never followed: a stale handle names no member.
     var except: ?*Socket = null;
     if (p.except != 0) if (slotOf(e, p.except)) |found| {

@@ -514,7 +514,7 @@ jobs:
         run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh
 
   mongodb:
-    name: MongoDB (live client tests)
+    name: MongoDB (live client tests; the C ABI's suite)
     # MongoDB 8.0.21+ and 9.x exit at startup on Linux kernels 6.19 to
     # 7.0.13 (SERVER-125742; ubuntu-24.04 runs 7.0.0), and earlier 8.0s
     # crash there: 8.0 and 9.0 run on ubuntu-22.04 (kernel 6.8) until the
@@ -538,5 +538,5 @@ jobs:
       # A replica set of one with authentication and failCommand, plain and
       # over TLS on a CA made for the run; SCRAM-SHA-256 and SCRAM-SHA-1.
       - name: Tests with a live server
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: tests/mongodb/run.sh ${{ matrix.image }}

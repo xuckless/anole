@@ -2125,9 +2125,14 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     try slow_writer.interface.flush();
     try sync.started.wait(io);
 
-    // Idle by the time the drain starts.
+    // Idle by the time the drain starts, and accepted: one still in the
+    // listen backlog when the accept loops stop is never served (a loaded
+    // machine can take that long to accept it).
     const idle = try server.address.ip.connect(io, .{ .mode = .stream });
     defer idle.close(io);
+    while (server.active_connections.load(.acquire) < 2) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
 
     // The drain blocks on the slow handler, so it runs on a task of its own.
     var shutdown_future = try io.concurrent(struct {

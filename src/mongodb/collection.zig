@@ -136,7 +136,12 @@ pub const Collection = struct {
     /// and is sent as a write (with the write concern, not retried).
     pub fn aggregate(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: anytype) Error![]T {
         // Shared only when the pipeline is known to read: a tuple of
-        // stages whose last is neither `$out` nor `$merge`.
+        // stages whose last is neither `$out` nor `$merge`, or a
+        // `bson.Array` whose last is neither.
+        if (@TypeOf(pipeline) == bson.Array) {
+            if (writes(pipeline)) return self.aggregateNow(T, c, pipeline, opts);
+            return self.client.cache.read([]T, c, self.options, "aggregate", .{ self.database, self.name, pipeline, opts }, Shared(.aggregate, T){ .collection = self });
+        }
         if (comptime !readsOnly(@TypeOf(pipeline))) return self.aggregateNow(T, c, pipeline, opts);
         return self.client.cache.read([]T, c, self.options, "aggregate", .{ self.database, self.name, pipeline, opts }, Shared(.aggregate, T){ .collection = self });
     }
@@ -456,7 +461,7 @@ pub const Collection = struct {
 
 /// The options `find`, `findOne`, `findOptional` and `iterate` take, and
 /// `all`, `one` and `optional`, which are the same calls.
-const find_options = .{
+pub const find_options = .{
     .{ "sort", "sort" },            .{ "projection", "projection" },       .{ "skip", "skip" },
     .{ "limit", "limit" },          .{ "batch_size", "batchSize" },        .{ "hint", "hint" },
     .{ "collation", "collation" },  .{ "comment", "comment" },             .{ "allow_disk_use", "allowDiskUse" },
@@ -466,21 +471,21 @@ const find_options = .{
 
 /// The options `aggregate` and `aggregateIterate` take (see
 /// `find_options`).
-const aggregate_options = .{
+pub const aggregate_options = .{
     .{ "allow_disk_use", "allowDiskUse" },                         .{ "batch_size", "batchSize" }, .{ "hint", "hint" },
     .{ "collation", "collation" },                                 .{ "comment", "comment" },      .{ "let", "let" },
     .{ "bypass_document_validation", "bypassDocumentValidation" },
 };
 
 /// The options `insertMany` takes (see `find_options`).
-const insert_many_options = .{ .{ "ordered", "ordered" }, .{ "bypass_document_validation", "bypassDocumentValidation" }, .{ "comment", "comment" } };
+pub const insert_many_options = .{ .{ "ordered", "ordered" }, .{ "bypass_document_validation", "bypassDocumentValidation" }, .{ "comment", "comment" } };
 
 /// The options `updateOne`, `updateMany` and `replaceOne` take (see
 /// `find_options`).
-const update_options = .{ .{ "upsert", "upsert" }, .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" }, .{ "collation", "collation" } };
+pub const update_options = .{ .{ "upsert", "upsert" }, .{ "array_filters", "arrayFilters" }, .{ "hint", "hint" }, .{ "collation", "collation" } };
 
 /// The options `deleteOne` and `deleteMany` take (see `find_options`).
-const delete_options = .{ .{ "hint", "hint" }, .{ "collation", "collation" } };
+pub const delete_options = .{ .{ "hint", "hint" }, .{ "collation", "collation" } };
 
 /// The options `findOneAndUpdate`, `findOneAndReplace` and
 /// `findOneAndDelete` take (see `find_options`); `return_document` is

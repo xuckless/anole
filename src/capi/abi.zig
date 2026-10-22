@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 2;
+pub const version_minor: u32 = 3;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -171,6 +171,8 @@ pub const DB_BOOL: u32 = 5;
 pub const DB_ARRAY: u32 = 6;
 pub const DB_MAP: u32 = 7;
 pub const DB_ERROR: u32 = 8;
+/// A BSON document (MongoDB): its bytes in the span.
+pub const DB_BSON: u32 = 9;
 
 pub const DbValue = extern struct {
     type: u32,

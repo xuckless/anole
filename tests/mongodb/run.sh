@@ -10,7 +10,8 @@
 #   tests/mongodb/run.sh mongo:7.0       # another image
 #   KEEP=1 tests/mongodb/run.sh          # leave the container running
 #
-# Each run checks SCRAM-SHA-256 (negotiated), SCRAM-SHA-1 and TLS.
+# Each run checks SCRAM-SHA-256 (negotiated), SCRAM-SHA-1 and TLS, then the
+# C ABI's suite over TLS.
 set -euo pipefail
 
 image="${1:-mongo:8.0}"
@@ -102,3 +103,9 @@ for target in \
     echo "== $(echo "$target" | sed -E 's#//([^:]+):[^@]+@#//\1:***@#')"
     "$zig" build test-mongodb --summary line "-Dmongodb-test-url=$target"
 done
+# The C ABI's suite (tests/capi/consumer.c), its MongoDB part included,
+# over TLS; CAPI=0 skips it.
+if [ "${CAPI:-1}" != 0 ]; then
+    echo "== the C ABI (TLS)"
+    "$zig" build capi-test --summary line "-Dmongodb-test-url=$base&tls=true&tlsCAFile=$work/ca.pem"
+fi

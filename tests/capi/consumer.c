@@ -1593,6 +1593,324 @@ static void test_db_redis(void) {
          coalesced, MANY);
 }
 
+/* ---- a little BSON, for the MongoDB part ---- */
+
+typedef struct {
+  unsigned char buf[96 * 1024];
+  size_t len;
+  size_t open[8];
+  int depth;
+} bson_b;
+
+static void bb_raw(bson_b *b, const void *p, size_t n) {
+  CHECK(b->len + n <= sizeof b->buf);
+  memcpy(b->buf + b->len, p, n);
+  b->len += n;
+}
+static void bb_i32le(bson_b *b, int32_t v) {
+  unsigned char x[4] = {(unsigned char)v, (unsigned char)(v >> 8), (unsigned char)(v >> 16), (unsigned char)(v >> 24)};
+  bb_raw(b, x, 4);
+}
+static void bb_begin(bson_b *b) {
+  b->open[b->depth++] = b->len;
+  bb_i32le(b, 0);
+}
+static void bb_end(bson_b *b) {
+  unsigned char z = 0;
+  bb_raw(b, &z, 1);
+  size_t start = b->open[--b->depth];
+  int32_t n = (int32_t)(b->len - start);
+  unsigned char x[4] = {(unsigned char)n, (unsigned char)(n >> 8), (unsigned char)(n >> 16), (unsigned char)(n >> 24)};
+  memcpy(b->buf + start, x, 4);
+}
+static void bb_key(bson_b *b, unsigned char type, const char *name) {
+  bb_raw(b, &type, 1);
+  bb_raw(b, name, strlen(name) + 1);
+}
+static void bb_int(bson_b *b, const char *name, int32_t v) {
+  bb_key(b, 0x10, name);
+  bb_i32le(b, v);
+}
+static void bb_bool(bson_b *b, const char *name, int v) {
+  unsigned char x = v ? 1 : 0;
+  bb_key(b, 0x08, name);
+  bb_raw(b, &x, 1);
+}
+static void bb_str(bson_b *b, const char *name, const char *v, size_t n) {
+  bb_key(b, 0x02, name);
+  bb_i32le(b, (int32_t)n + 1);
+  bb_raw(b, v, n);
+  unsigned char z = 0;
+  bb_raw(b, &z, 1);
+}
+static void bb_doc(bson_b *b, const char *name) { bb_key(b, 0x03, name), bb_begin(b); }
+static void bb_arr(bson_b *b, const char *name) { bb_key(b, 0x04, name), bb_begin(b); }
+static anole_db_value bb_value(const bson_b *b) {
+  anole_db_value v = {ANOLE_DB_BLOB, 0, {.s = {(const char *)b->buf, b->len}}};
+  return v;
+}
+
+/* The element `name` at the top of `doc`: its type, and a pointer to its value. */
+static int bson_find(const unsigned char *doc, size_t len, const char *name, const unsigned char **value) {
+  size_t at = 4;
+  while (at < len && doc[at] != 0) {
+    unsigned char t = doc[at++];
+    const char *key = (const char *)doc + at;
+    at += strlen(key) + 1;
+    const unsigned char *v = doc + at;
+    size_t n;
+    switch (t) {
+      case 0x01: case 0x09: case 0x11: case 0x12: n = 8; break;
+      case 0x02: n = 4 + (size_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); break;
+      case 0x03: case 0x04: n = (size_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); break;
+      case 0x05: n = 5 + (size_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); break;
+      case 0x07: n = 12; break;
+      case 0x08: n = 1; break;
+      case 0x0A: n = 0; break;
+      case 0x10: n = 4; break;
+      default: return -1;
+    }
+    if (strcmp(key, name) == 0) {
+      *value = v;
+      return t;
+    }
+    at += n;
+  }
+  return -1;
+}
+static int span_has(anole_str s, const char *want) {
+  size_t n = strlen(want);
+  for (size_t i = 0; i + n <= s.len; i++)
+    if (memcmp(s.ptr + i, want, n) == 0) return 1;
+  return 0;
+}
+static int32_t le32(const unsigned char *v) { return (int32_t)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24); }
+static int64_t le64(const unsigned char *v) { return (int64_t)((uint64_t)(uint32_t)le32(v) | (uint64_t)(uint32_t)le32(v + 4) << 32); }
+static int64_t bson_int(const anole_db_result_event *r, uint32_t row, const char *name) {
+  anole_str d = anole_event_str(r, db_cell(r, row, 0)->v.s);
+  const unsigned char *v;
+  int t = bson_find((const unsigned char *)d.ptr, d.len, name, &v);
+  if (t == 0x10) return le32(v);
+  if (t == 0x12) return le64(v);
+  return -999;
+}
+static int bson_str_is(const anole_db_result_event *r, uint32_t row, const char *name, const char *want) {
+  anole_str d = anole_event_str(r, db_cell(r, row, 0)->v.s);
+  const unsigned char *v;
+  if (bson_find((const unsigned char *)d.ptr, d.len, name, &v) != 0x02) return 0;
+  return strcmp((const char *)v + 4, want) == 0;
+}
+
+/* MongoDB, against the server ANOLE_TEST_MONGODB_URL names (zig build
+   capi-test -Dmongodb-test-url=...; tests/mongodb/run.sh). */
+static void test_db_mongodb(void) {
+  anole_str mongo_name = LIT("mongodb");
+  const char *url = getenv("ANOLE_TEST_MONGODB_URL");
+  if (!anole_has_feature(mongo_name) || url == NULL || url[0] == 0) {
+    printf("ok mongodb (%s)\n", anole_has_feature(mongo_name) ? "no ANOLE_TEST_MONGODB_URL" : "not built in");
+    return;
+  }
+  char json[4096];
+  snprintf(json, sizeof json,
+           "{\"executors\": 2, \"listeners\": [{\"port\": 0}], \"limits\": {\"db_result_max\": 65536},"
+           " \"databases\": [{\"name\": \"docs\", \"mongodb\": {\"url\": \"%s\", \"database\": \"anole_capi\"}}]}",
+           url);
+  anole_server *s = make_server(json);
+  anole_db *db = NULL;
+  anole_str name = LIT("docs");
+  CHECK(anole_db_find(s, name, &db) == ANOLE_OK);
+  anole_consumer *c = NULL;
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  static unsigned char rec[1 << 20];
+  static bson_b b1, b2, b3;
+  const anole_db_result_event *r;
+  anole_db_value p[3];
+
+  /* a clean collection */
+  anole_str drop = LIT("runCommand");
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "drop", "items", 5), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_query(db, c, drop, p, 1, NULL, 1) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec); /* ok, or NamespaceNotFound: either way it is gone */
+
+  /* insertOne: the summary carries the new _id */
+  anole_str ins1 = LIT("insertOne items");
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_int(&b1, "qty", 3), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_query(db, c, ins1, p, 1, NULL, 2) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ncolumns == 1 && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_BSON);
+  CHECK(str_is(db_column(r, 0), "document"));
+  {
+    anole_str d = anole_event_str(r, db_cell(r, 0, 0)->v.s);
+    const unsigned char *v;
+    CHECK(bson_find((const unsigned char *)d.ptr, d.len, "insertedId", &v) == 0x07);
+  }
+
+  /* insertMany through exec: the count as changes */
+  anole_str insn = LIT("insertMany items");
+  b1.len = b2.len = 0;
+  bb_begin(&b1), bb_str(&b1, "name", "pear", 4), bb_int(&b1, "qty", 5), bb_end(&b1);
+  bb_begin(&b2), bb_str(&b2, "name", "plum", 4), bb_int(&b2, "qty", 7), bb_end(&b2);
+  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  CHECK(anole_db_exec(db, c, insn, p, 2, NULL, 3) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 2 && r->nrows == 0);
+
+  /* find with a filter and options under the command's names */
+  anole_str find = LIT("find items");
+  b1.len = b2.len = 0;
+  bb_begin(&b1), bb_doc(&b1, "qty"), bb_int(&b1, "$gte", 4), bb_end(&b1), bb_end(&b1);
+  bb_begin(&b2), bb_doc(&b2, "sort"), bb_int(&b2, "qty", -1), bb_end(&b2), bb_doc(&b2, "projection"), bb_int(&b2, "_id", 0),
+      bb_end(&b2), bb_int(&b2, "batchSize", 1), bb_end(&b2);
+  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  CHECK(anole_db_query(db, c, find, p, 2, NULL, 4) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->nrows == 2);
+  CHECK(bson_str_is(r, 0, "name", "plum") && bson_int(r, 0, "qty") == 7 && bson_str_is(r, 1, "name", "pear"));
+
+  /* findOne, countDocuments, aggregate */
+  anole_str find1 = LIT("findOne items");
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_query(db, c, find1, p, 1, NULL, 5) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->nrows == 1 && bson_int(r, 0, "qty") == 3);
+  anole_str count = LIT("countDocuments items");
+  CHECK(anole_db_query(db, c, count, NULL, 0, NULL, 6) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_INT && db_cell(r, 0, 0)->v.i == 3);
+  anole_str agg = LIT("aggregate items");
+  b1.len = 0;
+  bb_begin(&b1), bb_doc(&b1, "0"), bb_doc(&b1, "$group"), bb_key(&b1, 0x0A, "_id"), bb_doc(&b1, "total"),
+      bb_str(&b1, "$sum", "$qty", 4), bb_end(&b1), bb_end(&b1), bb_end(&b1), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_query(db, c, agg, p, 1, NULL, 7) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->nrows == 1 && bson_int(r, 0, "total") == 15);
+
+  /* updateOne and deleteOne */
+  anole_str upd = LIT("updateOne items");
+  b1.len = b2.len = 0;
+  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_end(&b1);
+  bb_begin(&b2), bb_doc(&b2, "$inc"), bb_int(&b2, "qty", 1), bb_end(&b2), bb_end(&b2);
+  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  CHECK(anole_db_query(db, c, upd, p, 2, NULL, 8) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && bson_int(r, 0, "matchedCount") == 1 && bson_int(r, 0, "modifiedCount") == 1);
+  anole_str del = LIT("deleteOne items");
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "name", "plum", 4), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_exec(db, c, del, p, 1, NULL, 9) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 1);
+
+  /* a unique index, then a duplicate: 409 with the server's code */
+  anole_str cmd = LIT("runCommand");
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "createIndexes", "items", 5), bb_arr(&b1, "indexes"), bb_doc(&b1, "0"), bb_doc(&b1, "key"),
+      bb_int(&b1, "name", 1), bb_end(&b1), bb_str(&b1, "name", "name_1", 6), bb_bool(&b1, "unique", 1), bb_end(&b1),
+      bb_end(&b1), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_query(db, c, cmd, p, 1, NULL, 10) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_exec(db, c, ins1, p, 1, NULL, 11) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->http_status == 409 && r->error_class == ANOLE_DB_ERR_UNIQUE);
+  CHECK(str_is(anole_event_str(r, r->error_code), "11000"));
+
+  /* calls Anole refuses: 400 */
+  anole_str nope = LIT("frobnicate items"), bare = LIT("find");
+  CHECK(anole_db_query(db, c, nope, NULL, 0, NULL, 12) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->http_status == 400);
+  CHECK(anole_db_query(db, c, bare, NULL, 0, NULL, 13) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->http_status == 400);
+  anole_db_value text = {ANOLE_DB_TEXT, 0, {.s = LIT("{}")}};
+  CHECK(anole_db_query(db, c, find, &text, 1, NULL, 14) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->http_status == 400);
+  b1.len = b2.len = 0;
+  bb_begin(&b1), bb_end(&b1);
+  bb_begin(&b2), bb_int(&b2, "limt", 1), bb_end(&b2);
+  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  CHECK(anole_db_query(db, c, find, p, 2, NULL, 15) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->http_status == 400 && span_has(anole_event_str(r, r->error), "limt"));
+
+  /* the cache: a hit until invalidated */
+  anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
+  for (int round = 0; round < 3; round++) {
+    CHECK(anole_db_query(db, c, find, NULL, 0, &cached, 20) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK && r->nrows == 2);
+    if (round == 2) CHECK(r->source == ANOLE_DB_FROM_CACHE);
+  }
+  anole_str items = LIT("items");
+  CHECK(anole_db_invalidate(db, items) == ANOLE_OK);
+  CHECK(anole_db_query(db, c, find, NULL, 0, &cached, 21) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+
+  /* many at once, coalesced */
+  enum { MANY = 200 };
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
+  int coalesced = 0;
+  for (int i = 0; i < MANY; i++) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 2);
+    if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
+  }
+
+  /* a timeout: a filter that sleeps on the server */
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "$where", "sleep(3000) || true", 19), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  anole_db_options quick = {sizeof quick, 0, 200, 0, 0, {NULL, 0}};
+  double t0 = now_ms();
+  CHECK(anole_db_query(db, c, find, p, 1, &quick, 30) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
+  CHECK(now_ms() - t0 < 2500);
+
+  /* an answer past limits.db_result_max */
+  static char big[70000];
+  memset(big, 'x', sizeof big);
+  b3.len = 0;
+  bb_begin(&b3), bb_str(&b3, "name", "big", 3), bb_str(&b3, "blob", big, sizeof big), bb_end(&b3);
+  p[0] = bb_value(&b3);
+  CHECK(anole_db_exec(db, c, ins1, p, 1, NULL, 31) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  CHECK(anole_db_query(db, c, find, NULL, 0, NULL, 32) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_TOOBIG);
+
+  b1.len = 0;
+  bb_begin(&b1), bb_str(&b1, "drop", "items", 5), bb_end(&b1);
+  p[0] = bb_value(&b1);
+  CHECK(anole_db_query(db, c, drop, p, 1, NULL, 33) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, -1) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok mongodb: CRUD and aggregate with BSON both ways, errors, cache, %d of %d coalesced, timeout, size limit\n",
+         coalesced, MANY);
+}
+
 static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
@@ -1602,6 +1920,7 @@ static int run_tests(void) {
   test_db();
   test_db_postgres();
   test_db_redis();
+  test_db_mongodb();
   printf("PASS\n");
   return 0;
 }

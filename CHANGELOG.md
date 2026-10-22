@@ -39,6 +39,16 @@ breaking changes are listed anyway.
 - `anole.redis`'s `Query.reply` sends a command known only at run time
   (`[]const []const u8`), through the cache for read commands; the result
   caches copy types that hold themselves (a reply tree).
+- C ABI 0.3: `anole_db_*` with MongoDB: a `"mongodb"` database (`url`, `database`,
+  `ca_file`/`ca_pem`, pool and selection timeouts). `sql` names the
+  operation and the collection (`"find orders"`): find, findOne,
+  aggregate, countDocuments, insertOne, insertMany, updateOne, updateMany,
+  replaceOne, deleteOne, deleteMany, and runCommand; parameters are BSON
+  documents in the drivers' order, options under the command's names.
+  Answers are rows of `ANOLE_DB_BSON` documents (a new cell type), a count,
+  or the driver's write result; `anole_db_exec` gives the count changed.
+- `anole.mongodb.dynamic`: those operations named at run time with BSON
+  arguments; `aggregate` caches a `bson.Array` pipeline that only reads.
 - C ABI 0.2: a gRPC server whose methods are implemented by the consumer
   (Node, Python, C). A `"grpc"` configuration section names the services
   (with their descriptors, a `FileDescriptorSet`, or a method list); Anole
@@ -68,6 +78,11 @@ breaking changes are listed anyway.
   `libanole.a` with GNU ld got an executable stack (the packed object had
   no `.note.GNU-stack`); glibc 2.41 refuses to load such an extension.
   The note is added when libanole is packed.
+- C ABI: a publish (`anole_ws_publish`) could overtake an
+  `anole_ws_subscribe` made before it, since the subscription is applied
+  on the socket's executor and the publish fans out from another, so a
+  socket that had just subscribed could miss it. A publish now waits for
+  the subscriptions taken before it.
 
 ### Clients
 
