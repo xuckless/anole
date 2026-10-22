@@ -478,7 +478,7 @@ test "parse: the defaults, a full document, and what is refused" {
     try std.testing.expectEqual(@as(usize, 1), d.listeners.len);
     try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms);
 
-    const full =
+    const full_doc =
         \\{"executors": 2,
         \\ "listeners": [{"name": "web", "address": "127.0.0.1", "port": 0}],
         \\ "limits": {"inline_body_max": 1024, "max_inflight": 8},
@@ -486,13 +486,14 @@ test "parse: the defaults, a full document, and what is refused" {
         \\                {"rate_limit": {"limit": 5, "key": "header:X-Key"}}],
         \\ "routes": [
         \\   {"method": "GET", "path": "/a", "handler": 1, "timeout_ms": 500, "cache": {"ttl_ms": 1000}},
-        \\   {"path": "/b", "respond": {"status": 201, "body": "x", "headers": {"x-y": "z"}}},
-        \\   {"path": "/ws", "websocket": {"handler": 2}}
-        \\ ],
-        \\ "observe": {"metrics": {}, "health": {}}}
+        \\   {"path": "/b", "respond": {"status": 201, "body": "x", "headers": {"x-y": "z"}}}
     ;
+    const ws_route = ",\n   {\"path\": \"/ws\", \"websocket\": {\"handler\": 2}}";
+    const end = "\n ],\n \"observe\": {\"metrics\": {}, \"health\": {}}}";
+    // The WebSocket route only where WebSocket is built in.
+    const full = if (features.websocket) full_doc ++ ws_route ++ end else full_doc ++ end;
     const f = try parse(a, full, &why);
-    try std.testing.expectEqual(@as(usize, 3), f.routes.len);
+    try std.testing.expectEqual(@as(usize, if (features.websocket) 3 else 2), f.routes.len);
     try std.testing.expectEqual(@as(?u32, 500), f.routes[0].timeout_ms);
     try std.testing.expect(f.middleware[2] == .rate_limit);
 

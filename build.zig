@@ -458,13 +458,6 @@ pub fn build(b: *std.Build) void {
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
-    // The C ABI's configuration schema, for the test that keeps it in step
-    // with src/capi/config.zig.
-    {
-        const wf = b.addWriteFiles();
-        _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
-        tests.root_module.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
-    }
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
@@ -1563,6 +1556,13 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.postgres) mod.addImport("anole_pg", if (f.needsTls()) o.c.pg_tls.? else o.c.pg_plain.?);
     if (f.sqlite) mod.addImport("anole_sqlite", o.c.sqlite.?);
     // The generated test service (tests/grpc/gen), outside src/.
+    // The C ABI's configuration schema, for the test that keeps it in step
+    // with src/capi/config.zig.
+    if (o.for_test) {
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
+        mod.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
+    }
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
         .target = o.target,
