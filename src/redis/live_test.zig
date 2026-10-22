@@ -132,6 +132,50 @@ test "redis: live calls, helpers and replies into types" {
     try testing.expectError(error.BadRequest, strict.lpush(&c, "anole:test:k", "x"));
 }
 
+test "redis: live reply: commands known only at run time, cached reads" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const r = try open(io, .{});
+    defer r.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const q = r.with(.{});
+
+    _ = try q.reply(&c, &.{ "DEL", "anole:reply:s", "anole:reply:l" });
+    try testing.expectEqualStrings("OK", (try q.reply(&c, &.{ "SET", "anole:reply:s", "v\x00w" })).status);
+    try testing.expectEqualStrings("v\x00w", (try q.reply(&c, &.{ "GET", "anole:reply:s" })).string);
+    try testing.expectEqual(@as(i64, 3), (try q.reply(&c, &.{ "RPUSH", "anole:reply:l", "a", "b", "c" })).int);
+    const nested = try q.reply(&c, &.{ "EVAL", "return {1, 'x', {2, false}}", "0" });
+    try testing.expectEqual(@as(usize, 3), nested.array.len);
+    try testing.expectEqual(@as(i64, 2), nested.array[2].array[0].int);
+    try testing.expect(nested.array[2].array[1] == .nil);
+    try testing.expect((try q.reply(&c, &.{ "GET", "anole:reply:none" })) == .nil);
+
+    // A read command through the cache: copied out whole, nested items too.
+    const cached = r.with(.{ .cache = .{ .ttl = .fromSeconds(60), .tag = "l" } });
+    const first = try cached.reply(&c, &.{ "LRANGE", "anole:reply:l", "0", "-1" });
+    try testing.expectEqual(db.Source.database, db.lastSource(&c).?);
+    _ = try q.reply(&c, &.{ "RPUSH", "anole:reply:l", "d" });
+    const again = try cached.reply(&c, &.{ "lrange", "anole:reply:l", "0", "-1" });
+    try testing.expectEqual(db.Source.cache, db.lastSource(&c).?);
+    try testing.expectEqual(@as(usize, 3), again.array.len);
+    try testing.expectEqualStrings(first.array[2].string, again.array[2].string);
+    r.cache.invalidate(.{ .tag = "l" });
+    try testing.expectEqual(@as(usize, 4), (try cached.reply(&c, &.{ "LRANGE", "anole:reply:l", "0", "-1" })).array.len);
+    // A write is never cached.
+    _ = try cached.reply(&c, &.{ "INCR", "anole:reply:n" });
+    try testing.expect(db.lastSource(&c) == null or db.lastSource(&c).? == .database);
+
+    const level = quiet();
+    defer testing.log_level = level;
+    try testing.expectError(error.Database, q.reply(&c, &.{ "INCR", "anole:reply:l" }));
+    try testing.expectEqualStrings("WRONGTYPE", db.lastError(&c).?.code);
+    _ = try q.reply(&c, &.{ "DEL", "anole:reply:s", "anole:reply:l", "anole:reply:n" });
+}
+
 test "redis: live pipelines, MULTI/EXEC, and WATCH on an acquired connection" {
     _ = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });

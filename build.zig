@@ -881,6 +881,7 @@ pub fn build(b: *std.Build) void {
             run_consumer.has_side_effects = true;
             // The PostgreSQL part of the suite, against that server.
             if (postgres_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_POSTGRES_URL", url);
+            if (redis_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
             capi_test_step.dependOn(&run_consumer.step);
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
@@ -904,6 +905,7 @@ pub fn build(b: *std.Build) void {
             // stack-overflow handler); ASan's would unmap it at thread exit.
             run_asan.setEnvironmentVariable("ASAN_OPTIONS", "use_sigaltstack=0");
             if (postgres_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_POSTGRES_URL", url);
+            if (redis_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
             asan_step.dependOn(&run_asan.step);
         }
         test_step.dependOn(capi_test_step);

@@ -466,7 +466,7 @@ jobs:
         run: tests/grpc/interop/run-http2.sh ./zig-out/bin/grpc-interop-server
 
   redis:
-    name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS)
+    name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS; the C ABI's suite)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -486,7 +486,7 @@ jobs:
       # server's certificate: the script starts the server itself, with a
       # CA made for the run.
       - name: Tests against a live server
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh
 
   postgres:

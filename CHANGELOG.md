@@ -29,6 +29,16 @@ breaking changes are listed anyway.
 - `anole.db.Value`, `Table` and `Changes` are shared by the SQL connectors
   (`anole.sqlite`'s are now these); `anole.pg` gains `table` and `run` for
   rows and parameters known only at run time, and `Options.sslmode`.
+- `anole_db_*` with Redis and Valkey: a `"redis"` database (`url`,
+  `ca_file`/`ca_pem`, pool bounds and timeouts). A command is `sql` (its
+  name and fixed words) plus parameters as binary-safe arguments;
+  `anole_db_query` answers with the reply as a tree of cells in preorder
+  (`ANOLE_DB_ARRAY`, `ANOLE_DB_MAP` and `ANOLE_DB_ERROR` are new cell
+  types), `anole_db_exec` with an integer reply as `changes`. Coalescing
+  and the result cache apply to read commands.
+- `anole.redis`'s `Query.reply` sends a command known only at run time
+  (`[]const []const u8`), through the cache for read commands; the result
+  caches copy types that hold themselves (a reply tree).
 
 ## 0.1.1 (2026-10-22)
 

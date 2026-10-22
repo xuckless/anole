@@ -807,6 +807,12 @@ _ = try app.redis.hset(req, key, changed);
 app.redis.cache.invalidate(.{ .tag = "profiles" });
 ```
 
+A command known only at run time (what the C ABI and the language
+bindings send) goes through `with(opts).reply(req, args)`, with `args` a
+`[]const []const u8` (the name, then the items). It returns the `Reply`,
+and `.coalesce` and `.cache` apply as above when the name is a read
+command.
+
 ### Pipelines and transactions
 
 ```zig

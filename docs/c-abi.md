@@ -295,8 +295,8 @@ per executor, and the larger of 16 x `limits.ws_high_water` and
 
 `anole_db_*` runs SQL without blocking the caller, for event-loop consumers
 (Node, asyncio). A database is configured with the server and opened at
-start, before the listeners, with its `init` script. SQLite and PostgreSQL
-are the kinds so far:
+start, before the listeners, with its `init` script (SQL). SQLite,
+PostgreSQL and Redis are the kinds so far:
 
 ```json
 "databases": [
@@ -402,6 +402,61 @@ database:
 - `ANOLE_DB_WRITE` means nothing here (any connection runs any
   statement).
 
+### Redis
+
+The same calls with a `"redis"` database (Redis or Valkey), on
+`anole.redis`:
+
+```json
+"databases": [
+  { "name": "kv", "redis": { "url": "rediss://app:secret@cache.internal:6380/0", "ca_file": "/etc/ssl/cache-ca.pem" } }
+]
+```
+
+```c
+anole_db_value p[] = {{ANOLE_DB_TEXT, 0, {.s = {"user:7", 6}}},
+                      {ANOLE_DB_BLOB, 0, {.s = {data, len}}},
+                      {ANOLE_DB_TEXT, 0, {.s = {"EX", 2}}},
+                      {ANOLE_DB_INT, 0, {.i = 60}}};
+anole_db_exec(db, consumer, (anole_str){"SET", 3}, p, 4, NULL, 1);
+anole_db_query(db, consumer, (anole_str){"GET", 3}, p, 1, &cached, 2);
+```
+
+- A command is an array of arguments: `sql` holds the command's name and
+  any fixed words (`"GET"`, `"CLIENT INFO"`, split on spaces), and each
+  parameter is one more argument, binary-safe: text and blobs as they are,
+  numbers in decimal, a bool as `1` or `0`, NULL left out. Keys and values
+  always go in parameters, never in `sql`, as with SQL.
+- `anole_db_query` answers with the whole reply. Replies are trees (an
+  array of arrays, a map), so they are not forced into rows: the cells are
+  the reply in preorder, `ncolumns` is 0 and `nrows` is the number of
+  cells. `ANOLE_DB_ARRAY` (`i` items follow, each a whole subtree) and
+  `ANOLE_DB_MAP` (`i` key, value pairs follow) are the inner nodes; bulk
+  strings are `ANOLE_DB_BLOB` (bytes: a binding decodes UTF-8 by default
+  and offers the bytes, as ioredis and redis-py do); status replies
+  (`"OK"`) are `ANOLE_DB_TEXT`; integers `ANOLE_DB_INT`; nil
+  `ANOLE_DB_NULL`; `ANOLE_DB_ERROR` is an error reply inside another
+  (EXEC's). A binding rebuilds the reply with one recursive walk; for a
+  flat reply (`GET`, `LRANGE`) it reads the cells after the first. Why
+  the same record rather than one of its own: one event, one parser and
+  one size limit for every database, and the cell types it needs already
+  exist but for three.
+- `anole_db_exec` runs the command for its effect: no cells, and
+  `changes` holds the reply when it is an integer (`DEL`, `INCR`,
+  `RPUSH`...).
+- `ANOLE_DB_COALESCE` and `cache_ttl_ms` apply only to commands that just
+  read (`GET`, `MGET`, `HGETALL`, `LRANGE`, `ZRANGE`... as
+  `anole.redis.read_commands`); others run as they are. `timeout_ms`
+  closes the connection the command waits on (a blocking pop, say).
+- An error reply is `ANOLE_E_DB`: `error_code` is its first word
+  (`"WRONGTYPE"`), `error` the whole message. `LOADING`, `READONLY`,
+  `OOM`, `BUSY` and the like, a refused login and an unreachable server are
+  `ANOLE_DB_ERR_UNAVAILABLE` (503); the rest `ANOLE_DB_ERR_OTHER` (500).
+  An empty command is answered with `http_status` 400.
+- One command per call. A transaction that must stay on one connection
+  (`MULTI`/`EXEC`, `WATCH`) goes in one `EVAL` script for now; pub/sub is
+  not part of `anole_db_*` (WebSocket topics cover fan-out to clients).
+
 ## Lifecycle
 
 ```c
@@ -442,11 +497,11 @@ routes with native ones.
 ## What comes next
 
 ABI 0.1 is the request/response and WebSocket core, plus `anole_db_*` with
-SQLite and PostgreSQL. Before the ABI freezes (1.0) and the bindings ship, these come as
+SQLite, PostgreSQL and Redis. Before the ABI freezes (1.0) and the bindings ship, these come as
 their own pull requests; their event types and handle kinds are reserved
 already:
 
-- The other databases through `anole_db_*`: Redis, then MongoDB.
+- MongoDB through `anole_db_*`.
 - gRPC: server, with service methods implemented in the language.
 - WebTransport: sessions, streams and datagrams.
 - TLS extras: mutual TLS and the client certificate in the request,

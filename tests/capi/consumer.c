@@ -1457,6 +1457,142 @@ static void test_db_postgres(void) {
          coalesced, MANY);
 }
 
+/* Redis, against the server ANOLE_TEST_REDIS_URL names (zig build
+   capi-test -Dredis-test-url=...; tests/redis/run.sh). */
+static void test_db_redis(void) {
+  anole_str redis_name = LIT("redis");
+  const char *url = getenv("ANOLE_TEST_REDIS_URL");
+  if (!anole_has_feature(redis_name) || url == NULL || url[0] == 0) {
+    printf("ok redis (%s)\n", anole_has_feature(redis_name) ? "no ANOLE_TEST_REDIS_URL" : "not built in");
+    return;
+  }
+  char json[2048];
+  snprintf(json, sizeof json,
+           "{\"executors\": 2, \"listeners\": [{\"port\": 0}], \"limits\": {\"db_result_max\": 65536},"
+           " \"databases\": [{\"name\": \"kv\", \"redis\": {\"url\": \"%s\"}}]}",
+           url);
+  anole_server *s = make_server(json);
+  anole_db *db = NULL;
+  anole_str name = LIT("kv");
+  CHECK(anole_db_find(s, name, &db) == ANOLE_OK);
+  anole_consumer *c = NULL;
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  static unsigned char rec[1 << 20];
+  const anole_db_result_event *r;
+  anole_str del = LIT("DEL"), set = LIT("SET"), get = LIT("GET"), rpush = LIT("RPUSH"), lrange = LIT("LRANGE");
+  anole_db_value keys[3] = {{ANOLE_DB_TEXT, 0, {.s = LIT("anole:capi:s")}},
+                            {ANOLE_DB_TEXT, 0, {.s = LIT("anole:capi:l")}},
+                            {ANOLE_DB_TEXT, 0, {.s = LIT("anole:capi:n")}}};
+  CHECK(anole_db_exec(db, c, del, keys, 3, NULL, 1) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->nrows == 0);
+
+  /* SET with binary-safe bytes and an int, then GET */
+  anole_db_value sv[4] = {keys[0], {ANOLE_DB_BLOB, 0, {.s = LIT("v\x00w")}}, {ANOLE_DB_TEXT, 0, {.s = LIT("EX")}},
+                          {ANOLE_DB_INT, 0, {.i = 60}}};
+  CHECK(anole_db_query(db, c, set, sv, 4, NULL, 2) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ncolumns == 0 && r->nrows == 1);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 0)->v.s), "OK"));
+  CHECK(anole_db_query(db, c, get, keys, 1, NULL, 3) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_BLOB && db_cell(r, 0, 0)->v.s.len == 3);
+  CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 0)->v.s).ptr, "v\x00w", 3) == 0);
+  CHECK(anole_db_query(db, c, get, &keys[2], 1, NULL, 4) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_NULL);
+
+  /* exec: an integer reply as `changes` */
+  anole_db_value lv[4] = {keys[1], {ANOLE_DB_TEXT, 0, {.s = LIT("a")}}, {ANOLE_DB_INT, 0, {.i = 2}},
+                          {ANOLE_DB_FLOAT, 0, {.f = 2.5}}};
+  CHECK(anole_db_exec(db, c, rpush, lv, 4, NULL, 5) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 3);
+
+  /* an array; a nested reply from a script, in preorder */
+  anole_db_value rv[3] = {keys[1], {ANOLE_DB_INT, 0, {.i = 0}}, {ANOLE_DB_INT, 0, {.i = -1}}};
+  CHECK(anole_db_query(db, c, lrange, rv, 3, NULL, 6) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->nrows == 4 && db_cell(r, 0, 0)->type == ANOLE_DB_ARRAY && db_cell(r, 0, 0)->v.i == 3);
+  CHECK(str_is(anole_event_str(r, db_cell(r, 0, 3)->v.s), "2.5"));
+  anole_str eval = LIT("EVAL");
+  anole_db_value ev[2] = {{ANOLE_DB_TEXT, 0, {.s = LIT("return {1, {2, 'x'}, 3}")}}, {ANOLE_DB_INT, 0, {.i = 0}}};
+  CHECK(anole_db_query(db, c, eval, ev, 2, NULL, 7) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->nrows == 6);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_ARRAY && db_cell(r, 0, 0)->v.i == 3);
+  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_INT && db_cell(r, 0, 1)->v.i == 1);
+  CHECK(db_cell(r, 0, 2)->type == ANOLE_DB_ARRAY && db_cell(r, 0, 2)->v.i == 2);
+  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_BLOB && db_cell(r, 0, 5)->v.i == 3);
+
+  /* a server error; an empty command */
+  anole_str incr = LIT("INCR");
+  CHECK(anole_db_query(db, c, incr, &keys[1], 1, NULL, 8) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
+  CHECK(str_is(anole_event_str(r, r->error_code), "WRONGTYPE"));
+  anole_str blank = LIT("  ");
+  CHECK(anole_db_query(db, c, blank, NULL, 0, NULL, 9) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->http_status == 400);
+
+  /* the cache, for read commands: a hit until invalidated */
+  anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("l")};
+  for (int round = 0; round < 3; round++) {
+    CHECK(anole_db_query(db, c, lrange, rv, 3, &cached, 20) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 3);
+    if (round == 2) CHECK(r->source == ANOLE_DB_FROM_CACHE);
+  }
+  anole_str l = LIT("l");
+  CHECK(anole_db_invalidate(db, l) == ANOLE_OK);
+  CHECK(anole_db_query(db, c, lrange, rv, 3, &cached, 21) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+
+  /* many at once, coalesced */
+  enum { MANY = 200 };
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, get, keys, 1, &co_opts, 1000 + i) == ANOLE_OK);
+  int coalesced = 0;
+  for (int i = 0; i < MANY; i++) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.s.len == 3);
+    if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
+  }
+
+  /* a timeout: a blocking pop that waits longer */
+  anole_str blpop = LIT("BLPOP");
+  anole_db_value bv[2] = {keys[2], {ANOLE_DB_INT, 0, {.i = 5}}};
+  anole_db_options quick = {sizeof quick, 0, 100, 0, 0, {NULL, 0}};
+  double t0 = now_ms();
+  CHECK(anole_db_query(db, c, blpop, bv, 2, &quick, 30) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
+  CHECK(now_ms() - t0 < 3000);
+
+  /* an answer past limits.db_result_max */
+  anole_str setrange = LIT("SETRANGE");
+  anole_db_value sr[3] = {keys[2], {ANOLE_DB_INT, 0, {.i = 100000}}, {ANOLE_DB_TEXT, 0, {.s = LIT("x")}}};
+  CHECK(anole_db_exec(db, c, setrange, sr, 3, NULL, 31) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 100001);
+  CHECK(anole_db_query(db, c, get, &keys[2], 1, NULL, 32) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_TOOBIG);
+
+  CHECK(anole_db_exec(db, c, del, keys, 3, NULL, 33) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 3);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, -1) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok redis: commands with binary values, nested replies, errors, cache, %d of %d coalesced, timeout, size limit\n",
+         coalesced, MANY);
+}
+
 static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
@@ -1465,6 +1601,7 @@ static int run_tests(void) {
   test_shared_consumer();
   test_db();
   test_db_postgres();
+  test_db_redis();
   printf("PASS\n");
   return 0;
 }
