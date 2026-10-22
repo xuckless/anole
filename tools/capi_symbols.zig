@@ -1,6 +1,6 @@
 //! libanole's symbol tool, run by `zig build capi` (no system binutils):
 //!
-//!   capi_symbols hide <in.o> <out.o>
+//!   capi_symbols hide <in.o> <out.o> [<input.a|input.o> ...]
 //!       Every defined global symbol of a relocatable object whose name does
 //!       not start with `anole_` becomes hidden (ELF STV_HIDDEN, Mach-O
 //!       private extern): the linker of a shared library or a Node/Python
@@ -9,10 +9,28 @@
 //!       carries. They stay global inside one link, so two static libraries
 //!       defining the same name still clash there; hiding is what the
 //!       formats offer in place, without rewriting relocations.
+//!
+//!       Mach-O only: the inputs the object was merged from (the static
+//!       libraries and objects it links) give back the symbol flags that
+//!       Zig's relocatable link (`zig build-obj` of several inputs) drops,
+//!       N_ALT_ENTRY and N_NO_DEAD_STRIP. Without them a final link with
+//!       -dead_strip (Apple's ld, and Zig's in release modes) cuts the
+//!       merged object at every symbol: BoringSSL's assembly, whose
+//!       functions call each other's alt entries with no relocation (one
+//!       atom per file in the original), lost the pieces nothing pointed
+//!       at, and the calls into them ran into other code (a crash in P-256
+//!       key generation on the first TLS listener). A flag set on a symbol
+//!       whose name merely matches is harmless: it only keeps code.
+//!
+//!       ELF only: the same link drops the inputs' empty .note.GNU-stack
+//!       sections, without which GNU ld gives the final program or shared
+//!       library an executable stack (and glibc 2.41 refuses to dlopen such
+//!       a library, a Node or Python extension). The section is added back.
 //!   capi_symbols check <file>
 //!       Fails unless every symbol the file exports (an object's defined
 //!       globals of default visibility; a shared library's dynamic symbols)
-//!       is `anole_*`. Lists the exported `anole_*` names on success.
+//!       is `anole_*`. Lists the exported `anole_*` names on success. An ELF
+//!       object must also carry .note.GNU-stack.
 //!
 //! ELF64 little-endian and Mach-O 64 are read; COFF (Windows) exports only
 //! what is marked dllexport, so it needs neither.
@@ -40,20 +58,32 @@ pub fn main(init: std.process.Init) !void {
     const data = try cwd.readFileAlloc(io, args[2], arena, .unlimited);
     var out: std.Io.File.Writer = .init(.stdout(), io, &.{});
     if (std.mem.eql(u8, cmd, "hide")) {
-        if (args.len != 4) return usage();
+        if (args.len < 4) return usage();
         const n = try hide(data);
+        const noted = if (try formatOf(data) == .elf) try addGnuStack(arena, data) else null;
+        var restored: usize = 0;
+        if (args.len > 4 and try formatOf(data) == .macho) {
+            var flags: std.StringHashMapUnmanaged(u16) = .empty;
+            for (args[4..]) |path| try collectFlags(arena, try cwd.readFileAlloc(io, path, arena, .unlimited), &flags);
+            restored = try restoreFlags(data, &flags);
+        }
+        const result = noted orelse data;
         // Padded to 8 bytes: Zig's archiver does not pad the last member of
         // an archive, and Apple's ld and ranlib call an odd-sized last
         // member "malformed". Trailing zeros are harmless in an object.
-        const padded = try arena.alloc(u8, std.mem.alignForward(usize, data.len, 8));
-        @memcpy(padded[0..data.len], data);
-        @memset(padded[data.len..], 0);
+        const padded = try arena.alloc(u8, std.mem.alignForward(usize, result.len, 8));
+        @memcpy(padded[0..result.len], result);
+        @memset(padded[result.len..], 0);
         try cwd.writeFile(io, .{ .sub_path = args[3], .data = padded });
-        try out.interface.print("capi_symbols: {d} symbols hidden\n", .{n});
+        try out.interface.print("capi_symbols: {d} symbols hidden, {d} Mach-O symbol flags restored\n", .{ n, restored });
     } else if (std.mem.eql(u8, cmd, "check")) {
         var names: std.ArrayList([]const u8) = .empty;
         var bad: std.ArrayList([]const u8) = .empty;
         try exported(arena, data, &names);
+        if (try formatOf(data) == .elf and rd(u16, data, 0x10) == 1 and elfSection(data, gnu_stack) == null) {
+            std.log.err("{s}: no .note.GNU-stack section (GNU ld would make the stack executable)", .{args[2]});
+            std.process.exit(1);
+        }
         var ours: usize = 0;
         for (names.items) |n| {
             if (!allowed(n)) try bad.append(arena, n);
@@ -73,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() error{Usage} {
-    std.log.err("usage: capi_symbols hide <in.o> <out.o> | check <file>", .{});
+    std.log.err("usage: capi_symbols hide <in.o> <out.o> [<input.a|input.o> ...] | check <file>", .{});
     return error.Usage;
 }
 
@@ -138,6 +168,65 @@ fn elfDefined(data: []const u8, t: ElfTable, f: anytype) !void {
     }
 }
 
+const gnu_stack = ".note.GNU-stack";
+
+/// The index of the section with this name, or null.
+fn elfSection(data: []const u8, name: []const u8) ?usize {
+    const shoff: usize = @intCast(rd(u64, data, 0x28));
+    const shentsize = rd(u16, data, 0x3a);
+    const shnum = rd(u16, data, 0x3c);
+    const strtab: usize = @intCast(rd(u64, data, shoff + @as(usize, rd(u16, data, 0x3e)) * shentsize + 0x18));
+    for (0..shnum) |i| {
+        if (std.mem.eql(u8, cstr(data, strtab + rd(u32, data, shoff + i * shentsize)), name)) return i;
+    }
+    return null;
+}
+
+/// A copy of a relocatable object with an empty .note.GNU-stack section
+/// added (null when it has one): the section-name table is copied to the
+/// end with the name appended, then the section headers with one more, so
+/// every existing section keeps its index (symbols and relocations name
+/// sections by index).
+fn addGnuStack(arena: std.mem.Allocator, data: []const u8) !?[]u8 {
+    if (elfSection(data, gnu_stack) != null) return null;
+    const shoff: usize = @intCast(rd(u64, data, 0x28));
+    const shentsize: usize = rd(u16, data, 0x3a);
+    const shnum: usize = rd(u16, data, 0x3c);
+    const shstrndx: usize = rd(u16, data, 0x3e);
+    if (shentsize != 64 or shnum == 0 or shnum >= 0xff00) return error.UnsupportedElf;
+    const str_sh = shoff + shstrndx * shentsize;
+    const str_off: usize = @intCast(rd(u64, data, str_sh + 0x18));
+    const str_size: usize = @intCast(rd(u64, data, str_sh + 0x20));
+
+    const new_str_off = data.len;
+    const new_str_size = str_size + gnu_stack.len + 1;
+    const new_shoff = std.mem.alignForward(usize, new_str_off + new_str_size, 8);
+    const out = try arena.alloc(u8, new_shoff + (shnum + 1) * shentsize);
+    @memset(out, 0);
+    @memcpy(out[0..data.len], data);
+    @memcpy(out[new_str_off..][0..str_size], data[str_off..][0..str_size]);
+    @memcpy(out[new_str_off + str_size ..][0..gnu_stack.len], gnu_stack);
+    @memcpy(out[new_shoff..][0 .. shnum * shentsize], data[shoff..][0 .. shnum * shentsize]);
+    const wr = struct {
+        fn u64_(buf: []u8, off: usize, v: usize) void {
+            std.mem.writeInt(u64, buf[off..][0..8], @intCast(v), .little);
+        }
+    };
+    // The name table, moved.
+    wr.u64_(out, new_shoff + shstrndx * shentsize + 0x18, new_str_off);
+    wr.u64_(out, new_shoff + shstrndx * shentsize + 0x20, new_str_size);
+    // The new section: SHT_PROGBITS, no flags (not executable), empty.
+    const sh = new_shoff + shnum * shentsize;
+    std.mem.writeInt(u32, out[sh..][0..4], @intCast(str_size), .little);
+    std.mem.writeInt(u32, out[sh + 4 ..][0..4], 1, .little);
+    wr.u64_(out, sh + 0x18, new_str_off);
+    wr.u64_(out, sh + 0x30, 1);
+    // The header.
+    wr.u64_(out, 0x28, new_shoff);
+    std.mem.writeInt(u16, out[0x3c..][0..2], @intCast(shnum + 1), .little);
+    return out;
+}
+
 // ---- Mach-O ------------------------------------------------------------------------
 
 const LC_SYMTAB = 0x2;
@@ -177,6 +266,90 @@ fn machoDefined(data: []const u8, t: MachoTable, f: anytype) !void {
         const raw = cstr(data, t.strtab + rd(u32, data, e));
         try f.each(if (raw.len > 0 and raw[0] == '_') raw[1..] else raw, e);
     }
+}
+
+// ---- Mach-O symbol flags lost in a relocatable link ----------------------------------
+
+const N_NO_DEAD_STRIP: u16 = 0x0020;
+const N_ALT_ENTRY: u16 = 0x0200;
+const kept_flags = N_NO_DEAD_STRIP | N_ALT_ENTRY;
+const LC_SEGMENT_64 = 0x19;
+
+/// The flags of every defined symbol of a Mach-O object, or of each Mach-O
+/// member of an archive, by name (flags of equal names are joined).
+fn collectFlags(arena: std.mem.Allocator, data: []const u8, flags: *std.StringHashMapUnmanaged(u16)) !void {
+    if (std.mem.startsWith(u8, data, "!<arch>\n")) {
+        var off: usize = 8;
+        while (off + 60 <= data.len) {
+            const name = data[off..][0..16];
+            const size = std.fmt.parseInt(usize, std.mem.trimEnd(u8, data[off + 48 ..][0..10], " "), 10) catch return error.BadArchive;
+            var body = off + 60;
+            var len = size;
+            // BSD long names: "#1/<n>", the name's n bytes before the data.
+            if (std.mem.startsWith(u8, name, "#1/")) {
+                const n = std.fmt.parseInt(usize, std.mem.trimEnd(u8, name[3..], " "), 10) catch return error.BadArchive;
+                body += n;
+                len -|= n;
+            }
+            if (body + len > data.len) return error.BadArchive;
+            try collectObject(arena, data[body..][0..len], flags);
+            off = std.mem.alignForward(usize, off + 60 + size, 2);
+        }
+        return;
+    }
+    try collectObject(arena, data, flags);
+}
+
+fn collectObject(arena: std.mem.Allocator, data: []const u8, flags: *std.StringHashMapUnmanaged(u16)) !void {
+    if (data.len < 32 or rd(u32, data, 0) != 0xfeedfacf) return; // not Mach-O 64 (a symbol index, ...)
+    const t = machoTable(data) catch return; // no symbols (an empty assembly file)
+    for (0..t.count) |i| {
+        const e = t.off + i * 16;
+        const typ = data[e + 4];
+        if (typ & N_STAB != 0 or typ & N_TYPE != N_SECT) continue;
+        const desc = rd(u16, data, e + 6) & kept_flags;
+        if (desc == 0) continue;
+        const gop = try flags.getOrPut(arena, cstr(data, t.strtab + rd(u32, data, e)));
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* |= desc;
+    }
+}
+
+/// Sets the collected flags on the object's symbols of the same names. An
+/// alt entry is never put at the start of its section (nothing to join).
+fn restoreFlags(data: []u8, flags: *const std.StringHashMapUnmanaged(u16)) !usize {
+    var starts: [256]u64 = @splat(0);
+    {
+        const ncmds = rd(u32, data, 16);
+        var lc: usize = 32;
+        var sect: usize = 1;
+        for (0..ncmds) |_| {
+            const cmd = rd(u32, data, lc);
+            if (cmd == LC_SEGMENT_64) {
+                const nsects = rd(u32, data, lc + 64);
+                for (0..nsects) |j| {
+                    if (sect < starts.len) starts[sect] = rd(u64, data, lc + 72 + j * 80 + 32);
+                    sect += 1;
+                }
+            }
+            lc += rd(u32, data, lc + 4);
+        }
+    }
+    const t = try machoTable(data);
+    var n: usize = 0;
+    for (0..t.count) |i| {
+        const e = t.off + i * 16;
+        const typ = data[e + 4];
+        if (typ & N_STAB != 0 or typ & N_TYPE != N_SECT) continue;
+        var want = flags.get(cstr(data, t.strtab + rd(u32, data, e))) orelse continue;
+        const sect = data[e + 5];
+        if (want & N_ALT_ENTRY != 0 and rd(u64, data, e + 8) == starts[sect]) want &= ~N_ALT_ENTRY;
+        const desc = rd(u16, data, e + 6);
+        if (desc | want == desc) continue;
+        std.mem.writeInt(u16, data[e + 6 ..][0..2], desc | want, .little);
+        n += 1;
+    }
+    return n;
 }
 
 // ---- hide and check ------------------------------------------------------------------
