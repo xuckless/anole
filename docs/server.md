@@ -41,10 +41,10 @@ The same with every listener spelled out in the options, which is how to
 serve cleartext and TLS from one process:
 
 ```zig
-var app = try anole.Server(void).init(init.gpa, .{
+var app = try anole.App.init(init.gpa, .{
     .http = .{ .port = 8080 },
     .https = .{ .port = 8443, .cert = .dev_self_signed },
-}, {});
+});
 defer app.deinit();
 app.get("/", hello);
 try app.run();
@@ -135,7 +135,7 @@ preface (h2c), on `address` in Go's notation, until SIGINT, SIGTERM or
 
 | Address | Binds |
 | --- | --- |
-| `":3000"` | every interface, IPv6 and IPv4 alike, as a container or a server needs (see [IPv6 and IPv4](#ipv6-and-ipv4)) |
+| `":3000"`, `"3000"` | every interface, IPv6 and IPv4 alike, as a container or a server needs (see [IPv6 and IPv4](#ipv6-and-ipv4)) |
 | `"0.0.0.0:3000"` | every IPv4 interface only |
 | `"127.0.0.1:3000"`, `"localhost:3000"` | this machine only |
 | `"[::]:3000"` | every IPv6 interface (and IPv4 too where the system maps it) |
@@ -158,7 +158,10 @@ nor `https`); otherwise they fail with `error.ListenersAlreadySet` and the
 listeners from the options are served with `run`. To serve both cleartext
 and TLS, name both in the options. A port in use, a certificate that does
 not load or an address that does not parse is returned by `listen`, and by
-`waitReady` to any task waiting for the server.
+`waitReady` to any task waiting for the server, as an `anole.ServerError`
+(see [When it does not start](#when-it-does-not-start)). An address Anole
+cannot read is logged with examples of ones it can: a port (`"3000"`, every
+interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 
 ## Options
 
@@ -171,17 +174,55 @@ not load or an address that does not parse is returned by `listen`, and by
 | `https` | `null` | The TLS listener. Needs `-Dtls=boringssl`. |
 | `http3` | `null` | HTTP/3 over QUIC. Needs `-Dhttp3` and `https` (or a listener in `listeners` with `http3 = true`, which it then tunes). |
 | `listeners` | none | More listeners, each with its own address or unix socket, TLS and protocols; see [Several listeners](#several-listeners). |
-| `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
-| `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
-| `process` | `null` | `init.minimal` enables socket activation, SIGUSR2 restarts and `sd_notify`. |
-| `restart_timeout_ms` | 10 000 | How long a restart waits for the new process. |
 | `listen_tls_http3` | true | Whether `listenTls` adds HTTP/3 (when built in). |
-| `raise_fd_limit` | true | Raise the soft open-file limit to the hard one at `init`; see [Many connections](#many-connections). |
-| `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
+| `timeouts` | see below | The request, head, write, keep-alive and drain deadlines. |
+| `limits` | see below | Body, head and connection limits. |
+| `proxy` | none trusted | Trust in proxies in front: `X-Forwarded-*`. |
+| `request`, `response` | see below | How requests are read and responses written. |
+| `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
 | `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
-| `server` | `.{}` | The rest of the HTTP core's `ServerConfig`: timeouts, limits, proxies. |
-| `client` | `.{}` | The server's outbound client (`anole.client(req)`): its `ClientOptions`, with the connection pool, timeout and CAs; see [clients.md](clients.md#the-connection-pool). |
+| `executors` | `.auto` | One per CPU (cgroup-aware), or `.exact(n)`. |
+| `max_stack_size` | 1 MiB | The most stack a connection's coroutine may grow to. |
+| `raise_fd_limit` | true | Raise the soft open-file limit to the hard one at `init`; see [Many connections](#many-connections). |
+| `signals` | true | Whether `run` handles SIGINT, SIGTERM and SIGHUP. |
+| `process` | `null` | `init.minimal` enables socket activation, SIGUSR2 restarts and `sd_notify`. |
+| `restart_timeout` | 10 s | How long a restart waits for the new process (an `anole.Duration`). |
+| `blocking` | `null` | A blocking pool for CPU-heavy or blocking calls; see [Blocking work](#blocking-work). |
+| `client` | `.{}` | The server's outbound client (`anole.client(req)`): its `anole.ClientOptions`, with the connection pool, timeout and CAs; see [clients.md](clients.md#the-connection-pool). |
+
+These groups have the same names and defaults as the C ABI's JSON
+configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
+`anole.Duration` (`.fromSeconds(30)`) or `null` for none.
+
+`timeouts`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. It ends when a stream or file body starts (see [streams](routing.md#timeouts-and-limits)); `write` bounds each write after that. |
+| `read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). Null: `request` alone. |
+| `write` | 30 s | One write the peer does not take for this long ends the response (HTTP/1.1: the connection; HTTP/2 and HTTP/3: the stream). Applies once a stream or file body has started, and to every HTTP/2 connection write. |
+| `keepalive` | 60 s | An idle connection between requests. Null: never. |
+| `idle_park` | 1 s | An idle HTTP/1.1 connection gives up its coroutine after this. Null: never. |
+| `shutdown` | 10 s | The graceful drain. Null waits for every connection. |
+
+`limits`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `body_max` | 1 MiB | The largest request body: `req.body()`, `req.reader()` (declared and chunked) and an early 413 on a larger `Content-Length`. `req.readerLimited(buf, n)` takes a limit of your own. |
+| `max_head_size` | 16 KiB | The request line and headers; larger is 431. |
+| `max_header_count`, `max_param_count`, `max_query_count`, `max_form_count`, `max_multiform_count` | 32, 8, 32, 32, 32 | Counts in a request. |
+| `max_connections` | 0 | Open connections at most; 0 follows the open-file limit (10 000 on Windows). |
+| `max_requests_per_connection` | none | Requests per keep-alive connection. |
+| `ws_max_message` | 1 MiB | The largest WebSocket message, in or out; a route's `max_message_size` overrides it. |
+
+`proxy`: `trusted_hops` (0), `trust_forwarded_proto` (true) and
+`trust_forwarded_host` (false), as in [Behind a proxy](#behind-a-proxy).
+`request`: `require_host` (true), `decompress` (true) and `keep_buffers`
+(false). `response`: `write_buffer_size` (16 KiB), `date` (true),
+`default_content_type` (`.text`), `max_header_count` (64) and
+`brotli_quality` (5).
 
 You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
@@ -192,7 +233,7 @@ both. Listeners named in the options bind to `127.0.0.1` unless given an
 connections from other machines.
 
 ```zig
-var app = try anole.Server(void).init(init.gpa, .{
+var app = try anole.App.init(init.gpa, .{
     .http = .{ .address = "", .port = 80 },
     .https = .{
         .address = "",
@@ -203,22 +244,21 @@ var app = try anole.Server(void).init(init.gpa, .{
         } },
     },
     .http3 = .{}, // UDP 443, advertised with Alt-Svc
-    .server = .{
-        .timeout = .{ .request = .fromSeconds(60), .shutdown = .fromSeconds(10) },
-        .request = .{ .max_body_size = 8 << 20 },
-    },
-}, {});
+    .timeouts = .{ .request = .fromSeconds(60), .shutdown = .fromSeconds(10) },
+    .limits = .{ .body_max = 8 << 20 },
+});
 ```
 
 `http` has `address`, `port`, `h2c`, `proxy_protocol` and
 `proxy_protocol_from`. `https` has `address`, `port`, `cert`,
-`alpn_protocols`, `client_auth`, `proxy_protocol` and `proxy_protocol_from`. `cert` is one of:
+`alpn`, `client_auth`, `proxy_protocol` and `proxy_protocol_from`. `cert` is one of:
 
 - `.{ .pem = .{ .cert = ..., .key = ... } }`: PEM text in memory, copied by
   `init`, for keys from a secret store or the environment.
 - `.{ .files = .{ .cert_path = ..., .key_path = ... } }`: PEM files (chain
-  leaf first), read by `init` and by every reload, relative to the working
-  directory. One that cannot be read is logged with its path
+  leaf first), read when the listeners are set up (by `init` when it names
+  them, else by `listen`, `listenTls` or `run`) and by every reload,
+  relative to the working directory. One that cannot be read is logged with its path
   (`cannot read the TLS certificate "cert.pem": FileNotFound`).
 - `.dev_self_signed`: a fresh P-256 key and certificate for `localhost`,
   `127.0.0.1` and `::1`, held only in memory. For development; clients need
@@ -228,11 +268,22 @@ var app = try anole.Server(void).init(init.gpa, .{
   for any name.
 
 `anole.Cert.fromFiles(cert_path, key_path)` and `.fromPem(cert, key)` build
-the first two: `.cert = .fromFiles("cert.pem", "key.pem")`.
+the first two: `.cert = .fromFiles("cert.pem", "key.pem")`. One shape serves
+everywhere a certificate goes: listeners, the HTTP/2 and HTTP/3 clients,
+`ClientOptions.tls`, and the database connectors' client certificates. A
+listener that serves `.dev_self_signed` on anything but loopback logs a
+warning: browsers will warn and clients cannot verify it.
 
-`server` goes to the HTTP core as is, except that `listeners` and `http2` are
-replaced by the fields above. Its timeouts and limits are covered in
-[routing.md](routing.md#timeouts-and-limits); `trusted_proxy_hops` below;
+Trusted authorities, for a client verifying a server or a listener verifying
+clients, are an `anole.Ca`: `.system`, `.fromFile("ca.pem")`, `.dir` (a
+directory of PEM files), `.fromPem(text)`. Paths are relative to the working
+directory. Mutual TLS on a listener is an `anole.ClientAuth`:
+
+```zig
+.client_auth = .{ .ca = .fromFile("clients-ca.pem") },            // required
+.client_auth = .{ .ca = .fromFile("clients-ca.pem"), .mode = .request }, // asked for
+```
+
 `max_connections` caps open connections, by default at what the open-file
 limit allows (see [Many connections](#many-connections)).
 
@@ -247,7 +298,7 @@ or instead of those two. Each has:
 | `name` | made up | What the listener is called: `LISTEN_FDNAMES` for socket activation and restarts, and `req.listener.name` for handlers. Unique, at most 255 bytes, no `:`. Without one: `http-<port>`, `https-<port>` or `unix-<path>`. |
 | `address`, `port` | `127.0.0.1`, 8080 | Where it listens. |
 | `unix` | `null` | A unix domain socket at this path instead. |
-| `tls` | `null` | `.{ .cert = ... }` for TLS, with optional `alpn_protocols` and `client_auth`. Listeners that name the same certificate (the same files, the same PEM) share one copy of it. |
+| `tls` | `null` | `.{ .cert = ... }` for TLS, with optional `alpn` and `client_auth`. Listeners that name the same certificate (the same files, the same PEM) share one copy of it. |
 | `http1` | true | HTTP/1.1 (and 1.0). |
 | `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
@@ -441,12 +492,12 @@ SIGUSR2, or `stop()`, starts a graceful drain:
    sessions get DRAIN_WEBTRANSPORT_SESSION and a close (see
    [Shutdown](webtransport.md#shutdown)).
 6. `run` returns once every connection is closed, or when
-   `server.timeout.shutdown` (30 s) runs out.
+   `timeouts.shutdown` (10 s) runs out.
 
 Handlers that run for long can learn of the drain: `req.drain` is an
 `std.Io.Event` set when it starts, to wait on or test with `isSet()`. An
 event stream that does neither never closes on its own, so with
-`timeout.shutdown = null` it holds the drain open forever.
+`timeouts.shutdown = null` it holds the drain open forever.
 
 ### Ports in use
 
@@ -465,6 +516,56 @@ no `TIME_WAIT`), before the first of them binds. A dual-stack listener's
 probe is dual-stack too, so it also finds an IPv4 socket on the port. On macOS, as on other BSDs, a listener on a specific address beside one on the wildcard
 address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
 allowed: the kernel treats those as different addresses.
+
+### When it does not start
+
+`init`, `listen`, `listenTls`, `run` and `waitReady` fail with an
+`anole.ServerError`, a named set you can switch on; the certificate reloads
+(`reloadCertificates`, `setCertificate`) fail with an `anole.TlsLoadError`,
+a subset of it. After a failed `run`, `app.failedListener()` names the
+listener whose port could not be bound. The C ABI reports the same names
+(`anole_last_error_name`).
+
+| Error | Means | What to do |
+| --- | --- | --- |
+| `InvalidListenAddress` | An address Anole cannot read. | Use a port (`"3000"`), `":3000"` or `"127.0.0.1:3000"`. |
+| `ListenersAlreadySet` | `listen` or `listenTls` on a server whose options name listeners. | Serve them with `run`, or leave `http` and `https` out of the options. |
+| `InvalidListenerName`, `DuplicateListenerName` | A listener name that is empty, longer than 255 bytes, holds `:`, or is taken. | Give each listener its own short name. |
+| `InvalidProxyNetwork` | A `proxy_protocol_from` entry that is not an address or a CIDR network. | Write `"10.0.0.0/8"` or `"192.0.2.7"`. |
+| `NoProtocols`, `SeveralHttp3Listeners`, `Http3NeedsTls`, `Http3NeedsHttps` | A listener that speaks nothing; HTTP/3 on several listeners, or on one without TLS. | One TLS listener serves HTTP/3. |
+| `TooManyListeners` | More listeners than a restart can hand over. | Fewer listeners, or no `process`. |
+| `RouteConflict` | Two routes (or a helper route) on one path. | Rename one of them. |
+| `HqInteropNotAllowed` | The QUIC interop runner's mode, off in programs that did not ask for it. | Leave `http3.hq_interop_root` out. |
+| `TlsNotBuilt`, `Http2NotBuilt`, `Http3NotBuilt` | A listener asks for what this build left out. | Build with `-Dtls`, `-Dhttp2` or `-Dhttp3`. |
+| `AddressInUse` | Another process listens on the port. | `lsof -i :3000` shows which. |
+| `AddressNotAvailable` | The address is not on this machine. | Check the interface address. |
+| `AccessDenied` | Ports below 1024 need root or `CAP_NET_BIND_SERVICE`; or a certificate file the process cannot read. | Use a high port behind a proxy, or grant the capability. |
+| `InheritedSocketMismatch` | A socket from systemd or a predecessor that is not the listener it was named for. | Check `LISTEN_FDNAMES` and the unit's `Sockets=`. |
+| `NoTlsListener` | A certificate reload on a server without TLS. | Reload only TLS servers. |
+| `FileNotFound` | A certificate, key or CA file that is not there (its path is logged). | Check the path, relative to the working directory. |
+| `InvalidCertificate`, `InvalidKey` | A file that is not a PEM certificate (chain) or private key. | Keys are PKCS#8 or SEC1 PEM without a passphrase. |
+| `KeyMismatch` | The key is not the certificate's. | Reload both from the same pair. |
+| `DatabaseUnavailable` | A connector opened at start (`connect_at_start`) could not connect (its own error is logged first). | Fix the URL, or leave `connect_at_start` off. |
+| `ServerAlreadyOnThread` | A second server on a thread that has one. | Start it on a thread of its own, or after `deinit`. |
+| `SystemResources`, `OutOfMemory`, `Canceled`, `Unexpected` | The system ran out of something; cancelled; or a cause Anole does not name (logged at `err`). | |
+
+### Defaults
+
+One table; the C ABI's defaults are the same (the schema test checks them).
+
+| Setting | Default |
+| --- | --- |
+| `timeouts.request` / `read_header` / `write` / `keepalive` / `idle_park` / `shutdown` | 30 s / 10 s / 30 s / 60 s / 1 s / 10 s |
+| `limits.body_max` | 1 MiB (chunked `req.reader()` too) |
+| `limits.max_head_size` | 16 KiB (431 past it) |
+| `limits.max_connections` | 0: the open-file limit |
+| `limits.ws_max_message` | 1 MiB |
+| `http2.max_concurrent_streams` | 250 |
+| HTTP/3 streams / idle / 0-RTT / Retry | 100 / 30 s / off / off |
+| `errors` | `.auto` |
+| `proxy.trusted_hops` | 0 |
+| `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 5 |
+| `executors` | one per CPU |
 
 ### IPv6 and IPv4
 
@@ -523,17 +624,17 @@ With Docker's 1,048,576 and 16 executors that is about 917,000 connections;
 with a limit that stays at 1024, about 800. Past the cap the server stops
 accepting and new connections wait in the kernel's accept queue, rather than
 `accept` failing for want of a descriptor. 10,000 on Windows. Set
-`.server = .{ .max_connections = 50_000 }` to cap it lower, as memory
+`.limits = .{ .max_connections = 50_000 }` to cap it lower, as memory
 suggests: an idle connection costs a few kilobytes, about 20 KB with TLS on
-Linux, and a request in progress its buffers on top (see
-`ServerConfig.max_connections`); `null` lifts the cap. The startup
+Linux, and a request in progress its buffers on top; 0, the default,
+follows the open-file limit. The startup
 debug log names the cap it worked out.
 
 To allow more, raise the hard limit where the process starts:
 `LimitNOFILE=1048576` in a systemd unit, `--ulimit nofile=1048576:1048576`
 for `docker run`, `ulimit -Hn` in a shell (as root).
 
-An HTTP/1.1 connection that has waited `timeout.idle_park` (1 s) for its
+An HTTP/1.1 connection that has waited `timeouts.idle_park` (1 s) for its
 next request, with nothing buffered, ends its coroutine and parks: it is
 then a small heap object whose socket the executor watches, and the next
 request starts a coroutine for it again on the same executor; a
@@ -545,7 +646,7 @@ second, and the drain and the stop close them. A WebSocket served through
 callbacks ([`app.wsCallbacks`](websocket.md#callbacks)) parks the same
 way between messages. HTTP/2 connections, and WebSockets served by a
 handler that loops on `ws.next()`, keep their coroutines. Set
-`server.timeout.idle_park` to null to keep every connection's coroutine
+`timeouts.idle_park` to null to keep every connection's coroutine
 (parking needs zio's pinned executors, which `run` uses).
 
 Each connection with a coroutine has a stack, which is two memory mappings.
@@ -592,8 +693,8 @@ past which the connection is closed), `max_continuations` (8) and
 Memory per HTTP/2 connection is per stream, too: besides the raised
 windows, each of up to `max_concurrent_streams` streams may hold a
 `stream_window` body buffer and, when its handler reads the whole body,
-up to `request.max_body_size`. Size memory for `max_connections` times
-that, or lower `max_concurrent_streams` or `max_body_size`.
+up to `limits.body_max`. Size memory for `max_connections` times
+that, or lower `max_concurrent_streams` or `body_max`.
 
 ## HTTP/3
 
@@ -724,14 +825,14 @@ outside `minimal`).
   exchange (forward secrecy) and an AEAD cipher: AES-GCM and
   ChaCha20-Poly1305, no RSA key exchange and no CBC. TLS 1.3's suites are
   all of that kind.
-- ALPN: the server picks by its own order (`alpn_protocols`). A client whose
+- ALPN: the server picks by its own order (`alpn`). A client whose
   offer shares nothing with it gets no ALPN answer and HTTP/1.1, rather than
   a refusal.
 - Resumption uses stateless session tickets only, with no server-side cache.
   The ticket keys live in the process and rotate every two days, as
   BoringSSL's own do; tickets survive a certificate reload, but not a
   restart, and do not carry over to another machine.
-- A handshake has the same deadline as a request (`timeout.request`). Failed
+- A handshake has the same deadline as a request (`timeouts.request`). Failed
   handshakes are logged at `info`, since any client can cause them.
 - No revocation checking: neither the server (for client certificates under
   `client_auth`) nor the clients consult CRLs or OCSP, and the server does
@@ -772,9 +873,9 @@ Mutual TLS verifies client certificates against the CAs you give:
 ```zig
 .https = .{
     .port = 8443,
-    .cert = .{ .pem = .{ .cert = cert_pem, .key = key_pem } },
+    .cert = .fromPem(cert_pem, key_pem),
     .client_auth = .{
-        .ca = .{ .file = .{ .path = "clients-ca.pem" } }, // or .dir, .system
+        .ca = .fromFile("clients-ca.pem"), // or .{ .dir = "cas" }, .system
         .mode = .require, // .request also accepts a client that sends none
     },
 },
@@ -827,7 +928,7 @@ listening sockets, HTTP/3's included (in the `LISTEN_FDS` format; every
 per-core UDP socket, in the group's order, so the steering stays right),
 binds nothing of its own, and reports through a pipe once it serves; only then does
 the old one stop accepting and drain. TCP clients never see a closed port. If
-the new process does not report within `restart_timeout_ms`, the old one kills
+the new process does not report within `restart_timeout` (10 s), the old one kills
 it and keeps serving. To deploy, replace the binary on disk and send SIGUSR2.
 
 **HTTP/3 across a restart.** A UDP socket has no queue of new connections to
@@ -880,8 +981,8 @@ ExecStop=/bin/sh -c 'kill -TERM $MAINPID; while kill -0 $MAINPID 2>/dev/null; do
 # The default: a stop signals every process of the service, an old one
 # still draining after a restart too.
 KillMode=control-group
-# Longer than the drain (timeout.shutdown, 30 s).
-TimeoutStopSec=40
+# Longer than the drain (timeouts.shutdown, 10 s).
+TimeoutStopSec=20
 Sockets=anole-http.socket anole-https.socket anole-h3.socket
 
 [Install]
@@ -940,21 +1041,21 @@ mechanisms carry the client address.
 **The PROXY protocol** (v1 and v2, as HAProxy, nginx, AWS NLB and Envoy send
 it), per listener: `.http = .{ .port = 8080, .proxy_protocol = true }`. Each
 connection must open with a valid header, read before TLS and within
-`timeout.read_header`, or it is closed. The header's address becomes
+`timeouts.read_header`, or it is closed. The header's address becomes
 `req.remote_address`, and v2's SSL field sets `req.secure`.
 Name the load balancers with `proxy_protocol_from`
 (`.proxy_protocol_from = &.{ "10.0.0.0/8", "2001:db8::/32" }`) and a
 connection from any other peer is closed before anything is read, so a
 client that reaches the port directly cannot claim another address.
 
-**`X-Forwarded-*`**, with `.server = .{ .trusted_proxy_hops = 1 }`. With `n`
+**`X-Forwarded-*`**, with `.proxy = .{ .trusted_hops = 1 }`. With `n`
 hops, `req.remote_address` is the `n`-th address from the right of
 `X-Forwarded-For` (with port 0); entries left of it are the client's own and
 are not read, and a selected entry that is not an address gives `0.0.0.0`,
 never the proxy's address. The nearest proxy's `X-Forwarded-Proto` sets
-`req.secure` (`.trust_forwarded_proto = false` turns that off). Its
+`req.secure` (`.proxy = .{ .trust_forwarded_proto = false }` turns that off). Its
 `X-Forwarded-Host` is what `req.host()` returns only with
-`.trust_forwarded_host = true`: a proxy that passes the client's header
+`.proxy = .{ .trust_forwarded_host = true }`: a proxy that passes the client's header
 through (nginx does unless told `proxy_set_header X-Forwarded-Host $host`)
 would let a client choose the host your links and redirects are built from.
 The proxy must set (overwrite) both headers on every request; append-only
@@ -964,7 +1065,7 @@ read.
 Enable either only on a listener that nothing but the proxy can reach;
 otherwise clients write the header themselves and choose the address your
 handlers see. The two combine: the PROXY header sets the peer, and
-`trusted_proxy_hops` applies on top.
+`proxy.trusted_hops` applies on top.
 
 ## Build flags
 
@@ -1023,9 +1124,11 @@ To serve from a Windows machine, run the Linux build in WSL2 or Docker.
 ## Full control with `anole.http`
 
 `app.router` and `app.server` are the HTTP core's router and server
-(src/http/core, adapted from dusty), and `anole.http` is that core, with TLS
-already on BoringSSL (`anole.http.core` has whatever it does not
-re-export). You can skip `Server` and drive the core yourself:
+(src/http/core, adapted from lalinsky/dusty), and `anole.http` is that core,
+with TLS already on BoringSSL (`anole.http.core` has whatever it does not
+re-export). You can skip `Server` and drive the core yourself. Its
+`ServerConfig` is what `ServerOptions` builds for it: use `ServerOptions`
+unless you drive the core alone:
 
 ```zig
 const rt = try anole.zio.Runtime.init(init.gpa, .{ .executors = .auto });

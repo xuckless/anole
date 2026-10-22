@@ -25,7 +25,7 @@ builds a whole API step by step.
 | `fiber.Query[int](c, "limit", 20)` | `req.query.getInt(usize, "limit") orelse 20` |
 | `c.Get("X-Api-Key")` | `req.headers.get("X-Api-Key")` |
 | `c.Cookies("sid")` | `req.cookies().get("sid")` |
-| `c.IP()` | `req.remote_address` (behind a proxy, with `trusted_proxy_hops` set) |
+| `c.IP()` | `req.remote_address` (behind a proxy, with `proxy.trusted_hops` set) |
 | `c.Body()` | `try req.body()`, a `?[]const u8` |
 | `c.Bind().Body(&in)` | `const in = try req.bind(NewUser);` |
 | `c.SendString("hi")` | `res.body = "hi";` or `try res.print(.text, "hi {s}", .{name});` |
@@ -52,7 +52,7 @@ builds a whole API step by step.
 | `requestid.New()` | `app.use(anole.middleware.RequestId.init(.{}));` |
 | `compress.New()` | `app.use(anole.middleware.Compress.init(.{}));` |
 | `recover.New()` | nothing to add, and nothing like it ([below](#what-is-different)) |
-| `limiter.New(limiter.Config{Max: 100, Expiration: time.Minute})` | `anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window_ms = 60_000 })` ([below](#rate-limits-sessions-and-jwt)) |
+| `limiter.New(limiter.Config{Max: 100, Expiration: time.Minute})` | `app.rateLimit(.{ .limit = 100 })` ([below](#rate-limits-sessions-and-jwt)) |
 | `session.New()` and `session.FromContext(c)` | `try anole.session.Middleware.init(.{ .key = key })` and `req.session` |
 | `jwtware.New(jwtware.Config{...})` (contrib/jwt) | `anole.auth.RequireJwt.init(keys, policy, .{})` and `anole.auth.claims(req)` |
 | `healthcheck.New()` | `_ = app.health(.{});` (`/healthz`, `/readyz`) |
@@ -205,7 +205,7 @@ rather than calls that return a handler:
 // by something else, `.on_error = .deny` to refuse when the limiter fails).
 var limiter = anole.ratelimit.MemoryLimiter.init(init.gpa, app.io(), .{});
 defer limiter.deinit();
-app.use(anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window_ms = 60_000 }));
+app.use(anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100, .window = .fromSeconds(60) }));
 
 // session.New(): an encrypted cookie; 32 random bytes from your secret store
 // (anole.session.keyFromBase64 reads one). No key is an error, not a default.

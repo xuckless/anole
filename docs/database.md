@@ -885,7 +885,7 @@ call.
 
 ```zig
 fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    req.setTimeout(.none); // a stream
+    req.setTimeout(null); // a stream
     const sub = try app.redis.subscribe(req, "room:lobby");
     defer sub.close();
     var buf: [1024]u8 = undefined;

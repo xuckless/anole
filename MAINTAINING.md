@@ -158,6 +158,13 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   accepting on a busy executor (`accept-now`: a direct accept with its own
   budget, and spawn backpressure every 64 spawns instead of on every one).
   The bench suite's `conns` and `raw` scenarios measure both.
+  Anole requires the fork's declarations and fails to compile without them
+  (src/http/core/placement.zig, top): `Placement`, `Group` (with
+  `spawnInto`), `AutoCancel` (with its `task` field), `currentTask`, `Event`,
+  `Runtime` (with `fromIo`, `currentExecutor` and `executors`), and off
+  Windows `CompletionQueue` and `ev.NetPoll`/`ev.Async`. After a bump, a
+  compile error naming one of them means the branch lost it. The core's own
+  tests build against src/http/core/zio_stub.zig instead (`is_stub`).
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed. websocket-zig also

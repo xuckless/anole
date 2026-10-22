@@ -571,7 +571,8 @@ ANOLE_API anole_status anole_respond_fd(anole_req r, uint16_t status, const anol
                                         int fd, uint64_t offset, uint64_t len);
 /* Starts a streamed response: the head goes out now (copied); the body
    follows with anole_stream_write, and anole_stream_end finishes it. The
-   request deadline no longer applies once a stream has started. */
+   request deadline ends once a stream has started; each write the peer does
+   not take within timeouts.write_ms ends the stream (ANOLE_EV_ABORT). */
 ANOLE_API anole_status anole_stream_start(anole_req r, uint16_t status, const anole_header *headers, size_t nheaders);
 /* Queues body bytes (copied, or borrowed with ANOLE_BODY_BORROW). Returns
    ANOLE_OK, or ANOLE_BUSY when the bytes are taken but more than

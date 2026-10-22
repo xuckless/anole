@@ -326,13 +326,13 @@ all of them trust the system store unless told otherwise:
 | Need | `.tls = ...` |
 | --- | --- |
 | System trust store | `.ca = .system` (the default) |
-| A CA file or directory | `.ca = .{ .file = .{ .path = "ca.pem" } }`, or `.dir` |
-| A CA in memory | `.ca = .{ .pem = ca_pem }` (one or more certificates) |
+| A CA file or directory | `.ca = .fromFile("ca.pem")`, or `.{ .dir = "cas" }` |
+| A CA in memory | `.ca = .fromPem(ca_pem)` (one or more certificates) |
 | Skip verification (tests only) | `.insecure_skip_verify = true`, optionally `.ca = .none` |
-| Client certificate (mutual TLS) | `.client_certificate = .{ .cert_path = "client.pem", .key_path = "client.key" }`, or `.{ .pem = .{ .cert = cert_pem, .key = key_pem } }` |
+| Client certificate (mutual TLS) | `.client_certificate = .fromFiles("client.pem", "client.key")`, or `.fromPem(cert_pem, key_pem)` |
 | ALPN | `anole.http`: none, or "h2" and "http/1.1" with `.http2 = true`; `anole.h2`, `anole.h3`: "h2" or "h3", fixed |
 
-`ca` is an `anole.http.TlsCa`. `.none` without `insecure_skip_verify` fails
+`ca` is an `anole.Ca`. `.none` without `insecure_skip_verify` fails
 with `error.NoCertificateAuthority`.
 
 When it is read:
@@ -354,9 +354,10 @@ on the path, so reading such a body then fails with
 `error.TlsConnectionTruncated`. Framed bodies are not affected: their
 framing already shows a cut.
 
-Paths are relative to the current directory, or to `dir` when you set one
-(`.{ .path = "ca.pem", .dir = some_dir }`). A client key must be PKCS#8 or
-SEC1 PEM without a passphrase.
+Paths are relative to the working directory (`.fromFile("ca.pem")`). A
+client key must be PKCS#8 or SEC1 PEM without a passphrase. The same
+`anole.Cert` and `anole.Ca` describe certificates on listeners and in the
+database connectors.
 
 To trust a development certificate from `anole.tls.selfSigned`, pass its
 `cert` (not the key) as `.ca = .{ .pem = pem.cert }`, as `examples/clients`

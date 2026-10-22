@@ -3,6 +3,97 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+Server options, TLS and errors (API hardening; see
+[docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)).
+
+### Breaking
+
+- `ServerOptions.server` is gone. Its settings are now flat groups with the
+  same names as the C ABI's JSON config: `timeouts`, `limits`, `proxy`,
+  `request`, `response` (see the migration table). `errors`, `error_handler`,
+  `http2` and `listeners` set inside `.server` used to be ignored without a
+  word; there is no such place to put them any more.
+- Durations in options are `anole.Duration` (`.fromSeconds(10)`) and lose
+  their unit suffix: `restart_timeout_ms` is `restart_timeout`; `window`,
+  `idle`, `ttl`, `leeway`, `max_age`, `interval`, `valid_for`, `lifetime`,
+  `min_refresh`, `stale`, `retry` and `max_retry` replace the `_ms` and
+  `_seconds` fields of the rate limiter, sessions, JWT verification, OIDC,
+  the keyring, CORS, tracing and `tls.selfSigned`.
+- TLS settings have one shape everywhere: `anole.Cert` (`.fromFiles`,
+  `.fromPem`, `.dev_self_signed`) for listener and client certificates,
+  `anole.Ca` (`.system`, `.fromFile(path)`, `.dir`, `.fromPem`) for trusted
+  CAs, `anole.ClientAuth` for mutual TLS. `alpn_protocols` is `alpn`. The
+  `dir` fields are gone (paths are relative to the working directory).
+  `http.ClientConfig` is `anole.ClientOptions`, `http.TlsConfig` is
+  `http.TlsOptions`. A listener that serves `.dev_self_signed` on anything
+  but loopback logs a warning.
+- `init`, `listen`, `listenTls`, `run` and `waitReady` return
+  `anole.ServerError`, and the certificate reloads `anole.TlsLoadError`:
+  named, documented sets you can switch on (`error.AddressInUse`,
+  `error.KeyMismatch`, ...). `app.failedListener()` names the listener whose
+  port could not be bound.
+- `req.setTimeout` takes `?anole.Duration` (`req.setTimeout(.fromSeconds(60))`,
+  `null` for none); the old form is `req.setDeadline(std.Io.Timeout)`.
+- Every middleware is built with `init(.{ ... })` and takes `Options`
+  (`Cors.Options`, `Logger.init(.{})`, `Compress.init(.{})`,
+  `MemoryStore.init(gpa, io, .{})`). Struct middleware gets the chain as
+  `next` and calls `next.call()`, as function middleware does (was
+  `executor.next()`).
+- Using a request or response out of order (a second `req.reader()`,
+  `res.stream` after `res.body` was set, writing after the head went out)
+  returns a named error (`anole.http.MisuseError`, answered 500) instead of
+  undefined behaviour in ReleaseFast. `res.writer()` can now fail: add `try`.
+- Engine fields of `Request` and `Response` are marked internal with a
+  leading `_` (`res.conn`, `req.parser`, `res.headers_written`, ...). Use
+  `res.headersSent()`.
+- The graceful drain now waits 10 s by default (was 30 s in Zig; the C ABI
+  already used 10 s), the same as Docker's stop grace. Set
+  `timeouts.shutdown` for longer.
+- WebSocket messages are limited to 1 MiB by default (was 16 MiB; the C ABI
+  already used 1 MiB): set `limits.ws_max_message` or the route's
+  `max_message_size`. `req.reader()` now stops at `limits.body_max` for
+  chunked bodies too (`error.BodyTooBig`, 413); `req.readerLimited(buf, n)`
+  takes larger ones.
+- C ABI 0.7 configuration: `trusted_proxy_hops`, `trust_forwarded_proto` and
+  `trust_forwarded_host` move into a `proxy` group (`proxy.trusted_hops`).
+  Timeouts take `null` for none. New keys: `timeouts.read_header_ms`,
+  `write_ms`, `idle_park_ms`; request head limits in `limits`; `proxy`,
+  `request`, `response`, `http2` and `errors` groups; `http3.address`,
+  `port`, `validate_address`, `prefer_v2`, `sockets`,
+  `enable_connect_protocol`, `inline_no_wait`; `tls.client_ca_dir` and
+  `client_ca_system`. `jwt.leeway_s` is `leeway_ms`, `cors.max_age` is
+  `max_age_ms`. Every Zig server option now has a JSON key with the same name
+  or is listed in docs/c-abi.md with the reason it has none.
+- Outbound requests say `User-Agent: anole/<version>` (was `dusty/0.4.0`);
+  `anole.version` is the version.
+
+### Added
+
+- `app.listen("3000")` (a bare port) listens on every interface, like
+  `":3000"`. A listen address Anole cannot read is now logged with examples.
+- `app.rateLimit(.{ .limit = 100 })`, a one-line in-memory rate limiter.
+- `req.readerLimited`, `req.setDeadline`, `res.headersSent()`.
+- `EventStream.comment` (heartbeats), `end` and `draining`.
+- `timeouts.write` (30 s) bounds each write once a stream or file body has
+  started.
+- `anole.Duration`, `anole.Ca`, `anole.ClientAuth`, `anole.ClientOptions`,
+  `anole.ServerError`, `anole.TlsLoadError`, `anole.errors`.
+- `Compress.Options.brotli_quality`, a per-middleware Brotli quality.
+
+### Fixed
+
+- Event streams, streamed responses and file downloads are no longer cut at
+  the request timeout (30 s in Zig, `request_ms` + 5 s through the C ABI over
+  HTTP/1.1 and tasked HTTP/2 and HTTP/3 streams). Once the head is out, the
+  request deadline ends and `timeouts.write` bounds each write the client does
+  not take.
+- Setting any `http2` option no longer drops the concurrent-stream limit from
+  250 to 100.
+- `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
+  from the environment; it used to need `.process`.
+
 ## 0.1.3 (2026-10-22)
 
 ### Security

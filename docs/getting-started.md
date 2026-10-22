@@ -379,12 +379,11 @@ pub fn main(init: std.process.Init) !void {
 
 **Stopping.** SIGTERM (or SIGINT) starts a drain: the listeners close,
 requests in flight finish, HTTP/2 and HTTP/3 clients get a GOAWAY and
-WebSockets a close, for up to 30 seconds (`.server = .{ .timeout = .{
-.shutdown = ... } }` in the options). Give the process manager at least
-that long before it kills.
+WebSockets a close, for up to 10 seconds (`.timeouts = .{ .shutdown = ... }`
+in the options). Give the process manager a little longer before it kills.
 
 **Behind a proxy** such as nginx or a cloud load balancer, set
-`.server = .{ .trusted_proxy_hops = 1 }` so `req.remote_address` is the
+`.proxy = .{ .trusted_hops = 1 }` so `req.remote_address` is the
 client's address from `X-Forwarded-For` rather than the proxy's
 ([server.md](server.md#behind-a-proxy)). Anole serves TLS, HTTP/2 and
 HTTP/3 itself, so a proxy is optional.
@@ -435,8 +434,9 @@ ENTRYPOINT ["/api"]
 
 Listen on `":3000"`, not `127.0.0.1`, which inside a container is
 unreachable from outside it. `docker stop` waits 10 seconds before it kills,
-less than the drain: use `docker stop -t 40` (or `stop_grace_period` in
-Compose), or shorten `timeout.shutdown`. An image without CA certificates
+the same as the drain: give the container a little more (`docker stop -t 15`,
+or `stop_grace_period: 15s` in Compose). Kubernetes' default grace period
+(30 s) is enough. An image without CA certificates
 (`distroless/cc` has them; `debian:*-slim` needs the `ca-certificates`
 package) cannot make outbound HTTPS calls.
 

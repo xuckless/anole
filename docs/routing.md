@@ -123,8 +123,8 @@ app.use(requireKey);
 ```
 
 A middleware with settings of its own is a struct with an `execute` method
-of exactly this shape, where `next.call()` plays the part of
-`next.call()`:
+of the same shape, taking the chain as `next` and calling `next.call()`
+exactly as a function middleware does:
 
 ```zig
 const RequireToken = struct {
@@ -193,7 +193,7 @@ on every response, and a preflight (an `OPTIONS` with `Origin` and
 | `headers` | what the preflight asks for | `Access-Control-Allow-Headers`. |
 | `expose` | none | `Access-Control-Expose-Headers`, response headers a page's script may read. |
 | `credentials` | false | Cookies and HTTP authentication across origins (`Access-Control-Allow-Credentials`). Needs `origins`: with any origin, `init` panics. |
-| `max_age` | 600 | Seconds a browser may reuse a preflight answer; null sends none. |
+| `max_age` | 10 minutes | How long a browser may reuse a preflight answer (an `anole.Duration`, sent in whole seconds); null sends none. |
 
 ```zig
 app.use(anole.middleware.Cors.init(.{
@@ -339,7 +339,7 @@ log, metrics and tracing ([observability.md](observability.md)).
 The body is read once, whole or as a stream:
 
 - `body()` returns `?[]const u8` (null when empty), read into the arena up to
-  `request.max_body_size` (1 MiB). Beyond that it fails with `BodyTooBig`,
+  `limits.body_max` (1 MiB). Beyond that it fails with `BodyTooBig`,
   answered 413.
 - `bind(T)` parses the body as JSON into a `T` (`std.json`, in the
   request's arena). Fields `T` does not have are ignored; a missing body
@@ -354,8 +354,11 @@ The body is read once, whole or as a stream:
 - `formData()` parses `application/x-www-form-urlencoded` and
   `multiFormData()` `multipart/form-data` (entries have `value` and
   `filename`); both return a map with `get`.
-- `reader(buffer)` streams the body. It is not bounded by `max_body_size`;
-  set `request.max_content_length` to refuse long bodies up front.
+- `reader(buffer)` streams the body and stops at `limits.body_max` too, for
+  chunked bodies as well (`error.BodyTooBig`, answered 413). A handler that
+  takes larger uploads (to a file, say) uses `readerLimited(buffer, limit)`,
+  where a null limit means any amount. A second `reader`, or `body()` after
+  `reader`, is `error.BodyReaderTaken` (answered 500).
 
 ```zig
 const NewUser = struct { name: []const u8, email: []const u8 };
@@ -413,8 +416,18 @@ res.body = "{\"id\":42}"; // must outlive the handler: a literal or res.arena
 
 A buffered body leaves the headers open until the handler returns, so
 middleware can still change them. After `stream`, `res.header` fails with
-`HeadersAlreadySent`. A stream that outlives `timeout.request` should call
-`req.setTimeout(.none)` first.
+`HeadersAlreadySent`. The request deadline (`timeouts.request`) ends once a
+stream's head is out: from then on each write the peer does not take within
+`timeouts.write` ends the stream. A deadline the handler set before the
+stream started (`req.setTimeout`) is kept. Event streams take heartbeats
+(`events.comment("keep-alive")`), tell when the server is draining
+(`events.draining()`) and end with `events.end()`.
+
+Using a request or response out of order (a second `req.reader()`,
+`res.stream` after `res.body` was set, writing after the head went out)
+returns a named error from `anole.http.MisuseError`, answered 500, rather
+than undefined behaviour; `res.writer()` can fail for that reason, so write
+`try res.writer()`.
 
 Trailers go out over HTTP/2 and HTTP/3, after a buffered or a streamed
 body; HTTP/1.1 drops them.
@@ -509,7 +522,7 @@ the handler sets `res.compress = true`, or always through `Compress`.
   written, and each `flush` sends what was written so far in a form the
   client can already decode.
 - Brotli runs at quality 5 by default
-  (`.server = .{ .response = .{ .brotli_quality = 5 } }`, 0 to 11), or per
+  (`.response = .{ .brotli_quality = 5 }`, 0 to 11), or per
   response with `res.brotli_quality`. On JSON bodies of 1.5 to 12 KB,
   quality 5 is 10-15% smaller than gzip and zstd and 8-13% smaller than
   quality 4, at about twice gzip's CPU time; quality 6 gains under 1% more,
@@ -529,35 +542,39 @@ the handler sets `res.compress = true`, or always through `Compress`.
 
 ## Timeouts and limits
 
-These live in `ServerOptions.server`, for example
-`.server = .{ .timeout = .{ .request = .fromSeconds(10) }, .request = .{ .max_body_size = 8 << 20 } }`.
-Null disables a timeout.
+These live in `ServerOptions`, in the groups `timeouts` and `limits`, with the
+same names in the C ABI's JSON configuration:
+`.timeouts = .{ .request = .fromSeconds(10) }, .limits = .{ .body_max = 8 << 20 }`.
+A duration is an `anole.Duration`; null disables a timeout.
 
-| Field | Default | Covers |
+| `timeouts` | Default | Covers |
 | --- | --- | --- |
-| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. Over HTTP/2, a response still going out after its handler returned gets this long again (or `timeout.keepalive` when this is off) before the stream is reset, and any one write to a peer that stops reading is cut off after it. |
-| `timeout.read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). |
-| `timeout.keepalive` | 60 s | An idle connection between requests. |
-| `timeout.request_count` | none | Requests per keep-alive connection. |
-| `timeout.shutdown` | 30 s | The graceful drain. |
+| `request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. It ends when a stream or a file body starts; `write` takes over. Over HTTP/2, a response still going out after its handler returned gets this long again (or `keepalive` when this is off) before the stream is reset. |
+| `read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). |
+| `write` | 30 s | One write the peer does not take: it ends the response (HTTP/1.1: the connection; HTTP/2 and HTTP/3: the stream). Counted once a stream or file body has started, and on every HTTP/2 connection write. |
+| `keepalive` | 60 s | An idle connection between requests. |
+| `idle_park` | 1 s | An idle HTTP/1.1 connection gives up its coroutine. |
+| `shutdown` | 10 s | The graceful drain. |
 
-There are no separate read-body and write timeouts; both fall under
-`timeout.request`. A handler can replace its own deadline:
+A handler can replace its own deadline, for one request:
 
 ```zig
-req.setTimeout(.{ .duration = .{ .raw = .fromSeconds(300), .clock = .awake } });
-req.setTimeout(.none); // a WebSocket or event stream
+req.setTimeout(.fromSeconds(300));   // 300 s from now
+req.setTimeout(null);                // none
+req.setDeadline(.{ .deadline = t }); // an absolute std.Io.Timeout
 ```
 
-| `request` field | Default | Over the limit |
+| `limits` field | Default | Over the limit |
 | --- | --- | --- |
-| `max_body_size` | 1 MiB | `body()`, `bind()`, `json()` and forms fail: 413. Counted after decoding. |
-| `max_content_length` | none | A larger declared `Content-Length` is a 413 before the handler runs. Bounds streams too. |
-| `require_host` | true | An HTTP/1.1 request with no `Host`, or any with two, is a 400 (RFC 9112). |
-| `buffer_size` | 16 KiB | The request line and headers must fit: 431. |
+| `body_max` | 1 MiB | `body()`, `bind()`, `json()`, forms and `reader()` fail: 413. Counted after decoding. A larger declared `Content-Length` is a 413 before the handler runs. |
+| `max_head_size` | 16 KiB | The request line and headers must fit: 431. |
 | `max_header_count` | 32 | Request headers: 431. |
 | `max_param_count`, `max_query_count` | 8, 32 | Path parameters and query values: 400. |
 | `max_form_count`, `max_multiform_count` | 32, 32 | Form fields. |
+| `max_requests_per_connection` | none | Requests per keep-alive connection. |
+
+`request.require_host` (true): an HTTP/1.1 request with no `Host`, or any with
+two, is a 400 (RFC 9112).
 
 `response.max_header_count` (64) caps the headers a response can carry,
 those the server adds included; past it `res.header` fails with

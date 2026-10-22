@@ -95,7 +95,7 @@ per-socket state behind `ws.context` (`ws.contextAs(T)` reads it back),
 set in `open` and freed in `close`.
 
 Over HTTP/1.1 a callback socket holds no coroutine while it waits: when
-nothing has arrived for `timeout.idle_park` (1 s), it gives up its buffers
+nothing has arrived for `timeouts.idle_park` (1 s), it gives up its buffers
 and parks, a few kilobytes on the heap, and the next message starts a
 coroutine for it on the same executor. The callbacks run there one at a
 time and may wait (a database call, a lock); messages that arrive meanwhile
@@ -155,7 +155,7 @@ Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `allowed_origins` | `.same_origin` | The pages that may open the socket (see [Origins](#origins)). |
-| `max_message_size` | 16 MiB | The largest message `receive` assembles, measured after inflating. |
+| `max_message_size` | `limits.ws_max_message` (1 MiB) | The largest message `receive` assembles, measured after inflating. |
 | `timeout` | `.none` | Replaces the request timeout once the socket is open. |
 | `compression` | on with `-Dcompression` | Accept permessage-deflate when the client offers it. |
 | `deflate` | see below | Compressor settings. |
@@ -260,7 +260,7 @@ on every HTTP version. Return from the handler.
 
 ## Timeouts
 
-A WebSocket outlives the server's request timeout (`timeout.request`, 30 s
+A WebSocket outlives the server's request timeout (`timeouts.request`, 30 s
 by default). `upgrade` replaces it with `UpgradeOptions.timeout`, which is
 no limit by default. A duration there is a deadline for the whole socket.
 
@@ -271,7 +271,7 @@ closes a chat socket that sends nothing for five minutes:
 const chat_idle: std.Io.Duration = .fromSeconds(300);
 
 while (true) {
-    req.setTimeout(.{ .duration = .{ .raw = chat_idle, .clock = .awake } });
+    req.setTimeout(chat_idle);
     const msg = ws.receive() catch return;
     // ...
 }
@@ -307,12 +307,12 @@ yourself with `ws.close(.going_away, ...)` and keep calling `receive` until
 the answer arrives.
 
 A client that never answers the close holds its socket open until
-`timeout.shutdown` (30 s by default) runs out; the remaining sockets are then
+`timeouts.shutdown` (10 s by default) runs out; the remaining sockets are then
 cut without a further frame. A server with long-lived sockets may want a
 shorter wait:
 
 ```zig
-.server = .{ .timeout = .{ .shutdown = .fromSeconds(5) } },
+.timeouts = .{ .shutdown = .fromSeconds(5) },
 ```
 
 The close is sent by a small task beside each socket's handler, on the same

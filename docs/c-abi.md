@@ -215,8 +215,9 @@ here and runs on Anole's threads:
     { "name": "web", "address": "", "port": 8080 },
     { "name": "tls", "port": 8443, "tls": { "cert_file": "cert.pem", "key_file": "key.pem" }, "http3": true }
   ],
+  "timeouts": { "request_ms": 30000, "write_ms": 30000, "shutdown_ms": 10000, "rewake_ms": 20 },
   "limits": { "body_max": 1048576, "inline_body_max": 65536, "max_inflight": 1024 },
-  "timeouts": { "request_ms": 30000, "shutdown_ms": 10000, "rewake_ms": 20 },
+  "proxy": { "trusted_hops": 1 },
   "middleware": [
     { "request_id": {} },
     { "access_log": { "format": "json", "exclude": ["/healthz"] } },
@@ -267,8 +268,9 @@ development, plus `alpn`.
 Mutual TLS is `client_auth`: `"none"` (the default), `"request"` (a
 certificate is asked for and checked when the client sends one) or
 `"require"` (a client without one is refused at the handshake), with the CAs
-that client certificates must chain to as `client_ca_file` or
-`client_ca_pem`:
+that client certificates must chain to as exactly one of `client_ca_file`,
+`client_ca_pem`, `client_ca_dir` (a directory of PEM files) or
+`client_ca_system: true`:
 
 ```json
 { "port": 8443, "http3": true,
@@ -290,21 +292,75 @@ swaps in new ones for every TLS listener (and HTTP/3), as file paths or, with
 `ANOLE_TLS_PEM`, as PEM text, and they become what later reloads read.
 Handshakes under way finish on the old certificate, and session tickets
 issued before still resume. A certificate that does not load leaves the old
-one in place (`ANOLE_E_INVALID`, or `ANOLE_E_SYSTEM` for a file that cannot
-be read). With `ANOLE_SERVER_SIGNALS`, SIGHUP does the same as
+one in place (`ANOLE_E_INVALID` for a certificate, key or pair that does
+not load, `ANOLE_E_SYSTEM` for a file that cannot be read). With `ANOLE_SERVER_SIGNALS`, SIGHUP does the same as
 `anole_server_reload_certificates`. A reload changes the server's own
-certificate only; the client CAs stay those of the configuration.
+certificate only; a reload re-reads the client CA source
+(`client_ca_file`, `client_ca_dir`, `client_ca_pem` or the system store);
+the source itself stays that of the configuration.
 
-Behind a proxy, `trusted_proxy_hops` says how many proxies in front to
+Behind a proxy, `proxy.trusted_hops` says how many proxies in front to
 trust for `X-Forwarded-For` (the client's address in `remote_addr`), with
-`trust_forwarded_proto` (default true: `X-Forwarded-Proto` decides
-`ANOLE_REQ_SECURE`) and `trust_forwarded_host` (default false). A
+`proxy.trust_forwarded_proto` (default true: `X-Forwarded-Proto` decides
+`ANOLE_REQ_SECURE`) and `proxy.trust_forwarded_host` (default false). A
 listener's `proxy_protocol` expects a PROXY protocol (v1 or v2) header on
-every connection; `proxy_protocol_from` limits who may send one
-(addresses or CIDR networks).
+every connection (PROXY protocol is per listener); `proxy_protocol_from`
+limits who may send one (addresses or CIDR networks).
 
 `anole_server_port(s, i)` reports listener *i*'s bound port (port 0 picks a
 free one); *i* = the number of listeners gives the HTTP/3 UDP port.
+
+## Keys and defaults
+
+Every option of Zig's `ServerOptions` has a key here with the same name and
+the same default, or is listed below with the reason it has none; a test
+holds the two together (`src/capi/parity.zig`, `include/anole.schema.json`).
+A duration in Zig (`anole.Duration`) is `<name>_ms` here, and `null` means
+none.
+
+| Key | Default | Zig |
+| --- | --- | --- |
+| `timeouts.request_ms` | 30000 | `timeouts.request`: the consumer deadline (504); the core gets the longest plus 5 s |
+| `timeouts.read_header_ms` | 10000 | `timeouts.read_header` |
+| `timeouts.write_ms` | 30000 | `timeouts.write`: a write the peer does not take ends the response; replaces the request deadline once a stream or file body has started |
+| `timeouts.keepalive_ms` | 60000 | `timeouts.keepalive` |
+| `timeouts.idle_park_ms` | 1000 | `timeouts.idle_park` |
+| `timeouts.shutdown_ms` | 10000 | `timeouts.shutdown` |
+| `limits.body_max` | 1048576 | `limits.body_max` |
+| `limits.max_head_size` | 16384 | `limits.max_head_size` (431 past it) |
+| `limits.max_header_count`, `max_param_count`, `max_query_count`, `max_form_count`, `max_multiform_count` | 32, 8, 32, 32, 32 | `limits.*` |
+| `limits.max_connections` | 0 | `limits.max_connections` (0: the open-file limit) |
+| `limits.max_requests_per_connection` | null | `limits.max_requests_per_connection` |
+| `limits.ws_max_message` | 1048576 | `limits.ws_max_message` |
+| `proxy.trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | 0, true, false | `proxy.*` |
+| `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
+| `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
+| `http2.*` | 250 streams, ... | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
+| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 100, false, 30000, true, false, true, null, true, true | `http3.*` |
+| `errors` | "auto" | `errors` ("auto", "json", "text") |
+| `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
+
+Keys with no Zig option: `limits.inline_body_max`, `max_inflight`, `queue`,
+`stream_high_water`, `ws_high_water`, `db_result_max`; `timeouts.rewake_ms`;
+`routes`, `middleware`, `grpc`, `observe`, `databases`.
+
+Zig options with no key, and why:
+
+| Zig option | Why the ABI has none |
+| --- | --- |
+| `http`, `https`, `listen_tls_http3` | shorthands for a listener; the ABI names every listener in `listeners`, with `http3: true` |
+| `http3.hq_interop_root` | QUIC interop runner only |
+| `http3.webtransport` | on when a route is `webtransport` |
+| `error_handler` | a function: the language answers its own errors |
+| `max_stack_size` | stacks run Anole's native work only, never language handlers |
+| `raise_fd_limit` | always on under the ABI |
+| `signals` | the `ANOLE_SERVER_SIGNALS` flag of `anole_server_create` |
+| `process`, `restart_timeout` | embedded mode: no hand-off, SIGUSR2, LISTEN_FDS or sd_notify |
+| `blocking` | the ABI starts a pool when SQLite is configured |
+| `client` | no outbound client in the ABI |
+
+The middleware keys follow the same rule for durations: `jwt.leeway_ms`
+(60000) and `cors.max_age_ms` (600000).
 
 ## Requests
 
@@ -325,7 +381,10 @@ thread. A body past `limits.body_max` ends the request with 413.
 - `anole_stream_start`, `anole_stream_write` (or `anole_stream_write_wait`
   for a thread that may block), `anole_stream_end` with trailers: a streamed
   answer. `ANOLE_BUSY` past `limits.stream_high_water`; wait for
-  `ANOLE_EV_WRITABLE`. The deadline no longer applies once a stream started.
+  `ANOLE_EV_WRITABLE`. The request deadline ends once a stream has started
+  (the same on every protocol and for `anole_respond_fd`); each write the
+  peer does not take within `timeouts.write_ms` ends the stream
+  (`ANOLE_EV_ABORT`).
 - `anole_release(r)`: give up; the client gets 500, or a cut-short stream.
 
 ## WebSocket
