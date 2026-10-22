@@ -101,6 +101,10 @@ returns. Options:
 - `.format`: `.text` (default) or `.json`, one object per line.
 - `.file`: a `std.Io.File` to write to; stderr when null.
 - `.exclude`: paths not logged (see [Wiring](#wiring)).
+- `.log_query`: also log the query string (false). Off by default, because
+  queries carry OIDC `code` and `state`, password-reset tokens and API keys,
+  and logs keep them. `anole.middleware.Logger` has the same switch
+  (`Logger.initWith(.{ .log_query = true })`).
 
 Each line is a single write, so lines from concurrent requests do not
 interleave. The line is written straight to the file, not through
@@ -118,8 +122,8 @@ JSON, from the example:
 {"ts":1792333306429,"method":"GET","path":"/users/7","status":200,"duration_us":124,"client":"127.0.0.1:64388","route":"/users/:id","request_id":"9045897231062d793bd832ff5459f9e3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"3d4c9f621d6f31cc"}
 ```
 
-`ts` is Unix time in milliseconds. `path` is the raw target, query
-included. `route` appears only when a route matched. `request_id`,
+`ts` is Unix time in milliseconds. `path` is the raw target's path, the
+query left out unless `log_query` is set. `route` appears only when a route matched. `request_id`,
 `trace_id` and `span_id` appear only when the RequestId and tracing
 middleware are installed. A handler that returns `error.NotFound` is logged
 as the 404 it becomes. Any other error adds `error` and reports the status

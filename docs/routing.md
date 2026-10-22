@@ -163,7 +163,7 @@ CSRF, auth and rate limits have their own namespaces (`anole.session`,
 | Middleware | What it does |
 | --- | --- |
 | `RequestId.init(.{})` | Sets `req.id` (128 random bits, hex) and sends it as `X-Request-Id`. `.header` renames it; `.trust_incoming = true` keeps a valid incoming one (only behind a proxy that sets or strips it). |
-| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path, status or error, time, client, request ID. |
+| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path (no query; `initWith(.{ .log_query = true })` logs it), status or error, time, client, request ID. |
 | `Compress.init()` | Sets `res.compress` on every response; see [Compression](#compression). |
 | `Cors.init(.{})` | CORS for browsers: any origin by default, preflights answered with 204; see [CORS](#cors). |
 | `ResponseCache` | Whole responses kept per executor and answered from memory; see [Response cache](#response-cache). |

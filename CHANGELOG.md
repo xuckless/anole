@@ -87,6 +87,11 @@ breaking changes are listed anyway.
   128 of `[A-Za-z0-9._:-]` (before: any visible ASCII), and the JSON access
   log escapes `request_id`, `trace_id` and `span_id`: a client-chosen ID
   could add or override fields in the JSON line.
+- Access logs (`observe.AccessLog`, `middleware.Logger`) leave the query
+  string out by default (`log_query = true` keeps it), since queries carry
+  sign-in codes, reset tokens and API keys. `access_log.format` drops it
+  too; `formatLine` takes the option. Log consumers that parsed the query
+  out of `path` need `log_query`.
 
 ### C ABI (ABI 0.1)
 

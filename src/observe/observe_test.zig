@@ -366,3 +366,20 @@ test "observe: exclude keeps probes out of metrics and traces" {
     try std.testing.expectEqual(@as(usize, 1), try exporter.queue.get(io, &spans, 0));
     try std.testing.expectEqualStrings("/users/:id", spans[0].route[0..spans[0].route_len]);
 }
+
+test "access log: the query is left out unless log_query" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/callback?code=secret-code&state=s";
+    const json = try observe.access_log.format(arena, .json, &req, 200, 1, 0, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqualStrings("/callback", parsed.object.get("path").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, json, "secret-code") == null);
+    const text = try observe.access_log.format(arena, .text, &req, 200, 1, 0, null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret-code") == null);
+    const kept = try observe.access_log.formatLine(arena, .{ .format = .text, .log_query = true }, &req, 200, 1, 0, null);
+    try std.testing.expect(std.mem.startsWith(u8, kept, "GET /callback?code=secret-code&state=s 200 "));
+}
