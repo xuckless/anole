@@ -254,7 +254,8 @@ lives until the call ends.
 | `call.arena` | The call's arena; thread-safe. |
 | `call.metadata(name)` | A request metadata value by lower-case name, or null. |
 | `call.addHeader(name, value)` | Initial metadata. `error.HeadersSent` once the first response message has gone out. |
-| `call.addTrailer(name, value)` | Trailing metadata, sent with the status. |
+| `call.addTrailer(name, value)` | Trailing metadata, sent with the status. The name is lower-case (letters, digits, `-`, `_`, `.`), the value printable ASCII; a `-bin` name takes base64 text, as `call.metadata` returns it. `error.InvalidMetadata` otherwise. |
+| `call.addBinaryTrailer(name, bytes)` | Binary trailing metadata under a `-bin` name, base64-encoded for you. |
 | `call.fail(code, message)` | Sets the status; return what it returns. |
 | `call.deadline` | The client's deadline, if it sent one. |
 | `call.deadlineExceeded()` | True once the deadline has passed. |

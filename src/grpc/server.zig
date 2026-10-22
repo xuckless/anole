@@ -212,9 +212,24 @@ pub const Call = struct {
         try self.res.header(name, value);
     }
 
-    /// Adds trailing metadata, sent with the status.
+    /// Adds trailing metadata, sent with the status. `name` is a metadata
+    /// key (lower-case letters, digits, `-`, `_` and `.`) and `value`
+    /// printable ASCII; under a `-bin` name, `value` is the base64 text, as
+    /// `metadata` returns it (`addBinaryTrailer` takes the bytes). Anything
+    /// else fails with `error.InvalidMetadata`, so a value from the client
+    /// cannot add lines to the trailers.
     pub fn addTrailer(self: *Call, name: []const u8, value: []const u8) !void {
+        if (!metadata_mod.isValidKey(name) or !validTrailerValue(name, value)) return error.InvalidMetadata;
         try self.impl.trailers.append(self.arena, .{ .key = name, .value = value });
+    }
+
+    /// Adds binary trailing metadata: `bytes` under a `-bin` name, base64
+    /// encoded (unpadded, as gRPC recommends).
+    pub fn addBinaryTrailer(self: *Call, name: []const u8, bytes: []const u8) !void {
+        if (!metadata_mod.isBinaryKey(name)) return error.InvalidMetadata;
+        const encoder = std.base64.standard_no_pad.Encoder;
+        const text = try self.arena.alloc(u8, encoder.calcSize(bytes.len));
+        return self.addTrailer(name, encoder.encode(text, bytes));
     }
 
     /// The client went away (reset the stream or closed the connection),
@@ -248,6 +263,20 @@ pub const Call = struct {
         return std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d);
     }
 };
+
+/// Whether `value` may go out as trailing metadata under `name`: base64
+/// text for a `-bin` name, else printable ASCII.
+fn validTrailerValue(name: []const u8, value: []const u8) bool {
+    if (metadata_mod.isBinaryKey(name)) {
+        for (value) |ch| switch (ch) {
+            'A'...'Z', 'a'...'z', '0'...'9', '+', '/', '=' => {},
+            else => return false,
+        };
+        return true;
+    }
+    for (value) |ch| if (ch < 0x20 or ch > 0x7e) return false;
+    return true;
+}
 
 /// The four gRPC call shapes, told apart by a generated method's
 /// signature: one request or a queue of them, one response or a queue.
@@ -1216,6 +1245,31 @@ test "fuzz: Connect GET messages, base64 and gzip" {
         "\x07H4sIAAAAAAAA",
         "\x02\x1f\x8b\x08\x00",
     });
+}
+
+test "addTrailer refuses names and values that are not metadata" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
+    try call.addTrailer("x-ok", "a value: 1");
+    try call.addTrailer("x-empty", "");
+    try call.addTrailer("x-data-bin", "AAEC/w==");
+    try call.addBinaryTrailer("x-raw-bin", "\x00\r\n\xff");
+    for ([_][2][]const u8{
+        .{ "x-a", "one\r\ngrpc-status:0" },
+        .{ "x-a", "nul\x00" },
+        .{ "x-a", "caf\xc3\xa9" },
+        .{ "X-Upper", "v" },
+        .{ "x-a:b", "v" },
+        .{ "x-a\r\nb", "v" },
+        .{ "", "v" },
+        .{ "x-data-bin", "AA\r\n" },
+        .{ "x-data-bin", "not base64!" },
+    }) |case| try std.testing.expectError(error.InvalidMetadata, call.addTrailer(case[0], case[1]));
+    try std.testing.expectError(error.InvalidMetadata, call.addBinaryTrailer("x-text", "v"));
+    const items = call.impl.trailers.items;
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings("AA0K/w", items[3].value);
 }
 
 test "percentEncode leaves printable ASCII and escapes the rest" {

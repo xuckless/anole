@@ -44,6 +44,11 @@ breaking changes are listed anyway.
 - JSON transcoding: a binding with a `body` answers 415 to a non-empty body
   whose `Content-Type` is not `application/json` (or `+json`). Breaking for
   clients that post JSON with another content type.
+- gRPC: `Call.addTrailer` refuses names that are not metadata keys and
+  values that are not printable ASCII (base64 text under a `-bin` name) with
+  `error.InvalidMetadata`, so client data echoed into a trailer cannot add
+  trailer lines in gRPC-Web. New `Call.addBinaryTrailer` encodes raw bytes.
+  Breaking for handlers that passed raw bytes or upper-case names.
 
 ### C ABI (ABI 0.1)
 
