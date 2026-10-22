@@ -1,0 +1,8 @@
+{
+  "name": "anole-bench-bun",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "jsonwebtoken": "9.0.3"
+  }
+}

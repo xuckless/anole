@@ -2,13 +2,22 @@
   "name": "bun",
   "label": "Bun 1.4.3 (Bun.serve)",
   "modes": {
-    "h1":  "Bun.serve 1.4.3",
+    "h1": "Bun.serve 1.4.3",
     "h2c": "Bun.serve 1.4.3 (http2: true, prior knowledge; experimental)",
     "tls": "Bun.serve 1.4.3 (http2: true over TLS, BoringSSL; experimental)",
-    "h3":  "Bun.serve 1.4.3 (http3: true; experimental)"
+    "h3": "Bun.serve 1.4.3 (http3: true; experimental)"
   },
-  "tls_alpn": ["h2", "http/1.1"],
-  "ws": "Bun.serve websocket (uWebSockets)",
+  "tls_alpn": [
+    "h2",
+    "http/1.1"
+  ],
+  "ws": "Bun.serve websocket (uWebSockets; /ws/feed through Bun's pub/sub)",
   "ws_h2": false,
-  "scenarios": ["raw", "wspipe"]
+  "scenarios": [
+    "raw",
+    "wspipe",
+    "ws",
+    "twelve"
+  ],
+  "twelve": "Bun.SQL (built-in Postgres client) + jsonwebtoken 9.0.3"
 }

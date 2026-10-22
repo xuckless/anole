@@ -3,5 +3,7 @@
 FROM oven/bun:1.4.3-slim
 ENV NODE_ENV=production
 WORKDIR /app
-COPY bench/servers/bun/server.ts ./
+COPY bench/servers/bun/package.json bench/servers/bun/bun.lock ./
+RUN bun install --frozen-lockfile --production
+COPY bench/servers/bun/server.ts bench/servers/bun/twelve.ts ./
 ENTRYPOINT ["bun", "server.ts"]
