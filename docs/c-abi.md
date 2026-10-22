@@ -32,6 +32,13 @@ checks that the object and the shared library export `anole_*` alone. Hidden
 symbols are still global within one link: two static libraries that both
 define, say, `SSL_new` still clash when linked into the same extension.
 
+Dead-stripping is safe (`-Wl,-dead_strip` on macOS, `-Wl,--gc-sections` on
+Linux, Zig's release links): the packing step restores the Mach-O symbol
+flags that keep BoringSSL's assembly whole, and the ELF object carries
+`.note.GNU-stack`, so programs and extensions linking it keep a
+non-executable stack. `zig build capi-test` serves HTTPS from a dead-stripped
+link of `libanole.a`; `capi-test-asan` does the same with the system linker.
+
 The build flags apply: `-Dprofile=minimal` gives a library without TLS,
 HTTP/2, HTTP/3 or WebSocket. `anole_has_feature("http3")` says what is in.
 

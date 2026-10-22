@@ -806,6 +806,9 @@ pub fn build(b: *std.Build) void {
             hide.addArg("hide");
             hide.addFileArg(merged.getEmittedBin());
             lib_obj = hide.addOutputFileArg("anole.o");
+            // Mach-O: the merge drops N_ALT_ENTRY/N_NO_DEAD_STRIP, which the
+            // tool takes back from the inputs (tools/capi_symbols.zig).
+            if (os.isDarwin()) for (linkedInputs(b, capi_mod)) |input| hide.addFileArg(input);
             const static_lib = b.addLibrary(.{
                 .name = "anole",
                 .linkage = .static,
@@ -885,10 +888,34 @@ pub fn build(b: *std.Build) void {
             capi_test_step.dependOn(&run_consumer.step);
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
+            // A TLS listener in a program linked with dead-stripping, as
+            // bindings and release links are (tests/capi/tls_start.c): the
+            // packed object must survive being cut at its symbols. Zig's
+            // linker here; the system's in capi-test-asan.
+            const tls_driver = if (features.tls == .boringssl) b.addExecutable(.{
+                .name = "capi-tls-start-driver",
+                .root_module = b.createModule(.{ .root_source_file = b.path("tests/capi/tls_start.zig"), .target = b.graph.host, .optimize = .Debug }),
+            }) else null;
+            if (tls_driver) |driver| {
+                const tls_start = b.addExecutable(.{
+                    .name = "capi-tls-start",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                tls_start.root_module.addCSourceFile(.{ .file = b.path("tests/capi/tls_start.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                tls_start.root_module.addIncludePath(b.path("include"));
+                tls_start.root_module.linkLibrary(static_lib);
+                tls_start.link_gc_sections = true; // Mach-O -dead_strip, ELF --gc-sections
+                const run_tls_start = b.addRunArtifact(driver);
+                run_tls_start.addArtifactArg(tls_start);
+                run_tls_start.has_side_effects = true;
+                run_tls_start.stdio = .inherit;
+                capi_test_step.dependOn(&run_tls_start.step);
+            }
+
             // capi-test-asan: the C suite built by the system C compiler
             // with AddressSanitizer and UBSan (Zig ships no ASan runtime);
             // libanole itself keeps Zig's own safety checks.
-            const asan_step = b.step("capi-test-asan", "Run the C ABI suite built with -fsanitize=address,undefined (needs a system cc)");
+            const asan_step = b.step("capi-test-asan", "Run the C ABI suite built with -fsanitize=address,undefined, and a TLS listener in a dead-stripped link (needs a system cc)");
             const cc = b.addSystemCommand(&.{ "cc", "-O1", "-g", "-std=c11", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined" });
             cc.addPrefixedDirectoryArg("-I", b.path("include"));
             cc.addFileArg(b.path("tests/capi/consumer.c"));
@@ -907,6 +934,20 @@ pub fn build(b: *std.Build) void {
             if (postgres_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_POSTGRES_URL", url);
             if (redis_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
             asan_step.dependOn(&run_asan.step);
+            if (tls_driver) |driver| {
+                const ds = b.addSystemCommand(&.{ "cc", "-O2", "-std=c11" });
+                ds.addPrefixedDirectoryArg("-I", b.path("include"));
+                ds.addFileArg(b.path("tests/capi/tls_start.c"));
+                ds.addFileArg(static_lib.getEmittedBin());
+                if (os == .linux) ds.addArgs(&.{ "-Wl,--gc-sections", "-lpthread", "-ldl", "-lm" }) else ds.addArg("-Wl,-dead_strip");
+                ds.addArg("-o");
+                const ds_exe = ds.addOutputFileArg("capi-tls-start-cc");
+                const run_ds = b.addRunArtifact(driver);
+                run_ds.addFileArg(ds_exe);
+                run_ds.has_side_effects = true;
+                run_ds.stdio = .inherit;
+                asan_step.dependOn(&run_ds.step);
+            }
         }
         test_step.dependOn(capi_test_step);
         capi_step.dependOn(&b.addInstallHeaderFile(b.path("include/anole.h"), "anole.h").step);
@@ -1601,4 +1642,23 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         if (o.for_test) mod.addImport("anole_h3_layout", o.c.h3_layout.?);
     }
     return mod;
+}
+
+/// Every static library and object a module links, through the modules it
+/// imports and the libraries those link (for tools/capi_symbols.zig).
+fn linkedInputs(b: *std.Build, root: *std.Build.Module) []const std.Build.LazyPath {
+    var out: std.ArrayList(std.Build.LazyPath) = .empty;
+    var seen: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, void) = .empty;
+    var todo: std.ArrayList(*std.Build.Module) = .empty;
+    todo.append(b.allocator, root) catch @panic("OOM");
+    while (todo.pop()) |top| for (top.getGraph().modules) |m| for (m.link_objects.items) |lo| switch (lo) {
+        .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
+        .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
+            if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
+            out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
+            todo.append(b.allocator, c.root_module) catch @panic("OOM");
+        },
+        else => {},
+    };
+    return out.items;
 }
