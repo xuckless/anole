@@ -11,7 +11,7 @@ whoever writes one, or uses Anole from C.
 The contract is [`include/anole.h`](../include/anole.h): every function
 there says who owns what and for how long. The configuration's schema is
 [`include/anole.schema.json`](../include/anole.schema.json). This is ABI
-**0.1**: it changes before 1.0 (see [What comes next](#what-comes-next)).
+**0.2**: it changes before 1.0 (see [What comes next](#what-comes-next)).
 
 ## Building and linking
 
@@ -126,16 +126,20 @@ are `anole_span`s (offset from the record's start, length).
 | --- | --- | --- |
 | `ANOLE_EV_REQUEST` | `anole_request_event`, then header spans, parameter spans, bytes | `anole_req` |
 | `ANOLE_EV_BODY` | `anole_event`: more request body (after `ANOLE_E_AGAIN`) | `anole_req` |
-| `ANOLE_EV_ABORT` | `anole_event`: the client left (or the drain cut it); nothing more is owed | `anole_req` |
-| `ANOLE_EV_WRITABLE` | `anole_event`: a stream that took `ANOLE_BUSY` has room | `anole_req` |
-| `ANOLE_EV_SENT` | `anole_sent_event`: a borrowed body is no longer read | either |
+| `ANOLE_EV_ABORT` | `anole_event`: the client left (or the drain cut it, or the deadline passed); nothing more is owed | `anole_req`, `anole_grpc_call` |
+| `ANOLE_EV_WRITABLE` | `anole_event`: a stream that took `ANOLE_BUSY` has room | `anole_req`, `anole_grpc_call` |
+| `ANOLE_EV_SENT` | `anole_sent_event`: a borrowed body is no longer read | any |
 | `ANOLE_EV_WS_OPEN` | `anole_request_event` of the upgrade request | `anole_ws` |
 | `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` |
 | `ANOLE_EV_WS_CLOSE` | `anole_ws_close_event`: the socket is done | `anole_ws` |
 | `ANOLE_EV_WS_DRAIN` | `anole_event`: a socket that took `ANOLE_BUSY` has room | `anole_ws` |
 | `ANOLE_EV_STOPPED` | `anole_event`: the server stopped; the consumer's last event | 0 |
+| `ANOLE_EV_GRPC_CALL` | `anole_grpc_call_event`, then metadata spans, bytes | `anole_grpc_call` |
+| `ANOLE_EV_GRPC_MESSAGE` | `anole_grpc_message_event`, then the message | `anole_grpc_call` |
+| `ANOLE_EV_GRPC_HALF_CLOSE` | `anole_event`: the client sent its last message | `anole_grpc_call` |
 
-Types 10 and 12-39 are reserved (database results, gRPC calls, WebTransport).
+Types 10, 15-19 and 20-39 are reserved (database results, more gRPC,
+WebTransport).
 
 A request record carries the route's `handler` id, the method (an enum and
 the name as sent), the HTTP version (11, 20, 30), the raw path and query, the
@@ -147,7 +151,7 @@ keep.
 
 ## Handles
 
-`anole_req` and `anole_ws` are 64-bit and generation-checked: a handle that
+`anole_req`, `anole_ws` and `anole_grpc_call` are 64-bit and generation-checked: a handle that
 was answered, expired, aborted, made up, or belongs to another kind gets
 `ANOLE_E_GONE`, never another request. Treat the bits as opaque; 0 is never a
 handle.
@@ -289,6 +293,106 @@ per executor, and the larger of 16 x `limits.ws_high_water` and
 2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
 `ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
+## gRPC
+
+A `"grpc"` section serves gRPC services whose methods the consumer
+implements. Anole does everything that is not the method itself: gRPC over
+HTTP/2 (cleartext and TLS), gRPC-Web (binary and text, HTTP/1.1 and 2),
+Connect (unary, GET for methods without side effects, streaming), JSON
+transcoding of `google.api.http` routes, message framing and gzip, the
+deadline (`grpc-timeout`, `connect-timeout-ms`, capped by
+`max_call_duration_ms`), the per-call limits (`max_message_size`,
+`max_received_bytes`, `read_timeout_ms`), status and trailers in each
+protocol's form, and `grpc.health.v1` (`"health": true`).
+
+```json
+{"grpc": {
+  "descriptor_set_file": "api.binpb",
+  "health": true,
+  "services": [
+    {"name": "helloworld.Greeter", "handler": 1},
+    {"name": "chat.Room", "handler": 2, "read_ahead": 16, "max_message_size": 65536}
+  ]}}
+```
+
+**Registration.** Each service names its full name and a route id
+(`handler`). Its methods come from the descriptors, a serialized
+`FileDescriptorSet` with imports (`protoc --include_imports
+--descriptor_set_out`, `buf build -o`, or what the binding's protobuf
+library emits), given inline as base64 (`descriptor_set`) or as a file;
+`methods` picks some and fixes their order. Without descriptors every
+service lists its methods with their `kind`, and only protobuf is served.
+`method_id` in each call is the method's index in that list.
+
+**Messages cross as protobuf bytes, always.** Bindings already have
+protobuf code generation (protobufjs, ts-proto, @bufbuild/protobuf,
+grpcio-tools, betterproto), so the consumer decodes and encodes with its
+own; Anole never needs the language's types. JSON is Anole's side of the
+wire: with descriptors it converts Connect JSON, gRPC-Web JSON and
+transcoded REST to protobuf and back with upb (protobuf's C runtime, the
+proto3 JSON mapping including the well-known types), so a consumer sees
+the same bytes whatever the client spoke (`ANOLE_GRPC_CALL_JSON` says
+which). Without descriptors a JSON content type is answered 415. This is
+why the descriptors are the registration: they are the one input that makes
+JSON, transcoding and Connect GET possible, and every protobuf toolchain
+can produce them.
+
+**A call.** `ANOLE_EV_GRPC_CALL` carries the method (`route_id`,
+`method_id`, `/package.Service/Method`), the call mode, the protocol, the
+request metadata (the protocols' own headers left out, `-bin` values
+decoded), the time left before the deadline (`timeout_us`, -1 for none),
+the client's address and, for unary and server-streaming methods, the one
+request message (`ANOLE_GRPC_CALL_MESSAGE`). The consumer answers:
+
+- `anole_grpc_send_headers`: initial metadata, before the first message.
+- `anole_grpc_send`: a response message. A unary or client-streaming
+  call keeps its one message until `anole_grpc_finish`; with
+  `ANOLE_GRPC_SEND_FINISH` it is sent with OK at once (a unary answer in
+  one call). For server and bidirectional streaming each message goes out
+  in order, and `ANOLE_BUSY` past `limits.stream_high_water` waits for
+  `ANOLE_EV_WRITABLE`, as a streamed response does. `ANOLE_BODY_BORROW`
+  borrows the bytes until `ANOLE_EV_SENT`.
+- `anole_grpc_finish(code, message, trailers)`: the status, after the
+  messages. The handle is stale afterwards.
+
+Client- and bidirectional-streaming calls get their request messages as
+`ANOLE_EV_GRPC_MESSAGE` events, then `ANOLE_EV_GRPC_HALF_CLOSE`. A call
+starts with `read_ahead` messages of credit (8); `anole_grpc_read(c, n)`
+grants more. Without credit Anole stops reading the call's messages, so a
+slow consumer holds back its client through HTTP/2 flow control rather than
+filling memory. Metadata the consumer sends follows gRPC's rules: a
+lower-case key, a printable ASCII value, bytes under a `-bin` key (Anole
+encodes them); the protocols' own keys (`grpc-*` but
+`grpc-status-details-bin`, `connect-*`, `content-type`, `te`) are refused.
+
+**The end.** `ANOLE_EV_ABORT` ends a call the consumer has not finished:
+the client reset the stream or left, the deadline passed (the client got
+DEADLINE_EXCEEDED), or its request messages failed a limit (the client got
+RESOURCE_EXHAUSTED, or INTERNAL for a malformed frame). Calls on the handle
+then return `ANOLE_E_GONE`. Anole enforces deadlines: a call needs no timer
+in the language.
+
+**The hot path.** A unary or server-streaming call that arrives whole over
+HTTP/2 or HTTP/3 (the usual case) is detached, as a `no_wait` REST route's
+request is: no task waits for it, its message is read where it lies in the
+request (no copy when it is not compressed), and the consumer's answer is
+written by the executor's capi task as one response with its trailers.
+Deadlines of detached calls sit in a per-executor heap the capi task
+sweeps. Client and bidirectional streaming, and calls over HTTP/1.1, run
+on a task, whose deadline cancels it as a native handler's does. gRPC over
+HTTP/3 is not served (as natively: gRPC runs over HTTP/2).
+
+**Health.** With `"health": true`, `grpc.health.v1.Health` (Check, List,
+Watch) is Anole's: the server (`""`) and every configured service start
+SERVING, all turn NOT_SERVING when the server drains, and
+`anole_grpc_health_set(server, service, status)` changes one, from any
+thread, before or after start.
+
+**Not in this ABI yet.** Reflection, server-side interceptors in the
+language (Anole's middleware applies: `request_id`, `jwt` (its claims are
+in the call event), `cors`, rate limits), gRPC over HTTP/3, and the
+gRPC client.
+
 ## Lifecycle
 
 ```c
@@ -319,22 +423,30 @@ threads; it must not block or enter the language), filtered by `log_level`.
 
 `zig build capi-test` (part of `zig build test`) checks `anole.h` through
 translate-c against the Zig side (every struct's layout, every constant),
-and runs the C suite (`tests/capi/consumer.c`) against `libanole.a`.
+and runs the C suites (`tests/capi/consumer.c`, and `tests/capi/grpc.c`
+for gRPC over gRPC-Web and HTTP/2) against `libanole.a`. `zig build
+capi-grpc` builds `capi-grpc-interop` (`tests/capi/grpc_interop.c`,
+grpc.testing.TestService in C), which `tests/grpc/interop/run.sh
+zig-out/bin/capi-grpc-interop` runs grpc-go's interop client against.
 `zig build capi-test-asan` builds the suite with the system C compiler under
 ASan and UBSan (it runs with `ASAN_OPTIONS=use_sigaltstack=0`: Zig's threads
 install their own signal stack). `zig build test-capi-engine` runs the
-engine's HTTP/2 and HTTP/3 tests. `tests/capi/bench.sh` compares consumer
+engine's HTTP/2 and HTTP/3 tests; `zig build test-grpc` the gRPC ones
+(native, transcoding, and the ABI's, with descriptors, JSON and
+transcoding). `tests/capi/bench.sh` compares consumer
 routes with native ones.
 
 ## What comes next
 
-ABI 0.1 is the request/response and WebSocket core. Before the ABI freezes
+ABI 0.1 was the request/response and WebSocket core; 0.2 adds the gRPC
+server. Before the ABI freezes
 (1.0) and the bindings ship, these come as their own pull requests, in this
 order; their event types and handle kinds are reserved already:
 
 1. `anole_db_*` with SQLite: non-blocking queries for event-loop consumers,
    with per-query request coalescing and a TTL result cache.
-2. gRPC: server, with service methods implemented in the language.
+2. gRPC: server, with service methods implemented in the language (in
+   0.2; event types 12-14, 15-19 reserved for gRPC).
 3. WebTransport: sessions, streams and datagrams.
 4. PostgreSQL through `anole_db_*`.
 5. Redis.
