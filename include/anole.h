@@ -155,7 +155,11 @@ typedef struct anole_server_options {
 ANOLE_API anole_status anole_server_create(const anole_server_options *options, anole_server **out);
 /* Starts Anole's threads and binds every listener; returns once listening,
    or with the error (the server may then only be destroyed). Consumers
-   attach before this. */
+   attach before this. ANOLE_E_CONFIG: two routes the router cannot tell
+   apart (the same method and path twice, two parameter names at one
+   position, a method route less specific than an any-method one, or a
+   route on a path Anole serves itself, such as observe.metrics);
+   anole_last_error names them. */
 ANOLE_API anole_status anole_server_start(anole_server *s);
 /* The bound port of listener i, in configuration order (the real one when
    port 0 was asked for); i = the number of listeners: the HTTP/3 (UDP)

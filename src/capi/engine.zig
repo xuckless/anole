@@ -649,6 +649,10 @@ pub const Engine = struct {
     /// `start` with a plain threaded Io (no runtime yet).
     started: std.Io.Event = .unset,
     start_error: ?anyerror = null,
+    /// What `start_error` was about, when there is more to say
+    /// (`error.RouteConflict`: the routes).
+    start_why: [400]u8 = undefined,
+    start_why_len: usize = 0,
     stopped: std.Io.Event = .unset,
     app: ?*anole.App = null,
     /// The runtime's Io, for waking executor tasks from consumer threads
@@ -812,7 +816,15 @@ pub const Engine = struct {
         const nexec = app.rt.executors.items.len;
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
         e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
+        // The routes come from the configuration: a conflict between them
+        // is ANOLE_E_CONFIG, not a panic in the host process. Those Anole
+        // adds while starting (metrics, health) are checked by `run`.
+        app.router.record_conflicts = true;
         e.buildRoutes(&app) catch |err| return e.failStartDeinit(&app, err);
+        if (app.router.conflict) |why| {
+            e.setWhy(why);
+            return e.failStartDeinit(&app, error.RouteConflict);
+        }
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
@@ -833,7 +845,7 @@ pub const Engine = struct {
             if (!e.started.isSet()) {
                 e.start_error = err;
                 e.started.set(threadedIo());
-            } else log.err("server stopped: {t}", .{err});
+            } else if (e.start_error == null) log.err("server stopped: {t}", .{err});
         }
         e.phase.store(.stopped, .release);
         e.app = null;
@@ -977,8 +989,15 @@ pub const Engine = struct {
         return .{ .list = origins };
     }
 
+    fn setWhy(e: *Engine, why: []const u8) void {
+        const n = @min(why.len, e.start_why.len);
+        @memcpy(e.start_why[0..n], why[0..n]);
+        e.start_why_len = n;
+    }
+
     fn watchReady(e: *Engine, app: *anole.App) void {
         app.waitReady() catch |err| {
+            if (err == error.RouteConflict) if (app.router.conflict) |why| e.setWhy(why);
             e.start_error = err;
             e.started.set(threadedIo());
             return;

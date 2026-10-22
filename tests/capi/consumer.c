@@ -706,6 +706,63 @@ static void test_basics(void) {
   printf("ok basics\n");
 }
 
+/* Route tables come from user code in bindings (app.get calls collected into
+   the JSON), so a conflict is a user mistake: ANOLE_E_CONFIG naming the
+   routes, never a panic that takes the host process with it. */
+static void test_route_conflicts(void) {
+#define LISTEN "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],"
+#define OK200 "\"respond\":{\"status\":200}"
+  static const struct {
+    const char *json, *names;
+  } cases[] = {
+      /* the same route twice */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/\"," OK200 "},{\"method\":\"GET\",\"path\":\"/\"," OK200 "}]}",
+       "GET /"},
+      /* one parameter position, two names */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/users/:id\"," OK200
+              "},{\"method\":\"GET\",\"path\":\"/users/:name/posts\"," OK200 "}]}",
+       "/users/:name/posts"},
+      /* a method route less specific than an any-method one */
+      {LISTEN "\"routes\":[{\"path\":\"/a/b\"," OK200 "},{\"method\":\"GET\",\"path\":\"/a/:x\"," OK200 "}]}", "/a/:x"},
+      /* a consumer route on a static prefix's own path */
+      {LISTEN "\"routes\":[{\"path\":\"/assets\",\"static\":{\"dir\":\".\"}},"
+              "{\"method\":\"GET\",\"path\":\"/assets/*rest\",\"handler\":1}]}",
+       "/assets/*rest"},
+      /* a route on the metrics path, which Anole adds while starting */
+      {LISTEN "\"observe\":{\"metrics\":{}},\"routes\":[{\"method\":\"GET\",\"path\":\"/metrics\"," OK200 "}]}",
+       "/metrics"},
+  };
+#undef LISTEN
+#undef OK200
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+    anole_server_options o = {sizeof o, {cases[i].json, strlen(cases[i].json)}, 0, 0, NULL, NULL};
+    anole_server *s = NULL;
+    int rc = anole_server_create(&o, &s);
+    if (rc == ANOLE_OK) {
+      anole_consumer *c = NULL;
+      anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+      CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+      rc = anole_server_start(s);
+    }
+    anole_str why = anole_last_error();
+    if (rc != ANOLE_E_CONFIG) fprintf(stderr, "route conflict case %zu: %d\n", i, rc);
+    CHECK(rc == ANOLE_E_CONFIG);
+    /* the message names the route */
+    CHECK(why.len > 0 && memmem(why.ptr, why.len, cases[i].names, strlen(cases[i].names)) != NULL);
+    anole_server_destroy(s);
+  }
+  /* and a server without conflicts still starts after them */
+  const char *fine = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"routes\":[{\"method\":\"GET\","
+                     "\"path\":\"/users/:id\",\"respond\":{\"status\":200}},{\"method\":\"GET\",\"path\":"
+                     "\"/users/:id/posts\",\"respond\":{\"status\":200}}]}";
+  anole_server *s = make_server(fine);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok route conflicts: ANOLE_E_CONFIG naming the routes, no panic\n");
+}
+
 static void test_main_server(void) {
   char json[4096];
   snprintf(json, sizeof json, test_config, 4, 128 * 1024, 64, 400, 600, have_websocket ? ws_route : "");
@@ -2201,6 +2258,7 @@ static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
   test_basics();
+  test_route_conflicts();
   test_main_server();
   test_shared_consumer();
   test_db();

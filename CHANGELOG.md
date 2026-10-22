@@ -3,6 +3,19 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Fixed
+
+- C ABI: two routes of the configuration that the router cannot tell
+  apart (the same method and path twice, two parameter names at one
+  position, a method route less specific than an any-method one, or a
+  route on a path Anole serves itself, such as the metrics path) made
+  `anole_server_start` panic, which aborted the host process (Node,
+  Python). `anole_server_start` now answers `ANOLE_E_CONFIG`, and
+  `anole_last_error` names the routes. Zig's `app.get` and friends still
+  panic on a conflict, at registration.
+
 ## 0.1.2 (2026-10-22)
 
 ### Breaking

@@ -231,6 +231,12 @@ export fn anole_server_start(s: ?*anyopaque) i32 {
     }
     e.start() catch |err| return switch (err) {
         error.State => fail(abi.E_STATE, "anole_server_start", err),
+        // Two routes of the configuration (or one and a route Anole adds,
+        // such as metrics) that the router cannot tell apart.
+        error.RouteConflict => blk: {
+            setError("routes: {s}", .{e.start_why[0..e.start_why_len]});
+            break :blk abi.E_CONFIG;
+        },
         error.OutOfMemory => fail(abi.E_NOMEM, "anole_server_start", err),
         else => fail(abi.E_SYSTEM, "anole_server_start", err),
     };
