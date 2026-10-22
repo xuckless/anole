@@ -454,7 +454,9 @@ test "port in use: a second server on the same port fails instead of sharing it"
     try first.start();
     defer first.stop();
 
-    try std.testing.expectError(error.AddressInUse, dusty.checkAddressFree(.{ .ip4 = .loopback(port) }));
+    // No probe on Windows, where listeners bind without SO_REUSEADDR: the
+    // bind itself refuses (below).
+    if (builtin.os.tag != .windows) try std.testing.expectError(error.AddressInUse, dusty.checkAddressFree(.{ .ip4 = .loopback(port) }));
     var second: Running(void) = .{ .server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = listeners }, {}) };
     defer second.server.deinit();
     try std.testing.expectError(error.AddressInUse, second.start());

@@ -90,7 +90,7 @@ pub fn library(
     }
 
     lib.root_module.addIncludePath(upstream.path("include"));
-    if (t.os.tag == .windows) lib.root_module.linkSystemLibrary("ws2_32", .{});
+    if (t.os.tag == .windows) lib.root_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     lib.installHeadersDirectory(upstream.path("include"), "", .{});
     return lib;
 }

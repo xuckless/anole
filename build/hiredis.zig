@@ -21,7 +21,7 @@ pub fn library(
     if (target.result.os.tag == .windows) {
         // net.c's socket calls go through hiredis's Winsock shims.
         lib.root_module.addCSourceFiles(.{ .root = upstream.path("."), .files = &.{"sockcompat.c"}, .flags = &.{"-std=c99"} });
-        lib.root_module.linkSystemLibrary("ws2_32", .{});
+        lib.root_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     }
     inline for (.{ "hiredis.h", "read.h", "sds.h", "alloc.h" }) |h| lib.installHeader(upstream.path(h), "hiredis/" ++ h);
     return lib;

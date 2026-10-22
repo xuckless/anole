@@ -119,6 +119,11 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Strawberry Perl's pkg-config.bat is on the runner's PATH and fails
+    # when Zig asks it about the Windows system libraries (advapi32 for
+    # translate-c): with no pkg-config, Zig links them directly.
+    env:
+      PKG_CONFIG: anole-no-pkg-config
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2.2.1

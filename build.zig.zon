@@ -14,15 +14,18 @@
         // give back their deeper stack pages (Linux, pinned), recvmmsg with
         // control messages and sendmmsg in sendMany, and a spawn
         // cache per executor (stacks and task allocations without the
-        // runtime's locks). Pinned at dcaf6fe (branch
-        // fix/accept-pending-cancel, ebb7014 + one fix): the direct accept
+        // runtime's locks). Pinned at 683612b (`anole`): the direct accept
         // puts back a cancel it finds pending, so an accept loop canceled
-        // before its first accept no longer parks for good. The HTTP core
+        // before its first accept no longer parks for good (dcaf6fe);
+        // net.ReadyWatch (unused by Anole); and for Windows, streaming file
+        // reads and writes on IOCP's overlapped handles, UDP sockets that
+        // ignore an earlier datagram's ICMP error, and peer-caused socket
+        // errors logged at debug (branch windows-dev). The HTTP core
         // (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#dcaf6fe009093f123791e088cb89daf16fb26327",
-            .hash = "zio-0.19.0-xHbVVKYtLQAXfpCcXwZJymED6o6EfERjrLjAwxDwhsor",
+            .url = "git+https://github.com/xuckless/zio#683612bba6b4f34ef5b989d2ca335a84008dc780",
+            .hash = "zio-0.19.0-xHbVVDqXLQDYaDoeYaMHQ9_OrsDGo4yFX61vY8m-sa_p",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
