@@ -470,12 +470,16 @@ answers 429 with `Retry-After`.
 var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle_ms 300_000
 defer limiter.deinit();
 var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
-var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKey, .on_error = .deny });
+var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKeyOwner, .on_error = .deny });
 ```
 
-- `MemoryLimiter` is for one process. It holds at most `max_entries` keys,
-  dropping the least recently used one first, and forgets keys idle for
-  `idle_ms`.
+- `MemoryLimiter` is for one process. It holds at most `max_entries` keys
+  and forgets a key idle for `idle_ms` once its bucket is full again. When
+  the table is full, a new key takes the place of a least recently used
+  bucket that is full again, else of one that still has tokens; a throttled
+  bucket is never pushed out, so a flood of new keys can't refill it. If
+  every bucket near that end is throttled, new keys share one overflow
+  bucket until room frees up.
 - `RedisLimiter` (`.{ .client = redis, .gpa = gpa }` with `redis` from
   `app.redis(.{})`, keys `anole:rl:<key>`)
   is shared by every node. One Lua script refills and takes atomically, on
@@ -483,18 +487,34 @@ var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 100
 - Your own limiter implements `anole.ratelimit.Limiter`: a vtable with
   `take(ptr, key, cost, policy) !Result`.
 
-The key is the client's address by default (`ratelimit.clientAddress`).
+The key is the client's address by default (`ratelimit.clientAddress`): an
+IPv4 address on its own, an IPv6 address by its /64 network, since one
+subscriber or host usually gets a whole /64 and could otherwise use a new
+address, and a fresh bucket, for every request.
+`.key = anole.ratelimit.clientAddressPrefix(56)` groups by another prefix
+(48 or 56 for providers that hand out larger blocks, 128 for each address
+alone).
 Behind a proxy, set `.server = .{ .trusted_proxy_hops = 1 }` in the server
 options so that the address comes from `X-Forwarded-For`, or turn on the
 listener's `proxy_protocol`.
 Otherwise every client shares the proxy's bucket. To limit by something
 else, such as an account or an API key, pass `.key`, a
 `fn (req: *anole.Request, buf: []u8) []const u8` that returns the key,
-written into `buf` (128 bytes) or pointing into the request:
+written into `buf` (128 bytes) or pointing into the request.
+
+Key only on an identity that was checked, never on a raw header: a client
+picks any header value it likes, and each new value is a fresh bucket. Put
+the rate limit after the authentication middleware and use what it
+verified (`anole.auth.apikey.owner(req)`, `anole.auth.subject(req)`),
+falling back to the client's address:
 
 ```zig
-fn byApiKey(req: *anole.Request, _: []u8) []const u8 {
-    return anole.auth.apikey.fromRequest(req) orelse "anonymous";
+// After anole.auth.apikey.Middleware, so the owner is a key that exists.
+fn byApiKeyOwner(req: *anole.Request, buf: []u8) []const u8 {
+    if (anole.auth.apikey.owner(req)) |owner| {
+        return std.fmt.bufPrint(buf, "key:{s}", .{owner}) catch owner;
+    }
+    return anole.ratelimit.clientAddress(req, buf);
 }
 ```
 

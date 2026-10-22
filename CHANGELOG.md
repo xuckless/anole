@@ -43,6 +43,15 @@ breaking changes are listed anyway.
   middlewares refuse a `__Host-`/`__Secure-` cookie name that their
   `cookie_opts` do not satisfy (`error.CookiePrefixMismatch`); docs/auth.md
   recommends `__Host-anole_session` in production.
+- Rate limiting: `ratelimit.clientAddress` groups IPv6 clients by their /64
+  (`clientAddressPrefix(bits)` for another prefix), so a client with a
+  /64 no longer gets a bucket per address. `MemoryLimiter` never evicts a
+  throttled bucket to make room for a new key (a full table sends new keys
+  to a shared overflow bucket instead), and forgets an idle key only once
+  its bucket has refilled; before, a stream of fresh keys, or waiting
+  `idle_ms` on a long window, reset a client's limit. docs/auth.md's API key
+  example now keys on the verified owner, not the raw header. Rate-limit
+  keys of IPv6 clients change; no configuration change needed.
 
 ### C ABI (ABI 0.1)
 
