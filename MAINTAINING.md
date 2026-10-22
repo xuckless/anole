@@ -154,9 +154,18 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 
 - **zio**: after a change, run its suite in both scheduling modes
   (`./check.sh` and `./check.sh --scheduling pinned` in the fork; Anole
-  runs pinned). Its changes include accepting on a busy executor
-  (`accept-now`: a direct accept with its own budget, and spawn backpressure every 64 spawns instead of on every one).
-  The bench suite's `conns` and `raw` scenarios measure both.
+  runs pinned; add `--fast-accept`, which Anole builds with, and once
+  without it). Its changes: the pinned run queue kept one FIFO order across
+  the ring and its overflow (`anole-merge-fix`, on top of upstream #841,
+  whose push could leave overflowed tasks waiting forever behind more than
+  256 yielding tasks), and accepting on a busy executor (`accept-now`: a
+  direct accept with its own budget, and spawn backpressure every 64 spawns
+  instead of on every one; `accept-fairness`: both budgets grow to the
+  number of tasks that ran during the last trip to the back of the run
+  queue), all behind zio's `fast_accept` option except the run-queue fix, as
+  in lalinsky/zio#837, which Anole turns on in `build.zig` and
+  `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
+  them.
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed. websocket-zig also

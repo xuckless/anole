@@ -1285,8 +1285,10 @@ const Core = struct {
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
         // program that declares no `zio_options` still gets what Anole needs;
-        // anole.Server refuses to compile with work stealing declared.
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned }).module("zio");
+        // anole.Server refuses to compile with work stealing declared. And
+        // `fast_accept` (see `anole.zio_options`), so a program whose own
+        // `zio_options` leave it out still has it.
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true }).module("zio");
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,

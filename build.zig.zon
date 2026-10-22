@@ -11,7 +11,9 @@
         // into the ring fully (#841), sendmmsg in sendMany (#833, #843) and
         // the Windows UDP ICMP fix (#849); it also drops the runtime-wide
         // task counter (#842) and re-arms a caller's cancel after
-        // waitUntilComplete (#823). Fork patches on top: an accept loop that
+        // waitUntilComplete (#823). Fork patches on top: a push that waits
+        // behind the pinned overflow queue (one FIFO order; #841 alone could
+        // starve overflowed tasks behind >256 yielding ones), an accept loop that
         // keeps up on a busy executor (direct accept with its own budget,
         // putting back a cancel it finds pending; spawn backpressure every
         // 64 spawns), a spawn cache per executor (stacks and task
@@ -25,8 +27,8 @@
         // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#89bddaebdffa00e2f77309849dd64de12986e824",
-            .hash = "zio-0.19.0-xHbVVJ-fLQC5CK_UfsQ6E4-qtngYln0Hm43vkkmNBjHs",
+            .url = "git+https://github.com/xuckless/zio#b4974873565677327cb45f8731b4f393ff637bad",
+            .hash = "zio-0.19.0-xHbVVCTMLQD1ucYoMOJfO8bzSuHnrjjXYubniBKtnu8F",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

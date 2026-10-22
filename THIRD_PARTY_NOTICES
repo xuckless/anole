@@ -27,7 +27,7 @@ zio (async runtime)
             upstream main 035d245 plus Anole's accept, spawn-cache,
             idle-stack, recvmmsg-with-control and Windows patches; some are
             open upstream as lalinsky/zio #837, #838 and #850)
-  Pinned:   commit 89bddaebdffa00e2f77309849dd64de12986e824 of the fork
+  Pinned:   commit b4974873565677327cb45f8731b4f393ff637bad of the fork
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)
