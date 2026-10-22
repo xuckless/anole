@@ -13,6 +13,17 @@ const Str = abi.Str;
 const Header = abi.Header;
 
 pub const zio_options = anole.zio_options;
+/// A panic goes to the binding's log callback (when it set one) as one error
+/// line with its stack trace, and to standard error as Zig prints it (the
+/// callback only queues the line, and the process aborts before a binding
+/// could flush it).
+pub const panic = std.debug.FullPanic(panicFn);
+
+fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    if (log_fn != null) anole.logPanic(msg, first_trace_addr orelse @returnAddress());
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
 pub const std_options: std.Options = .{
     .logFn = logFn,
     .log_level = if (builtin.mode == .debug) .debug else .info,

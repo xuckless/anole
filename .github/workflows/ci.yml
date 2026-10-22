@@ -44,8 +44,8 @@ jobs:
     # slower runner) instead of holding the runner for GitHub's 6 h limit.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
       # Zig fetches git and tarball dependencies itself on a cold cache;
@@ -94,8 +94,8 @@ jobs:
         target: [aarch64-linux-gnu, x86_64-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: cross-${{ matrix.target }}
@@ -120,8 +120,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: capi
@@ -170,8 +170,8 @@ jobs:
     env:
       PKG_CONFIG: anole-no-pkg-config
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: windows
@@ -230,8 +230,8 @@ jobs:
     name: h2spec (HTTP/2 conformance, h2c and TLS)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: h2spec
@@ -256,8 +256,8 @@ jobs:
     name: Autobahn (WebSocket conformance, HTTP/1.1)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: autobahn
@@ -281,8 +281,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: h3
@@ -305,8 +305,8 @@ jobs:
     name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: quic-interop
@@ -335,7 +335,7 @@ jobs:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
       - name: Keep the logs of a failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
         with:
           name: quic-interop-logs
           path: ${{ runner.temp }}/interop/logs
@@ -345,8 +345,8 @@ jobs:
     name: WebTransport interop runner (Anole's server, flupke; Chrome and Firefox)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: webtransport-interop
@@ -380,7 +380,7 @@ jobs:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/wt-interop-browsers
       - name: Keep the logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
         with:
           name: webtransport-interop-logs
           path: |
@@ -394,8 +394,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           use-cache: false
@@ -410,8 +410,8 @@ jobs:
     name: Fuzz the parsers (200K runs per target)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: fuzz
@@ -432,8 +432,8 @@ jobs:
     name: gRPC interop (both directions with grpc-go, h2c and TLS; grpc's HTTP/2 checks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: grpc-interop
@@ -442,7 +442,7 @@ jobs:
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7 (v7.0.0)
         with:
           go-version: stable
       - name: Build the interop server
@@ -473,8 +473,8 @@ jobs:
       matrix:
         image: ["redis:7", "valkey/valkey:8"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: redis
@@ -497,8 +497,8 @@ jobs:
       matrix:
         image: ["postgres:17"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: postgres
@@ -528,8 +528,8 @@ jobs:
           - { image: "mongo:8.0", os: ubuntu-22.04 }
           - { image: "mongo:9.0", os: ubuntu-22.04 }
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: mongodb-${{ matrix.os }}

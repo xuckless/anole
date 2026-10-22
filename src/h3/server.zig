@@ -2603,7 +2603,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// The response goes on from a task, in the connection's group:
         /// its body writes may now wait for the peer.
-        fn detachedAttach(d: *dusty.Detached) *std.Io.Group {
+        fn detachedAttach(d: *dusty.Detached) ?*std.Io.Group {
             const ex = exchangeOf(d);
             const s = ex.sink_state.stream;
             const conn = s.conn;

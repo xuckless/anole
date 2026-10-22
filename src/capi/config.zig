@@ -65,7 +65,7 @@ pub const Config = struct {
         /// The largest request body, inline or streamed: past it, 413.
         body_max: u64 = 1 << 20,
         /// Bodies up to this come inline in the request record; larger
-        /// ones are read with anole_req_read.
+        /// ones are read with anole_req_read. At most 1 GiB.
         inline_body_max: u32 = 64 * 1024,
         /// Requests handed to consumers and not yet answered, per executor;
         /// past it, 503.
@@ -77,7 +77,8 @@ pub const Config = struct {
         /// to go out answers ANOLE_BUSY.
         stream_high_water: u32 = 256 * 1024,
         ws_high_water: u32 = 1 << 20,
-        /// The largest WebSocket message, in or out (after inflating).
+        /// The largest WebSocket message, in or out (after inflating). At
+        /// most 1 GiB.
         ws_max_message: u32 = 1 << 20,
         /// Open connections at most; 0 follows the open-file limit.
         max_connections: u32 = 0,
@@ -233,6 +234,9 @@ pub const Config = struct {
 
 pub const max_timeouts = 16;
 
+/// The most an inline body or a WebSocket message may be (one event each).
+pub const max_record_payload: u32 = 1 << 30;
+
 /// What `check` found wrong, for anole_last_error.
 pub const Problem = error{Config};
 
@@ -267,6 +271,10 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     if (cfg.executors > 256) return fail(why, "executors: at most 256", .{});
     if (cfg.limits.max_inflight == 0 or cfg.limits.max_inflight > 1 << 20) return fail(why, "limits.max_inflight: 1 to 1048576", .{});
     if (cfg.limits.inline_body_max > cfg.limits.body_max) return fail(why, "limits.inline_body_max is above limits.body_max", .{});
+    // Events carry their length in 32 bits: what goes inside one is bounded
+    // well below that (the request head comes on top of an inline body).
+    if (cfg.limits.inline_body_max > max_record_payload) return fail(why, "limits.inline_body_max: at most {d}", .{max_record_payload});
+    if (cfg.limits.ws_max_message > max_record_payload) return fail(why, "limits.ws_max_message: at most {d}", .{max_record_payload});
     var http3_listeners: usize = 0;
     for (cfg.listeners, 0..) |l, i| {
         if (l.tls) |t| {
@@ -506,6 +514,9 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"listeners\": []}",
         "{\"middleware\": [{\"rate_limit\": {\"key\": \"cookie\"}}]}",
         "{\"limits\": {\"inline_body_max\": 10, \"body_max\": 5}}",
+        // A record carries its length in 32 bits.
+        "{\"limits\": {\"inline_body_max\": 4294967295, \"body_max\": 8589934592}}",
+        "{\"limits\": {\"ws_max_message\": 4294967295}}",
     };
     for (bad) |doc| {
         why.end = 0;

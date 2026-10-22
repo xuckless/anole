@@ -17,6 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
+const sd_notify = @import("sd_notify.zig");
 
 /// False on Windows (see above).
 pub const supported = builtin.os.tag != .windows;
@@ -75,6 +76,43 @@ pub fn inherited(environ: std.process.Environ) ?Inherited {
     // Ours now: not passed on to anything this process starts.
     for (out.fds[0..out.count]) |fd| _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
     return out;
+}
+
+pub const SocketKind = enum {
+    /// A listening TCP or unix stream socket.
+    listener,
+    /// A UDP socket (HTTP/3).
+    datagram,
+};
+
+/// Checks that an inherited `fd` is what it is to be used as: a socket of
+/// `kind` (listening, for a stream), of an IP family when `ip`, else a unix
+/// one. A wrong descriptor at 3.. (another unit's socket, a file, a stale
+/// `LISTEN_FDS`) is refused at start rather than served on.
+pub fn checkInherited(fd: Fd, kind: SocketKind, ip: bool) error{InheritedSocketMismatch}!void {
+    if (comptime !supported) return;
+    var storage: c.sockaddr.storage = undefined;
+    var len: c.socklen_t = @sizeOf(c.sockaddr.storage);
+    if (c.getsockname(fd, @ptrCast(&storage), &len) != 0) return error.InheritedSocketMismatch;
+    const family = storage.family;
+    const family_ok = if (ip) family == c.AF.INET or family == c.AF.INET6 else family == c.AF.UNIX;
+    if (!family_ok) return error.InheritedSocketMismatch;
+    var typ: c_int = 0;
+    var typ_len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.TYPE, &typ, &typ_len) != 0) return error.InheritedSocketMismatch;
+    switch (kind) {
+        .listener => {
+            if (typ != c.SOCK.STREAM) return error.InheritedSocketMismatch;
+            // Whether it listens: Linux answers SO_ACCEPTCONN; macOS does
+            // not (ENOPROTOOPT), so there the type has to do.
+            if (comptime builtin.os.tag != .linux) return;
+            var listening: c_int = 0;
+            var l_len: c.socklen_t = @sizeOf(c_int);
+            if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.ACCEPTCONN, &listening, &l_len) != 0 or listening == 0)
+                return error.InheritedSocketMismatch;
+        },
+        .datagram => if (typ != c.SOCK.DGRAM or !ip) return error.InheritedSocketMismatch,
+    }
 }
 
 /// What `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` say to the process
@@ -209,9 +247,13 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
     for (process.environ.block.slice) |entry| {
         const e = std.mem.span(entry.?);
         if (std.mem.startsWith(u8, e, "LISTEN_") or std.mem.startsWith(u8, e, "ANOLE_READY_FD=") or
-            std.mem.startsWith(u8, e, "ANOLE_H3_SECRET_FD=")) continue;
+            std.mem.startsWith(u8, e, "ANOLE_H3_SECRET_FD=") or std.mem.eql(u8, e, sd_notify.placeholder)) continue;
         try env.append(arena, entry);
     }
+    // systemd's socket, which this process took out of its own environment
+    // (`sd_notify.take`): the successor reports to it.
+    if (sd_notify.taken()) |path|
+        try env.append(arena, try std.fmt.allocPrintSentinel(arena, "NOTIFY_SOCKET={s}", .{path}, 0));
     try env.append(arena, try std.fmt.allocPrintSentinel(arena, "LISTEN_FDS={d}", .{listeners.len}, 0));
     var names: std.ArrayList(u8) = .empty;
     for (listeners, 0..) |l, i| {
@@ -331,6 +373,35 @@ test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
     const none: std.process.Environ = .{ .block = .{ .slice = &[_:null]?[*:0]const u8{"PATH=/bin"} } };
     try std.testing.expect(inheritedSecret(none) == null);
     try std.testing.expect(!isSuccessor(none));
+}
+
+test "checkInherited: only a socket of the kind it is to be used as" {
+    if (comptime !supported) return error.SkipZigTest;
+    var addr: c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    const tcp = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    defer _ = c.close(tcp);
+    try std.testing.expect(c.bind(tcp, @ptrCast(&addr), @sizeOf(c.sockaddr.in)) == 0);
+    // Bound, not yet listening: refused (where the system says).
+    if (builtin.os.tag == .linux) try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(tcp, .listener, true));
+    try std.testing.expect(c.listen(tcp, 1) == 0);
+    try checkInherited(tcp, .listener, true);
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(tcp, .listener, false));
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(tcp, .datagram, true));
+
+    const udp = c.socket(c.AF.INET, c.SOCK.DGRAM, 0);
+    defer _ = c.close(udp);
+    try std.testing.expect(c.bind(udp, @ptrCast(&addr), @sizeOf(c.sockaddr.in)) == 0);
+    try checkInherited(udp, .datagram, true);
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(udp, .listener, true));
+
+    // Not a socket at all, and no descriptor.
+    var fds: [2]Fd = undefined;
+    try std.testing.expect(c.pipe(&fds) == 0);
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(fds[0], .listener, true));
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(-1, .datagram, true));
 }
 
 test "fuzz: LISTEN_PID, LISTEN_FDS and LISTEN_FDNAMES" {

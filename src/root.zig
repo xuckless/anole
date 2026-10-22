@@ -126,6 +126,13 @@ pub const blocking = @import("blocking.zig");
 /// and Anole's per-connection debug lines out of a Debug build's output;
 /// warnings, errors and info (the startup line, the access log) stay.
 pub const std_options = @import("log.zig").std_options;
+/// Optional, in the executable's root file: `pub const panic = anole.panic;`.
+/// A panic is written as one error line (message and stack trace) through
+/// the log function, so it lands where the logs go, then the process aborts.
+pub const panic = @import("panic.zig").panic;
+/// The logging half of `panic`, for a root file with a panic handler of its
+/// own.
+pub const logPanic = @import("panic.zig").log;
 /// Anole's libraries log under Anole's own scopes (`anole`, `access`,
 /// `anole_h2`, `anole_h3`); this log function is kept for programs that set
 /// it, and renames the scopes older builds used.
@@ -288,6 +295,7 @@ test {
     _ = @import("cache/response_test.zig");
     _ = blocking;
     _ = @import("sd_notify.zig");
+    _ = @import("panic.zig");
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = http;

@@ -353,6 +353,10 @@ pub const App = struct {
 pub fn addApp(b: *std.Build, options: AppOptions) App {
     const target = options.target orelse b.standardTargetOptions(.{});
     const optimize = options.optimize orelse b.standardOptimizeOption(.{});
+    // Not refused (it is the fastest build), but said: a server takes
+    // untrusted input, and ReleaseFast turns a bug Zig would stop at into
+    // undefined behaviour.
+    if (optimize == .fast or optimize == .small) std.log.warn("{s}: -Doptimize={s} turns Zig's safety checks off (a bug that would stop the server can corrupt memory instead); Anole recommends -Doptimize=ReleaseSafe for production", .{ options.name, if (optimize == .fast) "ReleaseFast" else "ReleaseSmall" });
     const anole_dep = if (options.profile) |profile|
         b.dependency(options.dependency, .{ .target = target, .optimize = optimize, .profile = profile })
     else

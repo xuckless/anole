@@ -23,7 +23,7 @@ work=$(mktemp -d)
 pids=""
 trap 'for p in $pids; do kill -9 $p 2>/dev/null || true; done; rm -rf "$work"' EXIT
 python3 -m venv "$work/venv"
-"$work/venv/bin/pip" install -q aioquic==1.7.0
+"$work/venv/bin/pip" install -q --require-hashes -r "$here/../h3/requirements.txt"
 py="$work/venv/bin/python -I"
 port=18580
 tls_port=18581

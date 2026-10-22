@@ -26,6 +26,13 @@ that happens promptly.
 can check them against the upstreams' advisories. Moving a pin without
 updating that table makes the script exit 2.
 
+CI's GitHub Actions are pinned by commit SHA, the tag in a comment beside it;
+bump them by resolving the new tag's commit (`git ls-remote --tags`). The
+Python packages the protocol checks install are pinned with hashes in
+`tests/h3/requirements.txt` (aioquic) and `tests/interop/requirements.txt`
+(the QUIC interop runner's, which follow its pinned commit): regenerate them
+with every file's SHA-256 from PyPI when either moves.
+
 ## Advisories
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
@@ -46,7 +53,9 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
    "hash mismatch". Check the final hashes from an empty cache
    (`ZIG_GLOBAL_CACHE_DIR=$(mktemp -d) zig build test`).
 2. Update the version in `tools/advisories.py` and the "Pinned:" line in
-   THIRD_PARTY_NOTICES. Re-read the "Includes:" lines there (sfparse in
+   THIRD_PARTY_NOTICES. For zlib-ng, zstd, Brotli and yyjson, add the new
+   tarball's SHA-256 (and Brotli's `testdata.txz`'s) to `sha256_of` in
+   `tools/sanitize-c-libs.sh`, which refuses a download it has no hash for. Re-read the "Includes:" lines there (sfparse in
    nghttp2 and nghttp3, PCG in ngtcp2, fiat in BoringSSL), and re-copy
    BoringSSL's licence text into part E if it changed.
 3. Library-specific steps:

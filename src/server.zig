@@ -132,7 +132,8 @@ pub const Options = struct {
     /// Raise the soft open-file limit to the hard one when the server is
     /// made, as Go does at startup: every connection is a file descriptor,
     /// and the soft limit is often 1024. `server.max_connections` follows
-    /// the limit by default. Processes started from here inherit it.
+    /// the limit by default. Processes started from here inherit it (see
+    /// docs/server.md, "Many connections", for programs that use `select`).
     raise_fd_limit: bool = true,
     /// HTTP/2 settings, for h2c and h2 over TLS. 250 concurrent streams per
     /// connection by default.
@@ -638,6 +639,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
+            // systemd's notify socket is this process's to use, not its
+            // children's: kept, and taken out of the environment.
+            if (opts.process) |p| sd_notify.take(p.environ);
             // Before anything opens a socket, and before `run` works out
             // the connection cap from it.
             if (opts.raise_fd_limit) if (http.fd_limit.raiseSoftLimit()) |r| {
@@ -966,6 +970,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 // listeners), with the predecessor's secret.
                 var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
                 const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.len, &h3_buf) else &.{};
+                for (h3_fds) |fd| handoff.checkInherited(fd, .datagram, true) catch |err| {
+                    std.log.scoped(.anole).err("inherited fd {any} for HTTP/3 is not a UDP socket", .{fd});
+                    return err;
+                };
                 const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
                 // The UDP socket follows the TCP listener's address, "" (dual-stack) included.
                 const udp_host = q.address orelse l.address;
@@ -1045,7 +1053,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Null outside hand-off mode (dusty binds).
         fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
             if (!handoff_mode) return null;
-            if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
+            if (inherited) |inh| if (inh.find(name, index)) |fd| {
+                handoff.checkInherited(fd, .listener, address == .ip) catch |err| {
+                    std.log.scoped(.anole).err("inherited fd {any} for listener \"{s}\" is not a listening {s} socket", .{ fd, name, if (address == .ip) "TCP" else "unix" });
+                    return err;
+                };
+                return fd;
+            };
             switch (address) {
                 .ip => |ip| {
                     // SO_REUSEPORT would share the port with whoever has it.
@@ -1966,6 +1980,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// thread that called `init`.
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
+            logBuildMode();
             self.addHelperRoutes();
             self.startConnectors() catch |err| return self.failStart(err);
             const rt_io = self.rt.io();
@@ -2079,6 +2094,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     else => log.err("SIGHUP: certificate reload failed, keeping the current one: {t}", .{err}),
                 }
                 if (self.process) |p| sd_notify.ready(p.environ, null);
+            }
+        }
+
+        /// Which build this is; a loud word for ReleaseFast, which has none
+        /// of Zig's safety checks (docs/server.md recommends ReleaseSafe).
+        fn logBuildMode() void {
+            const log = std.log.scoped(.anole);
+            const name = switch (builtin.mode) {
+                .debug => "Debug",
+                .safe => "ReleaseSafe",
+                .fast => "ReleaseFast",
+                .small => "ReleaseSmall",
+            };
+            switch (builtin.mode) {
+                .fast, .small => log.warn("built with {s}: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production", .{name}),
+                .debug, .safe => log.info("{s} build", .{name}),
             }
         }
 

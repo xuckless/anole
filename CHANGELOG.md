@@ -221,6 +221,40 @@ breaking changes are listed anyway.
   passwords.
 - `exec` with no arguments runs every statement in its SQL (PostgreSQL,
   SQLite); the docs now say so: never build that SQL from input.
+- C ABI: a made-up WebSocket handle, a file length past the end of the file
+  (`anole_respond_fd`), and a request body read after the request was
+  answered are now refused (`ANOLE_E_GONE` / `ANOLE_E_INVALID`) instead of
+  reaching memory they should not. No configuration change needed.
+- C ABI: publishes still being fanned out to a topic are bounded (64 per
+  executor, and the larger of 16 x `limits.ws_high_water` and
+  2 x `limits.ws_max_message` bytes); past that `anole_ws_publish` returns
+  `ANOLE_E_AGAIN` and sends nothing. A publish larger than
+  `limits.ws_max_message` is refused (`ANOLE_E_INVALID`). Bindings should
+  handle `ANOLE_E_AGAIN` from publish.
+- C ABI configuration: `limits.inline_body_max` and `limits.ws_max_message`
+  are capped at 1 GiB (larger values are a configuration error).
+- C ABI: WebSocket messages waiting for a consumer are bounded per executor
+  in bytes (the larger of 16 x `limits.ws_high_water` and
+  2 x `limits.ws_max_message`), not only in count, so clients cannot make a
+  slow consumer's queue hold `limits.queue` whole messages.
+- With `ServerOptions.process` set, the server keeps systemd's `NOTIFY_SOCKET`
+  for itself and takes it out of the environment that programs started by
+  handlers inherit (a restart passes it to the new process). Sockets
+  inherited through `LISTEN_FDS` are checked to be listening TCP/unix (or,
+  for `h3`, UDP) sockets; anything else stops the start with
+  `error.InheritedSocketMismatch`. A CPU quota that does not fit 32 bits no
+  longer stops the start.
+- `anole.panic` (`pub const panic = anole.panic;` in the root file; the
+  examples and libanole use it): a panic is written as one error line with
+  its stack trace through the log function, then the process aborts. The
+  server logs its build mode at start and warns when it is ReleaseFast or
+  ReleaseSmall; `addApp` warns at build time for those modes (the build is
+  not refused).
+- CI: a Release checks workflow runs h2spec, Autobahn, the HTTP/3 checks,
+  the QUIC interop runner, gRPC interop and the C ABI suite against
+  ReleaseFast builds, and the bundled C libraries under sanitizers, at every
+  release tag. Actions are pinned by commit; downloads in the sanitizer
+  script and the Python test packages are checked by hash.
 
 ### C ABI (ABI 0.1)
 

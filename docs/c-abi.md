@@ -261,12 +261,18 @@ A `websocket` route upgrades over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3
 (RFC 9220). `ANOLE_EV_WS_OPEN` carries the upgrade request; each whole
 message (inflated, UTF-8 checked) is an `ANOLE_EV_WS_MESSAGE`; the end is
 `ANOLE_EV_WS_CLOSE` with the code (1005 without one, 1006 when the
-connection ended without a close). `anole_ws_send` queues a message
+connection ended without a close). Messages waiting for a consumer that is
+behind are bounded per executor by bytes as well as by `limits.queue` (the
+larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`):
+past that, the sockets feeding it are not read until it catches up. `anole_ws_send` queues a message
 (`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WS_DRAIN`),
 `anole_ws_close` sends a close. Topics are Anole's: `anole_ws_subscribe`,
 `anole_ws_unsubscribe`, and `anole_ws_publish(server, topic, ...)` fans out
-on Anole's threads without entering the language. A drain closes sockets with
-1001.
+on Anole's threads without entering the language. Publishes still being fanned
+out are bounded (64 per executor, and the larger of 16 x `limits.ws_high_water`
+and 2 x `limits.ws_max_message` bytes), because a subscriber that stops reading
+holds up every publish sending to it: past the bound `anole_ws_publish` answers
+`ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
 ## Lifecycle
 
