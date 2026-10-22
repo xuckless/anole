@@ -253,6 +253,9 @@ pub const Options = struct {
         /// (`error.HqInteropNotAllowed`) unless the program's root file
         /// declares `pub const anole_hq_interop = true;`.
         hq_interop_root: ?[]const u8 = null,
+        /// Move clients that offer QUIC v2 (RFC 9369) beside v1 to v2;
+        /// false keeps them on v1 unless they start in v2.
+        prefer_v2: bool = true,
         /// UDP sockets on Linux, each served on an executor of its own,
         /// with the kernel steering each connection's datagrams to its
         /// socket: null for one per executor, as the TCP accept loops. At
@@ -995,6 +998,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .validate_address = q.validate_address,
                     .idle_timeout = q.idle_timeout,
                     .hq_interop_root = q.hq_interop_root,
+                    .prefer_v2 = q.prefer_v2,
                     .early_data = q.early_data,
                     .enable_connect_protocol = q.enable_connect_protocol,
                     .webtransport = q.webtransport or self.extras.webtransport,

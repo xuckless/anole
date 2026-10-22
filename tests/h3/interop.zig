@@ -3,7 +3,11 @@
 //! HTTP/3 and over hq-interop (HTTP/0.9), on one port, with 0-RTT on (the
 //! `zerortt` case; GETs only, which run from early data at once).
 //!
-//!   h3-interop-server CERT KEY WWW PORT [retry]
+//!   h3-interop-server CERT KEY WWW PORT [retry] [v2]
+//!
+//! `retry` validates every address with a Retry (the `retry` case). `v2`
+//! moves clients that offer QUIC v2 to it (the `v2` case); without it
+//! they stay on v1, which every other case expects.
 const std = @import("std");
 const anole = @import("anole");
 
@@ -25,14 +29,19 @@ pub fn main(init: std.process.Init) !void {
     const www = args.next() orelse return error.Usage;
     const port = try std.fmt.parseInt(u16, args.next() orelse return error.Usage, 10);
     var retry = false;
+    var v2 = false;
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "retry")) retry = true else return error.Usage;
+        if (std.mem.eql(u8, a, "retry")) {
+            retry = true;
+        } else if (std.mem.eql(u8, a, "v2")) {
+            v2 = true;
+        } else return error.Usage;
     }
 
     var app = try anole.Server(void).init(init.gpa, .{
         .http = null,
         .https = .{ .address = "0.0.0.0", .port = port, .cert = .{ .files = .{ .cert_path = cert, .key_path = key } } },
-        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000, .early_data = true },
+        .http3 = .{ .validate_address = retry, .hq_interop_root = www, .max_streams_bidi = 1000, .early_data = true, .prefer_v2 = v2 },
     }, {});
     defer app.deinit();
     const dir = try std.Io.Dir.cwd().openDir(app.io(), www, .{});

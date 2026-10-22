@@ -203,6 +203,7 @@ const Fixture = struct {
         /// GET /hello says it comes from the successor.
         successor: bool = false,
         early_data: bool = false,
+        prefer_v2: bool = true,
     };
 
     fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig, extra: Extra) !Fixture {
@@ -249,6 +250,7 @@ const Fixture = struct {
             .fd = extra.fd,
             .secret = extra.secret,
             .early_data = extra.early_data,
+            .prefer_v2 = extra.prefer_v2,
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -1287,6 +1289,35 @@ test "h3: 0-RTT the server refuses goes again after the handshake" {
     try std.testing.expectEqual(client.EarlyData.rejected, conn.earlyData());
     try std.testing.expect(!conn.resumed());
     try std.testing.expectEqual(@as(u64, 0), new.ep.early_served.load(.monotonic));
+}
+
+test "h3: a client offering QUIC v2 moves to it only when the server prefers v2" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const v1: u32 = 1;
+    const v2: u32 = 0x6b3343cf;
+    // The interop runner's v2 case wants v2, every other case v1, from
+    // clients (aioquic) that offer both every time.
+    for ([_]bool{ true, false }) |prefer_v2| {
+        var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .prefer_v2 = prefer_v2 });
+        defer f.stop(gpa, io);
+        for ([_]bool{ true, false }) |offer_v2| {
+            const conn = try client.ClientConnection.connect(gpa, io, .{
+                .host = "localhost",
+                .address = f.ep.address(),
+                .port = f.ep.address().getPort(),
+                .tls = .{ .ca = .{ .pem = f.pem.cert } },
+                .quic_v2 = offer_v2,
+            });
+            defer conn.close();
+            const body = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+            defer gpa.free(body);
+            try std.testing.expectEqualStrings("hello over h3", body);
+            try std.testing.expectEqual(if (prefer_v2 and offer_v2) v2 else v1, conn.quicVersion());
+        }
+    }
 }
 
 test "h3: a client that moves to a new port keeps its connection, and the server follows" {

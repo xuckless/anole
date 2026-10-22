@@ -106,6 +106,11 @@ pub const ConnectOptions = struct {
     /// HTTP/3 only: speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
     /// HTTP datagrams, and streams the server may open.
     webtransport: bool = false,
+    /// HTTP/3 only: start in QUIC v1 and offer v2 (RFC 9369) beside it,
+    /// so a server that prefers v2 moves the connection there through
+    /// compatible version negotiation (RFC 9368). `quicVersion` says which
+    /// one it ended on.
+    quic_v2: bool = false,
 
     /// The fields of `anole.h2.ConnectOptions.Tls`, with the same defaults.
     pub const Tls = struct {
@@ -331,6 +336,11 @@ pub const ClientConnection = struct {
         var initial_pkt_num: [4]u8 = undefined;
         io.random(&initial_pkt_num);
         settings.initial_pkt_num = std.mem.readInt(u32, &initial_pkt_num, .little) & 0x7fffffff;
+        const v1_and_v2 = [_]u32{ c.NGTCP2_PROTO_VER_V1, c.NGTCP2_PROTO_VER_V2 };
+        if (options.quic_v2) {
+            settings.available_versions = &v1_and_v2;
+            settings.available_versionslen = v1_and_v2.len;
+        }
 
         var params: ngtcp2.TransportParams = undefined;
         ngtcp2.transportParamsDefault(&params);
@@ -420,6 +430,15 @@ pub const ClientConnection = struct {
         self.lock();
         defer self.unlock();
         return self.early;
+    }
+
+    /// The QUIC version the connection runs on (1, or 0x6b3343cf for v2):
+    /// v1 unless `ConnectOptions.quic_v2` offered v2 and the server took
+    /// it. Final once the handshake has completed.
+    pub fn quicVersion(self: *ClientConnection) u32 {
+        self.lock();
+        defer self.unlock();
+        return c.ngtcp2_conn_get_negotiated_version(self.q);
     }
 
     /// The handshake resumed an earlier session (from `session_cache`).

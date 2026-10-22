@@ -79,8 +79,16 @@ const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 const hold_ns = std.time.ns_per_ms;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
-/// QUIC v2 first when the client offers both.
-const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
+/// The versions a connection may end up on, in order of preference
+/// (`Options.prefer_v2`): RFC 9368's compatible version negotiation moves
+/// a client that started in one to the first of these it also lists.
+const versions_v2_first = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
+const versions_v1_first = [_]u32{ c.NGTCP2_PROTO_VER_V1, c.NGTCP2_PROTO_VER_V2 };
+
+/// The versions in `options`' order of preference.
+fn preferredVersions(options: *const Options) []const u32 {
+    return if (options.prefer_v2) &versions_v2_first else &versions_v1_first;
+}
 
 /// An `Endpoint`'s settings (`anole.h3.EndpointOptions`). A server sets
 /// them from `ServerOptions.Http3` and its TLS listener.
@@ -121,6 +129,10 @@ pub const Options = struct {
     /// `init` refuses it (`error.HqInteropNotAllowed`) unless the program's
     /// root file declares `pub const anole_hq_interop = true;`.
     hq_interop_root: ?[]const u8 = null,
+    /// Move a client that offers QUIC v2 (RFC 9369) beside v1 to v2,
+    /// through compatible version negotiation (RFC 9368). False keeps such
+    /// a client on v1, unless it starts in v2. Either way both are spoken.
+    prefer_v2: bool = true,
     /// Mutual TLS: ask for client certificates and verify them, as the TCP
     /// listener does. Handlers read the certificate with
     /// `Request.peerCertificate`.
@@ -1358,10 +1370,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.token_type = token_type;
                 settings.rand_ctx = .{ .native_handle = conn };
                 settings.max_window = 6 * ep.options.max_data;
-                // QUIC v2 (RFC 9369) when the client offers it, through
-                // compatible version negotiation; v1 otherwise.
-                settings.preferred_versions = &preferred_versions;
-                settings.preferred_versionslen = preferred_versions.len;
+                // QUIC v2 (RFC 9369) when the client offers it and
+                // `prefer_v2` is on, through compatible version
+                // negotiation; v1 otherwise.
+                const versions = preferredVersions(&ep.options);
+                settings.preferred_versions = versions.ptr;
+                settings.preferred_versionslen = versions.len;
                 settings.max_stream_window = 6 * ep.options.max_stream_data;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
