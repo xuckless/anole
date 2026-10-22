@@ -2908,6 +2908,28 @@ const CountingMiddleware = struct {
     }
 };
 
+test "Server: anole.noWait(f) marks a function middleware; a noWait route behind it registers" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0, .h2c = true }, .executors = .exact(1) }, {});
+    defer app.deinit();
+    const Fns = struct {
+        fn tag(_: *http.Request, res: *http.Response, next: handlers.Next) !void {
+            try res.header("X-Tag", "1");
+            return next.call();
+        }
+        fn quick(_: *http.Request, res: *http.Response) !void {
+            res.body = "quick";
+        }
+    };
+    const plain = app.middleware(Fns.tag);
+    try std.testing.expect(!plain.no_wait);
+    const marked = app.middleware(handlers.noWait(Fns.tag));
+    try std.testing.expect(marked.no_wait);
+    app.use(handlers.noWait(Fns.tag));
+    // Would panic at registration if the middleware were not marked.
+    app.get("/quick", handlers.noWait(Fns.quick));
+}
+
 test "anole.Server: use, group and middleware copy what they are given, and deinit it with the server; static, embedded and query" {
     const gpa = std.testing.allocator;
     var hits: std.atomic.Value(u32) = .init(0);

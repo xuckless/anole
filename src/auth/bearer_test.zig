@@ -157,3 +157,17 @@ test "RequireJwt: RFC 6750 answers, claims in the locals only, required claims, 
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 403"));
     try std.testing.expect(has(resp, "WWW-Authenticate: Bearer error=\"insufficient_scope\", scope=\"notes:read notes:write\"\r\n"));
 }
+
+test "RequireJwt.noWait: static keys yes, a keyring no, a hook no" {
+    const keys: []const jws.Key = &.{};
+    const static_mw = bearer.RequireJwt.init(.{ .static = keys }, .{}, .{});
+    try std.testing.expect(static_mw.noWait());
+    var ring: @import("keyring.zig").Keyring = undefined;
+    const ring_mw = bearer.RequireJwt.init(.{ .keyring = &ring }, .{}, .{});
+    try std.testing.expect(!ring_mw.noWait());
+    const Hooks = struct {
+        fn check(_: ?*anyopaque, _: *dusty.Request, _: *const jws.Verified) anyerror!void {}
+    };
+    const hooked = bearer.RequireJwt.init(.{ .static = keys }, .{}, .{ .hook = .{ .func = Hooks.check } });
+    try std.testing.expect(!hooked.noWait());
+}

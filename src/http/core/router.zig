@@ -2074,3 +2074,54 @@ test "Router: HEAD falling back to GET still captures path params" {
     try std.testing.expect(try router.findHandler(&req) != null);
     try std.testing.expectEqualStrings("42", req.params.get("id").?);
 }
+
+test "router: a no_wait route behind middleware that may wait is a conflict, recorded under record_conflicts" {
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    const Waits = struct {
+        _: u8 = 0,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, next: anytype) !void {
+            return next.call();
+        }
+    };
+    var mw: Waits = .{};
+    router.use(Middleware(void).init(&mw));
+    router.addRouteWith(.get, "/ping", voidHandler1, .{ .no_wait = true });
+    try std.testing.expect(router.conflict != null);
+    try std.testing.expect(std.mem.indexOf(u8, router.conflict.?, "route GET /ping is marked noWait, but middleware") != null);
+    try std.testing.expect(std.mem.indexOf(u8, router.conflict.?, "Waits") != null);
+    // Without the mark the route registers.
+    router.conflict = null;
+    router.addRouteWith(.get, "/slow", voidHandler1, .{});
+    try std.testing.expect(router.conflict == null);
+}
+
+test "router: a no_wait route behind no_wait middleware registers" {
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    const Quick = struct {
+        _: u8 = 0,
+        pub const no_wait = true;
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, next: anytype) !void {
+            return next.call();
+        }
+    };
+    const Depends = struct {
+        quick: bool,
+        pub fn noWait(self: *const @This()) bool {
+            return self.quick;
+        }
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, next: anytype) !void {
+            return next.call();
+        }
+    };
+    var q: Quick = .{};
+    var d: Depends = .{ .quick = true };
+    router.use(Middleware(void).init(&q));
+    router.use(Middleware(void).init(&d));
+    router.addRouteWith(.get, "/ping", voidHandler1, .{ .no_wait = true });
+    try std.testing.expect(router.conflict == null);
+    try std.testing.expect(router.has_no_wait);
+}

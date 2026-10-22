@@ -727,3 +727,19 @@ test "MemoryLimiter: an idle bucket is forgotten only once it is full again" {
     _ = try l.takeAt("c", 1, policy, 3_700_000);
     try std.testing.expect((try l.takeAt("a", 1, policy, 3_700_000)).allowed);
 }
+
+test "ratelimit.Middleware.noWait follows its limiter" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
+    defer l.deinit();
+    const mem = Middleware.init(l.limiter(), .{});
+    try std.testing.expect(mem.noWait());
+    // A limiter that is not marked (Redis, a custom one) may wait.
+    const Dummy = struct {
+        fn take(_: *anyopaque, _: []const u8, _: u32, _: Policy) anyerror!Result {
+            return error.Unused;
+        }
+    };
+    var dummy: u8 = 0;
+    const other: Limiter = .{ .ptr = &dummy, .vtable = &.{ .take = Dummy.take } };
+    try std.testing.expect(!Middleware.init(other, .{}).noWait());
+}
