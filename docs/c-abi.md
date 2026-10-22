@@ -226,6 +226,10 @@ here and runs on Anole's threads:
 - `middleware` at the top runs for every route, a route's own after it.
   `jwt` with `jwks_url` fetches keys, so its requests keep a task; with
   `jwks` inline (or no `jwt`), HTTP/2 and HTTP/3 requests detach.
+  `jwt` with `jwks_url` needs `audience` (this API's identifier at the
+  provider), since a provider's keys also sign tokens for its other
+  clients; `allow_any_audience: true` is only for keys that sign for this
+  application alone. The configuration is refused otherwise.
 - `cache` keeps GET answers per executor (the response cache) and serves
   hits without reaching the consumer.
 - `no_wait: false` gives each request a task (for comparisons).

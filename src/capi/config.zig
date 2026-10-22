@@ -142,7 +142,13 @@ pub const Config = struct {
         /// a JWK Set ({"keys": [...]}) given here.
         jwks: ?std.json.Value = null,
         issuer: ?[]const u8 = null,
+        /// Required in the token's `aud`. With `jwks_url` it must be set (a
+        /// provider's keys also sign tokens for its other clients), unless
+        /// `allow_any_audience`.
         audience: ?[]const u8 = null,
+        /// With `jwks_url` and no `audience`: only for keys that sign for
+        /// this application alone.
+        allow_any_audience: bool = false,
         leeway_s: i64 = 60,
         require_exp: bool = true,
         /// String claims a token must carry.
@@ -336,6 +342,8 @@ fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std
         .jwt => |j| {
             if (comptime !features.auth) return fail(why, "{s}[{d}].jwt: auth is not built in (-Dauth)", .{ where, i });
             if ((j.jwks_url == null) == (j.jwks == null)) return fail(why, "{s}[{d}].jwt: exactly one of jwks_url and jwks", .{ where, i });
+            if (j.jwks_url != null and j.audience == null and !j.allow_any_audience)
+                return fail(why, "{s}[{d}].jwt: jwks_url needs audience (this API's identifier at the provider), or allow_any_audience: true when the keys sign for this application alone", .{ where, i });
         },
         .rate_limit => |r| {
             if (!std.mem.eql(u8, r.key, "ip") and !std.mem.startsWith(u8, r.key, "header:"))
@@ -430,6 +438,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
             return app.middleware(anole.auth.RequireJwt.init(keys, .{
                 .issuer = c.issuer,
                 .audience = c.audience,
+                .allow_any_audience = c.allow_any_audience,
                 .leeway_seconds = c.leeway_s,
                 .require_exp = c.require_exp,
             }, .{ .required_claims = c.required_claims, .scopes = c.scopes, .realm = c.realm }));
@@ -516,6 +525,8 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"routes\": [{\"method\": \"FETCH\", \"path\": \"/x\", \"handler\": 1}]}",
         "{\"listeners\": []}",
         "{\"middleware\": [{\"rate_limit\": {\"key\": \"cookie\"}}]}",
+        // A provider's keys sign for its other clients too.
+        "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\"}}]}",
         "{\"limits\": {\"inline_body_max\": 10, \"body_max\": 5}}",
         // A record carries its length in 32 bits.
         "{\"limits\": {\"inline_body_max\": 4294967295, \"body_max\": 8589934592}}",
@@ -525,6 +536,14 @@ test "parse: the defaults, a full document, and what is refused" {
         why.end = 0;
         try std.testing.expectError(error.Config, parse(a, doc, &why));
         try std.testing.expect(why.buffered().len > 0);
+    }
+
+    if (features.auth) {
+        why.end = 0;
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"audience\": \"api\"}}]}", &why);
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"allow_any_audience\": true}}]}", &why);
+        // Inline keys are the application's own: no audience needed.
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks\": {\"keys\": []}}}]}", &why);
     }
 }
 

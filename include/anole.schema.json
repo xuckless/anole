@@ -496,7 +496,13 @@
                     {
                       "type": "null"
                     }
-                  ]
+                  ],
+                  "description": "Required in the token's aud. Required with jwks_url (a provider's keys also sign tokens for its other clients), unless allow_any_audience."
+                },
+                "allow_any_audience": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "With jwks_url and no audience: only for keys that sign for this application alone."
                 },
                 "leeway_s": {
                   "type": "integer",
@@ -531,7 +537,7 @@
                   ]
                 }
               },
-              "description": "Exactly one of jwks_url and jwks. The verified claims reach the consumer as JSON (`claims`)."
+              "description": "Exactly one of jwks_url and jwks; jwks_url needs audience (or allow_any_audience). The verified claims reach the consumer as JSON (`claims`)."
             }
           },
           "required": [
