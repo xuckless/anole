@@ -148,6 +148,30 @@ const TestClient = struct {
         return id;
     }
 
+    /// A GET with `extra` fields after the pseudo-headers, and no
+    /// `:authority` when `authority` is null.
+    fn requestWith(self: *TestClient, path: []const u8, authority: ?[]const u8, extra: []const c.nghttp2_nv) !i32 {
+        var nva: [16]c.nghttp2_nv = undefined;
+        nva[0] = nv(":method", "GET");
+        nva[1] = nv(":path", path);
+        nva[2] = nv(":scheme", "http");
+        var n: usize = 3;
+        if (authority) |a| {
+            nva[n] = nv(":authority", a);
+            n += 1;
+        }
+        for (extra) |f| {
+            nva[n] = f;
+            n += 1;
+        }
+        const resp = try self.gpa.create(Resp);
+        resp.* = .{};
+        const id = c.nghttp2_submit_request2(self.session, null, &nva, n, null, resp);
+        if (id < 0) return error.Http2Submit;
+        try self.responses.put(self.gpa, id, resp);
+        return id;
+    }
+
     fn get(self: *TestClient, id: i32) *Resp {
         return self.responses.get(id).?;
     }
@@ -292,6 +316,15 @@ const TestClient = struct {
 };
 
 const Handlers = struct {
+    /// The cookie header, how many `accept` fields came, and the host.
+    fn fields(req: *dusty.Request, res: *dusty.Response) !void {
+        var accepts: usize = 0;
+        var it = req.headers.iterator();
+        while (it.next()) |e| {
+            if (std.ascii.eqlIgnoreCase(e.key, "accept")) accepts += 1;
+        }
+        try res.print(.text, "cookie={s} accepts={d} host={s}", .{ req.headers.get("cookie") orelse "-", accepts, req.host() orelse "-" });
+    }
     fn hello(_: *dusty.Request, res: *dusty.Response) !void {
         try res.print(.text, "hello", .{});
     }
@@ -396,6 +429,7 @@ const Fixture = struct {
             .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
         }, {});
         self.server.router.get("/hello", Handlers.hello);
+        self.server.router.get("/fields", Handlers.fields);
         self.server.router.get("/users/:id", Handlers.user);
         self.server.router.post("/echo", Handlers.echo);
         self.server.router.get("/trailers", Handlers.trailers);
@@ -1171,4 +1205,49 @@ test "HTTP/2: a handler is let go when the client closes the connection" {
     const closed_at: std.Io.Clock.Timestamp = .now(io, .awake);
     client.deinit();
     try Waiter.expectDoneWithin(io, closed_at, 3000);
+}
+
+test "HTTP/2: cookie crumbs are joined with \"; \" and other repeated fields kept" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.requestWith("/fields", "localhost", &.{
+        TestClient.nv("cookie", "a=1"),
+        TestClient.nv("accept", "text/html"),
+        TestClient.nv("cookie", "anole_session=x"),
+        TestClient.nv("accept", "application/json"),
+        TestClient.nv("cookie", "c=3"),
+    });
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("cookie=a=1; anole_session=x; c=3 accepts=2 host=localhost", client.get(id).body.items);
+}
+
+test "HTTP/2: :authority is the host; a host field that differs from it is refused" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const same = try client.requestWith("/fields", "example.com", &.{TestClient.nv("host", "example.com")});
+    const differs = try client.requestWith("/fields", "example.com", &.{TestClient.nv("host", "evil.example")});
+    const host_only = try client.requestWith("/fields", null, &.{TestClient.nv("host", "example.org")});
+    const two_hosts = try client.requestWith("/fields", null, &.{ TestClient.nv("host", "example.org"), TestClient.nv("host", "evil.example") });
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(same).status);
+    try std.testing.expectEqualStrings("cookie=- accepts=0 host=example.com", client.get(same).body.items);
+    try std.testing.expectEqual(@as(u16, 400), client.get(differs).status);
+    try std.testing.expectEqual(@as(u16, 200), client.get(host_only).status);
+    try std.testing.expectEqualStrings("cookie=- accepts=0 host=example.org", client.get(host_only).body.items);
+    // Two host fields: nghttp2 refuses the stream itself.
+    try std.testing.expectEqual(@as(u16, 0), client.get(two_hosts).status);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_PROTOCOL_ERROR), client.get(two_hosts).error_code);
 }

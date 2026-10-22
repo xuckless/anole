@@ -1135,12 +1135,37 @@ pub fn Engine(comptime Ctx: type) type {
 
             request.headers = http.Headers.init(arena, server.config.request.max_header_count) catch return error.OutOfMemory;
             var too_many = false;
-            for (stream.headers.items) |f| request.headers.put(f.name, f.value) catch {
-                too_many = true;
-                break;
-            };
-            if (!too_many and request.headers.get("Host") == null and stream.authority.len > 0) {
-                request.headers.put("Host", stream.authority) catch {
+            // Repeated fields stay separate entries, as over HTTP/1.1,
+            // except cookie crumbs, joined into one (RFC 9113 §8.2.3).
+            var hosts: usize = 0;
+            var host_field: []const u8 = "";
+            for (stream.headers.items) |f| {
+                if (std.mem.eql(u8, f.name, "host")) {
+                    hosts += 1;
+                    host_field = f.value;
+                }
+                request.headers.addRequestField(arena, f.name, f.value) catch |err| switch (err) {
+                    error.TooManyHeaders => {
+                        too_many = true;
+                        break;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+            }
+            // One host, from `:authority` when it is there (RFC 9113
+            // §8.3.1): a `host` field naming another, or two of them, make
+            // the request ambiguous.
+            if (!too_many and (hosts > 1 or (hosts == 1 and stream.authority.len > 0 and
+                !std.ascii.eqlIgnoreCase(host_field, stream.authority))))
+            {
+                response.status = .bad_request;
+                {
+                    try response.write();
+                    return .done;
+                }
+            }
+            if (!too_many and hosts == 0 and stream.authority.len > 0) {
+                request.headers.add("Host", stream.authority) catch {
                     too_many = true;
                 };
             }

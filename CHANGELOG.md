@@ -21,6 +21,10 @@ breaking changes are listed anyway.
   `server.trust_forwarded_host = true`. `X-Forwarded-Proto` stays on with
   `trusted_proxy_hops` and can be turned off with
   `trust_forwarded_proto = false`. Make sure the proxy overwrites both.
+- HTTP/2: a request's repeated header fields are all kept (they used to
+  replace each other), and cookie fields sent separately are joined with
+  "; ", so no cookie is lost. `:authority` is the request's host; a `host`
+  field that names another host gets 400.
 
 ### C ABI (ABI 0.1)
 
