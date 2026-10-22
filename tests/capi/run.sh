@@ -16,8 +16,9 @@ fi
 (cd "$root" && $zig build capi "$@")
 out=${CAPI_OUT:-$root/zig-out/capi-test}
 mkdir -p "$out"
-cxx_lib=-lc++
-[ "$(uname -s)" = Linux ] && cxx_lib="-lstdc++ -lpthread"
+# libanole needs no C++ runtime (src/capi/cxx_shim.cpp); threads on Linux.
+cxx_lib=
+[ "$(uname -s)" = Linux ] && cxx_lib=-lpthread
 # shellcheck disable=SC2086
 cc $cflags -std=c11 -Wall -Wextra -I"$root/zig-out/include" "$root/tests/capi/consumer.c" \
   "$root/zig-out/lib/libanole.a" $cxx_lib -o "$out/consumer"

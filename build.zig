@@ -754,6 +754,13 @@ pub fn build(b: *std.Build) void {
             .pic = true,
             .imports = &.{.{ .name = "anole", .module = anole_mod }},
         });
+        // The C++ runtime symbols BoringSSL's objects need, so that libanole
+        // needs no libstdc++ or libc++ in the final link (Linux has no
+        // std::__1 in libstdc++ at all).
+        if ((target.result.os.tag == .linux or target.result.os.tag.isDarwin()) and features.tls == .boringssl) {
+            capi_mod.link_libcpp = true;
+            capi_mod.addCSourceFile(.{ .file = b.path("src/capi/cxx_shim.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
+        }
         const capi_step = b.step("capi", "Build libanole (static and shared, only anole_* exported) and install include/anole.h");
         const zig_lib = b.addLibrary(.{ .name = "anole_zig", .linkage = .static, .root_module = capi_mod });
         zig_lib.bundle_compiler_rt = true;

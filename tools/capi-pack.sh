@@ -10,9 +10,9 @@
 #  - macOS: ld64 `-r -exported_symbols_list` (every other symbol becomes
 #    private extern: bound inside the final image, never exported).
 #  - Linux: `ld -r` then `objcopy --keep-global-symbol` (binutils).
-# Left undefined: libc, and on macOS the C++ runtime (BoringSSL's few C++
-# runtime references: operator delete, __cxa_pure_virtual, two libc++
-# internals), which the final link takes from the system (-lc++).
+# Left undefined: libc only. BoringSSL's few C++ runtime references
+# (operator delete, __cxa_pure_virtual, two libc++ internals) are defined
+# in src/capi/cxx_shim.cpp, so no C++ runtime is linked anywhere.
 set -eu
 out=$1; zig_lib=$2; shift 2
 mkdir -p "$out"
@@ -29,11 +29,12 @@ Darwin)
   rm -f "$out/libanole.a"
   ar rcs "$out/libanole.a" "$work/libanole.o" 2>/dev/null
   cc -dynamiclib -o "$out/libanole.dylib" -install_name @rpath/libanole.dylib \
-    "$work/libanole.o" -lc++ -Wl,-exported_symbols_list,"$work/exports"
+    "$work/libanole.o" -Wl,-exported_symbols_list,"$work/exports"
   ;;
 Linux)
   ld -r -o "$work/libanole.o" --whole-archive "$zig_lib" --no-whole-archive \
     --start-group "$@" --end-group
+  strip --strip-debug "$work/libanole.o"
   objcopy --wildcard --keep-global-symbol='anole_*' "$work/libanole.o"
   rm -f "$out/libanole.a"
   ar rcs "$out/libanole.a" "$work/libanole.o"

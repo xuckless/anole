@@ -96,6 +96,11 @@ const Slot = struct {
     next: u32 = no_slot,
     linked: bool = false,
     timed_out: bool = false,
+    // The executor's done list (replies waiting for its capi task, which
+    // wakes their tasks locally): one remote wake per burst of replies
+    // rather than one per reply.
+    next_done: u32 = no_slot,
+    drained: std.atomic.Value(bool) = .init(false),
 
     /// Above this, a slot's reply buffer is freed after use.
     const keep_capacity = 64 * 1024;
@@ -164,6 +169,10 @@ pub const Exec = struct {
     /// it watches for lost doorbells.
     sweeper_idle: bool = false,
     kick: std.Io.Event = .unset,
+    /// Slots answered and not yet handed to their tasks (an intrusive
+    /// stack, pushed by `respond` from any thread, taken whole by the
+    /// executor's capi task).
+    done_head: std.atomic.Value(u32) = .init(no_slot),
 
     fn link(x: *Exec, io: std.Io, i: u32, deadline: i96) void {
         if (x.dl_head == no_slot and x.sweeper_idle) {
@@ -281,7 +290,7 @@ pub const Consumer = struct {
 
     pub fn openFd(c: *Consumer) !void {
         if (comptime builtin.os.tag == .linux) {
-            const fd = std.c.eventfd(0, std.c.EFD.NONBLOCK | std.c.EFD.CLOEXEC);
+            const fd = std.c.eventfd(0, std.os.linux.EFD.NONBLOCK | std.os.linux.EFD.CLOEXEC);
             if (fd < 0) return error.SystemResources;
             c.fd_read = fd;
             c.fd_write = fd;
@@ -683,6 +692,7 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     slot.route_id = route.kind.consumer;
     slot.body = body;
     slot.event.reset();
+    slot.drained.store(false, .monotonic);
     slot.word.store(pack(gen, .queued), .release);
     const handle: Handle = .{ .gen = gen, .slot = @intCast(si), .exec = @intCast(xi) };
     x.link(io, si, std.Io.Clock.awake.now(io).nanoseconds + e.deadline.nanoseconds);
@@ -736,6 +746,12 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
             return;
         },
         .done => {
+            // Woken some other way (deadline, cancel) just as the reply
+            // came: the slot is still on the done list, so it may not be
+            // reused until the capi task has taken it.
+            while (!slot.drained.load(.acquire)) zio.yield() catch {
+                canceled = true;
+            };
             if (canceled) io.recancel();
             defer x.release(si);
             res.status = http.Status.fromCode(slot.status) catch .internal_server_error;
@@ -756,6 +772,15 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
 /// deadline than that.
 fn sweeper(e: *Engine, x: *Exec, io: std.Io) void {
     while (true) {
+        x.kick.reset();
+        // Replies: wake their tasks (local wakes, no syscalls).
+        var list = x.done_head.swap(no_slot, .acquire);
+        while (list != no_slot) {
+            const s = &x.slots[list];
+            list = s.next_done;
+            s.drained.store(true, .release);
+            s.event.set(io);
+        }
         const now = std.Io.Clock.awake.now(io).nanoseconds;
         while (x.dl_head != no_slot) {
             const i = x.dl_head;
@@ -773,7 +798,6 @@ fn sweeper(e: *Engine, x: *Exec, io: std.Io) void {
             until = @min(until, now + rewake);
         };
         x.sweeper_idle = x.dl_head == no_slot;
-        x.kick.reset();
         x.kick.waitTimeout(io, .{ .duration = .{ .raw = .{ .nanoseconds = until - now }, .clock = .awake } }) catch |err| switch (err) {
             error.Timeout => {},
             error.Canceled => return,
@@ -1012,9 +1036,14 @@ pub fn respond(e: *Engine, hv: u64, status: u16, headers: []const CHeader, body:
     slot.body_len = @intCast(body.len);
     slot.bytes.appendSliceAssumeCapacity(body);
     slot.status = status;
-    // The event first, then `done`: once the executor sees `done` this
-    // thread no longer touches the slot (the event included), so the slot
-    // can be reused at once.
-    slot.event.set(e.io);
     slot.word.store(pack(h.gen, .done), .release);
+    // Onto the executor's done list; only the push that finds it empty
+    // wakes the executor's capi task (one remote wake per burst).
+    const x = &e.execs[h.exec];
+    var old = x.done_head.load(.monotonic);
+    while (true) {
+        slot.next_done = old;
+        old = x.done_head.cmpxchgWeak(old, h.slot, .release, .monotonic) orelse break;
+    }
+    if (old == no_slot) x.kick.set(e.io);
 }
