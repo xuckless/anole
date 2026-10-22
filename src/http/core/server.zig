@@ -3072,6 +3072,28 @@ fn fuzzConnection(input: []const u8) !void {
     defer _ = std.c.close(fds[1]);
     const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = .{ .ip4 = .loopback(40000) } } };
 
+    // The input and its end go in before the connection starts reading. On
+    // macOS a thread blocked reading a socketpair(2) end can miss the
+    // wakeup of its peer's shutdown(SHUT_WR) and sleep on, after the bytes,
+    // until something else wakes it: a plain C reader on read(2) or
+    // recvmsg(2) does this about once in 3,000 to 30,000 pairs on macOS 27
+    // (none in 600,000 TCP loopback pairs, none on Linux). An end that is
+    // already there when the reads start is seen at once. The input fits
+    // the socket buffer (at most `fuzz.max_len`, 4 KiB; 8 KiB on macOS).
+    var wrote: usize = 0;
+    while (wrote < input.len) {
+        const n = std.c.write(fds[1], input[wrote..].ptr, input.len - wrote);
+        if (n <= 0) {
+            _ = std.c.close(fds[0]);
+            return error.InputDidNotFit;
+        }
+        wrote += @intCast(n);
+    }
+    if (std.c.shutdown(fds[1], std.c.SHUT.WR) != 0) {
+        _ = std.c.close(fds[0]);
+        return error.Shutdown;
+    }
+
     // As the accept loop leaves it.
     _ = server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
     try server.reserveConnectionSlot();
@@ -3080,13 +3102,6 @@ fn fuzzConnection(input: []const u8) !void {
     var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ &server, &l, stream });
     var finished = false;
     defer if (!finished) future.cancel(io) catch {};
-    var wrote: usize = 0;
-    while (wrote < input.len) {
-        const n = std.c.write(fds[1], input[wrote..].ptr, input.len - wrote);
-        if (n <= 0) break; // the server hung up first
-        wrote += @intCast(n);
-    }
-    _ = std.c.shutdown(fds[1], std.c.SHUT.WR);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);
