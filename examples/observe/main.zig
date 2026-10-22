@@ -8,8 +8,17 @@
 //! (http://127.0.0.1:4318 when unset). Without a collector there the server
 //! runs the same; the exporter counts the spans it could not send as dropped.
 //!
+//! The app's routes are on the public listener (the port given); the
+//! operator's are on an "admin" listener, the next port, bound to loopback
+//! only, so neither the scraper's view nor the maintenance switch is
+//! reachable from outside. Behind a load balancer, bind it to a private
+//! interface instead.
+//!
 //!   GET /users/:id        "user <id>", with the request's trace ID
 //!   GET /chain/:id        calls /users/:id on this server, passing the trace on
+//!
+//! On the admin port (8086):
+//!
 //!   POST /maintenance     fail the readiness check
 //!   DELETE /maintenance   pass it again
 //!   GET /metrics          Prometheus text format
@@ -85,7 +94,11 @@ pub fn main(init: std.process.Init) !void {
     const otlp_endpoint = init.environ_map.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "http://127.0.0.1:4318";
 
     var app: App = .{ .port = port, .lookups = undefined, .maintenance_gauge = undefined };
-    var server = try anole.Server(App).init(init.gpa, .{}, &app);
+    var server = try anole.Server(App).init(init.gpa, .{ .listeners = &.{
+        .{ .name = "public", .address = "127.0.0.1", .port = port },
+        // Operators only: loopback (or a private interface), never public.
+        .{ .name = "admin", .address = "127.0.0.1", .port = port + 1 },
+    } }, &app);
     defer server.deinit();
 
     // Order matters only for what runs first: the IDs are set before the
@@ -98,21 +111,23 @@ pub fn main(init: std.process.Init) !void {
     server.use(observe.AccessLog.init(.{ .format = log_format, .exclude = &observe.probe_paths }));
     // Metrics: the HTTP series come from a middleware, the rest from the
     // application, on the registry the server serves at /metrics.
-    const registry = server.metrics(.{});
+    const registry = server.metrics(.{ .listener = "admin" });
     app.lookups = try registry.counter("example_user_lookups_total", "User lookups, by how they arrived.", &.{"via"});
     app.maintenance_gauge = try registry.gauge("example_maintenance", "1 while in maintenance mode.", &.{});
     app.maintenance_gauge.with(&.{}).set(0);
     // /healthz and /readyz, with a readiness check of our own.
-    try server.health(.{}).addCheck("maintenance", notInMaintenance, &app);
+    try server.health(.{ .listener = "admin" }).addCheck("maintenance", notInMaintenance, &app);
 
     server.get("/users/:id", handleUser);
     server.get("/chain/:id", handleChain);
-    server.post("/maintenance", handleMaintenanceOn);
-    server.delete("/maintenance", handleMaintenanceOff);
+    // The maintenance switch changes what the load balancer sees: only on
+    // the admin listener (404 on the public one).
+    const admin = server.group("/maintenance", .{anole.onlyOn("admin")});
+    admin.post("", handleMaintenanceOn);
+    admin.delete("", handleMaintenanceOff);
 
     std.log.info("sending spans to {s}/v1/traces", .{otlp_endpoint});
-    var addr_buf: [32]u8 = undefined;
-    try server.listen(try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port}));
+    try server.run();
     // `deinit` sends what is still queued.
     std.log.info("stopped; spans exported {d}, dropped {d} so far", .{
         exporter.exported.load(.monotonic), exporter.dropped.load(.monotonic),

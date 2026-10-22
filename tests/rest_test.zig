@@ -27,7 +27,7 @@ fn expectReply(want_status: anole.http.Status, want_body: []const u8, got: Reply
 }
 
 test "examples/rest: create, list, get, update, delete, the API key and JSON errors" {
-    var store: rest.Store = .{ .gpa = alloc };
+    var store: rest.Store = .{ .gpa = alloc, .api_key_digest = rest.keyDigest("test-api-key-not-a-secret") };
     defer store.deinit();
     var app = try Server.init(alloc, .{ .errors = .json, .executors = .exact(2) }, &store);
     defer app.deinit();
@@ -43,7 +43,7 @@ test "examples/rest: create, list, get, update, delete, the API key and JSON err
             const arena = arena_state.allocator();
             const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/api/users", .{a.addresses()[0].ip.getPort()});
             const one = try std.fmt.allocPrint(arena, "{s}/1", .{base});
-            const key = "secret";
+            const key = "test-api-key-not-a-secret";
 
             // The key: none is a 401, a wrong one a 403, both as JSON.
             try expectReply(.unauthorized, "{\"error\":\"Unauthorized\"}", try call(io, arena, .get, base, null, null));

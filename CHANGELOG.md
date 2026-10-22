@@ -102,6 +102,12 @@ breaking changes are listed anyway.
   operating system (`std.Io.randomSecure`) and fail rather than fall back
   to a weaker source; `apikey.generate` can now return
   `error.EntropyUnavailable`.
+- Examples model the safe patterns: `examples/rest` (and the
+  getting-started guide) read the API key from `API_KEY`, keep its SHA-256
+  and compare in constant time instead of a hard-coded key compared with
+  `std.mem.eql`; `examples/observe` serves `/metrics`, the health routes and
+  its `/maintenance` switch on a loopback-only admin listener (the next
+  port) instead of the public one.
 
 ### C ABI (ABI 0.1)
 

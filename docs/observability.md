@@ -13,6 +13,11 @@ zig build run-observe                  # port 8085, JSON access log
 zig build run-observe -- 9000 text     # another port, text access log
 ```
 
+The app's routes are on that port; `/metrics`, `/healthz`, `/readyz` and
+the `/maintenance` switch are on an `admin` listener on the next port
+(8086), bound to loopback, as [Keep them off the public
+port](#keep-them-off-the-public-port) describes.
+
 ## Wiring
 
 The server sets each one up in a line, and owns what it makes:
@@ -346,7 +351,7 @@ A check is a `fn (ctx: ?*anyopaque) bool` plus a context pointer, added with
 `/readyz` request, so keep them cheap: read a flag that a background task
 keeps current rather than querying a database.
 
-From the example, after `POST /maintenance`:
+From the example, after `POST /maintenance` on its admin port:
 
 ```
 HTTP/1.1 503 Service Unavailable
