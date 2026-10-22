@@ -30,6 +30,10 @@ pub fn init(config: Config) RequestId {
     return .{ .header = config.header, .trust_incoming = config.trust_incoming };
 }
 
+/// Only sets the ID before `next()`: requests behind it can detach
+/// (`Detached`).
+pub const detach_safe = true;
+
 pub fn execute(self: *const RequestId, req: *Request, res: *Response, executor: anytype) !void {
     req.id = if (self.trust_incoming) incoming(req, self.header) orelse try generate(req) else try generate(req);
     try res.header(self.header, req.id);

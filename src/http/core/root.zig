@@ -27,6 +27,9 @@ pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 /// Where a response goes when a protocol engine (HTTP/2) frames it; see `Response.initSink`.
 pub const Sink = @import("sink.zig").Sink;
+/// A response finished after its handler returned, with no task waiting
+/// (`Response.detach`): HTTP/2 and HTTP/3 requests that ran on the reader.
+pub const Detached = @import("detach.zig").Detached;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");

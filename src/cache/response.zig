@@ -184,8 +184,32 @@ pub const ResponseCache = struct {
         const before = res.headers.len;
         try executor.next();
         if (req.method == .head) return;
+        if (res.isDetached()) {
+            const later = try req.arena.create(Later);
+            later.* = .{ .cache = self, .local = local, .before = before, .stamp = stamp };
+            res.onFinish(&later.finisher);
+            return;
+        }
         self.keep(local, req, res, before, stamp) catch {};
     }
+
+    /// A detached response (`dusty.Detached`) is kept when it is finished,
+    /// on the executor it was asked on.
+    pub const detach_safe = true;
+
+    const Later = struct {
+        finisher: dusty.Detached.Finisher = .{ .func = run },
+        cache: *ResponseCache,
+        local: *Local,
+        before: usize,
+        stamp: store.Stamp,
+
+        fn run(f: *dusty.Detached.Finisher, req: *Request, res: *Response, result: anyerror!void) void {
+            const later: *Later = @alignCast(@fieldParentPtr("finisher", f));
+            result catch return;
+            later.cache.keep(later.local, req, res, later.before, later.stamp) catch {};
+        }
+    };
 
     fn credentials(self: *const ResponseCache, req: *const Request) bool {
         for (self.options.credential_headers) |name| if (req.headers.get(name) != null) return true;

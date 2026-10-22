@@ -11,6 +11,7 @@ const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
 const Adopter = @import("server.zig").Adopter;
 pub const Sink = @import("sink.zig").Sink;
+pub const Detached = @import("detach.zig").Detached;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
 const ErrorFormat = @import("config.zig").ErrorFormat;
@@ -762,6 +763,16 @@ pub const Response = struct {
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
+    /// Set by an engine that can finish this response with no task waiting
+    /// for it (HTTP/2 and HTTP/3 requests that run on the reader): see
+    /// `detach`.
+    detach_engine: ?*const Detached.Engine = null,
+    detach_ctx: ?*anyopaque = null,
+    /// A middleware that is not detach-safe ran (`Detached`): `detach` is
+    /// refused.
+    detach_blocked: bool = false,
+    /// Set by `detach`.
+    detached: ?*Detached = null,
 
     /// A file body set up by `sendFile`.
     pub const BodyFile = struct {
@@ -1292,6 +1303,50 @@ pub const Response = struct {
         // and none of the events; the body writer already drops what it is
         // given for a HEAD, so no send has to ask.
         return .{ .body = try self.stream(buf) };
+    }
+
+    /// Whether `detach` would work: the engine supports it, nothing has
+    /// gone out, and every middleware the request passed is detach-safe.
+    pub fn canDetach(self: *const Response) bool {
+        return self.detach_engine != null and !self.detach_blocked and self.detached == null and !self.headers_written;
+    }
+
+    /// Whether the handler detached the response (`detach`): a detach-safe
+    /// middleware that does work after `executor.next()` puts it off with
+    /// `onFinish` instead.
+    pub fn isDetached(self: *const Response) bool {
+        return self.detached != null;
+    }
+
+    /// Detaches the response from the handler (see `Detached`): the handler
+    /// returns, and `finish` on the result, later and on this request's
+    /// executor, writes the response. The request and the response stay
+    /// valid until then. `owner.abort` runs instead if the request goes
+    /// away first. `error.Unsupported` when `canDetach` is false; the
+    /// handler then answers as usual (waiting, if it must).
+    pub fn detach(self: *Response, req: *Request, owner: Detached.Owner) error{ Unsupported, OutOfMemory }!*Detached {
+        if (!self.canDetach()) return error.Unsupported;
+        const d = try self.arena.create(Detached);
+        d.* = .{
+            .request = req,
+            .response = self,
+            .engine = self.detach_engine.?,
+            .engine_ctx = self.detach_ctx.?,
+            .owner = owner,
+        };
+        self.detached = d;
+        return d;
+    }
+
+    /// For a detach-safe middleware whose `executor.next()` returned with
+    /// the response detached: `f` runs when the response is finished, in
+    /// place of the work the middleware would have done after `next()`.
+    /// `f` lives in the request's arena or longer.
+    pub fn onFinish(self: *Response, f: *Detached.Finisher) void {
+        const d = self.detached orelse return;
+        f.next = null;
+        if (d.last) |l| l.next = f else d.first = f;
+        d.last = f;
     }
 
     /// Hands the connection over to `adopter` (see `Adopter`) once the

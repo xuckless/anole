@@ -353,6 +353,9 @@ pub fn onlyOn(name: []const u8) OnlyOn {
 pub const OnlyOn = struct {
     name: []const u8,
 
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, executor: anytype) !void {
         if (!std.mem.eql(u8, req.listener.name, self.name)) return error.NotFound;
         return executor.next();
@@ -590,6 +593,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         const AltSvc = struct {
             value: ?[]const u8 = null,
             listener: ?*const http.Listener = null,
+
+            /// Does nothing after `next()`: requests behind it can detach.
+            pub const detach_safe = true;
 
             pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
                 if (self.value) |v| if (req.version_major != 3 and self.listener != null and req.listener == self.listener.?) try res.header("Alt-Svc", v);

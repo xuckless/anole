@@ -79,6 +79,9 @@ pub const Middleware = struct {
         return .{ .lookup = lookup };
     }
 
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         const key = fromRequest(req) orelse return unauthorized(res);
         const found = (try self.lookup.lookup(self.lookup.ptr, req.arena, digest(key))) orelse return unauthorized(res);

@@ -80,6 +80,9 @@ pub const RequireJwt = struct {
         return .{ .keys = keys, .policy = policy, .options = options };
     }
 
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const RequireJwt, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         const header = req.headers.get("Authorization") orelse return self.refuse(res, .missing);
         const space = std.mem.indexOfScalar(u8, header, ' ') orelse return self.refuse(res, .missing);

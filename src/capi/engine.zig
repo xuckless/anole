@@ -1,31 +1,69 @@
-//! The C ABI's engine (M17 spike): requests that a route hands to a
-//! consumer (a language thread: Node, Python, a C program) cross through
-//! a lock-free ring per executor, and the consumer answers by handle.
+//! The engine under Anole's C ABI (`include/anole.h`): requests a route
+//! hands to a consumer (a language thread: Node, Python, a C program) cross
+//! through a lock-free ring per executor, and the consumer answers by
+//! handle. docs/c-abi.md is the binding author's view; this is how it works.
 //!
-//! Rules (research/c-abi-design-2026-10-21.md, recommendation 1):
+//! Rules (research/c-abi-design-2026-10-21.md, as amended by the spike):
 //! - No executor ever runs consumer code. An executor fills a slot, pushes
 //!   its handle onto the ring of the consumer it feeds, and rings the
 //!   consumer's doorbell only when the consumer has said it is going to
 //!   sleep (`awake` false). The doorbell is the consumer's own non-blocking
-//!   callback (a threadsafe function, an eventfd write) or Anole's fd.
-//! - The consumer drains a whole batch with one `poll` into its own
-//!   buffer, and answers with `respond`, which copies the reply into the
-//!   slot and wakes the waiting task (zio's remote wake).
-//! - Handles are 64-bit: executor (8 bits), slot (24), generation (32).
-//!   A slot's state and generation share one atomic word, so a stale
-//!   handle can never claim a reused slot: it gets `error.Gone`.
-//! - Anole enforces the deadline: the task stops waiting, answers 504 and
-//!   frees the slot; a reply after that gets `error.Gone`.
+//!   callback (a threadsafe function, an eventfd write) or Anole's fd. A
+//!   doorbell may be lost (Bun's threadsafe functions drop calls), so each
+//!   executor rings again after `timeouts.rewake_ms` when its ring stays
+//!   unpolled: "at least once, may repeat".
+//! - The consumer drains a whole batch with one `poll` into its own buffer
+//!   and answers with `respond` (or a stream), which writes the reply into
+//!   the slot and pushes the slot onto its executor's done list. Only the
+//!   push that finds the list empty wakes the executor's capi task, which
+//!   hands each reply to its request: one remote wake per burst.
+//! - Handles are 64-bit: executor (8 bits), slot (24), generation (32). A
+//!   slot's state and generation share one atomic word, so a stale handle
+//!   can never claim a reused slot: it gets `error.Gone`.
+//! - Over HTTP/1.1 the request's task waits for the reply. Over HTTP/2 and
+//!   HTTP/3, a request that arrived whole runs on the connection's reader
+//!   and its response is detached (`anole.http.core.Detached`): no task
+//!   waits, and the capi task writes the reply into the connection, whose
+//!   writer sends it. A streamed reply or a file gets a task then.
+//! - Anole enforces deadlines with one sweeper per executor (the capi task)
+//!   over a deadline-ordered list per distinct timeout: no timer per
+//!   request. At the deadline the client gets 504 and the slot is freed
+//!   at once; a reply after that gets `error.Gone`.
 const std = @import("std");
+const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
+pub const abi = @import("abi.zig");
+const config_mod = @import("config.zig");
+const pipe_mod = @import("pipe.zig");
+const features = anole.features;
 const http = anole.http;
 const zio = anole.zio;
 const placement = dusty.placement;
+const Detached = dusty.Detached;
+const Pipe = pipe_mod.Pipe;
+const Chunk = pipe_mod.Chunk;
+pub const Config = config_mod.Config;
+pub const ws = if (features.websocket) @import("ws.zig") else struct {
+    pub const ExecState = struct {
+        pub fn deinit(_: *ExecState) void {}
+    };
+};
+pub const pipe = pipe_mod;
+pub const config = config_mod;
+
+const log = std.log.scoped(.anole_capi);
 
 /// The allocator for everything here: thread-safe, since consumers and
 /// executors both use it.
-pub const gpa = std.heap.smp_allocator;
+pub const gpa = if (builtin.mode == .debug) debug_gpa.allocator() else std.heap.smp_allocator;
+var debug_gpa: std.heap.DebugAllocator(.{ .thread_safe = true, .stack_trace_frames = 8 }) = .init;
+
+/// The `std.Io` for consumer threads that block (`poll_wait`, blocking
+/// reads and writes) and for `start`/`wait`, outside the runtime.
+pub fn threadedIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
 
 // ---------------------------------------------------------------------------
 // Slots and handles
@@ -35,15 +73,18 @@ pub const SlotState = enum(u32) {
     free,
     /// Filled, its handle in the consumer's ring.
     queued,
-    /// `poll` is copying its head out (executor memory is being read).
+    /// `poll` is copying its head out (request memory is being read).
     polling,
-    /// Delivered: the consumer owes a reply.
+    /// Delivered: the consumer owes an answer.
     out,
-    /// `respond` is copying the reply in.
+    /// The consumer is writing its answer in.
     responding,
-    /// The reply is in; the executor takes it.
+    /// The answer is in; the executor takes it.
     done,
-    /// The executor gave up (deadline, cancel): no reply is taken.
+    /// A streamed answer: the head is in, the body comes through `out`.
+    streaming,
+    /// The executor gave up on it (deadline, client gone): no answer is
+    /// taken.
     expired,
 };
 
@@ -72,70 +113,126 @@ pub const Handle = packed struct(u64) {
 
 const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
-const Slot = struct {
+const Reply = enum { respond, release, fd };
+
+pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
+    /// What a waiting request's task waits on (an answer, the deadline,
+    /// stream data), and what an attached stream task waits on.
     event: std.Io.Event = .unset,
-    // Request side: set by the executor before the handle is queued, read
-    // by `poll` while the state is `polling`.
+    /// What the request body's pump task waits on (room in `in`): an event
+    /// of its own, since it waits beside the request's task.
+    pump_event: std.Io.Event = .unset,
+
+    // The request: set by the executor before the handle is queued, read by
+    // `poll` while `polling`.
     req: *http.Request = undefined,
-    route_id: u32 = 0,
+    route: *const Route = undefined,
+    /// The body when it came inline.
     body: []const u8 = "",
-    // Reply side: written by `respond` while `responding`, read by the
-    // executor once `done`. Owned by the slot (thread-safe allocator),
-    // reused across requests.
+    flags: u16 = 0,
+    content_length: u64 = std.math.maxInt(u64),
+    remote: [64]u8 = undefined,
+    remote_len: u8 = 0,
+    claims: []const u8 = "",
+
+    // The answer: written by the consumer while `responding`, read by the
+    // executor once `done` or `streaming`. Owned by the slot (the
+    // thread-safe allocator), reused across requests.
+    reply: Reply = .respond,
     status: u16 = 0,
     headers: std.ArrayList(ReplyHeader) = .empty,
     bytes: std.ArrayList(u8) = .empty,
     body_off: u32 = 0,
     body_len: u32 = 0,
-    next_free: u32 = no_slot,
-    // The executor's deadline list (executor-local): requests out with a
-    // consumer, oldest first. The executor's sweeper task expires them.
+    /// `ANOLE_BODY_BORROW`: the consumer's own memory.
+    borrowed: ?[]const u8 = null,
+    fd: std.posix.fd_t = -1,
+    fd_offset: u64 = 0,
+    fd_len: u64 = 0,
+    /// Trailers of a streamed answer (`stream_end`), written under `out`'s
+    /// lock before it is marked ended.
+    trailers: std.ArrayList(ReplyHeader) = .empty,
+    trailer_bytes: std.ArrayList(u8) = .empty,
+
+    /// The request body when it is streamed (executor to consumer), and a
+    /// streamed answer's body (consumer to executor).
+    in: Pipe = .{},
+    out: Pipe = .{},
+
+    // Executor-local from here.
+    /// The request's response is detached (HTTP/2, HTTP/3): no task waits.
+    detached: ?*Detached = null,
+    /// The detached request went away while the consumer was in a call on
+    /// it: the capi task (or the sweeper) frees the slot once it can.
+    orphan: bool = false,
+    /// The sweeper's verdict for a waiting task.
+    timed_out: bool = false,
+    /// The request body failed (too large, cut short): the answer.
+    body_error: ?http.Status = null,
     deadline: i96 = 0,
+    list: u8 = 0,
     prev: u32 = no_slot,
     next: u32 = no_slot,
     linked: bool = false,
-    timed_out: bool = false,
-    // The executor's done list (replies waiting for its capi task, which
-    // wakes their tasks locally): one remote wake per burst of replies
-    // rather than one per reply.
     next_done: u32 = no_slot,
-    drained: std.atomic.Value(bool) = .init(false),
+    /// Taken off the done list by the capi task (a task woken some other
+    /// way must not free a slot still on it).
+    drained: std.atomic.Value(bool) = .init(true),
+    next_free: u32 = no_slot,
 
-    /// Above this, a slot's reply buffer is freed after use.
+    /// Above this, a slot's answer buffer is freed after use.
     const keep_capacity = 64 * 1024;
+
+    fn replyBody(s: *const Slot) []const u8 {
+        if (s.borrowed) |b| return b;
+        return s.bytes.items[s.body_off..][0..s.body_len];
+    }
 };
 
-const no_slot = std.math.maxInt(u32);
+pub const no_slot = std.math.maxInt(u32);
 
 // ---------------------------------------------------------------------------
 // The SPSC ring: one executor produces, one consumer thread consumes.
 
+/// A request whose record `poll` builds from its slot (`rec` null), or a
+/// record built already (owned, freed by `poll`).
+const Entry = struct {
+    handle: u64,
+    rec: ?[*]align(8) u8,
+};
+
 const Ring = struct {
     head: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
     tail: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
-    buf: []u64,
+    buf: []Entry,
     mask: u64,
 
     fn init(capacity: usize) !Ring {
-        const cap = std.math.ceilPowerOfTwo(usize, capacity) catch return error.OutOfMemory;
-        return .{ .buf = try gpa.alloc(u64, cap), .mask = cap - 1 };
+        const cap = std.math.ceilPowerOfTwo(usize, @max(capacity, 2)) catch return error.OutOfMemory;
+        return .{ .buf = try gpa.alloc(Entry, cap), .mask = cap - 1 };
     }
     fn deinit(r: *Ring) void {
+        // Records nobody polled.
+        var h = r.head.raw;
+        while (h != r.tail.raw) : (h += 1) if (r.buf[h & r.mask].rec) |rec| freeRecord(rec);
         gpa.free(r.buf);
     }
     /// Producer. False when full.
-    fn push(r: *Ring, v: u64) bool {
+    fn push(r: *Ring, e: Entry) bool {
         const tail = r.tail.raw;
         if (tail - r.head.load(.acquire) == r.buf.len) return false;
-        r.buf[tail & r.mask] = v;
+        r.buf[tail & r.mask] = e;
         // seq_cst: ordered before the producer's read of `awake` (Dekker
         // with the consumer's store of `awake` and read of `tail`).
         r.tail.store(tail + 1, .seq_cst);
         return true;
     }
+    fn full(r: *Ring) bool {
+        return r.tail.raw - r.head.load(.acquire) == r.buf.len;
+    }
     /// Consumer.
-    fn peek(r: *Ring) ?u64 {
+    fn peek(r: *Ring) ?Entry {
         const head = r.head.raw;
         if (head == r.tail.load(.seq_cst)) return null;
         return r.buf[head & r.mask];
@@ -144,56 +241,89 @@ const Ring = struct {
         r.head.store(r.head.raw + 1, .release);
     }
     fn isEmpty(r: *Ring) bool {
-        return r.head.raw == r.tail.load(.seq_cst);
+        return r.head.load(.acquire) == r.tail.load(.seq_cst);
     }
+};
+
+fn freeRecord(rec: [*]align(8) u8) void {
+    const ev: *const abi.Event = @ptrCast(rec);
+    gpa.free(rec[0..ev.len]);
+}
+
+/// A record of `size` bytes (rounded up), its header filled in.
+fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
+    const n = abi.alignUp(size);
+    const rec = try gpa.alignedAlloc(u8, .@"8", n);
+    @memset(rec[@sizeOf(abi.Event)..], 0);
+    const ev: *abi.Event = @ptrCast(rec.ptr);
+    ev.* = .{ .type = @intFromEnum(typ), .len = @intCast(n), .handle = handle };
+    return rec;
+}
+
+// ---------------------------------------------------------------------------
+// Work for an executor's capi task, from any thread.
+
+pub const Command = struct {
+    next: ?*Command = null,
+    /// On the executor's capi task. Frees the command.
+    run: *const fn (cmd: *Command, x: *Exec) void,
 };
 
 // ---------------------------------------------------------------------------
 // Executors and consumers
 
+const DeadlineList = struct {
+    head: u32 = no_slot,
+    tail: u32 = no_slot,
+};
+
 pub const Exec = struct {
+    engine: *Engine,
     index: u8,
     slots: []Slot,
     /// Only this executor touches the free list.
     free_head: u32,
     ring: Ring,
     consumer: ?*Consumer = null,
-    /// The deadline list: every consumer request has the same timeout, so
-    /// appending keeps it in deadline order, and one sleeping task per
-    /// executor enforces them all (a timer per request cost ~20% of the
-    /// executor's throughput here).
-    dl_head: u32 = no_slot,
-    dl_tail: u32 = no_slot,
-    /// The sweeper sleeps a whole request timeout while nothing is out; the
-    /// first request handed over wakes it (once per idle period) so that
-    /// it watches for lost doorbells.
-    sweeper_idle: bool = false,
+    /// One list per distinct timeout: appending keeps each in deadline
+    /// order, and the capi task sleeps until the earliest head.
+    lists: [config_mod.max_timeouts]DeadlineList = @splat(.{}),
+    /// The capi task's wake: an answer, a command, a deadline to look at.
     kick: std.Io.Event = .unset,
-    /// Slots answered and not yet handed to their tasks (an intrusive
-    /// stack, pushed by `respond` from any thread, taken whole by the
-    /// executor's capi task).
+    /// The capi task sleeps a whole request timeout while nothing is out;
+    /// the first request handed over wakes it, so that it watches for lost
+    /// doorbells.
+    idle: bool = false,
+    /// Answered slots not yet handed to their requests: an intrusive stack
+    /// pushed by consumers, taken whole by the capi task.
     done_head: std.atomic.Value(u32) = .init(no_slot),
+    /// Commands (WebSocket sends, publishes), likewise.
+    inbox: std.atomic.Value(?*Command) = .init(null),
+    ws: ws.ExecState = .{},
 
-    fn link(x: *Exec, io: std.Io, i: u32, deadline: i96) void {
-        if (x.dl_head == no_slot and x.sweeper_idle) {
-            x.sweeper_idle = false;
-            x.kick.set(io);
+    fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
+        if (x.idle) {
+            x.idle = false;
+            x.kick.set(x.engine.io);
         }
         const s = &x.slots[i];
         s.deadline = deadline;
+        s.list = list;
         s.timed_out = false;
         s.linked = true;
         s.next = no_slot;
-        s.prev = x.dl_tail;
-        if (x.dl_tail != no_slot) x.slots[x.dl_tail].next = i else x.dl_head = i;
-        x.dl_tail = i;
+        const l = &x.lists[list];
+        s.prev = l.tail;
+        if (l.tail != no_slot) x.slots[l.tail].next = i else l.head = i;
+        l.tail = i;
     }
 
     fn unlink(x: *Exec, i: u32) void {
         const s = &x.slots[i];
         if (!s.linked) return;
-        if (s.prev != no_slot) x.slots[s.prev].next = s.next else x.dl_head = s.next;
-        if (s.next != no_slot) x.slots[s.next].prev = s.prev else x.dl_tail = s.prev;
+        const l = &x.lists[s.list];
+        if (s.prev != no_slot) x.slots[s.prev].next = s.next else l.head = s.next;
+        if (s.next != no_slot) x.slots[s.next].prev = s.prev else l.tail = s.prev;
         s.linked = false;
     }
 
@@ -203,59 +333,143 @@ pub const Exec = struct {
         x.free_head = x.slots[i].next_free;
         return i;
     }
+
+    /// Frees slot `i`: a new generation makes every handle to the old one
+    /// stale. What its pipes still hold is freed or reported sent.
     fn release(x: *Exec, i: u32) void {
         x.unlink(i);
         const s = &x.slots[i];
         const gen = genOf(s.word.load(.monotonic));
+        x.closePipe(&s.in, gen, i);
+        x.closePipe(&s.out, gen, i);
+        if (s.fd >= 0) {
+            _ = std.c.close(s.fd);
+            s.fd = -1;
+        }
+        if (s.borrowed) |b| {
+            x.postSent(Handle.encode(.{ .gen = gen, .slot = @intCast(i), .exec = x.index }), b);
+            s.borrowed = null;
+        }
         if (s.bytes.capacity > Slot.keep_capacity) {
             s.bytes.clearAndFree(gpa);
             s.headers.clearAndFree(gpa);
         }
-        // A new generation: every handle to the old one is stale now. 0 is
-        // skipped so that no handle is ever 0.
+        if (s.trailer_bytes.capacity > Slot.keep_capacity) {
+            s.trailer_bytes.clearAndFree(gpa);
+            s.trailers.clearAndFree(gpa);
+        }
+        s.detached = null;
+        s.orphan = false;
+        s.body_error = null;
+        s.claims = "";
+        _ = x.engine.inflight.fetchSub(1, .monotonic);
+        // 0 is skipped so that no handle is ever 0.
         const next = if (gen == std.math.maxInt(u32)) 1 else gen + 1;
         s.word.store(pack(next, .free), .release);
         s.next_free = x.free_head;
         x.free_head = i;
     }
+
+    fn closePipe(x: *Exec, p: *Pipe, gen: u32, i: u32) void {
+        p.acquire();
+        const was_open = p.gen != 0;
+        const rest = p.close();
+        p.release();
+        if (!was_open and rest.len == 0) return;
+        for (rest) |ch| {
+            dropChunk(x, i, gen, ch);
+        }
+        p.acquire();
+        p.clear();
+        p.release();
+        // A consumer thread blocked on it sees the end.
+        p.notifyBlocked();
+    }
+
+    /// Queues an owned record for the consumer, waiting for room in the
+    /// ring if `wait` (else dropping it when full: advisory events only).
+    pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
+        const c = x.consumer orelse return freeRecord(rec.ptr);
+        while (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
+            if (!wait) return freeRecord(rec.ptr);
+            zio.yield() catch return freeRecord(rec.ptr);
+        }
+        c.wake();
+    }
+
+    /// A small advisory event (`ANOLE_EV_ABORT`, `_BODY`, `_WRITABLE`,
+    /// `_WS_DRAIN`).
+    pub fn postEvent(x: *Exec, typ: abi.EventType, handle: u64) void {
+        const rec = newRecord(@sizeOf(abi.Event), typ, handle) catch return;
+        x.postRecord(rec, false);
+    }
+
+    /// `ANOLE_EV_SENT` for a borrowed body: it must arrive, so it waits for
+    /// room when it can.
+    pub fn postSent(x: *Exec, handle: u64, data: []const u8) void {
+        const rec = newRecord(@sizeOf(abi.SentEvent), .sent, handle) catch return;
+        const ev: *abi.SentEvent = @ptrCast(rec.ptr);
+        ev.data = @intFromPtr(data.ptr);
+        ev.len = data.len;
+        x.postRecord(rec, placement.currentExecutor(x.engine.io) != null);
+    }
+
+    pub fn post(x: *Exec, cmd: *Command) void {
+        var old = x.inbox.load(.monotonic);
+        while (true) {
+            cmd.next = old;
+            old = x.inbox.cmpxchgWeak(old, cmd, .release, .monotonic) orelse break;
+        }
+        if (old == null) x.kick.set(x.engine.io);
+    }
+
+    fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
+        return Handle.encode(.{ .gen = gen, .slot = @intCast(i), .exec = x.index });
+    }
 };
 
-pub const WakeFn = *const fn (?*anyopaque) callconv(.c) void;
+pub const WakeFn = abi.WakeFn;
 
-const builtin = @import("builtin");
 /// Windows has no pollable doorbell fd: consumers there pass a callback.
 const have_fd = builtin.os.tag != .windows;
-/// A doorbell fd (a plain int; unused on Windows).
-pub const Fd = c_int;
 
 pub const Consumer = struct {
     engine: *Engine,
     wake_fn: ?WakeFn,
     wake_ud: ?*anyopaque,
+    shared: bool,
     /// Anole's own doorbell when the consumer gave no callback: an eventfd
     /// (Linux) or a pipe (elsewhere).
-    fd_read: Fd = -1,
-    fd_write: Fd = -1,
+    fd_read: std.posix.fd_t = -1,
+    fd_write: std.posix.fd_t = -1,
     /// True while the consumer will poll again without being woken.
     awake: std.atomic.Value(bool) align(std.atomic.cache_line) = .init(false),
+    /// Bumped by every wake, for threads blocked in `poll_wait`.
+    bell: std.atomic.Value(u32) = .init(0),
+    waiters: std.atomic.Value(u32) = .init(0),
+    /// Serializes a shared consumer's polls.
+    poll_lock: std.Io.Mutex = .init,
     /// The executors this consumer is fed by (set at start).
     execs: std.ArrayList(*Exec) = .empty,
     next_exec: usize = 0,
     stopped_sent: bool = false,
     /// When `poll` last ran (awake clock, ns), for the lost-wake check.
     last_poll: std.atomic.Value(i64) = .init(0),
-    // Counters, for the spike's report.
     wakes: std.atomic.Value(u64) = .init(0),
     rewakes: std.atomic.Value(u64) = .init(0),
-    polls: u64 = 0,
-    delivered: u64 = 0,
 
     pub fn wake(c: *Consumer) void {
         // Cheap when the consumer is busy: one load of a line it rarely
         // writes.
         if (c.awake.load(.seq_cst)) return;
         if (c.awake.swap(true, .seq_cst)) return;
+        c.ring();
+    }
+
+    fn ring(c: *Consumer) void {
         _ = c.wakes.fetchAdd(1, .monotonic);
+        _ = c.bell.fetchAdd(1, .release);
+        if (c.waiters.load(.acquire) > 0) threadedIo().futexWake(u32, &c.bell.raw, std.math.maxInt(u32));
         if (c.wake_fn) |f| return f(c.wake_ud);
         if (have_fd and c.fd_write >= 0) {
             if (comptime builtin.os.tag == .linux) {
@@ -268,14 +482,12 @@ pub const Consumer = struct {
         }
     }
 
-    /// Rings again although the doorbell is up: the runtime lost the
-    /// first ring (Bun 1.3's threadsafe functions drop calls; a loop
-    /// shutting down drops call_soon_threadsafe). Any executor's sweeper.
+    /// Rings again although the doorbell is up: the runtime lost the first
+    /// ring (Bun 1.3's threadsafe functions drop calls; a loop shutting
+    /// down drops call_soon_threadsafe). From any executor's capi task.
     fn rewake(c: *Consumer) void {
         _ = c.rewakes.fetchAdd(1, .monotonic);
-        if (c.wake_fn) |f| return f(c.wake_ud);
-        c.awake.store(false, .seq_cst);
-        c.wake();
+        c.ring();
     }
 
     fn drainFd(c: *Consumer) void {
@@ -288,7 +500,7 @@ pub const Consumer = struct {
         }
     }
 
-    pub fn openFd(c: *Consumer) !void {
+    fn openFd(c: *Consumer) !void {
         if (comptime builtin.os.tag == .linux) {
             const fd = std.c.eventfd(0, std.os.linux.EFD.NONBLOCK | std.os.linux.EFD.CLOEXEC);
             if (fd < 0) return error.SystemResources;
@@ -309,7 +521,7 @@ pub const Consumer = struct {
         }
     }
 
-    pub fn deinit(c: *Consumer) void {
+    fn deinit(c: *Consumer) void {
         if (have_fd) {
             if (c.fd_read >= 0) _ = std.c.close(c.fd_read);
             if (c.fd_write >= 0 and c.fd_write != c.fd_read) _ = std.c.close(c.fd_write);
@@ -319,65 +531,18 @@ pub const Consumer = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Configuration (one JSON document)
-
-pub const Config = struct {
-    listeners: []const ListenerCfg = &.{.{}},
-    /// 0: one per CPU.
-    executors: u32 = 0,
-    limits: Limits = .{},
-    timeouts: Timeouts = .{},
-    routes: []const RouteCfg = &.{},
-
-    pub const ListenerCfg = struct {
-        name: ?[]const u8 = null,
-        address: []const u8 = "127.0.0.1",
-        port: u16 = 0,
-        h2c: bool = true,
-    };
-    pub const Limits = struct {
-        /// Request bodies up to this size are read before the request is
-        /// handed over, and delivered inline. Larger ones get 413 (spike).
-        inline_body_max: u32 = 65536,
-        /// Requests in flight in a consumer per executor; past it, 503.
-        max_inflight: u32 = 1024,
-        body_max: u32 = 1048576,
-    };
-    pub const Timeouts = struct {
-        /// The consumer's deadline: 504 from Anole after it.
-        request_ms: u32 = 30_000,
-        shutdown_ms: u32 = 10_000,
-        keepalive_ms: u32 = 60_000,
-        /// A consumer with events waiting that has not polled for this
-        /// long is woken again (a doorbell the language runtime lost).
-        /// 0: never.
-        rewake_ms: u32 = 20,
-    };
-    pub const RouteCfg = struct {
-        method: ?[]const u8 = null,
-        path: []const u8,
-        /// The consumer's route id: the request goes to a consumer.
-        handler: ?u32 = null,
-        /// A fixed response, served without the consumer.
-        respond: ?Fixed = null,
-        /// Fixed responses only: run them where the protocol engine reads
-        /// (HTTP/2, HTTP/3) rather than on a task of their own. On by
-        /// default; off only to measure what a task costs.
-        no_wait: bool = true,
-    };
-    pub const Fixed = struct {
-        status: u16 = 200,
-        body: []const u8 = "",
-        headers: std.json.ArrayHashMap([]const u8) = .{},
-    };
-};
+// Routes
 
 pub const Route = struct {
     engine: *Engine,
-    kind: union(enum) {
-        consumer: u32,
-        fixed: struct { status: http.Status, body: []const u8, headers: []const [2][]const u8 },
-    },
+    /// The consumer's route id ("handler").
+    id: u32,
+    /// Which deadline list (and timeout) its requests use.
+    list: u8 = 0,
+    /// Its requests may detach: nothing in its chain waits.
+    detachable: bool = true,
+    /// A WebSocket endpoint's settings.
+    ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
 };
 
 // ---------------------------------------------------------------------------
@@ -390,30 +555,42 @@ pub var global: ?*Engine = null;
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
     config: Config,
-    routes: []Route,
     signals: bool,
     consumers: std.ArrayList(*Consumer) = .empty,
     execs: []Exec = &.{},
     thread: ?std.Thread = null,
     phase: std.atomic.Value(Phase) = .init(.created),
-    /// Set by the anole main thread once listening (or failed); waited on
-    /// by `start` with a plain threaded Io (no runtime yet).
+    /// Set by the anole main thread once listening (or failed); waited on by
+    /// `start` with a plain threaded Io (no runtime yet).
     started: std.Io.Event = .unset,
     start_error: ?anyerror = null,
     stopped: std.Io.Event = .unset,
     app: ?*anole.App = null,
     /// The runtime's Io, for waking executor tasks from consumer threads
-    /// (zio's futex wake is process-wide and works from any thread).
+    /// (zio's wakes work from any thread).
     io: std.Io = undefined,
     ports: std.ArrayList(u16) = .empty,
-    /// One deadline sweeper per executor.
-    sweepers: std.Io.Group = .init,
-    deadline: std.Io.Duration,
+    /// One capi task per executor.
+    tasks: std.Io.Group = .init,
+    /// The timeout of each deadline list.
+    timeouts: [config_mod.max_timeouts]i96 = @splat(0),
+    ntimeouts: u8 = 1,
     inline_body_max: u32,
-    // Counters, for the spike's report.
+    stream_high_water: usize,
+    rewake: i96,
+    // Counters.
+    requests: std.atomic.Value(u64) = .init(0),
+    detached_count: std.atomic.Value(u64) = .init(0),
+    inflight: std.atomic.Value(u64) = .init(0),
     expired_count: std.atomic.Value(u64) = .init(0),
+    aborted_count: std.atomic.Value(u64) = .init(0),
     gone_count: std.atomic.Value(u64) = .init(0),
     busy_count: std.atomic.Value(u64) = .init(0),
+    websockets: std.atomic.Value(u64) = .init(0),
+    ws_in: std.atomic.Value(u64) = .init(0),
+    ws_out: std.atomic.Value(u64) = .init(0),
+    /// WebSocket topics, shared by every executor.
+    rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa) else {},
 
     pub fn create(json: []const u8, signals: bool, why: *std.Io.Writer) !*Engine {
         const e = try gpa.create(Engine);
@@ -421,69 +598,47 @@ pub const Engine = struct {
         e.* = .{
             .arena = .init(gpa),
             .config = undefined,
-            .routes = &.{},
             .signals = signals,
-            .deadline = undefined,
             .inline_body_max = 0,
+            .stream_high_water = 0,
+            .rewake = 0,
         };
         errdefer e.arena.deinit();
         const a = e.arena.allocator();
-        var diag: std.json.Diagnostics = .{};
-        var scanner = std.json.Scanner.initCompleteInput(a, json);
-        scanner.enableDiagnostics(&diag);
-        e.config = std.json.parseFromTokenSourceLeaky(Config, a, &scanner, .{ .allocate = .alloc_always }) catch |err| {
-            why.print("config: {t} at line {d} column {d}", .{ err, diag.getLine(), diag.getColumn() }) catch {};
-            return error.Config;
-        };
-        if (e.config.listeners.len == 0) {
-            why.writeAll("config: no listeners") catch {};
-            return error.Config;
-        }
-        e.deadline = .fromMilliseconds(e.config.timeouts.request_ms);
-        e.inline_body_max = e.config.limits.inline_body_max;
-        e.routes = try a.alloc(Route, e.config.routes.len);
-        for (e.config.routes, e.routes, 0..) |rc, *r, i| {
-            if ((rc.handler == null) == (rc.respond == null)) {
-                why.print("config: routes[{d}] needs exactly one of \"handler\" and \"respond\"", .{i}) catch {};
-                return error.Config;
-            }
-            if (rc.method) |m| if (methodOf(m) == null) {
-                why.print("config: routes[{d}].method \"{s}\" is unknown", .{ i, m }) catch {};
-                return error.Config;
-            };
-            if (rc.handler) |id| {
-                r.* = .{ .engine = e, .kind = .{ .consumer = id } };
-            } else {
-                const f = rc.respond.?;
-                const status = http.Status.fromCode(f.status) catch {
-                    why.print("config: routes[{d}].respond.status {d} is invalid", .{ i, f.status }) catch {};
-                    return error.Config;
-                };
-                const hs = try a.alloc([2][]const u8, f.headers.map.count());
-                var it = f.headers.map.iterator();
-                var j: usize = 0;
-                while (it.next()) |kv| : (j += 1) hs[j] = .{ kv.key_ptr.*, kv.value_ptr.* };
-                r.* = .{ .engine = e, .kind = .{ .fixed = .{ .status = status, .body = f.body, .headers = hs } } };
-            }
-        }
-        // One per process: the handlers and `respond` find it here.
+        // The document is copied: parsed values may point into it.
+        e.config = try config_mod.parse(a, try a.dupe(u8, json), why);
+        const cfg = &e.config;
+        e.inline_body_max = cfg.limits.inline_body_max;
+        e.stream_high_water = cfg.limits.stream_high_water;
+        e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
+        e.timeouts[0] = @as(i96, cfg.timeouts.request_ms) * std.time.ns_per_ms;
+        // One per process: `respond` and the handlers find it here.
         global = e;
         return e;
     }
 
-    fn methodOf(name: []const u8) ?http.Method {
-        var buf: [16]u8 = undefined;
-        if (name.len > buf.len) return null;
-        return std.meta.stringToEnum(http.Method, std.ascii.lowerString(&buf, name));
+    /// The deadline list for a route's `timeout_ms`.
+    fn listFor(e: *Engine, timeout_ms: ?u32) u8 {
+        const t: i96 = @as(i96, timeout_ms orelse return 0) * std.time.ns_per_ms;
+        for (e.timeouts[0..e.ntimeouts], 0..) |have, i| if (have == t) return @intCast(i);
+        e.timeouts[e.ntimeouts] = t;
+        e.ntimeouts += 1;
+        return e.ntimeouts - 1;
     }
 
-    pub fn attach(e: *Engine, wake_fn: ?WakeFn, wake_ud: ?*anyopaque) !*Consumer {
+    /// Whether any route sends events to a consumer.
+    pub fn needsConsumer(e: *const Engine) bool {
+        for (e.config.routes) |r| if (r.handler != null or r.websocket != null) return true;
+        return false;
+    }
+
+    pub fn attach(e: *Engine, wake_fn: ?WakeFn, wake_ud: ?*anyopaque, shared: bool) !*Consumer {
         if (e.phase.load(.acquire) != .created) return error.State;
         if (e.consumers.items.len >= 256) return error.State;
         const c = try gpa.create(Consumer);
         errdefer gpa.destroy(c);
-        c.* = .{ .engine = e, .wake_fn = wake_fn, .wake_ud = wake_ud };
-        if (wake_fn == null) try c.openFd();
+        c.* = .{ .engine = e, .wake_fn = wake_fn, .wake_ud = wake_ud, .shared = shared };
+        if (wake_fn == null and !shared and have_fd) try c.openFd();
         errdefer c.deinit();
         try e.consumers.append(gpa, c);
         return c;
@@ -495,8 +650,7 @@ pub const Engine = struct {
             e.phase.store(.failed, .release);
             return err;
         };
-        const tio = std.Io.Threaded.global_single_threaded.io();
-        e.started.waitUncancelable(tio);
+        e.started.waitUncancelable(threadedIo());
         if (e.start_error) |err| {
             e.thread.?.join();
             e.thread = null;
@@ -507,85 +661,178 @@ pub const Engine = struct {
     /// The anole main thread: owns the runtime (it becomes executor 0),
     /// serves until `drain`, then frees the server.
     fn mainThread(e: *Engine) void {
-        const tio = std.Io.Threaded.global_single_threaded.io();
         const cfg = e.config;
         const a = e.arena.allocator();
-        const listeners = a.alloc(anole.ServerOptions.Listener, cfg.listeners.len) catch |err| return e.failStart(err);
-        for (cfg.listeners, listeners, 0..) |l, *out, i| out.* = .{
-            .name = l.name orelse (std.fmt.allocPrint(a, "http{d}", .{i}) catch |err| return e.failStart(err)),
-            .address = l.address,
-            .port = l.port,
-            .http2 = l.h2c and anole.features.http2,
-        };
         var server_cfg: http.ServerConfig = .{};
         // Anole's own backstop, past the consumer deadline.
-        server_cfg.timeout.request = .fromMilliseconds(@as(i64, cfg.timeouts.request_ms) + 5000);
+        var longest: u32 = cfg.timeouts.request_ms;
+        for (cfg.routes) |r| if (r.timeout_ms) |t| {
+            longest = @max(longest, t);
+        };
+        server_cfg.timeout.request = .fromMilliseconds(@as(i64, longest) + 5000);
         server_cfg.timeout.shutdown = .fromMilliseconds(cfg.timeouts.shutdown_ms);
         server_cfg.timeout.keepalive = .fromMilliseconds(cfg.timeouts.keepalive_ms);
-        server_cfg.request.max_body_size = cfg.limits.body_max;
+        server_cfg.request.max_body_size = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize);
+        server_cfg.request.max_content_length = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize);
+        server_cfg.trusted_proxy_hops = cfg.trusted_proxy_hops;
+        if (cfg.limits.max_connections > 0) server_cfg.max_connections = cfg.limits.max_connections;
+        const listeners = buildListeners(a, cfg) catch |err| return e.failStart(err);
         var app = anole.App.init(gpa, .{
             .listeners = listeners,
             .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
             .signals = e.signals,
             .raise_fd_limit = true,
             .server = server_cfg,
+            .http3 = if (comptime features.http3) if (!wantsHttp3(cfg)) null else .{
+                .max_streams_bidi = cfg.http3.max_streams_bidi,
+                .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
+                .alt_svc = cfg.http3.alt_svc,
+                .early_data = cfg.http3.early_data,
+            } else null,
         }) catch |err| return e.failStart(err);
         e.app = &app;
         e.io = app.io();
         const nexec = app.rt.executors.items.len;
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
         e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
-        for (e.config.routes, e.routes) |rc, *r| {
-            const method: ?http.Method = if (rc.method) |m| methodOf(m) else null;
-            if (r.kind == .fixed)
-                app.router.addRouteWith(method, rc.path, fixedHandler, .{ .data = r, .no_wait = rc.no_wait })
-            else
-                app.router.addRouteWith(method, rc.path, consumerHandler, .{ .data = r });
-        }
-        for (e.execs, 0..) |*x, i| placement.concurrent(&e.sweepers, app.io(), .{ .executor = i }, sweeper, .{ e, x, app.io() }) catch |err| {
-            e.sweepers.cancel(app.io());
+        e.buildRoutes(&app) catch |err| return e.failStartDeinit(&app, err);
+        for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
+            e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
         };
-        var watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| return e.failStartDeinit(&app, err);
+        var watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
+            e.tasks.cancel(app.io());
+            return e.failStartDeinit(&app, err);
+        };
         e.phase.store(.running, .release);
         const result = app.run();
         watcher.cancel(app.io());
-        e.sweepers.cancel(app.io());
+        e.tasks.cancel(app.io());
+        if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
                 e.start_error = err;
-                e.started.set(tio);
-            } else std.log.scoped(.anole).err("server stopped: {t}", .{err});
+                e.started.set(threadedIo());
+            } else log.err("server stopped: {t}", .{err});
         }
         e.phase.store(.stopped, .release);
         e.app = null;
         app.deinit();
+        if (comptime features.websocket) e.rooms.deinit();
         // Every consumer hears of the stop (ANOLE_EV_STOPPED).
         for (e.consumers.items) |c| {
             c.awake.store(false, .seq_cst);
             c.wake();
         }
-        e.stopped.set(tio);
+        e.stopped.set(threadedIo());
+    }
+
+    fn wantsHttp3(cfg: Config) bool {
+        for (cfg.listeners) |l| if (l.http3) return true;
+        return false;
+    }
+
+    fn buildListeners(a: std.mem.Allocator, cfg: Config) ![]const anole.ServerOptions.Listener {
+        const out = try a.alloc(anole.ServerOptions.Listener, cfg.listeners.len);
+        for (cfg.listeners, out) |l, *o| {
+            o.* = .{
+                .name = l.name,
+                .address = l.address,
+                .port = l.port,
+                .unix = l.unix,
+                .http1 = l.http1,
+                .http2 = l.http2 and features.http2,
+                .http3 = l.http3,
+                .proxy_protocol = l.proxy_protocol,
+            };
+            if (l.tls) |t| {
+                if (comptime features.tls != .boringssl) return error.Unsupported;
+                o.tls = .{
+                    .cert = if (t.self_signed)
+                        .dev_self_signed
+                    else if (t.cert_file) |f|
+                        .fromFiles(f, t.key_file.?)
+                    else
+                        .fromPem(t.cert_pem.?, t.key_pem.?),
+                    .alpn_protocols = t.alpn,
+                };
+            }
+        }
+        return out;
+    }
+
+    /// The configured middleware and routes, on `app`.
+    fn buildRoutes(e: *Engine, app: *anole.App) !void {
+        const cfg = e.config;
+        const a = e.arena.allocator();
+        const M = http.Middleware(void);
+        if (cfg.observe.metrics) |m| _ = app.metrics(.{ .path = m.path });
+        if (cfg.observe.health) |h| _ = app.health(.{ .healthz_path = h.live, .readyz_path = h.ready });
+        for (cfg.middleware) |m| app.use(try config_mod.middleware(app, a, m));
+        const global_ok = config_mod.neverWaits(cfg.middleware);
+        for (cfg.routes) |rc| {
+            const method: ?http.Method = if (rc.method) |m| config_mod.methodOf(m) else null;
+            var chain: std.ArrayList(M) = .empty;
+            for (rc.middleware) |m| try chain.append(a, try config_mod.middleware(app, a, m));
+            if (rc.cache) |cc| {
+                const cache = app.responseCache(.{
+                    .ttl = .fromMilliseconds(cc.ttl_ms),
+                    .authenticated = cc.authenticated,
+                    .max_entries = cc.max_entries,
+                    .max_bytes = std.math.cast(usize, cc.max_bytes) orelse std.math.maxInt(usize),
+                    .name = rc.path,
+                });
+                try chain.append(a, M.init(cache));
+            }
+            const group = app.with(chain.items);
+            if (rc.respond) |f| {
+                group.inner.addRouteWith(method, rc.path, config_mod.FixedRoute.handler, .{ .data = try config_mod.fixed(a, f), .no_wait = rc.no_wait });
+            } else if (rc.static) |st| {
+                try group.staticDir(rc.path, st.dir, .{
+                    .index = st.index,
+                    .precompressed = try config_mod.precompressed(a, st.precompressed),
+                    .cache_control = st.cache_control,
+                    .hide_dotfiles = st.hide_dotfiles,
+                });
+            } else if (rc.handler) |id| {
+                const route = try a.create(Route);
+                route.* = .{
+                    .engine = e,
+                    .id = id,
+                    .list = e.listFor(rc.timeout_ms),
+                    .detachable = rc.no_wait and global_ok and config_mod.neverWaits(rc.middleware),
+                };
+                group.inner.addRouteWith(method, rc.path, consumerHandler, .{ .data = route, .no_wait = route.detachable });
+            } else if (rc.websocket) |wc| {
+                if (comptime !features.websocket) unreachable;
+                const route = try a.create(Route);
+                route.* = .{ .engine = e, .id = wc.handler, .ws = .{
+                    .max_message_size = cfg.limits.ws_max_message,
+                    .compression = wc.compression and features.compression,
+                    .close_on_drain = wc.close_on_drain,
+                } };
+                group.inner.addRouteWith(.get, rc.path, ws.handler, .{ .data = route });
+            }
+        }
     }
 
     fn watchReady(e: *Engine, app: *anole.App) void {
-        const tio = std.Io.Threaded.global_single_threaded.io();
         app.waitReady() catch |err| {
             e.start_error = err;
-            e.started.set(tio);
+            e.started.set(threadedIo());
             return;
         };
         for (app.addresses()) |addr| e.ports.append(gpa, switch (addr) {
             .ip => |ip| ip.getPort(),
             else => 0,
         }) catch {};
-        e.started.set(tio);
+        e.started.set(threadedIo());
     }
 
     fn failStart(e: *Engine, err: anyerror) void {
         e.start_error = err;
         e.phase.store(.failed, .release);
-        e.started.set(std.Io.Threaded.global_single_threaded.io());
+        e.started.set(threadedIo());
     }
 
     fn failStartDeinit(e: *Engine, app: *anole.App, err: anyerror) void {
@@ -596,10 +843,23 @@ pub const Engine = struct {
 
     fn setupExecs(e: *Engine, n: usize) !void {
         const per = e.config.limits.max_inflight;
+        const queue = if (e.config.limits.queue > 0) e.config.limits.queue else per * 2;
         e.execs = try gpa.alloc(Exec, n);
+        var made: usize = 0;
+        errdefer {
+            for (e.execs[0..made]) |*x| {
+                gpa.free(x.slots);
+                x.ring.deinit();
+            }
+            gpa.free(e.execs);
+            e.execs = &.{};
+        }
         for (e.execs, 0..) |*x, i| {
-            x.* = .{ .index = @intCast(i), .slots = try gpa.alloc(Slot, per), .free_head = 0, .ring = try Ring.init(per * 2) };
+            const slots = try gpa.alloc(Slot, per);
+            errdefer gpa.free(slots);
+            x.* = .{ .engine = e, .index = @intCast(i), .slots = slots, .free_head = 0, .ring = try Ring.init(queue) };
             for (x.slots, 0..) |*s, j| s.* = .{ .next_free = if (j + 1 < per) @intCast(j + 1) else no_slot };
+            made += 1;
             if (e.consumers.items.len > 0) {
                 const c = e.consumers.items[i % e.consumers.items.len];
                 x.consumer = c;
@@ -615,15 +875,26 @@ pub const Engine = struct {
         if (e.app) |app| app.stop();
     }
 
-    pub fn wait(e: *Engine) void {
-        if (e.thread == null) return;
-        e.stopped.waitUncancelable(std.Io.Threaded.global_single_threaded.io());
+    /// Waits for the stop; false when `timeout_ms` passed first.
+    pub fn wait(e: *Engine, timeout_ms: i32) bool {
+        if (e.thread == null) return true;
+        if (timeout_ms < 0) {
+            e.stopped.waitUncancelable(threadedIo());
+            return true;
+        }
+        e.stopped.waitTimeout(threadedIo(), .{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } }) catch return e.stopped.isSet();
+        return true;
+    }
+
+    pub fn reloadCertificates(e: *Engine) !void {
+        if (e.phase.load(.acquire) != .running) return error.State;
+        const app = e.app orelse return error.State;
+        try app.reloadCertificates();
     }
 
     pub fn destroy(e: *Engine) void {
         if (e.thread) |t| {
-            const p = e.phase.load(.acquire);
-            if (p == .running) e.drain() catch {};
+            if (e.phase.load(.acquire) == .running) e.drain() catch {};
             t.join();
         }
         if (global == e) global = null;
@@ -631,9 +902,22 @@ pub const Engine = struct {
             for (x.slots) |*s| {
                 s.bytes.deinit(gpa);
                 s.headers.deinit(gpa);
+                s.trailers.deinit(gpa);
+                s.trailer_bytes.deinit(gpa);
+                s.in.deinit();
+                s.out.deinit();
+                if (s.fd >= 0) _ = std.c.close(s.fd);
             }
             gpa.free(x.slots);
             x.ring.deinit();
+            // Commands nobody ran.
+            var cmd = x.inbox.swap(null, .acquire);
+            while (cmd) |c| {
+                cmd = c.next;
+                c.next = null;
+                c.run(c, x);
+            }
+            x.ws.deinit();
         }
         gpa.free(e.execs);
         for (e.consumers.items) |c| {
@@ -644,18 +928,98 @@ pub const Engine = struct {
         e.ports.deinit(gpa);
         e.arena.deinit();
         gpa.destroy(e);
+        // Debug builds: everything the engine allocated is freed by now
+        // (the leaks, with where they were made, go to the log).
+        if (builtin.mode == .debug) if (debug_gpa.detectLeaks() > 0) log.err("the C ABI engine leaked memory", .{});
+    }
+
+    pub fn stats(e: *Engine) abi.Stats {
+        var wakes: u64 = 0;
+        var rewakes: u64 = 0;
+        for (e.consumers.items) |c| {
+            wakes += c.wakes.load(.monotonic);
+            rewakes += c.rewakes.load(.monotonic);
+        }
+        return .{
+            .size = @sizeOf(abi.Stats),
+            .requests = e.requests.load(.monotonic),
+            .detached = e.detached_count.load(.monotonic),
+            .inflight = e.inflight.load(.monotonic),
+            .expired = e.expired_count.load(.monotonic),
+            .aborted = e.aborted_count.load(.monotonic),
+            .gone = e.gone_count.load(.monotonic),
+            .busy = e.busy_count.load(.monotonic),
+            .wakes = wakes,
+            .rewakes = rewakes,
+            .websockets = e.websockets.load(.monotonic),
+            .ws_messages_in = e.ws_in.load(.monotonic),
+            .ws_messages_out = e.ws_out.load(.monotonic),
+        };
+    }
+
+    pub fn gone(e: *Engine) error{Gone} {
+        _ = e.gone_count.fetchAdd(1, .monotonic);
+        return error.Gone;
     }
 };
 
 // ---------------------------------------------------------------------------
-// Handlers (on executors)
+// The handler for consumer routes (on executors)
 
-fn fixedHandler(req: *http.Request, res: *http.Response) anyerror!void {
-    const route: *const Route = @ptrCast(@alignCast(req.route.?.data.?));
-    const f = route.kind.fixed;
-    res.status = f.status;
-    for (f.headers) |h| try res.header(h[0], h[1]);
-    res.body = f.body;
+pub fn remoteText(req: *const http.Request, buf: *[64]u8) u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{f}", .{req.remote_address}) catch return 0;
+    return @intCast(w.end);
+}
+
+/// The verified JWT's claims as JSON, when a jwt middleware ran.
+pub fn claimsOf(req: *http.Request) []const u8 {
+    if (comptime !features.auth) return "";
+    const v = anole.auth.claims(req) orelse return "";
+    return std.json.Stringify.valueAlloc(req.arena, std.json.Value{ .object = v.claims }, .{}) catch "";
+}
+
+/// What a request's body is, before it is handed over.
+const BodyPlan = union(enum) {
+    /// Whole, inline in the record.
+    inline_body: []const u8,
+    /// Whole but too big to be inline: it goes into the slot's pipe at once.
+    whole: []const u8,
+    /// Still coming: `first` is what came so far, and a pump task reads
+    /// the rest.
+    streamed: struct { first: []const u8, reader: *std.Io.Reader, body: *dusty.RequestBodyReader },
+    /// Refused before the handover.
+    refused: http.Status,
+};
+
+/// Reads up to `inline_body_max + 1` bytes: a body that ends within it is
+/// inline. Over HTTP/2 and HTTP/3 on the reader (`whole_only`) the body is
+/// all there, so it is read to its end without waiting.
+fn planBody(e: *Engine, req: *http.Request, whole_only: bool) !BodyPlan {
+    if (req.content_length) |len| {
+        if (len == 0) return .{ .inline_body = "" };
+        if (len > e.config.limits.body_max) return .{ .refused = .payload_too_large };
+    } else if (req.version_major == 1 and req.headers.get("Transfer-Encoding") == null) {
+        // HTTP/1.x: no length and no chunked coding is no body.
+        return .{ .inline_body = "" };
+    }
+    if (whole_only or (req.content_length != null and req.content_length.? <= e.inline_body_max)) {
+        const whole = (req.body() catch |err| switch (err) {
+            error.BodyTooBig => return .{ .refused = .payload_too_large },
+            error.Canceled => return error.Canceled,
+            else => return .{ .refused = .bad_request },
+        }) orelse "";
+        return if (whole.len <= e.inline_body_max) .{ .inline_body = whole } else .{ .whole = whole };
+    }
+    const body = try req.arena.create(dusty.RequestBodyReader);
+    body.* = req.reader(&.{}) catch return .{ .refused = .unsupported_media_type };
+    const first = try req.arena.alloc(u8, e.inline_body_max + 1);
+    const n = body.interface.readSliceShort(first) catch {
+        if (body.err) |err| if (err == error.Canceled) return error.Canceled;
+        return .{ .refused = .bad_request };
+    };
+    if (n <= e.inline_body_max) return .{ .inline_body = first[0..n] };
+    return .{ .streamed = .{ .first = first[0..n], .reader = &body.interface, .body = body } };
 }
 
 fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
@@ -664,57 +1028,116 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     const io = req.io;
     const xi = placement.currentExecutor(io) orelse return error.InternalServerError;
     const x = &e.execs[xi];
-    const consumer = x.consumer orelse {
+    if (x.consumer == null) {
         res.fail(.service_unavailable, "no consumer");
         return;
-    };
-    // Small bodies come whole, read here on the executor.
-    var body: []const u8 = "";
-    if (req.content_length) |len| if (len > e.inline_body_max) {
-        res.fail(.payload_too_large, "body too large for the spike's inline delivery");
-        return;
-    };
-    if (try req.body()) |b| {
-        if (b.len > e.inline_body_max) {
-            res.fail(.payload_too_large, "body too large for the spike's inline delivery");
+    }
+    const detach = res.canDetach() and route.detachable;
+    const plan = try planBody(e, req, detach);
+    switch (plan) {
+        .refused => |status| {
+            res.fail(status, "");
             return;
-        }
-        body = b;
+        },
+        else => {},
     }
     const si = x.alloc() orelse {
         _ = e.busy_count.fetchAdd(1, .monotonic);
         res.fail(.service_unavailable, "too many requests in flight");
         return;
     };
-    const slot = &x.slots[si];
-    const gen = genOf(slot.word.load(.monotonic));
-    slot.req = req;
-    slot.route_id = route.kind.consumer;
-    slot.body = body;
-    slot.event.reset();
-    slot.drained.store(false, .monotonic);
-    slot.word.store(pack(gen, .queued), .release);
-    const handle: Handle = .{ .gen = gen, .slot = @intCast(si), .exec = @intCast(xi) };
-    x.link(io, si, std.Io.Clock.awake.now(io).nanoseconds + e.deadline.nanoseconds);
+    _ = e.inflight.fetchAdd(1, .monotonic);
+    _ = e.requests.fetchAdd(1, .monotonic);
+    const s = &x.slots[si];
+    const gen = genOf(s.word.load(.monotonic));
+    s.req = req;
+    s.route = route;
+    s.flags = if (req.secure) abi.REQ_SECURE else 0;
+    if (anole.early_data.isEarly(req)) s.flags |= abi.REQ_EARLY_DATA;
+    s.content_length = if (req.content_length) |l| l else std.math.maxInt(u64);
+    s.remote_len = remoteText(req, &s.remote);
+    s.claims = claimsOf(req);
+    s.body = "";
+    s.event.reset();
+    s.pump_event.reset();
+    s.drained.store(true, .monotonic);
+    switch (plan) {
+        .inline_body => |b| {
+            s.body = b;
+            s.flags |= abi.REQ_BODY_INLINE;
+        },
+        .whole => |b| {
+            s.flags |= abi.REQ_BODY_STREAM;
+            s.in.acquire();
+            s.in.open(gen);
+            s.in.push(.{ .data = b, .owner = .request }) catch {};
+            s.in.ended = true;
+            s.in.release();
+        },
+        .streamed => |st| {
+            s.flags |= abi.REQ_BODY_STREAM;
+            s.in.acquire();
+            s.in.open(gen);
+            s.in.push(.{ .data = st.first, .owner = .request }) catch {};
+            s.in.release();
+        },
+        .refused => unreachable,
+    }
+    s.word.store(pack(gen, .queued), .release);
+    x.link(si, route.list, std.Io.Clock.awake.now(io).nanoseconds + e.timeouts[route.list]);
 
-    // Hand over. A full ring (consumer far behind) is backpressure: wait
-    // for room, up to the deadline.
+    // Hand over. A full ring (the consumer far behind) is backpressure:
+    // wait for room, up to the deadline; on a reader, refuse instead.
     var canceled = false;
-    while (!x.ring.push(handle.encode())) {
-        if (slot.timed_out) break;
+    while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
+        if (detach or s.timed_out) {
+            x.unlink(si);
+            x.release(si);
+            _ = e.busy_count.fetchAdd(1, .monotonic);
+            res.fail(.service_unavailable, "the application is behind");
+            return;
+        }
         zio.yield() catch {
             canceled = true;
             break;
         };
     }
-    consumer.wake();
+    x.consumer.?.wake();
 
-    // Wait for the reply, the deadline, or a cancel.
-    const outcome: enum { done, expired } = while (true) {
-        const w = slot.word.load(.acquire);
+    if (detach) {
+        s.detached = res.detach(req, .{ .abort = detachedAborted, .ctx = s }) catch unreachable;
+        _ = e.detached_count.fetchAdd(1, .monotonic);
+        return;
+    }
+
+    // The rest of a streamed body comes through a pump task, while this
+    // one waits for the answer.
+    var pump: std.Io.Group = .init;
+    defer pump.cancel(io);
+    switch (plan) {
+        .streamed => |st| placement.concurrent(&pump, io, .local, pumpBody, .{ x, si, gen, st.reader, st.body }) catch {
+            s.in.acquire();
+            s.in.failed = true;
+            s.in.release();
+        },
+        else => {},
+    }
+    return waitForAnswer(x, si, gen, req, res, canceled);
+}
+
+/// The request's task waits for its answer (HTTP/1.1, and requests that
+/// could not detach), and writes it.
+fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Response, canceled_in: bool) anyerror!void {
+    const e = x.engine;
+    const io = req.io;
+    const s = &x.slots[si];
+    var canceled = canceled_in;
+    const outcome: enum { done, streaming, expired } = while (true) {
+        const w = s.word.load(.acquire);
         std.debug.assert(genOf(w) == gen);
         switch (stateOf(w)) {
             .done => break .done,
+            .streaming => break .streaming,
             // Short windows on the consumer thread: let them finish.
             .polling, .responding => {
                 zio.yield() catch {
@@ -723,15 +1146,20 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
                 continue;
             },
             .queued, .out => {
-                if (canceled or slot.timed_out) {
-                    if (slot.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) break .expired;
+                if (canceled or s.timed_out or s.body_error != null) {
+                    if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
+                        // The consumer saw it: it hears that it is over.
+                        if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
+                        break .expired;
+                    }
                     continue;
                 }
-                // No timer of its own: the executor's sweeper sets the
-                // event at the deadline.
-                slot.event.wait(io) catch {
+                // No timer of its own: the capi task sets the event at the
+                // deadline.
+                s.event.wait(io) catch {
                     canceled = true;
                 };
+                s.event.reset();
             },
             .free, .expired => unreachable,
         }
@@ -739,100 +1167,470 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
 
     switch (outcome) {
         .expired => {
+            const body_error = s.body_error;
             x.release(si);
+            if (canceled) {
+                _ = e.aborted_count.fetchAdd(1, .monotonic);
+                return error.Canceled;
+            }
+            if (body_error) |status| {
+                res.fail(status, "");
+                return;
+            }
             _ = e.expired_count.fetchAdd(1, .monotonic);
-            if (canceled) return error.Canceled;
             res.fail(.gateway_timeout, "the application did not answer in time");
-            return;
         },
         .done => {
-            // Woken some other way (deadline, cancel) just as the reply
+            // Woken some other way (deadline, cancel) just as the answer
             // came: the slot is still on the done list, so it may not be
             // reused until the capi task has taken it.
-            while (!slot.drained.load(.acquire)) zio.yield() catch {
+            while (!s.drained.load(.acquire)) zio.yield() catch {
                 canceled = true;
             };
             if (canceled) io.recancel();
+            x.unlink(si);
             defer x.release(si);
-            res.status = http.Status.fromCode(slot.status) catch .internal_server_error;
-            const bytes = slot.bytes.items;
-            for (slot.headers.items) |h| {
-                const name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]);
-                const value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]);
-                res.addHeader(name, value) catch {};
-            }
-            res.body = try req.arena.dupe(u8, bytes[slot.body_off..][0..slot.body_len]);
+            try applyAnswer(x, si, req, res);
+            // A borrowed body must be out before the consumer hears it may
+            // let go of it.
+            if (s.borrowed != null) try res.write();
+        },
+        .streaming => {
+            while (!s.drained.load(.acquire)) zio.yield() catch {
+                canceled = true;
+            };
+            if (canceled) io.recancel();
+            x.unlink(si);
+            defer x.release(si);
+            return streamAnswer(x, si, gen, req, res);
         },
     }
 }
 
-/// One per executor: sleeps until the oldest request out with a consumer
-/// reaches its deadline, and wakes it to answer 504. With nothing out it
-/// sleeps one request timeout: anything handed over meanwhile has a later
-/// deadline than that.
-fn sweeper(e: *Engine, x: *Exec, io: std.Io) void {
+/// The consumer's answer (`done`) into `res`.
+fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void {
+    const s = &x.slots[si];
+    if (s.reply == .release) {
+        res.fail(.internal_server_error, "");
+        return;
+    }
+    res.status = http.Status.fromCode(s.status) catch .internal_server_error;
+    try applyHeaders(s, req, res);
+    switch (s.reply) {
+        .respond => {
+            if (s.borrowed) |b| {
+                // HTTP/2 keeps a reference to a body past `write` (its
+                // frames are cut as the writer sends), so there it is
+                // copied; elsewhere `write` copies it into the connection.
+                if (req.version_major == 2) {
+                    res.body = try req.arena.dupe(u8, b);
+                } else res.body = b;
+            } else res.body = try req.arena.dupe(u8, s.replyBody());
+        },
+        .fd => {
+            const len = s.fd_len;
+            res.file = .{
+                .handle = .{ .handle = s.fd, .flags = .{ .nonblocking = false } },
+                .offset = s.fd_offset,
+                .size = std.math.cast(usize, len) orelse return error.FileTooBig,
+            };
+            s.fd = -1;
+        },
+        .release => unreachable,
+    }
+}
+
+fn applyHeaders(s: *const Slot, req: *http.Request, res: *http.Response) !void {
+    const bytes = s.bytes.items;
+    for (s.headers.items) |h| {
+        const name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]);
+        const value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]);
+        res.addHeader(name, value) catch {};
+    }
+}
+
+/// Sends a streamed answer: the head, then what the consumer writes, until
+/// `stream_end` (or `release`, which cuts it short). On a task.
+fn streamAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Response) anyerror!void {
+    const s = &x.slots[si];
+    const e = x.engine;
+    res.status = http.Status.fromCode(s.status) catch .internal_server_error;
+    try applyHeaders(s, req, res);
+    const buf = try req.arena.alloc(u8, 16 * 1024);
+    var w = res.stream(buf) catch |err| {
+        streamGone(x, si, gen);
+        return err;
+    };
+    var batch: [16]Chunk = undefined;
+    while (true) {
+        s.event.reset();
+        var n: usize = 0;
+        var ended = false;
+        var failed = false;
+        var writable = false;
+        {
+            s.out.acquire();
+            defer s.out.release();
+            while (n < batch.len) {
+                const ch = s.out.front() orelse break;
+                batch[n] = ch.*;
+                n += 1;
+                _ = s.out.take(ch.data.len - ch.off);
+            }
+            ended = s.out.ended and s.out.front() == null;
+            failed = s.out.failed;
+            if (n == 0 and !ended and !failed) s.out.exec_waiting = true;
+            if (s.out.want_event and s.out.bytes <= e.stream_high_water / 2) {
+                s.out.want_event = false;
+                writable = true;
+            }
+        }
+        if (writable) x.postEvent(.writable, x.handleOf(si, gen));
+        s.out.notifyBlocked();
+        for (batch[0..n], 0..) |ch, k| {
+            w.interface.writeAll(ch.data[ch.off..]) catch |err| {
+                for (batch[k..n]) |rest| releaseChunk(x, si, gen, rest);
+                streamGone(x, si, gen);
+                return w.err orelse err;
+            };
+            releaseChunk(x, si, gen, ch);
+        }
+        if (n > 0) {
+            w.interface.flush() catch |err| {
+                streamGone(x, si, gen);
+                return w.err orelse err;
+            };
+            continue;
+        }
+        if (failed) {
+            streamGone(x, si, gen);
+            return res.abort();
+        }
+        if (ended) {
+            const tb = s.trailer_bytes.items;
+            for (s.trailers.items) |t| {
+                const name = try req.arena.dupe(u8, tb[t.name_off..][0..t.name_len]);
+                const value = try req.arena.dupe(u8, tb[t.value_off..][0..t.value_len]);
+                res.trailer(name, value) catch {};
+            }
+            try w.end();
+            return;
+        }
+        s.event.wait(req.io) catch |err| {
+            streamGone(x, si, gen);
+            _ = e.aborted_count.fetchAdd(1, .monotonic);
+            return err;
+        };
+    }
+}
+
+fn releaseChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
+    dropChunk(x, si, gen, ch);
+}
+
+/// A chunk nobody reads any more: freed, reported sent, or left to the
+/// request's arena.
+fn dropChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
+    switch (ch.owner) {
+        .pipe => gpa.free(ch.data),
+        .consumer => x.postSent(x.handleOf(si, gen), ch.data),
+        .request => {},
+    }
+}
+
+/// A streamed answer that cannot go on (the client left, `release`): the
+/// consumer hears it, and its writes get `ANOLE_E_GONE` from here on.
+fn streamGone(x: *Exec, si: u32, gen: u32) void {
+    const s = &x.slots[si];
+    s.out.acquire();
+    const failed = s.out.failed;
+    s.out.release();
+    x.closePipe(&s.out, gen, si);
+    if (!failed) x.postEvent(.abort, x.handleOf(si, gen));
+}
+
+/// Reads the rest of a request body into the slot's pipe, `limits.body_max`
+/// at most, holding back while the consumer is behind. A task beside the
+/// request's.
+fn pumpBody(x: *Exec, si: u32, gen: u32, reader: *std.Io.Reader, body: *dusty.RequestBodyReader) std.Io.Cancelable!void {
+    const e = x.engine;
+    const s = &x.slots[si];
+    const high: usize = @max(64 * 1024, e.inline_body_max);
+    var total: u64 = s.in.bytes;
+    while (true) {
+        // Room first.
+        while (true) {
+            s.pump_event.reset();
+            s.in.acquire();
+            const live = s.in.live(gen);
+            const room = s.in.bytes < high;
+            if (live and !room) s.in.exec_waiting = true;
+            s.in.release();
+            if (!live) return;
+            if (room) break;
+            try s.pump_event.wait(e.io);
+        }
+        const chunk = gpa.alloc(u8, 16 * 1024) catch return failBody(x, si, gen, .internal_server_error);
+        const n = reader.readSliceShort(chunk) catch {
+            gpa.free(chunk);
+            if (body.err) |err| if (err == error.Canceled) return error.Canceled;
+            return failBody(x, si, gen, .bad_request);
+        };
+        total += n;
+        if (total > e.config.limits.body_max) {
+            gpa.free(chunk);
+            return failBody(x, si, gen, .payload_too_large);
+        }
+        var notify = false;
+        s.in.acquire();
+        if (!s.in.live(gen)) {
+            s.in.release();
+            gpa.free(chunk);
+            return;
+        }
+        const eof = n < chunk.len;
+        // Freed by length later: exactly what was read.
+        const data: []u8 = if (eof) blk: {
+            const exact = gpa.dupe(u8, chunk[0..n]) catch {
+                gpa.free(chunk);
+                s.in.release();
+                return failBody(x, si, gen, .internal_server_error);
+            };
+            gpa.free(chunk);
+            break :blk exact;
+        } else chunk;
+        if (n > 0) {
+            s.in.push(.{ .data = data, .owner = .pipe }) catch {
+                gpa.free(data);
+                s.in.release();
+                return failBody(x, si, gen, .internal_server_error);
+            };
+        } else gpa.free(data);
+        if (eof) s.in.ended = true;
+        if (s.in.want_event) {
+            s.in.want_event = false;
+            notify = true;
+        }
+        s.in.release();
+        s.in.notifyBlocked();
+        if (notify) x.postEvent(.body, x.handleOf(si, gen));
+        if (eof) return;
+    }
+}
+
+/// The request body failed: a waiting request answers `status` (if the
+/// consumer has not answered yet), and the consumer's reads end.
+fn failBody(x: *Exec, si: u32, gen: u32, status: http.Status) void {
+    const s = &x.slots[si];
+    s.in.acquire();
+    const live = s.in.live(gen);
+    if (live) s.in.failed = true;
+    const notify = live and s.in.want_event;
+    s.in.release();
+    if (!live) return;
+    s.in.notifyBlocked();
+    if (notify) x.postEvent(.body, x.handleOf(si, gen));
+    if (genOf(s.word.load(.acquire)) == gen) {
+        s.body_error = status;
+        s.event.set(x.engine.io);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Detached requests (HTTP/2, HTTP/3)
+
+/// The engine let go of a detached request (its stream or connection
+/// ended). On the request's executor; afterwards nothing here may touch
+/// the request.
+fn detachedAborted(ctx: *anyopaque) void {
+    const s: *Slot = @ptrCast(@alignCast(ctx));
+    const e = global.?;
+    const x = execOfSlot(e, s);
+    const si: u32 = @intCast(s - x.slots.ptr);
+    s.detached = null;
+    _ = e.aborted_count.fetchAdd(1, .monotonic);
+    while (true) {
+        const w = s.word.load(.acquire);
+        const gen = genOf(w);
+        switch (stateOf(w)) {
+            .queued, .out => {
+                if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) continue;
+                if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
+                x.release(si);
+                return;
+            },
+            // `poll` is reading the request, which is about to go: wait
+            // for it (a copy, on the consumer's thread).
+            .polling => std.atomic.spinLoopHint(),
+            // The consumer is answering, or has: the capi task frees it.
+            .responding, .done, .streaming => {
+                s.orphan = true;
+                return;
+            },
+            .free, .expired => return,
+        }
+    }
+}
+
+fn execOfSlot(e: *Engine, s: *Slot) *Exec {
+    for (e.execs) |*x| {
+        const lo = @intFromPtr(x.slots.ptr);
+        if (@intFromPtr(s) >= lo and @intFromPtr(s) < lo + x.slots.len * @sizeOf(Slot)) return x;
+    }
+    unreachable;
+}
+
+/// An answered detached request: written now, or on a task when it needs
+/// one (a stream, a file).
+fn finishDetached(x: *Exec, si: u32) void {
+    const s = &x.slots[si];
+    const d = s.detached.?;
+    const w = s.word.load(.acquire);
+    const gen = genOf(w);
+    x.unlink(si);
+    if (stateOf(w) == .streaming or (stateOf(w) == .done and s.reply == .fd)) {
+        const group = d.attach();
+        placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) catch {
+            d.finish(error.SystemResources);
+            x.release(si);
+        };
+        return;
+    }
+    s.detached = null;
+    const result = applyAnswer(x, si, d.request, d.response);
+    d.finish(result);
+    x.release(si);
+}
+
+/// A detached answer that needs a task: a streamed body or a file.
+fn attachedTask(x: *Exec, si: u32, gen: u32) std.Io.Cancelable!void {
+    const s = &x.slots[si];
+    const d = s.detached.?;
+    s.detached = null;
+    d.enter();
+    const result: anyerror!void = if (stateOf(s.word.load(.acquire)) == .streaming)
+        streamAnswer(x, si, gen, d.request, d.response)
+    else
+        applyAnswer(x, si, d.request, d.response);
+    d.finish(result);
+    x.release(si);
+    if (result) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
+}
+
+/// A detached request past its deadline: 504 now. The consumer, if it saw
+/// it, hears it is over.
+fn expireDetached(x: *Exec, si: u32, w: u64) void {
+    const s = &x.slots[si];
+    const gen = genOf(w);
+    if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
+    if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
+    _ = x.engine.expired_count.fetchAdd(1, .monotonic);
+    if (s.detached) |d| {
+        s.detached = null;
+        d.response.fail(.gateway_timeout, "the application did not answer in time");
+        d.finish({});
+    }
+    x.release(si);
+}
+
+// ---------------------------------------------------------------------------
+// The capi task: one per executor.
+
+/// Hands answers to their requests, runs commands, enforces deadlines and
+/// rings lost doorbells again.
+fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
+    const io = e.io;
     while (true) {
         x.kick.reset();
-        // Replies: wake their tasks (local wakes, no syscalls).
+        // Answers: wake their tasks (local wakes, no syscalls), or finish
+        // detached requests here.
         var list = x.done_head.swap(no_slot, .acquire);
+        // Oldest first.
+        var rev: u32 = no_slot;
         while (list != no_slot) {
             const s = &x.slots[list];
-            list = s.next_done;
+            const next = s.next_done;
+            s.next_done = rev;
+            rev = list;
+            list = next;
+        }
+        while (rev != no_slot) {
+            const si = rev;
+            const s = &x.slots[si];
+            rev = s.next_done;
             s.drained.store(true, .release);
-            s.event.set(io);
+            if (s.orphan) {
+                const w = s.word.load(.acquire);
+                if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, genOf(w)));
+                x.release(si);
+            } else if (s.detached != null) {
+                finishDetached(x, si);
+            } else s.event.set(io);
         }
+        // Commands.
+        var cmds = x.inbox.swap(null, .acquire);
+        var fifo: ?*Command = null;
+        while (cmds) |c| {
+            cmds = c.next;
+            c.next = fifo;
+            fifo = c;
+        }
+        while (fifo) |c| {
+            fifo = c.next;
+            c.next = null;
+            c.run(c, x);
+        }
+        // Deadlines.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
-        while (x.dl_head != no_slot) {
-            const i = x.dl_head;
-            const s = &x.slots[i];
-            if (s.deadline > now) break;
-            x.unlink(i);
-            s.timed_out = true;
-            s.event.set(io);
+        var until: i96 = now + e.timeouts[0];
+        var any_out = false;
+        for (x.lists[0..e.ntimeouts]) |*l| {
+            while (l.head != no_slot) {
+                const si = l.head;
+                const s = &x.slots[si];
+                if (s.deadline > now) break;
+                const w = s.word.load(.acquire);
+                switch (stateOf(w)) {
+                    .queued, .out => {
+                        if (s.orphan) {
+                            if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) continue;
+                            if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, genOf(w)));
+                            x.release(si);
+                        } else if (s.detached != null) {
+                            expireDetached(x, si, w);
+                        } else {
+                            x.unlink(si);
+                            s.timed_out = true;
+                            s.event.set(io);
+                        }
+                    },
+                    // The consumer is in a call on it: look again shortly.
+                    else => {
+                        until = @min(until, now + std.time.ns_per_ms);
+                        break;
+                    },
+                }
+            }
+            if (l.head != no_slot) {
+                until = @min(until, x.slots[l.head].deadline);
+                any_out = true;
+            }
         }
-        var until: i96 = if (x.dl_head != no_slot) x.slots[x.dl_head].deadline else now + e.deadline.nanoseconds;
         // Requests out: also watch for a lost doorbell, every rewake_ms.
-        const rewake: i96 = @as(i96, e.config.timeouts.rewake_ms) * std.time.ns_per_ms;
-        if (rewake > 0 and x.dl_head != no_slot) if (x.consumer) |c| {
-            if (!x.ring.isEmpty() and c.awake.load(.acquire) and now - c.last_poll.load(.monotonic) > rewake) c.rewake();
-            until = @min(until, now + rewake);
+        if (e.rewake > 0 and (any_out or !x.ring.isEmpty())) if (x.consumer) |c| {
+            if (!x.ring.isEmpty() and c.awake.load(.acquire) and now - c.last_poll.load(.monotonic) > e.rewake) c.rewake();
+            until = @min(until, now + e.rewake);
         };
-        x.sweeper_idle = x.dl_head == no_slot;
-        x.kick.waitTimeout(io, .{ .duration = .{ .raw = .{ .nanoseconds = until - now }, .clock = .awake } }) catch |err| switch (err) {
+        x.idle = !any_out and x.ring.isEmpty();
+        x.kick.waitTimeout(io, .{ .duration = .{ .raw = .{ .nanoseconds = @max(until - now, 0) }, .clock = .awake } }) catch |err| switch (err) {
             error.Timeout => {},
-            error.Canceled => return,
+            error.Canceled => return error.Canceled,
         };
     }
 }
 
 // ---------------------------------------------------------------------------
-// Consumer side: poll and respond (on the consumer's thread)
-
-pub const EventType = enum(u32) { request = 1, stopped = 11 };
-
-pub const EventHeader = extern struct { type: u32, len: u32, handle: u64 };
-pub const Span = extern struct { off: u32, len: u32 };
-pub const RequestRecord = extern struct {
-    ev: EventHeader,
-    route_id: u32,
-    method: u8,
-    version: u8,
-    flags: u16,
-    method_name: Span,
-    path: Span,
-    query: Span,
-    body: Span,
-    nheaders: u16,
-    nparams: u16,
-    reserved: u32 = 0,
-};
-comptime {
-    std.debug.assert(@sizeOf(EventHeader) == 16);
-    std.debug.assert(@sizeOf(RequestRecord) == 64);
-}
-
-pub const req_flag_body_inline: u16 = 1;
-pub const req_flag_secure: u16 = 4;
+// Consumer side: poll (on the consumer's thread)
 
 fn methodCode(m: http.Method) u8 {
     return switch (m) {
@@ -849,87 +1647,131 @@ fn methodCode(m: http.Method) u8 {
     };
 }
 
-fn alignUp(n: usize) usize {
-    return (n + 7) & ~@as(usize, 7);
-}
+/// What a request record is built from: a slot's request (`poll`), or the
+/// upgrade request of a WebSocket (`ws_open`).
+pub const Head = struct {
+    req: *const http.Request,
+    route_id: u32,
+    body: []const u8 = "",
+    flags: u16 = 0,
+    content_length: u64 = std.math.maxInt(u64),
+    remote: []const u8 = "",
+    claims: []const u8 = "",
 
-/// The size of `slot`'s request record.
-fn recordSize(slot: *const Slot) usize {
-    const req = slot.req;
-    var n: usize = @sizeOf(RequestRecord);
-    const nh = req.headers.len;
-    n += nh * 2 * @sizeOf(Span);
-    n += req.params.count() * 2 * @sizeOf(Span);
-    n += req.method.name().len + req.url.len + slot.body.len;
-    for (req.headers.keys[0..nh], req.headers.values[0..nh]) |k, v| n += k.len + v.len;
-    var it = req.params.map.iterator();
-    while (it.next()) |kv| n += kv.key_ptr.len + kv.value_ptr.len;
-    return alignUp(n);
-}
+    pub fn size(h: Head) usize {
+        const req = h.req;
+        var n: usize = @sizeOf(abi.RequestEvent);
+        const nh = req.headers.len;
+        n += nh * 2 * @sizeOf(abi.Span);
+        n += req.params.count() * 2 * @sizeOf(abi.Span);
+        n += methodName(req).len + req.url.len + h.body.len + h.remote.len + req.listener.name.len + req.id.len + h.claims.len;
+        for (req.headers.keys[0..nh], req.headers.values[0..nh]) |k, v| n += k.len + v.len;
+        var it = req.params.map.iterator();
+        while (it.next()) |kv| n += kv.key_ptr.len + kv.value_ptr.len;
+        return abi.alignUp(n);
+    }
 
-fn encode(slot: *const Slot, handle: u64, out: []u8) usize {
-    const req = slot.req;
-    const size = out.len;
-    const nh = req.headers.len;
-    const np = req.params.count();
-    var spans: [*]align(1) Span = @ptrCast(out[@sizeOf(RequestRecord)..].ptr);
-    var pos: usize = @sizeOf(RequestRecord) + (nh + np) * 2 * @sizeOf(Span);
-    const put = struct {
-        fn f(buf: []u8, p: *usize, s: []const u8, lower: bool) Span {
-            const at = p.*;
-            if (lower) {
-                for (s, buf[at..][0..s.len]) |ch, *d| d.* = std.ascii.toLower(ch);
-            } else @memcpy(buf[at..][0..s.len], s);
-            p.* += s.len;
-            return .{ .off = @intCast(at), .len = @intCast(s.len) };
+    /// Writes the record into `out` (exactly `size()` bytes).
+    pub fn encode(h: Head, typ: abi.EventType, handle: u64, out: []u8) usize {
+        const req = h.req;
+        const size_ = out.len;
+        const nh = req.headers.len;
+        const np = req.params.count();
+        const spans: [*]align(1) abi.Span = @ptrCast(out[@sizeOf(abi.RequestEvent)..].ptr);
+        var pos: usize = @sizeOf(abi.RequestEvent) + (nh + np) * 2 * @sizeOf(abi.Span);
+        const put = struct {
+            fn f(buf: []u8, p: *usize, s: []const u8, lower: bool) abi.Span {
+                const at = p.*;
+                if (lower) {
+                    for (s, buf[at..][0..s.len]) |ch, *d| d.* = std.ascii.toLower(ch);
+                } else @memcpy(buf[at..][0..s.len], s);
+                p.* += s.len;
+                return .{ .off = @intCast(at), .len = @intCast(s.len) };
+            }
+        }.f;
+        const url = req.url;
+        const q = std.mem.indexOfScalar(u8, url, '?');
+        const method_name = put(out, &pos, methodName(req), false);
+        const url_span = put(out, &pos, url, false);
+        const path: abi.Span = .{ .off = url_span.off, .len = @intCast(q orelse url.len) };
+        const query: abi.Span = if (q) |i| .{ .off = url_span.off + @as(u32, @intCast(i + 1)), .len = @intCast(url.len - i - 1) } else .{};
+        var k: usize = 0;
+        for (req.headers.keys[0..nh], req.headers.values[0..nh]) |hk, hv| {
+            spans[k] = put(out, &pos, hk, true);
+            spans[k + 1] = put(out, &pos, hv, false);
+            k += 2;
         }
-    }.f;
-    const url = req.url;
-    const q = std.mem.indexOfScalar(u8, url, '?');
-    const method_name = put(out, &pos, req.method.name(), false);
-    const url_span = put(out, &pos, url, false);
-    const path: Span = .{ .off = url_span.off, .len = @intCast(q orelse url.len) };
-    const query: Span = if (q) |i| .{ .off = url_span.off + @as(u32, @intCast(i + 1)), .len = @intCast(url.len - i - 1) } else .{ .off = 0, .len = 0 };
-    var k: usize = 0;
-    for (req.headers.keys[0..nh], req.headers.values[0..nh]) |hk, hv| {
-        spans[k] = put(out, &pos, hk, true);
-        spans[k + 1] = put(out, &pos, hv, false);
-        k += 2;
+        var it = req.params.map.iterator();
+        while (it.next()) |kv| {
+            spans[k] = put(out, &pos, kv.key_ptr.*, false);
+            spans[k + 1] = put(out, &pos, kv.value_ptr.*, false);
+            k += 2;
+        }
+        const body = put(out, &pos, h.body, false);
+        const remote = put(out, &pos, h.remote, false);
+        const listener = put(out, &pos, req.listener.name, false);
+        const id = put(out, &pos, req.id, false);
+        const claims = put(out, &pos, h.claims, false);
+        std.debug.assert(abi.alignUp(pos) == size_);
+        @memset(out[pos..size_], 0);
+        const rec: *align(1) abi.RequestEvent = @ptrCast(out.ptr);
+        rec.* = .{
+            .ev = .{ .type = @intFromEnum(typ), .len = @intCast(size_), .handle = handle },
+            .route_id = h.route_id,
+            .method = methodCode(req.method),
+            .version = req.version_major * 10 + req.version_minor,
+            .flags = h.flags,
+            .method_name = method_name,
+            .path = path,
+            .query = query,
+            .body = body,
+            .remote_addr = remote,
+            .listener = listener,
+            .id = id,
+            .claims = claims,
+            .nheaders = @intCast(nh),
+            .nparams = @intCast(np),
+            .content_length = h.content_length,
+        };
+        return size_;
     }
-    var it = req.params.map.iterator();
-    while (it.next()) |kv| {
-        spans[k] = put(out, &pos, kv.key_ptr.*, false);
-        spans[k + 1] = put(out, &pos, kv.value_ptr.*, false);
-        k += 2;
+
+    fn methodName(req: *const http.Request) []const u8 {
+        // An extended CONNECT is routed as GET; the record says GET too.
+        return req.method.name();
     }
-    const body = put(out, &pos, slot.body, false);
-    std.debug.assert(alignUp(pos) == size);
-    @memset(out[pos..size], 0);
-    const rec: *align(1) RequestRecord = @ptrCast(out.ptr);
-    rec.* = .{
-        .ev = .{ .type = @intFromEnum(EventType.request), .len = @intCast(size), .handle = handle },
-        .route_id = slot.route_id,
-        .method = methodCode(req.method),
-        .version = req.version_major * 10 + req.version_minor,
-        .flags = req_flag_body_inline | (if (req.secure) req_flag_secure else 0),
-        .method_name = method_name,
-        .path = path,
-        .query = query,
-        .body = body,
-        .nheaders = @intCast(nh),
-        .nparams = @intCast(np),
+};
+
+fn headOf(s: *const Slot) Head {
+    return .{
+        .req = s.req,
+        .route_id = s.route.id,
+        .body = s.body,
+        .flags = s.flags,
+        .content_length = s.content_length,
+        .remote = s.remote[0..s.remote_len],
+        .claims = s.claims,
     };
-    return size;
 }
 
-pub const PollError = error{ TooBig, State };
+pub const PollError = error{TooBig};
 
-/// Drains up to `out.len` bytes of events. 0: nothing pending, and the
-/// doorbell is armed again.
+/// Drains up to `out.len` bytes of events (one event for a shared
+/// consumer). 0: nothing pending, and the doorbell is armed again (unless
+/// `!arm`).
 pub fn poll(c: *Consumer, out: []u8, arm: bool) PollError!usize {
+    if (c.shared) {
+        c.poll_lock.lockUncancelable(threadedIo());
+        defer c.poll_lock.unlock(threadedIo());
+        return pollLocked(c, out, arm, true);
+    }
+    return pollLocked(c, out, arm, false);
+}
+
+fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
     const e = c.engine;
-    c.polls += 1;
-    c.last_poll.store(@intCast(std.Io.Clock.awake.now(e.io).nanoseconds), .monotonic);
+    if (e.phase.load(.acquire) != .created and e.phase.load(.acquire) != .starting)
+        c.last_poll.store(@intCast(std.Io.Clock.awake.now(e.io).nanoseconds), .monotonic);
     var pos: usize = 0;
     var rechecked = false;
     outer: while (true) {
@@ -937,37 +1779,52 @@ pub fn poll(c: *Consumer, out: []u8, arm: bool) PollError!usize {
         var i: usize = 0;
         while (i < c.execs.items.len) : (i += 1) {
             const x = c.execs.items[(c.next_exec + i) % c.execs.items.len];
-            while (x.ring.peek()) |hv| {
-                const h = Handle.decode(hv);
-                const slot = &x.slots[h.slot];
+            while (x.ring.peek()) |entry| {
+                if (one and pos > 0) break :outer;
+                if (entry.rec) |rec| {
+                    const ev: *const abi.Event = @ptrCast(rec);
+                    if (ev.len > out.len - pos) {
+                        if (pos == 0) return error.TooBig;
+                        c.next_exec = (c.next_exec + i) % c.execs.items.len;
+                        break :outer;
+                    }
+                    @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
+                    pos += ev.len;
+                    freeRecord(rec);
+                    x.ring.pop();
+                    progressed = true;
+                    continue;
+                }
+                const h = Handle.decode(entry.handle);
+                const s = &x.slots[h.slot];
                 const queued = pack(h.gen, .queued);
-                if (slot.word.cmpxchgStrong(queued, pack(h.gen, .polling), .acquire, .monotonic) != null) {
+                if (s.word.cmpxchgStrong(queued, pack(h.gen, .polling), .acquire, .monotonic) != null) {
                     // Expired (or reused since): skip it.
                     x.ring.pop();
                     continue;
                 }
-                const size = recordSize(slot);
+                const head = headOf(s);
+                const size = head.size();
                 if (size > out.len - pos) {
-                    slot.word.store(queued, .release);
+                    s.word.store(queued, .release);
                     if (pos == 0) return error.TooBig;
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += encode(slot, hv, out[pos..][0..size]);
-                slot.word.store(pack(h.gen, .out), .release);
+                pos += head.encode(.request, entry.handle, out[pos..][0..size]);
+                s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
-                c.delivered += 1;
                 progressed = true;
             }
         }
         c.next_exec = (c.next_exec + 1) % @max(c.execs.items.len, 1);
         if (pos > 0 or progressed) break;
         if (e.phase.load(.acquire) == .stopped and !c.stopped_sent) {
-            if (out.len < @sizeOf(EventHeader)) return error.TooBig;
-            const hdr: *align(1) EventHeader = @ptrCast(out.ptr);
-            hdr.* = .{ .type = @intFromEnum(EventType.stopped), .len = @sizeOf(EventHeader), .handle = 0 };
+            if (out.len < @sizeOf(abi.Event)) return error.TooBig;
+            const hdr: *align(1) abi.Event = @ptrCast(out.ptr);
+            hdr.* = .{ .type = @intFromEnum(abi.EventType.stopped), .len = @sizeOf(abi.Event), .handle = 0 };
             c.stopped_sent = true;
-            return @sizeOf(EventHeader);
+            return @sizeOf(abi.Event);
         }
         if (rechecked or !arm) break;
         // Nothing: arm the doorbell, then look once more (a producer that
@@ -988,62 +1845,283 @@ pub fn poll(c: *Consumer, out: []u8, arm: bool) PollError!usize {
     return pos;
 }
 
-pub const RespondError = error{ Gone, Invalid, OutOfMemory };
-
-pub const CHeader = extern struct { name: CStr, value: CStr };
-pub const CStr = extern struct { ptr: ?[*]const u8, len: usize };
-
-fn cslice(s: CStr) []const u8 {
-    return if (s.ptr) |p| p[0..s.len] else "";
+/// `poll`, blocking up to `timeout_ms` (< 0: for ever) for an event.
+pub fn pollWait(c: *Consumer, out: []u8, timeout_ms: i32) PollError!usize {
+    const tio = threadedIo();
+    const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms < 0) null else std.Io.Clock.Timestamp.now(tio, .awake).addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    while (true) {
+        const seq = c.bell.load(.acquire);
+        const n = try poll(c, out, true);
+        if (n > 0) return n;
+        if (c.stopped_sent) return 0;
+        _ = c.waiters.fetchAdd(1, .acq_rel);
+        defer _ = c.waiters.fetchSub(1, .acq_rel);
+        if (deadline) |d| {
+            const now = std.Io.Clock.Timestamp.now(tio, .awake);
+            if (now.compare(.gte, d)) return 0;
+            tio.futexWaitTimeout(u32, &c.bell.raw, seq, .{ .deadline = d }) catch {};
+        } else tio.futexWaitUncancelable(u32, &c.bell.raw, seq);
+    }
 }
 
-pub fn slotOf(e: *Engine, hv: u64) ?struct { *Slot, Handle } {
+// ---------------------------------------------------------------------------
+// Consumer side: answers (any thread)
+
+pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again };
+
+pub const CHeader = abi.Header;
+
+fn slotOf(e: *Engine, hv: u64) ?struct { *Exec, *Slot, Handle } {
     const h = Handle.decode(hv);
     if (h.gen == 0 or h.exec >= e.execs.len) return null;
     const x = &e.execs[h.exec];
     if (h.slot >= x.slots.len) return null;
-    return .{ &x.slots[h.slot], h };
+    return .{ x, &x.slots[h.slot], h };
 }
 
-pub fn respond(e: *Engine, hv: u64, status: u16, headers: []const CHeader, body: []const u8) RespondError!void {
-    if (status < 100 or status > 999) return error.Invalid;
-    const slot, const h = slotOf(e, hv) orelse return error.Gone;
-    const out = pack(h.gen, .out);
-    if (slot.word.cmpxchgStrong(out, pack(h.gen, .responding), .acquire, .monotonic) != null) {
-        _ = e.gone_count.fetchAdd(1, .monotonic);
-        return error.Gone;
-    }
-    errdefer slot.word.store(out, .release);
-    var total: usize = body.len;
-    for (headers) |hd| {
-        total += hd.name.len + hd.value.len;
-        dusty.validateHeaderName(cslice(hd.name)) catch return error.Invalid;
-        dusty.validateHeaderValue(cslice(hd.value)) catch return error.Invalid;
-    }
-    if (total > std.math.maxInt(u32)) return error.Invalid;
-    slot.bytes.clearRetainingCapacity();
-    slot.headers.clearRetainingCapacity();
-    try slot.bytes.ensureTotalCapacity(gpa, total);
-    try slot.headers.ensureTotalCapacity(gpa, headers.len);
-    for (headers) |hd| {
-        const no: u32 = @intCast(slot.bytes.items.len);
-        slot.bytes.appendSliceAssumeCapacity(cslice(hd.name));
-        const vo: u32 = @intCast(slot.bytes.items.len);
-        slot.bytes.appendSliceAssumeCapacity(cslice(hd.value));
-        slot.headers.appendAssumeCapacity(.{ .name_off = no, .name_len = @intCast(hd.name.len), .value_off = vo, .value_len = @intCast(hd.value.len) });
-    }
-    slot.body_off = @intCast(slot.bytes.items.len);
-    slot.body_len = @intCast(body.len);
-    slot.bytes.appendSliceAssumeCapacity(body);
-    slot.status = status;
-    slot.word.store(pack(h.gen, .done), .release);
+/// Claims slot `hv` for an answer: `out` to `responding`.
+fn claim(e: *Engine, hv: u64) error{Gone}!struct { *Exec, *Slot, Handle } {
+    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
+    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return e.gone();
+    return .{ x, s, h };
+}
+
+/// Hands slot `si` to its executor (`done` or `streaming`).
+fn handBack(x: *Exec, s: *Slot, h: Handle, state: SlotState) void {
+    s.drained.store(false, .monotonic);
+    s.word.store(pack(h.gen, state), .release);
     // Onto the executor's done list; only the push that finds it empty
-    // wakes the executor's capi task (one remote wake per burst).
-    const x = &e.execs[h.exec];
+    // wakes the capi task (one remote wake per burst).
     var old = x.done_head.load(.monotonic);
     while (true) {
-        slot.next_done = old;
+        s.next_done = old;
         old = x.done_head.cmpxchgWeak(old, h.slot, .release, .monotonic) orelse break;
     }
-    if (old == no_slot) x.kick.set(e.io);
+    if (old == no_slot) x.kick.set(x.engine.io);
+}
+
+fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
+    var total: usize = 0;
+    for (headers) |hd| {
+        total += hd.name.len + hd.value.len;
+        dusty.validateHeaderName(hd.name.slice()) catch return error.Invalid;
+        dusty.validateHeaderValue(hd.value.slice()) catch return error.Invalid;
+    }
+    return total;
+}
+
+fn storeHeaders(list: *std.ArrayList(ReplyHeader), bytes: *std.ArrayList(u8), headers: []const CHeader, extra: usize) !void {
+    var total = extra;
+    for (headers) |hd| total += hd.name.len + hd.value.len;
+    if (total > std.math.maxInt(u32)) return error.Invalid;
+    bytes.clearRetainingCapacity();
+    list.clearRetainingCapacity();
+    try bytes.ensureTotalCapacity(gpa, total);
+    try list.ensureTotalCapacity(gpa, headers.len);
+    for (headers) |hd| {
+        const no: u32 = @intCast(bytes.items.len);
+        bytes.appendSliceAssumeCapacity(hd.name.slice());
+        const vo: u32 = @intCast(bytes.items.len);
+        bytes.appendSliceAssumeCapacity(hd.value.slice());
+        list.appendAssumeCapacity(.{ .name_off = no, .name_len = @intCast(hd.name.len), .value_off = vo, .value_len = @intCast(hd.value.len) });
+    }
+}
+
+fn checkStatus(status: u16) error{Invalid}!void {
+    _ = http.Status.fromCode(status) catch return error.Invalid;
+}
+
+pub fn respond(e: *Engine, hv: u64, status: u16, headers: []const CHeader, body: []const u8, borrow: bool) AnswerError!void {
+    try checkStatus(status);
+    _ = try checkHeaders(headers);
+    const x, const s, const h = try claim(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    try storeHeaders(&s.headers, &s.bytes, headers, if (borrow) 0 else body.len);
+    s.body_off = @intCast(s.bytes.items.len);
+    if (borrow) {
+        s.borrowed = body;
+        s.body_len = 0;
+    } else {
+        if (body.len > std.math.maxInt(u32)) return error.Invalid;
+        s.borrowed = null;
+        s.body_len = @intCast(body.len);
+        s.bytes.appendSliceAssumeCapacity(body);
+    }
+    s.reply = .respond;
+    s.status = status;
+    handBack(x, s, h, .done);
+}
+
+pub fn release(e: *Engine, hv: u64) AnswerError!void {
+    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
+    // A stream under way: cut it short.
+    if (s.out.gen == h.gen) {
+        s.out.acquire();
+        if (s.out.live(h.gen) and !s.out.ended) {
+            s.out.failed = true;
+            const wake = s.out.exec_waiting;
+            s.out.exec_waiting = false;
+            s.out.release();
+            if (wake) s.event.set(e.io);
+            return;
+        }
+        s.out.release();
+    }
+    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return e.gone();
+    s.reply = .release;
+    s.headers.clearRetainingCapacity();
+    s.bytes.clearRetainingCapacity();
+    handBack(x, s, h, .done);
+}
+
+pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd: c_int, offset: u64, len: u64) AnswerError!void {
+    if (comptime builtin.os.tag == .windows) return error.Unsupported;
+    try checkStatus(status);
+    _ = try checkHeaders(headers);
+    // A regular file, and how much of it.
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return error.Invalid;
+    if (!std.c.S.ISREG(@intCast(st.mode))) return error.Invalid;
+    const size: u64 = @intCast(st.size);
+    if (offset > size) return error.Invalid;
+    const n = if (len == 0) size - offset else len;
+    if (offset + n > size) return error.Invalid;
+    const x, const s, const h = try claim(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    const dup = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+    if (dup < 0) return error.Invalid;
+    errdefer _ = std.c.close(dup);
+    try storeHeaders(&s.headers, &s.bytes, headers, 0);
+    s.reply = .fd;
+    s.status = status;
+    s.fd = dup;
+    s.fd_offset = offset;
+    s.fd_len = n;
+    handBack(x, s, h, .done);
+}
+
+pub fn streamStart(e: *Engine, hv: u64, status: u16, headers: []const CHeader) AnswerError!void {
+    try checkStatus(status);
+    _ = try checkHeaders(headers);
+    const x, const s, const h = try claim(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    try storeHeaders(&s.headers, &s.bytes, headers, 0);
+    s.trailers.clearRetainingCapacity();
+    s.trailer_bytes.clearRetainingCapacity();
+    s.status = status;
+    s.out.acquire();
+    s.out.open(h.gen);
+    s.out.release();
+    handBack(x, s, h, .streaming);
+}
+
+/// `ANOLE_BUSY` is `true`.
+pub fn streamWrite(e: *Engine, hv: u64, data: []const u8, borrow: bool) AnswerError!bool {
+    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    if (data.len == 0) return false;
+    const owned: ?[]u8 = if (borrow) null else try gpa.dupe(u8, data);
+    errdefer if (owned) |o| gpa.free(o);
+    s.out.acquire();
+    if (!s.out.live(h.gen) or s.out.ended or s.out.failed) {
+        s.out.release();
+        return e.gone();
+    }
+    s.out.push(.{ .data = owned orelse data, .owner = if (borrow) .consumer else .pipe }) catch |err| {
+        s.out.release();
+        return err;
+    };
+    const busy = s.out.bytes > e.stream_high_water;
+    if (busy) s.out.want_event = true;
+    const wake = s.out.exec_waiting;
+    s.out.exec_waiting = false;
+    s.out.release();
+    if (wake) s.event.set(e.io);
+    return busy;
+}
+
+/// Waits (a blocking consumer thread) for the stream to fall below the
+/// high-water mark, then writes `data` (copied).
+pub fn streamWriteWait(e: *Engine, hv: u64, data: []const u8, timeout_ms: i32) AnswerError!void {
+    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    const tio = threadedIo();
+    const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms < 0) null else std.Io.Clock.Timestamp.now(tio, .awake).addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    while (true) {
+        const seq = s.out.seq.load(.acquire);
+        s.out.acquire();
+        const live = s.out.live(h.gen) and !s.out.ended and !s.out.failed;
+        const room = s.out.bytes <= e.stream_high_water;
+        s.out.release();
+        if (!live) return e.gone();
+        if (room) break;
+        _ = s.out.blocked.fetchAdd(1, .acq_rel);
+        defer _ = s.out.blocked.fetchSub(1, .acq_rel);
+        if (deadline) |d| {
+            if (std.Io.Clock.Timestamp.now(tio, .awake).compare(.gte, d)) return error.Timeout;
+            tio.futexWaitTimeout(u32, &s.out.seq.raw, seq, .{ .deadline = d }) catch {};
+        } else tio.futexWaitUncancelable(u32, &s.out.seq.raw, seq);
+    }
+    _ = try streamWrite(e, hv, data, false);
+}
+
+pub fn streamEnd(e: *Engine, hv: u64, trailers: []const CHeader) AnswerError!void {
+    _ = try checkHeaders(trailers);
+    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    s.out.acquire();
+    if (!s.out.live(h.gen) or s.out.ended or s.out.failed) {
+        s.out.release();
+        return e.gone();
+    }
+    storeHeaders(&s.trailers, &s.trailer_bytes, trailers, 0) catch |err| {
+        s.out.release();
+        return err;
+    };
+    s.out.ended = true;
+    const wake = s.out.exec_waiting;
+    s.out.exec_waiting = false;
+    s.out.release();
+    if (wake) s.event.set(e.io);
+}
+
+/// Copies request body bytes out; 0 at the end. `error.Again` with
+/// `timeout_ms` 0 and nothing there (an `ANOLE_EV_BODY` follows).
+pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usize {
+    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
+    const tio = threadedIo();
+    const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms <= 0) null else std.Io.Clock.Timestamp.now(tio, .awake).addDuration(.{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    while (true) {
+        const seq = s.in.seq.load(.acquire);
+        s.in.acquire();
+        const state = stateOf(s.word.load(.acquire));
+        const mine = genOf(s.word.load(.acquire)) == h.gen and state != .free and state != .expired;
+        if (!mine) {
+            s.in.release();
+            return e.gone();
+        }
+        if (!s.in.live(h.gen)) {
+            // No streamed body: an inline one (or none) reads as ended.
+            s.in.release();
+            return 0;
+        }
+        if (s.in.failed) {
+            s.in.release();
+            return e.gone();
+        }
+        const n = s.in.read(out);
+        const ended = s.in.ended and s.in.front() == null;
+        const wake = s.in.exec_waiting and n > 0;
+        if (wake) s.in.exec_waiting = false;
+        if (n == 0 and !ended and timeout_ms == 0) s.in.want_event = true;
+        s.in.release();
+        if (wake) s.pump_event.set(e.io);
+        if (n > 0) return n;
+        if (ended) return 0;
+        _ = x;
+        if (timeout_ms == 0) return error.Again;
+        _ = s.in.blocked.fetchAdd(1, .acq_rel);
+        defer _ = s.in.blocked.fetchSub(1, .acq_rel);
+        if (deadline) |d| {
+            if (std.Io.Clock.Timestamp.now(tio, .awake).compare(.gte, d)) return error.Timeout;
+            tio.futexWaitTimeout(u32, &s.in.seq.raw, seq, .{ .deadline = d }) catch {};
+        } else tio.futexWaitUncancelable(u32, &s.in.seq.raw, seq);
+    }
 }

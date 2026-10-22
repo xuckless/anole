@@ -754,6 +754,9 @@ pub fn build(b: *std.Build) void {
             .pic = true,
             .imports = &.{.{ .name = "anole", .module = anole_mod }},
         });
+        const capi_opts = b.addOptions();
+        capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+        capi_mod.addOptions("capi_options", capi_opts);
         // The C++ runtime symbols BoringSSL's objects need, so that libanole
         // needs no libstdc++ or libc++ in the final link (Linux has no
         // std::__1 in libstdc++ at all).

@@ -17,6 +17,10 @@ pub fn init() Compress {
     return .{};
 }
 
+/// Only sets a flag before `next()`: requests behind it can detach
+/// (`Detached`).
+pub const detach_safe = true;
+
 pub fn execute(_: *const Compress, req: *Request, res: *Response, executor: anytype) !void {
     _ = req;
     res.compress = true;

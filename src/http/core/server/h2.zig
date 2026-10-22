@@ -44,6 +44,7 @@ const ServerConfig = @import("../config.zig").ServerConfig;
 const Request = @import("../request.zig").Request;
 const BodySource = @import("../request.zig").BodySource;
 const Response = @import("../response.zig").Response;
+const Detached = @import("../detach.zig").Detached;
 const Sink = @import("../sink.zig").Sink;
 const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
@@ -184,6 +185,10 @@ pub fn Engine(comptime Ctx: type) type {
             /// Set while the reader runs the session, so a stream whose head
             /// completes can be handed to a task in the connection's group.
             group: ?*std.Io.Group = null,
+            /// The connection's group for its whole life: where a detached
+            /// response that needs a task after all gets one
+            /// (`Detached.attach`).
+            tasks: ?*std.Io.Group = null,
             /// Requests of `no_wait` routes that arrived whole, for the
             /// reader to run once the session has taken the read. Only the
             /// reader touches it.
@@ -408,6 +413,11 @@ pub fn Engine(comptime Ctx: type) type {
             inline_mode: bool = false,
             backlog: std.ArrayList(u8) = .empty,
             backlog_pos: usize = 0,
+            /// The handler detached the response (`Response.detach`): the
+            /// request and response live on in the stream's arena, and the
+            /// handler's hold on the stream goes when it is finished or
+            /// aborted.
+            detached: ?*Exchange = null,
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
             /// Or a whole body in memory (`StreamSink.complete`), which the
@@ -586,6 +596,13 @@ pub fn Engine(comptime Ctx: type) type {
                     const stream = (it.next() orelse break).*;
                     stream.reset = true;
                     stream.closeBody();
+                    // A detached response nobody finished: its owner hears
+                    // of it and lets go of the request, which may free the
+                    // stream; the loop looks again.
+                    if (stream.detached != null) {
+                        abortDetached(stream);
+                        continue;
+                    }
                     // No handler task is left (a stream whose head never
                     // completed never had one), so this frees it.
                     stream.handler_done = true;
@@ -600,6 +617,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             var group: std.Io.Group = .init;
             defer group.cancel(conn.io);
+            conn.tasks = &group;
             // The writer and the streams stay on the connection's executor.
             try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
 
@@ -636,13 +654,20 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 conn.closing = true;
                 var it = conn.streams.valueIterator();
+                var gone: std.ArrayList(*Stream) = .empty;
+                defer gone.deinit(conn.allocator);
                 while (it.next()) |stream| {
                     if (reader_failed or !stream.*.body_done) {
                         stream.*.reset = true;
                         stream.*.closeBody();
                         stream.*.cancelHandler();
+                        if (stream.*.detached != null) gone.append(conn.allocator, stream.*) catch {};
                     }
                 }
+                // Detached responses with nobody left to send them to: let
+                // go of them now rather than at their deadline. (Out of the
+                // iteration: the abort may free the stream.)
+                for (gone.items) |stream| abortDetached(stream);
             }
             conn.kickWriter();
             group.await(conn.io) catch |err| switch (err) {
@@ -953,7 +978,7 @@ pub fn Engine(comptime Ctx: type) type {
                 log.debug("HTTP/2 stream {d} reset before its handler started", .{stream.id});
                 return;
             }
-            serveStream(conn, stream, false) catch |err| return streamFailed(conn, stream, err);
+            _ = serveStream(conn, stream, false) catch |err| return streamFailed(conn, stream, err);
         }
 
         /// Runs the requests `onFrameRecv` set aside for the reader
@@ -965,16 +990,22 @@ pub fn Engine(comptime Ctx: type) type {
                 const gone = stream.reset;
                 conn.unlock();
                 var canceled = false;
+                var detached = false;
                 if (!gone) {
-                    serveStream(conn, stream, true) catch |err| {
+                    if (serveStream(conn, stream, true)) |served| {
+                        detached = served == .detached;
+                    } else |err| {
                         streamFailed(conn, stream, err) catch {
                             canceled = true;
                         };
-                    };
+                    }
                 }
-                conn.lock();
-                stream.release(.handler);
-                conn.unlock();
+                // A detached response keeps the stream until it is finished.
+                if (!detached) {
+                    conn.lock();
+                    stream.release(.handler);
+                    conn.unlock();
+                }
                 // The reader itself is canceled: the connection is going.
                 if (canceled) return error.Canceled;
             }
@@ -1020,10 +1051,23 @@ pub fn Engine(comptime Ctx: type) type {
             conn.kickWriter();
         }
 
+        /// One request and its response, with what they point at: on the
+        /// handler's stack, or in the stream's arena for a request that
+        /// runs on the reader, whose response may be detached.
+        const Exchange = struct {
+            request: Request,
+            response: Response,
+            sink_state: StreamSink,
+            body_reader: BodyReader,
+        };
+
+        const Served = enum { done, detached };
+
         /// Serves one request. `inline_mode`: on the connection's reader
         /// (a `no_wait` route), with no request timeout, whose timer would
-        /// cancel the reader.
-        fn serveStream(conn: *Conn, stream: *Stream, inline_mode: bool) !void {
+        /// cancel the reader; its response may be detached (`Detached`),
+        /// and then the stream is held until it is finished.
+        fn serveStream(conn: *Conn, stream: *Stream, inline_mode: bool) !Served {
             const server = conn.server;
             const arena = stream.arena.allocator();
             const io = conn.io;
@@ -1032,7 +1076,10 @@ pub fn Engine(comptime Ctx: type) type {
             defer timer.clear(io);
             if (!inline_mode) if (server.config.timeout.request) |d| timer.set(io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
-            var request: Request = .{
+            var on_stack: Exchange = undefined;
+            const ex: *Exchange = if (inline_mode) try arena.create(Exchange) else &on_stack;
+            const request = &ex.request;
+            request.* = .{
                 .arena = arena,
                 .io = io,
                 .parser = undefined,
@@ -1048,19 +1095,30 @@ pub fn Engine(comptime Ctx: type) type {
                 ._timeout_context = if (inline_mode) null else &timer,
                 ._set_timeout = if (inline_mode) null else setTimeout,
             };
-            var body_reader: BodyReader = .init(stream);
+            const body_reader = &ex.body_reader;
+            body_reader.* = .init(stream);
             request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
-            var sink_state: StreamSink = .{ .stream = stream };
-            var response = try Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
-            server.configureResponse(&response);
-            defer response.deinit();
-            response.request = &request;
-            request.response = &response;
+            const sink_state = &ex.sink_state;
+            sink_state.* = .{ .stream = stream };
+            const response = &ex.response;
+            response.* = try Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
+            server.configureResponse(response);
+            var detached = false;
+            defer if (!detached) response.deinit();
+            response.request = request;
+            request.response = response;
+            if (inline_mode) {
+                response.detach_engine = &detach_engine;
+                response.detach_ctx = ex;
+            }
 
             request.method = parseMethod(stream.method) orelse {
                 response.status = .not_implemented;
-                return response.write();
+                {
+                    try response.write();
+                    return .done;
+                }
             };
             // An extended CONNECT (RFC 8441; nghttp2 has checked its pseudo
             // headers) is routed as the GET that the HTTP/1.1 upgrade it
@@ -1085,7 +1143,10 @@ pub fn Engine(comptime Ctx: type) type {
             }
             if (too_many) {
                 response.status = .request_header_fields_too_large;
-                return response.write();
+                {
+                    try response.write();
+                    return .done;
+                }
             }
             request.applyEntityHeaders();
             // A body declared longer than allowed is refused unread; the
@@ -1095,28 +1156,109 @@ pub fn Engine(comptime Ctx: type) type {
                     response.status = .payload_too_large;
                     response.content_type = .text;
                     response.body = "413 Content Too Large\n";
-                    return response.write();
+                    {
+                    try response.write();
+                    return .done;
+                }
                 };
             }
-            server.applyForwarded(&request, conn.connection);
+            server.applyForwarded(request, conn.connection);
 
             if (request.headers.get("Expect")) |expect| {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                     request.expects_continue = !stream.body_done;
                 } else {
                     response.status = .expectation_failed;
-                    return response.write();
+                    {
+                    try response.write();
+                    return .done;
+                }
                 }
             }
 
             log.debug("Received (h2 stream {d}): {f} {s}", .{ stream.id, request.method, request.url });
 
-            server.dispatch(&request, &response) catch |err| switch (err) {
+            server.dispatch(request, response) catch |err| switch (err) {
                 error.ReadFailed => return body_reader.err orelse error.Unexpected,
                 error.WriteFailed => return sink_state.writeErr() orelse error.Unexpected,
                 else => |e| return e,
             };
+            if (response.detached != null) {
+                // Finished later (`detach_engine`); the stream is held till
+                // then.
+                detached = true;
+                conn.lock();
+                stream.detached = ex;
+                conn.unlock();
+                return .detached;
+            }
             try response.write();
+            return .done;
+        }
+
+        /// How a detached response is finished, attached to a task, or let
+        /// go (`Detached`).
+        const detach_engine: Detached.Engine = .{ .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+
+        fn exchangeOf(d: *Detached) *Exchange {
+            return @ptrCast(@alignCast(d.engine_ctx));
+        }
+
+        /// Writes the response (or handles `result`'s error as a handler's),
+        /// then lets go of the stream. On the connection's executor: the
+        /// owner's task, or the task `detachedAttach` was for.
+        fn detachedEnd(d: *Detached, result: anyerror!void) void {
+            const ex = exchangeOf(d);
+            const stream = ex.sink_state.stream;
+            const conn = stream.conn;
+            if (result) |_| {
+                ex.response.write() catch |err| {
+                    streamFailed(conn, stream, err) catch {};
+                };
+            } else |err| {
+                streamFailed(conn, stream, err) catch {};
+            }
+            ex.response.deinit();
+            conn.lock();
+            defer conn.unlock();
+            stream.detached = null;
+            stream.task = null;
+            stream.release(.handler);
+            conn.kickWriter();
+        }
+
+        /// The response goes on from a task: its body writes may now wait
+        /// for the peer, as a handler task's do.
+        fn detachedAttach(d: *Detached) *std.Io.Group {
+            const ex = exchangeOf(d);
+            const stream = ex.sink_state.stream;
+            const conn = stream.conn;
+            conn.lock();
+            defer conn.unlock();
+            stream.inline_mode = false;
+            return conn.tasks.?;
+        }
+
+        fn detachedEnter(d: *Detached) void {
+            const ex = exchangeOf(d);
+            const stream = ex.sink_state.stream;
+            const conn = stream.conn;
+            conn.lock();
+            defer conn.unlock();
+            stream.task = placement.currentTask(conn.io);
+        }
+
+        /// The stream ended with its response still detached (not
+        /// attached): the owner hears of it, and the stream is let go.
+        /// Under the mutex.
+        fn abortDetached(stream: *Stream) void {
+            const ex = stream.detached orelse return;
+            const d = ex.response.detached.?;
+            if (d.state != .detached) return;
+            stream.detached = null;
+            d.abort();
+            ex.response.deinit();
+            stream.release(.handler);
         }
 
         fn setTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
@@ -1840,6 +1982,8 @@ pub fn Engine(comptime Ctx: type) type {
             stream.closeBody();
             if (stream.out) |*q| q.close(conn.io);
             if (stream.reset) stream.cancelHandler();
+            // Reset with its response detached: the owner lets go now.
+            if (stream.reset) abortDetached(stream);
             stream.release(.protocol);
             conn.kickWriter();
             return 0;
