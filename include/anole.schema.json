@@ -1431,6 +1431,140 @@
             }
           },
           "description": "Bounds of the answers kept for queries with cache_ttl_ms, over every executor."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on every query that has no timeout_ms of its own, in a request or not; past it the statement is interrupted (ANOLE_E_TIMEOUT). 0: none."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
         }
       },
       "required": [
@@ -1445,6 +1579,11 @@
         "path": {
           "type": "string",
           "description": "A file (created when missing), or \":memory:\"."
+        },
+        "uri": {
+          "type": "boolean",
+          "default": false,
+          "description": "Take a path starting with \"file:\" as a SQLite URI."
         },
         "readers": {
           "anyOf": [
@@ -1466,10 +1605,10 @@
           "default": 5000,
           "description": "How long a statement waits for a lock another process holds."
         },
-        "statement_cache": {
+        "statement_cache_size": {
           "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
+          "minimum": 1,
+          "maximum": 65535,
           "default": 64,
           "description": "Prepared statements kept per connection."
         },
@@ -1490,6 +1629,13 @@
               "type": "null"
             }
           ]
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the database's answer."
         }
       },
       "required": [
@@ -1634,6 +1780,62 @@
               "type": "null"
             }
           ]
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file with the client certificate (chain), for servers that ask. With client_key_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The client certificate's private key (PEM file)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "TLS without checking the server's certificate. Refused with a CA and with a URL that verifies."
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the server's answer."
         }
       },
       "description": "A PostgreSQL database (anole.pg; docs/database.md)."
@@ -1713,6 +1915,62 @@
           "type": "boolean",
           "default": false,
           "description": "Open a connection per executor at start, and fail the start if that fails."
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file with the client certificate (chain), for servers that ask. With client_key_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The client certificate's private key (PEM file)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "TLS without checking the server's certificate. Refused with a CA and with a URL that verifies."
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the server's answer."
         }
       },
       "description": "A Redis or Valkey server (anole.redis; docs/database.md)."
@@ -1766,11 +2024,17 @@
           ]
         },
         "max_connections": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
-          "default": 100,
-          "description": "Connections at most, split between the executors (maxPoolSize; 0: no limit)."
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections at most, split between the executors (maxPoolSize). Left out: 100."
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "acquire_timeout_ms": {
           "type": "integer",
@@ -1791,7 +2055,92 @@
           "minimum": 0,
           "maximum": 4294967295,
           "default": 10000,
-          "description": "TCP connect and TLS handshake."
+          "description": "TCP connect and TLS handshake; 0: no limit."
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file with the client certificate (chain), for servers that ask. With client_key_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The client certificate's private key (PEM file)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "TLS without checking the server's certificate. Refused with a CA and with a URL that verifies."
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the server's answer."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "Idle connections older than this are closed; 0: never."
+        },
+        "heartbeat_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "Between two checks of a server."
+        },
+        "retry_reads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Retry a read once after a network error or a primary change."
+        },
+        "retry_writes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Retry a single-document write once, likewise."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Select a server and open a connection per executor at start, and fail the start if that fails."
         }
       },
       "description": "A MongoDB deployment (anole.mongodb; docs/database.md)."
@@ -1930,6 +2279,13 @@
           "type": "boolean",
           "default": true,
           "description": "Unary and server-streaming calls that arrive whole over HTTP/2 or HTTP/3 run with no task (detached), as no_wait routes do."
+        },
+        "middleware": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Middleware"
+          },
+          "description": "After the global ones; runs for the service's gRPC paths and its transcoded routes, as a route's middleware does."
         }
       },
       "required": [
