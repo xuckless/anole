@@ -155,6 +155,13 @@ token's `kid` is new, wait for that one fetch. If it fails, they get
 `error.JwksFetchFailed`. Requests the current keys can verify don't wait,
 and verification itself runs outside the lock.
 
+When the provider can't be reached, keys past their TTL stay in use for
+`stale_seconds` (a day), so an outage there doesn't fail every request at
+once. A failed fetch isn't retried for `retry_seconds` (5), doubling with
+each failure up to `max_retry_seconds` (300); meanwhile requests use the
+stale keys, or get `error.JwksFetchFailed` at once when there are none, and
+a warning is logged per failed fetch.
+
 ## OIDC sign-in (Google, Apple)
 
 `anole.auth.oidc` is a relying party. It is never a provider. It runs the

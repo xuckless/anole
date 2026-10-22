@@ -230,3 +230,35 @@ test "Keyring: a policy without an audience is refused" {
     try std.testing.expectError(error.AudienceRequired, f.keyring.verify(arena, t1, .{}));
     _ = try f.keyring.verify(arena, t1, .{ .audience = "api" });
 }
+
+test "Keyring: past its TTL, a provider outage leaves the keys in hand, and failed fetches back off" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    for (&keys) |*k| k.* = Ed.KeyPair.generate(io);
+    served.store(1, .monotonic);
+    delay_ms.store(0, .monotonic);
+    down.store(false, .monotonic);
+    defer down.store(false, .monotonic);
+
+    var f: Fixture = undefined;
+    try f.init(gpa, io);
+    defer f.deinit(io);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const t1 = try token(arena_state.allocator(), io, 1);
+
+    _ = try verifyTimed(&f.keyring, io, t1, "u1");
+    const fetched = fetches.load(.monotonic);
+    // The set is past its TTL, and the provider is down.
+    f.keyring.current.?.fetched_at -= f.keyring.ttl_seconds + 10;
+    down.store(true, .monotonic);
+    for (0..20) |_| _ = try verifyTimed(&f.keyring, io, t1, "u1");
+    // One attempt, then a pause before the next.
+    try std.testing.expectEqual(fetched + 1, fetches.load(.monotonic));
+
+    // Past the grace period the stale keys are no longer used.
+    f.keyring.current.?.fetched_at -= 400 * 24 * 3600;
+    try std.testing.expectError(error.JwksFetchFailed, verifyTimed(&f.keyring, io, t1, "u1"));
+}

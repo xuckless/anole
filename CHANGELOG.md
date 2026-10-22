@@ -60,6 +60,11 @@ breaking changes are listed anyway.
   keys that sign for your application alone. New `Policy.typ` (e.g.
   `"at+jwt"`) checks the header's `typ`, and `Policy.require_iat` makes
   `iat` mandatory.
+- JWKS `Keyring`: while the provider can't be reached, keys past their TTL
+  stay in use for `stale_seconds` (24 h), and failed fetches back off
+  (`retry_seconds` 5, doubling up to `max_retry_seconds` 300). Before, an
+  outage failed every request with 503 and turned each one into another
+  fetch. No configuration change needed.
 
 ### C ABI (ABI 0.1)
 
