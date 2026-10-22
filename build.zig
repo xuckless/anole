@@ -263,21 +263,22 @@ pub fn addProtoModule(b: *std.Build, anole_dep: *std.Build.Dependency, proto: Pr
 }
 
 /// zig-protobuf's pinned protoc for the machine running the build (its
-/// `build_util.getProtocBin`, which its build.zig does not export).
+/// `build_util.getProtocBin`, which its build.zig does not export). Google's
+/// release binaries, pinned by hash in zig-protobuf's build.zig.zon; on
+/// Windows the win64 one (also on arm64 Windows, which runs x64 programs).
 fn protocBinary(pb_builder: *std.Build) ?std.Build.LazyPath {
-    const os = switch (builtin.os.tag) {
-        .macos => "osx",
-        .linux => "linux",
-        else => @compileError("protoc: Anole builds on Linux and macOS"),
+    const name = switch (builtin.os.tag) {
+        .windows => "protoc-win64",
+        .macos, .linux => "protoc-" ++ (if (builtin.os.tag == .macos) "osx" else "linux") ++ "-" ++ switch (builtin.cpu.arch) {
+            .aarch64 => "aarch_64",
+            .x86_64 => "x86_64",
+            .x86 => "x86_32",
+            else => @compileError("protoc: no pinned binary for this CPU"),
+        },
+        else => @compileError("protoc: Anole builds on Linux, macOS and Windows"),
     };
-    const arch = switch (builtin.cpu.arch) {
-        .aarch64 => "aarch_64",
-        .x86_64 => "x86_64",
-        .x86 => "x86_32",
-        else => @compileError("protoc: no pinned binary for this CPU"),
-    };
-    const dep = pb_builder.lazyDependency("protoc-" ++ os ++ "-" ++ arch, .{}) orelse return null;
-    return dep.path("bin/protoc");
+    const dep = pb_builder.lazyDependency(name, .{}) orelse return null;
+    return dep.path(if (builtin.os.tag == .windows) "bin/protoc.exe" else "bin/protoc");
 }
 
 /// The `package` a .proto file in the project declares, or null. The
