@@ -818,10 +818,22 @@ fn alpnSelect(
     return c.SSL_TLSEXT_ERR_NOACK;
 }
 
+/// What a server offers over TLS 1.2: Mozilla's "intermediate" list less
+/// finite-field Diffie-Hellman, which BoringSSL does not do. ChaCha20 ranks
+/// with AES-128-GCM, so a client without AES hardware can pick it.
+const server_tls12_ciphers =
+    "[ECDHE-ECDSA-AES128-GCM-SHA256|ECDHE-ECDSA-CHACHA20-POLY1305]:" ++
+    "[ECDHE-RSA-AES128-GCM-SHA256|ECDHE-RSA-CHACHA20-POLY1305]:" ++
+    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384";
+
 fn newServerCtx() !*c.SSL_CTX {
     const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
     errdefer c.SSL_CTX_free(ctx);
     if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1) return error.TlsFailure;
+    // TLS 1.2 suites: ECDHE key exchange (forward secrecy) with an AEAD
+    // only. BoringSSL's default also has RSA key exchange and CBC with
+    // SHA-1. TLS 1.3 suites are all of that kind and are not set here.
+    if (c.SSL_CTX_set_strict_cipher_list(ctx, server_tls12_ciphers) != 1) return error.TlsFailure;
     // Idle keep-alive connections give their record buffers back.
     _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
     // Resumption through stateless session tickets only. The stateful cache

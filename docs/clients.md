@@ -320,7 +320,10 @@ SEC1 PEM without a passphrase.
 To trust a development certificate from `anole.tls.selfSigned`, pass its
 `cert` (not the key) as `.ca = .{ .pem = pem.cert }`, as `examples/clients`
 does. The certificate is its own CA and names `localhost`, `127.0.0.1` and
-`::1`. An IP literal as the host is checked against the IP names, and no
+`::1`. Being a CA, it could vouch for any name, so trust it only in
+development and tests.
+
+The clients do not check revocation (no CRLs, no OCSP). An IP literal as the host is checked against the IP names, and no
 SNI is sent for it.
 
 ## Timeouts

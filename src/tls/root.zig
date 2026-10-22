@@ -91,7 +91,8 @@ pub const SelfSignedOptions = struct {
 
 /// A fresh key and a self-signed certificate for it, for development
 /// and tests: nothing touches the disk. The certificate is its own CA
-/// (`CA:TRUE`), so a client can trust it directly. Free it with
+/// (`CA:TRUE`), so a client can trust it directly; never trust it outside
+/// development, since a CA certificate can vouch for any name. Free it with
 /// `Pem.deinit`. A listener that only needs one can name
 /// `.dev_self_signed` instead.
 ///
@@ -1057,5 +1058,52 @@ test "TLS hello: a reload that changes the client CAs stops earlier sessions fro
         try RawClient.onThread(io, Visit.run, .{ &after, ctx, port, Visit.latest orelse return error.NoSession });
         try std.testing.expect(!after.reused);
         try std.testing.expect(!after.hello);
+    }
+}
+
+test "TLS hello: TLS 1.2 offers only forward-secret AEAD cipher suites" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
+    // An RSA key, which RSA key exchange would also work with.
+    var h = try Https.initWith(.{ .key = .rsa4096 });
+    defer h.deinit();
+    const io = h.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const Offer = struct {
+        /// Whether a TLS 1.2 handshake offering only `ciphers` succeeds.
+        fn run(port: u16, ciphers: [:0]const u8, ok: *bool) !void {
+            const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+            defer c.SSL_CTX_free(ctx);
+            _ = c.SSL_CTX_set_max_proto_version(ctx, c.TLS1_2_VERSION);
+            if (c.SSL_CTX_set_strict_cipher_list(ctx, ciphers.ptr) != 1) return error.BadCipherList;
+            const conn = RawClient.connect(ctx, port, null) catch |err| switch (err) {
+                error.Handshake => {
+                    ok.* = false;
+                    return;
+                },
+                else => return err,
+            };
+            defer conn.close();
+            ok.* = (try conn.get()).hello;
+        }
+    };
+    const port = server.address.ip.getPort();
+    for ([_][:0]const u8{ "ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384", "ECDHE-RSA-CHACHA20-POLY1305" }) |good| {
+        var ok = false;
+        try RawClient.onThread(io, Offer.run, .{ port, good, &ok });
+        try std.testing.expect(ok);
+    }
+    // No forward secrecy (RSA key exchange), or CBC with SHA-1.
+    for ([_][:0]const u8{ "AES128-GCM-SHA256", "AES256-GCM-SHA384", "AES128-SHA", "ECDHE-RSA-AES128-SHA", "ECDHE-RSA-AES256-SHA" }) |weak| {
+        var ok = true;
+        try RawClient.onThread(io, Offer.run, .{ port, weak, &ok });
+        try std.testing.expect(!ok);
     }
 }

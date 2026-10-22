@@ -42,6 +42,12 @@ breaking changes are listed anyway.
   certificate reload that changes them no longer carries the ticket keys
   over. Removing a client CA and reloading now stops clients whose
   certificates it vouched for from resuming with older sessions.
+- TLS listeners offer only ECDHE key exchange with AES-GCM or
+  ChaCha20-Poly1305 over TLS 1.2 (BoringSSL's default also allowed RSA key
+  exchange and CBC with SHA-1). TLS 1.2 clients that support none of these
+  can no longer connect. Docs now state that revocation (CRL, OCSP) is not
+  checked and that `.dev_self_signed` certificates are CAs for development
+  only.
 
 ### C ABI (ABI 0.1)
 
