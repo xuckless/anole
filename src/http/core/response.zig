@@ -3544,7 +3544,7 @@ test "Response: resetBody replaces a half written body" {
     try body.interface.writeAll("{\"half\":");
     // The handler fails here, without ever calling `end`.
 
-    response.resetBody();
+    try response.resetBody();
     response.status = .internal_server_error;
     response.content_type = .text;
     response.body = "500 Internal Server Error\n";
@@ -3578,7 +3578,7 @@ test "Response: resetBody drops the headers that described the old body" {
     var body = try response.writer();
     try body.interface.writeAll("{\"half\":");
 
-    response.resetBody();
+    try response.resetBody();
     response.status = .internal_server_error;
     response.body = "oops\n";
     try response.write();
@@ -3895,7 +3895,7 @@ test "BodyWriter: resetBody after several segments leaves only the replacement" 
     try body.interface.flush();
     try std.testing.expect(response.body_buffer.segments.len() > 1);
     try std.testing.expectEqual(5300, response.body_buffer.len());
-    response.resetBody();
+    try response.resetBody();
     var again = try response.writer();
     try again.interface.writeAll("fresh");
     try again.end();
@@ -4149,7 +4149,7 @@ test "Response: a stream refused at the headers leaves nothing for the error res
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = try testGzipRequest(arena.allocator());
+    var request = try testGzipRequest(arena.allocator());
     var response = try Response.init(arena.allocator(), &connection, 2);
     response.request = &request;
     response.compress = true;
@@ -4161,7 +4161,7 @@ test "Response: a stream refused at the headers leaves nothing for the error res
     try std.testing.expectError(error.TooManyHeaders, response.stream(&stream_buf));
 
     // What `handleError` does with headers that are still open.
-    response.resetBody();
+    try response.resetBody();
     response.status = .internal_server_error;
     response.body = "oops";
     try response.write();
@@ -4182,7 +4182,7 @@ test "Response: compress without room for its headers sends the body as it is" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = try testGzipRequest(arena.allocator());
+    var request = try testGzipRequest(arena.allocator());
     var response = try Response.init(arena.allocator(), &connection, 1);
     response.request = &request;
     response.compress = true;
@@ -4205,7 +4205,7 @@ test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = try testGzipRequest(arena.allocator());
+    var request = try testGzipRequest(arena.allocator());
     var response = try Response.init(arena.allocator(), &connection, 8);
     response.request = &request;
     response.compress = true;
@@ -4230,7 +4230,7 @@ test "Response: a 304 gets the Vary and ETag of a gzipped 200, without its codin
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = try testGzipRequest(arena.allocator());
+    var request = try testGzipRequest(arena.allocator());
     var response = try Response.init(arena.allocator(), &connection, 8);
     response.request = &request;
     response.compress = true;
@@ -4272,7 +4272,7 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = try testGzipRequest(arena.allocator());
+    var request = try testGzipRequest(arena.allocator());
     var response = try Response.init(failing.allocator(), &connection, 8);
     response.request = &request;
     response.compress = true;
@@ -4355,7 +4355,7 @@ test "Response: a buffered body goes out as br, at the configured quality" {
         var conn_writer: std.Io.Writer = .fixed(&buf);
         var connection: Connection = undefined;
         connection.initWriterForTesting(&conn_writer);
-        const request = try testBrRequest(arena.allocator());
+        var request = try testBrRequest(arena.allocator());
         var response = try Response.init(arena.allocator(), &connection, 8);
         defer response.deinit();
         response.request = &request;
@@ -4387,7 +4387,7 @@ test "Response: a streamed body goes out as br, each flush decodable" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
-    const request = try testBrRequest(arena.allocator());
+    var request = try testBrRequest(arena.allocator());
     var response = try Response.init(arena.allocator(), &connection, 8);
     defer response.deinit();
     response.request = &request;
@@ -4435,7 +4435,7 @@ test "Response.deinit frees the Brotli encoder of a stream never ended" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
-    const request = try testBrRequest(arena.allocator());
+    var request = try testBrRequest(arena.allocator());
     var response = try Response.init(arena.allocator(), &connection, 8);
     response.request = &request;
     response.compress = true;

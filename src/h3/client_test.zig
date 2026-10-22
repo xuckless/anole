@@ -763,13 +763,17 @@ test "h3 server: mutual TLS in request mode, and the client certificate in handl
         defer tmp.cleanup();
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = f.pem.cert });
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = f.pem.key });
+        var cert_buf: [160]u8 = undefined;
+        var key_buf: [160]u8 = undefined;
+        const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+        const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
         const conn = try client.ClientConnection.connect(gpa, io, .{
             .host = "localhost",
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
             .tls = .{
-                .ca = .{ .file = .{ .path = "cert.pem", .dir = tmp.dir } },
-                .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = tmp.dir },
+                .ca = .{ .file = cert_path },
+                .client_certificate = .fromFiles(cert_path, key_path),
             },
         });
         defer conn.close();

@@ -808,28 +808,31 @@ pub const Engine = struct {
     fn mainThread(e: *Engine) void {
         const cfg = e.config;
         const a = e.arena.allocator();
-        var server_cfg: http.ServerConfig = .{};
         // Anole's own backstop, past the consumer deadline.
         var longest: u32 = cfg.timeouts.request_ms;
         for (cfg.routes) |r| if (r.timeout_ms) |t| {
             longest = @max(longest, t);
         };
-        server_cfg.timeout.request = .fromMilliseconds(@as(i64, longest) + 5000);
-        server_cfg.timeout.shutdown = .fromMilliseconds(cfg.timeouts.shutdown_ms);
-        server_cfg.timeout.keepalive = .fromMilliseconds(cfg.timeouts.keepalive_ms);
-        server_cfg.request.max_body_size = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize);
-        server_cfg.request.max_content_length = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize);
-        server_cfg.trusted_proxy_hops = cfg.trusted_proxy_hops;
-        server_cfg.trust_forwarded_proto = cfg.trust_forwarded_proto;
-        server_cfg.trust_forwarded_host = cfg.trust_forwarded_host;
-        if (cfg.limits.max_connections > 0) server_cfg.max_connections = cfg.limits.max_connections;
         const listeners = buildListeners(a, cfg) catch |err| return e.failStart(err);
         var app = anole.App.init(gpa, .{
             .listeners = listeners,
             .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
             .signals = e.signals,
             .raise_fd_limit = true,
-            .server = server_cfg,
+            .timeouts = .{
+                .request = .fromMilliseconds(@as(i64, longest) + 5000),
+                .shutdown = .fromMilliseconds(cfg.timeouts.shutdown_ms),
+                .keepalive = .fromMilliseconds(cfg.timeouts.keepalive_ms),
+            },
+            .limits = .{
+                .body_max = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize),
+                .max_connections = cfg.limits.max_connections,
+            },
+            .proxy = .{
+                .trusted_hops = @intCast(@min(cfg.trusted_proxy_hops, 255)),
+                .trust_forwarded_proto = cfg.trust_forwarded_proto,
+                .trust_forwarded_host = cfg.trust_forwarded_host,
+            },
             .http3 = if (comptime features.http3) if (!wantsHttp3(cfg)) null else .{
                 .max_streams_bidi = cfg.http3.max_streams_bidi,
                 .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
@@ -922,12 +925,12 @@ pub const Engine = struct {
                         .fromFiles(f, t.key_file.?)
                     else
                         .fromPem(t.cert_pem.?, t.key_pem.?),
-                    .alpn_protocols = t.alpn,
+                    .alpn = t.alpn,
                     .client_auth = switch (config_mod.clientAuth(t.client_auth).?) {
                         .none => null,
                         inline .request, .require => |m| .{
-                            .ca = if (t.client_ca_file) |f| .{ .file = .{ .path = f } } else .{ .pem = t.client_ca_pem.? },
-                            .mode = @field(http.ServerConfig.Tls.ClientAuth.Mode, @tagName(m)),
+                            .ca = if (t.client_ca_file) |f| .{ .file = f } else .{ .pem = t.client_ca_pem.? },
+                            .mode = @field(http.ClientAuth.Mode, @tagName(m)),
                         },
                     },
                 };

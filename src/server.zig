@@ -2451,13 +2451,14 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = pem.cert });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = pem.key });
+    var ca_buf: [160]u8 = undefined;
 
     var app = try Server(void).init(gpa, .{
         .http = null,
         .https = .{
             .port = 0,
             .cert = .{ .pem = .{ .cert = pem.cert, .key = pem.key } },
-            .client_auth = .{ .ca = .{ .file = .{ .path = "cert.pem", .dir = tmp.dir } } },
+            .client_auth = .{ .ca = .{ .file = tmpPath(&ca_buf, &tmp, "cert.pem") } },
         },
         .http3 = .{ .port = 0, .alt_svc = false },
         .executors = .exact(2),
@@ -2466,10 +2467,12 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
     app.get("/peer", handlePeerCertificate);
 
     const Check = struct {
-        fn run(a: *Server(void), p: *const tls.Pem, dir: std.Io.Dir) !void {
+        fn run(a: *Server(void), p: *const tls.Pem, td: *const std.testing.TmpDir) !void {
             defer a.stop();
             const io_ = a.io();
             const alloc = std.testing.allocator;
+            var cert_buf: [160]u8 = undefined;
+            var key_buf: [160]u8 = undefined;
             try a.waitReady();
             var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
             defer bundle.deinit(alloc);
@@ -2480,7 +2483,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             // HTTP/1.1, without a certificate and with one.
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/peer", .{port});
-            const ca: http.core.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
+            const ca: http.core.Ca = .{ .file = tmpPath(&cert_buf, td, "cert.pem") };
             {
                 var anon = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
                 defer anon.deinit();
@@ -2493,7 +2496,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             {
                 var authed = http.Client.init(alloc, io_, .{ .tls = .{
                     .ca = ca,
-                    .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = dir },
+                    .client_certificate = .fromFiles(tmpPath(&cert_buf, td, "cert.pem"), tmpPath(&key_buf, td, "key.pem")),
                 } });
                 defer authed.deinit();
                 var resp = try authed.fetch(url, .{});
@@ -2564,7 +2567,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             return s.reader().allocRemaining(alloc, .unlimited);
         }
     };
-    var client_future = try app.io().concurrent(Check.run, .{ &app, &pem, tmp.dir });
+    var client_future = try app.io().concurrent(Check.run, .{ &app, &pem, &tmp });
     try app.run();
     try client_future.await(app.io());
 }
@@ -2628,6 +2631,12 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
     try client_future.await(app.io());
 }
 
+/// The path of `name` in a test's temporary directory, relative to the
+/// working directory (TLS settings take paths, not directory handles).
+fn tmpPath(buf: []u8, tmp: *const std.testing.TmpDir, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name }) catch unreachable;
+}
+
 /// Certificate reload checks: GETs over each protocol, trusting one CA.
 const ReloadCheck = struct {
     const alloc = std.testing.allocator;
@@ -2646,9 +2655,10 @@ const ReloadCheck = struct {
         try std.testing.expectEqualStrings("reloaded", body);
     }
 
-    /// HTTP/1.1, trusting only the CA in `dir/ca_name`.
-    fn h1(io_: std.Io, port: u16, dir: std.Io.Dir, ca_name: []const u8) !void {
-        var client = http.Client.init(alloc, io_, .{ .tls = .{ .ca = .{ .file = .{ .path = ca_name, .dir = dir } } } });
+    /// HTTP/1.1, trusting only the CA in `tmp/ca_name`.
+    fn h1(io_: std.Io, port: u16, tmp: *const std.testing.TmpDir, ca_name: []const u8) !void {
+        var path_buf: [160]u8 = undefined;
+        var client = http.Client.init(alloc, io_, .{ .tls = .{ .ca = .{ .file = tmpPath(&path_buf, tmp, ca_name) } } });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
         var resp = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{port}), .{});
@@ -2672,10 +2682,10 @@ const ReloadCheck = struct {
     }
 
     /// New connections over all three protocols verify against `ca` alone.
-    fn serves(a: *Server(void), dir: std.Io.Dir, ca_name: []const u8, ca: []const u8) !void {
+    fn serves(a: *Server(void), tmp: *const std.testing.TmpDir, ca_name: []const u8, ca: []const u8) !void {
         const io_ = a.io();
         const port = a.addresses()[0].ip.getPort();
-        try h1(io_, port, dir, ca_name);
+        try h1(io_, port, tmp, ca_name);
         const c2 = try h2(io_, port, ca);
         defer c2.close();
         try request(c2);
@@ -2727,13 +2737,14 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
     app.get("/", ReloadCheck.handle);
 
     const Run = struct {
-        fn run(a: *Server(void), p: *const [4]tls.Pem, dir: std.Io.Dir) !void {
+        fn run(a: *Server(void), p: *const [4]tls.Pem, td: *const std.testing.TmpDir) !void {
+            const dir = td.dir;
             defer a.stop();
             const io_ = a.io();
             try a.waitReady();
             const port = a.addresses()[0].ip.getPort();
 
-            try ReloadCheck.serves(a, dir, "ca0.pem", p[0].cert);
+            try ReloadCheck.serves(a, td, "ca0.pem", p[0].cert);
             // Connections that outlive the reloads.
             const old2 = try ReloadCheck.h2(io_, port, p[0].cert);
             defer old2.close();
@@ -2746,8 +2757,8 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[1].cert });
             try dir.writeFile(io_, .{ .sub_path = "key.pem", .data = p[1].key });
             try a.reloadCertificates();
-            try ReloadCheck.serves(a, dir, "ca1.pem", p[1].cert);
-            try std.testing.expect(std.meta.isError(ReloadCheck.h1(io_, port, dir, "ca0.pem")));
+            try ReloadCheck.serves(a, td, "ca1.pem", p[1].cert);
+            try std.testing.expect(std.meta.isError(ReloadCheck.h1(io_, port, td, "ca0.pem")));
             try ReloadCheck.request(old2);
             try ReloadCheck.request(old3);
 
@@ -2755,7 +2766,7 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
             // nothing changes.
             try dir.writeFile(io_, .{ .sub_path = "key.pem", .data = p[2].key });
             try std.testing.expect(std.meta.isError(a.reloadCertificates()));
-            try ReloadCheck.serves(a, dir, "ca1.pem", p[1].cert);
+            try ReloadCheck.serves(a, td, "ca1.pem", p[1].cert);
 
             // SIGHUP, once `run` listens for it.
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[2].cert });
@@ -2777,20 +2788,20 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
                 try a.reloadCertificates();
             }
             const switched = for (0..300) |_| {
-                if (ReloadCheck.h1(io_, port, dir, "ca2.pem")) |_| break true else |_| {}
+                if (ReloadCheck.h1(io_, port, td, "ca2.pem")) |_| break true else |_| {}
                 try io_.sleep(.fromMilliseconds(10), .awake);
             } else false;
             try std.testing.expect(switched);
-            try ReloadCheck.serves(a, dir, "ca2.pem", p[2].cert);
+            try ReloadCheck.serves(a, td, "ca2.pem", p[2].cert);
 
             // setCertificate: PEM in memory.
             try a.setCertificate(.{ .pem = .{ .cert = p[3].cert, .key = p[3].key } });
-            try ReloadCheck.serves(a, dir, "ca3.pem", p[3].cert);
+            try ReloadCheck.serves(a, td, "ca3.pem", p[3].cert);
             try ReloadCheck.request(old2);
             try ReloadCheck.request(old3);
         }
     };
-    var client_future = try app.io().concurrent(Run.run, .{ &app, &pems, tmp.dir });
+    var client_future = try app.io().concurrent(Run.run, .{ &app, &pems, &tmp });
     try app.run();
     try client_future.await(app.io());
 }
@@ -3040,7 +3051,7 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
 
             // TLS, HTTP/1.1 only: a client that offers h2 alone does not
             // get it; one that offers both gets HTTP/1.1. No Alt-Svc.
-            const ca: http.core.TlsCa = .{ .pem = p.cert };
+            const ca: http.core.Ca = .{ .pem = p.cert };
             try std.testing.expect(std.meta.isError(h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h1tls,
@@ -3197,7 +3208,7 @@ test "anole.Server: the open-file limit is raised, and max_connections follows i
         .listeners = &.{.{ .port = 0 }},
         .executors = .exact(1),
         .raise_fd_limit = false,
-        .server = .{ .max_connections = 77 },
+        .limits = .{ .max_connections = 77 },
     });
     defer capped.deinit();
     try std.testing.expectEqual(@as(u64, @intCast(low.cur)), http.fd_limit.softLimit().?);

@@ -147,7 +147,7 @@ test "anole.Server: status errors in JSON, an error_handler without a Ctx, bind,
     try client_future.await(app.io());
 }
 
-test "anole.Server: Options.errors and error_handler reach dusty's configuration" {
+test "anole.Server: Options.errors and error_handler reach the core's configuration" {
     const gpa = std.testing.allocator;
     {
         var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1), .errors = .text, .error_handler = teapotOrDefault }, {});
@@ -155,8 +155,8 @@ test "anole.Server: Options.errors and error_handler reach dusty's configuration
         try std.testing.expectEqual(http.ErrorFormat.text, app.server.config.errors);
         try std.testing.expect(app.server.config.error_handler.? == teapotOrDefault);
     }
-    // Without `error_handler`, the one in `Options.server` stands.
-    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1), .server = .{ .error_handler = teapotOrDefault } }, {});
+    // Without `errors`, the default is `.auto`.
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0 }, .executors = .exact(1), .error_handler = teapotOrDefault }, {});
     defer app.deinit();
     try std.testing.expectEqual(http.ErrorFormat.auto, app.server.config.errors);
     try std.testing.expect(app.server.config.error_handler.? == teapotOrDefault);

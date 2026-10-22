@@ -407,7 +407,7 @@ test "fuzz: OIDC discovery documents, token responses and ID token claims" {
                 .float => |f| f,
                 else => return error.TestUnexpectedResult,
             };
-            try std.testing.expect(exp > now - rp.leeway.toSeconds());
+            try std.testing.expect(exp > now - @as(f64, @floatFromInt(rp.leeway.toSeconds())));
             try std.testing.expect(claims.get("iat") != null);
             if (claims.get("azp")) |azp| try std.testing.expectEqualStrings("client-1", azp.string);
             switch (claims.get("aud").?) {

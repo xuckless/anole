@@ -792,7 +792,7 @@ test "HTTP/2: over TLS, chosen through ALPN" {
     defer future.cancel(io) catch {};
     try server.waitReady(io);
 
-    const ca: dusty.TlsCa = .{ .file = .{ .path = "certs/cert.pem" } };
+    const ca: dusty.Ca = .{ .file = "certs/cert.pem" };
     var bundle = try ca.load(std.testing.allocator, io);
     defer bundle.deinit(std.testing.allocator);
 
@@ -1003,7 +1003,7 @@ test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 str
     defer future.cancel(io) catch {};
     try server.waitReady(io);
 
-    const ca: dusty.TlsCa = .{ .file = .{ .path = "certs/cert.pem" } };
+    const ca: dusty.Ca = .{ .file = "certs/cert.pem" };
     var bundle = try ca.load(std.testing.allocator, io);
     defer bundle.deinit(std.testing.allocator);
 

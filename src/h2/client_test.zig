@@ -446,7 +446,7 @@ test "h2 client: the system trust store by default, a CA in memory, mutual TLS f
 
     // The default is the system store, which has certificates in it and
     // does not trust a development certificate.
-    const system = (try @import("anole_dusty_tls").clientStore(gpa, io, @as(dusty.TlsCa, .system))).?;
+    const system = (try @import("anole_dusty_tls").clientStore(gpa, io, @as(dusty.Ca, .system))).?;
     defer @import("anole_dusty_tls").releaseStore(system);
     try std.testing.expect(@import("anole_dusty_tls").storeCertCount(system) > 0);
 
@@ -491,9 +491,15 @@ test "h2 client: the system trust store by default, a CA in memory, mutual TLS f
     try tmp.dir.writeFile(io, .{ .sub_path = "ca.pem", .data = server_pem.cert });
     try tmp.dir.writeFile(io, .{ .sub_path = "client.pem", .data = client_pem.cert });
     try tmp.dir.writeFile(io, .{ .sub_path = "client.key", .data = client_pem.key });
+    var ca_buf: [160]u8 = undefined;
+    var cert_buf: [160]u8 = undefined;
+    var key_buf: [160]u8 = undefined;
     opts.tls = .{
-        .ca = .{ .file = .{ .path = "ca.pem", .dir = tmp.dir } },
-        .client_certificate = .{ .cert_path = "client.pem", .key_path = "client.key", .dir = tmp.dir },
+        .ca = .{ .file = try std.fmt.bufPrint(&ca_buf, ".zig-cache/tmp/{s}/ca.pem", .{tmp.sub_path}) },
+        .client_certificate = .fromFiles(
+            try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/client.pem", .{tmp.sub_path}),
+            try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/client.key", .{tmp.sub_path}),
+        ),
     };
     {
         const conn = try h2.ClientConnection.connect(gpa, io, opts);

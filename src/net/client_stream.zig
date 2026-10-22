@@ -4,7 +4,7 @@
 //! the calling coroutine, never its thread.
 //!
 //!     const s = try anole.net.ClientStream.connect(gpa, io, .{
-//!         .host = "db.internal", .port = 27017, .tls = .{ .ca = .{ .file = .{ .path = "ca.pem" } } } });
+//!         .host = "db.internal", .port = 27017, .tls = .{ .ca = .{ .file = "ca.pem" } } });
 //!     defer s.close();
 //!     try s.writer().writeAll(request);
 //!     try s.writer().flush();

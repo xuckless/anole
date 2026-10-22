@@ -416,7 +416,7 @@ pub const ClientConnection = struct {
         const ca = options.tls.ca;
         hashField(&hash, @tagName(ca));
         switch (ca) {
-            .file, .dir => |src| hashField(&hash, src.path),
+            .file, .dir => |ca_path| hashField(&hash, ca_path),
             .pem => |text| hashField(&hash, text),
             .system, .none => {},
         }

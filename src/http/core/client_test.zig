@@ -877,7 +877,7 @@ test "Client: one server serves a plain listener and a TLS listener" {
             try s.waitReady(_io);
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
-                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+                .tls = .{ .ca = .{ .file = test_cert_path } },
             });
             defer client.deinit();
 
@@ -927,7 +927,7 @@ test "Client: HTTPS with a custom CA file" {
             try s.waitReady(_io);
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
-                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+                .tls = .{ .ca = .{ .file = test_cert_path } },
             });
             defer client.deinit();
 
@@ -980,7 +980,7 @@ test "Client: HTTPS to a listener whose certificate is PEM in memory" {
             try s.waitReady(_io);
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
-                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+                .tls = .{ .ca = .{ .file = test_cert_path } },
             });
             defer client.deinit();
 
@@ -1053,7 +1053,7 @@ test "Server: reloadTls swaps a listener's certificate; open connections keep th
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), l: *dusty.Listener, good_key: []const u8, _io: std.Io) !void {
             try s.ready.wait(_io);
-            const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+            const ca: dusty.Ca = .{ .file = test_cert_path };
             var bundle = try ca.load(std.testing.allocator, _io);
             defer bundle.deinit(std.testing.allocator);
 
@@ -1127,7 +1127,7 @@ test "Server: tls.alpn_protocols is offered to the client through ALPN" {
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
             try s.waitReady(_io);
-            const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+            const ca: dusty.Ca = .{ .file = test_cert_path };
             var bundle = try ca.load(std.testing.allocator, _io);
             defer bundle.deinit(std.testing.allocator);
 
@@ -1165,7 +1165,7 @@ test "Client: presents a client certificate for mutual TLS" {
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
             .cert_path = test_cert_path,
             .key_path = test_key_path,
-            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            .client_auth = .{ .ca = .{ .file = test_cert_path } },
         } }},
     }, {});
     defer server.deinit();
@@ -1191,8 +1191,8 @@ test "Client: presents a client certificate for mutual TLS" {
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
                 .tls = .{
-                    .ca = .{ .file = .{ .path = test_cert_path } },
-                    .client_certificate = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+                    .ca = .{ .file = test_cert_path },
+                    .client_certificate = .fromFiles(test_cert_path, test_key_path),
                 },
             });
             defer client.deinit();
@@ -1271,7 +1271,7 @@ test "TlsCa: .pem loads what .file loads" {
     const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
     defer gpa.free(cert_pem);
 
-    const from_file: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+    const from_file: dusty.Ca = .{ .file = test_cert_path };
     var a = try from_file.load(gpa, io);
     defer a.deinit(gpa);
     // Twice over, with CRLF line ends: the same certificate, kept once.
@@ -1279,7 +1279,7 @@ test "TlsCa: .pem loads what .file loads" {
     defer gpa.free(doubled);
     const crlf = try std.mem.replaceOwned(u8, gpa, doubled, "\n", "\r\n");
     defer gpa.free(crlf);
-    const from_pem: dusty.TlsCa = .{ .pem = crlf };
+    const from_pem: dusty.Ca = .{ .pem = crlf };
     var b = try from_pem.load(gpa, io);
     defer b.deinit(gpa);
 
@@ -1287,9 +1287,9 @@ test "TlsCa: .pem loads what .file loads" {
     try std.testing.expectEqualSlices(u8, a.bytes.items, b.bytes.items);
     try std.testing.expectEqual(a.map.count(), b.map.count());
 
-    const cut: dusty.TlsCa = .{ .pem = cert_pem[0 .. cert_pem.len - 30] };
+    const cut: dusty.Ca = .{ .pem = cert_pem[0 .. cert_pem.len - 30] };
     try std.testing.expectError(error.MissingEndCertificateMarker, cut.load(gpa, io));
-    const empty: dusty.TlsCa = .{ .pem = "" };
+    const empty: dusty.Ca = .{ .pem = "" };
     var none = try empty.load(gpa, io);
     defer none.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), none.bytes.items.len);
@@ -1303,7 +1303,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
             .cert_path = test_cert_path,
             .key_path = test_key_path,
-            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
+            .client_auth = .{ .ca = .{ .file = test_cert_path }, .mode = .require },
         } }},
     }, {});
     defer server.deinit();
@@ -1328,7 +1328,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
-                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+                .tls = .{ .ca = .{ .file = test_cert_path } },
             });
             defer client.deinit();
 
@@ -1352,7 +1352,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
             .cert_path = test_cert_path,
             .key_path = test_key_path,
-            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
+            .client_auth = .{ .ca = .{ .file = test_cert_path }, .mode = .request },
         } }},
     }, {});
     defer server.deinit();
@@ -1377,7 +1377,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
-                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+                .tls = .{ .ca = .{ .file = test_cert_path } },
             });
             defer client.deinit();
 

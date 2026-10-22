@@ -122,7 +122,7 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
         .sslmode = if (p.sslmode) |m| switch (config_mod.sslMode(m).?) {
             inline else => |t| @field(anole.pg.SslMode, @tagName(t)),
         } else null,
-        .tls = .{ .ca = if (p.ca_file) |f| .{ .file = .{ .path = f } } else if (p.ca_pem) |pem| .{ .pem = pem } else null },
+        .tls = .{ .ca = if (p.ca_file) |f| .{ .file = f } else if (p.ca_pem) |pem| .{ .pem = pem } else null },
         .connect_at_start = p.connect_at_start,
         .application_name = p.application_name,
         .reset_session = switch (p.reset_session) {
@@ -155,7 +155,7 @@ fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
         .acquire_timeout = ms(r.acquire_timeout_ms),
         .connect_timeout = if (r.connect_timeout_ms > 0) ms(r.connect_timeout_ms) else null,
         .idle_timeout = if (r.idle_timeout_ms > 0) ms(r.idle_timeout_ms) else null,
-        .tls = .{ .ca = if (r.ca_file) |f| .{ .file = .{ .path = f } } else if (r.ca_pem) |pem| .{ .pem = pem } else null },
+        .tls = .{ .ca = if (r.ca_file) |f| .{ .file = f } else if (r.ca_pem) |pem| .{ .pem = pem } else null },
         .connect_at_start = r.connect_at_start,
         .cache = .{
             .max_entries = d.config.cache.max_entries,
@@ -168,7 +168,7 @@ fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
 fn openMongodb(d: *Db, app: *anole.App, m: config_mod.Config.Mongodb) !void {
     const ms = std.Io.Duration.fromMilliseconds;
     const Tls = @typeInfo(@FieldType(anole.mongodb.Options, "tls")).optional.child;
-    const ca: ?Tls = if (m.ca_file) |f| .{ .ca = .{ .file = .{ .path = f } } } else if (m.ca_pem) |pem| .{ .ca = .{ .pem = pem } } else null;
+    const ca: ?Tls = if (m.ca_file) |f| .{ .ca = .{ .file = f } } else if (m.ca_pem) |pem| .{ .ca = .{ .pem = pem } } else null;
     const client = try app.mongodb(anole.mongodb.Options{
         .url = m.url,
         .database = m.database,
