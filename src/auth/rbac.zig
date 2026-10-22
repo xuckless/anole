@@ -81,6 +81,9 @@ pub const Require = struct {
         return .{ .policy = policy, .permission = permission, .roles = roles };
     }
 
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const Require, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (!self.policy.anyAllows(try self.roles.roles(self.roles.ptr, req), self.permission)) {
             res.status = .forbidden;

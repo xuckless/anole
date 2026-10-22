@@ -35,6 +35,11 @@ pub fn Middleware(comptime Ctx: type) type {
             executor: *Executor(Ctx),
         ) anyerror!void,
         deinitFn: ?*const fn (ptr: *anyopaque) void,
+        /// The middleware declares `pub const detach_safe = true`: it does
+        /// nothing after `next()`, or puts that work off with
+        /// `Response.onFinish` when the response is detached (see
+        /// `Detached`). A request that passes one that is not cannot detach.
+        detach_safe: bool = false,
 
         /// A handle on `impl`, a pointer to a middleware value that must
         /// outlive the router.
@@ -58,6 +63,7 @@ pub fn Middleware(comptime Ctx: type) type {
                 .ptr = @ptrCast(@constCast(impl)),
                 .executeFn = gen.execute,
                 .deinitFn = if (@hasDecl(Impl, "deinit")) gen.deinit else null,
+                .detach_safe = comptime @hasDecl(Impl, "detach_safe") and Impl.detach_safe,
             };
         }
 
@@ -145,6 +151,7 @@ pub fn Executor(comptime Ctx: type) type {
             if (self.index < self.middlewares.len) {
                 const mw = self.middlewares[self.index];
                 self.index += 1;
+                if (!mw.detach_safe) self.res.detach_blocked = true;
                 return mw.execute(self.req, self.res, self);
             }
 

@@ -5,6 +5,28 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### C ABI (ABI 0.1)
+
+- `libanole`, Anole as a C library for the language bindings
+  ([docs/c-abi.md](docs/c-abi.md)): `include/anole.h`, `zig build capi`
+  (`libanole.a`, one object with every bundled C library and only `anole_*`
+  exported, packed with Zig alone; `libanole.{so,dylib}`; `anole.dll` on
+  Windows). A JSON configuration (`include/anole.schema.json`) sets
+  listeners, limits, native routes (fixed answers, static files, the
+  response cache, health and metrics) and middleware (request ID, access
+  log, compression, CORS, JWT, rate limiting); consumer routes hand requests
+  to a consumer thread that polls batches of events and answers by
+  generation-checked handle: whole responses (copied or borrowed), files,
+  streams with trailers, request bodies read without blocking, WebSockets
+  with topics. Deadlines, aborts and lost wakes are Anole's to handle.
+- Detached responses in the HTTP core: an HTTP/2 or HTTP/3 request that
+  arrived whole is answered later with no task waiting
+  (`Response.detach`); middleware opts in with `detach_safe` (every
+  built-in one that runs before the handler does). The request and response
+  stay on the reader's stack unless the handler detaches. On h2c a consumer
+  route serves 2.0x the requests per second at one executor and 1.48x at
+  four (M2 Pro, local).
+
 ### Server
 
 - Listeners on every interface without a family are dual-stack (#57):

@@ -32,10 +32,36 @@ pub const AccessLog = struct {
         return .{ .options = options };
     }
 
+    /// A detached response (`dusty.Detached`) is logged when it is
+    /// finished.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (common.excluded(req, self.options.exclude)) return executor.next();
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
         const result = executor.next();
+        if (res.isDetached()) {
+            const later = try req.arena.create(Later);
+            later.* = .{ .log = self, .start = start };
+            res.onFinish(&later.finisher);
+            return result;
+        }
+        return self.write(req, res, result, start);
+    }
+
+    /// The line of a detached response, written once it is finished.
+    const Later = struct {
+        finisher: dusty.Detached.Finisher = .{ .func = run },
+        log: *const AccessLog,
+        start: std.Io.Clock.Timestamp,
+
+        fn run(f: *dusty.Detached.Finisher, req: *dusty.Request, res: *dusty.Response, result: anyerror!void) void {
+            const later: *Later = @alignCast(@fieldParentPtr("finisher", f));
+            later.log.write(req, res, result, later.start) catch {};
+        }
+    };
+
+    fn write(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, result: anyerror!void, start: std.Io.Clock.Timestamp) anyerror!void {
         const micros = start.durationTo(.now(req.io, .awake)).raw.toMicroseconds();
         const status = statusOf(req, res, result);
         const line = format(req.arena, self.options.format, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;

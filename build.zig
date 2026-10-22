@@ -496,6 +496,13 @@ pub fn build(b: *std.Build) void {
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
     }
 
+    // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
+    // HTTP/3 detached answers, the configuration parser).
+    {
+        const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
+        b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
+    }
+
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
     // nghttp2, zlib-ng, zstd and Brotli. Part of `test`, and `core-test` alone.
@@ -740,6 +747,160 @@ pub fn build(b: *std.Build) void {
         });
         b.step("bench-server", "Build the benchmark server (bench/run.sh; use -Doptimize=ReleaseFast)").dependOn(&b.addInstallArtifact(bench, .{}).step);
         test_step.dependOn(&bench.step);
+    }
+
+    // capi: libanole, the C ABI (include/anole.h) as a static and a shared
+    // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
+    {
+        const capi_mod = b.createModule(.{
+            .root_source_file = b.path("src/capi/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            // Linked into shared objects (a Node addon, a Python extension).
+            .pic = true,
+            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+        });
+        const capi_opts = b.addOptions();
+        capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+        capi_mod.addOptions("capi_options", capi_opts);
+        // The C++ runtime symbols BoringSSL's objects need, so that libanole
+        // needs no libstdc++ or libc++ in the final link (Linux has no
+        // std::__1 in libstdc++ at all).
+        if ((target.result.os.tag == .linux or target.result.os.tag.isDarwin()) and features.tls == .boringssl) {
+            capi_mod.link_libcpp = true;
+            capi_mod.addCSourceFile(.{ .file = b.path("src/capi/cxx_shim.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
+        }
+        const capi_step = b.step("capi", "Build libanole (static and shared, only anole_* exported) and install include/anole.h");
+        // capi-zig: the Zig part alone, as a static library (not
+        // self-contained), e.g. to check that it cross-compiles.
+        const zig_lib = b.addLibrary(.{ .name = "anole_zig", .linkage = .static, .root_module = capi_mod });
+        b.step("capi-zig", "Build only the Zig part of libanole (libanole_zig.a, not self-contained)").dependOn(&b.addInstallArtifact(zig_lib, .{}).step);
+        // Packing, with Zig alone: one relocatable object holds the Zig
+        // code, every C library it links (the linker pulls in what is
+        // used), compiler-rt and, in Debug, the UBSan runtime; it needs only
+        // libc. tools/capi_symbols.zig then hides every symbol but anole_*,
+        // and the two libraries are made from that object.
+        const symbols_tool = b.addExecutable(.{
+            .name = "capi_symbols",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/capi_symbols.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const os = target.result.os.tag;
+        const packable = os == .linux or os.isDarwin();
+        var lib_obj: std.Build.LazyPath = undefined;
+        var shared_lib: *std.Build.Step.Compile = undefined;
+        var static_lib_opt: ?*std.Build.Step.Compile = null;
+        if (packable) {
+            const merged = b.addObject(.{ .name = "anole", .root_module = capi_mod });
+            merged.bundle_compiler_rt = true;
+            merged.bundle_ubsan_rt = true;
+            const hide = b.addRunArtifact(symbols_tool);
+            hide.addArg("hide");
+            hide.addFileArg(merged.getEmittedBin());
+            lib_obj = hide.addOutputFileArg("anole.o");
+            const static_lib = b.addLibrary(.{
+                .name = "anole",
+                .linkage = .static,
+                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+            });
+            static_lib.root_module.addObjectFile(lib_obj);
+            capi_step.dependOn(&b.addInstallArtifact(static_lib, .{}).step);
+            static_lib_opt = static_lib;
+            shared_lib = b.addLibrary(.{
+                .name = "anole",
+                .linkage = .dynamic,
+                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .pic = true }),
+            });
+            shared_lib.root_module.addObjectFile(lib_obj);
+        } else {
+            // COFF cannot merge objects into one, and a DLL exports only
+            // what is dllexport (the anole_* functions): Windows gets
+            // anole.dll and its import library, linked from the module.
+            shared_lib = b.addLibrary(.{ .name = "anole", .linkage = .dynamic, .root_module = capi_mod });
+            shared_lib.bundle_compiler_rt = true;
+            shared_lib.bundle_ubsan_rt = true;
+        }
+        capi_step.dependOn(&b.addInstallArtifact(shared_lib, .{}).step);
+        // The symbol check runs with every build of libanole on Linux and
+        // macOS: the object and the shared library export anole_* alone.
+        if (packable) for ([_]std.Build.LazyPath{ lib_obj, shared_lib.getEmittedBin() }) |file| {
+            const check = b.addRunArtifact(symbols_tool);
+            check.addArg("check");
+            check.addFileArg(file);
+            check.expectExitCode(0);
+            capi_step.dependOn(&check.step);
+        };
+
+        // capi-test (also part of `test`): anole.h's layout against
+        // src/capi/abi.zig (the header through translate-c), the symbol
+        // check, and the C suite (tests/capi/consumer.c) on libanole.a.
+        const capi_test_step = b.step("capi-test", "Test the C ABI: anole.h layout, exported symbols, the C suite");
+        if (b.lazyImport(@This(), "translate_c")) |tc| if (b.lazyDependency("translate_c", .{})) |tc_dep| {
+            const header: tc.Translator = .init(tc_dep, .{
+                .name = "anole_h",
+                .c_source_file = b.path("include/anole.h"),
+                .target = target,
+                .optimize = optimize,
+            });
+            const abi_test = b.addTest(.{
+                .name = "capi-abi-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/capi/abi_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "capi_abi", .module = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize }) },
+                        .{ .name = "anole_h", .module = header.mod },
+                    },
+                }),
+            });
+            capi_test_step.dependOn(&b.addRunArtifact(abi_test).step);
+        };
+        if (static_lib_opt) |static_lib| {
+            capi_test_step.dependOn(capi_step);
+            const consumer = b.addExecutable(.{
+                .name = "capi-consumer",
+                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+            });
+            consumer.root_module.addCSourceFile(.{ .file = b.path("tests/capi/consumer.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+            consumer.root_module.addIncludePath(b.path("include"));
+            consumer.root_module.linkLibrary(static_lib);
+            const run_consumer = b.addRunArtifact(consumer);
+            run_consumer.addArg("test");
+            // Its progress lines and Anole's warnings (a drain cut short on
+            // purpose) on the terminal; a failure is its exit code.
+            run_consumer.stdio = .inherit;
+            run_consumer.has_side_effects = true;
+            capi_test_step.dependOn(&run_consumer.step);
+            b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
+
+            // capi-test-asan: the C suite built by the system C compiler
+            // with AddressSanitizer and UBSan (Zig ships no ASan runtime);
+            // libanole itself keeps Zig's own safety checks.
+            const asan_step = b.step("capi-test-asan", "Run the C ABI suite built with -fsanitize=address,undefined (needs a system cc)");
+            const cc = b.addSystemCommand(&.{ "cc", "-O1", "-g", "-std=c11", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined" });
+            cc.addPrefixedDirectoryArg("-I", b.path("include"));
+            cc.addFileArg(b.path("tests/capi/consumer.c"));
+            cc.addFileArg(static_lib.getEmittedBin());
+            if (os == .linux) cc.addArgs(&.{ "-lpthread", "-ldl", "-lm" });
+            cc.addArg("-o");
+            const asan_exe = cc.addOutputFileArg("capi-consumer-asan");
+            const run_asan = std.Build.Step.Run.create(b, "run capi-consumer-asan");
+            run_asan.addFileArg(asan_exe);
+            run_asan.addArg("test");
+            run_asan.has_side_effects = true;
+            run_asan.stdio = .inherit;
+            // Zig's threads install a signal stack of their own (for the
+            // stack-overflow handler); ASan's would unmap it at thread exit.
+            run_asan.setEnvironmentVariable("ASAN_OPTIONS", "use_sigaltstack=0");
+            asan_step.dependOn(&run_asan.step);
+        }
+        test_step.dependOn(capi_test_step);
+        capi_step.dependOn(&b.addInstallHeaderFile(b.path("include/anole.h"), "anole.h").step);
     }
 
     // tls-public-check: outbound HTTPS against public hosts (needs the network).
@@ -1395,6 +1556,13 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     if (f.postgres) mod.addImport("anole_pg", if (f.needsTls()) o.c.pg_tls.? else o.c.pg_plain.?);
     if (f.sqlite) mod.addImport("anole_sqlite", o.c.sqlite.?);
     // The generated test service (tests/grpc/gen), outside src/.
+    // The C ABI's configuration schema, for the test that keeps it in step
+    // with src/capi/config.zig.
+    if (o.for_test) {
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
+        mod.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
+    }
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
         .target = o.target,
@@ -1425,3 +1593,4 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     }
     return mod;
 }
+

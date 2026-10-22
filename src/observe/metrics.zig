@@ -343,13 +343,43 @@ pub const HttpMetrics = struct {
         };
     }
 
+    /// A detached response (`dusty.Detached`) is counted when it is
+    /// finished.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const HttpMetrics, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (common.excluded(req, self.options.exclude)) return executor.next();
         const gauge = self.in_flight.with(&.{});
         gauge.add(1);
-        defer gauge.add(-1);
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
         const result = executor.next();
+        if (res.isDetached()) {
+            const later = req.arena.create(Later) catch {
+                gauge.add(-1);
+                return result;
+            };
+            later.* = .{ .metrics = self, .start = start };
+            res.onFinish(&later.finisher);
+            return result;
+        }
+        gauge.add(-1);
+        return self.record(req, res, result, start);
+    }
+
+    /// The counts of a detached response, once it is finished.
+    const Later = struct {
+        finisher: dusty.Detached.Finisher = .{ .func = run },
+        metrics: *const HttpMetrics,
+        start: std.Io.Clock.Timestamp,
+
+        fn run(f: *dusty.Detached.Finisher, req: *dusty.Request, res: *dusty.Response, result: anyerror!void) void {
+            const later: *Later = @alignCast(@fieldParentPtr("finisher", f));
+            later.metrics.in_flight.with(&.{}).add(-1);
+            later.metrics.record(req, res, result, later.start) catch {};
+        }
+    };
+
+    fn record(self: *const HttpMetrics, req: *dusty.Request, res: *dusty.Response, result: anyerror!void, start: std.Io.Clock.Timestamp) anyerror!void {
         const elapsed = start.durationTo(.now(req.io, .awake)).raw;
         var method_buf: [16]u8 = undefined;
         const method = std.fmt.bufPrint(&method_buf, "{f}", .{req.method}) catch "?";

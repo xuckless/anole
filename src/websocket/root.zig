@@ -526,15 +526,7 @@ pub fn callbacks(comptime Ctx: type, comptime Handler: type, comptime options: U
     const S = struct {
         fn serve(ctx: if (Ctx == void) void else *Ctx, req: *dusty.Request, res: *dusty.Response) anyerror!void {
             const state: ?*anyopaque = if (Ctx == void) null else ctx;
-            if (req.protocol != null) {
-                var ws = (try upgrade(req, res, options)) orelse return refuse(res);
-                defer ws.deinit();
-                return serveOnTask(&ws, req, res, &H.table, state);
-            }
-            const self = (try H1Callbacks.open(req, res, options, &H.table, state)) orelse return refuse(res);
-            // The connection is the socket's from here: a failure closes
-            // the socket, not the request.
-            H.table.open(state, &self.socket, req) catch |err| self.openFailed(req, err);
+            return serveTable(req, res, options, &H.table, state);
         }
     };
     return if (Ctx == void) struct {
@@ -544,8 +536,24 @@ pub fn callbacks(comptime Ctx: type, comptime Handler: type, comptime options: U
     }.h else S.serve;
 }
 
-/// A callback socket's `Handler`, behind plain function pointers.
-const Table = struct {
+/// `callbacks` with the callbacks and options chosen at run time (the C
+/// ABI's WebSocket routes): `table`'s functions get `state` first. Answers
+/// 426 to a request that is not a WebSocket handshake.
+pub fn serveTable(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) anyerror!void {
+    if (req.protocol != null) {
+        var ws = (try upgrade(req, res, options)) orelse return refuse(res);
+        defer ws.deinit();
+        return serveOnTask(&ws, req, res, table, state);
+    }
+    const self = (try H1Callbacks.open(req, res, options, table, state)) orelse return refuse(res);
+    // The connection is the socket's from here: a failure closes the
+    // socket, not the request.
+    table.open(state, &self.socket, req) catch |err| self.openFailed(req, err);
+}
+
+/// A callback socket's `Handler`, behind plain function pointers
+/// (`serveTable`).
+pub const Table = struct {
     open: *const fn (state: ?*anyopaque, *Socket, *dusty.Request) anyerror!void,
     message: *const fn (state: ?*anyopaque, *Socket, Message) anyerror!void,
     close: *const fn (state: ?*anyopaque, *Socket) void,
@@ -615,7 +623,7 @@ const H1Callbacks = struct {
     /// from the connection while it has something to send.
     const window_len = 2048;
 
-    fn open(req: *dusty.Request, res: *dusty.Response, comptime options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
+    fn open(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
         const gpa = res.conn.allocator;
         const self = try gpa.create(H1Callbacks);
         errdefer gpa.destroy(self);

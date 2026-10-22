@@ -93,6 +93,10 @@ pub fn init(config: Config) Cors {
     return self;
 }
 
+/// Only sets headers before `next()`: requests behind it can detach
+/// (`Detached`).
+pub const detach_safe = true;
+
 pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anytype) !void {
     const origin = req.headers.get("Origin");
     const preflight = req.method == .options and origin != null and

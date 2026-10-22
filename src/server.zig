@@ -163,6 +163,12 @@ pub const Options = struct {
     /// How long a restart waits for the new process to be serving before
     /// giving up on it and carrying on.
     restart_timeout_ms: u32 = 10_000,
+    /// Whether `run` listens for signals: SIGINT and SIGTERM drain and
+    /// stop, SIGHUP reloads certificates (SIGUSR2 needs `process` too).
+    /// False when Anole is embedded in a process whose signals belong to
+    /// someone else (the C ABI under Node or Python): `stop` is then the
+    /// only way to drain.
+    signals: bool = true,
     /// Whether `listenTls` also serves HTTP/3 on the same port number (UDP),
     /// advertised with `Alt-Svc`, when HTTP/3 is built in (the default
     /// `full` profile): with `http3`'s settings when set, else the defaults.
@@ -356,6 +362,9 @@ pub fn onlyOn(name: []const u8) OnlyOn {
 pub const OnlyOn = struct {
     name: []const u8,
 
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, executor: anytype) !void {
         if (!std.mem.eql(u8, req.listener.name, self.name)) return error.NotFound;
         return executor.next();
@@ -408,6 +417,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         process: ?std.process.Init.Minimal = null,
         held: []const handoff.Listener = &.{},
         restart_timeout_ms: u32 = 10_000,
+        /// `Options.signals`.
+        signals: bool = true,
         /// The HTTP/3 endpoint, when `Options.http3` asked for one.
         h3: H3Endpoint,
         /// The blocking pool, when `Options.blocking` asked for one.
@@ -592,6 +603,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             value: ?[]const u8 = null,
             listener: ?*const http.Listener = null,
 
+            /// Does nothing after `next()`: requests behind it can detach.
+            pub const detach_safe = true;
+
             pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
                 if (self.value) |v| if (req.version_major != 3 and self.listener != null and req.listener == self.listener.?) try res.header("Alt-Svc", v);
                 return executor.next();
@@ -681,6 +695,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .stopped = stopped,
                 .process = opts.process,
                 .restart_timeout_ms = opts.restart_timeout_ms,
+                .signals = opts.signals,
                 .h3 = if (features.http3) null else {},
                 .blocking_pool = pool,
                 .extras = extras,
@@ -1941,18 +1956,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             var done_buf: [8]Done = undefined;
             var sel = std.Io.Select(Done).init(rt_io, &done_buf);
-            try sel.concurrent(.int, waitForSignal, .{.interrupt});
-            try sel.concurrent(.term, waitForSignal, .{.terminate});
+            if (self.signals) {
+                try sel.concurrent(.int, waitForSignal, .{.interrupt});
+                try sel.concurrent(.term, waitForSignal, .{.terminate});
+            }
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             try sel.concurrent(.served, serve, .{self.server});
             if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
             // Windows has neither SIGUSR2 nor SIGHUP (zio maps Ctrl-C to
             // `.interrupt` and closing the console to `.terminate`): no
             // restart, and certificates reload by `reloadCertificates` only.
-            const restartable = self.process != null and self.held.len > 0;
+            // With `signals` off (an embedding process owns them: the C
+            // ABI) none of them is watched.
+            const restartable = self.signals and self.process != null and self.held.len > 0;
             if (comptime unix_signals) if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
             // SIGHUP reloads the certificate, where there is one.
-            if (comptime unix_signals) if (self.certs.len > 0) try sel.concurrent(.reload, reloadOnHangup, .{self});
+            if (comptime unix_signals) if (self.signals and self.certs.len > 0) try sel.concurrent(.reload, reloadOnHangup, .{self});
             // Once serving: systemd hears (`NOTIFY_SOCKET`), and a successor
             // tells the predecessor that started it.
             var notify: ?std.Io.Future(void) = if (self.process) |p|

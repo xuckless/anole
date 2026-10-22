@@ -43,6 +43,9 @@ fn tooEarly(res: *dusty.Response) void {
 /// 425 for unsafe requests marked as early data (RFC 8470 §5.1).
 /// `anole.Server` adds it to every route.
 pub const Guard = struct {
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(_: *const Guard, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (isEarly(req) and !isSafe(req.method)) return tooEarly(res);
         return executor.next();
@@ -54,6 +57,9 @@ pub const Guard = struct {
 ///
 ///     const pay = app.group("/pay", .{anole.early_data.TooEarly{}});
 pub const TooEarly = struct {
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(_: *const TooEarly, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (isEarly(req)) return tooEarly(res);
         return executor.next();

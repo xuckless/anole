@@ -316,6 +316,9 @@ pub const Middleware = struct {
         return .{ .limiter = limiter, .options = options };
     }
 
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         var key_buf: [128]u8 = undefined;
         const key = self.options.key(req, &key_buf);

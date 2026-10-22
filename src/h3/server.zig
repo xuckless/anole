@@ -1800,6 +1800,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer _ = io.swapCancelProtection(protection);
                 conn.lock();
                 conn.close(.closed);
+                // Responses still detached have nobody to go to.
+                var i: usize = 0;
+                while (i < conn.streams.count()) {
+                    const s = conn.streams.values()[i];
+                    const before = conn.streams.count();
+                    if (s.detached != null) {
+                        s.reset = true;
+                        abortDetached(s);
+                    }
+                    // Freed (and swapped out) by the abort: look at the
+                    // same index again.
+                    if (conn.streams.count() == before) i += 1;
+                }
                 conn.unlock();
                 conn.group.cancel(io);
                 conn.forget();
@@ -2065,6 +2078,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             await_body: bool = false,
             spill: std.ArrayList(u8) = .empty,
             spill_pos: usize = 0,
+            /// The handler detached the response (`dusty.Detached`): the
+            /// request and response live on in the stream's arena, and the
+            /// handler's hold on the stream goes when it is finished or
+            /// aborted.
+            detached: ?*Exchange = null,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2166,7 +2184,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unlock();
                     conn.kick();
                 }
-                s.serve(false) catch |err| return s.failed(err);
+                _ = s.serve(false) catch |err| return s.failed(err);
             }
 
             /// A `no_wait` route's request, whole, on the endpoint task.
@@ -2177,7 +2195,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.unlock();
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
-                    s.serve(true) catch |err| s.failed(err) catch {
+                    if (s.serve(true)) |served| {
+                        // Finished later; the stream is held till then.
+                        if (served == .detached) return;
+                    } else |err| s.failed(err) catch {
                         // The endpoint task itself is canceled: it stops
                         // reading once these requests are done.
                         conn.ep.io.recancel();
@@ -2230,8 +2251,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// `inline_mode`: on the endpoint task (a `no_wait` route),
-            /// with no request timeout, whose timer would cancel that task.
-            fn serve(s: *Stream, inline_mode: bool) !void {
+            /// with no request timeout, whose timer would cancel that task;
+            /// its response may be detached (`dusty.Detached`), and then the
+            /// stream is held until it is finished.
+            fn serve(s: *Stream, inline_mode: bool) !Served {
                 const conn = s.conn;
                 const ep = conn.ep;
                 const server = ep.http;
@@ -2245,7 +2268,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer timer.clear();
                 if (!inline_mode) if (server.config.timeout.request) |d| setTimeout(&timer, io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
-                var request: dusty.Request = .{
+                // On the stack (warm, no allocation); `detachedRelocate`
+                // moves it to the stream's arena if the handler detaches.
+                var on_stack: Exchange = undefined;
+                const ex: *Exchange = &on_stack;
+                const request = &ex.request;
+                request.* = .{
                     .arena = arena,
                     .io = io,
                     .parser = undefined,
@@ -2260,29 +2288,47 @@ pub fn Endpoint(comptime Ctx: type) type {
                     ._timeout_context = if (inline_mode) null else &timer,
                     ._set_timeout = if (inline_mode) null else setTimeout,
                 };
-                var body_reader: BodyReader = .init(s);
+                const body_reader = &ex.body_reader;
+                body_reader.* = .init(s);
                 request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
-                var sink_state: StreamSink = .{ .stream = s };
-                var response = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
-                server.configureResponse(&response);
-                defer response.deinit();
-                response.request = &request;
-                request.response = &response;
+                const sink_state = &ex.sink_state;
+                sink_state.* = .{ .stream = s };
+                const response = &ex.response;
+                response.* = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
+                server.configureResponse(response);
+                var detached = false;
+                defer if (!detached) response.deinit();
+                response.request = request;
+                request.response = response;
+                if (inline_mode) {
+                    ex.attached = false;
+                    response.detach_engine = &detach_engine;
+                    response.detach_ctx = ex;
+                }
 
                 if (s.method.len == 0 or s.path.len == 0) {
                     response.status = .bad_request;
-                    return response.write();
+                    {
+                        try response.write();
+                        return .done;
+                    }
                 }
                 request.method = parseMethod(s.method) orelse {
                     response.status = .not_implemented;
-                    return response.write();
+                    {
+                        try response.write();
+                        return .done;
+                    }
                 };
                 if (request.method == .connect) {
                     // A plain CONNECT (a proxy's tunnel) is not served.
                     if (s.protocol.len == 0) {
                         response.status = .not_implemented;
-                        return response.write();
+                        {
+                        try response.write();
+                        return .done;
+                    }
                     }
                     // An extended CONNECT (RFC 9220; nghttp3 has checked
                     // its pseudo-headers) is routed as the GET that the
@@ -2333,7 +2379,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (too_many) {
                     response.status = .request_header_fields_too_large;
-                    return response.write();
+                    {
+                        try response.write();
+                        return .done;
+                    }
                 }
                 request.applyEntityHeaders();
                 if (server.config.request.max_content_length) |max| {
@@ -2341,7 +2390,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.status = .payload_too_large;
                         response.content_type = .text;
                         response.body = "413 Content Too Large\n";
-                        return response.write();
+                        {
+                        try response.write();
+                        return .done;
+                    }
                     };
                 }
                 // Where the client is now: a migration moves it.
@@ -2349,7 +2401,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const peer = Addr.fromNgtcp2(c.ngtcp2_conn_get_path2(conn.q).*.remote).ip();
                 request.peer_certificate = quic_tls.peerCertificate(conn.ssl);
                 conn.unlock();
-                server.applyForwardedFrom(&request, peer);
+                server.applyForwardedFrom(request, peer);
                 // The client is on our TLS, whatever proxies say.
                 request.secure = true;
 
@@ -2360,17 +2412,30 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                     } else {
                         response.status = .expectation_failed;
-                        return response.write();
+                        {
+                        try response.write();
+                        return .done;
+                    }
                     }
                 }
 
-                server.dispatch(&request, &response) catch |err| switch (err) {
+                server.dispatch(request, response) catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
                     else => |e| return e,
                 };
+                if (response.detached) |d| {
+                    // Finished later, from the moved copy.
+                    detached = true;
+                    conn.lock();
+                    s.detached = exchangeOf(d);
+                    conn.unlock();
+                    return .detached;
+                }
                 try response.write();
+                return .done;
             }
+
 
             /// Every byte of the response body is in the ring and handed
             /// to nghttp3. Locked.
@@ -2429,6 +2494,96 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
         };
+
+        /// One request and its response, with what they point at: on the
+        /// handler's stack, or in the stream's arena for a request that
+        /// runs on the endpoint task, whose response may be detached.
+        const Exchange = struct {
+            request: dusty.Request,
+            response: dusty.Response,
+            sink_state: StreamSink,
+            body_reader: BodyReader,
+            /// Its response went on from a task (`detachedAttach`),
+            /// counted in `Conn.tasks`.
+            attached: bool,
+        };
+
+        const Served = enum { done, detached };
+
+        /// How a detached response is finished, attached to a task, or let
+        /// go (`dusty.Detached`).
+        const detach_engine: dusty.Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+
+        /// The exchange, from the endpoint's stack into the stream's
+        /// arena, its pointers into itself moved along.
+        fn detachedRelocate(d: *dusty.Detached) error{OutOfMemory}!*anyopaque {
+            const old = exchangeOf(d);
+            const ex = try old.response.arena.create(Exchange);
+            ex.* = old.*;
+            ex.request.response = &ex.response;
+            ex.response.request = &ex.request;
+            ex.request.body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response.sink = ex.sink_state.sink();
+            ex.response.detach_ctx = ex;
+            d.request = &ex.request;
+            d.response = &ex.response;
+            return ex;
+        }
+
+        fn exchangeOf(d: *dusty.Detached) *Exchange {
+            return @ptrCast(@alignCast(d.engine_ctx));
+        }
+
+        /// Writes the response (or handles `result`'s error as a handler's),
+        /// then lets go of the stream. On the endpoint's executor: the
+        /// owner's task, or the task `detachedAttach` was for.
+        fn detachedEnd(d: *dusty.Detached, result: anyerror!void) void {
+            const ex = exchangeOf(d);
+            const s = ex.sink_state.stream;
+            const conn = s.conn;
+            if (result) |_| {
+                ex.response.write() catch |err| s.failed(err) catch {};
+            } else |err| s.failed(err) catch {};
+            ex.response.deinit();
+            conn.lock();
+            s.detached = null;
+            if (!s.body_done and !s.reset)
+                _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+            s.release(.handler);
+            conn.unlock();
+            conn.kick();
+            // Last: the driver may free the connection once no task runs.
+            if (ex.attached) _ = conn.tasks.fetchSub(1, .acq_rel);
+        }
+
+        /// The response goes on from a task, in the connection's group:
+        /// its body writes may now wait for the peer.
+        fn detachedAttach(d: *dusty.Detached) *std.Io.Group {
+            const ex = exchangeOf(d);
+            const s = ex.sink_state.stream;
+            const conn = s.conn;
+            ex.attached = true;
+            _ = conn.tasks.fetchAdd(1, .acq_rel);
+            conn.lock();
+            defer conn.unlock();
+            s.inline_mode = false;
+            return &conn.group;
+        }
+
+        fn detachedEnter(_: *dusty.Detached) void {}
+
+        /// The stream or its connection ended with the response still
+        /// detached (not attached): the owner hears of it, and the stream
+        /// is let go. Locked.
+        fn abortDetached(s: *Stream) void {
+            const ex = s.detached orelse return;
+            const d = ex.response.detached.?;
+            if (d.state != .detached) return;
+            s.detached = null;
+            d.abort();
+            ex.response.deinit();
+            s.release(.handler);
+        }
 
         fn isWebTransport(protocol: []const u8) bool {
             // "webtransport" in draft-02 (Chrome, Firefox) and up to
@@ -2906,6 +3061,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
                     if (!(s.ended and s.allSent() and s.body_done)) s.reset = true;
+                    // Gone with its response detached: the owner lets go now.
+                    if (s.reset) abortDetached(s);
                     s.release(.quic);
                 }
             }
