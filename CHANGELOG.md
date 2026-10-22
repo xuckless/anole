@@ -30,6 +30,10 @@ breaking changes are listed anyway.
   and `ClientConfig.deny_private_addresses` (refuse loopback, private,
   link-local and similar addresses, after DNS, on every hop). Redirects are
   followed in a loop, so the stack no longer grows with `max_redirects`.
+- HTTPS client: a response body delimited by the end of the connection
+  (no Content-Length, not chunked) now fails with
+  `error.TlsConnectionTruncated` when the TLS connection ends without
+  close_notify, instead of being returned as complete.
 
 ### C ABI (ABI 0.1)
 

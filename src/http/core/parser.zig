@@ -849,6 +849,13 @@ pub fn BodyReader(comptime Parser: type) type {
 
                             // Check if body is now complete after finish()
                             if (parser.isBodyComplete()) {
+                                // The end of the connection was the end of
+                                // the body. Over TLS that end must be the
+                                // peer's close_notify: a bare EOF can come
+                                // from anyone on the path.
+                                if (comptime build_options.use_tls) {
+                                    if (self.transport.tlsEndedWithoutCloseNotify()) return self.fail(error.TlsConnectionTruncated);
+                                }
                                 return error.EndOfStream;
                             }
 

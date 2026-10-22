@@ -519,15 +519,24 @@ pub const Connection = struct {
         sh.output.flush() catch {};
     }
 
+    /// Whether the stream ended with a transport EOF and no close_notify:
+    /// anyone on the path can end it so. HTTP checks it where nothing else
+    /// marks the end of a message (a response body that runs to the end of
+    /// the connection). False while the stream has not ended.
+    pub fn endedWithoutCloseNotify(self: *const Connection) bool {
+        const sh = self.shared orelse return false;
+        return sh.eof_without_close_notify;
+    }
+
     /// Cleartext into `buf`; 0 means the peer ended the stream, with
     /// close_notify or by closing the transport between records. Belongs to
     /// the reading side.
     ///
-    /// A transport EOF without close_notify is taken as a clean end, as
+    /// A transport EOF without close_notify is taken as an end here, as
     /// tls.zig does by default: many peers skip close_notify, and HTTP's own
-    /// framing (Content-Length, chunked) detects a truncated message.
-    /// BoringSSL does not say whether the EOF fell inside a record, so
-    /// `TlsConnectionTruncated` is never reported.
+    /// framing (Content-Length, chunked) detects a truncated message. It is
+    /// recorded (`endedWithoutCloseNotify`) for a message HTTP does not
+    /// frame, whose reader reports `TlsConnectionTruncated`.
     fn read(self: *Connection, buf: []u8) ReadError!usize {
         const sh = self.shared.?;
         const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
@@ -561,7 +570,11 @@ pub const Connection = struct {
                     error.ReadFailed => return error.ReadFailed,
                 },
                 c.SSL_ERROR_ZERO_RETURN => return 0,
-                c.SSL_ERROR_SYSCALL => return if (eof) 0 else error.TlsFailure,
+                c.SSL_ERROR_SYSCALL => {
+                    if (!eof) return error.TlsFailure;
+                    sh.eof_without_close_notify = true;
+                    return 0;
+                },
                 else => {
                     const f = failure orelse return error.TlsFailure;
                     if (asAlert(f)) |alert| return alert;
@@ -1231,6 +1244,9 @@ const Shared = struct {
     /// The socket reached end of stream; the BIO reports EOF once `input`
     /// is drained.
     input_eof: bool = false,
+    /// The reading side's: the stream ended at that EOF with no
+    /// close_notify (`Connection.endedWithoutCloseNotify`).
+    eof_without_close_notify: bool = false,
     /// Set while `fill` reads into `input`, so the BIO leaves it alone.
     filling: bool = false,
     /// Records BoringSSL produced, not yet handed to `output`.

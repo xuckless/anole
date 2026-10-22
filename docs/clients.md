@@ -306,6 +306,13 @@ When it is read:
   store is cached by its contents), so connect once and share the
   connection. PEM need only live through `connect`.
 
+A response body with neither `Content-Length` nor chunked framing ends
+where the connection does. Over TLS that end must be the server's
+close_notify; a connection that just closes could have been cut by anyone
+on the path, so reading such a body then fails with
+`error.TlsConnectionTruncated`. Framed bodies are not affected: their
+framing already shows a cut.
+
 Paths are relative to the current directory, or to `dir` when you set one
 (`.{ .path = "ca.pem", .dir = some_dir }`). A client key must be PKCS#8 or
 SEC1 PEM without a passphrase.

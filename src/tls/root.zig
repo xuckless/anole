@@ -907,3 +907,72 @@ test "TLS hello: a certificate reload serves the new certificate, and tickets fr
         try std.testing.expect(returning.reused);
     }
 }
+
+/// A blocking BoringSSL server on a thread of its own: one connection,
+/// answered with `response`, then ended with close_notify or with a bare
+/// close of the socket.
+const RawServer = struct {
+    fd: c_int,
+    port: u16,
+
+    fn listen() !RawServer {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = std.c.close(fd);
+        var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Bind;
+        if (std.c.listen(fd, 1) != 0) return error.Listen;
+        var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        if (std.c.getsockname(fd, @ptrCast(&addr), &len) != 0) return error.Bind;
+        return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+    }
+
+    fn serveOnce(self: RawServer, ctx: *c.SSL_CTX, response: []const u8, close_notify: bool) void {
+        defer _ = std.c.close(self.fd);
+        const conn = std.c.accept(self.fd, null, null);
+        if (conn < 0) return;
+        defer _ = std.c.close(conn);
+        const ssl = c.SSL_new(ctx) orelse return;
+        defer c.SSL_free(ssl);
+        _ = c.SSL_set_fd(ssl, conn);
+        if (c.SSL_accept(ssl) != 1) return;
+        var buf: [4096]u8 = undefined;
+        var got: usize = 0;
+        while (std.mem.indexOf(u8, buf[0..got], "\r\n\r\n") == null) {
+            const n = c.SSL_read(ssl, buf[got..].ptr, @intCast(buf.len - got));
+            if (n <= 0) return;
+            got += @intCast(n);
+        }
+        _ = c.SSL_write(ssl, response.ptr, @intCast(response.len));
+        if (close_notify) _ = c.SSL_shutdown(ssl);
+    }
+};
+
+test "TLS hello: a response body that runs to the end of the connection needs close_notify" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawServer: BoringSSL over a blocking BSD socket
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    const gpa = std.testing.allocator;
+    var pair = try dusty_tls.config.CertKeyPair.fromSlice(gpa, io, h.pem.cert, h.pem.key);
+    defer pair.deinit(gpa);
+    // No Content-Length, no chunking: the body ends where the connection does.
+    const response = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nall of it";
+
+    for ([_]bool{ true, false }) |close_notify| {
+        const server = try RawServer.listen();
+        const thread = try std.Thread.spawn(.{}, RawServer.serveOnce, .{ server, pair.server_ctx, response, close_notify });
+        defer thread.join();
+        var client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = h.caFile() } });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{server.port});
+        if (close_notify) {
+            var resp = try client.fetch(url, .{});
+            defer resp.deinit();
+            try std.testing.expectEqualStrings("all of it", (try resp.body()).?);
+        } else {
+            try std.testing.expectError(error.TlsConnectionTruncated, client.fetch(url, .{}));
+        }
+    }
+}
