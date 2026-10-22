@@ -128,8 +128,9 @@
         // cache, pool lifetimes, a refused connect's error, and TLS through
         // an injected module (Anole's BoringSSL, src/pg/tls.zig).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#6ffefc88696ec34441297d4b898cc3d9279c844c",
-            .hash = "pg-0.0.0-Wp_7gT8JCAAGQBoEPdK4HJ9dJVRgQPRp2WnblxGwOQhZ",
+            // TEMPORARY (sec/db): local clone, branch sec/anole; the lead
+            // re-pins it by URL and hash at release.
+            .path = "../../anole-forks/pg.zig",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON

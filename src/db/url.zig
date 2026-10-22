@@ -154,24 +154,26 @@ pub const Redacted = struct {
     /// Writes `text` with its password and password parameters as `***`.
     pub fn format(self: Redacted, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var text = self.text;
-        var query: ?[]const u8 = null;
-        if (std.mem.indexOfScalar(u8, text, '?')) |i| {
-            query = text[i + 1 ..];
-            text = text[0..i];
-        }
-        // The userinfo's password: between the first ':' after "//" and
-        // the authority's last '@'.
+        // The userinfo's password: from the first ':' after "//" to the
+        // last '@' of the whole text. A password with an unencoded '/', '?'
+        // or '@' (a URL that does not parse, logged as such) has no
+        // reliable end, so a query holding an '@' is hidden too: more than
+        // the password at worst, never less.
         if (std.mem.indexOf(u8, text, "//")) |slashes| {
             const start = slashes + 2;
-            const end = if (std.mem.indexOfScalarPos(u8, text, start, '/')) |i| i else text.len;
-            if (std.mem.lastIndexOfScalar(u8, text[start..end], '@')) |at_rel| {
-                const at = start + at_rel;
+            if (std.mem.lastIndexOfScalar(u8, text[start..], '@')) |r| {
+                const at = start + r;
                 if (std.mem.indexOfScalarPos(u8, text[0..at], start, ':')) |c| {
                     try w.writeAll(text[0 .. c + 1]);
                     try w.writeAll("***");
                     text = text[at..];
                 }
             }
+        }
+        var query: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, text, '?')) |i| {
+            query = text[i + 1 ..];
+            text = text[0..i];
         }
         try w.writeAll(text);
         const q = query orelse return;
@@ -298,11 +300,20 @@ test "redacted: no password in what is printed" {
         .{ "postgres://app:p@ss@word@db/main", "postgres://app:***@db/main" },
         .{ "postgres://app@db/main?password=s3cret&sslpassword=x&x=1", "postgres://app@db/main?password=***&sslpassword=***&x=1" },
         .{ "mongodb://db1,db2/?tlsCertificateKeyFilePassword=k", "mongodb://db1,db2/?tlsCertificateKeyFilePassword=***" },
+        // a '/' or '?' in the password: the URL does not parse, and the
+        // password stays hidden all the same
+        .{ "postgres://app:pa/ss@db/main", "postgres://app:***@db/main" },
+        .{ "postgres://app:pa?ss@db/main?sslmode=require", "postgres://app:***@db/main?sslmode=require" },
+        .{ "postgres://app:pa/s?s@db/main?x=1", "postgres://app:***@db/main?x=1" },
+        .{ "postgres://app:pa/ss@db/main?email=a@b", "postgres://app:***@b" },
+        .{ "postgres://app:a@b?c@db/main", "postgres://app:***@db/main" },
         .{ "sqlite:data/app.db", "sqlite:data/app.db" },
         .{ "not a url at all", "not a url at all" },
     }) |case| {
         try testing.expectEqualStrings(case[1], try std.fmt.bufPrint(&buf, "{f}", .{redacted(case[0])}));
     }
+    // Even when the password holds a '?', and the query an '@'.
+    try testing.expect(std.mem.indexOf(u8, try std.fmt.bufPrint(&buf, "{f}", .{redacted("postgres://app:hunter2?x@db/main?email=a@b")}), "hunter2") == null);
     const url = try Url.parse(arena_state.allocator(), "redis://default:hunter2@cache:6379/0");
     try testing.expectEqualStrings("redis://default:***@cache:6379/0", try std.fmt.bufPrint(&buf, "{f}", .{url}));
 }
@@ -312,4 +323,27 @@ test "env: from the C environment, or from an Environ" {
     try testing.expect(env(null, "PATH") != null);
     // Windows reads the C library's environment whatever it is given.
     if (comptime @import("builtin").os.tag != .windows) try testing.expect(env(.empty, "PATH") == null);
+}
+
+test "fuzz: redacted never shows the password" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            // The input is the password, whatever bytes it holds; a short one
+            // may also be a piece of the rest of the URL.
+            if (input.len < 6) return;
+            var text_buf: [512]u8 = undefined;
+            var out_buf: [1024]u8 = undefined;
+            for ([_][2][]const u8{
+                .{ "postgres://app:", "@db.example/main?sslmode=require" },
+                .{ "mongodb://app:", "@h1:27017,h2/admin?authSource=admin&email=a@b" },
+                .{ "rediss://default:", "@cache:6380/0" },
+            }) |parts| {
+                const text = std.fmt.bufPrint(&text_buf, "{s}{s}{s}", .{ parts[0], input, parts[1] }) catch return;
+                const out = std.fmt.bufPrint(&out_buf, "{f}", .{redacted(text)}) catch return;
+                const scaffold = std.fmt.bufPrint(out_buf[out.len..], "{s}***{s}", .{ parts[0], parts[1] }) catch return;
+                if (std.mem.indexOf(u8, scaffold, input) != null) continue;
+                if (std.mem.indexOf(u8, out, input) != null) return error.PasswordShown;
+            }
+        }
+    }.check, &.{ "hunter2", "pa/ss?x", "a@b?c", "p@ss/w?rd", "x?y=z&password=1" });
 }

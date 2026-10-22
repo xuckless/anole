@@ -241,7 +241,7 @@ const Parser = struct {
         if (path.len > 0) {
             const db = try p.decode(path, "the database");
             for (db) |ch| if (std.mem.indexOfScalar(u8, "/\\ \"$", ch) != null)
-                return p.fail("the database name \"{s}\" holds a character a database name cannot", .{db});
+                return p.fail("the database name holds a character a database name cannot (/, \\, space, \" or $)", .{});
             cs.database = db;
         }
 
@@ -272,12 +272,12 @@ const Parser = struct {
                 kind = .ip_literal;
                 const after = item[close + 1 ..];
                 if (after.len > 0) {
-                    if (after[0] != ':') return p.fail("\"{s}\" is not host:port", .{item});
+                    if (after[0] != ':') return p.fail("an IP literal not followed by :port", .{});
                     port_text = after[1..];
                 }
             } else if (std.mem.indexOfScalar(u8, item, ':')) |c| {
                 if (std.mem.indexOfScalarPos(u8, item, c + 1, ':') != null)
-                    return p.fail("\"{s}\": an IPv6 address goes in brackets, [::1]:27017", .{item});
+                    return p.fail("a host with more than one ':' (an IPv6 address goes in brackets, [::1]:27017, and a ':' or '/' in the password must be percent-encoded)", .{});
                 name_text = item[0..c];
                 port_text = item[c + 1 ..];
             }
@@ -285,14 +285,14 @@ const Parser = struct {
             if (name.len == 0) return p.fail("an empty host name", .{});
             if (kind == .hostname) {
                 if (std.mem.indexOfScalar(u8, name, '/') != null) {
-                    if (!std.mem.endsWith(u8, name, ".sock")) return p.fail("\"{s}\": a Unix socket path ends in .sock", .{name});
+                    if (!std.mem.endsWith(u8, name, ".sock")) return p.fail("a host with a '/' that is not a Unix socket path ending in .sock (a '/' in the password must be percent-encoded)", .{});
                     kind = .unix;
                 } else if (isIpv4(name)) kind = .ipv4;
             }
             var host: Host = .{ .name = name, .kind = kind };
             if (port_text) |pt| {
-                const n = std.fmt.parseInt(u32, pt, 10) catch return p.fail("\"{s}\" is not a port", .{pt});
-                if (n == 0 or n > 65535 or pt[0] == '+') return p.fail("port {s} is outside 1-65535", .{pt});
+                const n = std.fmt.parseInt(u32, pt, 10) catch return p.fail("a port that is not a number (a '/', '?' or ':' in the password must be percent-encoded)", .{});
+                if (n == 0 or n > 65535 or pt[0] == '+') return p.fail("a port outside 1-65535", .{});
                 host.port = @intCast(n);
             }
             try hosts.append(p.arena, host);
@@ -312,7 +312,7 @@ const Parser = struct {
         var it = std.mem.splitScalar(u8, query, '&');
         while (it.next()) |pair| {
             if (pair.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return p.fail("option \"{s}\" has no value", .{pair});
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return p.fail("an option with no value (no '=')", .{});
             const key = try p.decode(pair[0..eq], "an option name");
             const value = try p.decode(pair[eq + 1 ..], "an option value");
 
@@ -727,4 +727,46 @@ test "parse: warnings for what is left out, errors for what is wrong" {
         try testing.expectError(error.InvalidUri, parse(arena, bad, &diag));
         try testing.expect(diag.message.len > 0);
     }
+
+    // A password with a character it should have percent-encoded: refused,
+    // without the password in the message.
+    for ([_][]const u8{
+        "mongodb://u:hunter2/x@h/db",
+        "mongodb://u:hunter2?x@h/db",
+        "mongodb://u:hunter2/@h",
+        "mongodb://u:hunter2:x@h",
+        "mongodb://u:x/hunter2@h/db",
+        "mongodb://u:x?hunter2@h",
+        "mongodb://u:hunter2/x.sock@h/db",
+    }) |bad| {
+        diag = .{};
+        if (parse(arena, bad, &diag)) |_| return error.TestUnexpectedResult else |_| {}
+        try testing.expect(std.mem.indexOf(u8, diag.message, "hunter2") == null);
+    }
+}
+
+test "fuzz: connection strings: parsed or refused, never the password in the message" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var diag: Diagnostic = .{};
+            // As a whole connection string.
+            if (parse(arena, input, &diag)) |cs| {
+                _ = credential(arena, cs, &diag) catch {};
+            } else |_| {}
+            // As the password.
+            if (input.len < 6) return;
+            const scaffold = "mongodb://app:***@h1:27017,h2/shop?authSource=admin&replicaSet=rs0";
+            if (std.mem.indexOf(u8, scaffold, input) != null) return;
+            const text = try std.fmt.allocPrint(arena, "mongodb://app:{s}@h1:27017,h2/shop?authSource=admin&replicaSet=rs0", .{input});
+            diag = .{};
+            if (parse(arena, text, &diag)) |cs| {
+                diag = .{};
+                _ = credential(arena, cs, &diag) catch {};
+            } else |_| {}
+            if (std.mem.indexOf(u8, diag.message, input) != null) return error.PasswordShown;
+        }
+    }.check, &.{ "mongodb://u:p@h/db", "hunter2", "pa/ss?x", "a@b?c", "p:ss/w?rd", "x]y[z", "%zz%41", "mongodb://h/?tls=true&ssl=false" });
 }

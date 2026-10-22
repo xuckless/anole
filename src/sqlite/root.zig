@@ -80,8 +80,14 @@ const log = std.log.scoped(.anole);
 pub const Options = struct {
     /// A file (created when missing), `":memory:"` for one in-memory
     /// database shared by the whole app, or a `sqlite:` URL of either
-    /// (`sqlite:data/app.db`, `sqlite::memory:`).
+    /// (`sqlite:data/app.db`, `sqlite::memory:`). A path starting with
+    /// `file:` is a SQLite URI only with `uri = true`.
     path: []const u8,
+    /// Take a path starting with `file:` as a SQLite URI
+    /// (https://sqlite.org/uri.html), whose parameters choose the VFS, the
+    /// open mode, `immutable` and `nolock`. Off by default, since the path
+    /// often comes from the environment: such a path is refused unless set.
+    uri: bool = false,
     /// The `db` label of its metrics and spans. Null: the file's name
     /// (`app.db`), or `memory`.
     name: ?[]const u8 = null,
@@ -147,6 +153,10 @@ pub const Client = struct {
     /// calls will come from. Close it with `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
         const path = stripScheme(options.path);
+        if (!options.uri and std.ascii.startsWithIgnoreCase(path, "file:")) {
+            log.warn("sqlite: \"{s}\" is a SQLite URI, taken only with Options.uri = true", .{path});
+            return error.InvalidDatabaseUrl;
+        }
         const memory = std.mem.eql(u8, path, ":memory:");
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
@@ -1387,10 +1397,16 @@ fn decodeValue(comptime F: type, stmt: *c.sqlite3_stmt, col: c_int, arena: std.m
     }
     if (F == db.Time) {
         switch (kind) {
-            c.SQLITE_INTEGER => return db.Time.fromSeconds(c.sqlite3_column_int64(stmt, col)),
+            c.SQLITE_INTEGER => {
+                const v = c.sqlite3_column_int64(stmt, col);
+                return db.Time.fromSecondsChecked(v) catch return f.ours(.other, "column \"{s}\": {d} seconds is beyond what anole.db.Time holds", .{ field, v });
+            },
             // A Julian day number (`julianday()`), to the millisecond as
             // SQLite keeps it.
-            c.SQLITE_FLOAT => return db.Time.fromMillis(@intFromFloat(@round((c.sqlite3_column_double(stmt, col) - 2440587.5) * 86400e3))),
+            c.SQLITE_FLOAT => {
+                const v = c.sqlite3_column_double(stmt, col);
+                return db.Time.fromJulianDay(v) catch return f.ours(.other, "column \"{s}\": the Julian day {d} is beyond what anole.db.Time holds", .{ field, v });
+            },
             else => {
                 const text = columnBytes(stmt, col, kind);
                 return db.Time.parse(text) catch return f.ours(.other, "column \"{s}\": \"{s}\" is not a time", .{ field, text });

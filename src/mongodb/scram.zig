@@ -39,6 +39,12 @@ pub const Mechanism = enum {
     }
 };
 
+/// The most PBKDF2 iterations a server may ask for (MongoDB's default is
+/// 15000 for SCRAM-SHA-256 and 10000 for SCRAM-SHA-1). The client hashes them
+/// before the server has proven it knows the password, so the bound keeps a
+/// server that asks for billions from holding an executor for minutes.
+pub const max_iterations = 1_000_000;
+
 pub const Error = error{
     OutOfMemory,
     /// The server's message is not what SCRAM sends at that step.
@@ -47,6 +53,9 @@ pub const Error = error{
     InvalidNonce,
     /// Fewer than 4096 iterations: a downgrade the spec forbids.
     IterationCountTooLow,
+    /// More than `max_iterations`: hours of hashing before the server has
+    /// proven anything.
+    IterationCountTooHigh,
     /// The server could not prove it knows the password.
     ServerSignatureMismatch,
     /// The server said why it refused ("e=...").
@@ -178,6 +187,7 @@ pub const Conversation = struct {
         if (!std.mem.startsWith(u8, server_nonce, self.nonce) or server_nonce.len == self.nonce.len) return error.InvalidNonce;
         const rounds = iterations orelse return error.InvalidServerMessage;
         if (rounds < 4096) return error.IterationCountTooLow;
+        if (rounds > max_iterations) return error.IterationCountTooHigh;
         const salt_b64 = salt_text orelse return error.InvalidServerMessage;
         const salt = try arena.alloc(u8, base64.Decoder.calcSizeForSlice(salt_b64) catch return error.InvalidServerMessage);
         base64.Decoder.decode(salt, salt_b64) catch return error.InvalidServerMessage;
@@ -361,6 +371,8 @@ test "Conversation: messages, checks on the server's, and the key cache" {
     try testing.expectError(error.InvalidNonce, conv.clientFinal(arena, testing.io, null, "r=someone-else,s=QSXCR+Q6sek8bf92,i=4096"));
     const low = try std.fmt.allocPrint(arena, "r={s}X,s=QSXCR+Q6sek8bf92,i=1000", .{ours});
     try testing.expectError(error.IterationCountTooLow, conv.clientFinal(arena, testing.io, null, low));
+    const high = try std.fmt.allocPrint(arena, "r={s}X,s=QSXCR+Q6sek8bf92,i=4000000000", .{ours});
+    try testing.expectError(error.IterationCountTooHigh, conv.clientFinal(arena, testing.io, null, high));
     const ext = try std.fmt.allocPrint(arena, "m=x,r={s}X,s=QSXCR+Q6sek8bf92,i=4096", .{ours});
     try testing.expectError(error.InvalidServerMessage, conv.clientFinal(arena, testing.io, null, ext));
 }

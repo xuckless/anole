@@ -48,7 +48,13 @@ name means the same thing in each:
 | `acquire` | yes | yes, the writer | no | yes |
 | `with` | yes | yes | yes, and on a `db(name)` or a collection | yes |
 
-`args` is a tuple: `.{ id, name }`. Outside a handler (startup, a
+`args` is a tuple: `.{ id, name }`. Values always go in `args`, never
+into the SQL text: with arguments, a call runs exactly one statement. With
+no arguments (`.{}`), PostgreSQL's and SQLite's `exec` run every statement
+in the text (a schema, a migration), so SQL built from input there could
+run statements of its own.
+
+Outside a handler (startup, a
 background task) pass an `anole.db.Ctx` instead of the request:
 
 ```zig
@@ -100,7 +106,9 @@ The URL takes libpq's parameters:
 
 | Parameter | |
 | --- | --- |
-| `sslmode` | `disable`, `allow`, `prefer` (the default), `require`, `verify-ca`, `verify-full` |
+| `sslmode` | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; unset: `verify-full`, or `prefer` for a server on this machine (see below) |
+| `require_auth` | the ways the server may ask for the password, as in libpq: `scram-sha-256`, `md5`, `password`, `none`, a list, or `!` to exclude |
+| `channel_binding` | `prefer` (the default), `require` (SCRAM-SHA-256-PLUS over TLS only), `disable` |
 | `sslrootcert` | the CA file for `verify-ca`/`verify-full`; the system's store when unset (or `system`) |
 | `sslcert`, `sslkey` | a client certificate |
 | `sslnegotiation=direct` | TLS without the SSLRequest round trip (PostgreSQL 17+) |
@@ -110,6 +118,28 @@ The URL takes libpq's parameters:
 
 A host that is a directory is a Unix socket's:
 `postgres://app@%2Fvar%2Frun%2Fpostgresql/app`.
+
+**TLS and logging in.** Without an `sslmode` (in the URL or `PGSSLMODE`),
+a server on another host is reached with `verify-full`: TLS, with its
+certificate checked against the system's store (or `sslrootcert`, or
+`Options.tls.ca`) and its host name. A server on this machine (`localhost`,
+127.0.0.0/8, `::1`, a Unix socket) gets libpq's `prefer`. So a server
+whose certificate does not check out (self-signed, a private CA you did not
+give, a Docker Compose service name the certificate does not carry) fails
+to connect, and the log says what to set: `sslrootcert` (or `tls.ca`) for
+a private CA, or `sslmode=require` to encrypt without checking, or
+`sslmode=disable` on a network you trust. With `Options.tls.ca` set in
+code, the server is always checked: an `sslmode` that would not check it
+(`disable`, `allow`, `prefer`), from the URL or the environment, is
+refused.
+
+The password is sent in clear text or as MD5 only to a server that was
+verified or is on this machine; otherwise a server asking for it that
+way is refused (SCRAM-SHA-256 is PostgreSQL's default since 14).
+`require_auth` sets the allowed methods explicitly, for example
+`require_auth=md5` for an old server you trust. SCRAM uses channel binding
+when the server offers it over TLS, which ties the login to the TLS
+connection; `channel_binding=require` refuses to log in without it.
 
 `anole.pg.Options` has the rest: `max_connections` (twice the executors,
 at least 4), `acquire_timeout` (5 s), `connect_timeout` (10 s),
@@ -247,7 +277,17 @@ try tx.commit(req); // under the request's deadline, like every call
 - **Raw access.** `app.db.acquire(req)` hands over pg.zig's connection
   (`conn.raw`: `query`, `row`, `prepare`...) for what the calls above do
   not cover; `conn.release()` gives it back. `app.db.listener()` opens a
-  connection for `LISTEN`/`NOTIFY`.
+  connection for `LISTEN`/`NOTIFY` (channel names up to 63 bytes,
+  PostgreSQL's limit).
+- **Session state.** A connection going back to the pool is reset: what a
+  call left with `SET`, `set_config(..., false)`, `SET ROLE`, `SET SESSION
+  AUTHORIZATION`, temporary tables, cursors or advisory locks is gone
+  before another request gets it. The reset is sent with the release and
+  its answer read with the next call's, so it adds no round trip, only a
+  little work on the server. `Options.reset_session = false` turns it off;
+  then set per-request state only with `SET LOCAL` (or `set_config(...,
+  true)`) inside a transaction, since the next call on that connection may
+  be another user's.
 
 ### Observability
 
@@ -385,12 +425,18 @@ try tx.commit(req);
 ```zig
 state.db = try app.sqlite(.{
     .path = "data/app.db",       // or "sqlite:data/app.db", ":memory:"
+    .uri = false,                // true: a "file:..." path is a SQLite URI
     .readers = 4,                // read-only connections; 0: everything on the writer
     .busy_timeout_ms = 5000,     // waiting for a lock another process holds
     .statement_cache = 64,       // per connection
     .pragmas = &.{"PRAGMA cache_size = -20000"}, // run on every connection
 });
 ```
+
+A path starting with `file:` is a [SQLite URI](https://sqlite.org/uri.html),
+whose parameters pick the VFS, the open mode, `immutable` and `nolock`.
+Since the path often comes from the environment, such a path is refused
+unless `.uri = true`.
 
 ### Values
 
@@ -483,7 +529,7 @@ The connection string takes the standard options; these are honoured:
 | --- | --- |
 | `replicaSet`, `directConnection` | the topology |
 | `authSource`, `authMechanism` | `SCRAM-SHA-256` (the default when the server has it), `SCRAM-SHA-1`, `PLAIN`, `MONGODB-X509` |
-| `tls`, `tlsCAFile`, `tlsCertificateKeyFile`, `tlsInsecure`, `tlsAllowInvalidCertificates`, `tlsAllowInvalidHostnames` | TLS; the system's trust store when no CA is given |
+| `tls`, `tlsCAFile`, `tlsCertificateKeyFile`, `tlsInsecure`, `tlsAllowInvalidCertificates`, `tlsAllowInvalidHostnames` | TLS; the system's trust store when no CA is given. The options that stop checking the certificate are logged as warnings, and with `Options.tls` set in code, `tls=false` and those options are refused |
 | `appName` | in the server's logs and `currentOp` |
 | `maxPoolSize` | connections in all, split between the executors (100) |
 | `waitQueueTimeoutMS`, `serverSelectionTimeoutMS`, `connectTimeoutMS`, `heartbeatFrequencyMS`, `maxIdleTimeMS` | the waits (10 s, 30 s, 10 s, 10 s, none) |
@@ -667,7 +713,7 @@ URL is the one go-redis and redis-py take:
 | `rediss://...` | TLS, the certificate checked against the system's store |
 | `rediss://...?ssl_ca_certs=/etc/ca.pem` | ... against this CA instead (or `.tls.ca`) |
 | `rediss://...?ssl_certfile=c.pem&ssl_keyfile=k.pem` | a client certificate (or `.tls.client_certificate`) |
-| `rediss://...?ssl_cert_reqs=none` | any certificate: a managed server with a self-signed one |
+| `rediss://...?ssl_cert_reqs=none` | any certificate: a managed server with a self-signed one (logged as a warning; refused when `.tls.ca` is set in code) |
 | `unix:///run/redis.sock?db=0` | a Unix socket |
 
 `anole.redis.Options` has the rest: `max_connections` (ten per executor),

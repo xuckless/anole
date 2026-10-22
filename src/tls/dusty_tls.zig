@@ -369,10 +369,11 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     };
 }
 
-/// The peer's leaf certificate (DER), if it sent one: on a server, the
-/// first of `SSL_get0_peer_certificates` (BoringSSL keeps the leaf there,
-/// unlike `SSL_get_peer_cert_chain`). Owned by the SSL's session, which a
-/// server never replaces (no renegotiation), so valid until `SSL_free`.
+/// The peer's leaf certificate (DER), if it sent one: the first of
+/// `SSL_get0_peer_certificates` (BoringSSL keeps the leaf there, unlike
+/// `SSL_get_peer_cert_chain` on a server). Owned by the SSL's session,
+/// which is never replaced after the handshake (no renegotiation), so
+/// valid until `SSL_free`.
 pub fn peerLeaf(ssl: *const c.SSL) ?[]const u8 {
     const certs = c.SSL_get0_peer_certificates(ssl) orelse return null;
     if (c.sk_CRYPTO_BUFFER_num(certs) == 0) return null;
@@ -437,7 +438,7 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
     }
 
     try handshake(shared);
-    return .{ .shared = shared, .alpn_protocol = selectedAlpn(ssl, opt.alpn_protocols) };
+    return .{ .shared = shared, .alpn_protocol = selectedAlpn(ssl, opt.alpn_protocols), .peer_certificate = peerLeaf(ssl) };
 }
 
 /// One TLS connection: owns its SSL (and through it the BIO and the shared
@@ -453,8 +454,7 @@ pub const Connection = struct {
     /// The negotiated ALPN protocol: one of the strings the caller passed in
     /// `alpn_protocols`, so it outlives the connection.
     alpn_protocol: ?[]const u8 = null,
-    /// A server's verified client certificate (mutual TLS); see
-    /// `peerCertificate`.
+    /// The peer's leaf certificate; see `peerCertificate`.
     peer_certificate: ?[]const u8 = null,
 
     // Inert; only dusty's own test fixture sets them
@@ -474,9 +474,11 @@ pub const Connection = struct {
     /// What writing plaintext can fail with.
     pub const WriteError = error{ WriteFailed, TlsFailure };
 
-    /// The client's certificate (the leaf, DER) on a server connection
-    /// whose handshake verified one, else null. dusty fork seam: dusty puts
-    /// it in `Request.peer_certificate`. Valid until `deinit`.
+    /// On a server connection, the client's certificate (the leaf, DER)
+    /// when the handshake verified one, else null: dusty puts it in
+    /// `Request.peer_certificate`. On a client connection, the server's
+    /// leaf certificate, verified or not as the connection's options said
+    /// (PostgreSQL's SCRAM channel binding hashes it). Valid until `deinit`.
     pub fn peerCertificate(self: *const Connection) ?[]const u8 {
         return self.peer_certificate;
     }

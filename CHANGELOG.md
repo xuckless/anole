@@ -182,6 +182,45 @@ breaking changes are listed anyway.
   end cannot grow the caller's arena without bound. Response frames are read
   and inflated outside the arena and freed once decoded. Behaviour change
   for clients of streams that send more than 64 MiB.
+- **PostgreSQL connects to a remote server with `verify-full` when no
+  `sslmode` is given (breaking).** A server on this machine (loopback, Unix
+  socket) still gets `prefer`. Action: a server reached by a name or
+  address its certificate does not carry, or signed by a private CA, now
+  fails to connect; set `sslrootcert` (or `Options.tls.ca`), or set
+  `sslmode` explicitly (`require` encrypts without checking, `disable`
+  sends plain text). The log says which.
+- **PostgreSQL sends the password in clear text or as MD5 only to a
+  verified server or one on this machine (breaking).** Action, only for a
+  server that still asks for `password` or `md5` over the network: move
+  it to SCRAM-SHA-256, verify it, or allow the method with
+  `require_auth=md5`. `require_auth` and `channel_binding` (SCRAM-SHA-256-PLUS,
+  used whenever the server offers it over TLS) are new URL parameters.
+- PostgreSQL connections are reset when they go back to the pool, so
+  session settings, roles, temporary tables and advisory locks from one
+  request never reach another (`Options.reset_session`, on; no extra round
+  trip). No action needed.
+- A CA set in code (`tls.ca` for PostgreSQL and Redis, `Options.tls` for
+  MongoDB) can no longer be switched off by the URL or the environment:
+  `sslmode=disable|allow|prefer`, `ssl_cert_reqs=none`, `tls=false` and
+  `tlsInsecure`/`tlsAllowInvalid*` are refused there, and logged as
+  warnings everywhere else.
+- The PostgreSQL client checks message lengths and every value of a
+  result row before decoding it, refuses `LISTEN` channel names over 63
+  bytes, and checks SCRAM's server nonce and iteration count; MongoDB's
+  SCRAM caps the iteration count at one million, and Redis refuses replies
+  nested deeper than 32 levels. A malformed answer now fails the call and
+  closes the connection instead of crashing the process. No action needed.
+- A date or time column beyond what `anole.db.Time` holds (PostgreSQL and
+  SQLite) fails that read instead of crashing. No action needed.
+- SQLite limits expression depth to 1000 again (it was unlimited), and a
+  `file:` path is a SQLite URI only with `Options.uri = true` (breaking
+  for paths that relied on it; action: set `.uri = true`).
+- A database URL whose password holds `/` or `?` no longer shows the
+  password in logs, and MongoDB's connection-string errors no longer quote
+  parts of the string. No action needed, but percent-encode such
+  passwords.
+- `exec` with no arguments runs every statement in its SQL (PostgreSQL,
+  SQLite); the docs now say so: never build that SQL from input.
 
 ### C ABI (ABI 0.1)
 
