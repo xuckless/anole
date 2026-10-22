@@ -126,8 +126,13 @@ pub const ClientConnection = struct {
     /// Serializes every nghttp2 call and guards what follows.
     mutex: std.Io.Mutex = .init,
     session: ?*c.nghttp2_session = null,
-    /// The connection is going or gone: no new streams.
+    /// The connection is going or gone: no new streams. A GOAWAY sets it,
+    /// and the streams it covers carry on.
     closing: bool = false,
+    /// The session is over: the reader has ended or a write failed. From
+    /// here nothing calls into nghttp2 but `close`, so no callback can
+    /// reach a stream any more.
+    dead: bool = false,
     /// Why it went, when it failed.
     failure: ?anyerror = null,
     write_gen: std.atomic.Value(u32) = .init(0),
@@ -283,10 +288,10 @@ pub const ClientConnection = struct {
         {
             self.lock();
             defer self.unlock();
-            if (!self.closing) {
-                self.closing = true;
-                _ = c.nghttp2_session_terminate_session(self.session, c.NGHTTP2_NO_ERROR);
-            }
+            // Also after the server's GOAWAY, whose streams may still be
+            // open.
+            if (!self.dead) _ = c.nghttp2_session_terminate_session(self.session, c.NGHTTP2_NO_ERROR);
+            self.closing = true;
         }
         self.kickWriter();
         // The tasks have ended either way; a cancel is the caller's to see.
@@ -386,6 +391,7 @@ pub const ClientConnection = struct {
         const err = self.runReader();
         self.lock();
         self.closing = true;
+        self.dead = true;
         if (self.failure == null) self.failure = err;
         self.unlock();
         self.failAll();
@@ -434,8 +440,10 @@ pub const ClientConnection = struct {
             {
                 self.lock();
                 defer self.unlock();
-                closing = self.closing;
-                while (staging.items.len < 64 * 1024) {
+                // A GOAWAY only stops new streams: what is open finishes,
+                // and `finished` ends the loop after that.
+                closing = self.dead;
+                while (!closing and staging.items.len < 64 * 1024) {
                     var data: [*c]const u8 = undefined;
                     const n = c.nghttp2_session_mem_send2(self.session, &data);
                     if (n <= 0) break;
@@ -461,6 +469,7 @@ pub const ClientConnection = struct {
     fn writeFailed(self: *ClientConnection) void {
         self.lock();
         self.closing = true;
+        self.dead = true;
         if (self.failure == null) self.failure = error.ConnectionClosed;
         self.unlock();
         self.socket.shutdown(self.io, .both) catch {};
@@ -762,19 +771,25 @@ pub const Stream = struct {
         conn.kickWriter();
     }
 
-    /// Done with the stream: an unfinished one is canceled first.
+    /// Done with the stream: an unfinished one is canceled first, and
+    /// freed once nghttp2 has closed it.
     pub fn release(self: *Stream) void {
         const conn = self.conn;
         conn.lock();
-        const open = !self.protocol_done and self.submitted and conn.session != null and !conn.closing;
+        // Also after a GOAWAY, which leaves the streams it covers open.
+        const open = !self.protocol_done and self.submitted and conn.session != null and !conn.dead;
         conn.unlock();
         if (open) self.cancel();
         conn.lock();
         defer conn.unlock();
         self.user_done = true;
-        // A stream nghttp2 never got, or one the connection's end left
-        // behind, has no close to wait for.
-        if (!self.submitted or conn.session == null or conn.closing) self.protocol_done = true;
+        // A stream nghttp2 never got, or one a dead session left behind,
+        // has no close to wait for. nghttp2 must not hand it out again.
+        if (!self.submitted or conn.session == null or conn.dead) {
+            if (self.submitted and !self.protocol_done and conn.session != null)
+                _ = c.nghttp2_session_set_stream_user_data(conn.session, self.id, null);
+            self.protocol_done = true;
+        }
         self.maybeFree();
     }
 

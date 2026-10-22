@@ -5,6 +5,13 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- HTTP/2 client: a graceful GOAWAY from the server no longer ends the
+  connection at once; the streams it covers finish. A stream released
+  after a GOAWAY is reset and freed once the session has closed it, never
+  while the session can still reach it.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings
