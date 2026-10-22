@@ -123,24 +123,24 @@ app.use(requireKey);
 ```
 
 A middleware with settings of its own is a struct with an `execute` method
-of exactly this shape, where `executor.next()` plays the part of
+of exactly this shape, where `next.call()` plays the part of
 `next.call()`:
 
 ```zig
 const RequireToken = struct {
     token: []const u8,
 
-    pub fn execute(self: *const RequireToken, req: *anole.Request, res: *anole.Response, executor: anytype) !void {
+    pub fn execute(self: *const RequireToken, req: *anole.Request, res: *anole.Response, next: anytype) !void {
         if (!std.mem.eql(u8, req.headers.get("Authorization") orelse "", self.token))
             return res.fail(.unauthorized, "");
-        return executor.next();
+        return next.call();
     }
 };
 
 const Timing = struct {
-    pub fn execute(_: *const Timing, req: *anole.Request, res: *anole.Response, executor: anytype) !void {
+    pub fn execute(_: *const Timing, req: *anole.Request, res: *anole.Response, next: anytype) !void {
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
-        try executor.next();
+        try next.call();
         const us = start.durationTo(.now(req.io, .awake)).raw.toMicroseconds();
         const value = try std.fmt.allocPrint(req.arena, "app;dur={d}", .{@divTrunc(us, 1000)});
         // A handler that streamed has sent its headers already.
@@ -657,10 +657,10 @@ locals: typed values by name, for this request only, in its arena.
 
 ```zig
 const Tenant = struct {
-    pub fn execute(_: *const Tenant, req: *anole.Request, _: *anole.Response, executor: anytype) !void {
+    pub fn execute(_: *const Tenant, req: *anole.Request, _: *anole.Response, next: anytype) !void {
         const id = req.headers.get("X-Tenant") orelse return error.BadRequest;
         try req.setLocal("tenant", id);
-        return executor.next();
+        return next.call();
     }
 };
 

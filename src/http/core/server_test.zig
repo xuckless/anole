@@ -3592,10 +3592,10 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
 
     const Tag = struct {
         value: []const u8,
-        pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+        pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
             _ = req;
             try res.header("X-Group", self.value);
-            return executor.next();
+            return next.call();
         }
     };
     var outer_tag: Tag = .{ .value = "outer" };

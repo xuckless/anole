@@ -1699,7 +1699,7 @@ test "Group: routes without group middleware get global middlewares" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw1 = TestMw{ .id = 1 };
@@ -1729,7 +1729,7 @@ test "Group: group middlewares appended after global" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw_global = TestMw{ .id = 1 };
@@ -1764,7 +1764,7 @@ test "Group: no global middlewares, only group middlewares" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw_group = TestMw{ .id = 1 };
@@ -1792,7 +1792,7 @@ test "Group: keeps its own copy of the middleware list" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw_group = TestMw{ .id = 1 };

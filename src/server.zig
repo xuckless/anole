@@ -507,9 +507,9 @@ pub const OnlyOn = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
-    pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, executor: anytype) !void {
+    pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, next: anytype) !void {
         if (!std.mem.eql(u8, req.listener.name, self.name)) return error.NotFound;
-        return executor.next();
+        return next.call();
     }
 };
 
@@ -750,9 +750,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Does nothing after `next()`: requests behind it can detach.
             pub const detach_safe = true;
 
-            pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
+            pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, next: anytype) !void {
                 if (self.value) |v| if (req.version_major != 3 and self.listener != null and req.listener == self.listener.?) try res.header("Alt-Svc", v);
-                return executor.next();
+                return next.call();
             }
         };
 
@@ -2819,9 +2819,9 @@ const CountingMiddleware = struct {
     hits: *std.atomic.Value(u32),
     deinits: *u32,
 
-    pub fn execute(self: *const CountingMiddleware, _: *http.Request, _: *http.Response, executor: anytype) !void {
+    pub fn execute(self: *const CountingMiddleware, _: *http.Request, _: *http.Response, next: anytype) !void {
         _ = self.hits.fetchAdd(1, .monotonic);
-        return executor.next();
+        return next.call();
     }
 
     pub fn deinit(self: *CountingMiddleware) void {

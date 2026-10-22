@@ -247,12 +247,12 @@ var held_started: std.Io.Event = .unset;
 /// to its route: a request routed during the drain, as an HTTP/2 stream
 /// opened before the final GOAWAY is.
 const HoldUntilDrain = struct {
-    pub fn execute(_: *const HoldUntilDrain, req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+    pub fn execute(_: *const HoldUntilDrain, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         if (std.mem.endsWith(u8, req.url, "?held")) {
             held_started.set(req.io);
             try req.drain.?.wait(req.io);
         }
-        return executor.next();
+        return next.call();
     }
 };
 

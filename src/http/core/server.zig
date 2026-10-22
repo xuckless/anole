@@ -27,7 +27,7 @@ const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersP
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
 const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
-const Executor = @import("middleware.zig").Executor;
+const Chain = @import("middleware.zig").Chain;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
 const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
@@ -2417,7 +2417,7 @@ pub fn Server(comptime Ctx: type) type {
                 else => |e| return e,
             };
             const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(req) else null;
-            var executor = Executor(Ctx){
+            var executor = Chain(Ctx){
                 .req = req,
                 .res = res,
                 .ctx = self.ctx,
@@ -2798,7 +2798,7 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
                 const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(&request) else null;
-                var executor = Executor(Ctx){
+                var executor = Chain(Ctx){
                     .req = &request,
                     .res = &response,
                     .ctx = self.ctx,

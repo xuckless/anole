@@ -1383,7 +1383,7 @@ pub const Response = struct {
     }
 
     /// Whether the handler detached the response (`detach`): a detach-safe
-    /// middleware that does work after `executor.next()` puts it off with
+    /// middleware that does work after `next.call()` puts it off with
     /// `onFinish` instead.
     pub fn isDetached(self: *const Response) bool {
         return self.detached != null;
@@ -1415,7 +1415,7 @@ pub const Response = struct {
         return d;
     }
 
-    /// For a detach-safe middleware whose `executor.next()` returned with
+    /// For a detach-safe middleware whose `next.call()` returned with
     /// the response detached: `f` runs when the response is finished, in
     /// place of the work the middleware would have done after `next()`.
     /// `f` lives in the request's arena or longer.

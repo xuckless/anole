@@ -323,8 +323,8 @@ pub const Middleware = struct {
         return .{ .exporter = exporter };
     }
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
-        if (common.excluded(req, self.exporter.options.exclude)) return executor.next();
+    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+        if (common.excluded(req, self.exporter.options.exclude)) return next.call();
         const parent = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;
         if (!self.exporter.options.sample_all) if (parent == null or !parent.?.sampled) {
             // Not recorded here, but the caller's context still goes on to
@@ -334,7 +334,7 @@ pub const Middleware = struct {
                 req.trace_id = try req.arena.dupe(u8, &p.trace_id);
                 req.span_id = try req.arena.dupe(u8, &p.span_id);
             }
-            return executor.next();
+            return next.call();
         };
         var span: Span = undefined;
         span.db = null;
@@ -345,7 +345,7 @@ pub const Middleware = struct {
         req.span_id = try req.arena.dupe(u8, &span.span_id);
         span.start_ns = std.Io.Clock.real.now(req.io).nanoseconds;
 
-        const result = executor.next();
+        const result = next.call();
 
         span.end_ns = std.Io.Clock.real.now(req.io).nanoseconds;
         var mbuf: [12]u8 = undefined;

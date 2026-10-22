@@ -147,7 +147,7 @@ test "init: a key shorter than 32 bytes, or of zeros, is refused" {
     _ = try init(.{ .secret_key = "test-secret-key-that-is-long-enough" });
 }
 
-pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const Session, req: *Request, res: *Response, next: anytype) !void {
     const cookie_value = req.cookies().get(self.config.cookie_name);
     // When the loaded cookie stops being honoured; 0 for none loaded.
     var expires_at: u32 = 0;
@@ -161,7 +161,7 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
         };
     }
 
-    try executor.next();
+    try next.call();
 
     // Re-sign if modified, or the session has data and its expiry should
     // slide: on every response with max_age (the cookie's Max-Age is

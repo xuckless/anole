@@ -414,7 +414,7 @@ pub const Middleware = struct {
         return .{ .config = config, .key = key };
     }
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         var id: ?[]const u8 = null;
         if (req.cookies().get(self.config.cookie_name)) |raw| {
             self.load(req, raw, &id) catch |err| switch (err) {
@@ -424,7 +424,7 @@ pub const Middleware = struct {
             };
         }
 
-        try executor.next();
+        try next.call();
 
         if (!req.session.modified and req.session.len == 0) return;
         const fresh = req.session.get(regenerate_key) != null;

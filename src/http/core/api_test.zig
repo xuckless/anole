@@ -243,10 +243,10 @@ test "bind: unknown fields ignored, a missing or malformed body is 400" {
 }
 
 const SetTenant = struct {
-    pub fn execute(_: *const SetTenant, req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+    pub fn execute(_: *const SetTenant, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         try req.setLocal("tenant", @as([]const u8, req.headers.get("X-Tenant") orelse "none"));
         try req.setLocal("level", @as(u8, 3));
-        return executor.next();
+        return next.call();
     }
 };
 

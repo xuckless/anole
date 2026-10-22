@@ -32,9 +32,9 @@ pub fn init(options: Options) Logger {
     return .{ .log_query = options.log_query };
 }
 
-pub fn execute(self: *const Logger, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const Logger, req: *Request, res: *Response, next: anytype) !void {
     const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
-    executor.next() catch |err| {
+    next.call() catch |err| {
         self.line(req, res, start, err);
         return err;
     };

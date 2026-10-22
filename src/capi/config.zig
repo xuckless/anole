@@ -696,10 +696,10 @@ pub const RateLimitMw = struct {
 
     pub const detach_safe = true;
 
-    pub fn execute(self: *const RateLimitMw, req: *http.Request, res: *http.Response, executor: anytype) !void {
+    pub fn execute(self: *const RateLimitMw, req: *http.Request, res: *http.Response, next: anytype) !void {
         var key_buf: [128]u8 = undefined;
         const key = if (self.header) |h| req.headers.get(h) orelse "" else anole.ratelimit.clientAddress(req, &key_buf);
-        const r = self.limiter.limiter().take(key, 1, self.policy) catch return executor.next();
+        const r = self.limiter.limiter().take(key, 1, self.policy) catch return next.call();
         try res.header("RateLimit-Limit", try std.fmt.allocPrint(res.arena, "{d}", .{r.limit}));
         try res.header("RateLimit-Remaining", try std.fmt.allocPrint(res.arena, "{d}", .{r.remaining}));
         try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));
@@ -710,7 +710,7 @@ pub const RateLimitMw = struct {
             res.body = "429 Too Many Requests\n";
             return;
         }
-        return executor.next();
+        return next.call();
     }
 
     pub fn deinit(self: *RateLimitMw) void {

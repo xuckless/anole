@@ -83,7 +83,7 @@ pub const RequireJwt = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
-    pub fn execute(self: *const RequireJwt, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    pub fn execute(self: *const RequireJwt, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         const header = req.headers.get("Authorization") orelse return self.refuse(res, .missing);
         const space = std.mem.indexOfScalar(u8, header, ' ') orelse return self.refuse(res, .missing);
         // Another scheme (Basic, ...) is no bearer token.
@@ -157,7 +157,7 @@ pub const RequireJwt = struct {
                 return self.refuse(res, .invalid_token);
             },
         };
-        return executor.next();
+        return next.call();
     }
 
     fn verify(self: *const RequireJwt, req: *dusty.Request, token: []const u8) !jws.Verified {

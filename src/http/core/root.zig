@@ -81,7 +81,7 @@ pub const ErrorHandler = @import("config.zig").ErrorHandler;
 pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
-pub const Executor = @import("middleware.zig").Executor;
+pub const Chain = @import("middleware.zig").Chain;
 /// The status a handler error stands for (status-named errors such as
 /// `error.Unauthorized`, request-body faults), or null for a 500: for
 /// middleware that records the status it will send.

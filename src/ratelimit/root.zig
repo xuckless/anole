@@ -416,13 +416,13 @@ pub const Middleware = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         var key_buf: [128]u8 = undefined;
         const key = self.options.key(req, &key_buf);
         const r = self.limiter.take(key, 1, self.options.policy()) catch |err| switch (self.options.on_error) {
             .allow => {
                 std.log.scoped(.anole_ratelimit).warn("limiter failed, request let through: {t}", .{err});
-                return executor.next();
+                return next.call();
             },
             .deny => {
                 std.log.scoped(.anole_ratelimit).warn("limiter failed, request refused (503): {t}", .{err});
@@ -442,7 +442,7 @@ pub const Middleware = struct {
             res.body = "429 Too Many Requests\n";
             return;
         }
-        return executor.next();
+        return next.call();
     }
 };
 

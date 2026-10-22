@@ -36,10 +36,10 @@ pub fn init(config: Options) RequestId {
 /// (`Detached`).
 pub const detach_safe = true;
 
-pub fn execute(self: *const RequestId, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const RequestId, req: *Request, res: *Response, next: anytype) !void {
     req.id = if (self.trust_incoming) incoming(req, self.header) orelse try generate(req) else try generate(req);
     try res.header(self.header, req.id);
-    return executor.next();
+    return next.call();
 }
 
 /// An incoming ID worth keeping: one that `validIncoming` accepts.

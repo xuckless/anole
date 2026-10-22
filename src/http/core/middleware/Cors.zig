@@ -97,7 +97,7 @@ pub fn init(config: Options) Cors {
 /// (`Detached`).
 pub const detach_safe = true;
 
-pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const Cors, req: *Request, res: *Response, next: anytype) !void {
     const origin = req.headers.get("Origin");
     const preflight = req.method == .options and origin != null and
         req.headers.get("Access-Control-Request-Method") != null;
@@ -106,7 +106,7 @@ pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anyty
 
     if (!preflight) {
         if (allowed and origin != null) if (self.expose) |expose| try res.header("Access-Control-Expose-Headers", expose);
-        return executor.next();
+        return next.call();
     }
 
     // A preflight is answered here, allowed or not: no route serves it. An

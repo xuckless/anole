@@ -12,7 +12,7 @@
 //! Only some requests can detach (`Response.canDetach`): the engine must
 //! support it (HTTP/2 and HTTP/3 on the reader; never HTTP/1.1, whose
 //! connection task is the request's), and every middleware the request
-//! passed must be detach-safe: one that does work after `executor.next()`
+//! passed must be detach-safe: one that does work after `next.call()`
 //! returns would do it on the unanswered response. A middleware says it is
 //! safe with `pub const detach_safe = true;`, either because it does
 //! nothing after `next()` or because it moves that work into `onFinish`

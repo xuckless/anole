@@ -55,9 +55,9 @@ const Handlers = struct {
 };
 
 const Tenant = struct {
-    pub fn execute(_: *const Tenant, req: *http.Request, _: *http.Response, executor: anytype) !void {
+    pub fn execute(_: *const Tenant, req: *http.Request, _: *http.Response, next: anytype) !void {
         try req.setLocal("tenant", @as([]const u8, "acme"));
-        return executor.next();
+        return next.call();
     }
 };
 

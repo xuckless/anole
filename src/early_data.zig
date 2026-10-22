@@ -47,9 +47,9 @@ pub const Guard = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
-    pub fn execute(_: *const Guard, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    pub fn execute(_: *const Guard, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         if (isEarly(req) and !isSafe(req.method)) return tooEarly(res);
-        return executor.next();
+        return next.call();
     }
 };
 
@@ -61,9 +61,9 @@ pub const TooEarly = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
-    pub fn execute(_: *const TooEarly, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    pub fn execute(_: *const TooEarly, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         if (isEarly(req)) return tooEarly(res);
-        return executor.next();
+        return next.call();
     }
 };
 

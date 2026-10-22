@@ -30,10 +30,10 @@ const FakeSession = struct {
     after: *[64]u8,
     after_len: *usize,
 
-    pub fn execute(self: *const FakeSession, req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+    pub fn execute(self: *const FakeSession, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         try req.session.set("user", "from-session");
         req.session.modified = false;
-        try executor.next();
+        try next.call();
         const v = req.session.get("user") orelse "(none)";
         @memcpy(self.after[0..v.len], v);
         self.after_len.* = v.len;

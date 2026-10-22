@@ -20,7 +20,7 @@ pub const MiddlewareConfig = struct {
 };
 
 /// A middleware as the router holds it: a pointer to a value with
-/// `execute(self, req, res, executor) !void` (and optionally `deinit`),
+/// `execute(self, req, res, next) !void` (and optionally `deinit`),
 /// for a server whose state is `Ctx`. `init(&value)` wraps one the caller
 /// keeps alive; `app.use` and `app.middleware` copy and own it instead.
 pub fn Middleware(comptime Ctx: type) type {
@@ -32,11 +32,11 @@ pub fn Middleware(comptime Ctx: type) type {
             ptr: *anyopaque,
             req: *Request,
             res: *Response,
-            executor: *Executor(Ctx),
+            next: *Chain(Ctx),
         ) anyerror!void,
         deinitFn: ?*const fn (ptr: *anyopaque) void,
         /// The middleware declares `pub const detach_safe = true`: it does
-        /// nothing after `next()`, or puts that work off with
+        /// nothing after `next.call()`, or puts that work off with
         /// `Response.onFinish` when the response is detached (see
         /// `Detached`). A request that passes one that is not cannot detach.
         detach_safe: bool = false,
@@ -48,9 +48,9 @@ pub fn Middleware(comptime Ctx: type) type {
             const Impl = @typeInfo(Ptr).pointer.child;
 
             const gen = struct {
-                fn execute(ptr: *anyopaque, req: *Request, res: *Response, executor: *Executor(Ctx)) anyerror!void {
+                fn execute(ptr: *anyopaque, req: *Request, res: *Response, next: *Chain(Ctx)) anyerror!void {
                     const self: Ptr = @ptrCast(@alignCast(ptr));
-                    return self.execute(req, res, executor);
+                    return self.execute(req, res, next);
                 }
 
                 fn deinit(ptr: *anyopaque) void {
@@ -68,8 +68,8 @@ pub fn Middleware(comptime Ctx: type) type {
         }
 
         /// Runs the middleware.
-        pub fn execute(self: Self, req: *Request, res: *Response, executor: *Executor(Ctx)) !void {
-            return self.executeFn(self.ptr, req, res, executor);
+        pub fn execute(self: Self, req: *Request, res: *Response, next: *Chain(Ctx)) !void {
+            return self.executeFn(self.ptr, req, res, next);
         }
 
         /// Calls the value's `deinit`, if it has one.
@@ -81,9 +81,9 @@ pub fn Middleware(comptime Ctx: type) type {
     };
 }
 
-/// What a middleware's `execute` gets as `executor`: `executor.next()`
-/// runs the rest of the chain, and `executor.ctx` is the server's state.
-pub fn Executor(comptime Ctx: type) type {
+/// What a middleware's `execute` gets as `next`: `next.call()` runs the
+/// rest of the chain, and `next.ctx` is the server's state.
+pub fn Chain(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
@@ -103,7 +103,7 @@ pub fn Executor(comptime Ctx: type) type {
 
         /// Runs the chain from the start. Called by the router.
         pub fn run(self: *Self) !void {
-            self.next() catch |err| switch (err) {
+            self.call() catch |err| switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
                 error.ReadFailed, error.WriteFailed, error.Canceled => return err,
@@ -147,7 +147,7 @@ pub fn Executor(comptime Ctx: type) type {
         /// Runs the next middleware, or the handler after the last one;
         /// a middleware that does not call it ends the request with what
         /// it put in the response.
-        pub fn next(self: *Self) anyerror!void {
+        pub fn call(self: *Self) anyerror!void {
             if (self.index < self.middlewares.len) {
                 const mw = self.middlewares[self.index];
                 self.index += 1;
@@ -386,11 +386,11 @@ const TestMiddleware = struct {
     tracker: *CallTracker,
     id: u8,
 
-    pub fn execute(self: *const TestMiddleware, req: *Request, res: *Response, executor: *Executor(void)) !void {
+    pub fn execute(self: *const TestMiddleware, req: *Request, res: *Response, next: *Chain(void)) !void {
         _ = req;
         _ = res;
         self.tracker.append(self.id);
-        return executor.next();
+        return next.call();
     }
 };
 
@@ -398,12 +398,12 @@ const ShortCircuitMiddleware = struct {
     tracker: *CallTracker,
     id: u8,
 
-    pub fn execute(self: *const ShortCircuitMiddleware, req: *Request, res: *Response, executor: *Executor(void)) !void {
+    pub fn execute(self: *const ShortCircuitMiddleware, req: *Request, res: *Response, next: *Chain(void)) !void {
         _ = req;
-        _ = executor;
+        _ = next;
         self.tracker.append(self.id);
         res.body = "short-circuited";
-        // Don't call executor.next() - short circuit
+        // Don't call next.call() - short circuit
     }
 };
 
@@ -443,7 +443,7 @@ test "Middleware: single middleware executes before handler" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -451,7 +451,7 @@ test "Middleware: single middleware executes before handler" {
         .middlewares = &middlewares,
     };
 
-    try executor.next();
+    try next.call();
 
     try std.testing.expectEqual(1, tracker.len);
     try std.testing.expectEqual(1, tracker.items()[0]);
@@ -476,7 +476,7 @@ test "Middleware: multiple middlewares execute in order" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -484,7 +484,7 @@ test "Middleware: multiple middlewares execute in order" {
         .middlewares = &middlewares,
     };
 
-    try executor.next();
+    try next.call();
 
     try std.testing.expectEqual(3, tracker.len);
     try std.testing.expectEqual(1, tracker.items()[0]);
@@ -511,7 +511,7 @@ test "Middleware: short-circuit prevents handler execution" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -519,7 +519,7 @@ test "Middleware: short-circuit prevents handler execution" {
         .middlewares = &middlewares,
     };
 
-    try executor.next();
+    try next.call();
 
     // mw1 runs, mw2 short-circuits, mw3 and handler don't run
     try std.testing.expectEqual(2, tracker.len);
@@ -534,7 +534,7 @@ test "Middleware: no middlewares calls handler directly" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -542,7 +542,7 @@ test "Middleware: no middlewares calls handler directly" {
         .middlewares = &.{},
     };
 
-    try executor.next();
+    try next.call();
 
     try std.testing.expectEqualStrings("handler called", res.body);
 }
@@ -553,7 +553,7 @@ test "Executor: a handler returning NotFound gets the 404" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -566,7 +566,7 @@ test "Executor: a handler returning NotFound gets the 404" {
         .middlewares = &.{},
     };
 
-    try executor.run();
+    try chain.run();
 
     try std.testing.expectEqual(.not_found, res.status);
     try std.testing.expectEqualStrings("404 Not Found\n", res.body);
@@ -582,7 +582,7 @@ test "Middleware: no action returns 404" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -590,7 +590,7 @@ test "Middleware: no action returns 404" {
         .middlewares = &middlewares,
     };
 
-    try executor.next();
+    try next.call();
 
     try std.testing.expectEqual(1, tracker.len);
     try std.testing.expectEqual(.not_found, res.status);
@@ -607,7 +607,7 @@ test "Executor: default 500 handler on action error" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -615,7 +615,7 @@ test "Executor: default 500 handler on action error" {
         .middlewares = &.{},
     };
 
-    executor.run() catch {};
+    chain.run() catch {};
 
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
@@ -631,7 +631,7 @@ test "Executor: a departed peer is not the handler's fault" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -644,7 +644,7 @@ test "Executor: a departed peer is not the handler's fault" {
 
     // Propagated rather than turned into a 500: there is nothing left to
     // write one to, and the handler did nothing wrong.
-    try std.testing.expectError(error.ConnectionResetByPeer, executor.run());
+    try std.testing.expectError(error.ConnectionResetByPeer, chain.run());
     try std.testing.expectEqual(.ok, res.status);
 }
 
@@ -654,7 +654,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -664,7 +664,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
 
     // Nothing failed on this connection, so the error came from elsewhere:
     // a file, an upstream call, a std helper at the end of the body.
-    executor.run() catch {};
+    chain.run() catch {};
     try std.testing.expectEqual(.internal_server_error, res.status);
 }
 
@@ -677,7 +677,7 @@ test "Executor: error after headers written propagates instead of rewriting the 
     // or a WebSocket upgrade) before the handler failed.
     res.headers_written = true;
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -685,7 +685,7 @@ test "Executor: error after headers written propagates instead of rewriting the 
         .middlewares = &.{},
     };
 
-    try std.testing.expectError(error.TestError, executor.run());
+    try std.testing.expectError(error.TestError, chain.run());
 
     // handleError() must not run: the already-sent headers can't be undone,
     // so status/body are left untouched rather than rewritten to a 500.
@@ -729,7 +729,7 @@ fn customCtxErrorHandler(_: *CustomCtx, _: *Request, _: *Response) !void {
 }
 
 const ErrorMiddleware = struct {
-    pub fn execute(_: *const ErrorMiddleware, _: *Request, _: *Response, _: *Executor(CustomCtx)) !void {
+    pub fn execute(_: *const ErrorMiddleware, _: *Request, _: *Response, _: *Chain(CustomCtx)) !void {
         return error.MiddlewareError;
     }
 };
@@ -741,7 +741,7 @@ test "Executor: custom notFound handler" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(CustomCtx){
+    var chain = Chain(CustomCtx){
         .req = &req,
         .res = &res,
         .ctx = &ctx,
@@ -749,7 +749,7 @@ test "Executor: custom notFound handler" {
         .middlewares = &.{},
     };
 
-    executor.run() catch {};
+    chain.run() catch {};
 
     try std.testing.expect(ctx.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
@@ -763,7 +763,7 @@ test "Executor: custom uncaughtError handler" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(CustomCtx){
+    var chain = Chain(CustomCtx){
         .req = &req,
         .res = &res,
         .ctx = &ctx,
@@ -771,7 +771,7 @@ test "Executor: custom uncaughtError handler" {
         .middlewares = &.{},
     };
 
-    executor.run() catch {};
+    chain.run() catch {};
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.CustomError, ctx.last_error.?);
@@ -786,7 +786,7 @@ test "Executor: custom dispatch method" {
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(CustomCtx){
+    var chain = Chain(CustomCtx){
         .req = &req,
         .res = &res,
         .ctx = &ctx,
@@ -794,7 +794,7 @@ test "Executor: custom dispatch method" {
         .middlewares = &.{},
     };
 
-    try executor.run();
+    try chain.run();
 
     try std.testing.expect(ctx.dispatch_called);
     try std.testing.expectEqualStrings("custom handler", res.body);
@@ -810,7 +810,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
     var mw = ErrorMiddleware{};
     const middlewares = [_]Middleware(CustomCtx){Middleware(CustomCtx).init(&mw)};
 
-    var executor = Executor(CustomCtx){
+    var chain = Chain(CustomCtx){
         .req = &req,
         .res = &res,
         .ctx = &ctx,
@@ -818,7 +818,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
         .middlewares = &middlewares,
     };
 
-    executor.run() catch {};
+    chain.run() catch {};
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);
@@ -838,7 +838,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
     var res = try Response.init(arena.allocator(), &connection, 32);
 
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
@@ -856,7 +856,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
         .middlewares = &.{},
     };
 
-    try executor.run();
+    try chain.run();
     try std.testing.expectEqual(.internal_server_error, res.status);
 
     try res.write();
@@ -867,12 +867,12 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
 }
 
 const WritingMiddleware = struct {
-    pub fn execute(_: *const WritingMiddleware, _: *Request, res: *Response, executor: *Executor(void)) !void {
+    pub fn execute(_: *const WritingMiddleware, _: *Request, res: *Response, next: *Chain(void)) !void {
         res.content_type = .json;
         var body = res.writer();
         try body.interface.writeAll("{\"half\":");
         try body.interface.flush();
-        return executor.next();
+        return next.call();
     }
 };
 
@@ -890,16 +890,16 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
 
     var mw = WritingMiddleware{};
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
-    var executor = Executor(void){
+    var chain = Chain(void){
         .req = &req,
         .res = &res,
         .ctx = {},
-        // No route matched, so the executor falls through to the 404.
+        // No route matched, so the chain falls through to the 404.
         .action = null,
         .middlewares = &middlewares,
     };
 
-    try executor.run();
+    try chain.run();
     try std.testing.expectEqual(.not_found, res.status);
 
     try res.write();

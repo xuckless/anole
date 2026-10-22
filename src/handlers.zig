@@ -105,12 +105,12 @@ pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
 /// calling it ends the request with whatever the middleware put in the
 /// response.
 pub const Next = struct {
-    executor: *anyopaque,
-    next_fn: *const fn (executor: *anyopaque) anyerror!void,
+    chain: *anyopaque,
+    next_fn: *const fn (chain: *anyopaque) anyerror!void,
 
     /// Runs the rest of the chain and returns its error, if any.
     pub fn call(self: Next) anyerror!void {
-        return self.next_fn(self.executor);
+        return self.next_fn(self.chain);
     }
 };
 
@@ -131,15 +131,15 @@ pub fn Func(comptime f: anytype) type {
         // Not zero-sized: the server keeps a pointer to its copy.
         _: u8 = 0,
 
-        pub fn execute(_: *const @This(), req: *dusty.Request, res: *dusty.Response, executor: anytype) anyerror!void {
-            const E = @TypeOf(executor);
-            const next: Next = .{ .executor = executor, .next_fn = struct {
-                fn next(p: *anyopaque) anyerror!void {
+        pub fn execute(_: *const @This(), req: *dusty.Request, res: *dusty.Response, chain: anytype) anyerror!void {
+            const E = @TypeOf(chain);
+            const next: Next = .{ .chain = chain, .next_fn = struct {
+                fn call(p: *anyopaque) anyerror!void {
                     const e: E = @ptrCast(@alignCast(p));
-                    return e.next();
+                    return e.call();
                 }
-            }.next };
-            if (params.len == 4) return f(executor.ctx, req, res, next);
+            }.call };
+            if (params.len == 4) return f(chain.ctx, req, res, next);
             return f(req, res, next);
         }
     };
