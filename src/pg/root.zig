@@ -1368,7 +1368,10 @@ fn decodeTime(data: []const u8, type_oid: i32) !db.Time {
             const days = std.mem.readInt(i32, data[0..4], .big);
             if (days == std.math.maxInt(i32)) return .{ .us = std.math.maxInt(i64) };
             if (days == std.math.minInt(i32)) return .{ .us = std.math.minInt(i64) };
-            return .{ .us = @as(i64, days) * std.time.us_per_day + y2k_us };
+            // A date can lie far beyond what microseconds since 1970 hold
+            // (PostgreSQL's dates reach the year 5874897).
+            const us = std.math.mul(i64, days, std.time.us_per_day) catch return error.OutOfRange;
+            return .{ .us = std.math.add(i64, us, y2k_us) catch return error.OutOfRange };
         },
         // text, as SQLite and hand-written SQL give it
         Oid.text, 1043, 705 => return db.Time.parse(data) catch error.InvalidType,
@@ -1624,6 +1627,11 @@ test "pg: column values into Zig types" {
     const infinity = std.mem.toBytes(std.mem.nativeToBig(i64, std.math.maxInt(i64)));
     try testing.expectEqual(std.math.maxInt(i64), (try decode(db.Time, V.of(&infinity), Oid.timestamp, arena)).us);
     try testing.expectError(error.InvalidType, decode(db.Time, V.of(&int4), Oid.int4, arena));
+    // A date beyond what anole.db.Time holds (the year 300000): an error, not a crash.
+    const far = std.mem.toBytes(std.mem.nativeToBig(i32, 109_000_000));
+    try testing.expectError(error.OutOfRange, decode(db.Time, V.of(&far), Oid.date, arena));
+    const far_back = std.mem.toBytes(std.mem.nativeToBig(i32, -109_000_000));
+    try testing.expectError(error.OutOfRange, decode(db.Time, V.of(&far_back), Oid.date, arena));
 
     // Text: copied, so the row's buffer can go; uuid as its text, jsonb
     // without its version byte; numbers refused.

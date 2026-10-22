@@ -1387,10 +1387,16 @@ fn decodeValue(comptime F: type, stmt: *c.sqlite3_stmt, col: c_int, arena: std.m
     }
     if (F == db.Time) {
         switch (kind) {
-            c.SQLITE_INTEGER => return db.Time.fromSeconds(c.sqlite3_column_int64(stmt, col)),
+            c.SQLITE_INTEGER => {
+                const v = c.sqlite3_column_int64(stmt, col);
+                return db.Time.fromSecondsChecked(v) catch return f.ours(.other, "column \"{s}\": {d} seconds is beyond what anole.db.Time holds", .{ field, v });
+            },
             // A Julian day number (`julianday()`), to the millisecond as
             // SQLite keeps it.
-            c.SQLITE_FLOAT => return db.Time.fromMillis(@intFromFloat(@round((c.sqlite3_column_double(stmt, col) - 2440587.5) * 86400e3))),
+            c.SQLITE_FLOAT => {
+                const v = c.sqlite3_column_double(stmt, col);
+                return db.Time.fromJulianDay(v) catch return f.ours(.other, "column \"{s}\": the Julian day {d} is beyond what anole.db.Time holds", .{ field, v });
+            },
             else => {
                 const text = columnBytes(stmt, col, kind);
                 return db.Time.parse(text) catch return f.ours(.other, "column \"{s}\": \"{s}\" is not a time", .{ field, text });
