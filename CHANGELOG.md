@@ -11,6 +11,11 @@ breaking changes are listed anyway.
   of an integer field (such as `9223372036854775808.0` for an `i64`) is
   refused as `error.Overflow` (400 from `readBody`) instead of stopping the
   process. No configuration change.
+- `anole.json.parse`: input nested deeper than the new
+  `ParseOptions.max_depth` (128) fails with `error.NestingTooDeep`, which
+  only a type that contains itself can reach, and `YYJSON_READ_INSITU` in
+  `ParseOptions.flags` is ignored (the input is read-only). `json.Error`
+  gains `NestingTooDeep` (breaking for exhaustive switches).
 
 ### C ABI (ABI 0.1)
 

@@ -26,7 +26,13 @@ pub const ParseOptions = struct {
     /// Object keys with no field are skipped; false makes them an error.
     ignore_unknown_fields: bool = true,
     /// yyjson read flags (`YYJSON_READ_*`), e.g. to allow comments.
+    /// `YYJSON_READ_INSITU` is ignored: the input is read-only and not
+    /// padded as in-place parsing needs.
     flags: u32 = 0,
+    /// The deepest nesting of arrays and objects mapped onto the type;
+    /// deeper input fails with `error.NestingTooDeep`. Only a type that
+    /// contains itself (a tree) can reach it.
+    max_depth: u32 = 128,
 };
 
 /// How `stringify` (and `respond`) writes a value.
@@ -52,6 +58,8 @@ pub const Error = error{
     Overflow,
     /// A string that names no tag of the enum.
     InvalidEnumTag,
+    /// Arrays and objects nested deeper than `ParseOptions.max_depth`.
+    NestingTooDeep,
     OutOfMemory,
 };
 
@@ -83,22 +91,27 @@ fn alcFree(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {}
 pub fn parse(comptime T: type, arena: std.mem.Allocator, input: []const u8, options: ParseOptions) Error!T {
     const alc = alcFor(&arena);
     var err: c.yyjson_read_err = undefined;
-    const doc = c.yyjson_read_opts(@constCast(input.ptr), input.len, options.flags, &alc, &err) orelse {
+    // In-place parsing would write into `input`.
+    const flags = options.flags & ~@as(u32, c.YYJSON_READ_INSITU);
+    const doc = c.yyjson_read_opts(@constCast(input.ptr), input.len, flags, &alc, &err) orelse {
         return if (err.code == c.YYJSON_READ_ERROR_MEMORY_ALLOCATION) error.OutOfMemory else error.SyntaxError;
     };
-    return fromValue(T, arena, c.yyjson_doc_get_root(doc), options);
+    return fromValue(T, arena, c.yyjson_doc_get_root(doc), options, 0);
 }
 
 fn typeOf(v: ?*c.yyjson_val) u8 {
     return @intCast(c.yyjson_get_type(v));
 }
 
-fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, options: ParseOptions) Error!T {
+fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, options: ParseOptions, depth: u32) Error!T {
     const t = typeOf(v);
+    if (t == c.YYJSON_TYPE_ARR or t == c.YYJSON_TYPE_OBJ) {
+        if (depth >= options.max_depth) return error.NestingTooDeep;
+    }
     switch (@typeInfo(T)) {
         .optional => |o| {
             if (t == c.YYJSON_TYPE_NULL) return null;
-            return try fromValue(o.child, arena, v, options);
+            return try fromValue(o.child, arena, v, options, depth);
         },
         .bool => {
             if (t != c.YYJSON_TYPE_BOOL) return error.UnexpectedType;
@@ -124,7 +137,7 @@ fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, opti
                 return std.meta.stringToEnum(T, name) orelse error.InvalidEnumTag;
             }
             if (t == c.YYJSON_TYPE_NUM) {
-                const n = try fromValue(e.tag_type, arena, v, options);
+                const n = try fromValue(e.tag_type, arena, v, options, depth);
                 return std.enums.fromInt(T, n) orelse error.InvalidEnumTag;
             }
             return error.UnexpectedType;
@@ -139,7 +152,7 @@ fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, opti
             const out = try arena.alloc(p.child, c.yyjson_arr_size(v));
             var it: c.yyjson_arr_iter = undefined;
             _ = c.yyjson_arr_iter_init(v, &it);
-            for (out) |*slot| slot.* = try fromValue(p.child, arena, c.yyjson_arr_iter_next(&it), options);
+            for (out) |*slot| slot.* = try fromValue(p.child, arena, c.yyjson_arr_iter_next(&it), options, depth + 1);
             return out;
         },
         .array => |a| {
@@ -147,7 +160,7 @@ fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, opti
             var out: T = undefined;
             var it: c.yyjson_arr_iter = undefined;
             _ = c.yyjson_arr_iter_init(v, &it);
-            for (&out) |*slot| slot.* = try fromValue(a.child, arena, c.yyjson_arr_iter_next(&it), options);
+            for (&out) |*slot| slot.* = try fromValue(a.child, arena, c.yyjson_arr_iter_next(&it), options, depth + 1);
             return out;
         },
         .@"struct" => |s| {
@@ -156,7 +169,7 @@ fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, opti
             inline for (s.field_names, s.field_types, s.field_attrs) |name, F, attrs| {
                 const field = c.yyjson_obj_getn(v, name.ptr, name.len);
                 if (field != null) {
-                    @field(out, name) = try fromValue(F, arena, field, options);
+                    @field(out, name) = try fromValue(F, arena, field, options, depth + 1);
                 } else if (comptime attrs.defaultValue(F)) |d| {
                     @field(out, name) = d;
                 } else if (@typeInfo(F) == .optional) {
@@ -319,6 +332,26 @@ test "parse: a whole float at the edge of an integer type's range" {
     try std.testing.expectEqual(@as(u64, 18446744073709549568), try parse(u64, arena, "18446744073709549568.0", .{}));
     try std.testing.expectEqual(@as(u8, 255), try parse(u8, arena, "255.0", .{}));
     try std.testing.expectEqual(@as(i8, -128), try parse(i8, arena, "-128.0", .{}));
+}
+
+test "parse: a type that contains itself nests at most max_depth deep" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Tree = struct { children: []const @This() = &.{} };
+    const deep = 100_000;
+    var text: std.ArrayList(u8) = .empty;
+    for (0..deep) |_| try text.appendSlice(arena, "{\"children\":[");
+    for (0..deep) |_| try text.appendSlice(arena, "]}");
+    try std.testing.expectError(error.NestingTooDeep, parse(Tree, arena, text.items, .{}));
+    // Within the limit (128 arrays and objects by default) it maps.
+    text.clearRetainingCapacity();
+    for (0..63) |_| try text.appendSlice(arena, "{\"children\":[");
+    try text.appendSlice(arena, "{}");
+    for (0..63) |_| try text.appendSlice(arena, "]}");
+    _ = try parse(Tree, arena, text.items, .{});
+    // In-place parsing is not used, so a read-only input is fine.
+    _ = try parse(Tree, arena, "{\"children\":[{}]}", .{ .flags = c.YYJSON_READ_INSITU });
 }
 
 test "readBody: bind's contract, answered 400 by the server" {
