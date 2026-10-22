@@ -38,9 +38,10 @@
 //!   (`require_auth=md5` allows it). SCRAM binds the login to the TLS
 //!   connection when the server offers it (`channel_binding=prefer`;
 //!   `require` insists).
-//! - Sessions: a connection going back to the pool is reset (what `SET`,
-//!   `set_config(..., false)`, `SET ROLE` and temporary tables left), with
-//!   no extra round trip; `Options.reset_session = false` turns it off.
+//! - Sessions: a connection going back to the pool is reset when what it
+//!   ran may have changed its session (what `SET`, `set_config(..., false)`,
+//!   `SET ROLE`, temporary tables, advisory locks or `LISTEN` left), with no
+//!   extra round trip; `Options.reset_session` (`.auto`, `.always`, `.off`).
 //! - Pools: `max_connections` split between the executors; a connection
 //!   opens when a call first needs one.
 //! - Statements: each connection prepares a statement the first time it
@@ -138,15 +139,39 @@ pub const Options = struct {
     /// Where `DATABASE_URL` and the `PG*` variables come from; null: the
     /// process's environment (`app.postgres` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
-    /// Reset each connection's session when it goes back to the pool
-    /// (`DISCARD ALL` but for the prepared statements): what one call left
-    /// with `SET`, `set_config(..., false)`, `SET ROLE`, temporary tables or
-    /// advisory locks is gone before the next call gets the connection. The
-    /// reset is sent on release and its answer read with the next call's,
-    /// so it costs the server a little work but no round trip. Off: only
-    /// `SET LOCAL` (or `set_config(..., true)`) inside a transaction is safe,
-    /// since the next call on the connection may be another user's.
-    reset_session: bool = true,
+    /// What happens to a connection's session when it goes back to the
+    /// pool, so that what one call left with `SET`, `set_config(...,
+    /// false)`, `SET ROLE`, temporary tables, advisory locks, `LISTEN` or
+    /// cursors `WITH HOLD` is gone before the next call gets the
+    /// connection. A reset is sent on release and its answer read with the
+    /// next call's, so it costs the server a little work but no round
+    /// trip. A connection given back inside a transaction is closed.
+    reset_session: ResetSession = .auto,
+
+    pub const ResetSession = enum {
+        /// Reset a connection only when what it ran may have changed its
+        /// session, with just the statements that undo it. Judged from the
+        /// SQL text (strings, quoted names and comments skipped): `SET`
+        /// but `SET LOCAL`, `RESET`, `set_config` without a literal `true`,
+        /// `SET ROLE`/`SESSION AUTHORIZATION`, `CREATE TEMP` and `pg_temp`,
+        /// `pg_advisory_lock` (not the `_xact_` ones), `LISTEN`, `DECLARE
+        /// ... WITH HOLD`, `nextval`/`setval` and `INSERT`/`MERGE`/`COPY`
+        /// (`lastval()`), `DO` and `CALL` (the full reset); and from the
+        /// settings the server reports changed (`TimeZone`, `DateStyle`,
+        /// `application_name`...). `PREPARE`, `DEALLOCATE`, `DISCARD ALL`
+        /// and `LOAD` close the connection instead. The limit: what a
+        /// server-side function does is not in the SQL, so `SELECT
+        /// my_function()` that runs `set_config(..., false)` or `SET ROLE`
+        /// inside leaves it for the next call; use `.always` then.
+        auto,
+        /// Reset on every release (`DISCARD ALL` but for the prepared
+        /// statements and `UNLISTEN`).
+        always,
+        /// No reset: only `SET LOCAL` (or `set_config(..., true)`) inside a
+        /// transaction is safe, since the next call on the connection may
+        /// be another user's.
+        off,
+    };
 
     /// Certificates beyond what the URL names (`Options.tls`).
     pub const Tls = struct {
@@ -559,7 +584,11 @@ pub const Client = struct {
             .connect_on_init_count = 0,
             .max_lifetime = if (opts.max_lifetime) |d| millis(d) else null,
             .idle_timeout = if (opts.idle_timeout) |d| millis(d) else null,
-            .reset = if (opts.reset_session) pg.Pool.reset_sql else null,
+            .reset = switch (opts.reset_session) {
+                .auto => .auto,
+                .always => .{ .always = pg.Pool.reset_sql },
+                .off => .off,
+            },
         };
 
         self.pools = try .init(gpa, io);

@@ -1118,9 +1118,13 @@
           ]
         },
         "reset_session": {
-          "type": "boolean",
-          "default": true,
-          "description": "Reset each connection's session when a query gives it back."
+          "enum": [
+            "auto",
+            "always",
+            "off"
+          ],
+          "default": "auto",
+          "description": "What happens to a connection's session when a query gives it back: \"auto\" resets it when what the query ran may have changed it, \"always\" on every release, \"off\" never."
         },
         "init": {
           "anyOf": [

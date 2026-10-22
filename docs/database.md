@@ -291,15 +291,43 @@ try tx.commit(req); // under the request's deadline, like every call
   not cover; `conn.release()` gives it back. `app.db.listener()` opens a
   connection for `LISTEN`/`NOTIFY` (channel names up to 63 bytes,
   PostgreSQL's limit).
-- **Session state.** A connection going back to the pool is reset: what a
-  call left with `SET`, `set_config(..., false)`, `SET ROLE`, `SET SESSION
-  AUTHORIZATION`, temporary tables, cursors or advisory locks is gone
-  before another request gets it. The reset is sent with the release and
-  its answer read with the next call's, so it adds no round trip, only a
-  little work on the server. `Options.reset_session = false` turns it off;
-  then set per-request state only with `SET LOCAL` (or `set_config(...,
-  true)`) inside a transaction, since the next call on that connection may
-  be another user's.
+- **Session state.** What a call left in its connection's session with
+  `SET`, `set_config(..., false)`, `SET ROLE`, `SET SESSION
+  AUTHORIZATION`, temporary tables, cursors `WITH HOLD`, advisory locks or
+  `LISTEN` is gone before another request gets the connection. A
+  connection given back inside a transaction is closed, never handed on.
+  `Options.reset_session` says how:
+  - `.auto` (the default) resets a connection only when what it ran may
+    have changed its session, and then sends only the statements that undo
+    it, so the plain reads and writes most requests make cost nothing.
+    Anole judges from each statement's SQL (string literals, quoted names
+    and comments are skipped; this covers every verb, `acquire`'s raw
+    connection and the C ABI): `SET` but `SET LOCAL`, `RESET`,
+    `set_config` without a literal `true` as its third argument, `CREATE
+    TEMP` and anything in `pg_temp`, `pg_advisory_lock` and
+    `pg_try_advisory_lock` (not the `_xact_` ones), `LISTEN`, `DECLARE ...
+    WITH HOLD`, and `nextval`, `setval`, `INSERT`, `MERGE` and `COPY`
+    (which may leave `lastval()` behind); `DO` and `CALL` get the full
+    reset. A setting the server reports changed (`TimeZone`, `DateStyle`,
+    `application_name`, `is_superuser`...) counts too, wherever it was
+    changed. `PREPARE`, `DEALLOCATE`, `DISCARD ALL` and `LOAD` close the
+    connection rather than reset it.
+  - `.always` sends the full reset (`DISCARD ALL` but for the prepared
+    statements and `UNLISTEN`) on every release.
+  - `.off` sends none; then set per-request state only with `SET LOCAL`
+    (or `set_config(..., true)`) inside a transaction, since the next call
+    on that connection may be another user's.
+
+  Either reset is sent with the release and its answer read with the next
+  call's, so it adds no round trip, only work on the server: `.always`
+  cost about a fifth of the requests per second on a read-heavy benchmark
+  (pooled single-row reads, 1024 connections), which `.auto` doesn't pay.
+  The limit of `.auto`: what a server-side function or trigger does is not
+  in the statement's text, so `SELECT my_function()` whose body runs
+  `set_config(..., false)`, `SET ROLE` or `CREATE TEMP TABLE` leaves that
+  for the next request (a changed `TimeZone` or role is still caught,
+  since the server reports it). If your functions change session state,
+  use `.always`.
 
 ### Observability
 

@@ -115,7 +115,9 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
         .tls = .{ .ca = if (p.ca_file) |f| .{ .file = .{ .path = f } } else if (p.ca_pem) |pem| .{ .pem = pem } else null },
         .connect_at_start = p.connect_at_start,
         .application_name = p.application_name,
-        .reset_session = p.reset_session,
+        .reset_session = switch (p.reset_session) {
+            inline else => |t| @field(anole.pg.Options.ResetSession, @tagName(t)),
+        },
         .cache = .{
             .max_entries = d.config.cache.max_entries,
             .max_bytes = std.math.cast(usize, d.config.cache.max_bytes) orelse std.math.maxInt(usize),
