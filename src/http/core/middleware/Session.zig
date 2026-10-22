@@ -95,7 +95,9 @@ pub const Config = struct {
     /// of zeros, with `error.WeakSessionKey`.
     secret_key: []const u8,
     /// Also signed into the cookie: a cookie signed under one name is no
-    /// session under another.
+    /// session under another. Over HTTPS, a `__Host-` name (`__Host-session`)
+    /// keeps the cookie to this host and path `/`, so a sibling subdomain
+    /// cannot set or shadow it.
     cookie_name: []const u8 = "session",
     /// How long the cookie lasts, renewed on every response while the
     /// session has data; null for a browser-session cookie. It is also the
@@ -117,12 +119,19 @@ const Session = @This();
 
 /// The middleware: `app.use(try anole.http.middleware.Session.init(.{ .secret_key = key }))`.
 /// Fails with `error.WeakSessionKey` (and logs it) when the key is shorter
-/// than 32 bytes or all zeros: such cookies could be forged.
-pub fn init(config: Config) error{WeakSessionKey}!Session {
+/// than 32 bytes or all zeros: such cookies could be forged. Fails with
+/// `error.CookiePrefixMismatch` when a `__Host-` or `__Secure-` cookie name
+/// asks for attributes `cookie_opts` does not give: browsers would drop
+/// the cookie.
+pub fn init(config: Config) error{ WeakSessionKey, CookiePrefixMismatch }!Session {
     if (!strongKey(config.secret_key)) {
         log.err("session: secret_key must be at least 32 random bytes from your secret store, not shorter and not all zeros", .{});
         return error.WeakSessionKey;
     }
+    config.cookie_opts.checkPrefix(config.cookie_name) catch |err| {
+        log.err("session: a __Host- cookie needs Secure, Path=/ and no Domain; a __Secure- one needs Secure", .{});
+        return err;
+    };
     return .{ .config = config };
 }
 

@@ -38,6 +38,11 @@ breaking changes are listed anyway.
   at most `max_entries` (100,000 by default, `MemoryStore.initOptions`);
   before, sessions created and never seen again (anonymous visitors, CSRF
   tokens on a login form) stayed in memory for good.
+- `anole.session.regenerate` also drops the session's CSRF token, so a
+  token from before a sign-in is not valid after it. Both session
+  middlewares refuse a `__Host-`/`__Secure-` cookie name that their
+  `cookie_opts` do not satisfy (`error.CookiePrefixMismatch`); docs/auth.md
+  recommends `__Host-anole_session` in production.
 
 ### C ABI (ABI 0.1)
 

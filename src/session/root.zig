@@ -338,7 +338,10 @@ pub const Config = struct {
     /// development only, `devKey(io)` makes a random one.
     key: ?[key_length]u8 = null,
     /// The cookie's name; also bound into the sealed cookie, so renaming
-    /// it ends every cookie-mode session.
+    /// it ends every cookie-mode session. Over HTTPS, a `__Host-` name
+    /// (`__Host-anole_session`) keeps the cookie to this host and path `/`,
+    /// so a sibling subdomain cannot set or shadow it; `init` checks that
+    /// `cookie_opts` allows it.
     cookie_name: []const u8 = "anole_session",
     /// How long a session lives without being touched; each response that
     /// carries it renews it.
@@ -353,6 +356,10 @@ pub const Config = struct {
 /// the save path takes it out first.
 pub const regenerate_key = "_anole_regenerate";
 
+/// Where `anole.auth.csrf` keeps the session's token; `regenerate` drops
+/// it, so a token handed out before a sign-in is not valid after.
+pub const csrf_key = "_csrf";
+
 /// Asks the session middleware to issue a new session id when it saves
 /// this response: call it when someone signs in (or their privileges
 /// change), against session fixation. With a store, the old id is
@@ -361,16 +368,24 @@ pub const regenerate_key = "_anole_regenerate";
 /// every save; an earlier copy of it stays valid until it expires, but
 /// holds only what the session held before.
 ///
+/// It also drops the session's CSRF token (`anole.auth.csrf`): the next
+/// `csrf.token(req)`, in this request or a later one, makes a new one.
+///
 /// It takes one of the session's 16 entries until the response is saved.
 pub fn regenerate(req: *dusty.Request) error{ SessionFull, InvalidSessionData }!void {
+    req.session.remove(csrf_key);
     try req.session.set(regenerate_key, "1");
 }
 
-/// What `Middleware.init` refuses: cookie mode without a usable key.
+/// What `Middleware.init` refuses: cookie mode without a usable key, and
+/// a cookie name whose prefix `cookie_opts` does not satisfy.
 pub const ConfigError = error{
     /// Cookie mode (no `Config.store`) with `Config.key` null or all
     /// zeros: such cookies could be forged and read by anyone.
     SessionKeyMissing,
+    /// A `__Host-` name without `Secure`, `Path=/` and no `Domain`, or a
+    /// `__Secure-` one without `Secure`: browsers would drop the cookie.
+    CookiePrefixMismatch,
 };
 
 /// The session middleware: `app.use(try anole.session.Middleware.init(config))`.
@@ -387,8 +402,14 @@ pub const Middleware = struct {
     /// (a logout elsewhere) stays destroyed.
     ///
     /// In cookie mode it fails with `error.SessionKeyMissing` (and logs
-    /// how to fix it) when `config.key` is null or all zeros.
+    /// how to fix it) when `config.key` is null or all zeros. It fails with
+    /// `error.CookiePrefixMismatch` for a `__Host-`/`__Secure-` name that
+    /// `cookie_opts` does not allow.
     pub fn init(config: Config) ConfigError!Middleware {
+        config.cookie_opts.checkPrefix(config.cookie_name) catch |err| {
+            log.err("anole.session: a __Host- cookie needs Secure, Path=/ and no Domain; a __Secure- one needs Secure", .{});
+            return err;
+        };
         if (config.store != null) return .{ .config = config, .key = @splat(0) };
         const key = cookieKey(config.key) orelse {
             log.err("anole.session: cookie sessions need Config.key, 32 random bytes (not all zeros) from your secret store and the same on every node " ++
@@ -670,6 +691,20 @@ test "MemoryStore: capped at max_entries, and update/touch never bring a session
     try std.testing.expect(!try s.update(arena, "a", "3", 3600));
     try std.testing.expect(!try s.touch(arena, "a", 3600));
     try std.testing.expect((try s.load(arena, "a")) == null);
+}
+
+test "regenerate drops the CSRF token, and __Host- names are checked" {
+    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    try req.session.set(csrf_key, "old-token");
+    try req.session.set("user", "alice");
+    try regenerate(&req);
+    try std.testing.expect(req.session.get(csrf_key) == null);
+    try std.testing.expectEqualStrings("alice", req.session.get("user").?);
+    // The defaults allow a __Host- name (the refusals are in cookie.zig's
+    // tests, without the error this would log).
+    _ = try Middleware.init(.{ .key = @splat(1), .cookie_name = "__Host-anole_session" });
+    const opts: CookieOpts = .{ .path = "/app" };
+    try std.testing.expectError(error.CookiePrefixMismatch, opts.checkPrefix("__Host-s"));
 }
 
 test "Config: setting one cookie_opts field keeps the secure defaults of the others" {

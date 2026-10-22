@@ -12,7 +12,7 @@ const std = @import("std");
 const dusty = @import("dusty");
 
 /// The session key the token is kept under.
-pub const session_key = "_csrf";
+pub const session_key = @import("../session/root.zig").csrf_key;
 /// The form field a urlencoded form sends the token back in.
 pub const field_name = "_csrf";
 /// The header a script sends the token back in.

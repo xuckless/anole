@@ -262,6 +262,11 @@ renewed by each response that carries the session) and `cookie_opts`
 (`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`; setting one field keeps
 the others' defaults). Chrome, Firefox and curl
 keep `Secure` cookies on `http://localhost`; anywhere else, serve over HTTPS.
+In production, name the cookie `__Host-anole_session` (`.cookie_name`): the
+browser then keeps it to this exact host and path `/`, so a sibling
+subdomain can't set or overwrite it. `init` refuses a `__Host-` name whose
+`cookie_opts` lack `Secure` or `Path=/`, or set a `Domain`
+(`error.CookiePrefixMismatch`).
 
 There are three ways to keep sessions:
 
@@ -328,6 +333,10 @@ A sealed cookie has no ID. `regenerate` makes the middleware seal it afresh
 stays valid until it expires, but it holds only what the session held
 before the sign-in, and nobody can forge one with a user in it without the
 key.
+
+`regenerate` also drops the session's CSRF token, so a token handed out
+before the sign-in is refused after it; the next `csrf.token(req)` makes a
+new one.
 
 `regenerate` uses one of the session's 16 entries, under
 `anole.session.regenerate_key`, until the response is saved. The middleware

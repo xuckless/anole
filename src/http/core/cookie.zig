@@ -135,6 +135,17 @@ pub const SessionCookieOpts = struct {
             .same_site = self.same_site,
         };
     }
+
+    /// What a cookie name's prefix requires (RFC 6265bis 4.1.3): `__Secure-`
+    /// needs `Secure`; `__Host-` needs `Secure`, `Path=/` and no `Domain`.
+    /// Browsers drop a cookie that breaks them.
+    pub fn checkPrefix(self: SessionCookieOpts, name: []const u8) error{CookiePrefixMismatch}!void {
+        if (std.mem.startsWith(u8, name, "__Host-")) {
+            if (!self.secure or !std.mem.eql(u8, self.path, "/") or self.domain.len != 0) return error.CookiePrefixMismatch;
+        } else if (std.mem.startsWith(u8, name, "__Secure-")) {
+            if (!self.secure) return error.CookiePrefixMismatch;
+        }
+    }
 };
 
 /// RFC 6265 cookie-name, which is a token: no separators and no controls.
@@ -383,4 +394,15 @@ test "serializeCookie: refuses a path or domain that would add attributes" {
     try std.testing.expectError(error.InvalidCookieDomain, serializeCookie(a, "a", "b", .{ .domain = "example.com; Secure" }));
     try std.testing.expectError(error.InvalidCookieDomain, serializeCookie(a, "a", "b", .{ .domain = "a\x7fb" }));
     try std.testing.expectEqualStrings("a=b; Path=/x; Domain=example.com", try serializeCookie(a, "a", "b", .{ .path = "/x", .domain = "example.com" }));
+}
+
+test "SessionCookieOpts.checkPrefix: __Host- and __Secure- names need what browsers require" {
+    const ok: SessionCookieOpts = .{};
+    try ok.checkPrefix("__Host-session");
+    try ok.checkPrefix("__Secure-session");
+    try ok.checkPrefix("session");
+    try std.testing.expectError(error.CookiePrefixMismatch, (SessionCookieOpts{ .secure = false }).checkPrefix("__Secure-s"));
+    try std.testing.expectError(error.CookiePrefixMismatch, (SessionCookieOpts{ .path = "/app" }).checkPrefix("__Host-s"));
+    try std.testing.expectError(error.CookiePrefixMismatch, (SessionCookieOpts{ .domain = "example.com" }).checkPrefix("__Host-s"));
+    try (SessionCookieOpts{ .path = "/app" }).checkPrefix("__Secure-s");
 }
