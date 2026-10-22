@@ -378,7 +378,10 @@ const Settings = struct {
         }
         const code_ca = opts.tls.ca != null;
         const insecure = opts.tls.insecure_skip_verify;
-        if (insecure and code_ca) return why.set("Options.tls.insecure_skip_verify cannot be set with Options.tls.ca: one checks the server's certificate and the other does not", .{});
+        if (insecure and code_ca) {
+            _ = why.set("Options.tls.insecure_skip_verify cannot be set with Options.tls.ca: one checks the server's certificate and the other does not", .{}) catch {};
+            return error.InvalidOptions;
+        }
         if (insecure and s.sslmode_set and (s.sslmode == .disable or s.sslmode.verifies())) return why.set("Options.tls.insecure_skip_verify asks for TLS without checking the certificate, but sslmode={t} does not; take sslmode out of the URL and PGSSLMODE, or set require", .{s.sslmode});
         // No sslmode given: the server's certificate is checked unless the
         // server is on this machine and the code gives no CA.
@@ -1828,6 +1831,13 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=" ++ mode, .tls = ca }, &cw));
         try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGSSLMODE=" ++ mode}), .tls = ca }, &cw));
     }
+
+    // insecure_skip_verify: TLS without checking; refused with a CA or with
+    // an sslmode that verifies or disables.
+    const skip: Options.Tls = .{ .insecure_skip_verify = true };
+    try testing.expectEqual(SslMode.require, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d", .tls = skip }, &cw)).sslmode);
+    try testing.expectError(error.InvalidOptions, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d", .tls = .{ .ca = .system, .insecure_skip_verify = true } }, &cw));
+    try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=verify-full", .tls = skip }, &cw));
 
     // No sslmode: verify-full for another host, prefer for this machine;
     // and the password goes in clear text or as MD5 only to a verified
