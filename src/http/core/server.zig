@@ -2101,6 +2101,10 @@ pub fn Server(comptime Ctx: type) type {
             // The PROXY protocol header comes first, ahead of TLS.
             var proxied: proxy_protocol.Header = .{};
             if (l.config.proxy_protocol) {
+                if (l.config.address == .ip and !proxy_protocol.trustedPeer(l.config.proxy_protocol_from, stream.socket.address)) {
+                    log.info("PROXY protocol: connection from {f} refused, not a trusted proxy", .{stream.socket.address});
+                    return .close;
+                }
                 defer timer.clear(self.io);
                 self.armDeadline(timer, earlier(
                     deadlineAfter(conn.accepted_at, self.config.timeout.read_header),

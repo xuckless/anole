@@ -3638,7 +3638,11 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
 
 /// The whole response to `request`, sent on a new connection.
 fn rawAll(io: std.Io, server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8 {
-    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    return rawAllTo(io, server.address.ip, request, out);
+}
+
+fn rawAllTo(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, out: []u8) ![]const u8 {
+    const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [512]u8 = undefined;
     var w = stream.writer(io, &wbuf);
@@ -3701,6 +3705,40 @@ test "Server: a PROXY protocol listener takes the client address from v1 and v2 
     // No header: the connection is closed without an answer (a reset,
     // since the request was left unread, or a plain close).
     if (rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n", &out)) |none| {
+        try std.testing.expectEqual(@as(usize, 0), none.len);
+    } else |err| switch (err) {
+        error.ReadFailed => {},
+        else => |e| return e,
+    }
+}
+
+test "Server: a PROXY protocol listener with proxy_protocol_from serves only those peers" {
+    const io = std.testing.io;
+    const trusted = [_]dusty.ProxyNetwork{try .parse("127.0.0.0/8")};
+    const elsewhere = [_]dusty.ProxyNetwork{try .parse("192.0.2.0/24")};
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{
+            .{ .address = loopback_addr, .proxy_protocol = true, .proxy_protocol_from = &trusted },
+            .{ .address = loopback_addr, .proxy_protocol = true, .proxy_protocol_from = &elsewhere },
+        },
+    }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const request = "PROXY TCP4 192.0.2.7 198.51.100.2 56324 443\r\nGET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    var out: [2048]u8 = undefined;
+    const ok = try rawAllTo(io, server.addresses[0].ip, request, &out);
+    try std.testing.expect(std.mem.endsWith(u8, ok, "192.0.2.7:56324 secure=false host=example.com"));
+
+    // 127.0.0.1 is not among the second listener's proxies: closed unanswered.
+    if (rawAllTo(io, server.addresses[1].ip, request, &out)) |none| {
         try std.testing.expectEqual(@as(usize, 0), none.len);
     } else |err| switch (err) {
         error.ReadFailed => {},

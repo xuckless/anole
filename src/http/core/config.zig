@@ -6,6 +6,7 @@ const std = @import("std");
 const ContentType = @import("http.zig").ContentType;
 const HttpRequest = @import("request.zig").Request;
 const HttpResponse = @import("response.zig").Response;
+const proxy_protocol = @import("proxy_protocol.zig");
 
 /// How the server's own error answers (a 404, a 500, `Response.fail`) are
 /// written. `ServerConfig.errors`.
@@ -182,8 +183,14 @@ pub const Listener = struct {
     /// `Timeout.read_header`.
     ///
     /// Only for a listener that nothing but the proxy can reach, since
-    /// whoever connects chooses the address the header claims.
+    /// whoever connects chooses the address the header claims; or name
+    /// the proxies in `proxy_protocol_from`.
     proxy_protocol: bool = false,
+    /// With `proxy_protocol`: the peers allowed to connect and send the
+    /// header (`proxy_protocol.Network.parse("10.0.0.0/8")`). A connection
+    /// from anywhere else is closed before anything is read. Empty trusts
+    /// every peer. Ignored on a unix socket listener.
+    proxy_protocol_from: []const proxy_protocol.Network = &.{},
     /// An already listening socket to serve instead of binding `address`:
     /// one handed over by systemd socket activation (`LISTEN_FDS`) or by
     /// the process this one replaces. `address` should still say what it

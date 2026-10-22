@@ -31,6 +31,87 @@ pub const Header = struct {
 
 pub const Error = error{InvalidProxyHeader};
 
+/// An address range in CIDR notation ("10.0.0.0/8", "2001:db8::/32", or a
+/// single address), for `Listener.proxy_protocol_from`: the peers allowed
+/// to send a PROXY header.
+pub const Network = struct {
+    /// Its first address (the bits past `prefix_len` are zero); the port
+    /// is not used.
+    address: IpAddress,
+    prefix_len: u8,
+
+    /// Parses "address/prefix" or a bare address (a /32 or /128). Host
+    /// bits past the prefix are refused, as a likely typo.
+    pub fn parse(text: []const u8) error{InvalidNetwork}!Network {
+        const slash = std.mem.indexOfScalar(u8, text, '/');
+        const address = IpAddress.parse(text[0 .. slash orelse text.len], 0) catch return error.InvalidNetwork;
+        const bits: u8 = if (address == .ip4) 32 else 128;
+        const prefix_len: u8 = if (slash) |at| blk: {
+            const digits = text[at + 1 ..];
+            if (digits.len == 0 or digits.len > 3) return error.InvalidNetwork;
+            for (digits) |ch| if (!std.ascii.isDigit(ch)) return error.InvalidNetwork;
+            break :blk std.fmt.parseInt(u8, digits, 10) catch return error.InvalidNetwork;
+        } else bits;
+        if (prefix_len > bits) return error.InvalidNetwork;
+        const net: Network = .{ .address = address, .prefix_len = prefix_len };
+        const b = net.bytes();
+        for (b, 0..) |byte, i| {
+            if (byte & ~prefixMask(prefix_len, i) != 0) return error.InvalidNetwork;
+        }
+        return net;
+    }
+
+    /// Whether `peer` is inside the range. An IPv4-mapped IPv6 peer (from
+    /// a dual-stack socket) is compared as IPv4.
+    pub fn contains(self: Network, peer: IpAddress) bool {
+        const p = unmap(peer);
+        if ((p == .ip4) != (self.address == .ip4)) return false;
+        const want = self.bytes();
+        const have: []const u8 = switch (p) {
+            .ip4 => |a| &a.bytes,
+            .ip6 => |a| &a.bytes,
+        };
+        for (want, have, 0..) |w, h, i| {
+            if ((w ^ h) & prefixMask(self.prefix_len, i) != 0) return false;
+        }
+        return true;
+    }
+
+    fn bytes(self: *const Network) []const u8 {
+        return switch (self.address) {
+            .ip4 => |*a| &a.bytes,
+            .ip6 => |*a| &a.bytes,
+        };
+    }
+
+    /// The mask of byte `i` under a prefix of `len` bits.
+    fn prefixMask(len: u8, i: usize) u8 {
+        const start = i * 8;
+        if (len >= start + 8) return 0xff;
+        if (len <= start) return 0;
+        const keep: u3 = @intCast(len - start);
+        return @as(u8, 0xff) << @intCast(@as(u4, 8) - keep);
+    }
+
+    fn unmap(address: IpAddress) IpAddress {
+        const a = switch (address) {
+            .ip4 => return address,
+            .ip6 => |a| a,
+        };
+        const prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+        if (!std.mem.eql(u8, a.bytes[0..12], &prefix)) return address;
+        return .{ .ip4 = .{ .bytes = a.bytes[12..16].*, .port = a.port } };
+    }
+};
+
+/// Whether `peer` may send a PROXY header: inside one of `trusted`, or
+/// any peer when `trusted` is empty.
+pub fn trustedPeer(trusted: []const Network, peer: IpAddress) bool {
+    if (trusted.len == 0) return true;
+    for (trusted) |net| if (net.contains(peer)) return true;
+    return false;
+}
+
 /// The v2 signature, the first 12 bytes of every v2 header.
 pub const v2_signature = "\r\n\r\n\x00\r\nQUIT\n";
 /// RFC-style limit on a v1 line, CRLF included.
@@ -128,8 +209,9 @@ pub fn parseV2(head: *const [16]u8, body: []const u8, complete: bool) Error!Head
     var rest = body[address_len..];
     while (rest.len >= 3) {
         const kind = rest[0];
-        const value_len = std.mem.readInt(u16, rest[1..3], .big);
-        if (rest.len < 3 + value_len) {
+        // In usize: `3 + len` overflows a u16 for the largest lengths.
+        const value_len: usize = std.mem.readInt(u16, rest[1..3], .big);
+        if (rest.len - 3 < value_len) {
             // Cut off by the kept prefix is fine; by the header is not.
             if (complete) return error.InvalidProxyHeader;
             break;
@@ -302,6 +384,54 @@ test "parseV2: checksum, truncation and bad versions" {
     try std.testing.expectError(error.InvalidProxyHeader, v2BodyLen(&head));
 }
 
+test "Network: parse and contains" {
+    const ten = try Network.parse("10.0.0.0/8");
+    try std.testing.expect(ten.contains(try IpAddress.parse("10.200.3.4", 1)));
+    try std.testing.expect(!ten.contains(try IpAddress.parse("11.0.0.1", 1)));
+    // IPv4-mapped peers from a dual-stack socket count as IPv4.
+    try std.testing.expect(ten.contains(try IpAddress.parse("::ffff:10.1.2.3", 1)));
+    try std.testing.expect(!ten.contains(try IpAddress.parse("2001:db8::1", 1)));
+
+    const odd = try Network.parse("192.168.4.0/22");
+    try std.testing.expect(odd.contains(try IpAddress.parse("192.168.7.255", 0)));
+    try std.testing.expect(!odd.contains(try IpAddress.parse("192.168.8.0", 0)));
+
+    const one = try Network.parse("192.0.2.7");
+    try std.testing.expectEqual(@as(u8, 32), one.prefix_len);
+    try std.testing.expect(one.contains(try IpAddress.parse("192.0.2.7", 9)));
+    try std.testing.expect(!one.contains(try IpAddress.parse("192.0.2.8", 9)));
+
+    const v6 = try Network.parse("2001:db8::/32");
+    try std.testing.expect(v6.contains(try IpAddress.parse("2001:db8:ffff::1", 0)));
+    try std.testing.expect(!v6.contains(try IpAddress.parse("2001:db9::1", 0)));
+    try std.testing.expect(!v6.contains(try IpAddress.parse("10.0.0.1", 0)));
+
+    const any = try Network.parse("0.0.0.0/0");
+    try std.testing.expect(any.contains(try IpAddress.parse("203.0.113.9", 0)));
+
+    for ([_][]const u8{ "10.0.0.1/8", "10.0.0.0/33", "10.0.0.0/", "10.0.0.0/+8", "nope", "::/129", "10.0.0.0/0008" }) |bad| {
+        try std.testing.expectError(error.InvalidNetwork, Network.parse(bad));
+    }
+
+    try std.testing.expect(trustedPeer(&.{}, try IpAddress.parse("203.0.113.9", 0)));
+    try std.testing.expect(trustedPeer(&.{ one, ten }, try IpAddress.parse("10.9.9.9", 0)));
+    try std.testing.expect(!trustedPeer(&.{ one, ten }, try IpAddress.parse("203.0.113.9", 0)));
+}
+
+test "parseV2: a TLV length near the top of u16 is refused, not wrapped" {
+    // An IPv4 body and one TLV header claiming 0xfffc..0xffff bytes, the
+    // lengths where `3 + len` no longer fits in a u16.
+    for ([_]u16{ 0xfffc, 0xfffd, 0xfffe, 0xffff }) |tlv_len| {
+        var body: [12 + 3 + 4]u8 = .{ 10, 0, 0, 1, 10, 0, 0, 2, 0, 80, 0, 81, 0x20, 0, 0, 1, 0, 0, 0 };
+        std.mem.writeInt(u16, body[13..15], tlv_len, .big);
+        const head = v2Head(1, 0x11, body.len);
+        try std.testing.expectError(error.InvalidProxyHeader, parseV2(&head, &body, true));
+        // Cut at the kept prefix: the addresses stand, the TLV is not seen.
+        const cut = try parseV2(&head, &body, false);
+        try std.testing.expect(!cut.ssl);
+    }
+}
+
 test "parse: random and mutated input never crashes" {
     // dusty's test runner has no fuzzer; this is the poor man's version:
     // random bytes, and valid headers with random bytes flipped.
@@ -444,6 +574,9 @@ test "fuzz: PROXY protocol headers, parsed and read off a socket" {
         v2_signature ++ "\x21\x21\x00\x24" ++ "\x20\x01\x0d\xb8" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x01" ++ "\x20\x01\x0d\xb8" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x02" ++ "\x01\xbb\x00\x50",
         v2_signature ++ "\x20\x00\x00\x00",
         v2_signature ++ "\x21\x11\x00\x13" ++ "\x0a\x00\x00\x01\x0a\x00\x00\x02\x00\x50\x00\x51" ++ "\x03\x00\x04\x00\x00\x00\x00",
+        // TLV lengths at the top of the u16 range.
+        v2_signature ++ "\x21\x11\x00\x13" ++ "\x0a\x00\x00\x01\x0a\x00\x00\x02\x00\x50\x00\x51" ++ "\x20\xff\xff\x01\x00\x00\x00",
+        v2_signature ++ "\x21\x11\x00\x0f" ++ "\x0a\x00\x00\x01\x0a\x00\x00\x02\x00\x50\x00\x51" ++ "\x04\xff\xfd",
     });
 }
 

@@ -193,9 +193,9 @@ var app = try anole.Server(void).init(init.gpa, .{
 }, {});
 ```
 
-`http` has `address`, `port`, `h2c` and `proxy_protocol`. `https` has
-`address`, `port`, `cert`, `alpn_protocols`, `client_auth` and
-`proxy_protocol`. `cert` is one of:
+`http` has `address`, `port`, `h2c`, `proxy_protocol` and
+`proxy_protocol_from`. `https` has `address`, `port`, `cert`,
+`alpn_protocols`, `client_auth`, `proxy_protocol` and `proxy_protocol_from`. `cert` is one of:
 
 - `.{ .pem = .{ .cert = ..., .key = ... } }`: PEM text in memory, copied by
   `init`, for keys from a secret store or the environment.
@@ -232,6 +232,7 @@ or instead of those two. Each has:
 | `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
 | `proxy_protocol` | false | Every connection starts with a PROXY protocol header. |
+| `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty allows any peer. |
 
 A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
 or one of them. One with `http2 = false` gives a client that offers `h2`
@@ -885,6 +886,10 @@ it), per listener: `.http = .{ .port = 8080, .proxy_protocol = true }`. Each
 connection must open with a valid header, read before TLS and within
 `timeout.read_header`, or it is closed. The header's address becomes
 `req.remote_address`, and v2's SSL field sets `req.secure`.
+Name the load balancers with `proxy_protocol_from`
+(`.proxy_protocol_from = &.{ "10.0.0.0/8", "2001:db8::/32" }`) and a
+connection from any other peer is closed before anything is read, so a
+client that reaches the port directly cannot claim another address.
 
 **`X-Forwarded-*`**, with `.server = .{ .trusted_proxy_hops = 1 }`. With `n`
 hops, `req.remote_address` is the `n`-th address from the right of

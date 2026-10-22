@@ -5,6 +5,16 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- PROXY protocol v2: a header whose TLV length is near 65535 is refused
+  instead of crashing the process (or, in ReleaseFast, reading past a
+  buffer). Only listeners with `proxy_protocol = true` were affected.
+- PROXY protocol listeners take `proxy_protocol_from`, a list of networks
+  in CIDR notation allowed to send the header; connections from other
+  peers are closed. Optional; recommended when the port is reachable by
+  more than the load balancer.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings

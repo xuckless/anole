@@ -208,8 +208,13 @@ pub const Options = struct {
         h2c: bool = features.http2,
         /// Every connection starts with a PROXY protocol header (v1 or v2)
         /// from a load balancer in front, which gives the client's real
-        /// address. Only for a port nothing else can reach.
+        /// address. Only for a port nothing else can reach, or with
+        /// `proxy_protocol_from` naming the load balancers.
         proxy_protocol: bool = false,
+        /// With `proxy_protocol`: the peers allowed to connect, in CIDR
+        /// notation ("10.0.0.0/8", "2001:db8::/32", "192.0.2.7"); a
+        /// connection from anywhere else is closed unread. Empty: any peer.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
     /// `Options.http3`: HTTP/3 over QUIC beside the TLS listener.
@@ -272,6 +277,8 @@ pub const Options = struct {
         client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
         /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
+        /// As `Http.proxy_protocol_from`.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
     /// A listener in `listeners`: where, plain or TLS, and what it speaks.
@@ -306,6 +313,8 @@ pub const Options = struct {
         http3: bool = false,
         /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
+        /// As `Http.proxy_protocol_from`.
+        proxy_protocol_from: []const []const u8 = &.{},
 
         /// `Listener.tls`.
         pub const Tls = struct {
@@ -745,6 +754,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .port = h.port,
                 .http2 = h.h2c and features.http2,
                 .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol_from = h.proxy_protocol_from,
             } });
             if (opts.https) |h| try specs.append(a, .{ .name = "https", .listener = .{
                 .address = h.address,
@@ -752,6 +762,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .tls = .{ .cert = h.cert, .alpn_protocols = h.alpn_protocols, .client_auth = h.client_auth },
                 .http3 = opts.http3 != null,
                 .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol_from = h.proxy_protocol_from,
             } });
             for (opts.listeners) |l| {
                 var name = l.name orelse if (l.unix) |path|
@@ -785,6 +796,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     try why.print("two listeners are named \"{s}\"", .{spec.name});
                     return error.DuplicateListenerName;
                 };
+                for (l.proxy_protocol_from) |text| {
+                    _ = http.ProxyNetwork.parse(text) catch {
+                        try why.print("listener \"{s}\": proxy_protocol_from \"{s}\" is not an address or a network in CIDR notation", .{ spec.name, text });
+                        return error.InvalidProxyNetwork;
+                    };
+                }
                 if (!l.http1 and !l.http2) {
                     try why.print("listener \"{s}\" speaks neither HTTP/1.1 nor HTTP/2", .{spec.name});
                     return error.NoProtocols;
@@ -913,6 +930,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .socket_per_acceptor = per_core_sockets and address == .ip,
                     .ipv6_only = ipv6_only,
                     .proxy_protocol = l.proxy_protocol,
+                    .proxy_protocol_from = from: {
+                        const nets = try a.alloc(http.ProxyNetwork, l.proxy_protocol_from.len);
+                        for (l.proxy_protocol_from, nets) |text, *net| net.* = http.ProxyNetwork.parse(text) catch return error.InvalidProxyNetwork;
+                        break :from nets;
+                    },
                     .tls = config,
                     .fd = fd,
                 };

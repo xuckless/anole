@@ -23,6 +23,8 @@ pub const Address = dusty.Address;
 /// One socket the core server accepts on (`ServerConfig.listeners`);
 /// `req.listener` points at the one a request came in on.
 pub const Listener = dusty.Listener;
+/// A peer range for `Listener.proxy_protocol_from` ("10.0.0.0/8").
+pub const ProxyNetwork = dusty.ProxyNetwork;
 /// The radix-tree router with `:param` and `*wildcard` segments;
 /// `app.router` is one.
 pub const Router = dusty.Router;
