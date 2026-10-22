@@ -10,6 +10,8 @@
 //!   `iat`, `iss` and `aud` are checked, with leeway for clock skew.
 const std = @import("std");
 
+/// The JWS algorithms `verify` accepts, by their `alg` names. `none` is not
+/// among them.
 pub const Alg = enum {
     HS256,
     HS384,
@@ -29,6 +31,9 @@ pub const Alg = enum {
     }
 };
 
+/// A verification key pinned to one algorithm. Build one by hand
+/// (`.{ .alg = .HS256, .material = .{ .hmac = secret } }`) or get a list
+/// from a JWK Set with `parseJwks`.
 pub const Key = struct {
     /// Matched against the token's `kid` when both have one.
     kid: ?[]const u8 = null,
@@ -36,7 +41,12 @@ pub const Key = struct {
     alg: Alg,
     material: Material,
 
+    /// The key itself, in the form its algorithm needs.
     pub const Material = union(enum) {
+        /// The shared secret, for the HS algorithms: at least as long as
+        /// the hash (32 bytes for HS256, 48 for HS384, 64 for HS512), as
+        /// RFC 7518 3.2 requires. A shorter one verifies nothing:
+        /// `verify` fails with `error.WeakKey`.
         hmac: []const u8,
         /// Big-endian modulus and exponent.
         rsa: struct { n: []const u8, e: []const u8 },
@@ -47,22 +57,47 @@ pub const Key = struct {
     };
 };
 
+/// What a token's claims must satisfy beyond a good signature. The
+/// default requires `exp` and allows 60 seconds of clock skew.
+///
+/// Set `issuer` and `audience` whenever the keys also sign tokens for
+/// others (any identity provider's): without `audience`, a token the
+/// provider issued to another application verifies here too. `Keyring`
+/// refuses a policy without one (`allow_any_audience` opts out).
 pub const Policy = struct {
     /// Required `iss`.
     issuer: ?[]const u8 = null,
     /// Required in `aud` (a string or an array).
     audience: ?[]const u8 = null,
+    /// Required header `typ`, compared without case and with or without
+    /// an `application/` prefix: "at+jwt" for RFC 9068 access tokens, so
+    /// an ID token from the same provider is not taken for one.
+    typ: ?[]const u8 = null,
+    /// Let a `Keyring` verify with no `audience`: only for keys that sign
+    /// for this application alone.
+    allow_any_audience: bool = false,
+    /// Clock skew allowed on `exp`, `nbf` and `iat`.
     leeway_seconds: i64 = 60,
+    /// Refuse a token without `exp` (`error.MissingExpiry`).
     require_exp: bool = true,
+    /// Refuse a token without `iat` (`error.MissingIssuedAt`); OIDC ID
+    /// tokens must carry one.
+    require_iat: bool = false,
     /// A token older than this (by `iat`) is refused.
     max_age_seconds: ?i64 = null,
 };
 
+/// Why `verify` refused a token. `NoMatchingKey`: no key has the token's
+/// `alg` (and `kid`); `BadSignature`: one did, and the signature does not
+/// match it; `WeakKey`: the key that would check it is an HMAC secret
+/// shorter than its hash, which anyone could guess (the application's
+/// configuration is wrong, not the token).
 pub const Error = error{
     Malformed,
     UnsupportedAlgorithm,
     NoMatchingKey,
     BadSignature,
+    WeakKey,
     Expired,
     NotYetValid,
     IssuedInFuture,
@@ -70,6 +105,8 @@ pub const Error = error{
     WrongIssuer,
     WrongAudience,
     TooOld,
+    MissingIssuedAt,
+    WrongType,
     OutOfMemory,
 };
 
@@ -80,11 +117,14 @@ pub const Verified = struct {
     alg: Alg,
     kid: ?[]const u8,
 
+    /// The claim `name` when it is a string, else null.
     pub fn string(self: Verified, name: []const u8) ?[]const u8 {
         const v = self.claims.get(name) orelse return null;
         return if (v == .string) v.string else null;
     }
 
+    /// The claim `name` when it is a whole number that fits an `i64` (such as
+    /// `exp`), else null.
     pub fn integer(self: Verified, name: []const u8) ?i64 {
         const v = self.claims.get(name) orelse return null;
         return switch (v) {
@@ -133,6 +173,7 @@ pub fn verify(arena: std.mem.Allocator, token: []const u8, keys: []const Key, po
         if (key.alg != alg) continue;
         if (kid != null and key.kid != null and !std.mem.eql(u8, kid.?, key.kid.?)) continue;
         any_candidate = true;
+        if (key.material == .hmac and key.material.hmac.len < minHmacKey(alg)) return error.WeakKey;
         if (verifySignature(key, alg, signing_input, signature)) {
             verified = true;
             break;
@@ -145,8 +186,22 @@ pub fn verify(arena: std.mem.Allocator, token: []const u8, keys: []const Key, po
     const claims = (std.json.parseFromSliceLeaky(std.json.Value, arena, claims_json, .{}) catch return error.Malformed);
     if (claims != .object) return error.Malformed;
     const v: Verified = .{ .header = header.object, .claims = claims.object, .alg = alg, .kid = kid };
+    if (policy.typ) |want| if (!typMatches(header.object, want)) return error.WrongType;
     try checkClaims(v, policy, now);
     return v;
+}
+
+/// The header's `typ` is `want`, ignoring case and an `application/`
+/// prefix on either (RFC 7515 4.1.9).
+fn typMatches(header: std.json.ObjectMap, want: []const u8) bool {
+    const got = header.get("typ") orelse return false;
+    if (got != .string) return false;
+    return std.ascii.eqlIgnoreCase(mediaSubtype(got.string), mediaSubtype(want));
+}
+
+fn mediaSubtype(typ: []const u8) []const u8 {
+    const prefix = "application/";
+    return if (std.ascii.startsWithIgnoreCase(typ, prefix)) typ[prefix.len..] else typ;
 }
 
 fn checkClaims(v: Verified, policy: Policy, now: i64) Error!void {
@@ -159,6 +214,8 @@ fn checkClaims(v: Verified, policy: Policy, now: i64) Error!void {
     if (v.integer("iat")) |iat| {
         if (now +| leeway < iat) return error.IssuedInFuture;
         if (policy.max_age_seconds) |max| if (now -| iat > max +| leeway) return error.TooOld;
+    } else if (policy.require_iat) {
+        return error.MissingIssuedAt;
     } else if (policy.max_age_seconds != null) return error.TooOld;
     if (policy.issuer) |iss| {
         const got = v.string("iss") orelse return error.WrongIssuer;
@@ -175,6 +232,16 @@ fn checkClaims(v: Verified, policy: Policy, now: i64) Error!void {
         };
         if (!ok) return error.WrongAudience;
     }
+}
+
+/// The shortest HMAC secret `alg` takes: its hash's output (RFC 7518 3.2).
+fn minHmacKey(alg: Alg) usize {
+    return switch (alg) {
+        .HS256 => 32,
+        .HS384 => 48,
+        .HS512 => 64,
+        else => 0,
+    };
 }
 
 fn verifySignature(key: Key, alg: Alg, input: []const u8, sig: []const u8) bool {
@@ -328,8 +395,13 @@ test "verify: RFC 7515 A.1 HS256, claims policy, and algorithm pinning" {
     const other: Key = .{ .alg = .HS512, .material = .{ .hmac = secret } };
     try std.testing.expectError(error.NoMatchingKey, verify(arena, rfc_hs256_token, &.{other}, .{}, before));
     // A wrong secret.
-    const wrong: Key = .{ .alg = .HS256, .material = .{ .hmac = "nope" } };
+    const wrong: Key = .{ .alg = .HS256, .material = .{ .hmac = "a wrong secret, 32 bytes or more" } };
     try std.testing.expectError(error.BadSignature, verify(arena, rfc_hs256_token, &.{wrong}, .{}, before));
+    // A secret shorter than the hash verifies nothing (RFC 7518 3.2), not
+    // even a token signed with it.
+    const short: Key = .{ .alg = .HS256, .material = .{ .hmac = "nope" } };
+    try std.testing.expectError(error.WeakKey, verify(arena, rfc_hs256_token, &.{short}, .{}, before));
+    try std.testing.expectError(error.WeakKey, verify(arena, rfc_hs256_token, &.{.{ .alg = .HS256, .material = .{ .hmac = "" } }}, .{}, before));
     // alg none.
     try std.testing.expectError(error.UnsupportedAlgorithm, verify(arena, "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.", &.{key}, .{}, 0));
 }
@@ -398,7 +470,7 @@ test "fuzz: JWS verification and JWK Sets" {
             const secret = try decode(arena, rfc_hs256_key);
             const keys = [_]Key{
                 .{ .alg = .HS256, .material = .{ .hmac = secret } },
-                .{ .alg = .HS512, .kid = "k2", .material = .{ .hmac = "another secret" } },
+                .{ .alg = .HS512, .kid = "k2", .material = .{ .hmac = "another secret, for HS512 at least sixty-four bytes long, so: pad" } },
             };
             if (verify(arena, input, &keys, .{}, 1300819000)) |v| {
                 // Only a signature over exactly this input verifies.
@@ -415,4 +487,33 @@ test "fuzz: JWS verification and JWK Sets" {
         \\{"keys":[{"kty":"EC","crv":"P-256","kid":"ec1","x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4","y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"},{"kty":"RSA","n":"0vx7","e":"AQAB","alg":"RS256"},{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}
         ,
     });
+}
+
+test "verify: an optional typ check, and require_iat" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const secret = "typ-test-secret-typ-test-secret-";
+    const key: Key = .{ .alg = .HS256, .material = .{ .hmac = secret } };
+    const Sign = struct {
+        fn token(a: std.mem.Allocator, header: []const u8, claims: []const u8) ![]const u8 {
+            const h = b64.Encoder.encode(try a.alloc(u8, b64.Encoder.calcSize(header.len)), header);
+            const c = b64.Encoder.encode(try a.alloc(u8, b64.Encoder.calcSize(claims.len)), claims);
+            const input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, c });
+            var mac: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, input, secret);
+            return std.fmt.allocPrint(a, "{s}.{s}", .{ input, b64.Encoder.encode(try a.alloc(u8, 43), &mac) });
+        }
+    };
+    const claims = "{\"exp\":2000000000}";
+    const at = try Sign.token(arena, "{\"alg\":\"HS256\",\"typ\":\"at+jwt\"}", claims);
+    const at_long = try Sign.token(arena, "{\"alg\":\"HS256\",\"typ\":\"application/AT+JWT\"}", claims);
+    const id = try Sign.token(arena, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}", claims);
+    const none = try Sign.token(arena, "{\"alg\":\"HS256\"}", claims);
+    _ = try verify(arena, at, &.{key}, .{ .typ = "at+jwt" }, 1700000000);
+    _ = try verify(arena, at_long, &.{key}, .{ .typ = "at+jwt" }, 1700000000);
+    try std.testing.expectError(error.WrongType, verify(arena, id, &.{key}, .{ .typ = "at+jwt" }, 1700000000));
+    try std.testing.expectError(error.WrongType, verify(arena, none, &.{key}, .{ .typ = "at+jwt" }, 1700000000));
+    _ = try verify(arena, none, &.{key}, .{}, 1700000000);
+    try std.testing.expectError(error.MissingIssuedAt, verify(arena, none, &.{key}, .{ .require_iat = true }, 1700000000));
 }

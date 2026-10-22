@@ -11,9 +11,10 @@
 //! `Guard` answers 425 Too Early to unsafe requests that carry the mark,
 //! as RFC 8470 §5.1 requires: waiting cannot make them safe, since the
 //! early part happened on an earlier hop. `anole.Server` runs it on every
-//! route when HTTP/3 is on. `TooEarly` answers 425 to any marked request, for a route whose
-//! GET has effects that must not repeat; the client retries once its
-//! handshake is done (RFC 8470 §5.2).
+//! route, HTTP/3 or not (a proxy in front may have taken the request in
+//! TLS early data). `TooEarly` answers 425 to any marked request,
+//! for a route whose GET has effects that must not repeat; the client
+//! retries once its handshake is done (RFC 8470 §5.2).
 const std = @import("std");
 const dusty = @import("dusty");
 
@@ -43,6 +44,9 @@ fn tooEarly(res: *dusty.Response) void {
 /// 425 for unsafe requests marked as early data (RFC 8470 §5.1).
 /// `anole.Server` adds it to every route.
 pub const Guard = struct {
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(_: *const Guard, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (isEarly(req) and !isSafe(req.method)) return tooEarly(res);
         return executor.next();
@@ -54,6 +58,9 @@ pub const Guard = struct {
 ///
 ///     const pay = app.group("/pay", .{anole.early_data.TooEarly{}});
 pub const TooEarly = struct {
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
     pub fn execute(_: *const TooEarly, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (isEarly(req)) return tooEarly(res);
         return executor.next();

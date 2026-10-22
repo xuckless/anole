@@ -13,7 +13,8 @@
 //!
 //! `anole.App` is `Server(void)` with a two-argument `init`. With state,
 //! `Server(App).init(gpa, options, &state)`; the listeners can also be set
-//! in `options` (`http`, `https`, `http3`) and served with `run`:
+//! in `options` (`http`, `https`, `http3`, and any number more in
+//! `listeners`) and served with `run`:
 //!
 //!     var app = try anole.Server(void).init(init.gpa, .{
 //!         .http = .{ .port = 8080 },
@@ -22,21 +23,32 @@
 //!     ...
 //!     try app.run();
 //!
-//! Everything dusty offers stays reachable: `app.router` is dusty's router,
-//! `app.server` dusty's server, and `anole.http` the whole of dusty.
+//! Everything the HTTP core offers stays reachable: `app.router` is its
+//! router, `app.server` its server, and `anole.http` the whole of it.
 const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const zio = @import("zio");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
+const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
+/// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
+const unix_signals = builtin.os.tag != .windows;
+
+/// `name` in `environ`; on Windows, where `Environ` holds UTF-16 with
+/// nothing to slice, in the C library's environment.
+fn envVar(environ: std.process.Environ, name: []const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) return @import("db/url.zig").env(null, name);
+    return environ.getPosix(name);
+}
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
 const early_data = @import("early_data.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
+const ResponseCache = @import("cache/response.zig").ResponseCache;
 const client_mod = @import("client.zig");
 const observe = @import("observe/root.zig");
 const websocket = if (features.websocket) @import("websocket/root.zig") else struct {
@@ -44,6 +56,21 @@ const websocket = if (features.websocket) @import("websocket/root.zig") else str
 };
 const webtransport_mod = if (features.http3) @import("webtransport.zig") else struct {
     pub const AcceptOptions = struct {};
+};
+const sqlite_mod = if (features.sqlite) @import("sqlite/root.zig") else struct {
+    pub const Client = void;
+};
+const pg_mod = if (features.postgres) @import("pg/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = void;
+};
+const mongodb_mod = if (features.mongodb) @import("mongodb/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = void;
+};
+const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = void;
 };
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
@@ -77,6 +104,9 @@ pub const ExecutorCount = @FieldType(@typeInfo(@TypeOf(zio.Runtime.init)).@"fn".
 /// over.
 threadlocal var server_on_thread: bool = false;
 
+/// `anole.ServerOptions`: everything `App.init` and `Server(Ctx).init`
+/// take. Every field has a default, so `.{}` is a working server (its
+/// listener named later by `listen` or `listenTls`).
 pub const Options = struct {
     /// The cleartext listener. When neither this nor `https` is set,
     /// 127.0.0.1:8080; with `https` set and this null, none: an HTTPS-only
@@ -85,8 +115,26 @@ pub const Options = struct {
     /// The TLS listener, or null for none. Needs `-Dtls=boringssl`.
     https: ?Https = null,
     /// HTTP/3 over QUIC, beside `https` and with its certificate, or null
-    /// for none. Needs `-Dhttp3` (on by default) and `https`.
+    /// for none. Needs `-Dhttp3` (on by default) and `https`. With
+    /// `listeners`, the settings for the one marked `http3`.
     http3: ?Http3 = null,
+    /// More listeners, for full control: each with its own address (or
+    /// unix socket), TLS certificate and protocols, served after `http`
+    /// and `https` and through the same routes. One port per protocol, an
+    /// internal port for metrics, a unix socket for a proxy on the same
+    /// machine. See `Listener`.
+    ///
+    ///     .listeners = &.{
+    ///         .{ .name = "public", .address = "", .port = 443, .tls = .{ .cert = cert }, .http3 = true },
+    ///         .{ .name = "admin", .port = 9090 },
+    ///     },
+    listeners: []const Listener = &.{},
+    /// Raise the soft open-file limit to the hard one when the server is
+    /// made, as Go does at startup: every connection is a file descriptor,
+    /// and the soft limit is often 1024. `server.max_connections` follows
+    /// the limit by default. Processes started from here inherit it (see
+    /// docs/server.md, "Many connections", for programs that use `select`).
+    raise_fd_limit: bool = true,
     /// HTTP/2 settings, for h2c and h2 over TLS. 250 concurrent streams per
     /// connection by default.
     http2: http.ServerConfig.Http2 = .{ .max_concurrent_streams = 250 },
@@ -116,6 +164,12 @@ pub const Options = struct {
     /// How long a restart waits for the new process to be serving before
     /// giving up on it and carrying on.
     restart_timeout_ms: u32 = 10_000,
+    /// Whether `run` listens for signals: SIGINT and SIGTERM drain and
+    /// stop, SIGHUP reloads certificates (SIGUSR2 needs `process` too).
+    /// False when Anole is embedded in a process whose signals belong to
+    /// someone else (the C ABI under Node or Python): `stop` is then the
+    /// only way to drain.
+    signals: bool = true,
     /// Whether `listenTls` also serves HTTP/3 on the same port number (UDP),
     /// advertised with `Alt-Svc`, when HTTP/3 is built in (the default
     /// `full` profile): with `http3`'s settings when set, else the defaults.
@@ -138,20 +192,45 @@ pub const Options = struct {
     /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
     /// replaced by the fields above.
     server: http.ServerConfig = .{},
+    /// The server's outbound HTTP client (`app.client()`,
+    /// `anole.client(req)`): its pool of idle connections
+    /// (`max_idle_per_host`, 256 per executor; `max_idle_connections`,
+    /// 1024 per executor; `idle_timeout`, 90 s), its timeout (30 s), the
+    /// CAs it trusts (`tls`), redirects and size limits.
+    client: http.ClientConfig = .{},
 
+    /// `Options.http`: a cleartext listener.
     pub const Http = struct {
+        /// The interface to bind: "127.0.0.1" (this machine), "" (every
+        /// interface, IPv6 and IPv4 alike: one dual-stack socket on `::`,
+        /// or `0.0.0.0` where the system has no IPv6; what
+        /// `listen(":3000")` binds), "0.0.0.0" (every IPv4 interface
+        /// only), "::" (every IPv6 one, and IPv4 too where the system's
+        /// default maps it).
         address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (see `addresses`).
         port: u16 = 8080,
         /// Cleartext HTTP/2 for clients that open with its preface, beside
         /// HTTP/1.1 on the same port.
         h2c: bool = features.http2,
+        /// Every connection starts with a PROXY protocol header (v1 or v2)
+        /// from a load balancer in front, which gives the client's real
+        /// address. Only for a port nothing else can reach, or with
+        /// `proxy_protocol_from` naming the load balancers.
         proxy_protocol: bool = false,
+        /// With `proxy_protocol`: the peers allowed to connect, in CIDR
+        /// notation ("10.0.0.0/8", "2001:db8::/32", "192.0.2.7"); a
+        /// connection from anywhere else is closed unread. Empty: any peer.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
+    /// `Options.http3`: HTTP/3 over QUIC beside the TLS listener.
     pub const Http3 = struct {
-        /// The UDP address and port; `https`'s when null (the usual setup:
-        /// one port number, over TCP and UDP).
+        /// The UDP address, as `Http.address` (so "" is dual-stack);
+        /// `https`'s when null (the usual setup: one port number, over TCP
+        /// and UDP).
         address: ?[]const u8 = null,
+        /// The UDP port; null for the TLS listener's.
         port: ?u16 = null,
         /// Advertise HTTP/3 to HTTP/1.1 and HTTP/2 clients (`Alt-Svc`), so
         /// browsers switch to it.
@@ -161,7 +240,8 @@ pub const Options = struct {
         /// Make every new client prove its address with a Retry first (one
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
-        idle_timeout_ms: u32 = 30_000,
+        /// How long a connection may sit idle before it is closed.
+        idle_timeout: std.Io.Duration = .fromSeconds(30),
         /// Take 0-RTT (early data) from clients resuming a session, which
         /// saves them a round trip. GET, HEAD and OPTIONS that come in
         /// 0-RTT run at once, with `Early-Data: 1` among their headers
@@ -169,8 +249,13 @@ pub const Options = struct {
         /// handshake completes, which a replayed flight never does.
         early_data: bool = false,
         /// QUIC interop runner tests only: also speak "hq-interop"
-        /// (HTTP/0.9), serving the files under this directory.
+        /// (HTTP/0.9), serving the files under this directory. Refused
+        /// (`error.HqInteropNotAllowed`) unless the program's root file
+        /// declares `pub const anole_hq_interop = true;`.
         hq_interop_root: ?[]const u8 = null,
+        /// Move clients that offer QUIC v2 (RFC 9369) beside v1 to v2;
+        /// false keeps them on v1 unless they start in v2.
+        prefer_v2: bool = true,
         /// UDP sockets on Linux, each served on an executor of its own,
         /// with the kernel steering each connection's datagrams to its
         /// socket: null for one per executor, as the TCP accept loops. At
@@ -189,16 +274,74 @@ pub const Options = struct {
         inline_no_wait: bool = true,
     };
 
+    /// `Options.https`: a TLS listener with HTTP/2 and HTTP/1.1 by ALPN.
     pub const Https = struct {
+        /// As `Http.address`.
         address: []const u8 = "127.0.0.1",
         port: u16 = 8443,
+        /// The certificate and key: `.fromFiles(...)`, `.fromPem(...)` or
+        /// `.dev_self_signed`.
         cert: Cert,
         /// "h2" and "http/1.1" when HTTP/2 is built in, else "http/1.1".
         alpn_protocols: ?[]const []const u8 = null,
+        /// Mutual TLS: ask clients for a certificate signed by these CAs
+        /// (`req.peerCertificate()` has it). Null: none asked for.
         client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+        /// As `Http.proxy_protocol`.
         proxy_protocol: bool = false,
+        /// As `Http.proxy_protocol_from`.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
+    /// A listener in `listeners`: where, plain or TLS, and what it speaks.
+    pub const Listener = struct {
+        /// What the listener is called: socket activation and SIGUSR2
+        /// restarts match inherited sockets by it (`LISTEN_FDNAMES`), and
+        /// handlers see it in `req.listener.name` (`anole.onlyOn`). Unique
+        /// among the server's listeners ("http" and "https" are `http`'s
+        /// and `https`'s), at most 255 bytes, no ':'. Null: "http-<port>",
+        /// "https-<port>", or "unix-<path>".
+        name: ?[]const u8 = null,
+        /// As `Http.address`.
+        address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (see `addresses`).
+        port: u16 = 8080,
+        /// A unix domain socket at this path instead of `address` and
+        /// `port`. A socket file left behind by a server that is gone is
+        /// replaced; one that something still listens on is an error.
+        unix: ?[]const u8 = null,
+        /// TLS with this certificate, or null for cleartext.
+        tls: ?Tls = null,
+        /// HTTP/1.1 (and 1.0).
+        http1: bool = true,
+        /// HTTP/2: "h2" by ALPN over TLS; on a cleartext listener, for
+        /// clients that open with its preface (h2c, prior knowledge).
+        /// Needs `-Dhttp2`.
+        http2: bool = features.http2,
+        /// HTTP/3 on the same port number over UDP (or `Options.http3`'s
+        /// address and port), with `Options.http3`'s settings, and
+        /// advertised with `Alt-Svc` on this listener's responses. TLS
+        /// listeners only, and one per server. Needs `-Dhttp3`.
+        http3: bool = false,
+        /// As `Http.proxy_protocol`.
+        proxy_protocol: bool = false,
+        /// As `Http.proxy_protocol_from`.
+        proxy_protocol_from: []const []const u8 = &.{},
+
+        /// `Listener.tls`.
+        pub const Tls = struct {
+            /// Listeners that name the same certificate (the same files,
+            /// the same PEM, `dev_self_signed`) share one copy of it.
+            cert: Cert,
+            /// Offered by ALPN, in order. Null: "h2" and "http/1.1", those
+            /// of the two the listener speaks.
+            alpn_protocols: ?[]const []const u8 = null,
+            /// As `Https.client_auth`.
+            client_auth: ?http.ServerConfig.Tls.ClientAuth = null,
+        };
+    };
+
+    /// `anole.Cert`: where a TLS listener's certificate and key come from.
     pub const Cert = union(enum) {
         /// PEM text in memory, copied by `init`.
         pem: struct { cert: []const u8, key: []const u8 },
@@ -225,6 +368,43 @@ pub const Options = struct {
 /// handlers that take `(req, res)`.
 pub const App = ServerOf(void, true);
 
+/// Middleware that lets requests through on the listener named `name`
+/// alone (`Options.Listener.name`; "http" and "https" are `http`'s and
+/// `https`'s, HTTP/3 its TLS listener's), and answers 404 on the others:
+/// routes for an internal port. Every listener shares the routes; this
+/// keeps some of them to one.
+///
+///     const admin = app.group("/admin", .{anole.onlyOn("admin")});
+pub fn onlyOn(name: []const u8) OnlyOn {
+    return .{ .name = name };
+}
+
+/// The middleware `onlyOn` returns.
+pub const OnlyOn = struct {
+    name: []const u8,
+
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
+
+    pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, executor: anytype) !void {
+        if (!std.mem.eql(u8, req.listener.name, self.name)) return error.NotFound;
+        return executor.next();
+    }
+};
+
+/// A server whose handlers share the state `Ctx`: `init(gpa, options,
+/// &state)`, and handlers `fn (state: *Ctx, req, res) !void` (or plain
+/// `(req, res)`). For no state, `App`.
+///
+///     var store: Store = .{ .gpa = init.gpa };
+///     var app = try anole.Server(Store).init(init.gpa, .{}, &store);
+///     defer app.deinit();
+///     app.get("/users/:id", getUser); // fn getUser(store: *Store, req, res) !void
+///     try app.listen(":3000");
+///
+/// A `Ctx` may also declare `notFound(self, req, res)`,
+/// `uncaughtError(self, req, res, err)` and `dispatch(self, action, req,
+/// res)` to take over those steps.
 pub fn Server(comptime Ctx: type) type {
     return ServerOf(Ctx, false);
 }
@@ -235,15 +415,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     comptime checkZioOptions();
     return struct {
         const Self = @This();
+        /// A handler as the router stores it: `fn (*Request, *Response)
+        /// anyerror!void`, with `*Ctx` first on a server with state.
         pub const Handler = http.Router(Ctx).Handler;
 
+        /// The allocator given to `init`.
         gpa: std.mem.Allocator,
+        /// The zio runtime the server owns; `io()` is its `std.Io`.
         rt: *zio.Runtime,
         /// Holds what the server points into for its whole life: the
         /// listeners, certificates and middleware copies. So `Self` can
         /// move after `init`.
         arena: *std.heap.ArenaAllocator,
+        /// The HTTP core's server underneath.
         server: *http.Server(Ctx),
+        /// The router the route methods add to, for what they do not
+        /// cover (`app.router.addRouteWith`).
         router: *http.Router(Ctx),
         stopped: *std.Io.Event,
         /// For hand-off: the process (args, environment), and the
@@ -251,13 +438,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         process: ?std.process.Init.Minimal = null,
         held: []const handoff.Listener = &.{},
         restart_timeout_ms: u32 = 10_000,
+        /// `Options.signals`.
+        signals: bool = true,
         /// The HTTP/3 endpoint, when `Options.http3` asked for one.
         h3: H3Endpoint,
         /// The blocking pool, when `Options.blocking` asked for one.
         blocking_pool: ?*blocking.Pool = null,
-        /// The TLS listener's certificate, for `reloadCertificates`; null
-        /// without `https`.
-        cert: ?*CertState = null,
+        /// The TLS listeners' certificates, one per distinct source, for
+        /// `reloadCertificates`; empty without a TLS listener.
+        certs: []const *CertState = &.{},
         /// Middleware the server copied (`use`, `group`, `middleware`),
         /// deinitialized with it.
         owned_middleware: std.ArrayList(http.Middleware(Ctx)) = .empty,
@@ -278,6 +467,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             client_registered: bool,
             metrics: ?*observe.metrics.Registry = null,
             metrics_path: []const u8 = "",
+            metrics_listener: ?[]const u8 = null,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -287,26 +477,79 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             dirs: std.ArrayList(std.Io.Dir) = .empty,
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
+            /// The database connectors and response caches made here
+            /// (`postgres`, `sqlite`, `mongodb`, `redis`, `responseCache`),
+            /// in order.
+            connectors: std.ArrayList(Connector) = .empty,
+            connectors_started: bool = false,
+            /// One certificate reload at a time.
+            cert_mutex: std.Io.Mutex = .init,
+        };
+
+        /// A database connector the server made: when serving starts it
+        /// gets the app's metrics, tracer and health checks (whichever
+        /// exist by then, so the helpers may come in any order), and it is
+        /// closed with the server, after the drain.
+        const Connector = struct {
+            context: *anyopaque,
+            start: *const fn (context: *anyopaque, metrics: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) anyerror!void,
+            deinit: *const fn (context: *anyopaque) void,
+
+            fn of(comptime T: type, value: *T) Connector {
+                const Hooks = struct {
+                    fn start(context: *anyopaque, metrics_: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health_: ?*observe.Health) anyerror!void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        return v.start(metrics_, tracer, health_);
+                    }
+                    fn deinit(context: *anyopaque) void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        v.deinit();
+                    }
+                };
+                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit };
+            }
         };
 
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
 
-        /// The TLS listener's certificate: the PEM in use, where a reload
-        /// reads it again, and the listener configuration dusty serves
-        /// from, whose `pem` a reload points at the new one.
+        /// A certificate the TLS listeners serve: the PEM in use, where a
+        /// reload reads it again, and the listener configurations dusty
+        /// serves from, whose `pem` a reload points at the new one.
+        /// Listeners that name the same source share one.
         const CertState = struct {
             gpa: std.mem.Allocator,
-            /// One reload at a time.
-            mutex: std.Io.Mutex = .init,
             /// Owned, the key zeroed when freed.
             pem: Pem,
             /// For `.files`: the paths each reload reads again. Owned.
             files: ?struct { cert_path: []u8, key_path: []u8 } = null,
-            listener: *http.Listener,
+            /// What the options named, to find listeners that share it.
+            /// Only read while the listeners are set up.
+            source: Options.Cert,
+            /// The listeners serving it.
+            listeners: std.ArrayList(*http.Listener) = .empty,
+            /// The TLS listener HTTP/3 serves the port of, when it serves
+            /// this certificate: its client CAs are HTTP/3's.
+            h3_listener: ?*http.Listener = null,
+
+            /// Whether `a` and `b` name the same certificate.
+            fn sameSource(a: Options.Cert, b: Options.Cert) bool {
+                return switch (a) {
+                    .pem => |p| b == .pem and std.mem.eql(u8, p.cert, b.pem.cert) and std.mem.eql(u8, p.key, b.pem.key),
+                    .files => |f| b == .files and std.mem.eql(u8, f.cert_path, b.files.cert_path) and
+                        std.mem.eql(u8, f.key_path, b.files.key_path),
+                    .dev_self_signed => b == .dev_self_signed,
+                };
+            }
 
             const Pem = struct {
                 cert: []u8,
                 key: []u8,
+
+                fn dupe(p: Pem, gpa: std.mem.Allocator) !Pem {
+                    const cert = try gpa.dupe(u8, p.cert);
+                    errdefer gpa.free(cert);
+                    return .{ .cert = cert, .key = try gpa.dupe(u8, p.key) };
+                }
 
                 fn deinit(p: *Pem, gpa: std.mem.Allocator) void {
                     gpa.free(p.cert);
@@ -375,13 +618,18 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// A certificate or key file larger than this is refused.
         const max_pem_len = 1 << 20;
 
-        /// `Alt-Svc` on responses that did not come over HTTP/3, once
-        /// HTTP/3 is set up (`value`).
+        /// `Alt-Svc` on responses from the TLS listener HTTP/3 serves the
+        /// port of (`listener`) that did not come over HTTP/3, once HTTP/3
+        /// is set up (`value`).
         const AltSvc = struct {
             value: ?[]const u8 = null,
+            listener: ?*const http.Listener = null,
+
+            /// Does nothing after `next()`: requests behind it can detach.
+            pub const detach_safe = true;
 
             pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, executor: anytype) !void {
-                if (self.value) |v| if (req.version_major != 3) try res.header("Alt-Svc", v);
+                if (self.value) |v| if (req.version_major != 3 and self.listener != null and req.listener == self.listener.?) try res.header("Alt-Svc", v);
                 return executor.next();
             }
         };
@@ -401,6 +649,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
+            // systemd's notify socket is this process's to use, not its
+            // children's: kept, and taken out of the environment.
+            if (opts.process) |p| sd_notify.take(p.environ);
+            // Before anything opens a socket, and before `run` works out
+            // the connection cap from it.
+            if (opts.raise_fd_limit) if (http.fd_limit.raiseSoftLimit()) |r| {
+                std.log.scoped(.anole).debug("raised the open-file limit from {d} to {d}", .{ r.from, r.to });
+            };
             const arena = try gpa.create(std.heap.ArenaAllocator);
             arena.* = .init(gpa);
             errdefer {
@@ -414,6 +670,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .stack_pool = .{
                     .maximum_size = opts.max_stack_size,
                     .committed_size = @min(opts.max_stack_size, 256 * 1024),
+                    // The stacks of tasks that ended, such as those of
+                    // connections that parked (`timeout.idle_park`), go back
+                    // to the system within seconds rather than minutes: the
+                    // pool keeps what was in use at once during the last
+                    // interval, and half of what it kept before.
+                    .shrink_interval = .fromSeconds(2),
                 },
             });
             errdefer rt.deinit();
@@ -441,7 +703,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer if (pool) |p| p.deinit();
 
             const extras = try a.create(Extras);
-            extras.* = .{ .client = http.Client.init(gpa, rt_io, .{}), .client_entry = undefined, .client_registered = false };
+            extras.* = .{ .client = http.Client.init(gpa, rt_io, opts.client), .client_entry = undefined, .client_registered = false };
             extras.client_entry = .{ .rt = rt, .client = &extras.client };
             extras.client_registered = client_mod.register(&extras.client_entry);
             errdefer {
@@ -458,25 +720,30 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .stopped = stopped,
                 .process = opts.process,
                 .restart_timeout_ms = opts.restart_timeout_ms,
+                .signals = opts.signals,
                 .h3 = if (features.http3) null else {},
                 .blocking_pool = pool,
                 .extras = extras,
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
-            // get 425 Too Early, on every route. Now, before any route, and
-            // for `listenTls` too, which turns HTTP/3 on later.
-            if (features.http3 and (opts.http3 != null or opts.listen_tls_http3)) {
+            // get 425 Too Early, on every route, with HTTP/3 or without:
+            // a TLS-terminating proxy can forward the mark to any listener.
+            // Now, before any route.
+            const h3_possible = features.http3 and (opts.http3 != null or opts.listen_tls_http3 or anyHttp3(opts.listeners));
+            {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
                 self.router.use(http.Middleware(Ctx).init(guard));
             }
+            // Neither `http` nor `https`: `listen`, `listenTls` or `run`
+            // sets up the listeners, `listeners` among them.
             if (opts.http == null and opts.https == null) {
                 self.pending = opts;
                 // `listenTls` turns HTTP/3 on once routes exist, when no
                 // middleware can be added any more: its `Alt-Svc` goes in
                 // now, silent until then.
-                if (features.http3 and (opts.http3 != null or opts.listen_tls_http3)) self.alt_svc = self.addAltSvc();
+                if (h3_possible) self.alt_svc = self.addAltSvc();
             } else {
                 try self.listenOn(opts);
             }
@@ -490,131 +757,294 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return alt;
         }
 
-        /// Sets up the listeners `opts` names (`http`, `https`, `http3`;
-        /// 127.0.0.1:8080 when it names none). Once, before serving.
+        /// A listener to set up: `http`, `https` and `listeners` alike.
+        const Spec = struct { name: []const u8, listener: Options.Listener };
+
+        /// `opts`' listeners in serving order (`http`, `https`, then
+        /// `listeners`), named. `checkSpecs` checks them.
+        fn listenerSpecs(a: std.mem.Allocator, opts: Options) ![]const Spec {
+            var specs: std.ArrayList(Spec) = .empty;
+            // 127.0.0.1:8080 when nothing else is named.
+            const http_opts: ?Options.Http = opts.http orelse if (opts.https == null and opts.listeners.len == 0) .{} else null;
+            if (http_opts) |h| try specs.append(a, .{ .name = "http", .listener = .{
+                .address = h.address,
+                .port = h.port,
+                .http2 = h.h2c and features.http2,
+                .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol_from = h.proxy_protocol_from,
+            } });
+            if (opts.https) |h| try specs.append(a, .{ .name = "https", .listener = .{
+                .address = h.address,
+                .port = h.port,
+                .tls = .{ .cert = h.cert, .alpn_protocols = h.alpn_protocols, .client_auth = h.client_auth },
+                .http3 = opts.http3 != null,
+                .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol_from = h.proxy_protocol_from,
+            } });
+            for (opts.listeners) |l| {
+                var name = l.name orelse if (l.unix) |path|
+                    try std.fmt.allocPrint(a, "unix-{s}", .{path})
+                else
+                    try std.fmt.allocPrint(a, "{s}-{d}", .{ if (l.tls != null) "https" else "http", l.port });
+                // A made-up name taken already (two on port 0): made unique.
+                if (l.name == null) for (specs.items) |other| {
+                    if (std.mem.eql(u8, other.name, name)) {
+                        name = try std.fmt.allocPrint(a, "{s}-{d}", .{ name, specs.items.len });
+                        break;
+                    }
+                };
+                try specs.append(a, .{ .name = name, .listener = l });
+            }
+            return specs.items;
+        }
+
+        /// Fails when `specs` cannot be served as they are, saying why to
+        /// `why`: names unique, each listener speaking something, HTTP/3 on
+        /// one TLS listener at most, and on one when `opts.http3` is set.
+        fn checkSpecs(specs: []const Spec, opts: Options, why: *std.Io.Writer) !void {
+            var h3_count: usize = 0;
+            for (specs, 0..) |spec, i| {
+                const l = spec.listener;
+                if (spec.name.len == 0 or spec.name.len > 255 or std.mem.indexOfScalar(u8, spec.name, ':') != null) {
+                    try why.print("listener name \"{s}\": names are 1 to 255 bytes, with no ':' (LISTEN_FDNAMES separates them with it)", .{spec.name});
+                    return error.InvalidListenerName;
+                }
+                for (specs[0..i]) |other| if (std.mem.eql(u8, other.name, spec.name)) {
+                    try why.print("two listeners are named \"{s}\"", .{spec.name});
+                    return error.DuplicateListenerName;
+                };
+                for (l.proxy_protocol_from) |text| {
+                    _ = http.ProxyNetwork.parse(text) catch {
+                        try why.print("listener \"{s}\": proxy_protocol_from \"{s}\" is not an address or a network in CIDR notation", .{ spec.name, text });
+                        return error.InvalidProxyNetwork;
+                    };
+                }
+                if (!l.http1 and !l.http2) {
+                    try why.print("listener \"{s}\" speaks neither HTTP/1.1 nor HTTP/2", .{spec.name});
+                    return error.NoProtocols;
+                }
+                if (l.http2 and !features.http2) {
+                    try why.print("listener \"{s}\" speaks HTTP/2, which this build leaves out (-Dhttp2)", .{spec.name});
+                    return error.Http2NotBuilt;
+                }
+                if (l.http3) {
+                    if (comptime !features.http3) {
+                        try why.print("listener \"{s}\" speaks HTTP/3, which this build leaves out (-Dhttp3)", .{spec.name});
+                        return error.Http3NotBuilt;
+                    }
+                    if (l.tls == null or l.unix != null) {
+                        try why.print("listener \"{s}\": HTTP/3 needs TLS and a UDP port", .{spec.name});
+                        return error.Http3NeedsTls;
+                    }
+                    h3_count += 1;
+                }
+            }
+            if (h3_count > 1) {
+                try why.print("HTTP/3 is on for {d} listeners; a server serves it on one", .{h3_count});
+                return error.SeveralHttp3Listeners;
+            }
+            if (opts.http3 != null and h3_count == 0) {
+                if (comptime !features.http3) {
+                    try why.writeAll("http3 is set, but this build leaves HTTP/3 out (-Dhttp3)");
+                    return error.Http3NotBuilt;
+                }
+                try why.writeAll("http3 is set, but no TLS listener serves it: set https, or http3 = true on a TLS listener");
+                return error.Http3NeedsHttps;
+            }
+        }
+
+        /// Whether a listener in `listeners` asks for HTTP/3.
+        fn anyHttp3(listeners: []const Options.Listener) bool {
+            for (listeners) |l| if (l.http3) return true;
+            return false;
+        }
+
+        /// The ALPN protocols a TLS listener offers by default.
+        fn defaultAlpn(l: Options.Listener) []const []const u8 {
+            if (l.http2 and l.http1) return &.{ "h2", "http/1.1" };
+            if (l.http2) return &.{"h2"};
+            return &.{"http/1.1"};
+        }
+
+        /// Sets up the listeners `opts` names (`http`, `https`,
+        /// `listeners`, `http3`; 127.0.0.1:8080 when it names none). Once,
+        /// before serving.
         fn listenOn(self: *Self, opts: Options) !void {
             const gpa = self.gpa;
             const a = self.arena.allocator();
             const rt_io = self.rt.io();
             const server = self.server;
+            const specs = try listenerSpecs(a, opts);
+            {
+                var why_buf: [512]u8 = undefined;
+                var why: std.Io.Writer = .fixed(&why_buf);
+                checkSpecs(specs, opts, &why) catch |err| {
+                    std.log.scoped(.anole).err("{s}", .{why.buffered()});
+                    return err;
+                };
+            }
             // One accept loop per executor (dusty's default on zio); on
             // Linux each with its own SO_REUSEPORT socket, so the kernel
             // spreads connections over the executors.
             // Hand-off needs one socket per listener, which we open (or
             // inherit) ourselves.
-            const handoff_mode = opts.process != null;
+            // Not on Windows (`handoff.supported`): there `process` only
+            // carries the environment, and dusty binds as usual.
+            const handoff_mode = opts.process != null and handoff.supported;
+            if (handoff_mode and specs.len > handoff.max_tcp_listeners) return error.TooManyListeners;
             const per_core_sockets = builtin.os.tag == .linux and !handoff_mode;
             const inherited = if (opts.process) |p| handoff.inherited(p.environ) else null;
             var held: std.ArrayList(handoff.Listener) = .empty;
-            var listeners: std.ArrayList(http.Listener) = .empty;
-            const http_opts: ?Options.Http = opts.http orelse if (opts.https == null) .{} else null;
-            if (http_opts) |h| {
-                const address = try std.Io.net.IpAddress.parse(h.address, h.port);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, "http", 0, address);
-                if (fd) |f| try held.append(a, .{ .fd = f, .name = "http" });
-                try listeners.append(a, .{
-                    .address = .{ .ip = address },
-                    .http2_prior_knowledge = h.h2c and features.http2,
-                    .socket_per_acceptor = per_core_sockets,
-                    .proxy_protocol = h.proxy_protocol,
-                    .fd = fd,
-                });
-            }
-            // The certificate is read here, files included, and handed to
-            // dusty (and HTTP/3) as PEM: a reload reads it again the same way.
-            var cert_state: ?*CertState = null;
-            errdefer if (cert_state) |cs| cs.deinit();
-            if (opts.https) |h| {
-                if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
-                const cs = try a.create(CertState);
-                cs.* = .{ .gpa = gpa, .pem = try CertState.load(gpa, rt_io, h.cert), .listener = undefined };
-                cert_state = cs;
-                try cs.setSource(h.cert);
-                const config: http.ServerConfig.Tls = .{
-                    .alpn_protocols = h.alpn_protocols orelse
-                        if (features.http2) &.{ "h2", "http/1.1" } else &.{"http/1.1"},
-                    .client_auth = h.client_auth,
-                    .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key },
+            // Fixed now: the certificates and Alt-Svc point into it.
+            const listeners = try a.alloc(http.Listener, specs.len);
+            // The certificates are read here, files included, and handed
+            // to dusty (and HTTP/3) as PEM: a reload reads them again the
+            // same way.
+            var certs: std.ArrayList(*CertState) = .empty;
+            errdefer for (certs.items) |cs| cs.deinit();
+            var h3_at: ?usize = null;
+            // Whether "" (every interface) can be one dual-stack socket:
+            // asked once, when a listener names it.
+            var dual: DualStack = .{};
+            for (specs, listeners, 0..) |spec, *out, i| {
+                const l = spec.listener;
+                var ipv6_only: ?bool = null;
+                const address: http.Address = if (l.unix) |path|
+                    .{ .unix = try std.Io.net.UnixAddress.init(path) }
+                else blk: {
+                    const bind = try address_mod.resolve(l.address, l.port, l.address.len == 0 and dual.get());
+                    ipv6_only = bind.ipv6_only;
+                    break :blk .{ .ip = bind.ip };
                 };
-                const address = try std.Io.net.IpAddress.parse(h.address, h.port);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, "https", listeners.items.len, address);
-                if (fd) |f| try held.append(a, .{ .fd = f, .name = "https" });
-                try listeners.append(a, .{
-                    .address = .{ .ip = address },
-                    .socket_per_acceptor = per_core_sockets,
-                    .proxy_protocol = h.proxy_protocol,
+                var config: ?http.ServerConfig.Tls = null;
+                if (l.tls) |t| {
+                    if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
+                    const cs = for (certs.items) |cs| {
+                        if (CertState.sameSource(cs.source, t.cert)) break cs;
+                    } else blk: {
+                        const cs = try a.create(CertState);
+                        cs.* = .{ .gpa = gpa, .pem = try CertState.load(gpa, rt_io, t.cert), .source = t.cert };
+                        try certs.append(a, cs);
+                        try cs.setSource(t.cert);
+                        break :blk cs;
+                    };
+                    try cs.listeners.append(a, out);
+                    config = .{
+                        .alpn_protocols = t.alpn_protocols orelse defaultAlpn(l),
+                        .client_auth = t.client_auth,
+                        .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key },
+                    };
+                }
+                if (l.http3) h3_at = i;
+                if (address == .unix and !handoff_mode) try clearStaleUnixSocket(rt_io, address.unix);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, i, address, ipv6_only);
+                if (fd) |f| try held.append(a, .{ .fd = f, .name = spec.name });
+                out.* = .{
+                    .address = address,
+                    .name = spec.name,
+                    .http1 = l.http1,
+                    .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
+                    .socket_per_acceptor = per_core_sockets and address == .ip,
+                    .ipv6_only = ipv6_only,
+                    .proxy_protocol = l.proxy_protocol,
+                    .proxy_protocol_from = from: {
+                        const nets = try a.alloc(http.ProxyNetwork, l.proxy_protocol_from.len);
+                        for (l.proxy_protocol_from, nets) |text, *net| net.* = http.ProxyNetwork.parse(text) catch return error.InvalidProxyNetwork;
+                        break :from nets;
+                    },
                     .tls = config,
                     .fd = fd,
-                });
+                };
             }
-            if (listeners.items.len == 0) return error.NoListeners;
-            // The HTTPS listener comes last; the list grows no more.
-            if (cert_state) |cs| cs.listener = &listeners.items[listeners.items.len - 1];
 
-            server.config.listeners = listeners.items;
+            server.config.listeners = listeners;
             errdefer server.config.listeners = &.{};
 
             var endpoint: H3Endpoint = if (features.http3) null else {};
-            if (opts.http3) |q| {
-                if (comptime !features.http3) return error.Http3NotBuilt;
-                if (comptime features.http3) {
-                    const https = opts.https orelse return error.Http3NeedsHttps;
-                    // Mutual TLS: the same CAs and mode as the TCP listener,
-                    // loaded once more here (dusty loads its own when it
-                    // starts listening).
-                    var client_ca: ?std.crypto.Certificate.Bundle = null;
-                    defer if (client_ca) |*b| b.deinit(gpa);
-                    if (https.client_auth) |ca| client_ca = try ca.ca.load(gpa, rt_io);
-                    // The UDP sockets: inherited (`h3`, in the order the
-                    // predecessor bound them, or by position after the TCP
-                    // listeners), with the predecessor's secret.
-                    var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
-                    const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.items.len, &h3_buf) else &.{};
-                    const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
-                    const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
-                        .address = try std.Io.net.IpAddress.parse(q.address orelse https.address, q.port orelse https.port),
-                        .cert_pem = cert_state.?.pem.cert,
-                        .key_pem = cert_state.?.pem.key,
-                        .max_streams_bidi = q.max_streams_bidi,
-                        .validate_address = q.validate_address,
-                        .idle_timeout_ms = q.idle_timeout_ms,
-                        .hq_interop_root = q.hq_interop_root,
-                        .early_data = q.early_data,
-                        .enable_connect_protocol = q.enable_connect_protocol,
-                        .webtransport = q.webtransport or self.extras.webtransport,
-                        .inline_no_wait = q.inline_no_wait,
-                        .client_auth = h3ClientAuth(https.client_auth, client_ca),
-                        .fds = h3_fds,
-                        .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
-                        .secret = secret,
-                        // The same drain deadline as HTTP/1.1 and HTTP/2.
-                        .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
-                            @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
-                        else
-                            std.math.maxInt(u32),
-                    });
-                    errdefer ep.deinit();
-                    endpoint = ep;
-                    // Named in the HTTPS listener's startup line.
-                    const tcp = &listeners.items[listeners.items.len - 1];
-                    const udp_port = ep.address().getPort();
-                    tcp.extra_protocols = if (udp_port == tcp.address.ip.getPort())
-                        &.{"HTTP/3"}
+            if (comptime features.http3) if (h3_at) |at| {
+                const q = opts.http3 orelse Options.Http3{};
+                const l = specs[at].listener;
+                const tcp = &listeners[at];
+                const cs = for (certs.items) |cs| {
+                    if (std.mem.indexOfScalar(*http.Listener, cs.listeners.items, tcp) != null) break cs;
+                } else unreachable;
+                cs.h3_listener = tcp;
+                const client_auth = l.tls.?.client_auth;
+                // Mutual TLS: the same CAs and mode as the TCP listener,
+                // loaded once more here (dusty loads its own when it
+                // starts listening).
+                var client_ca: ?std.crypto.Certificate.Bundle = null;
+                defer if (client_ca) |*b| b.deinit(gpa);
+                if (client_auth) |ca| client_ca = try ca.ca.load(gpa, rt_io);
+                // The UDP sockets: inherited (`h3`, in the order the
+                // predecessor bound them, or by position after the TCP
+                // listeners), with the predecessor's secret.
+                var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
+                const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.len, &h3_buf) else &.{};
+                for (h3_fds) |fd| handoff.checkInherited(fd, .datagram, true) catch |err| {
+                    std.log.scoped(.anole).err("inherited fd {any} for HTTP/3 is not a UDP socket", .{fd});
+                    return err;
+                };
+                const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
+                // The UDP socket follows the TCP listener's address, "" (dual-stack) included.
+                const udp_host = q.address orelse l.address;
+                const udp_bind = try address_mod.resolve(udp_host, q.port orelse l.port, udp_host.len == 0 and dual.get());
+                const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
+                    .address = udp_bind.ip,
+                    .ipv6_only = udp_bind.ipv6_only,
+                    .cert_pem = cs.pem.cert,
+                    .key_pem = cs.pem.key,
+                    .max_streams_bidi = q.max_streams_bidi,
+                    .validate_address = q.validate_address,
+                    .idle_timeout = q.idle_timeout,
+                    .hq_interop_root = q.hq_interop_root,
+                    .prefer_v2 = q.prefer_v2,
+                    .early_data = q.early_data,
+                    .enable_connect_protocol = q.enable_connect_protocol,
+                    .webtransport = q.webtransport or self.extras.webtransport,
+                    .inline_no_wait = q.inline_no_wait,
+                    .client_auth = h3ClientAuth(client_auth, client_ca),
+                    .listener_name = specs[at].name,
+                    .fds = h3_fds,
+                    .sockets = q.sockets orelse @intCast(@min(self.rt.executors.items.len, 255)),
+                    .secret = secret,
+                    // The same drain deadline as HTTP/1.1 and HTTP/2.
+                    .drain_timeout_ms = if (server.config.timeout.shutdown) |d|
+                        @intCast(@min(@max(d.toMilliseconds(), 0), std.math.maxInt(u32)))
                     else
-                        try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
-                    // Every socket, in the group's order.
-                    if (handoff_mode) for (ep.endpoints()) |e| try held.append(a, .{ .fd = e.udp.socket.handle, .name = "h3" });
-                    if (q.alt_svc) {
-                        const alt = self.alt_svc orelse self.addAltSvc();
-                        self.alt_svc = alt;
-                        alt.value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{ep.address().getPort()});
-                    }
+                        std.math.maxInt(u32),
+                });
+                errdefer ep.deinit();
+                endpoint = ep;
+                // Named in the TLS listener's startup line.
+                const udp_port = ep.address().getPort();
+                tcp.extra_protocols = if (udp_port == tcp.address.ip.getPort())
+                    &.{"HTTP/3"}
+                else
+                    try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
+                // Every socket, in the group's order.
+                if (handoff_mode) for (ep.endpoints()) |e| try held.append(a, .{ .fd = e.udp.socket.handle, .name = "h3" });
+                if (q.alt_svc) {
+                    const alt = self.alt_svc orelse self.addAltSvc();
+                    self.alt_svc = alt;
+                    alt.listener = tcp;
+                    alt.value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{udp_port});
                 }
-            }
+            };
             self.held = held.items;
             self.h3 = endpoint;
-            self.cert = cert_state;
+            self.certs = certs.items;
         }
+
+        /// `address_mod.dualStackAvailable`, asked at most once.
+        const DualStack = struct {
+            known: ?bool = null,
+
+            fn get(d: *DualStack) bool {
+                if (d.known == null) d.known = address_mod.dualStackAvailable();
+                return d.known.?;
+            }
+        };
 
         /// The HTTP/3 endpoint's mutual TLS settings: the TCP listener's
         /// mode, with its CAs (`bundle`, loaded by the caller).
@@ -633,15 +1063,53 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// The socket for one listener in hand-off mode: inherited if one
         /// was passed in under `name` (or at `index`), else opened here.
         /// Null outside hand-off mode (dusty binds).
-        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: std.Io.net.IpAddress) !?handoff.Fd {
+        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
             if (!handoff_mode) return null;
-            if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
-            // SO_REUSEPORT would share the port with whoever has it.
-            try http.checkAddressFree(address);
-            const s = try address.listen(io_, .{ .reuse_address = true });
-            return s.socket.handle;
+            if (inherited) |inh| if (inh.find(name, index)) |fd| {
+                handoff.checkInherited(fd, .listener, address == .ip) catch |err| {
+                    std.log.scoped(.anole).err("inherited fd {any} for listener \"{s}\" is not a listening {s} socket", .{ fd, name, if (address == .ip) "TCP" else "unix" });
+                    return err;
+                };
+                return fd;
+            };
+            switch (address) {
+                .ip => |ip| {
+                    // SO_REUSEPORT would share the port with whoever has it.
+                    try http.checkAddressFree(ip, ipv6_only);
+                    const s = try http.listenIp(io_, ip, .{ .reuse_address = true, .ipv6_only = ipv6_only });
+                    return s.socket.handle;
+                },
+                .unix => |unix| {
+                    try clearStaleUnixSocket(io_, unix);
+                    const s = try unix.listen(io_, .{});
+                    return s.socket.handle;
+                },
+            }
         }
 
+        /// Removes the socket file at `address` when nothing listens on it
+        /// any more (a server that stopped without removing it, as Anole
+        /// never does: a successor may be serving it), so it can be bound
+        /// again. One that something answers on is in use.
+        fn clearStaleUnixSocket(io_: std.Io, address: std.Io.net.UnixAddress) !void {
+            if (address.isAbstract()) return;
+            const cwd = std.Io.Dir.cwd();
+            const stat = cwd.statFile(io_, address.path, .{}) catch return;
+            if (stat.kind != .unix_domain_socket) return;
+            if (address.connect(io_)) |stream| {
+                stream.close(io_);
+                std.log.scoped(.anole).err("unix:{s} is already in use: another process is listening on it", .{address.path});
+                return error.AddressInUse;
+            } else |err| switch (err) {
+                error.ConnectionRefused => cwd.deleteFile(io_, address.path) catch {},
+                else => {},
+            }
+        }
+
+        /// Frees the server and everything it owns: the runtime, the
+        /// listeners, the middleware and helpers it made, and the database
+        /// connectors (closed last made, first). Call it after `run` (or
+        /// `listen`) has returned.
         pub fn deinit(self: *Self) void {
             const extras = self.extras;
             // First: it sends what is queued through the client, on the
@@ -649,6 +1117,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.exporter) |e| e.deinit();
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
+            // The databases, once nothing uses them: last made, first closed.
+            var c = extras.connectors.items.len;
+            while (c > 0) {
+                c -= 1;
+                extras.connectors.items[c].deinit(extras.connectors.items[c].context);
+            }
             // Last added, first freed.
             var i = self.owned_middleware.items.len;
             while (i > 0) {
@@ -660,7 +1134,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.client_registered) client_mod.unregister(&extras.client_entry);
             extras.client.deinit();
             for (extras.dirs.items) |d| d.close(self.rt.io());
-            if (self.cert) |cs| cs.deinit();
+            for (self.certs) |cs| cs.deinit();
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
             server_on_thread = false;
@@ -675,11 +1149,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         /// Serves on `address`, in Go's notation, until SIGINT, SIGTERM or
-        /// `stop`, as `run` does: ":3000" is every IPv4 interface (as in
-        /// a container), "127.0.0.1:3000" or "localhost:3000" this machine
-        /// only, "[::]:3000" every IPv6 interface. HTTP/1.1, and HTTP/2 for
+        /// `stop`, as `run` does: ":3000" is every interface, IPv6 and
+        /// IPv4 alike (as in a container; IPv4 alone where the system has
+        /// no IPv6), "0.0.0.0:3000" every IPv4 interface only,
+        /// "127.0.0.1:3000" or "localhost:3000" this machine only,
+        /// "[::]:3000" every IPv6 interface. HTTP/1.1, and HTTP/2 for
         /// clients that open with its preface (h2c). For a server whose
-        /// `init` options named no listener.
+        /// `init` options named neither `http` nor `https`; it serves the
+        /// options' `listeners` too.
         pub fn listen(self: *Self, address: []const u8) !void {
             var opts = try self.takePending("listen");
             const at = address_mod.parse(address) catch |err| return self.failStart(err);
@@ -699,7 +1176,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             var opts = try self.takePending("listenTls");
             const at = address_mod.parse(address) catch |err| return self.failStart(err);
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
-            if (features.http3 and opts.listen_tls_http3 and opts.http3 == null) opts.http3 = .{};
+            // Unless a listener in `listeners` serves HTTP/3 already.
+            if (features.http3 and opts.listen_tls_http3 and opts.http3 == null and !anyHttp3(opts.listeners)) opts.http3 = .{};
             try self.configure(opts);
             return self.run();
         }
@@ -733,10 +1211,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// function: see `anole.func`), that the server owns: freed with
         /// it, after its `deinit` if it has one. The handle can go into
         /// several groups. A handle given in place of a value is returned
-        /// as it is.
+        /// as it is, and so is a pointer to a middleware kept elsewhere
+        /// (`responseCache`'s).
         pub fn middleware(self: *Self, value: anytype) http.Middleware(Ctx) {
             const T = @TypeOf(value);
             if (T == http.Middleware(Ctx)) return value;
+            // A middleware kept elsewhere (`responseCache`'s).
+            if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .one and
+                @typeInfo(@typeInfo(T).pointer.child) == .@"struct" and @hasDecl(@typeInfo(T).pointer.child, "execute"))
+                return http.Middleware(Ctx).init(value);
             if (comptime handlers.isFn(T)) return self.middleware(handlers.func(value));
             const copy = self.arena.allocator().create(T) catch @panic("OOM");
             copy.* = value;
@@ -759,33 +1242,81 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return handlers.adapt(Ctx, handler);
         }
 
+        /// Adds `handler` at `path` on `target` (the router, or a group),
+        /// behind a `ResponseCache` of its own when it is `anole.cached`.
+        fn register(self: *Self, target: anytype, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+            const H = @TypeOf(handler);
+            if (comptime handlers.isCached(H)) {
+                var settings: ResponseCache.Options = H.cache_options;
+                // Named by its route in metrics.
+                if (settings.name == null) settings.name = std.fmt.allocPrint(self.arena.allocator(), "{s}{s}", .{
+                    if (@TypeOf(target) == *http.Router(Ctx)) "" else target.prefix, path,
+                }) catch @panic("OOM");
+                const cache = self.responseCache(settings);
+                const g = target.group("", &.{http.Middleware(Ctx).init(cache)});
+                return g.addRouteWith(method, path, route(handler), handlers.routeOptions(handler));
+            }
+            target.addRouteWith(method, path, route(handler), handlers.routeOptions(handler));
+        }
+
+        /// A `ResponseCache` owned by the server, for `with`, `group` or
+        /// `use`; it reports to `app.metrics` once serving starts and is
+        /// freed with the server. `anole.cached` makes one per route.
+        ///
+        ///     const pages = app.responseCache(.{ .ttl = .fromSeconds(30), .name = "pages" });
+        ///     app.with(.{pages}).get("/about", about);
+        ///     pages.invalidate(.{ .path = "/about" });
+        pub fn responseCache(self: *Self, settings: ResponseCache.Options) *ResponseCache {
+            const cache = ResponseCache.init(self.gpa, self.rt.io(), settings) catch @panic("OOM");
+            self.extras.connectors.append(self.arena.allocator(), .of(ResponseCache, cache)) catch @panic("OOM");
+            if (self.extras.connectors_started) cache.start(self.extras.metrics, self.extras.exporter, self.extras.health) catch {};
+            return cache;
+        }
+
+        /// Routes GET requests for `path` to `handler`; HEAD too, unless
+        /// `head` registers its own. `path` may have `:name` segments
+        /// (`req.params`) and end in `*name` (the rest of the path).
+        /// `handler` is `fn (req, res) !void` (`*Ctx` first on a server with
+        /// state), or wrapped in `anole.noWait` or `anole.cached`. Panics
+        /// when the route is already registered or conflicts with another.
+        ///
+        ///     app.get("/users/:id", getUser);
         pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.get, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .get, path, handler);
         }
+        /// As `get`, for HEAD.
         pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.head, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .head, path, handler);
         }
+        /// As `get`, for POST.
         pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.post, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .post, path, handler);
         }
+        /// As `get`, for PUT.
         pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.put, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .put, path, handler);
         }
+        /// As `get`, for PATCH.
         pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.patch, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .patch, path, handler);
         }
+        /// As `get`, for DELETE.
         pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.delete, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .delete, path, handler);
         }
+        /// As `get`, for OPTIONS. (`middleware.Cors` answers preflights
+        /// without one.)
         pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.options, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .options, path, handler);
         }
         /// The HTTP QUERY method (a GET with a body).
         pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(.query, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, .query, path, handler);
         }
+        /// As `get`, for every method; a route for a specific method at a
+        /// path wins over it.
         pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.router.addRouteWith(null, path, route(handler), handlers.routeOptions(handler));
+            self.register(self.router, null, path, handler);
         }
 
         /// A WebSocket endpoint at `path`, over HTTP/1.1, HTTP/2 (RFC
@@ -809,6 +1340,28 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn wsWith(self: *Self, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             self.router.get(path, websocket.route(Ctx, handler, upgrade));
+        }
+
+        /// A WebSocket endpoint at `path` served through callbacks:
+        /// `Handlers`'s `message` for each message, and `open` and `close`
+        /// if it declares them (see `anole.websocket.callbacks`). Over
+        /// HTTP/1.1 an idle socket holds no task, only a small heap object,
+        /// which suits many mostly idle sockets better than `ws`:
+        ///
+        ///     const Echo = struct {
+        ///         pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void {
+        ///             try ws.send(msg.type, msg.data);
+        ///         }
+        ///     };
+        ///     app.wsCallbacks("/echo", Echo);
+        pub fn wsCallbacks(self: *Self, path: []const u8, comptime Handlers: type) void {
+            self.wsCallbacksWith(path, Handlers, .{});
+        }
+
+        /// `wsCallbacks` with upgrade options.
+        pub fn wsCallbacksWith(self: *Self, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+            if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+            self.router.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
         }
 
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
@@ -922,8 +1475,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// middleware come after its parent's.
         pub const Group = struct {
             server: *Self,
+            /// The core router's group underneath.
             inner: http.Router(Ctx).Group,
 
+            /// `Server.group`, nested: `prefix` after this group's, and
+            /// `middlewares` after its own.
             pub fn group(g: Group, prefix: []const u8, middlewares: anytype) Group {
                 return .{ .server = g.server, .inner = g.inner.group(prefix, g.server.handles(middlewares)) };
             }
@@ -931,54 +1487,79 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn with(g: Group, middlewares: anytype) Group {
                 return g.group("", middlewares);
             }
+            /// `Server.get` under this group.
             pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.get, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .get, path, handler);
             }
+            /// `Server.head` under this group.
             pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.head, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .head, path, handler);
             }
+            /// `Server.post` under this group.
             pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.post, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .post, path, handler);
             }
+            /// `Server.put` under this group.
             pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.put, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .put, path, handler);
             }
+            /// `Server.patch` under this group.
             pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.patch, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .patch, path, handler);
             }
+            /// `Server.delete` under this group.
             pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.delete, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .delete, path, handler);
             }
+            /// `Server.options` under this group.
             pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.options, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .options, path, handler);
             }
+            /// `Server.query` under this group.
             pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(.query, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, .query, path, handler);
             }
+            /// `Server.any` under this group.
             pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.inner.addRouteWith(null, path, route(handler), handlers.routeOptions(handler));
+                g.server.register(g.inner, null, path, handler);
             }
+            /// `Server.ws` under this group.
             pub fn ws(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.wsWith(path, handler, .{});
             }
+            /// `Server.wsWith` under this group.
             pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
             }
+            /// `Server.wsCallbacks` under this group.
+            pub fn wsCallbacks(g: Group, path: []const u8, comptime Handlers: type) void {
+                g.wsCallbacksWith(path, Handlers, .{});
+            }
+            /// `Server.wsCallbacksWith` under this group.
+            pub fn wsCallbacksWith(g: Group, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+                if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                g.inner.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
+            }
+            /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
                 g.webtransportWith(path, handler, .{});
             }
+            /// `Server.webtransportWith` under this group.
             pub fn webtransportWith(g: Group, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
                 if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
+            /// `Server.static` under this group.
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
                 g.inner.static(prefix, dir, opts);
             }
+            /// `Server.staticDir` under this group.
             pub fn staticDir(g: Group, prefix: []const u8, path: []const u8, opts: http.StaticOptions) !void {
                 g.inner.static(prefix, try g.server.openDir(path), opts);
             }
+            /// `Server.embedded` under this group.
             pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
                 g.inner.embedded(path, data, opts);
             }
@@ -1071,12 +1652,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return out;
         }
 
+        /// Hands the databases what the app observes with, once.
+        fn startConnectors(self: *Self) !void {
+            const extras = self.extras;
+            if (extras.connectors_started) return;
+            extras.connectors_started = true;
+            for (extras.connectors.items) |c| try c.start(c.context, extras.metrics, extras.exporter, extras.health);
+        }
+
         /// The routes `metrics` and `health` left for when serving starts.
         fn addHelperRoutes(self: *Self) void {
             const extras = self.extras;
             if (extras.routes_added) return;
             extras.routes_added = true;
-            if (extras.metrics) |r| r.serveOn(Ctx, self.router, extras.metrics_path);
+            if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
             if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
         }
 
@@ -1094,6 +1683,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return h;
         }
 
+        /// `metrics`' settings.
         pub const MetricsOptions = struct {
             /// Where Prometheus scrapes.
             path: []const u8 = "/metrics",
@@ -1102,6 +1692,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             http: bool = true,
             /// Paths the HTTP metrics leave out.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Serve `path` only on the listener of this name
+            /// (`Options.Listener.name`, an internal port the scraper
+            /// reaches), 404 on the others. Null: on every listener,
+            /// public ones included, and the metrics name routes, errors
+            /// and databases; then keep the port private or put auth
+            /// middleware in front (global `use` middleware runs first).
+            listener: ?[]const u8 = null,
         };
 
         /// Prometheus metrics at `/metrics`, with the HTTP request counts,
@@ -1116,6 +1713,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             r.* = .init(self.gpa, self.rt.io());
             self.extras.metrics = r;
             self.extras.metrics_path = opts.path;
+            self.extras.metrics_listener = opts.listener;
             if (opts.http) self.use(observe.metrics.HttpMetrics.init(r, .{ .exclude = opts.exclude }) catch @panic("OOM"));
             return r;
         }
@@ -1132,6 +1730,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return h;
         }
 
+        /// `tracing`'s settings.
         pub const TracingOptions = struct {
             /// The collector's OTLP/HTTP base URL. Null: the
             /// `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (read
@@ -1143,8 +1742,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             sample_all: bool = true,
             /// Paths not traced.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Spans per export request.
             batch_size: usize = 256,
+            /// How often finished spans are sent, at the latest.
             interval_ms: u32 = 2000,
+            /// Spans held while waiting to be sent; past it, new ones are
+            /// dropped.
             queue_len: usize = 4096,
         };
 
@@ -1158,9 +1761,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.router.has_routes) @panic("app.tracing() adds a middleware, so it goes before the routes, with app.use()");
             const env = if (self.process) |p| p.environ else null;
             const e = try self.arena.allocator().create(observe.trace.Exporter);
-            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), &self.extras.client, .{
-                .endpoint = opts.endpoint orelse (if (env) |v| v.getPosix("OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
-                .service_name = opts.service_name orelse (if (env) |v| v.getPosix("OTEL_SERVICE_NAME") else null) orelse "anole",
+            e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), self.client(), .{
+                .endpoint = opts.endpoint orelse (if (env) |v| envVar(v, "OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
+                .service_name = opts.service_name orelse (if (env) |v| envVar(v, "OTEL_SERVICE_NAME") else null) orelse "anole",
                 .sample_all = opts.sample_all,
                 .exclude = opts.exclude,
                 .batch_size = opts.batch_size,
@@ -1176,73 +1779,197 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return e;
         }
 
-        /// Loads the TLS certificate and key again (from their files, for
-        /// `.files`) and the client CAs of `https.client_auth` (from theirs),
-        /// and switches the HTTPS listener and HTTP/3 to them. Connections
-        /// that start from then on get the new ones; connections already
-        /// open, handshakes in progress included, keep theirs. Session
-        /// tickets issued before still resume. SIGHUP calls it while `run`
-        /// serves.
-        ///
-        /// On an error (a file missing, a key that does not match the
-        /// certificate) nothing changes: the server goes on with what it
-        /// had. Call it from a task of the server's runtime (`io()`); one
-        /// reload runs at a time.
-        pub fn reloadCertificates(self: *Self) !void {
-            const cs = self.cert orelse return error.NoTlsListener;
-            const io_ = self.rt.io();
-            try cs.mutex.lock(io_);
-            defer cs.mutex.unlock(io_);
-            var next: CertState.Pem = if (cs.files) |f|
-                try CertState.load(cs.gpa, io_, .{ .files = .{ .cert_path = f.cert_path, .key_path = f.key_path } })
-            else
-                try CertState.load(cs.gpa, io_, .{ .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key } });
-            errdefer next.deinit(cs.gpa);
-            try self.switchCertificate(cs, next);
+        /// A PostgreSQL database for the handlers, owned by the server:
+        /// `state.db = try app.postgres(.{});` reads `DATABASE_URL` (or
+        /// `options.url`, or libpq's `PG*` variables). No connection opens
+        /// before a handler needs one (unless `connect_at_start`). Once
+        /// serving, it reports to `app.metrics`, `app.tracing` and
+        /// `app.health` (a ping behind `/readyz`) when the app has them,
+        /// and it is closed with the server, after the drain. See
+        /// `anole.pg`.
+        pub fn postgres(self: *Self, config: pg_mod.Options) !*pg_mod.Client {
+            if (comptime !features.postgres) @compileError("app.postgres needs PostgreSQL (-Dpostgres, on in the web and full profiles)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const d = try pg_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer d.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(pg_mod.Client, d));
+            return d;
         }
 
-        /// As `reloadCertificates`, from `cert` instead: new PEM in memory,
-        /// other files, or a fresh development certificate. On success it
-        /// becomes the source later reloads (and SIGHUP) read again.
-        pub fn setCertificate(self: *Self, cert: Options.Cert) !void {
-            const cs = self.cert orelse return error.NoTlsListener;
+        /// Opens a SQLite database (`anole.sqlite`), closed with the server:
+        /// a file, created when missing, or `":memory:"`, one in-memory
+        /// database for the whole app; or `anole.sqlite.Options`. Writes
+        /// run on its writer thread and reads on the blocking pool, which
+        /// this starts when `Options.blocking` did not. When serving starts
+        /// it reports to `metrics`, `tracing` and `/readyz`, whichever the
+        /// app has, and it is closed with the server, after the drain.
+        ///
+        ///     state.db = try app.sqlite("app.db");
+        ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout_ms = 10_000 });
+        pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
+            if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
+            const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {
+                .pointer => .{ .path = config },
+                else => config,
+            };
+            if (self.blocking_pool == null) {
+                const p = try self.arena.allocator().create(blocking.Pool);
+                try p.init(self.rt, .{});
+                self.blocking_pool = p;
+            }
+            const d = try sqlite_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer d.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(sqlite_mod.Client, d));
+            return d;
+        }
+
+        /// A MongoDB client for the handlers, owned by the server:
+        /// `state.db = try app.mongodb(.{});` reads `MONGODB_URI` (or
+        /// `options.url`), else mongodb://localhost:27017. It starts
+        /// monitoring the servers at once; connections for calls open when
+        /// a handler needs one. Once serving, it reports to `app.metrics`,
+        /// `app.tracing` and `app.health` (a ping behind `/readyz`) when the
+        /// app has them, and it is closed with the server, after the drain.
+        /// See `anole.mongodb`.
+        pub fn mongodb(self: *Self, config: mongodb_mod.Options) !*mongodb_mod.Client {
+            if (comptime !features.mongodb) @compileError("app.mongodb needs MongoDB (-Dmongodb, on in the full profile)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const mongo = try mongodb_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer mongo.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(mongodb_mod.Client, mongo));
+            return mongo;
+        }
+
+        /// A Redis or Valkey client for the handlers, owned by the server:
+        /// `state.redis = try app.redis(.{});` reads `REDIS_URL` (or
+        /// `options.url`), else uses `redis://127.0.0.1:6379`. No
+        /// connection opens before a handler needs one (unless
+        /// `connect_at_start`). Once serving, it reports to `app.metrics`,
+        /// `app.tracing` and `app.health` (a PING behind `/readyz`) when
+        /// the app has them, and it is closed with the server, after the
+        /// drain. See `anole.redis`.
+        pub fn redis(self: *Self, config: redis_mod.Options) !*redis_mod.Client {
+            if (comptime !features.redis) @compileError("app.redis needs Redis (-Dredis, on in the full profile)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const r = try redis_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer r.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(redis_mod.Client, r));
+            return r;
+        }
+
+        /// Loads every TLS listener's certificate and key again (from their
+        /// files, for `.files`) and their client CAs (`client_auth`, from
+        /// theirs), and switches the TLS listeners and HTTP/3 to them.
+        /// Connections that start from then on get the new ones;
+        /// connections already open, handshakes in progress included, keep
+        /// theirs. Session tickets issued before still resume. SIGHUP calls
+        /// it while `run` serves.
+        ///
+        /// All or nothing: on an error (a file missing, a key that does not
+        /// match the certificate) nothing changes, on any listener, and the
+        /// server goes on with what it had. Call it from a task of the
+        /// server's runtime (`io()`); one reload runs at a time.
+        pub fn reloadCertificates(self: *Self) !void {
+            if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try cs.mutex.lock(io_);
-            defer cs.mutex.unlock(io_);
-            var next = try CertState.load(cs.gpa, io_, cert);
-            errdefer next.deinit(cs.gpa);
-            try self.switchCertificate(cs, next);
+            try self.extras.cert_mutex.lock(io_);
+            defer self.extras.cert_mutex.unlock(io_);
+            const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
+            defer self.gpa.free(next);
+            var loaded: usize = 0;
+            defer for (next[0..loaded]) |*p| p.deinit(self.gpa);
+            for (self.certs, next) |cs, *n| {
+                n.* = if (cs.files) |f|
+                    try CertState.load(cs.gpa, io_, .{ .files = .{ .cert_path = f.cert_path, .key_path = f.key_path } })
+                else
+                    try CertState.load(cs.gpa, io_, .{ .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key } });
+                loaded += 1;
+            }
+            try self.switchCertificates(next);
+            loaded = 0;
+        }
+
+        /// As `reloadCertificates`, from `cert` instead, for every TLS
+        /// listener: new PEM in memory, other files, or a fresh development
+        /// certificate. On success it becomes the source later reloads (and
+        /// SIGHUP) read again.
+        pub fn setCertificate(self: *Self, cert: Options.Cert) !void {
+            if (self.certs.len == 0) return error.NoTlsListener;
+            const io_ = self.rt.io();
+            try self.extras.cert_mutex.lock(io_);
+            defer self.extras.cert_mutex.unlock(io_);
+            const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
+            defer self.gpa.free(next);
+            var loaded: usize = 0;
+            defer for (next[0..loaded]) |*p| p.deinit(self.gpa);
+            next[0] = try CertState.load(self.gpa, io_, cert);
+            loaded = 1;
+            for (next[1..]) |*n| {
+                n.* = try next[0].dupe(self.gpa);
+                loaded += 1;
+            }
+            try self.switchCertificates(next);
+            loaded = 0;
             // In place now; only the paths are left to remember.
-            cs.setSource(cert) catch |err| {
+            for (self.certs) |cs| cs.setSource(cert) catch |err| {
                 std.log.scoped(.anole).warn("certificate in use, but its source is not remembered for the next reload: {t}", .{err});
                 cs.freeSource();
             };
         }
 
-        /// Puts `next` in place on the TCP listener and HTTP/3, or neither.
-        /// Takes `next` on success. Under `cs.mutex`.
-        fn switchCertificate(self: *Self, cs: *CertState, next: CertState.Pem) !void {
-            const listener_tls = &cs.listener.tls.?;
+        /// Puts `next` (one per `certs`) in place on the TLS listeners and
+        /// HTTP/3, or none of it. Takes `next` on success. Under
+        /// `cert_mutex`.
+        fn switchCertificates(self: *Self, next: []const CertState.Pem) !void {
+            const gpa = self.gpa;
             // HTTP/3's context first: it checks the certificate and key, and
-            // is dropped if the TCP listener's reload fails.
+            // is dropped if the TCP listeners' reload fails.
             var quic: if (features.http3) ?h3.TlsContext else void = if (features.http3) null else {};
             if (comptime features.http3) if (self.h3) |ep| {
-                var client_ca: ?std.crypto.Certificate.Bundle = null;
-                defer if (client_ca) |*b| b.deinit(cs.gpa);
-                if (listener_tls.client_auth) |ca| client_ca = try ca.ca.load(cs.gpa, self.rt.io());
-                quic = try ep.loadTls(next.cert, next.key, h3ClientAuth(listener_tls.client_auth, client_ca));
+                for (self.certs, next) |cs, n| {
+                    const tcp = cs.h3_listener orelse continue;
+                    const client_auth = tcp.tls.?.client_auth;
+                    var client_ca: ?std.crypto.Certificate.Bundle = null;
+                    defer if (client_ca) |*b| b.deinit(gpa);
+                    if (client_auth) |ca| client_ca = try ca.ca.load(gpa, self.rt.io());
+                    quic = try ep.loadTls(n.cert, n.key, h3ClientAuth(client_auth, client_ca));
+                }
             };
             errdefer if (comptime features.http3) if (quic) |*q| q.deinit();
 
-            const before = listener_tls.pem;
-            listener_tls.pem = .{ .cert = next.cert, .key = next.key };
+            const TlsPem = @FieldType(http.ServerConfig.Tls, "pem");
+            var count: usize = 0;
+            for (self.certs) |cs| count += cs.listeners.items.len;
+            const before = try gpa.alloc(TlsPem, count);
+            defer gpa.free(before);
+            var i: usize = 0;
+            for (self.certs, next) |cs, n| for (cs.listeners.items) |l| {
+                before[i] = l.tls.?.pem;
+                l.tls.?.pem = .{ .cert = n.cert, .key = n.key };
+                i += 1;
+            };
             self.server.reloadTls() catch |err| {
-                listener_tls.pem = before;
+                i = 0;
+                for (self.certs) |cs| for (cs.listeners.items) |l| {
+                    l.tls.?.pem = before[i];
+                    i += 1;
+                };
                 return err;
             };
             if (comptime features.http3) if (quic) |q| self.h3.?.useTls(q);
-            cs.pem.deinit(cs.gpa);
-            cs.pem = next;
+            for (self.certs, next) |cs, n| {
+                cs.pem.deinit(cs.gpa);
+                cs.pem = n;
+            }
         }
 
         /// Ends `run`, as a signal would: the server drains and `run`
@@ -1251,8 +1978,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.stopped.set(self.rt.io());
         }
 
-        /// The bound address of each listener (`http` first), once serving;
-        /// a listener given port 0 has its real port here.
+        /// The bound address of each listener (`http`, `https`, then
+        /// `listeners`, in order), once serving; a listener given port 0
+        /// has its real port here.
         pub fn addresses(self: *const Self) []const http.Address {
             return self.server.addresses;
         }
@@ -1266,12 +1994,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and
         /// drains the requests in flight (bounded by `timeout.shutdown`).
-        /// Sets up the listeners first when `init` left them (127.0.0.1:8080
-        /// unless `listen` or `listenTls` named others). Call it from the
+        /// Sets up the listeners first when `init` left them (the options'
+        /// `listeners`, or 127.0.0.1:8080 when there are none, unless
+        /// `listen` or `listenTls` named others). Call it from the
         /// thread that called `init`.
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
+            logBuildMode();
             self.addHelperRoutes();
+            self.startConnectors() catch |err| return self.failStart(err);
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,
@@ -1284,15 +2015,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             var done_buf: [8]Done = undefined;
             var sel = std.Io.Select(Done).init(rt_io, &done_buf);
-            try sel.concurrent(.int, waitForSignal, .{.interrupt});
-            try sel.concurrent(.term, waitForSignal, .{.terminate});
+            if (self.signals) {
+                try sel.concurrent(.int, waitForSignal, .{.interrupt});
+                try sel.concurrent(.term, waitForSignal, .{.terminate});
+            }
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             try sel.concurrent(.served, serve, .{self.server});
             if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
-            const restartable = self.process != null and self.held.len > 0;
-            if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
+            // Windows has neither SIGUSR2 nor SIGHUP (zio maps Ctrl-C to
+            // `.interrupt` and closing the console to `.terminate`): no
+            // restart, and certificates reload by `reloadCertificates` only.
+            // With `signals` off (an embedding process owns them: the C
+            // ABI) none of them is watched.
+            const restartable = self.signals and self.process != null and self.held.len > 0;
+            if (comptime unix_signals) if (restartable) try sel.concurrent(.restart, waitForSignal, .{.user2});
             // SIGHUP reloads the certificate, where there is one.
-            if (self.cert != null) try sel.concurrent(.reload, reloadOnHangup, .{self});
+            if (comptime unix_signals) if (self.signals and self.certs.len > 0) try sel.concurrent(.reload, reloadOnHangup, .{self});
             // Once serving: systemd hears (`NOTIFY_SOCKET`), and a successor
             // tells the predecessor that started it.
             var notify: ?std.Io.Future(void) = if (self.process) |p|
@@ -1307,6 +2045,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (done == .reload) continue;
                 if (done != .restart) break done;
                 // SIGUSR2: start the successor; drain once it serves.
+                if (comptime !unix_signals) unreachable;
                 if (self.restart()) break done;
                 try sel.concurrent(.restart, waitForSignal, .{.user2});
             };
@@ -1378,6 +2117,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
+        /// Which build this is; a loud word for ReleaseFast, which has none
+        /// of Zig's safety checks (docs/server.md recommends ReleaseSafe).
+        fn logBuildMode() void {
+            const log = std.log.scoped(.anole);
+            const name = switch (builtin.mode) {
+                .debug => "Debug",
+                .safe => "ReleaseSafe",
+                .fast => "ReleaseFast",
+                .small => "ReleaseSmall",
+            };
+            switch (builtin.mode) {
+                .fast, .small => log.warn("built with {s}: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production", .{name}),
+                .debug, .safe => log.info("{s} build", .{name}),
+            }
+        }
+
         fn notifyWhenReady(server: *http.Server(Ctx), rt_io: std.Io, process: std.process.Init.Minimal) void {
             // Only a server that is listening tells the predecessor so;
             // one that failed to start leaves it to time out and carry on.
@@ -1385,7 +2140,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // A successor names itself the main process before its
             // predecessor starts to exit.
             const successor = handoff.isSuccessor(process.environ);
-            sd_notify.ready(process.environ, if (successor) std.c.getpid() else null);
+            const main_pid: ?i64 = if (comptime handoff.supported) (if (successor) std.c.getpid() else null) else null;
+            sd_notify.ready(process.environ, main_pid);
             handoff.notifyReady(process.environ);
         }
 
@@ -1497,7 +2253,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             const io_ = a.io();
             const alloc = std.testing.allocator;
             try a.waitReady();
-            var bundle = try tls.testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
+            var bundle = try tls_testing.bundleFromPem(alloc, std.Io.Clock.real.now(io_).toSeconds(), p.cert);
             defer bundle.deinit(alloc);
             // The certificate's DER: the bundle holds exactly it.
             const der = bundle.bytes.items;
@@ -1506,7 +2262,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
             // HTTP/1.1, without a certificate and with one.
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/peer", .{port});
-            const ca: http.dusty_module.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
+            const ca: http.core.TlsCa = .{ .file = .{ .path = "cert.pem", .dir = dir } };
             {
                 var anon = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
                 defer anon.deinit();
@@ -1785,18 +2541,23 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
 
             // SIGHUP, once `run` listens for it.
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[2].cert });
-            var armed = false;
-            for (0..500) |_| {
-                var current: std.posix.Sigaction = undefined;
-                std.posix.sigaction(.HUP, null, &current);
-                if (current.handler.handler != std.posix.SIG.DFL) {
-                    armed = true;
-                    break;
+            if (comptime unix_signals) {
+                var armed = false;
+                for (0..500) |_| {
+                    var current: std.posix.Sigaction = undefined;
+                    std.posix.sigaction(.HUP, null, &current);
+                    if (current.handler.handler != std.posix.SIG.DFL) {
+                        armed = true;
+                        break;
+                    }
+                    try io_.sleep(.fromMilliseconds(10), .awake);
                 }
-                try io_.sleep(.fromMilliseconds(10), .awake);
+                try std.testing.expect(armed);
+                _ = std.c.kill(std.c.getpid(), std.c.SIG.HUP);
+            } else {
+                // No SIGHUP on Windows: the call it makes.
+                try a.reloadCertificates();
             }
-            try std.testing.expect(armed);
-            _ = std.c.kill(std.c.getpid(), std.c.SIG.HUP);
             const switched = for (0..300) |_| {
                 if (ReloadCheck.h1(io_, port, dir, "ca2.pem")) |_| break true else |_| {}
                 try io_.sleep(.fromMilliseconds(10), .awake);
@@ -1957,4 +2718,279 @@ test "anole.Server: use, group and middleware copy what they are given, and dein
     }
     // The `use` copy, `shared`, and the copy in the "/api" group.
     try std.testing.expectEqual(@as(u32, 3), deinits);
+}
+
+/// Raw HTTP/1.1 over one connection, for the listener tests: the whole
+/// answer (up to 4 KiB), empty when the server closes without one.
+const RawGet = struct {
+    fn over(io_: std.Io, stream: std.Io.net.Stream, path: []const u8, out: []u8) ![]const u8 {
+        defer stream.close(io_);
+        var wbuf: [256]u8 = undefined;
+        var w = stream.writer(io_, &wbuf);
+        try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+        try w.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io_, &rbuf);
+        var fw: std.Io.Writer = .fixed(out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        return fw.buffered();
+    }
+
+    fn ip(io_: std.Io, address: std.Io.net.IpAddress, path: []const u8, out: []u8) ![]const u8 {
+        return over(io_, try address.connect(io_, .{ .mode = .stream }), path, out);
+    }
+};
+
+fn handleListenerName(req: *http.Request, res: *http.Response) !void {
+    try res.print(.text, "on {s}", .{req.listener.name});
+}
+
+test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 + h3 with Alt-Svc, a unix socket, TLS h2 only, onlyOn" {
+    if (comptime features.tls != .boringssl or !features.http2 or !features.http3) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pem = try tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    const cert: Options.Cert = .fromPem(pem.cert, pem.key);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Relative: a unix socket path has room for about 104 bytes.
+    const sock_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/s.sock", .{tmp.sub_path});
+    defer gpa.free(sock_path);
+
+    var app = try Server(void).init(gpa, .{
+        .listeners = &.{
+            .{ .name = "plain", .port = 0 },
+            .{ .name = "h1tls", .port = 0, .tls = .{ .cert = cert }, .http2 = false },
+            .{ .name = "h2c", .port = 0, .http1 = false },
+            .{ .name = "tls", .port = 0, .tls = .{ .cert = cert }, .http3 = true },
+            .{ .name = "admin", .port = 0 },
+            .{ .unix = sock_path },
+            .{ .name = "h2tls", .port = 0, .tls = .{ .cert = cert }, .http1 = false },
+        },
+        .executors = .exact(2),
+    }, {});
+    defer app.deinit();
+    app.get("/", handleListenerName);
+    app.group("/admin", .{onlyOn("admin")}).get("/stats", handleListenerName);
+
+    const Check = struct {
+        const h2c = @import("anole_h2_client");
+        const alloc = std.testing.allocator;
+
+        fn h2Get(conn: *h2c.ClientConnection, path: []const u8) ![]u8 {
+            const s = try conn.request(&.{
+                .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
+                .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+            }, .{});
+            defer s.release();
+            try s.waitHead();
+            if (s.status != 200) return error.UnexpectedStatus;
+            return s.reader().allocRemaining(alloc, .unlimited);
+        }
+
+        fn expectH2(conn: *h2c.ClientConnection, want: []const u8) !void {
+            defer conn.close();
+            const body = try h2Get(conn, "/");
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings(want, body);
+        }
+
+        fn run(a: *Server(void), p: *const tls.Pem, path: []const u8) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const addrs = a.addresses();
+            try std.testing.expectEqual(@as(usize, 7), addrs.len);
+            const plain = addrs[0].ip;
+            const h1tls = addrs[1].ip.getPort();
+            const h2c_only = addrs[2].ip;
+            const tls_port = addrs[3].ip.getPort();
+            const admin = addrs[4].ip;
+            var out: [4096]u8 = undefined;
+
+            // HTTP/1.1 and h2c on one port; no Alt-Svc on cleartext.
+            var resp = try RawGet.ip(io_, plain, "/", &out);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+            try std.testing.expect(std.mem.endsWith(u8, resp, "on plain"));
+            try std.testing.expect(std.mem.indexOf(u8, resp, "Alt-Svc") == null);
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{ .host = "127.0.0.1", .port = plain.getPort() }), "on plain");
+
+            // h2c only: HTTP/1.1 gets the connection closed, unanswered.
+            resp = try RawGet.ip(io_, h2c_only, "/", &out);
+            try std.testing.expectEqual(@as(usize, 0), resp.len);
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{ .host = "127.0.0.1", .port = h2c_only.getPort() }), "on h2c");
+
+            // TLS, HTTP/1.1 only: a client that offers h2 alone does not
+            // get it; one that offers both gets HTTP/1.1. No Alt-Svc.
+            const ca: http.core.TlsCa = .{ .pem = p.cert };
+            try std.testing.expect(std.meta.isError(h2c.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .port = h1tls,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+            })));
+            var client = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca } });
+            defer client.deinit();
+            var url_buf: [64]u8 = undefined;
+            {
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h1tls}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on h1tls", (try r.body()).?);
+                try std.testing.expect(r.headers().get("Alt-Svc") == null);
+            }
+
+            // TLS with HTTP/2 and HTTP/3, advertised on this listener.
+            const q = a.http3Address().?;
+            var alt_buf: [64]u8 = undefined;
+            const alt = try std.fmt.bufPrint(&alt_buf, "h3=\":{d}\"; ma=86400", .{q.getPort()});
+            {
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{tls_port}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on tls", (try r.body()).?);
+                try std.testing.expectEqualStrings(alt, r.headers().get("Alt-Svc").?);
+            }
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .port = tls_port,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+            }), "on tls");
+            {
+                const conn = try h3.ClientConnection.connect(alloc, io_, .{
+                    .host = "localhost",
+                    .address = q,
+                    .port = q.getPort(),
+                    .tls = .{ .ca = .{ .pem = p.cert } },
+                });
+                defer conn.close();
+                const s = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/" },
+                    .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer s.release();
+                try s.waitHead();
+                const body = try s.reader().allocRemaining(alloc, .unlimited);
+                defer alloc.free(body);
+                // HTTP/3 requests report the TLS listener they serve.
+                try std.testing.expectEqualStrings("on tls", body);
+            }
+
+            // onlyOn: /admin on its listener alone.
+            resp = try RawGet.ip(io_, admin, "/admin/stats", &out);
+            try std.testing.expect(std.mem.endsWith(u8, resp, "on admin"));
+            resp = try RawGet.ip(io_, plain, "/admin/stats", &out);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 404 "));
+
+            // The unix socket, named after its path.
+            const unix = try std.Io.net.UnixAddress.init(path);
+            resp = try RawGet.over(io_, try unix.connect(io_), "/", &out);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+            var name_buf: [128]u8 = undefined;
+            try std.testing.expect(std.mem.endsWith(u8, resp, try std.fmt.bufPrint(&name_buf, "on unix-{s}", .{path})));
+
+            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone (as
+            // the HTTP client does by default) is not served.
+            const h2tls = addrs[6].ip.getPort();
+            try std.testing.expect(std.meta.isError(client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+            try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .port = h2tls,
+                .tls = .{ .ca = .{ .pem = p.cert } },
+            }), "on h2tls");
+        }
+    };
+    var client_future = try app.io().concurrent(Check.run, .{ &app, &pem, sock_path });
+    try app.run();
+    try client_future.await(app.io());
+    // Every TLS listener named the same certificate: one copy.
+    try std.testing.expectEqual(@as(usize, 1), app.certs.len);
+    try std.testing.expectEqual(@as(usize, 3), app.certs[0].listeners.items.len);
+}
+
+test "anole.Server: listeners that cannot be set up are refused, with what is wrong" {
+    const S = Server(void);
+    const Case = struct { opts: Options, err: anyerror };
+    const cert: Options.Cert = .dev_self_signed;
+    const cases = [_]Case{
+        .{ .opts = .{ .listeners = &.{ .{ .name = "a" }, .{ .name = "a" } } }, .err = error.DuplicateListenerName },
+        // `http` is "http".
+        .{ .opts = .{ .http = .{}, .listeners = &.{.{ .name = "http" }} }, .err = error.DuplicateListenerName },
+        .{ .opts = .{ .listeners = &.{.{ .name = "a:b" }} }, .err = error.InvalidListenerName },
+        .{ .opts = .{ .listeners = &.{.{ .http1 = false, .http2 = false }} }, .err = error.NoProtocols },
+        .{ .opts = .{ .listeners = &.{.{ .http3 = true }} }, .err = if (features.http3) error.Http3NeedsTls else error.Http3NotBuilt },
+        .{ .opts = .{ .listeners = &.{
+            .{ .port = 1, .tls = .{ .cert = cert }, .http3 = true },
+            .{ .port = 2, .tls = .{ .cert = cert }, .http3 = true },
+        } }, .err = if (features.http3) error.SeveralHttp3Listeners else error.Http3NotBuilt },
+        .{ .opts = .{ .http3 = .{}, .listeners = &.{.{ .tls = .{ .cert = cert } }} }, .err = if (features.http3) error.Http3NeedsHttps else error.Http3NotBuilt },
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    for (cases) |c| {
+        const specs = try S.listenerSpecs(arena.allocator(), c.opts);
+        var why_buf: [512]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        try std.testing.expectError(c.err, S.checkSpecs(specs, c.opts, &why));
+        try std.testing.expect(why.buffered().len > 0);
+    }
+    // The names made up for listeners without one, unique on port 0 too.
+    const specs = try S.listenerSpecs(arena.allocator(), .{
+        .http = .{},
+        .listeners = &.{ .{ .port = 0 }, .{ .port = 0 }, .{ .port = 9443, .tls = .{ .cert = cert } }, .{ .unix = "/run/app.sock" } },
+    });
+    var names: [5][]const u8 = undefined;
+    for (specs, &names) |spec, *n| n.* = spec.name;
+    for ([_][]const u8{ "http", "http-0", "http-0-2", "https-9443", "unix-/run/app.sock" }, names) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "anole.Server: the open-file limit is raised, and max_connections follows it unless set" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const before = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, before) catch {};
+    var low = before;
+    low.cur = @min(before.max, 512);
+    try std.posix.setrlimit(.NOFILE, low);
+
+    {
+        // Two listeners, one socket each (one per executor on Linux).
+        var app = try App.init(gpa, .{
+            .listeners = &.{ .{ .port = 0 }, .{ .port = 0 } },
+            .executors = .exact(2),
+        });
+        defer app.deinit();
+        const soft = http.fd_limit.softLimit().?;
+        if (before.max > 512) try std.testing.expect(soft > 512);
+        const Run = struct {
+            fn run(a: *App, limit: u64) !void {
+                defer a.stop();
+                try a.waitReady();
+                const sockets: usize = if (builtin.os.tag == .linux) 4 else 2;
+                try std.testing.expectEqual(http.fd_limit.maxConnections(limit, 2, sockets), a.server.config.max_connections.?);
+            }
+        };
+        var f = try app.io().concurrent(Run.run, .{ &app, soft });
+        try app.run();
+        try f.await(app.io());
+    }
+
+    // Set: kept as it is; and with `raise_fd_limit` off, the limit is left
+    // alone.
+    try std.posix.setrlimit(.NOFILE, low);
+    var capped = try App.init(gpa, .{
+        .listeners = &.{.{ .port = 0 }},
+        .executors = .exact(1),
+        .raise_fd_limit = false,
+        .server = .{ .max_connections = 77 },
+    });
+    defer capped.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(low.cur)), http.fd_limit.softLimit().?);
+    const Capped = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            try a.waitReady();
+            try std.testing.expectEqual(@as(?u32, 77), a.server.config.max_connections);
+        }
+    };
+    var g = try capped.io().concurrent(Capped.run, .{&capped});
+    try capped.run();
+    try g.await(capped.io());
 }

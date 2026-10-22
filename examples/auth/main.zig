@@ -14,10 +14,10 @@
 //!   GET  /service/stats needs `X-API-Key: ak_...`
 //!
 //! Users: alice (editor) and bob (reader), both with the password
-//! "demo-password". Every secret here (the session key, the JWT key, the
-//! API key, the password hashes) is made at startup and printed or kept in
-//! memory only, so nothing survives a restart. docs/auth.md walks through
-//! the routes with curl.
+//! "demo-password". Every secret here (the JWT key, the API key, the
+//! password hashes, and the session key unless SESSION_KEY sets it) is
+//! made at startup and printed or kept in memory only, so nothing survives
+//! a restart. docs/auth.md walks through the routes with curl.
 const std = @import("std");
 const anole = @import("anole");
 const auth = anole.auth;
@@ -25,6 +25,8 @@ const auth = anole.auth;
 /// Keeps the runtime's per-thread lines and the connection loops' debug
 /// lines out of a Debug build; info (startup lines, access log) stays.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const issuer = "anole-auth-example";
 const demo_password = "demo-password";
@@ -135,7 +137,7 @@ fn lookupKey(ptr: ?*anyopaque, _: std.mem.Allocator, digest: auth.apikey.Digest)
 
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8084;
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
     const arena = init.arena.allocator();
@@ -157,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
 
     // A demo HS256 key, pinned to that algorithm, and a token signed with it.
     var jwt_secret: [32]u8 = undefined;
-    io.random(&jwt_secret);
+    try io.randomSecure(&jwt_secret); // a long-lived secret: from the OS, never a fallback
     const jwt_keys = [_]auth.Key{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = &jwt_secret } }};
     const now = std.Io.Clock.real.now(io).toSeconds();
     var signer = auth.jwt.SigningMethodHS256.init(arena);
@@ -170,11 +172,15 @@ pub fn main(init: std.process.Init) !void {
         .exp = now + 3600,
     }, &jwt_secret);
 
-    // Sessions sealed in the cookie (XChaCha20-Poly1305), with a key made
-    // here; give every node the same key from your secret store instead.
-    var session_key: [anole.session.key_length]u8 = undefined;
-    io.random(&session_key);
-    var sessions = anole.session.Middleware.init(.{ .key = session_key });
+    // Sessions sealed in the cookie (XChaCha20-Poly1305). The key comes
+    // from SESSION_KEY (32 random bytes in base64, `openssl rand -base64
+    // 32`), the same on every node, as in production; without it, a random
+    // development key, with a warning in the log.
+    const session_key = if (init.environ_map.get("SESSION_KEY")) |text|
+        try anole.session.keyFromBase64(text)
+    else
+        anole.session.devKey(io);
+    var sessions = try anole.session.Middleware.init(.{ .key = session_key });
     var csrf = auth.csrf.Middleware.init(.{});
     var limiter = anole.ratelimit.MemoryLimiter.init(init.gpa, io, .{});
     defer limiter.deinit();

@@ -36,16 +36,49 @@ pub const CidKey = struct {
     len: u8,
     bytes: [c.NGTCP2_MAX_CIDLEN]u8,
 
-    pub fn of(data: []const u8) CidKey {
+    /// Null when `data` is longer than any connection ID can be.
+    pub fn of(data: []const u8) ?CidKey {
+        if (data.len > c.NGTCP2_MAX_CIDLEN) return null;
         var k: CidKey = .{ .len = @intCast(data.len), .bytes = @splat(0) };
         @memcpy(k.bytes[0..data.len], data);
         return k;
     }
 
+    /// An ID ngtcp2 made or decoded, so never over the limit.
     pub fn ofCid(cid: *const c.ngtcp2_cid) CidKey {
-        return of(cid.data[0..cid.datalen]);
+        return of(cid.data[0..@min(cid.datalen, c.NGTCP2_MAX_CIDLEN)]).?;
     }
 };
+
+/// What a server endpoint makes of a datagram from its first bytes.
+pub const Incoming = union(enum) {
+    /// Not for us: malformed, a Version Negotiation packet (servers never
+    /// take one), or a long header with an ID longer than QUIC allows.
+    drop,
+    /// A long header with a version we do not speak.
+    version_negotiation: c.ngtcp2_version_cid,
+    /// A packet to look up by its destination ID.
+    packet: struct { vc: c.ngtcp2_version_cid, dcid: CidKey },
+};
+
+/// Classifies `data` (one datagram); `short_dcidlen` is the length of the
+/// server's own IDs.
+pub fn classify(data: []const u8, short_dcidlen: usize) Incoming {
+    if (data.len == 0) return .drop;
+    var vc: c.ngtcp2_version_cid = undefined;
+    switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, short_dcidlen)) {
+        0 => {},
+        // Echoed back as they came, whatever their length (RFC 8999).
+        c.NGTCP2_ERR_VERSION_NEGOTIATION => return .{ .version_negotiation = vc },
+        else => return .drop,
+    }
+    // ngtcp2 checks the ID lengths only for the versions it speaks, and
+    // reports a Version Negotiation packet (version 0) as a success.
+    if (data[0] & 0x80 != 0 and vc.version == 0) return .drop;
+    if (vc.scidlen > c.NGTCP2_MAX_CIDLEN) return .drop;
+    const dcid = CidKey.of(vc.dcid[0..vc.dcidlen]) orelse return .drop;
+    return .{ .packet = .{ .vc = vc, .dcid = dcid } };
+}
 
 /// For nghttp3's `rand` callback, which gets no user data: the `Io` the
 /// last endpoint or client was made with.
@@ -67,7 +100,9 @@ pub fn wallClock(io: std.Io) u64 {
 
 /// A UDP socket with SO_REUSEPORT, bound to `address`: one of a group that
 /// share it (`steer`). Blocking; whoever adopts it makes it otherwise.
-pub fn bindReusePort(address: std.Io.net.IpAddress) !std.posix.fd_t {
+/// `ipv6_only` sets IPV6_V6ONLY on an IPv6 address (false: dual-stack).
+pub fn bindReusePort(address: std.Io.net.IpAddress, ipv6_only: ?bool) !std.posix.fd_t {
+    if (comptime @import("builtin").os.tag == .windows) return error.ReusePortFailed;
     const posix = std.posix;
     const family: c_int = switch (address) {
         .ip4 => posix.AF.INET,
@@ -79,6 +114,7 @@ pub fn bindReusePort(address: std.Io.net.IpAddress) !std.posix.fd_t {
     _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
     const one: c_int = 1;
     if (std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int)) != 0) return error.ReusePortFailed;
+    try setIpv6Only(fd, address, ipv6_only);
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (std.c.bind(fd, &storage.any, len) != 0) return switch (std.posix.errno(@as(c_int, -1))) {
@@ -97,7 +133,10 @@ pub fn bindReusePort(address: std.Io.net.IpAddress) !std.posix.fd_t {
 /// probe sets no option at all, since UDP has no TIME_WAIT to tolerate and
 /// a probe with SO_REUSEADDR would join sockets that set it too. Port zero
 /// is not checked, and nothing is when the probe cannot be had.
-pub fn checkUdpAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void {
+pub fn checkUdpAddressFree(address: std.Io.net.IpAddress, ipv6_only: ?bool) error{AddressInUse}!void {
+    // Windows has no SO_REUSEPORT group to join: one socket, whose own
+    // bind fails on a port in use.
+    if (comptime @import("builtin").os.tag == .windows) return;
     if (address.getPort() == 0) return;
     const posix = std.posix;
     const family: c_int = switch (address) {
@@ -107,6 +146,9 @@ pub fn checkUdpAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!vo
     const fd = std.c.socket(@intCast(family), posix.SOCK.DGRAM, posix.IPPROTO.UDP);
     if (fd < 0) return;
     defer _ = std.c.close(fd);
+    // The probe covers what the real socket will: both families for a
+    // dual-stack one.
+    setIpv6Only(fd, address, ipv6_only) catch return;
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (std.c.bind(fd, &storage.any, len) != 0 and std.posix.errno(@as(c_int, -1)) == .ADDRINUSE) {
@@ -118,13 +160,32 @@ pub fn checkUdpAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!vo
     }
 }
 
+/// Whether `address` is IPv4-mapped IPv6 (`::ffff:a.b.c.d`): how a
+/// dual-stack socket names an IPv4 peer.
+pub fn isIpv4Mapped(address: std.Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => false,
+        .ip6 => |a| std.mem.eql(u8, a.bytes[0..12], &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }),
+    };
+}
+
+/// IPV6_V6ONLY on `fd` as `ipv6_only` says, when `address` is IPv6.
+fn setIpv6Only(fd: std.posix.fd_t, address: std.Io.net.IpAddress, ipv6_only: ?bool) error{Ipv6OnlyFailed}!void {
+    const v6only = ipv6_only orelse return;
+    if (address != .ip6) return;
+    const value: c_int = @intFromBool(v6only);
+    if (std.c.setsockopt(fd, std.posix.IPPROTO.IPV6, std.posix.IPV6.V6ONLY, &value, @sizeOf(c_int)) != 0) return error.Ipv6OnlyFailed;
+}
+
 /// A UDP socket set up for QUIC, after ngtcp2's examples/shared.cc and
 /// server.cc (MIT): ECN codepoints in and out, the local address of each
 /// datagram when bound to a wildcard address (PKTINFO, so replies leave
 /// from the address the peer wrote to), don't-fragment so path MTU
 /// discovery measures the real path, and on Linux segmentation offload
 /// both ways (GSO, GRO). Every option is best-effort: without it QUIC still
-/// works, just with less information.
+/// works, just with less information. On Windows (a development target)
+/// none is set and no control messages pass: no ECN, and replies leave a
+/// wildcard socket from the address the system picks.
 pub const Udp = struct {
     socket: std.Io.net.Socket,
     ip6: bool,
@@ -139,6 +200,10 @@ pub const Udp = struct {
     const linux = std.os.linux;
     const cmsg = std.Io.net.cmsg;
 
+    /// Whether datagrams carry control messages (ECN, PKTINFO, GSO/GRO):
+    /// not on Windows.
+    pub const has_control = native_os != .windows;
+
     /// Room for the control messages either way.
     pub const control_len = 128;
     pub const Control = [control_len]u8;
@@ -150,10 +215,15 @@ pub const Udp = struct {
             .ip6 => |a| std.mem.allEqual(u8, &a.bytes, 0),
         };
         var self: Udp = .{ .socket = socket, .ip6 = ip6, .wildcard = wildcard };
+        if (comptime !has_control) return self;
         const fd = socket.handle;
         if (ip6) {
             _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVTCLASS, 1);
             if (wildcard) _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVPKTINFO, 1);
+            // A dual-stack socket's IPv4 datagrams carry their TOS byte as
+            // IP_TOS, asked for at the IPv4 level (Linux); their local
+            // address comes as an IPv4-mapped IPV6_PKTINFO.
+            if (native_os == .linux and !ipv6Only(fd)) _ = setOption(fd, posix.IPPROTO.IP, posix.IP.RECVTOS, 1);
         } else {
             _ = setOption(fd, posix.IPPROTO.IP, posix.IP.RECVTOS, 1);
             if (wildcard) _ = setOption(fd, posix.IPPROTO.IP, posix.IP.PKTINFO, 1);
@@ -173,6 +243,14 @@ pub const Udp = struct {
                 _ = setOption(fd, posix.IPPROTO.IP, posix.IP.DONTFRAG, 1);
         }
         return self;
+    }
+
+    /// Whether an IPv6 socket takes IPv6 alone (IPV6_V6ONLY).
+    fn ipv6Only(fd: posix.socket_t) bool {
+        var value: c_int = 1;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @ptrCast(&value), &len) != 0) return true;
+        return value != 0;
     }
 
     fn setOption(fd: posix.socket_t, level: i32, name: u32, value: c_int) bool {
@@ -206,7 +284,7 @@ pub const Udp = struct {
 
     pub fn receive(self: *const Udp, io: std.Io, buf: []u8, control: *align(cmsg_align) Control, timeout: std.Io.Timeout) ReceiveError!Datagram {
         var msg: std.Io.net.IncomingMessage = .init;
-        msg.control = control;
+        if (comptime has_control) msg.control = control;
         const err, const count = self.socket.receiveManyTimeout(io, (&msg)[0..1], buf, .{}, timeout);
         if (err) |e| return e;
         std.debug.assert(count == 1);
@@ -240,7 +318,7 @@ pub const Udp = struct {
         std.debug.assert(buf.len >= batch_buffer_len);
         for (&batch.msgs, &batch.controls) |*m, *ctl| {
             m.* = .init;
-            m.control = ctl;
+            if (comptime has_control) m.control = ctl;
         }
         const err, const count = self.socket.receiveManyTimeout(io, &batch.msgs, buf, .{}, timeout);
         batch.count = count;
@@ -252,6 +330,7 @@ pub const Udp = struct {
 
     fn datagramOf(self: *const Udp, msg: *const std.Io.net.IncomingMessage) Datagram {
         var d: Datagram = .{ .from = msg.from, .local = null, .ecn = 0, .data = msg.data, .segment = msg.data.len };
+        if (comptime !has_control) return d;
         var it: cmsg.Iterator = .{ .control = @alignCast(msg.control) };
         while (it.next()) |m| {
             const level = m.header.level;
@@ -296,7 +375,7 @@ pub const Udp = struct {
             return;
         }
         var control: Control align(cmsg_align) = undefined;
-        const w = self.controlFor(&control, local, ecn, data.len, seg);
+        const w = self.controlFor(&control, to, local, ecn, data.len, seg);
         var msg: std.Io.net.OutgoingMessage = .{ .address = &to, .data_ptr = data.ptr, .data_len = data.len, .control = control[0..w] };
         const err, _ = self.socket.sendManyTimeout(io, (&msg)[0..1], .{}, .none);
         if (err) |e| {
@@ -315,25 +394,36 @@ pub const Udp = struct {
     }
 
     /// The control messages a datagram of `len` bytes (several of
-    /// `segment` each, with GSO, when longer) goes out with: its source
-    /// address on a wildcard socket, its ECN codepoint, the segment size.
-    /// Returns the bytes used.
-    fn controlFor(self: *const Udp, control: *align(cmsg_align) Control, local: ?std.Io.net.IpAddress, ecn: u8, len: usize, segment: usize) usize {
+    /// `segment` each, with GSO, when longer) to `to` goes out with: its
+    /// source address on a wildcard socket, its ECN codepoint, the segment
+    /// size. Returns the bytes used.
+    ///
+    /// An IPv4 peer of a dual-stack socket has an IPv4-mapped address:
+    /// Linux sends to it through its IPv4 path, which takes the source as
+    /// a mapped IPV6_PKTINFO and the ECN codepoint as IP_TOS (not
+    /// IPV6_TCLASS). Other systems get neither for such a peer, and pick
+    /// the source themselves (ngtcp2 then finds ECN does not get through
+    /// and stops marking).
+    fn controlFor(self: *const Udp, control: *align(cmsg_align) Control, to: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, len: usize, segment: usize) usize {
+        if (comptime !has_control) return 0;
         var w: usize = 0;
+        const mapped = self.ip6 and isIpv4Mapped(to);
+        if (mapped and native_os != .linux) return 0;
         if (self.wildcard) if (local) |l| switch (l) {
             .ip4 => |a| {
                 var pi = std.mem.zeroes(std.c.in_pktinfo);
                 pi.spec_dst = std.mem.bytesToValue(u32, &a.bytes);
                 w += put(control[w..], posix.IPPROTO.IP, posix.IP.PKTINFO, std.mem.asBytes(&pi));
             },
-            .ip6 => |a| {
+            // Linux refuses a mapped peer's source unless it is mapped too.
+            .ip6 => |a| if (!mapped or isIpv4Mapped(l)) {
                 var pi = std.mem.zeroes(std.c.in6_pktinfo);
                 pi.addr = a.bytes;
                 w += put(control[w..], posix.IPPROTO.IPV6, posix.IPV6.PKTINFO, std.mem.asBytes(&pi));
             },
         };
         const tos: c_int = ecn;
-        if (self.ip6)
+        if (self.ip6 and !mapped)
             w += put(control[w..], posix.IPPROTO.IPV6, posix.IPV6.TCLASS, std.mem.asBytes(&tos))
         else
             w += put(control[w..], posix.IPPROTO.IP, posix.IP.TOS, std.mem.asBytes(&tos));
@@ -416,7 +506,7 @@ pub const Udp = struct {
                 o.addrs[i] = to;
                 o.locals[i] = local;
                 o.ecns[i] = ecn;
-                const w = udp.controlFor(&o.controls[i], local, ecn, len, seg);
+                const w = udp.controlFor(&o.controls[i], to, local, ecn, len, seg);
                 o.msgs[i] = .{ .address = &o.addrs[i], .data_ptr = o.buf[at..].ptr, .data_len = len, .control = o.controls[i][0..w] };
                 o.count += 1;
                 o.datagrams += std.math.divCeil(usize, len, seg) catch unreachable;
@@ -461,7 +551,8 @@ pub const Udp = struct {
 
     /// The UDP_SEGMENT size among a message's control messages; 0 for none.
     fn segmentOf(control: []const u8) usize {
-        if (native_os != .linux or control.len == 0) return 0;
+        if (comptime native_os != .linux) return 0;
+        if (control.len == 0) return 0;
         var it: cmsg.Iterator = .{ .control = @alignCast(@constCast(control)) };
         while (it.next()) |m| if (m.header.level == posix.IPPROTO.UDP and m.header.type == linux.UDP.SEGMENT and m.data.len >= 2)
             return std.mem.readInt(u16, m.data[0..2], native_endian);
@@ -485,6 +576,75 @@ pub const Udp = struct {
 const cmsg_align = std.Io.net.cmsg_align;
 const native_endian = @import("builtin").cpu.arch.endian();
 const log = std.log.scoped(.anole_h3);
+
+fn rep(comptime ch: u8, comptime n: usize) *const [n]u8 {
+    const a: [n]u8 = @splat(ch);
+    return &a;
+}
+
+fn longHeader(buf: []u8, version: u32, dcidlen: u8, len: usize) []u8 {
+    @memset(buf[0..len], 0xab);
+    buf[0] = 0xc0;
+    std.mem.writeInt(u32, buf[1..5], version, .big);
+    buf[5] = dcidlen;
+    buf[6 + @as(usize, dcidlen)] = 0;
+    return buf[0..len];
+}
+
+test "classify: long-header IDs over 20 bytes, and Version Negotiation packets, are dropped" {
+    var buf: [1300]u8 = undefined;
+    // Version 0 with a 200-byte ID: ngtcp2 decodes it as a success.
+    try std.testing.expect(classify(longHeader(&buf, 0, 200, 208), 18) == .drop);
+    try std.testing.expect(classify(longHeader(&buf, 0, 21, 28), 18) == .drop);
+    // Version 0 with a valid ID length: still not for a server.
+    try std.testing.expect(classify(longHeader(&buf, 0, 8, 16), 18) == .drop);
+    // Version 1 with a 21-byte ID.
+    try std.testing.expect(classify(longHeader(&buf, 1, 21, 1300), 18) == .drop);
+    // Version 1 with a 20-byte ID: looked up.
+    switch (classify(longHeader(&buf, 1, 20, 1300), 18)) {
+        .packet => |p| try std.testing.expectEqual(@as(u8, 20), p.dcid.len),
+        else => return error.TestUnexpectedResult,
+    }
+    // An unknown version, padded: answered with Version Negotiation.
+    try std.testing.expect(classify(longHeader(&buf, 0x1a2a3a4a, 200, 1300), 18) == .version_negotiation);
+    // Short header: our ID length, version 0 as ngtcp2 reports it.
+    @memset(&buf, 0x41);
+    buf[0] = 0x40;
+    switch (classify(buf[0..40], 18)) {
+        .packet => |p| try std.testing.expectEqual(@as(u8, 18), p.dcid.len),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(classify(buf[0..5], 18) == .drop);
+    try std.testing.expect(classify(buf[0..0], 18) == .drop);
+    try std.testing.expect(CidKey.of(&@as([21]u8, @splat(0))) == null);
+}
+
+test "fuzz: the endpoint's first look at a datagram never yields an ID over 20 bytes" {
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            switch (classify(input, 18)) {
+                .drop => {},
+                .version_negotiation => |vc| {
+                    // Echoed back: a reply must fit the largest UDP payload.
+                    var out: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
+                    const versions = [_]u32{ 0x0a0a0a0a, c.NGTCP2_PROTO_VER_V1 };
+                    _ = c.ngtcp2_pkt_write_version_negotiation(&out, out.len, 0, vc.scid, vc.scidlen, vc.dcid, vc.dcidlen, &versions, versions.len);
+                },
+                .packet => |p| {
+                    try std.testing.expect(p.dcid.len <= c.NGTCP2_MAX_CIDLEN);
+                    try std.testing.expect(p.vc.scidlen <= c.NGTCP2_MAX_CIDLEN);
+                    try std.testing.expectEqualSlices(u8, p.vc.dcid[0..p.vc.dcidlen], p.dcid.bytes[0..p.dcid.len]);
+                },
+            }
+        }
+    }.check, &.{
+        "\xc0\x00\x00\x00\x00\xc8" ++ rep('a', 200) ++ "\x00",
+        "\xc0\x00\x00\x00\x00\x15" ++ rep('a', 21) ++ "\x00",
+        "\xc0\x00\x00\x00\x01\x14" ++ rep('a', 20) ++ "\x08" ++ rep('b', 8) ++ rep('c', 1200),
+        "\xc0\x1a\x2a\x3a\x4a\xc8" ++ rep('a', 200) ++ "\x00" ++ rep('c', 1100),
+        "\x40" ++ rep('a', 30),
+    });
+}
 
 test "UDP: a send that a cancelation interrupts leaves it for the next cancelation point" {
     const zio = @import("zio");
@@ -513,6 +673,7 @@ test "UDP: a send that a cancelation interrupts leaves it for the next cancelati
 }
 
 test "UDP: ECN codepoints and the local address of a wildcard socket come through" {
+    if (comptime !Udp.has_control) return error.SkipZigTest; // no control messages on Windows
     const zio = @import("zio");
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -558,8 +719,9 @@ test "UDP: ECN codepoints and the local address of a wildcard socket come throug
 }
 
 test "UDP: SO_REUSEPORT sockets share a port, and the probe sees any socket on it" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // no SO_REUSEPORT on Windows
     const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    const first = try bindReusePort(lo);
+    const first = try bindReusePort(lo, null);
     var first_open = true;
     defer if (first_open) {
         _ = std.c.close(first);
@@ -569,15 +731,15 @@ test "UDP: SO_REUSEPORT sockets share a port, and the probe sees any socket on i
     try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(first, &storage.any, &len));
     const taken = std.Io.Threaded.addressFromPosix(&storage);
     // The probe refuses the port, SO_REUSEPORT or not.
-    try std.testing.expectError(error.AddressInUse, checkUdpAddressFree(taken));
+    try std.testing.expectError(error.AddressInUse, checkUdpAddressFree(taken, null));
     // A second member of the group binds all the same.
-    const second = try bindReusePort(taken);
+    const second = try bindReusePort(taken, null);
     _ = std.c.close(second);
     // Free again once both are closed; port zero is never checked.
     _ = std.c.close(first);
     first_open = false;
-    try checkUdpAddressFree(taken);
-    try checkUdpAddressFree(lo);
+    try checkUdpAddressFree(taken, null);
+    try checkUdpAddressFree(lo, null);
 }
 
 test "UDP: an outbox sends several destinations' packets at once, a run of them as one GSO message" {
@@ -614,7 +776,7 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     var got: usize = 0;
     while (got < 3) {
         var dg = try a.receive(io, &buf, &control, timeout);
-        try std.testing.expectEqual(@as(u8, 2), dg.ecn);
+        try std.testing.expectEqual(@as(u8, if (Udp.has_control) 2 else 0), dg.ecn);
         while (dg.next()) |d| {
             try std.testing.expectEqualStrings(([_][]const u8{ "aaaa", "bbbb", "cc" })[got], d);
             got += 1;
@@ -622,5 +784,5 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     }
     const dg = try b.receive(io, &buf, &control, timeout);
     try std.testing.expectEqualStrings("dddd", dg.data);
-    try std.testing.expectEqual(@as(u8, 1), dg.ecn);
+    try std.testing.expectEqual(@as(u8, if (Udp.has_control) 1 else 0), dg.ecn);
 }

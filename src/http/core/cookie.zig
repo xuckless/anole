@@ -13,6 +13,7 @@ const std = @import("std");
 pub const Cookie = struct {
     header: []const u8,
 
+    /// The value of cookie `name`, as sent (not decoded), or null.
     pub fn get(self: Cookie, name: []const u8) ?[]const u8 {
         var it = std.mem.splitScalar(u8, self.header, ';');
         while (it.next()) |kv| {
@@ -33,6 +34,7 @@ pub const Cookie = struct {
         return null;
     }
 
+    /// Every cookie, in the order sent.
     pub fn iterator(self: Cookie) Iterator {
         return .{ .rest = self.header };
     }
@@ -82,12 +84,22 @@ pub const Cookie = struct {
 
 /// Options for setting a cookie in a response.
 pub const CookieOpts = struct {
+    /// `Path`; empty for none (the browser uses the request's directory).
+    /// A `;` or a control character in it is `error.InvalidCookiePath`.
     path: []const u8 = "",
+    /// `Domain`; empty for this host only. A `;` or a control character in
+    /// it is `error.InvalidCookieDomain`.
     domain: []const u8 = "",
+    /// `Max-Age`; null for a cookie that ends with the browser session,
+    /// zero to delete one.
     max_age: ?std.Io.Duration = null,
+    /// `Secure`: sent over HTTPS only.
     secure: bool = false,
+    /// `HttpOnly`: hidden from the page's scripts.
     http_only: bool = false,
+    /// `Partitioned` (CHIPS): kept per top-level site.
     partitioned: bool = false,
+    /// `SameSite`; null sends none.
     same_site: ?SameSite = null,
 
     pub const SameSite = enum {
@@ -95,6 +107,45 @@ pub const CookieOpts = struct {
         strict,
         none,
     };
+};
+
+/// A session cookie's attributes, for the session middleware
+/// (`anole.session.Config.cookie_opts`, `middleware.Session.Config.cookie_opts`).
+/// Unlike `CookieOpts`, every field defaults to the safe choice, so setting
+/// one (`.{ .same_site = .none }`) keeps the others: `Path=/`, `HttpOnly`,
+/// `Secure`, `SameSite=Lax`. `Max-Age` is the middleware's to set.
+pub const SessionCookieOpts = struct {
+    path: []const u8 = "/",
+    /// Empty: this host only.
+    domain: []const u8 = "",
+    secure: bool = true,
+    http_only: bool = true,
+    partitioned: bool = false,
+    same_site: ?CookieOpts.SameSite = .lax,
+
+    /// These attributes with `max_age`, as `setCookie` takes them.
+    pub fn withMaxAge(self: SessionCookieOpts, max_age: ?std.Io.Duration) CookieOpts {
+        return .{
+            .path = self.path,
+            .domain = self.domain,
+            .max_age = max_age,
+            .secure = self.secure,
+            .http_only = self.http_only,
+            .partitioned = self.partitioned,
+            .same_site = self.same_site,
+        };
+    }
+
+    /// What a cookie name's prefix requires (RFC 6265bis 4.1.3): `__Secure-`
+    /// needs `Secure`; `__Host-` needs `Secure`, `Path=/` and no `Domain`.
+    /// Browsers drop a cookie that breaks them.
+    pub fn checkPrefix(self: SessionCookieOpts, name: []const u8) error{CookiePrefixMismatch}!void {
+        if (std.mem.startsWith(u8, name, "__Host-")) {
+            if (!self.secure or !std.mem.eql(u8, self.path, "/") or self.domain.len != 0) return error.CookiePrefixMismatch;
+        } else if (std.mem.startsWith(u8, name, "__Secure-")) {
+            if (!self.secure) return error.CookiePrefixMismatch;
+        }
+    }
 };
 
 /// RFC 6265 cookie-name, which is a token: no separators and no controls.
@@ -118,10 +169,21 @@ pub fn validateCookieValue(value: []const u8) error{InvalidCookieValue}!void {
     }
 }
 
+/// An attribute value (`Path`, `Domain`): no `;`, which would end it and
+/// start another attribute, and no control characters (RFC 6265 4.1.1).
+fn validAttributeValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c < 0x20 or c == 0x7f or c == ';') return false;
+    }
+    return true;
+}
+
 /// Serialize a cookie name/value pair with options into a Set-Cookie header value.
 pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []const u8, opts: CookieOpts) ![]u8 {
     try validateCookieName(name);
     try validateCookieValue(value);
+    if (!validAttributeValue(opts.path)) return error.InvalidCookiePath;
+    if (!validAttributeValue(opts.domain)) return error.InvalidCookieDomain;
     // Estimate length: name=value + attributes (110 is typical for cookie attributes per Go's implementation)
     const estimated_len = name.len + value.len + opts.path.len + opts.domain.len + 110;
     var buf = std.ArrayListUnmanaged(u8).empty;
@@ -321,4 +383,26 @@ test "Cookie: jsonStringify" {
     try expectCookieJson(
         \\{"a":""}
     , "a=");
+}
+
+test "serializeCookie: refuses a path or domain that would add attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.InvalidCookiePath, serializeCookie(a, "a", "b", .{ .path = "/; Domain=example.com" }));
+    try std.testing.expectError(error.InvalidCookiePath, serializeCookie(a, "a", "b", .{ .path = "/\x01" }));
+    try std.testing.expectError(error.InvalidCookieDomain, serializeCookie(a, "a", "b", .{ .domain = "example.com; Secure" }));
+    try std.testing.expectError(error.InvalidCookieDomain, serializeCookie(a, "a", "b", .{ .domain = "a\x7fb" }));
+    try std.testing.expectEqualStrings("a=b; Path=/x; Domain=example.com", try serializeCookie(a, "a", "b", .{ .path = "/x", .domain = "example.com" }));
+}
+
+test "SessionCookieOpts.checkPrefix: __Host- and __Secure- names need what browsers require" {
+    const ok: SessionCookieOpts = .{};
+    try ok.checkPrefix("__Host-session");
+    try ok.checkPrefix("__Secure-session");
+    try ok.checkPrefix("session");
+    try std.testing.expectError(error.CookiePrefixMismatch, (SessionCookieOpts{ .secure = false }).checkPrefix("__Secure-s"));
+    try std.testing.expectError(error.CookiePrefixMismatch, (SessionCookieOpts{ .path = "/app" }).checkPrefix("__Host-s"));
+    try std.testing.expectError(error.CookiePrefixMismatch, (SessionCookieOpts{ .domain = "example.com" }).checkPrefix("__Host-s"));
+    try (SessionCookieOpts{ .path = "/app" }).checkPrefix("__Secure-s");
 }

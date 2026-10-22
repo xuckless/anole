@@ -1,8 +1,15 @@
 //! Compression: zlib-ng 2.3.3 in zlib-compat mode (gzip, zlib and raw
 //! deflate; built by build/zlib_ng.zig with runtime SIMD dispatch) behind
 //! lalinsky/zlib.zig's `std.Io` wrapper, and zstd 1.5.7 (build/zstd.zig) as
-//! translated C bindings.
+//! translated C bindings. With -Dbrotli, Brotli 1.2.0 (build/brotli.zig) the
+//! same way.
+//!
+//! Responses are compressed by `anole.middleware.Compress` (or
+//! `res.compress = true`), and request bodies inflated by the server, with
+//! nothing from here. This namespace is for compressing or inflating data
+//! of your own.
 const std = @import("std");
+const features = @import("build_options");
 
 /// `Compress` (a `std.Io.Writer` that deflates) and `Decompress` (a
 /// `std.Io.Reader` that inflates) over zlib-ng; the same module dusty uses.
@@ -10,6 +17,9 @@ pub const zlib = @import("anole_zlib");
 
 /// zstd.h.
 pub const zstd = @import("anole_zstd_c");
+
+/// brotli/encode.h and brotli/decode.h (-Dbrotli).
+pub const brotli = if (features.brotli) @import("anole_brotli_c") else struct {};
 
 /// zlib-ng's version string, `1.3.1.zlib-ng`.
 pub fn zlibVersion() []const u8 {
@@ -175,4 +185,39 @@ test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodie
     try rw.writeAll(frame[0..fn_len]);
     const echoed = try exchange(io, addr, rw.buffered(), &out);
     try std.testing.expect(std.mem.endsWith(u8, echoed, text));
+}
+
+test "dusty on Brotli: br when the client takes gzip and br, as browsers and HttpArena send" {
+    if (!features.brotli) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = loopback }} }, {});
+    defer server.deinit();
+    server.router.get("/big", bigHandler);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+    const addr = server.address.ip;
+
+    var out: [64 * 1024]u8 = undefined;
+    const resp = try exchange(io, addr, "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n", &out);
+    const split = std.mem.indexOf(u8, resp, "\r\n\r\n").?;
+    const head = resp[0..split];
+    try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Vary: Accept-Encoding") != null);
+    const body = resp[split + 4 ..];
+    var plain: [32 * 1024]u8 = undefined;
+    var n: usize = plain.len;
+    try std.testing.expect(brotli.BrotliDecoderDecompress(body.len, body.ptr, &n, &plain) == brotli.BROTLI_DECODER_RESULT_SUCCESS);
+    try std.testing.expect(std.mem.startsWith(u8, plain[0..n], "row 0: compressible"));
+    try std.testing.expect(std.mem.endsWith(u8, plain[0..n], "row 299: compressible compressible compressible\n"));
+    try std.testing.expect(body.len < n / 5);
 }

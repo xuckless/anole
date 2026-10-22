@@ -1,0 +1,49 @@
+name: Feature request
+description: Something Anole should do that it does not do yet.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The problem or use case, in terms of your app, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: How it could look from your code (an API sketch is welcome).
+      render: zig
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: Your workaround, or how another framework (Fiber, Express, Axum, Bun, ...) does it.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - HTTP/1.1
+        - HTTP/2
+        - HTTP/3 / QUIC
+        - WebSocket
+        - WebTransport
+        - gRPC
+        - TLS
+        - Router / middleware
+        - Database connectors
+        - Caches
+        - Auth
+        - Observability
+        - Build / flags / packaging
+        - Docs
+        - Other
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I would like to send a pull request for this.

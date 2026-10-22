@@ -2,10 +2,9 @@
 //! side reads and writes at the same time from two tasks, the way the HTTP/2
 //! engine uses a connection. Every byte is checked on arrival.
 //!
-//! The unit test in root.zig runs it on one executor (the two tasks interleave
-//! on one thread); tests/tls_duplex.zig runs it under pinned scheduling with
-//! several executors, so the reading and writing tasks sit on different OS
-//! threads.
+//! The unit tests in root.zig run it on one executor (the two tasks
+//! interleave on one thread) and on four pinned executors, so the reading
+//! and writing tasks sit on different OS threads.
 const std = @import("std");
 const tls = @import("anole_dusty_tls");
 const selfSigned = @import("root.zig").selfSigned;

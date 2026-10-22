@@ -3,7 +3,10 @@
 //! otherwise), and batches of finished spans sent to an OTLP/HTTP collector
 //! as JSON (`POST {endpoint}/v1/traces`).
 //!
-//!     var exporter = try anole.observe.trace.Exporter.init(gpa, io, &client, .{
+//! In an app, `_ = try app.tracing(.{ .service_name = "api" });` does all
+//! of this (see `TracingOptions` for the endpoint). By hand:
+//!
+//!     var exporter = try anole.observe.trace.Exporter.init(gpa, app.io(), app.client(), .{
 //!         .endpoint = "http://otel-collector:4318", .service_name = "api" });
 //!     defer exporter.deinit();
 //!     try exporter.start();  // the batching task
@@ -14,6 +17,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const common = @import("common.zig");
+const Client = @import("../client.zig").Client;
 
 /// A parsed `traceparent` (version 00).
 pub const Context = struct {
@@ -39,6 +43,7 @@ pub const Context = struct {
         return c;
     }
 
+    /// Writes the context as a `traceparent` value (`{f}`).
     pub fn format(self: Context, w: *std.Io.Writer) !void {
         try w.print("00-{s}-{s}-{s}", .{ &self.trace_id, &self.span_id, if (self.sampled) "01" else "00" });
     }
@@ -74,6 +79,16 @@ pub fn outgoing(req: *const dusty.Request, buf: *[55]u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "00-{s}-{s}-{s}", .{ req.trace_id, req.span_id, if (sampled) "01" else "00" }) catch null;
 }
 
+/// Whether `req`'s span is recorded here, so calls it makes get child
+/// spans: the middleware gave it a span ID of its own, rather than
+/// passing an unsampled caller's context on as it came.
+pub fn recording(req: *const dusty.Request) bool {
+    if (req.trace_id.len != 32 or req.span_id.len != 16) return false;
+    const passed_on = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;
+    const p = passed_on orelse return true;
+    return !std.mem.eql(u8, &p.span_id, req.span_id);
+}
+
 /// A finished span, as the exporter queues it.
 pub const Span = struct {
     trace_id: [32]u8,
@@ -89,11 +104,54 @@ pub const Span = struct {
     route: [64]u8,
     route_len: u8,
     status_code: u16,
+    /// Set for a database call made while serving a request (a client
+    /// span, child of the request's; `Exporter.child`), when the HTTP
+    /// fields above are unused. Null for the request's own span.
+    db: ?Db = null,
+
+    /// OpenTelemetry's database attributes, cut to fit.
+    pub const Db = struct {
+        /// `db.system.name`: "postgresql", "sqlite", "mongodb", "redis".
+        system: [16]u8 = undefined,
+        system_len: u8 = 0,
+        /// `db.namespace`: the database.
+        namespace: [48]u8 = undefined,
+        namespace_len: u8 = 0,
+        /// `db.operation.name`: "SELECT", "find".
+        operation: [24]u8 = undefined,
+        operation_len: u8 = 0,
+        /// `db.collection.name`: the table or collection, when known.
+        collection: [48]u8 = undefined,
+        collection_len: u8 = 0,
+        /// `error.type` (the error's name) for a failed call; empty for
+        /// success.
+        error_type: [32]u8 = undefined,
+        error_type_len: u8 = 0,
+
+        /// The attributes from their values, each cut to its field's size.
+        pub fn init(system: []const u8, namespace: []const u8, operation: []const u8, collection: ?[]const u8, error_type: ?[]const u8) Db {
+            var d: Db = .{};
+            d.system_len = put(&d.system, system);
+            d.namespace_len = put(&d.namespace, namespace);
+            d.operation_len = put(&d.operation, operation);
+            d.collection_len = put(&d.collection, collection orelse "");
+            d.error_type_len = put(&d.error_type, error_type orelse "");
+            return d;
+        }
+
+        fn put(dst: []u8, src: []const u8) u8 {
+            const n = @min(dst.len, src.len);
+            @memcpy(dst[0..n], src[0..n]);
+            return @intCast(n);
+        }
+    };
 };
 
+/// `Exporter` settings.
 pub const Options = struct {
     /// The collector's OTLP/HTTP base URL ("http://localhost:4318").
     endpoint: []const u8,
+    /// `service.name` on every span.
     service_name: []const u8,
     /// Spans sent per request to the collector, and how often.
     batch_size: usize = 256,
@@ -109,20 +167,30 @@ pub const Options = struct {
     exclude: []const []const u8 = &.{},
 };
 
+/// Queues finished spans and sends them to the collector in batches from a
+/// task of its own, through `client`. A full queue drops spans rather than
+/// slow requests. `app.tracing(.{})` makes one owned by the server,
+/// already started.
 pub const Exporter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    client: *dusty.Client,
+    client: Client,
     options: Options,
     queue: std.Io.Queue(Span),
     buffer: []Span,
     task: ?std.Io.Future(void) = null,
     /// Set by `deinit`: wakes the task from its pause between batches.
     closing: std.Io.Event = .unset,
+    /// Spans dropped: the queue was full, or the collector did not take
+    /// them.
     dropped: std.atomic.Value(u64) = .init(0),
+    /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *dusty.Client, options: Options) !Exporter {
+    /// An exporter with its queue allocated, sending through `client` (the
+    /// server's, `app.client()`). Nothing is sent until `start`. `client`'s
+    /// server must outlive it.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: Client, options: Options) !Exporter {
         const buffer = try gpa.alloc(Span, options.queue_len);
         return .{ .gpa = gpa, .io = io, .client = client, .options = options, .queue = .init(buffer), .buffer = buffer };
     }
@@ -138,6 +206,31 @@ pub const Exporter = struct {
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
         self.gpa.free(self.buffer);
+    }
+
+    /// Queues a client span for a call made while serving `req` (a
+    /// database query), as a child of the request's span, from
+    /// `start_ns` to `end_ns` (real clock). Nothing when the request is
+    /// not recorded (`recording`).
+    pub fn child(self: *Exporter, req: *const dusty.Request, start_ns: i96, end_ns: i96, db: Span.Db) void {
+        if (!recording(req)) return;
+        var span: Span = undefined;
+        @memcpy(&span.trace_id, req.trace_id[0..32]);
+        randomHex(req.io, &span.span_id);
+        span.parent_span_id = req.span_id[0..16].*;
+        const collection = db.collection[0..db.collection_len];
+        const name = std.fmt.bufPrint(&span.name, "{s} {s}", .{
+            db.operation[0..db.operation_len],
+            if (collection.len > 0) collection else db.namespace[0..db.namespace_len],
+        }) catch span.name[0..0];
+        span.name_len = @intCast(std.mem.trimEnd(u8, name, " ").len);
+        span.start_ns = start_ns;
+        span.end_ns = end_ns;
+        span.method_len = 0;
+        span.route_len = 0;
+        span.status_code = 0;
+        span.db = db;
+        self.submit(span);
     }
 
     fn submit(self: *Exporter, span: Span) void {
@@ -176,7 +269,7 @@ pub const Exporter = struct {
         const url = std.fmt.allocPrint(arena, "{s}/v1/traces", .{std.mem.trimEnd(u8, self.options.endpoint, "/")}) catch return;
         var headers = dusty.Headers.init(arena, 2) catch return;
         headers.put("Content-Type", "application/json") catch return;
-        var response = self.client.fetch(url, .{ .method = .post, .headers = &headers, .body = body }) catch {
+        var response = self.client.http.fetch(url, .{ .method = .post, .headers = &headers, .body = body }) catch {
             _ = self.dropped.fetchAdd(spans.len, .monotonic);
             return;
         };
@@ -196,6 +289,19 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
         if (i > 0) try w.writeByte(',');
         try w.print("{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",", .{ &s.trace_id, &s.span_id });
         if (s.parent_span_id) |p| try w.print("\"parentSpanId\":\"{s}\",", .{&p});
+        if (s.db) |d| {
+            try w.print("\"name\":{f},\"kind\":3,\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), s.start_ns, s.end_ns });
+            try w.print("\"attributes\":[{{\"key\":\"db.system.name\",\"value\":{{\"stringValue\":{f}}}}}", .{std.json.fmt(d.system[0..d.system_len], .{})});
+            const optional = [_]struct { []const u8, []const u8 }{
+                .{ "db.namespace", d.namespace[0..d.namespace_len] },
+                .{ "db.operation.name", d.operation[0..d.operation_len] },
+                .{ "db.collection.name", d.collection[0..d.collection_len] },
+                .{ "error.type", d.error_type[0..d.error_type_len] },
+            };
+            for (optional) |a| if (a[1].len > 0) try w.print(",{{\"key\":\"{s}\",\"value\":{{\"stringValue\":{f}}}}}", .{ a[0], std.json.fmt(a[1], .{}) });
+            try w.print("],\"status\":{{\"code\":{d}}}}}", .{@as(u8, if (d.error_type_len > 0) 2 else 0)});
+            continue;
+        }
         try w.print("\"name\":{f},\"kind\":2,\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), s.start_ns, s.end_ns });
         try w.print("\"attributes\":[{{\"key\":\"http.request.method\",\"value\":{{\"stringValue\":{f}}}}},", .{std.json.fmt(s.method[0..s.method_len], .{})});
         try w.print("{{\"key\":\"http.route\",\"value\":{{\"stringValue\":{f}}}}},", .{std.json.fmt(s.route[0..s.route_len], .{})});
@@ -212,6 +318,7 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
 pub const Middleware = struct {
     exporter: *Exporter,
 
+    /// The middleware, queueing spans on `exporter`, which must outlive it.
     pub fn init(exporter: *Exporter) Middleware {
         return .{ .exporter = exporter };
     }
@@ -230,6 +337,7 @@ pub const Middleware = struct {
             return executor.next();
         };
         var span: Span = undefined;
+        span.db = null;
         if (parent) |p| span.trace_id = p.trace_id else randomHex(req.io, &span.trace_id);
         randomHex(req.io, &span.span_id);
         span.parent_span_id = if (parent) |p| p.span_id else null;

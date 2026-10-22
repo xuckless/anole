@@ -41,6 +41,13 @@ fn jwks(_: *dusty.Request, res: *dusty.Response) !void {
     , .{ b64.Encoder.encode(&x, p[1..33]), b64.Encoder.encode(&y, p[33..65]) });
 }
 
+/// Sends the token request on to /token with its body, as a provider
+/// that moved would.
+fn tokenMoved(_: *dusty.Request, res: *dusty.Response) !void {
+    res.status = .temporary_redirect;
+    try res.header("Location", "/token");
+}
+
 fn token(req: *dusty.Request, res: *dusty.Response) !void {
     token_requests += 1;
     const body = (try req.body()) orelse "";
@@ -77,6 +84,7 @@ test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
     server.router.get("/.well-known/openid-configuration", discovery);
     server.router.get("/jwks", jwks);
     server.router.post("/token", token);
+    server.router.post("/token-moved", tokenMoved);
     var future = try io.concurrent(struct {
         fn r(s: *dusty.Server(void)) !void {
             try s.run();
@@ -89,9 +97,9 @@ test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
     var buf: [64]u8 = undefined;
-    var provider = try oidc.Provider.discover(&client, gpa, issuer(&buf));
+    var provider = try oidc.Provider.discover(gpa, .{ .http = &client }, issuer(&buf));
     defer provider.deinit(gpa);
-    var keyring = Keyring.init(gpa, io, &client, provider.jwks_uri);
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, provider.jwks_uri);
     defer keyring.deinit();
     const rp: oidc.RelyingParty = .{
         .provider = &provider,
@@ -110,19 +118,30 @@ test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
     @memcpy(next_nonce[0..start.nonce.len], start.nonce);
     next_nonce_len = start.nonce.len;
 
-    const id = try rp.finish(arena, io, &client, .{ .code = "the-code", .state = start.state }, start);
+    const id = try rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = start.state }, start);
     try std.testing.expectEqualStrings("user-7", id.subject);
     try std.testing.expectEqualStrings("u7@example.com", id.email.?);
     try std.testing.expect(id.email_verified);
 
     // A forged state never reaches the provider.
     const before = token_requests;
-    try std.testing.expectError(error.StateMismatch, rp.finish(arena, io, &client, .{ .code = "the-code", .state = "forged-state-forged-state-forged-state-1234" }, start));
+    try std.testing.expectError(error.StateMismatch, rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = "forged-state-forged-state-forged-state-1234" }, start));
     try std.testing.expectEqual(before, token_requests);
 
     // An ID token with another sign-in's nonce is refused (replay).
     const second = try rp.begin(arena, io);
-    try std.testing.expectError(error.NonceMismatch, rp.finish(arena, io, &client, .{ .code = "the-code", .state = second.state }, second));
+    try std.testing.expectError(error.NonceMismatch, rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = second.state }, second));
+
+    // The token request, client secret and all, is never sent on to
+    // where a redirect points.
+    var moved = provider;
+    moved.token_endpoint = try std.fmt.allocPrint(arena, "{s}/token-moved", .{issuer(&buf)});
+    var moved_rp = rp;
+    moved_rp.provider = &moved;
+    const third = try rp.begin(arena, io);
+    const before_moved = token_requests;
+    try std.testing.expectError(error.TokenRequestFailed, moved_rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = third.state }, third));
+    try std.testing.expectEqual(before_moved, token_requests);
 }
 
 test "Sign in with Apple: the client secret is an ES256 JWT our verifier accepts" {

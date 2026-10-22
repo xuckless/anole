@@ -9,18 +9,25 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
+const Adopter = @import("server.zig").Adopter;
 pub const Sink = @import("sink.zig").Sink;
+pub const Detached = @import("detach.zig").Detached;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
 const ErrorFormat = @import("config.zig").ErrorFormat;
 const statusBody = @import("middleware.zig").statusBody;
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
+const brotli_io = if (build_options.use_brotli) @import("brotli_io.zig") else struct {};
+const block_cache = @import("block_cache.zig");
 
 var no_buf: [0]u8 = .{};
 
 pub const EventWriter = struct {
     body: *StreamingBodyWriter,
     line_in_progress: bool,
+    /// The last write ended in a CR, so an LF that starts the next one
+    /// belongs to it (one CRLF line break, split across the writes).
+    pending_cr: bool = false,
     interface: std.Io.Writer,
     /// The real cause behind the generic `error.WriteFailed` that the
     /// `std.Io.Writer` interface has to return. An event long enough to
@@ -59,16 +66,29 @@ pub const EventWriter = struct {
         return total;
     }
 
+    /// CR, LF and CRLF each end a line, as they do for the peer's parser
+    /// (WHATWG HTML 9.2.6): data that could end one any other way would
+    /// start a line of its own that is not `data:`.
     fn writeLines(self: *EventWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
         const out = &self.body.interface;
         var rest = bytes;
-        while (std.mem.findScalar(u8, rest, '\n')) |idx| {
+        if (self.pending_cr) {
+            self.pending_cr = false;
+            if (rest[0] == '\n') rest = rest[1..];
+        }
+        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
             if (!self.line_in_progress) try out.writeAll("data: ");
-            const line_end = if (idx > 0 and rest[idx - 1] == '\r') idx - 1 else idx;
-            try out.writeAll(rest[0..line_end]);
+            try out.writeAll(rest[0..idx]);
             try out.writeAll("\n");
             self.line_in_progress = false;
-            rest = rest[idx + 1 ..];
+            var next = idx + 1;
+            if (rest[idx] == '\r') {
+                if (next == rest.len) {
+                    self.pending_cr = true;
+                } else if (rest[next] == '\n') next += 1;
+            }
+            rest = rest[next..];
         }
         if (rest.len > 0) {
             if (!self.line_in_progress) {
@@ -151,11 +171,15 @@ pub const EventStream = struct {
 
     fn sendEvent(w: *std.Io.Writer, data: []const u8, opts: Options) std.Io.Writer.Error!void {
         try sendFields(w, opts);
-        var it = std.mem.splitScalar(u8, data, '\n');
-        while (it.next()) |line| {
-            const stripped = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-            try w.print("data: {s}\n", .{stripped});
+        // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
+        var rest = data;
+        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
+            try w.print("data: {s}\n", .{rest[0..idx]});
+            var next = idx + 1;
+            if (rest[idx] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
+            rest = rest[next..];
         }
+        try w.print("data: {s}\n", .{rest});
         try w.writeAll("\n");
         // One event, one write: an event held back is an event the peer
         // has not had, and the next one may be a long way off.
@@ -210,8 +234,15 @@ const BodyBuffer = struct {
     /// its memory between a connection's requests, so this is a bump.
     fn init(arena: std.mem.Allocator) std.mem.Allocator.Error!BodyBuffer {
         var self: BodyBuffer = .{};
-        self.segments.append(&(try Segment.create(arena, first_segment_len)).node);
+        try self.reserveFirst(arena);
         return self;
+    }
+
+    /// `init`'s first segment, for a buffer that has none yet: before a
+    /// writer is made over it.
+    fn reserveFirst(self: *BodyBuffer, arena: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (self.segments.first != null) return;
+        self.segments.append(&(try Segment.create(arena, first_segment_len)).node);
     }
 
     fn last(self: *const BodyBuffer) ?*Segment {
@@ -430,8 +461,9 @@ pub const StreamingBodyWriter = struct {
     /// on the way to the framing.
     compressor: ?*StreamCompressor = null,
     /// Everything a write to the connection can fail with, resolved to its
-    /// cause rather than the `std.Io.Writer` sentinel.
-    pub const Error = Response.SendError;
+    /// cause rather than the `std.Io.Writer` sentinel, and
+    /// `ContentLengthMismatch` for a write past a declared Content-Length.
+    pub const Error = Response.SendError || error{ContentLengthMismatch};
 
     const vtable: std.Io.Writer.VTable = .{
         .drain = drain,
@@ -477,6 +509,16 @@ pub const StreamingBodyWriter = struct {
             try self.record(compressor.write(pending, data, splat));
             return w.consume(total);
         }
+
+        // Never past a declared length: the bytes after it would reach
+        // the peer (or a proxy reusing the connection) as the start of the
+        // next response. Nothing of this write goes out, and the
+        // connection is not reused.
+        if (self.res.content_length) |declared| if (!self.res.chunked and total > declared -| self.res.body_sent) {
+            self.res.keepalive = false;
+            self.err = error.ContentLengthMismatch;
+            return error.WriteFailed;
+        };
 
         try self.record(self.res.sendFramed(pending, data, splat, total));
         self.res.body_sent += total;
@@ -525,7 +567,7 @@ pub const StreamingBodyWriter = struct {
     }
 };
 
-/// Compresses a streamed body (gzip or zstd) between the handler and the
+/// Compresses a streamed body (gzip, zstd or Brotli) between the handler and the
 /// framing: what the handler writes goes into the coder, and what that
 /// produces collects in `out` until there is a chunk's worth. Allocated from
 /// the arena, since the coder writes into `out` by pointer and the body
@@ -539,12 +581,14 @@ const StreamCompressor = struct {
     const Coder = union(enum) {
         gzip: zlib.Compress,
         zstd: if (build_options.use_zstd) zstd_io.Compress else void,
+        br: if (build_options.use_brotli) brotli_io.Compress else void,
     };
 
     fn input(self: *StreamCompressor) *std.Io.Writer {
         return switch (self.coder) {
             .gzip => |*g| &g.writer,
             .zstd => |*z| if (build_options.use_zstd) &z.writer else unreachable,
+            .br => |*z| if (build_options.use_brotli) &z.writer else unreachable,
         };
     }
 
@@ -568,9 +612,28 @@ const StreamCompressor = struct {
                 self.coder = .{ .zstd = undefined };
                 try self.coder.zstd.init(res.arena, &self.out, &.{}, .{});
             } else unreachable,
+            // Its memory is not the arena's: `finish` frees it, or
+            // `Response.deinit` for a body never ended (`brotli_encoder`).
+            .br => if (build_options.use_brotli) {
+                self.coder = .{ .br = undefined };
+                try self.coder.br.init(&self.out, &.{}, .{ .quality = res.brotli_quality });
+                res.brotli_encoder = self.coder.br.state;
+            } else unreachable,
             else => self.coder = .{ .gzip = try .init(res.arena, &self.out, &.{}, .gzip, options) },
         }
         return self;
+    }
+
+    /// Frees what is not the arena's (Brotli's encoder), and says so to
+    /// the response.
+    fn deinit(self: *StreamCompressor) void {
+        switch (self.coder) {
+            .br => |*z| if (build_options.use_brotli) {
+                z.deinit();
+                self.res.brotli_encoder = null;
+            } else unreachable,
+            else => {},
+        }
     }
 
     fn write(self: *StreamCompressor, pending: []const u8, data: []const []const u8, splat: usize) std.Io.Writer.Error!void {
@@ -592,7 +655,9 @@ const StreamCompressor = struct {
         switch (self.coder) {
             .gzip => |*g| try g.finish(),
             .zstd => |*z| if (build_options.use_zstd) try z.finish() else unreachable,
+            .br => |*z| if (build_options.use_brotli) try z.finish() else unreachable,
         }
+        self.deinit();
         try self.out.flush();
     }
 
@@ -607,6 +672,12 @@ const StreamCompressor = struct {
     }
 };
 
+/// Framing fields the server writes itself (`Response.header` refuses
+/// them).
+pub fn isReservedHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or std.ascii.eqlIgnoreCase(name, "Connection");
+}
+
 /// Whether a response with this status carries a body at all. A 1xx, a
 /// 204 and a 304 do not, so a peer reads whatever follows their head as
 /// the next response.
@@ -615,11 +686,40 @@ fn statusHasBody(status: http.Status) bool {
     return code >= 200 and status != .no_content and status != .not_modified;
 }
 
+/// What a handler writes its answer into, over any protocol. Set `status`,
+/// `body` and headers and return; the server sends it after the handler
+/// (and the middleware after it) have run. For a body built in pieces use
+/// `writer`, `print`, `json` or `render`; to send while the handler is
+/// still working, `stream` or `startEventStream`.
+///
+///     fn create(req: *anole.Request, res: *anole.Response) !void {
+///         const in = try req.bind(NewUser);
+///         res.status = .created;
+///         try res.header("Location", "/users/7");
+///         try res.json(.{ .id = 7, .name = in.name });
+///     }
+///
+/// A handler can also answer by returning an error: `error.NotFound` and
+/// the other status-named errors become that status, the rest a 500 (see
+/// `anole.defaultError`), and `fail` writes an error answer directly.
 pub const Response = struct {
+    /// 200 unless set.
     status: http.Status = .ok,
+    /// The body, when it is one slice: a literal, or something in the
+    /// request's arena. It is sent after the handler returns, so it must
+    /// outlive the handler.
     body: []const u8 = "",
+    /// The response headers; set them through `header`, `addHeader` and
+    /// `setCookie`, which check names and values. The table starts small
+    /// and grows up to `max_headers`.
     headers: http.Headers = .{},
+    /// Most headers the response can carry (`ServerConfig.response
+    /// .max_header_count`).
+    max_headers: usize = 64,
+    /// The `Content-Type` sent, when the handler sets it by name; `json`,
+    /// `print` and the others set it for you.
     content_type: ?http.ContentType = null,
+    /// The request's arena: freed after the response has gone out.
     arena: std.mem.Allocator,
     /// The body, when it is written rather than set with `body`.
     body_buffer: BodyBuffer = .{},
@@ -672,7 +772,8 @@ pub const Response = struct {
     /// The request this answers, when the server built the pair. Set by the
     /// server.
     request: ?*const Request = null,
-    /// Send the body gzipped if the request's `Accept-Encoding` allows it.
+    /// Send the body compressed (zstd, Brotli or gzip, as the build has
+    /// them) if the request's `Accept-Encoding` allows it.
     /// Settled with the headers: by `stream`, or by `write` for a buffered
     /// body, which goes out as it is when it is short or does not shrink.
     /// Ignored when the handler set its own `Content-Encoding`,
@@ -688,10 +789,29 @@ pub const Response = struct {
     /// to go out as it was kept its `ETag` strong, which still matches the
     /// weak one under the weak comparison `If-None-Match` uses.
     compress: bool = false,
+    /// Brotli's quality, 0 to 11, when `compress` picks `br`. Set by the
+    /// server from `ServerConfig.response.brotli_quality`; a handler may
+    /// change it for its own response before the headers go out.
+    brotli_quality: u4 = 5,
+    /// A streamed body's Brotli encoder until the body ends: freed by
+    /// `deinit` if it never does. Held here, not only in the compressor,
+    /// which lives in the arena: the server may reset that before `deinit`.
+    brotli_encoder: if (build_options.use_brotli) ?*brotli_io.State else void = if (build_options.use_brotli) null else {},
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
+    /// Set by an engine that can finish this response with no task waiting
+    /// for it (HTTP/2 and HTTP/3 requests that run on the reader): see
+    /// `detach`.
+    detach_engine: ?*const Detached.Engine = null,
+    detach_ctx: ?*anyopaque = null,
+    /// A middleware that is not detach-safe ran (`Detached`): `detach` is
+    /// refused.
+    detach_blocked: bool = false,
+    /// Set by `detach`.
+    detached: ?*Detached = null,
 
+    /// A file body set up by `sendFile`.
     pub const BodyFile = struct {
         handle: std.Io.File,
         /// Where in the file the body starts, and how much of it there is.
@@ -721,13 +841,22 @@ pub const Response = struct {
     /// `InvalidContentLength` is such a header that is not a number.
     pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
+    /// The headers a response starts with room for: enough for most, so
+    /// that an ordinary one takes little of the arena. The table grows to
+    /// `max_headers` for one with more.
+    const initial_header_room = 16;
+
+    /// A response written to an HTTP/1.x connection. Made by the server;
+    /// handlers get theirs. The body buffer's first segment is taken once
+    /// a body is written (`writer`), so a response whose body is a slice
+    /// takes none.
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .body_buffer = try .init(arena),
             .conn = conn,
             .io = conn.io,
-            .headers = try http.Headers.init(arena, max_headers),
+            .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
+            .max_headers = max_headers,
         };
     }
 
@@ -737,12 +866,27 @@ pub const Response = struct {
     pub fn initSink(arena: std.mem.Allocator, io: std.Io, sink: Sink, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .body_buffer = try .init(arena),
             .conn = undefined,
             .sink = sink,
             .io = io,
-            .headers = try http.Headers.init(arena, max_headers),
+            .headers = try http.Headers.init(arena, @min(max_headers, initial_header_room)),
+            .max_headers = max_headers,
         };
+    }
+
+    /// Room for `n` more headers, the table grown if it must be. False
+    /// past `max_headers`, or without the memory for a bigger table.
+    fn headerRoom(self: *Response, n: usize) bool {
+        while (self.headers.keys.len - self.headers.len < n) {
+            if (!self.headers.grow(self.arena, self.max_headers)) return false;
+        }
+        return true;
+    }
+
+    /// `headers.put`, the table grown first if it is full.
+    fn putHeader(self: *Response, name: []const u8, value: []const u8) error{TooManyHeaders}!void {
+        if (self.headers.get(name) == null and !self.headerRoom(1)) return error.TooManyHeaders;
+        try self.headers.put(name, value);
     }
 
     /// Adds a trailer field, sent after the body. Carried only by a sink
@@ -772,9 +916,11 @@ pub const Response = struct {
         return self.conn.peerGone();
     }
 
-    /// Where body bytes go: the sink's writer, or the connection.
+    /// Where body bytes go: the sink's writer, or the connection, which
+    /// takes its write buffer now.
     fn bodyOut(self: *Response) *std.Io.Writer {
         if (self.sink) |sink| return sink.body();
+        self.conn.prepareWrite();
         return self.conn.writer;
     }
 
@@ -788,6 +934,8 @@ pub const Response = struct {
     /// Closes a file body that `write` never got to send.
     pub fn deinit(self: *Response) void {
         self.closeFile();
+        if (build_options.use_brotli) if (self.brotli_encoder) |state| brotli_io.destroy(state);
+        if (build_options.use_brotli) self.brotli_encoder = null;
     }
 
     pub const SendFileOptions = struct {
@@ -830,13 +978,37 @@ pub const Response = struct {
         self.file = null;
     }
 
+    /// Sets header `name` to `value`, replacing an earlier value under
+    /// the same name (case-insensitive). Neither is copied: use literals
+    /// or the arena. Fails once the headers have gone out, on a name or
+    /// value that is not valid on the wire, and past
+    /// `ServerConfig.response.max_header_count`.
+    ///
+    /// `Transfer-Encoding` and `Connection` are the server's, which frames
+    /// the body and decides about keep-alive (`keepalive`): setting either
+    /// is `error.InvalidHeaderName`.
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
         if (self.headers_written) return error.HeadersAlreadySent;
         try http.validateHeaderName(name);
+        if (isReservedHeader(name)) return error.InvalidHeaderName;
         try http.validateHeaderValue(value);
-        try self.headers.put(name, value);
+        try self.putHeader(name, value);
+    }
+
+    /// Adds a header even if the response has one by that name already:
+    /// for a field that may repeat or lists its values, such as `Vary`.
+    /// `Content-Length` never repeats: a second one replaces the first.
+    /// The names `header` refuses, this refuses too.
+    pub fn addHeader(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
+        if (self.headers_written) return error.HeadersAlreadySent;
+        try http.validateHeaderName(name);
+        if (isReservedHeader(name)) return error.InvalidHeaderName;
+        try http.validateHeaderValue(value);
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return self.putHeader(name, value);
+        if (!self.headerRoom(1)) return error.TooManyHeaders;
+        try self.headers.add(name, value);
     }
 
     /// A writer that collects the body without touching the connection.
@@ -847,6 +1019,8 @@ pub const Response = struct {
     pub fn writer(self: *Response) BodyWriter {
         self.startBody();
         self.body_writer_buffering = true;
+        // Without the memory, the first write fails the same way.
+        self.body_buffer.reserveFirst(self.arena) catch {};
         return .init(self);
     }
 
@@ -1146,10 +1320,14 @@ pub const Response = struct {
         return &final;
     }
 
+    /// Adds a `Set-Cookie` header: `try res.setCookie("theme", "dark",
+    /// .{ .path = "/", .max_age = .fromSeconds(86400) })`. Fails once the
+    /// headers have gone out, or on a name or value a cookie cannot carry.
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
         if (self.headers_written) return error.HeadersAlreadySent;
         const serialized = try serializeCookie(self.arena, name, value, opts);
         try http.validateHeaderValue(serialized);
+        if (!self.headerRoom(1)) return error.TooManyHeaders;
         try self.headers.add("Set-Cookie", serialized);
     }
 
@@ -1173,12 +1351,77 @@ pub const Response = struct {
         return .{ .body = try self.stream(buf) };
     }
 
-    /// Upgrade HTTP connection to WebSocket.
-    /// Returns null if request is not a valid WebSocket upgrade request.
+    /// Whether `detach` would work: the engine supports it, nothing has
+    /// gone out, and every middleware the request passed is detach-safe.
+    pub fn canDetach(self: *const Response) bool {
+        return self.detach_engine != null and !self.detach_blocked and self.detached == null and !self.headers_written;
+    }
+
+    /// Whether the handler detached the response (`detach`): a detach-safe
+    /// middleware that does work after `executor.next()` puts it off with
+    /// `onFinish` instead.
+    pub fn isDetached(self: *const Response) bool {
+        return self.detached != null;
+    }
+
+    /// Detaches the response from the handler (see `Detached`): the handler
+    /// returns, and `finish` on the result, later and on this request's
+    /// executor, writes the response. The engine moves the request and
+    /// the response to memory that lives until then: from here on, use
+    /// `d.request` and `d.response` (`req` and `self` go when the handler
+    /// returns). `owner.abort` runs instead if the request goes away
+    /// first. `error.Unsupported` when `canDetach` is false; the handler
+    /// then answers as usual (waiting, if it must).
+    pub fn detach(self: *Response, req: *Request, owner: Detached.Owner) error{ Unsupported, OutOfMemory }!*Detached {
+        if (!self.canDetach()) return error.Unsupported;
+        const d = try self.arena.create(Detached);
+        d.* = .{
+            .request = req,
+            .response = self,
+            .engine = self.detach_engine.?,
+            .engine_ctx = self.detach_ctx.?,
+            .owner = owner,
+        };
+        self.detached = d;
+        d.engine_ctx = d.engine.relocate(d) catch |err| {
+            self.detached = null;
+            return err;
+        };
+        return d;
+    }
+
+    /// For a detach-safe middleware whose `executor.next()` returned with
+    /// the response detached: `f` runs when the response is finished, in
+    /// place of the work the middleware would have done after `next()`.
+    /// `f` lives in the request's arena or longer.
+    pub fn onFinish(self: *Response, f: *Detached.Finisher) void {
+        const d = self.detached orelse return;
+        f.next = null;
+        if (d.last) |l| l.next = f else d.first = f;
+        d.last = f;
+    }
+
+    /// Hands the connection over to `adopter` (see `Adopter`) once the
+    /// handler returns, rather than closing it: for a protocol the request
+    /// upgraded to that serves the connection without a task of its own
+    /// while it is idle (a WebSocket with callbacks). Over HTTP/1.1 only,
+    /// after the 101 went out (`upgradeWebSocket`). From then on, whatever
+    /// the handler does, `adopter.release` runs when the connection closes.
+    /// The request and this response end with the handler.
+    pub fn adopt(self: *Response, adopter: *Adopter) error{Unsupported}!void {
+        if (self.sink != null or self.status != .switching_protocols or !self.headers_written) return error.Unsupported;
+        self.conn.adopter = adopter;
+    }
+
+    /// Upgrades an HTTP/1.1 connection to a WebSocket, or returns null when
+    /// the request is not a valid upgrade. HTTP/1.1 only: `app.ws` and
+    /// `anole.websocket.upgrade` also cover HTTP/2 and HTTP/3.
     pub fn upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
         // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
         // WebSocket (RFC 8441), which a sink does not offer.
         if (self.sink != null) return null;
+        // RFC 6455 §4.2.1: a GET, with a key of 16 bytes in base64.
+        if (req.method != .get) return null;
         // Validate upgrade headers
         const upgrade = req.headers.get("Upgrade") orelse return null;
         if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
@@ -1190,6 +1433,7 @@ pub const Response = struct {
         if (!std.mem.eql(u8, version, "13")) return null;
 
         const key = req.headers.get("Sec-WebSocket-Key") orelse return null;
+        if (!WebSocket.validKey(key)) return null;
 
         // Compute accept key
         var accept_key: [28]u8 = undefined;
@@ -1198,7 +1442,7 @@ pub const Response = struct {
         // Send 101 Switching Protocols response
         self.status = .switching_protocols;
         try self.header("Upgrade", "websocket");
-        try self.header("Connection", "Upgrade");
+        try self.putHeader("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
         // The connection is a WebSocket's from here: small windows, and the
@@ -1207,6 +1451,7 @@ pub const Response = struct {
         self.conn.shrinkForUpgrade();
         errdefer self.keepalive = false;
         try self.writeHeader();
+        self.conn.finishUpgrade();
         // The connection is the WebSocket's now, and whatever the peer sends
         // after the session is not an HTTP request.
         self.keepalive = false;
@@ -1261,9 +1506,10 @@ pub const Response = struct {
         identity,
         gzip,
         zstd,
+        br,
 
         fn isCoding(c: Compression) bool {
-            return c == .gzip or c == .zstd;
+            return c == .gzip or c == .zstd or c == .br;
         }
 
         fn name(c: Compression) []const u8 {
@@ -1272,13 +1518,13 @@ pub const Response = struct {
     };
 
     /// Whether compression applies to this response at all, and if so,
-    /// whether the client takes gzip.
+    /// which of our codings the client takes.
     ///
     /// Settles nothing: the headers that say so go on with `addVary` and
     /// `markCompressed`, which have their room reserved here, so that
     /// nothing fails after a response has started claiming a coding.
-    fn negotiateCompression(self: *const Response) Compression {
-        if (!(build_options.use_zlib or build_options.use_zstd) or !self.compress) return .off;
+    fn negotiateCompression(self: *Response) Compression {
+        if (!(build_options.use_zlib or build_options.use_zstd or build_options.use_brotli) or !self.compress) return .off;
         if (self.file != null) return .off;
         // A tunnel (RFC 8441), not a representation.
         if (self.request) |r| if (r.protocol != null) return .off;
@@ -1298,15 +1544,19 @@ pub const Response = struct {
         // can get wrong.
         var needed: usize = if (not_modified) 0 else 1;
         if (!self.variesByAcceptEncoding()) needed += 1;
-        if (self.headers.keys.len - self.headers.len < needed) return .off;
+        if (!self.headerRoom(needed)) return .off;
 
         const request = self.request orelse return .identity;
-        // The client's q-values first; on a tie, zstd, which compresses
-        // better and faster than gzip.
+        // The client's q-values first; on a tie, zstd, then Brotli, then
+        // gzip. zstd compresses about as well as gzip at a third of the
+        // time; Brotli at quality 5 is 10-15% smaller than either on JSON
+        // of a few KiB, at about twice gzip's time.
         const zstd_q: u16 = if (build_options.use_zstd) http.encodingQuality(&request.headers, "zstd") else 0;
+        const br_q: u16 = if (build_options.use_brotli) http.encodingQuality(&request.headers, "br") else 0;
         const gzip_q: u16 = if (build_options.use_zlib) http.encodingQuality(&request.headers, "gzip") else 0;
-        if (zstd_q == 0 and gzip_q == 0) return .identity;
-        return if (zstd_q >= gzip_q) .zstd else .gzip;
+        if (zstd_q == 0 and br_q == 0 and gzip_q == 0) return .identity;
+        if (zstd_q >= br_q and zstd_q >= gzip_q) return .zstd;
+        return if (br_q >= gzip_q) .br else .gzip;
     }
 
     /// `Vary: *` included, which says the response varies by anything.
@@ -1359,6 +1609,7 @@ pub const Response = struct {
         if (len < min_compress_len) return;
         const compressed = switch (coding) {
             .zstd => if (build_options.use_zstd) self.zstdBody(len) catch return else unreachable,
+            .br => if (build_options.use_brotli) self.brotliBody(len) catch return else unreachable,
             else => self.deflateBody(len) catch return,
         };
         if (compressed.len() >= len) return;
@@ -1380,13 +1631,29 @@ pub const Response = struct {
         return compressed;
     }
 
+    /// The buffered body as one Brotli stream, its window fitted to it.
+    fn brotliBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error || error{CompressFailed})!BodyBuffer {
+        var compressed: BodyBuffer = try .init(self.arena);
+        var out: BodyWriter = .into(self, &compressed);
+        var z: brotli_io.Compress = undefined;
+        try z.init(&out.interface, &.{}, .{ .quality = self.brotli_quality, .lgwin = brotli_io.windowFor(len), .size_hint = len });
+        defer z.deinit();
+        if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&z.writer) else try z.writer.writeAll(self.body);
+        try z.finish();
+        try out.interface.flush();
+        return compressed;
+    }
+
     fn deflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
         // Sized to the body, and zlib's memory with it: a window much past
-        // the body finds nothing more to match.
+        // the body finds nothing more to match. That memory (140 KiB and
+        // more) comes from `block_cache`, not the arena: an HTTP/2 or
+        // HTTP/3 stream's arena keeps less than that between requests, so
+        // it would be mapped again for each one.
         const window_bits: u4 = @intCast(std.math.clamp(std.math.log2_int_ceil(usize, len), 9, 15));
-        var gzip = try zlib.Compress.init(self.arena, &out.interface, &.{}, .gzip, .{
+        var gzip = try zlib.Compress.init(block_cache.allocator, &out.interface, &.{}, .gzip, .{
             .level = compression_level,
             .window_bits = window_bits,
             // Any less and the symbol buffer ends deflate blocks early
@@ -1503,8 +1770,17 @@ pub const Response = struct {
         try w.writeAll("\r\n");
     }
 
+    /// Sends what the handler left: the headers, if they have not gone
+    /// out, and the body. The server calls it after the handler; a
+    /// second call does nothing.
     pub fn write(self: *Response) WriteError!void {
         if (self.written) {
+            return;
+        }
+        // An upgrade's 101 went out with it, and the connection is the
+        // upgraded protocol's: its writer is not this response's to flush.
+        if (self.status == .switching_protocols and self.sink == null and self.conn.upgraded) {
+            self.written = true;
             return;
         }
         // A handler that failed part way through may never have called
@@ -1609,7 +1885,7 @@ pub const Response = struct {
     fn addSinkDate(self: *Response) std.Io.Writer.Error!void {
         if (self.send_date and self.headers.get("Date") == null) {
             const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
-            self.headers.put("Date", date) catch {};
+            self.putHeader("Date", date) catch {};
         }
     }
 
@@ -1642,6 +1918,28 @@ pub const Response = struct {
     fn declaredLength(self: *const Response) error{InvalidContentLength}!?usize {
         const value = self.headers.get("Content-Length") orelse return null;
         return std.fmt.parseInt(usize, value, 10) catch error.InvalidContentLength;
+    }
+
+    /// The length of a body held in memory, as it stands (what a body
+    /// writer collected, else `body`), for middleware that keeps whole
+    /// responses after the handler (`anole.middleware.ResponseCache`);
+    /// `copyBody` takes its bytes. Null for any other: a file, a stream,
+    /// a body writer still open, or headers already sent.
+    pub fn memoryBodyLen(self: *const Response) ?usize {
+        if (self.file != null or self.headers_written or self.body_writer_open or self.streaming or self.chunked) return null;
+        return self.bodyLen();
+    }
+
+    /// Copies a body held in memory into `out`, `memoryBodyLen` bytes.
+    pub fn copyBody(self: *const Response, out: []u8) void {
+        if (self.body_buffer.len() == 0) return @memcpy(out[0..self.body.len], self.body);
+        var at: usize = 0;
+        var it = self.body_buffer.segments.first;
+        while (it) |node| : (it = node.next) {
+            const segment = BodyBuffer.Segment.fromNode(node);
+            @memcpy(out[at..][0..segment.len], segment.bytes()[0..segment.len]);
+            at += segment.len;
+        }
     }
 
     /// The length of the body as set so far: what the body writer
@@ -2103,6 +2401,55 @@ test "StreamingBodyWriter: reports a body that does not match the declared lengt
     var body = try response.stream(&body_buf);
     try body.interface.writeAll("short");
     try std.testing.expectError(error.ContentLengthMismatch, body.end());
+}
+
+test "StreamingBodyWriter: never writes past a declared Content-Length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "5");
+
+    var body_buf: [4]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hel");
+    // Past the length: refused, and nothing of it reaches the wire, which
+    // would carry the extra bytes as the start of the next response.
+    try std.testing.expectError(error.WriteFailed, body.interface.writeAll("lo, and then some"));
+    try std.testing.expectEqual(@as(?StreamingBodyWriter.Error, error.ContentLengthMismatch), body.err);
+    try std.testing.expect(!response.keepalive);
+    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "then") == null);
+}
+
+test "Response: framing headers are the server's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try std.testing.expectError(error.InvalidHeaderName, response.header("Transfer-Encoding", "chunked"));
+    try std.testing.expectError(error.InvalidHeaderName, response.addHeader("transfer-encoding", "chunked"));
+    try std.testing.expectError(error.InvalidHeaderName, response.header("Connection", "keep-alive"));
+    try std.testing.expectError(error.InvalidHeaderName, response.addHeader("Connection", "close"));
+    // A second Content-Length replaces the first rather than joining it.
+    try response.addHeader("Content-Length", "5");
+    try response.addHeader("Content-Length", "2");
+    response.body = "hi";
+    try response.write();
+    const written = conn_writer.buffered();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "Content-Length"));
+    try std.testing.expect(std.mem.endsWith(u8, written, "Content-Length: 2\r\n\r\nhi"));
 }
 
 test "StreamingBodyWriter: rejects a Content-Length it cannot parse" {
@@ -2996,6 +3343,69 @@ test "EventWriter: splatBytesAll" {
     try std.testing.expectEqualStrings("data: ababab\n\n", try t.events());
 }
 
+test "EventStream: a bare CR in data is a line break, never the start of a field" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    try t.stream.send("hi\revent: admin\rid: 9\r\rdata: x\r\ny\nz", .{});
+
+    try std.testing.expectEqualStrings(
+        "data: hi\ndata: event: admin\ndata: id: 9\ndata: \ndata: data: x\ndata: y\ndata: z\n\n",
+        try t.events(),
+    );
+}
+
+test "EventWriter: a bare CR is a line break, and a CRLF split across writes is one" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    var ew = try t.stream.startSend(.{});
+    try ew.interface.writeAll("a\revent: x\r");
+    try ew.interface.writeAll("\nb\r");
+    try ew.interface.writeAll("c\r");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: a\ndata: event: x\ndata: b\ndata: c\n\n", try t.events());
+}
+
+test "fuzz: SSE data never adds a line that is not data" {
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var buf: [8192]u8 = undefined;
+            var t: TestEventStream = undefined;
+            try t.init(&buf);
+            defer t.deinit();
+            // What one event can expand to fits the test stream's buffers.
+            const data = input[0..@min(input.len, 64)];
+            const half = data.len / 2;
+            var ew = try t.stream.startSend(.{});
+            try ew.interface.writeAll(data[0..half]);
+            try ew.interface.writeAll(data[half..]);
+            try ew.end();
+            try t.stream.send(data, .{});
+            try expectOnlyData(try t.events());
+        }
+
+        /// Every line the WHATWG parser would see (CR, LF and CRLF end
+        /// one) is a `data:` line or the blank line ending an event.
+        fn expectOnlyData(out: []const u8) !void {
+            var i: usize = 0;
+            var start: usize = 0;
+            while (i < out.len) : (i += 1) {
+                if (out[i] != '\r' and out[i] != '\n') continue;
+                const line = out[start..i];
+                if (line.len > 0 and !std.mem.startsWith(u8, line, "data: ")) return error.InjectedField;
+                if (out[i] == '\r' and i + 1 < out.len and out[i + 1] == '\n') i += 1;
+                start = i + 1;
+            }
+        }
+    }.check, &.{ "", "a\rb", "a\r\nb\n", "\r\r\r", "x\revent: y\rid: 1\r\rdata: z" });
+}
+
 test "Response: resetBody replaces a half written body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3754,6 +4164,167 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary: Accept-Encoding\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+}
+
+test "Response: Accept-Encoding picks zstd, br or gzip by q-value, then in that order" {
+    if (!(build_options.use_zlib and build_options.use_zstd and build_options.use_brotli)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    const cases = [_]struct { []const u8, Response.Compression }{
+        // HttpArena's json-comp and Safari: br over gzip on a tie.
+        .{ "gzip, br", .br },
+        .{ "br", .br },
+        // Chrome and Firefox: zstd first on a tie.
+        .{ "gzip, deflate, br, zstd", .zstd },
+        .{ "br;q=1.0, zstd;q=0.9, gzip", .br },
+        .{ "br;q=0.5, gzip", .gzip },
+        .{ "gzip;q=0.2, br;q=0.8, zstd;q=0.5", .br },
+        .{ "*", .zstd },
+        .{ "*;q=0.1, br", .br },
+        .{ "*, zstd;q=0, gzip;q=0.5", .br },
+        .{ "br;q=0, gzip", .gzip },
+        .{ "br;q=0", .identity },
+        .{ "identity", .identity },
+        .{ "deflate", .identity },
+        .{ "", .identity },
+    };
+    for (cases) |case| {
+        var request: Request = .{ .arena = arena.allocator(), .parser = undefined, .transport = undefined };
+        request.headers = try http.Headers.init(arena.allocator(), 4);
+        try request.headers.put("Accept-Encoding", case[0]);
+        var response = try Response.init(arena.allocator(), &connection, 8);
+        response.request = &request;
+        response.compress = true;
+        std.testing.expectEqual(case[1], response.negotiateCompression()) catch |err| {
+            std.debug.print("Accept-Encoding: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+fn testBrRequest(arena: std.mem.Allocator) !Request {
+    var request: Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    request.headers = try http.Headers.init(arena, 4);
+    try request.headers.put("Accept-Encoding", "gzip, br");
+    return request;
+}
+
+fn testBrotliDecode(arena: std.mem.Allocator, encoded: []const u8, max: usize) ![]u8 {
+    const c = @import("brotli");
+    const out = try arena.alloc(u8, max);
+    var len: usize = max;
+    if (c.BrotliDecoderDecompress(encoded.len, encoded.ptr, &len, out.ptr) != c.BROTLI_DECODER_RESULT_SUCCESS) return error.InvalidBrotli;
+    return out[0..len];
+}
+
+test "Response: a buffered body goes out as br, at the configured quality" {
+    if (!build_options.use_brotli) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var text: std.Io.Writer.Allocating = .init(arena.allocator());
+    for (0..100) |i| try text.writer.print("{{\"id\":{d},\"name\":\"Widget {d}\",\"price\":{d}}},", .{ i, i % 9, i * 37 % 500 });
+    const body = text.written();
+
+    var sizes: [2]usize = undefined;
+    for ([_]u4{ 1, 9 }, &sizes) |quality, *size| {
+        var buf: [8192]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        const request = try testBrRequest(arena.allocator());
+        var response = try Response.init(arena.allocator(), &connection, 8);
+        defer response.deinit();
+        response.request = &request;
+        response.compress = true;
+        response.brotli_quality = quality;
+        response.content_type = .json;
+        response.body = body;
+        try response.write();
+
+        const written = conn_writer.buffered();
+        const split = std.mem.indexOf(u8, written, "\r\n\r\n").?;
+        const head = written[0 .. split + 2];
+        try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br\r\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, head, "Vary: Accept-Encoding\r\n") != null);
+        const encoded = written[split + 4 ..];
+        try std.testing.expect(std.mem.indexOf(u8, head, try std.fmt.allocPrint(arena.allocator(), "Content-Length: {d}\r\n", .{encoded.len})) != null);
+        try std.testing.expectEqualStrings(body, try testBrotliDecode(arena.allocator(), encoded, body.len));
+        size.* = encoded.len;
+    }
+    try std.testing.expect(sizes[1] < sizes[0]);
+}
+
+test "Response: a streamed body goes out as br, each flush decodable" {
+    if (!build_options.use_brotli) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [16384]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    const request = try testBrRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 8);
+    defer response.deinit();
+    response.request = &request;
+    response.compress = true;
+    response.content_type = .text;
+
+    var stream_buf: [128]u8 = undefined;
+    var w = try response.stream(&stream_buf);
+    var plain: std.Io.Writer.Allocating = .init(arena.allocator());
+    for (0..50) |i| {
+        try w.interface.print("event {d}: something happened, and then something else happened\n", .{i});
+        try plain.writer.print("event {d}: something happened, and then something else happened\n", .{i});
+        if (i % 10 == 9) try w.interface.flush();
+    }
+    try w.end();
+
+    const written = conn_writer.buffered();
+    const split = std.mem.indexOf(u8, written, "\r\n\r\n").?;
+    const head = written[0 .. split + 2];
+    try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Transfer-Encoding: chunked\r\n") != null);
+    // Undo the chunking: several chunks, one per flush and the end.
+    var encoded: std.Io.Writer.Allocating = .init(arena.allocator());
+    var rest = written[split + 4 ..];
+    var chunks: usize = 0;
+    while (true) {
+        const eol = std.mem.indexOf(u8, rest, "\r\n").?;
+        const size = try std.fmt.parseInt(usize, rest[0..eol], 16);
+        if (size == 0) break;
+        try encoded.writer.writeAll(rest[eol + 2 ..][0..size]);
+        rest = rest[eol + 2 + size + 2 ..];
+        chunks += 1;
+    }
+    try std.testing.expect(chunks >= 5);
+    try std.testing.expectEqualStrings(plain.written(), try testBrotliDecode(arena.allocator(), encoded.written(), plain.written().len));
+    // The encoder's memory went back when the body ended.
+    try std.testing.expect(response.brotli_encoder == null);
+}
+
+test "Response.deinit frees the Brotli encoder of a stream never ended" {
+    if (!build_options.use_brotli) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    const request = try testBrRequest(arena.allocator());
+    var response = try Response.init(arena.allocator(), &connection, 8);
+    response.request = &request;
+    response.compress = true;
+    var stream_buf: [64]u8 = undefined;
+    var w = try response.stream(&stream_buf);
+    try w.interface.writeAll("abandoned half way");
+    try std.testing.expect(response.brotli_encoder != null);
+    // As the HTTP/1.1 loop does: the arena (where the compressor is) goes
+    // before the response.
+    _ = arena.reset(.free_all);
+    response.deinit();
+    try std.testing.expect(response.brotli_encoder == null);
 }
 
 const test_templates = struct {

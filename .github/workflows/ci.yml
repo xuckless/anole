@@ -1,9 +1,28 @@
 name: CI
 
+# Changes to docs alone (guides, README, CHANGELOG, the site, issue
+# templates) skip this suite: the Docs site workflow builds and link-checks
+# them.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "site/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/dependabot.yml"
+      - "LICENSE*"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "site/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/dependabot.yml"
+      - "LICENSE*"
 
 permissions:
   contents: read
@@ -21,25 +40,39 @@ jobs:
         # macos-latest is Apple silicon (arm64).
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A hung test fails the step at about 3x its usual time (macOS, the
+    # slower runner) instead of holding the runner for GitHub's 6 h limit.
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Unit and smoke tests (default profile, every feature on)
+        timeout-minutes: 35
         run: zig build test --summary all
       - name: Every preset and edge flag combination
+        timeout-minutes: 25
         run: zig build test-flags --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
       - name: Profile minimal (no C library besides llhttp)
+        timeout-minutes: 15
         run: zig build test -Dprofile=minimal --summary all
       - name: Profile web (BoringSSL + nghttp2, no HTTP/3)
+        timeout-minutes: 15
         run: zig build test -Dprofile=web --summary all
       - name: Full profile without TLS (turns HTTP/3 off)
+        timeout-minutes: 15
         run: zig build test -Dtls=none --summary all
       - name: HTTP/3 without HTTP/2 (nghttp3 without nghttp2)
+        timeout-minutes: 15
         run: zig build test -Dhttp2=false -Dhttp3=true --summary all
       - name: Invalid flag combination is rejected
         shell: bash
@@ -52,26 +85,161 @@ jobs:
           grep -F "invalid Anole feature flags" <<<"$out"
 
   cross:
-    name: cross (aarch64-linux-gnu, compile and link only)
+    name: cross (${{ matrix.target }}, compile and link only)
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64-windows: every preset and edge combination, which the
+        # windows job (default profile only) does not build.
+        target: [aarch64-linux-gnu, x86_64-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
-          cache-key: cross-aarch64-linux-gnu
+          cache-key: cross-${{ matrix.target }}
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build every test binary and the full example
-        run: zig build test-flags full -Dtarget=aarch64-linux-gnu --summary all
+        run: zig build test-flags full -Dtarget=${{ matrix.target }} --summary all
+
+  capi:
+    name: capi (${{ matrix.os }})
+    # libanole, the C ABI (include/anole.h): packed with Zig alone, its
+    # exported symbols checked, anole.h's layout against the Zig side, the C
+    # suite plain and under ASan and UBSan; on Linux also the header and the
+    # Zig side of libanole for Windows.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: capi
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: libanole (static and shared, only anole_* exported)
+        timeout-minutes: 20
+        run: zig build capi --summary all
+      - name: anole.h layout, the C suite, the engine over HTTP/2 and HTTP/3
+        timeout-minutes: 20
+        run: zig build capi-test test-capi-engine --summary all
+      - name: The C suite under ASan and UBSan (system cc)
+        timeout-minutes: 20
+        run: zig build capi-test-asan --summary all
+      - name: The same, against a ReleaseSafe libanole
+        timeout-minutes: 20
+        run: zig build capi-test -Doptimize=ReleaseSafe --summary all
+      - name: anole.h and the Zig side of libanole for Windows
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        run: |
+          for t in x86_64-windows-gnu aarch64-windows-gnu; do
+            zig cc -target $t -std=c99 -Wall -Wextra -Werror -Iinclude -c tests/capi/layout.c -o /tmp/layout-$t.o
+            zig c++ -target $t -std=c++17 -Wall -Werror -Iinclude -x c++ -c tests/capi/layout.c -o /tmp/layout-$t-cxx.o
+          done
+          zig build capi-zig capi -Dtarget=x86_64-windows-gnu --summary all
+
+  windows:
+    name: windows (development target; default profile)
+    runs-on: windows-latest
+    # Windows is a development target ("works on Windows, fast on Linux"):
+    # the tests run, the examples build and two of them serve requests. The
+    # Unix-only parts (per-core SO_REUSEPORT sockets, HTTP/3 steering and
+    # UDP batching, listener hand-off and SIGUSR2, LISTEN_FDS, sd_notify,
+    # idle parking) are compiled out there and their tests skipped.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    # Strawberry Perl's pkg-config.bat is on the runner's PATH and fails
+    # when Zig asks it about the Windows system libraries (advapi32 for
+    # translate-c): with no pkg-config, Zig links them directly.
+    env:
+      PKG_CONFIG: anole-no-pkg-config
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: windows
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Unit and smoke tests (default profile, every feature on)
+        timeout-minutes: 60
+        run: zig build test --summary all
+      - name: Build and install the examples
+        timeout-minutes: 20
+        run: zig build hello rest websocket grpc auth clients observe postgres sqlite mongodb redis io full --summary all
+      # Two examples serve requests: hello over HTTP/1.1, and full (every
+      # listener, `process` set, so the Unix-only hand-off is skipped)
+      # over HTTP/1.1, HTTPS, and h2c and HTTP/2 over TLS when a curl with
+      # HTTP/2 is on the runner (Git for Windows' is built without it; the
+      # h2 client tests above cover HTTP/2 either way). Ctrl-C would drain
+      # them, but a runner has no console to send one to, so they are killed.
+      - name: examples/hello and examples/full answer requests
+        timeout-minutes: 5
+        run: |
+          h2curl=
+          for c in curl /c/Windows/System32/curl.exe; do
+            if "$c" -V 2>/dev/null | grep -q '^Features:.* HTTP2'; then h2curl=$c; break; fi
+          done
+          get() {
+            for i in $(seq 1 50); do
+              if "$@"; then echo; return 0; fi
+              sleep 0.2
+            done
+            return 1
+          }
+          ok=0
+          ./zig-out/bin/hello.exe > hello.log 2>&1 &
+          hello=$!
+          get curl -fsS http://127.0.0.1:3000/ || ok=1
+          kill $hello || true
+          ./zig-out/bin/full.exe > full.log 2>&1 &
+          full=$!
+          get curl -fsS http://127.0.0.1:8080/ || ok=1
+          get curl -fsSk https://127.0.0.1:8443/ || ok=1
+          if [ -n "$h2curl" ]; then
+            get "$h2curl" -fsS --http2-prior-knowledge http://127.0.0.1:8080/ -w ' (HTTP/%{http_version})' || ok=1
+            get "$h2curl" -fsSk --http2 https://127.0.0.1:8443/ -w ' (HTTP/%{http_version})' || ok=1
+          else
+            echo "no curl with HTTP/2 here: h2c and h2 over TLS not checked from outside"
+          fi
+          kill $full || true
+          echo "--- hello.log"; cat hello.log
+          echo "--- full.log"; cat full.log
+          exit $ok
 
   h2spec:
     name: h2spec (HTTP/2 conformance, h2c and TLS)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: h2spec
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build examples/full
         run: zig build full -Doptimize=ReleaseSafe --summary all
       - name: Fetch h2spec 2.6.0, pinned by SHA-256
@@ -88,11 +256,16 @@ jobs:
     name: Autobahn (WebSocket conformance, HTTP/1.1)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: autobahn
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build the echo peer
         run: zig build autobahn-echo -Doptimize=ReleaseSafe --summary all
       # The fuzzing client in Docker (image pinned by digest); fails on any
@@ -108,11 +281,16 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: h3
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # Debug, so the debug allocator reports any leak at exit.
       - name: Build the HTTP/3 test server and client
         run: zig build h3-test-server h3-test-client --summary all
@@ -127,25 +305,37 @@ jobs:
     name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: quic-interop
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # The runner reads its traces with pyshark; it needs a current tshark
       # (its own CI uses this PPA).
+      # Retried: the PPA answers 503 now and then; Ubuntu's own tshark is
+      # too old for the runner, so there is no fallback.
       - name: Install tshark
         run: |
-          sudo add-apt-repository -y ppa:wireshark-dev/nightly
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark
+          for i in 1 2 3 4 5; do
+            sudo add-apt-repository -y ppa:wireshark-dev/nightly &&
+              sudo apt-get update -qq &&
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark &&
+              exit 0
+            sleep $((i * 15))
+          done
+          exit 1
       - name: tests/interop/run.sh
         run: tests/interop/run.sh ngtcp2,quic-go
         env:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
       - name: Keep the logs of a failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
         with:
           name: quic-interop-logs
           path: ${{ runner.temp }}/interop/logs
@@ -155,16 +345,28 @@ jobs:
     name: WebTransport interop runner (Anole's server, flupke; Chrome and Firefox)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: webtransport-interop
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # Retried: the PPA answers 503 now and then; Ubuntu's own tshark is
+      # too old for the runner, so there is no fallback.
       - name: Install tshark
         run: |
-          sudo add-apt-repository -y ppa:wireshark-dev/nightly
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark
+          for i in 1 2 3 4 5; do
+            sudo add-apt-repository -y ppa:wireshark-dev/nightly &&
+              sudo apt-get update -qq &&
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark &&
+              exit 0
+            sleep $((i * 15))
+          done
+          exit 1
       - name: tests/interop/webtransport/run.sh flupke-webtransport
         run: tests/interop/webtransport/run.sh flupke-webtransport
         env:
@@ -178,7 +380,7 @@ jobs:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/wt-interop-browsers
       - name: Keep the logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
         with:
           name: webtransport-interop-logs
           path: |
@@ -192,8 +394,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           use-cache: false
@@ -208,28 +410,39 @@ jobs:
     name: Fuzz the parsers (200K runs per target)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: fuzz
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # The fuzz targets are the "fuzz:" tests (src/fuzz.zig, and the HTTP
       # core's: the PROXY protocol, requests through llhttp whole and in
       # pieces, a connection's bytes over HTTP/1.1 and HTTP/2); a plain
       # `zig build test` runs them on their seeds and fixed mutations only.
       - name: zig build test --fuzz=200K
+        timeout-minutes: 75
         run: zig build test -Dllvm=true --fuzz=200K
 
   grpc-interop:
     name: gRPC interop (both directions with grpc-go, h2c and TLS; grpc's HTTP/2 checks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: grpc-interop
-      - uses: actions/setup-go@v6
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7 (v7.0.0)
         with:
           go-version: stable
       - name: Build the interop server
@@ -253,19 +466,15 @@ jobs:
         run: tests/grpc/interop/run-http2.sh ./zig-out/bin/grpc-interop-server
 
   redis:
-    name: Redis and Valkey (live client and session store tests)
+    name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS; the C ABI's suite)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         image: ["redis:7", "valkey/valkey:8"]
-    services:
-      redis:
-        image: ${{ matrix.image }}
-        ports: ["6379:6379"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2.2.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: redis
@@ -273,5 +482,61 @@ jobs:
       # lookups fail now and then on the runners (NameServerFailure).
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # A service container takes no files, and the TLS run needs the
+      # server's certificate: the script starts the server itself, with a
+      # CA made for the run.
+      - name: Tests against a live server
+        timeout-minutes: 35
+        run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh
+
+  postgres:
+    name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256; the C ABI's suite)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["postgres:17"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: postgres
+      # Zig fetches git dependencies itself on a cold cache, and its DNS
+      # lookups fail now and then on the runners (NameServerFailure).
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # A service container takes no files, and the TLS run needs the
+      # server's certificate: the script starts the server itself, with a
+      # CA made for the run.
+      - name: Tests against a live server
+        timeout-minutes: 35
+        run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh
+
+  mongodb:
+    name: MongoDB (live client tests; the C ABI's suite)
+    # MongoDB 8.0.21+ and 9.x exit at startup on Linux kernels 6.19 to
+    # 7.0.13 (SERVER-125742; ubuntu-24.04 runs 7.0.0), and earlier 8.0s
+    # crash there: 8.0 and 9.0 run on ubuntu-22.04 (kernel 6.8) until the
+    # newer image's kernel reaches 7.0.14.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "mongo:7.0", os: ubuntu-latest }
+          - { image: "mongo:8.0", os: ubuntu-22.04 }
+          - { image: "mongo:9.0", os: ubuntu-22.04 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: mongodb-${{ matrix.os }}
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # A replica set of one with authentication and failCommand, plain and
+      # over TLS on a CA made for the run; SCRAM-SHA-256 and SCRAM-SHA-1.
       - name: Tests with a live server
-        run: zig build test -Dredis-test-port=6379 --summary all
+        timeout-minutes: 35
+        run: tests/mongodb/run.sh ${{ matrix.image }}

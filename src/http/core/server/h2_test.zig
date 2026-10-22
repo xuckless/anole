@@ -9,6 +9,7 @@ const dusty = @import("../root.zig");
 const c = @import("nghttp2");
 const build_options = @import("build_options");
 const tls = @import("tls");
+const h2 = @import("h2.zig");
 
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 
@@ -35,6 +36,8 @@ const TestClient = struct {
     /// The last-stream-ID of each GOAWAY received, in order.
     goaways: [4]i32 = undefined,
     goaway_count: usize = 0,
+    /// The error code of the last GOAWAY received.
+    goaway_error: u32 = 0,
     /// DATA frames received with no payload and END_STREAM: an end that
     /// could have gone on the frame before it.
     empty_ends: usize = 0,
@@ -147,6 +150,30 @@ const TestClient = struct {
         return id;
     }
 
+    /// A GET with `extra` fields after the pseudo-headers, and no
+    /// `:authority` when `authority` is null.
+    fn requestWith(self: *TestClient, path: []const u8, authority: ?[]const u8, extra: []const c.nghttp2_nv) !i32 {
+        var nva: [16]c.nghttp2_nv = undefined;
+        nva[0] = nv(":method", "GET");
+        nva[1] = nv(":path", path);
+        nva[2] = nv(":scheme", "http");
+        var n: usize = 3;
+        if (authority) |a| {
+            nva[n] = nv(":authority", a);
+            n += 1;
+        }
+        for (extra) |f| {
+            nva[n] = f;
+            n += 1;
+        }
+        const resp = try self.gpa.create(Resp);
+        resp.* = .{};
+        const id = c.nghttp2_submit_request2(self.session, null, &nva, n, null, resp);
+        if (id < 0) return error.Http2Submit;
+        try self.responses.put(self.gpa, id, resp);
+        return id;
+    }
+
     fn get(self: *TestClient, id: i32) *Resp {
         return self.responses.get(id).?;
     }
@@ -225,6 +252,7 @@ const TestClient = struct {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
+        if (frame.*.hd.type == c.NGHTTP2_GOAWAY) self.goaway_error = frame.*.goaway.error_code;
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
             self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
             self.goaway_count += 1;
@@ -291,6 +319,15 @@ const TestClient = struct {
 };
 
 const Handlers = struct {
+    /// The cookie header, how many `accept` fields came, and the host.
+    fn fields(req: *dusty.Request, res: *dusty.Response) !void {
+        var accepts: usize = 0;
+        var it = req.headers.iterator();
+        while (it.next()) |e| {
+            if (std.ascii.eqlIgnoreCase(e.key, "accept")) accepts += 1;
+        }
+        try res.print(.text, "cookie={s} accepts={d} host={s}", .{ req.headers.get("cookie") orelse "-", accepts, req.host() orelse "-" });
+    }
     fn hello(_: *dusty.Request, res: *dusty.Response) !void {
         try res.print(.text, "hello", .{});
     }
@@ -322,6 +359,10 @@ const Handlers = struct {
     fn slow(req: *dusty.Request, res: *dusty.Response) !void {
         try req.io.sleep(.fromMilliseconds(300), .awake);
         res.body = "slow but whole";
+    }
+    fn slower(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.io.sleep(.fromMilliseconds(900), .awake);
+        res.body = "slower but whole";
     }
     /// A streamed body far past the client's 64 KiB stream window.
     fn big(_: *dusty.Request, res: *dusty.Response) !void {
@@ -391,11 +432,13 @@ const Fixture = struct {
             .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
         }, {});
         self.server.router.get("/hello", Handlers.hello);
+        self.server.router.get("/fields", Handlers.fields);
         self.server.router.get("/users/:id", Handlers.user);
         self.server.router.post("/echo", Handlers.echo);
         self.server.router.get("/trailers", Handlers.trailers);
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
+        self.server.router.get("/slower", Handlers.slower);
         self.server.router.post("/late", Handlers.late);
         self.server.router.post("/stall", Handlers.stall);
         // The same handlers on routes that promise not to wait, which run
@@ -906,6 +949,44 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     try std.testing.expectEqualStrings("slow but whole", resp.body.items);
 }
 
+/// Holds every write of the HTTP/2 writer for 200 ms (`h2.test_before_flush`).
+fn holdFlush(io: std.Io) std.Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(200), .awake);
+}
+
+test "HTTP/2: a drain waits for a response that is taken from the session but not yet written" {
+    // nghttp2 closes a stream when the writer takes its last frame, before
+    // the write. The stream's count in the in-flight requests must last
+    // until that write is done, or the drain sees zero and cancels the
+    // connection with the response still in the writer's buffer. Every
+    // write is held 200 ms, which makes that window 200 ms wide; the drain's
+    // two GOAWAYs are out by about 500 ms, the response comes at 900.
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+
+    h2.test_before_flush = holdFlush;
+    defer h2.test_before_flush = null;
+    const id = try client.request("GET", "/slower", null);
+    try client.sendPending();
+    try io.sleep(.fromMilliseconds(100), .awake);
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+
+    try client.runUntilClosed();
+    const resp = client.get(id);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("slower but whole", resp.body.items);
+}
+
 test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 stream" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
@@ -1127,4 +1208,213 @@ test "HTTP/2: a handler is let go when the client closes the connection" {
     const closed_at: std.Io.Clock.Timestamp = .now(io, .awake);
     client.deinit();
     try Waiter.expectDoneWithin(io, closed_at, 3000);
+}
+
+test "HTTP/2: cookie crumbs are joined with \"; \" and other repeated fields kept" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.requestWith("/fields", "localhost", &.{
+        TestClient.nv("cookie", "a=1"),
+        TestClient.nv("accept", "text/html"),
+        TestClient.nv("cookie", "anole_session=x"),
+        TestClient.nv("accept", "application/json"),
+        TestClient.nv("cookie", "c=3"),
+    });
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("cookie=a=1; anole_session=x; c=3 accepts=2 host=localhost", client.get(id).body.items);
+}
+
+test "HTTP/2: :authority is the host; a host field that differs from it is refused" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const same = try client.requestWith("/fields", "example.com", &.{TestClient.nv("host", "example.com")});
+    const differs = try client.requestWith("/fields", "example.com", &.{TestClient.nv("host", "evil.example")});
+    const host_only = try client.requestWith("/fields", null, &.{TestClient.nv("host", "example.org")});
+    const two_hosts = try client.requestWith("/fields", null, &.{ TestClient.nv("host", "example.org"), TestClient.nv("host", "evil.example") });
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(same).status);
+    try std.testing.expectEqualStrings("cookie=- accepts=0 host=example.com", client.get(same).body.items);
+    try std.testing.expectEqual(@as(u16, 400), client.get(differs).status);
+    try std.testing.expectEqual(@as(u16, 200), client.get(host_only).status);
+    try std.testing.expectEqualStrings("cookie=- accepts=0 host=example.org", client.get(host_only).body.items);
+    // Two host fields: nghttp2 refuses the stream itself.
+    try std.testing.expectEqual(@as(u16, 0), client.get(two_hosts).status);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_PROTOCOL_ERROR), client.get(two_hosts).error_code);
+}
+
+/// Counts the bytes allocated and not yet freed.
+const LiveAllocator = struct {
+    inner: std.mem.Allocator,
+    live: std.atomic.Value(isize) = .init(0),
+    peak: std.atomic.Value(isize) = .init(0),
+
+    fn grew(self: *LiveAllocator, by: isize) void {
+        const now = self.live.fetchAdd(by, .monotonic) + by;
+        _ = self.peak.fetchMax(now, .monotonic);
+    }
+
+    fn allocator(self: *LiveAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawAlloc(len, alignment, ra) orelse return null;
+        self.grew(@intCast(len));
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.inner.rawResize(memory, alignment, new_len, ra)) return false;
+        self.grew(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)));
+        return true;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        self.grew(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)));
+        return p;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+        _ = self.live.fetchSub(@intCast(memory.len), .monotonic);
+    }
+};
+
+/// Streams whose head the server refuses: a header list past the limit,
+/// and two host fields (refused by nghttp2's own checks).
+fn sendRefusedHeads(client: *TestClient, n: usize) !void {
+    const big: [1500]u8 = @splat('x');
+    for (0..n) |i| {
+        if (i % 2 == 0) {
+            _ = try client.requestWith("/hello", "localhost", &.{ TestClient.nv("x-a", &big), TestClient.nv("x-b", &big) });
+        } else {
+            _ = try client.requestWith("/hello", null, &.{ TestClient.nv("host", "a.example"), TestClient.nv("x-a", &big), TestClient.nv("host", "b.example") });
+        }
+    }
+    try client.run();
+}
+
+test "HTTP/2: a stream whose head is refused is freed when it closes, not with the connection" {
+    const io = std.testing.io;
+    var live: LiveAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(live.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        // The refusal budget is the next test's.
+        .http2 = .{ .max_header_list_size = 2048, .refused_stream_burst = 1000 },
+    }, {});
+    defer server.deinit();
+    server.router.get("/hello", Handlers.hello);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // The first round fills the connection's spare streams.
+    try sendRefusedHeads(&client, 40);
+    const before = live.live.load(.monotonic);
+    try sendRefusedHeads(&client, 80);
+    const after = live.live.load(.monotonic);
+    try std.testing.expect(after - before < 32 * 1024);
+    // The connection still serves.
+    const ok = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(ok).body.items);
+}
+
+test "HTTP/2: a peer whose streams keep being refused is sent GOAWAY(ENHANCE_YOUR_CALM)" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .http2 = .{ .max_header_list_size = 2048, .refused_stream_burst = 20, .refused_stream_rate = 1 },
+    }, {});
+    defer server.deinit();
+    server.router.get("/hello", Handlers.hello);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    sendRefusedHeads(&client, 60) catch {};
+    try client.runUntilClosed();
+    try std.testing.expect(client.goaway_count >= 1);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_ENHANCE_YOUR_CALM), client.goaway_error);
+}
+
+test "HTTP/2: a finished response the peer never takes is reset at the request timeout" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .timeout = .{ .request = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/whole", struct {
+        const body: [100 * 1024]u8 = @splat('z');
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = &body;
+        }
+    }.handle);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // A stream window of zero: the server may send the head, never the body.
+    const zero = [_]c.nghttp2_settings_entry{.{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = 0 }};
+    if (c.nghttp2_submit_settings(client.session, c.NGHTTP2_FLAG_NONE, &zero, zero.len) != 0) return error.Http2Init;
+    const started: std.Io.Clock.Timestamp = .now(io, .awake);
+    const id = try client.request("GET", "/whole", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_CANCEL), client.get(id).error_code);
+    try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
+    try awaitStreamsFreed(&server, io);
+}
+
+test "HTTP/2: the raised body windows of a connection share one budget" {
+    const io = std.testing.io;
+    var live: LiveAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(live.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .http2 = .{ .reading_window_budget = 1024 * 1024 },
+    }, {});
+    defer server.deinit();
+    server.router.post("/late", Handlers.late);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    const body = try std.testing.allocator.alloc(u8, 300 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var ids: [8]i32 = undefined;
+    for (&ids) |*id| id.* = try client.request("POST", "/late", body);
+    try client.run();
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(std.testing.allocator);
+    try want.print(std.testing.allocator, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) });
+    for (ids) |id| try std.testing.expectEqualStrings(want.items, client.get(id).body.items);
+    // Eight streams reading at once would raise eight 1 MiB windows.
+    try std.testing.expect(live.peak.load(.monotonic) < 4 * 1024 * 1024);
 }

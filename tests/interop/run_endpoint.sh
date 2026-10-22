@@ -21,7 +21,10 @@ case "$TESTCASE" in
 esac
 
 args=()
-if [ "$TESTCASE" = retry ]; then
-  args+=(retry)
-fi
+case "$TESTCASE" in
+  retry) args+=(retry) ;;
+  # Only this case wants QUIC v2; the others check for v1 even when the
+  # client offers v2 too (aioquic does in every case).
+  v2) args+=(v2) ;;
+esac
 exec /usr/local/bin/h3-interop-server /certs/cert.pem /certs/priv.key /www 443 "${args[@]}" >/logs/server.log 2>&1

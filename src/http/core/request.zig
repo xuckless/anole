@@ -9,6 +9,7 @@ const http = @import("http.zig");
 const RouteInfo = @import("router.zig").RouteInfo;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
+/// Where an HTTP/2 or HTTP/3 stream's body comes from (`Request.body_source`).
 pub const BodySource = @import("parser.zig").BodySource;
 const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
@@ -16,20 +17,47 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const Listener = @import("config.zig").Listener;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
+/// The request's cookies (`Request.cookies`).
 pub const Cookie = @import("cookie.zig").Cookie;
+/// `Request.session`, filled by `middleware.Session`.
 pub const SessionData = @import("middleware/Session.zig").SessionData;
+/// `Request.locals` (`setLocal`, `local`).
 pub const Locals = @import("locals.zig").Locals;
 
 const log = std.log.scoped(.anole);
 
 const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
 
+/// What a handler gets for one request, over any protocol (HTTP/1.1,
+/// HTTP/2, HTTP/3): method, URL, headers, path and query parameters, and
+/// the body, read on demand (`body`, `bind`, `reader`, `formData`).
+///
+/// Everything it holds lives until the response has gone out. Allocate
+/// what the response needs from `arena`, which is freed in one go after
+/// it; the strings the request hands out (headers, parameters, the body)
+/// are borrowed for as long, so copy what must outlive it.
+///
+///     fn show(req: *anole.Request, res: *anole.Response) !void {
+///         const id = req.params.getInt(u64, "id") orelse return error.NotFound;
+///         const page = req.query.getInt(u32, "page") orelse 1;
+///         const agent = req.headers.get("User-Agent") orelse "";
+///         try res.json(.{ .id = id, .page = page, .agent = agent });
+///     }
 pub const Request = struct {
+    /// The method; HEAD reaches GET routes, an extended CONNECT is routed
+    /// as GET (see `protocol`).
     method: http.Method = undefined,
+    /// The request target as sent: path and query string
+    /// ("/users/42?page=2"), not decoded.
     url: []const u8 = "",
+    /// 1 for HTTP/1.x, 2 for HTTP/2, 3 for HTTP/3.
     version_major: u8 = 0,
     version_minor: u8 = 0,
+    /// The request headers, looked up case-insensitively:
+    /// `req.headers.get("Authorization")`.
     headers: http.Headers = .{},
+    /// The body's media type from `Content-Type`, when it is one the
+    /// server knows by name; read the header for the rest.
     content_type: ?http.ContentType = null,
     /// The coding the body arrived in. Undone by the body reader unless
     /// `config.decompress` is off, in which case reading the body yields
@@ -45,7 +73,13 @@ pub const Request = struct {
     content_length: ?usize = null,
     /// The route the request matched, null when none did.
     route: ?*const RouteInfo = null,
+    /// The route's path parameters: for "/users/:id",
+    /// `req.params.get("id")` or `req.params.getInt(u64, "id")`; a
+    /// `*wildcard` segment's rest of the path under its name.
     params: http.Params = .{},
+    /// The query string's values, percent-decoded:
+    /// `req.query.get("q")`, `req.query.getInt(u32, "page")`. A name
+    /// without `=` has the value ""; of a repeated name, the last wins.
     query: http.Params = .{},
     /// The client address. This is the socket peer unless
     /// `ServerConfig.trusted_proxy_hops` resolves it through
@@ -88,13 +122,22 @@ pub const Request = struct {
     /// Null in a request the server did not build.
     drain_hooks: ?*DrainHooks = null,
 
+    /// Freed in one go once the response has gone out: for anything the
+    /// handler builds for this request.
     arena: std.mem.Allocator,
+    /// The server's runtime, for I/O from a handler (files, sockets,
+    /// sleeping, locks): calls through it wait without blocking the
+    /// thread.
     io: std.Io = undefined,
 
     // Installed by the server for real requests. Kept as a callback so this
     // module does not depend on the server's backend-specific timer type.
     _timeout_context: ?*anyopaque = null,
     _set_timeout: ?*const fn (*anyopaque, std.Io, std.Io.Timeout) void = null,
+    /// The last deadline the handler set with `setTimeout`, on the awake
+    /// clock; null for none (or `.none`). The rest of an unread body is
+    /// drained no later than this.
+    _handler_deadline: ?std.Io.Clock.Timestamp = null,
 
     // Body reading support
     parser: *RequestParser,
@@ -114,6 +157,8 @@ pub const Request = struct {
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
     _mfd_read: bool = false,
+    /// The signed-cookie session `middleware.Session` loads and saves;
+    /// empty without it. (`anole.session` has its own stores.)
     session: SessionData = .{},
     /// Values a middleware hands to the handler for this request: see
     /// `setLocal` and `local`.
@@ -139,6 +184,8 @@ pub const Request = struct {
         return self.peer_certificate;
     }
 
+    /// Clears the request for reuse on the same connection. Called by
+    /// the server between requests; not for handlers.
     pub fn reset(self: *Request) void {
         const arena = self.arena;
         const io = self.io;
@@ -197,6 +244,10 @@ pub const Request = struct {
     /// spawned by the handler.
     pub fn setTimeout(self: *Request, timeout: std.Io.Timeout) void {
         const set = self._set_timeout orelse return;
+        self._handler_deadline = if (timeout.toDurationFromNow(self.io)) |d|
+            std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d.raw, .clock = .awake })
+        else
+            null;
         set(self._timeout_context.?, self.io, timeout);
     }
 
@@ -254,7 +305,9 @@ pub const Request = struct {
         _ = self.headers.remove("Content-Length");
     }
 
-    /// Read the entire body into memory. Result is cached for subsequent calls.
+    /// The whole body, in the request's arena, or null when there is none.
+    /// The result is kept, so later calls return it again. Fails with
+    /// `error.BodyTooBig` (a 413) past `config.max_body_size`.
     pub fn body(self: *Request) !?[]const u8 {
         if (self._body_read) {
             return self._body;
@@ -278,6 +331,20 @@ pub const Request = struct {
         }
         self._body = result;
         return result;
+    }
+
+    /// A path parameter by name, null when the route has none of that name:
+    /// `req.param("id")` for "/users/:id". The same as `req.params.get`;
+    /// `req.params.getInt(u64, "id")` parses one.
+    pub fn param(self: *const Request, name: []const u8) ?[]const u8 {
+        return self.params.get(name);
+    }
+
+    /// A query-string value by name, percent-decoded, null when absent:
+    /// `req.queryParam("page")` for "?page=2". The same as `req.query.get`;
+    /// `req.query.getInt(u32, "page")` parses one.
+    pub fn queryParam(self: *const Request, name: []const u8) ?[]const u8 {
+        return self.query.get(name);
     }
 
     /// The JSON body as a `T` (`std.json`), allocated in the request's
@@ -350,14 +417,17 @@ pub const Request = struct {
         return self.locals.get(T, key);
     }
 
-    /// Get cookies from the request
+    /// The `Cookie` header's cookies: `req.cookies().get("theme")`.
     pub fn cookies(self: *const Request) Cookie {
         return .{
             .header = self.headers.get("Cookie") orelse "",
         };
     }
 
-    /// Parse the body as a form (application/x-www-form-urlencoded)
+    /// The body as an `application/x-www-form-urlencoded` form, names and
+    /// values decoded, in the request's arena: `(try
+    /// req.formData()).get("email")`. Parsed once; later calls return the
+    /// same map.
     pub fn formData(self: *Request) !*std.StringHashMapUnmanaged([]const u8) {
         if (self._fd_read) {
             return &self._fd;
@@ -395,7 +465,9 @@ pub const Request = struct {
         return &self._fd;
     }
 
-    /// Parse the body as a multipart form (multipart/form-data)
+    /// The body as a `multipart/form-data` form (file uploads), by field
+    /// name, in the request's arena. Parsed once; later calls return the
+    /// same map.
     pub fn multiFormData(self: *Request) !*std.StringHashMapUnmanaged(MultipartForm.Entry) {
         if (self._mfd_read) {
             return &self._mfd;
@@ -483,8 +555,9 @@ pub const Request = struct {
         return &self._mfd;
     }
 
-    /// Unescape a URL-encoded string
-    /// Converts %XX hex sequences to bytes and + to space
+    /// Decodes a URL-encoded string: %XX sequences to bytes and '+' to a
+    /// space. Returns `input` itself when there is nothing to decode, else
+    /// a copy allocated with `allocator`.
     pub fn urlUnescape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
         var has_plus = false;
         var unescaped_len = input.len;
@@ -706,6 +779,10 @@ const MultipartForm = struct {
     // End of chunk.
 };
 
+/// How many headers `parseHeaders` makes room for before it has to grow the
+/// table.
+const initial_header_room = 16;
+
 const ParseHeadersError = std.Io.Reader.Error || ParseError ||
     error{ IncompleteRequest, HeadersTooLarge, OutOfMemory };
 
@@ -721,8 +798,10 @@ const ParseHeadersError = std.Io.Reader.Error || ParseError ||
 /// Returns error.HeadersTooLarge if the head does not fit.
 pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeadersError!void {
     // The arena is reset between requests, and may be another pooled set's
-    // by the next one, so the headers are allocated for each.
-    parser.request.headers = try http.Headers.init(parser.request.arena, parser.request.config.max_header_count);
+    // by the next one, so the headers are allocated for each: room for
+    // most heads, grown to `max_header_count` for one with more, so that an
+    // ordinary request takes little of its arena.
+    parser.request.headers = try http.Headers.init(parser.request.arena, @min(parser.request.config.max_header_count, initial_header_room));
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {
         const buffered = reader.buffered();
@@ -1260,7 +1339,7 @@ test "Request: a streaming read resolves through the reader it hands out" {
     var sink_buf: [64]u8 = undefined;
     var sink: std.Io.Writer = .fixed(&sink_buf);
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
-    try std.testing.expectEqual(error.CorruptInput, r.err.?);
+    try std.testing.expectEqual(error.MalformedBody, r.err.?);
 }
 
 test "Request.body: a body cut short is IncompleteBody, not a failed read" {
@@ -1334,7 +1413,7 @@ test "Request.body: framing the parser rejects is reported as itself" {
 
     try parseHeaders(&reader, &parser);
 
-    try std.testing.expectError(error.InvalidChunkSize, req.body());
+    try std.testing.expectError(error.MalformedBody, req.body());
 }
 
 test "Request.body: large body over 128 bytes" {

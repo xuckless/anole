@@ -13,7 +13,8 @@ attribution header and are listed in part B; that includes the HTTP core
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
 `-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
-ngtcp2 and nghttp3.
+ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dpostgres` adds pg.zig and
+buffer.zig; `-Dsqlite` adds SQLite and zig-sqlite.
 
 
 A. Fetched packages
@@ -26,7 +27,9 @@ zio (async runtime)
             plus Anole's scheduler, accept, spawn-cache, idle-stack and
             recvmmsg/sendmmsg patches; some are open upstream as
             lalinsky/zio #836-#838)
-  Pinned:   commit ebb701426b4431a1e04ab1efb1d1cb43fc7f0c12 of the fork
+  Pinned:   commit dcaf6fe009093f123791e088cb89daf16fb26327 of the fork
+            (ebb7014 plus the accept cancel fix, merged into the fork's
+            anole branch as 504ceab)
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)
@@ -58,9 +61,13 @@ ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
   Source:   https://github.com/ngtcp2/ngtcp2, used through Anole's fork
             https://github.com/xuckless/ngtcp2 (branch anole: tag v1.25.0,
             its generated version.h, and Anole's patches keeping a server's
-            fallback connection ID across a migration after a NAT rebinding
-            and retransmitting two Initial packets on a server PTO)
-  Pinned:   commit f47d1322abb7d65e48920f3e539f113866824478 of the fork
+            fallback connection ID across a migration after a NAT rebinding,
+            retransmitting two Initial packets on a server PTO, and giving
+            both PATH_CHALLENGE probes of a validation round the same data,
+            following a client whose address changes during the
+            handshake, and writing a new path's PATH_CHALLENGE before an
+            ACK while pacing holds data back)
+  Pinned:   commit b70d6d98d90be1af793af704bdf66b97df8dd7f1 of the fork
   Includes: lib/ngtcp2_pcg.c (PCG random number generator,
             Copyright 2014-2019 Melissa O'Neill and the PCG Project
             contributors, Apache-2.0 OR MIT, used under MIT), compiled in
@@ -93,6 +100,11 @@ zstd 1.5.7 (Zstandard)
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
 
+Brotli 1.2.0 (Brotli compression)
+  Licence:  MIT. Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+  Source:   https://github.com/google/brotli (tag archive v1.2.0)
+  Linked:   -Dbrotli=true (the encoder; the decoder only in Anole's tests)
+
 zig-jwt (JWT building and signing)
   Licence:  Apache License 2.0 (text in part E). Copyright deatil
   Source:   https://github.com/deatil/zig-jwt, used through Anole's fork
@@ -102,21 +114,78 @@ zig-jwt (JWT building and signing)
   Includes: zig-rsa (https://github.com/deatil/zig-rsa, Apache-2.0)
   Linked:   -Dauth=true
 
+upb (protobuf's C runtime) and utf8_range, from protobuf 36.2
+  Licence:  upb: BSD-3-Clause (text in part F). Copyright 2008 Google Inc.
+            utf8_range: MIT. Copyright (c) 2019 Yibo Cai, Copyright 2022
+            Google LLC
+  Source:   https://github.com/protocolbuffers/protobuf (release tarball
+            v36.2): ruby/ext/google/protobuf_c/ruby-upb.c (upb amalgamated)
+            and third_party/utf8_range
+  Linked:   -Dgrpc=true (the C ABI's gRPC server: protobuf <-> JSON with
+            the consumer's descriptors); built by build/upb.zig
+
 yyjson (JSON reader and writer)
   Licence:  MIT. Copyright (c) 2020 YaoYuan
   Source:   https://github.com/ibireme/yyjson (tag archive 0.13.0)
   Linked:   -Djson=true
 
-hiredis (RESP reader and command formatter)
+hiredis (RESP reader)
   Licence:  BSD-3-Clause (text in part F). Copyright (c) 2009-2011 Salvatore
             Sanfilippo, (c) 2010-2011 Pieter Noordhuis, and contributors
   Source:   https://github.com/redis/hiredis (tag archive v1.5.0)
   Linked:   -Dredis=true
 
+pg.zig (PostgreSQL client)
+  Licence:  MIT. Copyright (c) 2024 Karl Seguin
+  Source:   https://github.com/karlseguin/pg.zig, used through Anole's fork
+            https://github.com/xuckless/pg.zig (branch anole: upstream master
+            4d63344 plus a read timeout, CancelRequest, an automatic
+            prepared statement cache, pool lifetimes, a refused connect's
+            error kept, and TLS through an injected module instead of
+            OpenSSL; Anole injects its BoringSSL client, src/pg/tls.zig;
+            security patches: server messages checked before they are
+            read, LISTEN channel names bounded, SCRAM nonce and iteration
+            count checked, allowed login methods (require_auth) and SCRAM
+            channel binding, and an optional session reset on release,
+            every time or only when the SQL may have changed the session;
+            for the C ABI: parameters as a slice of tagged unions, and
+            results in PostgreSQL's text format)
+  Pinned:   commit 6f47a57bd5f7d9e96440526d5b51bd7a043a8203 of the fork
+  Linked:   -Dpostgres=true
+
+buffer.zig (byte buffers; a dependency of pg.zig)
+  Licence:  MIT. Copyright (c) 2024 Karl Seguin
+  Source:   https://github.com/karlseguin/buffer.zig
+  Pinned:   commit a0de50267550666dc126051f672a8f0b55c44083 (pinned by
+            pg.zig's build.zig.zon)
+  Linked:   -Dpostgres=true
+
+SQLite 3.54.1 (the amalgamation: sqlite3.c, sqlite3.h)
+  Licence:  Public domain (the dedication at the top of sqlite3.c; no
+            licence text to carry). Authors: D. Richard Hipp and the SQLite
+            developers
+  Source:   https://sqlite.org/2026/sqlite-amalgamation-3540100.zip
+            (SHA3-256 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30)
+  Linked:   -Dsqlite=true
+
+zig-sqlite (Zig bindings and driver for SQLite)
+  Licence:  MIT. Copyright (c) 2020 Vincent Rischmann <vincent@rischmann.fr>
+  Source:   https://github.com/vrischmann/zig-sqlite, used through Anole's
+            fork https://github.com/xuckless/zig-sqlite (branch anole:
+            upstream PR #215's Zig 0.17 port, bindings through the
+            translate-c package, sqlite3_initialize in Db.init, SQLite and
+            its options header taken from the caller)
+  Pinned:   commit 80742c3ce2b1917b44248371e02633cc942a1867
+  Linked:   -Dsqlite=true
+
 zig-protobuf (protobuf runtime and protoc-gen-zig; protoc release zips)
   Licence:  MIT. Copyright (c) 2021 Arwalk
   Source:   https://github.com/Arwalk/zig-protobuf
-  Pinned:   commit e9e18c7664b8c950e5fc679259c968dd66ccc48b
+  Fork:     https://github.com/xuckless/zig-protobuf, branch anole (upstream
+            e9e18c7 plus security patches: decoding bounds message nesting
+            depth and checks length-delimited fields against the input
+            before allocating; Timestamp fields validated)
+  Pinned:   commit ef23c279af0dcb12cce9eee39838c14f5955c75f of the fork
   Linked:   -Dgrpc=true (protoc and protoc-gen-zig run at build time only,
             for `zig build gen-proto`; protoc is Google's BSD-3-Clause
             release binary, pinned by hash in zig-protobuf's build.zig.zon)
@@ -125,8 +194,9 @@ websocket-zig (sans-IO WebSocket frame codec, for WebSocket over HTTP/2)
   Licence:  MIT. Copyright (c) 2026 Matt Robenolt
   Source:   https://github.com/mattrobenolt/websocket-zig
   Fork:     https://github.com/xuckless/websocket-zig, branch anole (ported to
-            Zig 0.17; the libxev example dropped)
-  Pinned:   commit 4bd0e5c4f46466ded5478afb0db3a2f72a264ae8
+            Zig 0.17; the libxev example dropped; a security patch refusing
+            RSV1 on control frames and continuations)
+  Pinned:   commit 065fac7e8b6c53e845335ccccf5a40f435d5ff30
   Linked:   -Dwebsocket=true
 
 zlib.zig (std.Io wrapper over the zlib API; its src/root.zig only)
@@ -143,6 +213,18 @@ translate-c (build-time C header translator; not linked)
 Aro (C front end used by translate-c at build time; not linked)
   Licence:  MIT. Copyright (c) 2021 Veikka Tuominen
   Source:   https://codeberg.org/ziglang/arocc (fetched by translate-c)
+
+MongoDB specifications, source/bson-corpus, connection-string,
+uri-options, auth and server-discovery-and-monitoring tests (test data;
+tests only, not linked, not vendored)
+  Licence:  Creative Commons Attribution-NonCommercial-ShareAlike 3.0 United
+            States (LICENSE.md in that repository). Copyright MongoDB, Inc.
+  Source:   https://github.com/mongodb/specifications (archive of commit
+            7235b61bde1bc75e51f28d8f67dd935198969c02)
+  Used:     fetched by `zig build test` only when Anole is the root build,
+            and read by tests/bson/corpus_test.zig and
+            src/mongodb/spec_test.zig; nothing from it is in
+            this repository, its package or any binary
 
 
 B. Code adapted into this repository
@@ -520,7 +602,7 @@ not compiled into BoringSSL and so is not reproduced here.
    limitations under the License.
 
 
-F. BSD-3-Clause licence text (zstd, hiredis, protobuf's descriptor.proto)
+F. BSD-3-Clause licence text (zstd, hiredis, protobuf's descriptor.proto, upb)
 -------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of zstd 1.5.7.

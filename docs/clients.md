@@ -52,17 +52,30 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
   `""` when there is none) and `json(T, allocator)`, which parses the body
   into `T`, skipping fields `T` does not have, with memory from `allocator`
   that outlives the response. It does not check the status.
-- `deinit` hands the connection back to the pool. `.inner` is dusty's
-  response, `.http` (on the client) dusty's client, for the rest of what
-  `anole.http.Client` below offers.
+- `deinit` hands the connection back to the pool. `.inner` is the HTTP
+  core's response, `.http` (on the client) the core's client, for the rest
+  of what `anole.http.Client` below offers.
 
-It trusts the system's CA store and has the defaults below. A client with
-other settings (CAs, a client certificate, HTTP/2) is an
-`anole.http.Client` of your own.
+It trusts the system's CA store and has the defaults below. To change them
+for the server's client, set `ServerOptions.client`, an
+`anole.http.ClientConfig` (CAs, a client certificate, HTTP/2, the timeout,
+the pool):
+
+```zig
+var app = try anole.App.init(gpa, .{
+    .client = .{ .timeout = .fromSeconds(5), .max_idle_per_host = 64 },
+});
+```
+
+A client with settings of its own beside it is an `anole.http.Client` of
+your own. The APIs that make requests for you
+(`anole.auth.Keyring`, `anole.auth.oidc`, `anole.observe.trace.Exporter`)
+take the `anole.Client` that `app.client()` and `anole.client(req)` return;
+wrap one of your own as `.{ .http = &my_client }`.
 
 ## HTTP/1.1 and HTTPS
 
-`anole.http.Client` is dusty's client. Create one, share it, and call `fetch`:
+`anole.http.Client` is the HTTP core's client. Create one, share it, and call `fetch`:
 
 ```zig
 var client = anole.http.Client.init(gpa, io, .{});
@@ -78,9 +91,40 @@ const content_type = response.headers().get("Content-Type");
 `fetch` reads the whole body by default, up to `max_response_size` (10 MiB).
 It sends `Accept-Encoding: gzip, deflate` and, when built with
 `-Dcompression` (on by default), undoes gzip, deflate and zstd. The
-response's memory lives until `deinit`. One client is safe to share between tasks; its pool keeps up to
-`max_idle_connections` (8) idle connections and reuses them. The `gpa` you
-pass must be thread-safe.
+response's memory lives until `deinit`. One client is safe to share between
+tasks, and its connections are pooled: `deinit` on a response hands its
+connection back, and the next request to the same scheme, host and port
+takes it. The `gpa` you pass must be thread-safe.
+
+### The connection pool
+
+On zio each executor has a pool of its own, as the database connectors do:
+a request takes and gives back connections on its own executor, so a
+connection stays on one thread. (Off zio there is one pool.) Each keeps:
+
+| `ClientConfig` field | Default | What it bounds |
+| --- | --- | --- |
+| `max_idle_per_host` | 256 | Idle connections to one scheme, host and port (or unix socket). |
+| `max_idle_connections` | 1024 | Idle connections in all. 0 turns pooling off. |
+| `idle_timeout` | 90 s | How long a connection may sit idle before the pool closes it. A shorter `Keep-Alive: timeout=N` from the server wins; null keeps it until the server closes it. |
+
+A pool is never bigger than the number of requests that were in flight at
+once on its executor, so the generous limits cost nothing until a burst
+needs them, and `idle_timeout` closes what a burst left behind (a task per
+pool runs only while connections are idle). Set them lower to keep fewer
+sockets open to an upstream, not to save memory on the common path: when
+many handlers call one host at once and the limit is below how many are in
+flight, every connection that comes back past the limit is closed and the
+next request dials again. That costs a handshake, a socket in TIME_WAIT and
+memory churn on every round; with 32 handlers on one upstream and the old
+limit of 8, a server's memory grew without end (see the changelog). Go's
+`MaxIdleConnsPerHost` of 2 is the same trap; hyper and reqwest keep no
+per-host limit.
+
+Each idle connection holds its read buffer (`buffer_size`, 16 KiB, plus 1
+KiB), a 1 KiB write buffer and at most 32 KiB its last response's arena
+kept. `client.dials` counts the connections the client opened, for
+checking that a steady load reuses them.
 
 A request with headers and a body:
 
@@ -94,6 +138,41 @@ defer response.deinit();
 
 Other `FetchOptions`: `max_redirects`, `timeout`, `decompress`, `stream`, and
 `unix_socket_path` (for a server on a Unix socket, such as Docker's).
+
+The URL's path and query go into the request as they are, so they must be
+percent-encoded: a space, a control character (CR and LF among them) or a
+byte past 0x7f in either fails the request with `error.InvalidUrl`, and so
+does a redirect to such a URL. Build query strings from data with
+`std.Uri.Component.percentEncode` or an equivalent, never by pasting it in.
+
+### Redirects
+
+`fetch` follows up to `max_redirects` (10) redirects: 301, 302, 303, 307 and
+308. 301, 302 and 303 turn a request other than GET and HEAD into a GET
+without a body (QUERY keeps both on 301 and 302); 307 and 308 keep the
+method and body. Along the way:
+
+- `Authorization`, `Cookie` and the proxy credentials are dropped once a
+  redirect leaves the first host and its subdomains, or goes from https to
+  http.
+- The `Referer` is the previous URL within one origin, only its origin
+  (`https://host/`) across origins, and none from https to http, as
+  browsers do by default. One you set yourself is sent as it is.
+- A body follows a 307 or 308 only to the same host (or from http to https
+  on it). A redirect that would take it elsewhere is not followed: `fetch`
+  returns the 307 or 308 response.
+
+`ClientConfig.check_redirect` replaces that last rule with your own: a
+function that sees each redirect (`status`, `from`, `to`, `method`,
+`has_body`, `hops`, `cross_origin`) and returns `.follow`, `.stop` (return
+the redirect response) or `.fail` (`error.RedirectRefused`).
+
+For a client that fetches URLs from untrusted input (webhooks, link
+previews), set `ClientConfig.deny_private_addresses = true`. It refuses
+loopback, private, link-local (cloud metadata included), shared, multicast
+and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
+The check is on the address the connection reached, after DNS, on every
+hop, before any byte of the request is sent.
 
 `ClientConfig.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
 ALPN on HTTPS connections. A server that picks it gets the request over
@@ -142,12 +221,25 @@ defer gpa.free(body);
 - `release` every stream you open, before `close`. Releasing an unfinished
   stream resets it (RST_STREAM CANCEL); `cancel` does that without releasing.
 - `waitHead` fails with `error.StreamReset`, `error.ConnectionClosed`,
-  `error.Timeout` (see [Timeouts](#timeouts)) or `error.Canceled`. A read or
+  `error.Timeout` (see [Timeouts](#timeouts)), `error.Canceled`,
+  `error.HeadersTooLarge` or `error.TooManyInterimResponses`. A read or
   write on a stream that ended early fails with `error.ReadFailed` or
   `error.WriteFailed`, the only errors a reader and a writer can return;
-  `s.readError()` and `s.writeError()` say which of those four it was.
+  `s.readError()` and `s.writeError()` say which it was.
+- `max_header_list_size` (64 KiB) bounds a response's header fields,
+  decoded, informational responses and trailers included, and is sent to
+  the server as SETTINGS_MAX_HEADER_LIST_SIZE. Up to five informational
+  (1xx) responses may come before the final one, as over HTTP/1.1.
+- After the server's GOAWAY, `request` fails with `error.ConnectionClosed`
+  and `isOpen()` is false, while the streams the GOAWAY covers finish.
 - A stream's `status`, `headers` and `trailers` live until `release`; copy
   what you keep.
+- `stream_window` (64 KiB) is what the server may send on a stream before
+  its reader takes it, and `max_data` (16 MiB) the same for the
+  connection. Each stream allocates a receive queue of `stream_window` up
+  front, hence the smaller default than HTTP/3's.
+- `RequestOptions.body_bytes` (HTTP/2 only) sends a whole body at once, in
+  place of `body = true` and the writer.
 
 ## HTTP/3
 
@@ -167,10 +259,17 @@ Each connection binds its own UDP socket. `connect` returns after the
 handshake, and fails with `error.HandshakeFailed` (a certificate it does not
 trust among other causes), `error.Timeout` (past `connect_timeout`, 10 s by
 default) or `error.NoH3`. `timeout` is each request's budget, as for
-HTTP/2. The other `ConnectOptions` are `stream_window` (256 KiB), `max_data`
-(16 MiB) and `idle_timeout_ms` (30 s). `anole.h3` exports the names
-`anole.h2` does: `ClientConnection`, `Stream` (also as `ClientStream`),
-`Header`, `ConnectOptions`, `RequestOptions` and `StreamError`.
+HTTP/2. `stream_window` (256 KiB) and `max_data` (16 MiB) mean what they
+do for HTTP/2, with the same types; the stream window's default is larger
+because an HTTP/3 stream's buffer grows as data arrives.
+`max_header_list_size` (64 KiB) and the limit of five informational
+responses are the same too (SETTINGS_MAX_FIELD_SECTION_SIZE over HTTP/3). Only HTTP/3 has
+`idle_timeout` (30 s, QUIC's idle timeout), `session_cache`, `early_data`
+and `webtransport` (below), and `RequestOptions.early`; `tls` is not
+optional. `anole.h3` exports the names `anole.h2` does:
+`ClientConnection`, `Stream`, `Header`, `ConnectOptions`, `RequestOptions`,
+`StreamError` and `version()` ("ngtcp2/1.25.0 nghttp3/1.18.0", against
+`anole.h2.version()`'s "nghttp2/1.70.0").
 
 The client does not discover HTTP/3 from `Alt-Svc` or retry over TCP.
 Connect to it when you know the server speaks it.
@@ -248,6 +347,13 @@ When it is read:
   store is cached by its contents), so connect once and share the
   connection. PEM need only live through `connect`.
 
+A response body with neither `Content-Length` nor chunked framing ends
+where the connection does. Over TLS that end must be the server's
+close_notify; a connection that just closes could have been cut by anyone
+on the path, so reading such a body then fails with
+`error.TlsConnectionTruncated`. Framed bodies are not affected: their
+framing already shows a cut.
+
 Paths are relative to the current directory, or to `dir` when you set one
 (`.{ .path = "ca.pem", .dir = some_dir }`). A client key must be PKCS#8 or
 SEC1 PEM without a passphrase.
@@ -255,7 +361,10 @@ SEC1 PEM without a passphrase.
 To trust a development certificate from `anole.tls.selfSigned`, pass its
 `cert` (not the key) as `.ca = .{ .pem = pem.cert }`, as `examples/clients`
 does. The certificate is its own CA and names `localhost`, `127.0.0.1` and
-`::1`. An IP literal as the host is checked against the IP names, and no
+`::1`. Being a CA, it could vouch for any name, so trust it only in
+development and tests.
+
+The clients do not check revocation (no CRLs, no OCSP). An IP literal as the host is checked against the IP names, and no
 SNI is sent for it.
 
 ## Timeouts

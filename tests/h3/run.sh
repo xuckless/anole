@@ -16,7 +16,7 @@ pid=""
 trap '[ -n "$pid" ] && kill -9 $pid 2>/dev/null; [ -n "$peer" ] && kill -9 $peer 2>/dev/null; rm -rf "$work"' EXIT
 peer=""
 python3 -m venv "$work/venv"
-"$work/venv/bin/pip" install -q aioquic==1.7.0
+"$work/venv/bin/pip" install -q --require-hashes -r "$here/requirements.txt"
 py="$work/venv/bin/python -I $here/client.py"
 port=${ANOLE_H3_PORT:-18543}
 url=https://127.0.0.1:$port

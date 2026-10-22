@@ -37,3 +37,7 @@ research/
 zig-pkg/
 bench/.data/
 bench/media/out/
+
+# Python bytecode
+__pycache__/
+*.pyc

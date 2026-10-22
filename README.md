@@ -4,29 +4,32 @@
 
 <p align="center">
   <b>One Zig server for your whole backend.</b><br>
-  REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3.
+  REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3. TLS, auth and observability are built in, on one listener and one router.
 </p>
 
 <p align="center">
-  <a href="https://github.com/xuckless/anole/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/xuckless/anole/ci.yml?branch=main&logo=github&label=CI"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/xuckless/anole?color=green"></a>
   <a href="https://ziglang.org/download/"><img alt="Zig 0.17" src="https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white"></a>
-  <img alt="Platforms: Linux, macOS" src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey">
+  <img alt="Platforms: Linux, macOS, Windows (development)" src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20(dev)-lightgrey">
   <img alt="Protocols: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket" src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%C2%B7%20h2%20%C2%B7%20h3%20%C2%B7%20gRPC%20%C2%B7%20WS-blue">
-  <img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-orange">
+  <img alt="WebTransport" src="https://img.shields.io/badge/WebTransport-draft--02-8A4FFF">
+  <img alt="Auth: JWT, OIDC, sessions" src="https://img.shields.io/badge/auth-JWT%20%C2%B7%20OIDC%20%C2%B7%20sessions-D8407F">
+  <img alt="TLS: BoringSSL" src="https://img.shields.io/badge/TLS-BoringSSL-2E7D32">
+  <img alt="Observability: Prometheus, OpenTelemetry" src="https://img.shields.io/badge/observability-Prometheus%20%C2%B7%20OpenTelemetry-E6522C">
+  <img alt="Databases: PostgreSQL, SQLite, MongoDB, Redis" src="https://img.shields.io/badge/databases-PostgreSQL%20%C2%B7%20SQLite%20%C2%B7%20MongoDB%20%C2%B7%20Redis-336791">
+  <a href="https://xuckless.github.io/anole/"><img alt="Docs" src="https://img.shields.io/badge/docs-xuckless.github.io%2Fanole-0A7B4F"></a>
   <a href="https://github.com/xuckless/anole/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/xuckless/anole?style=flat&logo=github"></a>
-  <a href="https://github.com/xuckless/anole/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/xuckless/anole"></a>
-  <a href="https://github.com/xuckless/anole/issues"><img alt="Issues" src="https://img.shields.io/github/issues/xuckless/anole"></a>
 </p>
 
 <p align="center">
-  <a href="docs/getting-started.md">Getting started</a> ·
-  <a href="docs/from-fiber.md">From Fiber</a> ·
-  <a href="docs/">Docs</a> ·
+  <a href="https://xuckless.github.io/anole/">Docs</a> ·
+  <a href="https://xuckless.github.io/anole/getting-started/">Getting started</a> ·
+  <a href="https://xuckless.github.io/anole/api/">API reference</a> ·
+  <a href="https://github.com/xuckless/anole/wiki">Wiki</a> ·
+  <a href="https://zigistry.dev/packages/github/xuckless/anole">Zigistry</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
-TLS, auth and observability are built in, on one listener and one router.
 
 An anole is a small lizard that changes colour to fit wherever it lands, and
 that's the idea: one server core that speaks whatever protocol the client
@@ -41,6 +44,10 @@ already survived the internet:
 - ngtcp2 and nghttp3 for HTTP/3.
 
 Anole wires them together, tunes them hard, and hands you a Fiber-sized API.
+The goal is that building a backend in Zig feels as easy as in Express, Fiber
+or Bun: one call per feature, sane defaults, clear errors, and databases,
+auth and observability already in the box.
+
 Zig compiles every C dependency, so you install nothing but Zig. Each one
 sits behind a build flag, and whatever you switch off is never downloaded or
 compiled.
@@ -66,7 +73,8 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>`.
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.1.2`
+   (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
 3. `zig build run`, then `curl localhost:3000/`.
@@ -78,6 +86,7 @@ app.ws("/echo", echo);                                    // WebSockets (HTTP/1.
 app.grpc(pb.Greeter, .{ .SayHello = sayHello });          // gRPC, gRPC-Web, Connect, JSON transcoding
 app.webtransport("/wt", session);                         // WebTransport
 try app.staticDir("/", "public", .{});                    // static files, ranges, ETags
+const db = try app.postgres(.{});                         // PostgreSQL from DATABASE_URL (also sqlite, mongodb, redis)
 app.metrics(.{}); app.health(.{}); app.tracing(.{});      // Prometheus, health checks, OpenTelemetry
 try app.listenTls(":443", .fromFiles("cert.pem", "key.pem")); // HTTPS + HTTP/2 + HTTP/3
 ```
@@ -88,93 +97,24 @@ core it runs on. When you want every knob, `anole.Server(App)` takes each
 listener and option explicitly ([docs/server.md](docs/server.md)).
 
 Where to go next:
-- [docs/getting-started.md](docs/getting-started.md) walks from `zig init`
-  to a JSON API, WebSockets, TLS, gRPC and a deployment.
-- [docs/from-fiber.md](docs/from-fiber.md) puts Fiber's API next to
-  Anole's, for Go developers.
+- [Getting started](https://xuckless.github.io/anole/getting-started/) walks
+  from `zig init` to a JSON API, WebSockets, TLS, gRPC and a deployment.
+- [From Fiber](https://xuckless.github.io/anole/from-fiber/) puts Fiber's API
+  next to Anole's, for Go developers.
 - `zig build run-rest` runs a JSON CRUD API with API-key auth.
 
-## How fast?
+## Performance
 
-Measured on one Linux box (Intel i7-14700F, Fedora 44) against the stacks
-people actually deploy. Each server runs in its own container, pinned to
-dedicated P-cores, with idle siblings and a memory cap. Load comes from wrk
-and h2load on other cores. Each server is set up the way its own docs say to,
-under the same rules for everyone. Server and load generator share the box
-and talk over loopback, so read the comparisons, not the absolute numbers.
-The harness, every server's code and the raw results are in `bench/` on the
-[`bench/suite`](https://github.com/xuckless/anole/tree/bench/suite/bench) branch
-(numbers from its quick profile, 2026-10-19, one 15 s run per case after a
-5 s warm-up).
-
-**One CPU, `/plaintext`, requests per second:**
-
-| Protocol | Anole | Fiber | Axum | Go net/http | Fastify | FastAPI | nginx (ceiling) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| HTTP/1.1 | **243.7k** | 237.5k | 223.5k | 145.3k | 123.3k | 23.2k | 257.9k |
-| HTTP/1.1 + TLS | **203.4k** | 200.6k | 199.5k | 137.5k | 94.5k | 20.8k | 186.1k |
-| HTTP/2 + TLS | **393.0k** | – | 259.4k | 65.2k | 64.9k | – | 222.3k |
-| HTTP/2 cleartext | **409.5k** | – | 276.0k | 65.0k | 69.0k | 5.7k | – |
-| HTTP/3 | **279.6k** | – | 112.6k | 84.0k | – | 2.6k | 437.3k |
-
-**Four CPUs:**
-
-| Protocol | Anole | Fiber | Axum | nginx |
-| --- | ---: | ---: | ---: | ---: |
-| HTTP/1.1 | **618.0k** | 477.3k | 457.3k | 609.5k |
-| HTTP/1.1 + TLS | **509.9k** | 426.2k | 406.6k | 444.5k |
-| HTTP/2 + TLS | **901.0k** | – | 561.0k | 644.7k |
-| HTTP/2 cleartext | **954.4k** | – | 599.3k | – |
-| HTTP/3 | **907.6k** | – | 273.7k | 1,267.5k |
-
-What we read in these numbers:
-
-- **On one core, Anole leads every app framework on every protocol here.**
-  The only server ahead of it is nginx on cleartext HTTP/1.1 and HTTP/3, and
-  nginx is serving a fixed string from its config. It's the ceiling, not a
-  competitor.
-- **The tail stays short.** HTTP/1.1 p99 on four cores is 0.50 ms for Anole,
-  1.06 ms for Axum and 3.87 ms for Fiber.
-- **It stays small.** Anole used 12–67 MB here. nginx used 31–150 MB, and the
-  Node stacks hundreds.
-- **HTTP/3 got 1.8–2.4× faster this week:** 157k → 280k on one core and
-  379k → 908k on four, mostly from batching packets per wake and per flush.
-  These rows come from the `perf-h3-bench` branch, which is on its way to
-  `main`.
-- **Not every stack has every protocol.** "–" means the framework has no
-  idiomatic way to serve it. Fiber has no HTTP/2 or HTTP/3, and Go's numbers
-  use net/http and quic-go.
-
-**WebSockets, one CPU:**
-
-| | Anole | Fiber | Go | Axum | Express | Fastify | FastAPI |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Echo, msgs/s (64 conns) | **279k** | 237k | 188k | 178k | 209k | 195k | 94k |
-| Fan-out 1,000 × 1 kHz, lag p99 | **3.6 ms** | 1.37 s | 6.8 ms | 4.19 s | 4.0 ms | 3.8 ms | 5.4 ms |
-| Fan-out 10,000 × 100 Hz, lag p99 | 43.6 ms | 14.7 s | 19.2 s | 32.5 s | 48.0 ms¹ | 44.0 ms¹ | 35.9 ms¹ |
-| Trading bots (2,000), order p99 | **1.0 ms** | 1.0 s | 10.0 ms | 438 ms | 49.1 ms | 46.9 ms | 124 ms |
-| Memory per idle socket | 54.5 KB | 20.6 KB | 27.8 KB | 137.6 KB | 10.2 KB | 14.7 KB | 34.6 KB |
-
-¹ Not all subscribers connected: Express held 9,698 of 10,000, Fastify 8,938
-and FastAPI 4,896. Anole held all 10,000.
-
-Under fan-out pressure Anole keeps everyone current, while several stacks
-quietly queue up seconds of backlog. The weak spot is memory: 54.5 KB per idle
-socket is too much, and a fix is in progress.
-
-**WebTransport (draft-02), one CPU:**
-
-Anole serves WebTransport from the same HTTP/3 listener as everything else.
-Its 16 KiB stream echo reaches 466 MB/s, level with Rust's wtransport
-(471 MB/s), ahead of Go's webtransport-go (299 MB/s), and 10–70× the Node
-and Python libraries.
-
-**Still cooking:**
-- **gRPC:** published once an error count we saw at four cores is explained.
-- **The $12 server challenge:** a JWT-authenticated social feed on Postgres,
-  scored by the most users held under SLOs. It runs on a 1-CPU / 2 GB box
-  and again on 4 CPUs / 8 GB.
-- **A TechEmpower entry,** for numbers nobody here produced.
+Anole is built to be fast and small: per-core event loops on io_uring or
+epoll, requests that arrive whole run without a task of their own, batched
+writes on every protocol, and idle connections that hold almost no memory.
+Rather than quote our own numbers, we're entering Anole in
+[HttpArena](https://github.com/MDA2AV/HttpArena), an independent benchmark
+that runs every framework on the same hardware with the same rules; its
+results will be linked here once they're published. Our own harness and raw
+results live in `bench/` on the
+[`bench/suite`](https://github.com/xuckless/anole/tree/bench/suite/bench)
+branch.
 
 ## What's in the box
 
@@ -229,17 +169,39 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   - the PROXY protocol and `X-Forwarded-*`.
 - **Clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients, plus Redis/Valkey, all
   on the same TLS stack.
+- **Databases:** built-in connectors, so a handler can query without a
+  third-party driver and without blocking its core:
+  - PostgreSQL, on a fork of pg.zig moved to `std.Io`, over the same
+    BoringSSL stack;
+  - SQLite, the amalgamation built by Zig, with one writer thread per
+    database and reads on the blocking pool;
+  - MongoDB, Anole's own client on the drivers' specifications (OP_MSG,
+    SCRAM, replica-set discovery, retryable writes) with a Zig BSON codec;
+  - Redis and Valkey (plain or TLS), with pipelines, `acquire` for
+    WATCH/MULTI and pub/sub, under the same shape (`-Dredis`);
+  - one shared shape: a pool per core, calls take the request first
+    (`db.all(Post, req, sql, .{args})`), request deadlines cancel queries,
+    errors become HTTP statuses, and rows land in the request's arena;
+  - opt-in request coalescing and short-lived result caches, off unless
+    asked for;
+  - behind `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and `-Dredis`.
 
-**Status: pre-alpha, heading for 0.1.0** ([CHANGELOG.md](CHANGELOG.md)).
-Nothing is stable before 1.0. Built-in Postgres, SQLite and MongoDB
-connectors are next on the roadmap, then Python (ASGI) and JavaScript
-bindings.
+**Status: pre-1.0; the latest release is 0.1.2** ([CHANGELOG.md](CHANGELOG.md)).
+The API may still change before 1.0. Known issues and limitations are tracked in
+[Issues](https://github.com/xuckless/anole/issues). Next: a C ABI, then
+bindings for Python (ASGI) and Node (TypeScript).
 
 ## Requirements
 
 - Zig **0.17.x** (tested on 0.17.0). The build stops with a clear error on
   any other minor version and on 0.17 dev builds.
-- macOS or Linux. Windows is not supported.
+- Linux or macOS. Production is Linux; macOS is for development.
+- Windows (x86_64) is a development target: Anole builds there with every
+  feature, runs, and passes its tests on CI, so an app can be written and
+  tested on Windows. It is not tuned for production there, and a few
+  Unix-only parts are compiled out
+  ([what Windows lacks](docs/server.md#windows)). To serve from a Windows
+  machine, run the Linux build in WSL2 or Docker.
 
 ## Build and test
 
@@ -250,6 +212,7 @@ zig build run-hello     # Hello, World! on http://localhost:3000
 zig build run-rest      # examples/rest, a JSON API on port 3000
 zig build run-full      # every listener: 8080 (HTTP/1.1, h2c), 8443 (HTTPS, HTTP/3)
 zig build run-io        # handlers waiting on timers, files and outbound requests (port 8081)
+zig build docs          # the API reference (Zig autodoc) in zig-out/docs
 ```
 
 `examples/full` speaks HTTP/1.1 and HTTP/2 on both ports and HTTP/3 on 8443
@@ -271,11 +234,15 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dhttp2=bool` | false | true | true | nghttp2 |
 | `-Dhttp3=bool` | false | false | true | ngtcp2, nghttp3, WebTransport |
 | `-Dcompression=bool` | false | true | true | zlib-ng, zstd |
+| `-Dbrotli=bool` | false | true | true | Brotli responses (google/brotli); needs `-Dcompression` |
 | `-Dgrpc=bool` | false | false | true | gRPC, zig-protobuf (and protoc for codegen) |
 | `-Dwebsocket=bool` | false | true | true | WebSocket |
 | `-Dauth=bool` | false | true | true | JWT, OIDC, CSRF, passwords, API keys, RBAC |
 | `-Djson=bool` | false | true | true | yyjson |
 | `-Dredis=bool` | false | false | true | hiredis (Redis/Valkey client, stores) |
+| `-Dpostgres=bool` | false | true | true | PostgreSQL client (pg.zig fork) |
+| `-Dsqlite=bool` | false | true | true | SQLite (amalgamation, zig-sqlite fork) |
+| `-Dmongodb=bool` | false | false | true | MongoDB client and BSON |
 
 Constraints:
 - gRPC needs HTTP/2, so `-Dhttp2=false` turns gRPC off. Asking for both
@@ -284,13 +251,16 @@ Constraints:
   `-Dtls=none` and `-Dhttp3=true` is an error.
 
 In code, the chosen flags are `anole.features`. A minimal build of
-Hello, World is about 1.1 MB; everything on is about 5 MB.
+Hello, World is about 1.3 MB; everything on is about 6 MB.
 
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>
+zig fetch --save git+https://github.com/xuckless/anole#v0.1.2
 ```
+
+Any later tag (see the [releases](https://github.com/xuckless/anole/releases))
+or a commit works the same way.
 
 A complete `build.zig`, with gRPC code generated from a `.proto` as part of
 `zig build` (no extra step, nothing to commit):
@@ -321,22 +291,29 @@ set up this way, and CI builds it from an empty cache on every push.
 
 ## Documentation
 
-- [docs/getting-started.md](docs/getting-started.md): from `zig init` to a
-  running API, then WebSockets, static files, TLS, gRPC and deploying.
-- [docs/from-fiber.md](docs/from-fiber.md): Fiber's API next to Anole's.
-- [docs/server.md](docs/server.md): listeners, TLS, HTTP/2, HTTP/3, draining,
-  restarts, socket activation, proxies.
-- [docs/routing.md](docs/routing.md): routes, middleware, requests and
-  responses, errors, static files, compression, timeouts and limits.
-- [docs/websocket.md](docs/websocket.md),
-  [docs/webtransport.md](docs/webtransport.md), [docs/grpc.md](docs/grpc.md),
-  [docs/clients.md](docs/clients.md), [docs/auth.md](docs/auth.md),
-  [docs/observability.md](docs/observability.md).
+- **[xuckless.github.io/anole](https://xuckless.github.io/anole/)**: the
+  guides, with search, and the [API reference](https://xuckless.github.io/anole/api/)
+  generated from the source's doc comments. The same guides are in
+  [`docs/`](docs/) and on the [wiki](https://github.com/xuckless/anole/wiki).
+- Guides: [getting started](docs/getting-started.md),
+  [routing](docs/routing.md), [the server](docs/server.md),
+  [WebSocket](docs/websocket.md), [WebTransport](docs/webtransport.md),
+  [gRPC](docs/grpc.md), [clients](docs/clients.md),
+  [databases](docs/database.md), [auth](docs/auth.md),
+  [observability](docs/observability.md), [from Fiber](docs/from-fiber.md).
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,
-  `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, and `full`
-  (every listener and option spelled out).
+  `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`,
+  `sqlite`, `mongodb`, `redis`, and `full` (every listener and option
+  spelled out).
 - [CHANGELOG.md](CHANGELOG.md) and [MAINTAINING.md](MAINTAINING.md): pins,
   forks, the Zig version policy, releases.
+
+## Contributing and security
+
+Bug reports and feature requests are welcome in
+[Issues](https://github.com/xuckless/anole/issues/new/choose); questions go to
+[Discussions](https://github.com/xuckless/anole/discussions). Please report
+security problems privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## Licence
 

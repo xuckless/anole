@@ -1,0 +1,964 @@
+//! The C ABI's configuration: one JSON document (`include/anole.schema.json`
+//! is its schema) parsed by `anole_server_create`, and the Anole server it
+//! describes, built on the server's own thread at start. Everything that
+//! never needs the language (listeners, fixed responses, static files, the
+//! response cache, compression, CORS, JWT, rate limits, request IDs, access
+//! logs, health and metrics) is Anole's own middleware and handlers; the
+//! ABI only configures them.
+const std = @import("std");
+const anole = @import("../root.zig");
+const http = anole.http;
+const features = anole.features;
+
+/// The document. Unknown keys are an error, with the line and column.
+pub const Config = struct {
+    /// Executor threads: 0 for one per CPU (cgroup-aware).
+    executors: u32 = 0,
+    listeners: []const Listener = &.{.{}},
+    limits: Limits = .{},
+    timeouts: Timeouts = .{},
+    http3: Http3 = .{},
+    /// Proxies in front whose `X-Forwarded-For` (and PROXY protocol)
+    /// Anole trusts for the client's address: 0 trusts none.
+    trusted_proxy_hops: u8 = 0,
+    /// With trusted_proxy_hops: the last X-Forwarded-Proto value says
+    /// whether the request is secure.
+    trust_forwarded_proto: bool = true,
+    /// With trusted_proxy_hops: the last X-Forwarded-Host value is the
+    /// request's host (only when every proxy in front sets it).
+    trust_forwarded_host: bool = false,
+    /// Middleware for every route, in order, before the route's own.
+    middleware: []const Middleware = &.{},
+    routes: []const Route = &.{},
+    /// gRPC services whose methods a consumer implements (-Dgrpc).
+    grpc: ?Grpc = null,
+    observe: Observe = .{},
+    /// Databases for `anole_db_*`, opened at start.
+    databases: []const Database = &.{},
+
+    pub const Listener = struct {
+        /// Unique; "http-<port>" / "https-<port>" when left out. Requests
+        /// carry it (`listener` in the record).
+        name: ?[]const u8 = null,
+        /// "127.0.0.1" (this machine), "" (every interface, IPv6 and IPv4),
+        /// "0.0.0.0", "::".
+        address: []const u8 = "127.0.0.1",
+        /// 0 picks a free port (`anole_server_port`).
+        port: u16 = 8080,
+        /// A unix domain socket at this path instead of address and port.
+        unix: ?[]const u8 = null,
+        /// TLS with this certificate; cleartext when left out.
+        tls: ?Tls = null,
+        http1: bool = true,
+        /// HTTP/2: h2 by ALPN over TLS, h2c (prior knowledge) in cleartext.
+        http2: bool = true,
+        /// HTTP/3 on the same port over UDP (a TLS listener; one per server).
+        http3: bool = false,
+        /// Connections start with a PROXY protocol header.
+        proxy_protocol: bool = false,
+        /// With proxy_protocol: the proxies allowed to send one (addresses
+        /// or CIDR networks, "10.0.0.0/8"); empty: any peer.
+        proxy_protocol_from: []const []const u8 = &.{},
+    };
+
+    pub const Tls = struct {
+        /// PEM files, read at start (and by anole_server_reload_certificates).
+        cert_file: ?[]const u8 = null,
+        key_file: ?[]const u8 = null,
+        /// Or PEM text.
+        cert_pem: ?[]const u8 = null,
+        key_pem: ?[]const u8 = null,
+        /// Or a fresh self-signed certificate for localhost (development).
+        self_signed: bool = false,
+        /// ALPN protocols in order; default "h2", "http/1.1".
+        alpn: ?[]const []const u8 = null,
+        /// Mutual TLS: "none", "request" (a certificate is asked for, and
+        /// checked when sent) or "require" (a client without one is
+        /// refused). Also over HTTP/3. Requests carry the certificate
+        /// (ANOLE_REQ_PEER_CERT).
+        client_auth: []const u8 = "none",
+        /// The CAs (PEM) client certificates must chain to, as a file or as
+        /// the PEM text: one of them with "request" and "require".
+        client_ca_file: ?[]const u8 = null,
+        client_ca_pem: ?[]const u8 = null,
+    };
+
+    pub const Limits = struct {
+        /// The largest request body, inline or streamed: past it, 413.
+        body_max: u64 = 1 << 20,
+        /// Bodies up to this come inline in the request record; larger
+        /// ones are read with anole_req_read. At most 1 GiB.
+        inline_body_max: u32 = 64 * 1024,
+        /// Requests handed to consumers and not yet answered, per executor;
+        /// past it, 503.
+        max_inflight: u32 = 1024,
+        /// Events waiting for a consumer, per executor: 0 for twice
+        /// max_inflight. A full queue holds requests back (backpressure).
+        queue: u32 = 0,
+        /// A streamed response or a WebSocket past this many bytes waiting
+        /// to go out answers ANOLE_BUSY.
+        stream_high_water: u32 = 256 * 1024,
+        ws_high_water: u32 = 1 << 20,
+        /// The largest WebSocket message, in or out (after inflating). At
+        /// most 1 GiB.
+        ws_max_message: u32 = 1 << 20,
+        /// Open connections at most; 0 follows the open-file limit.
+        max_connections: u32 = 0,
+        /// The largest database answer, in bytes of its record: past it,
+        /// the answer is ANOLE_E_TOOBIG.
+        db_result_max: u32 = 16 << 20,
+    };
+
+    pub const Database = struct {
+        /// What `anole_db_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        /// Exactly one of `sqlite`, `postgres`, `redis` and `mongodb`.
+        sqlite: ?Sqlite = null,
+        postgres: ?Postgres = null,
+        redis: ?Redis = null,
+        mongodb: ?Mongodb = null,
+        /// The bounds of the answers kept for queries with cache_ttl_ms,
+        /// over every executor.
+        cache: CacheBounds = .{},
+    };
+
+    pub const Sqlite = struct {
+        /// A file (created when missing), or ":memory:".
+        path: []const u8,
+        /// Read-only connections beside the writer; null: one per executor,
+        /// at most 8; 0: everything on the writer.
+        readers: ?u32 = null,
+        /// How long a statement waits for a lock another process holds.
+        busy_timeout_ms: u32 = 5000,
+        /// Prepared statements kept per connection.
+        statement_cache: u32 = 64,
+        /// Run on every connection as it opens: "PRAGMA cache_size = -20000".
+        pragmas: []const []const u8 = &.{},
+        /// SQL run once at start, before the listeners open: a schema.
+        init: ?[]const u8 = null,
+    };
+
+    /// A PostgreSQL database, as `anole.pg.Options` (docs/database.md).
+    pub const Postgres = struct {
+        /// postgres://user:password@host:port/database?params. Null:
+        /// DATABASE_URL, else libpq's variables (PGHOST, PGUSER...).
+        url: ?[]const u8 = null,
+        /// libpq's sslmode: disable, allow, prefer, require, verify-ca,
+        /// verify-full. Null: the URL's, else PGSSLMODE, else verify-full
+        /// for a server on another host and prefer on this machine.
+        sslmode: ?[]const u8 = null,
+        /// The CA certificates (PEM) the server's certificate is checked
+        /// against, as a file or as the PEM text: with one, the certificate
+        /// is always checked (verify-full unless sslmode says verify-ca).
+        /// Null: the URL's sslrootcert, else the system's store.
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        /// Connections in all, split between the executors. Null: the URL's
+        /// pool_max_conns, else twice the executors, at least 4.
+        max_connections: ?u32 = null,
+        /// How long a query waits for a connection when all are busy.
+        acquire_timeout_ms: u32 = 5000,
+        /// How long opening a connection may take; 0: no limit.
+        connect_timeout_ms: u32 = 10_000,
+        /// Statements each connection keeps prepared; 0 behind PgBouncer
+        /// before 1.21 in transaction mode.
+        statement_cache_size: u16 = 256,
+        /// Connections older than this are closed; 0: no limit.
+        max_lifetime_ms: u32 = 60 * 60 * 1000,
+        /// Connections idle this long are closed; 0: no limit.
+        idle_timeout_ms: u32 = 30 * 60 * 1000,
+        /// Open a connection per executor at start, and fail the start if
+        /// that fails.
+        connect_at_start: bool = false,
+        application_name: ?[]const u8 = null,
+        /// What happens to a connection's session when a query gives it
+        /// back: "auto" resets it when what the query ran may have changed
+        /// it, "always" on every release, "off" never.
+        reset_session: ResetSession = .auto,
+        /// SQL run once at start, before the listeners open: a schema.
+        init: ?[]const u8 = null,
+    };
+
+    /// A Redis or Valkey server, as `anole.redis.Options` (docs/database.md).
+    pub const Redis = struct {
+        /// redis://user:password@host:6379/0, rediss:// for TLS, or
+        /// unix:///path?db=0. Null: REDIS_URL, else redis://127.0.0.1:6379.
+        url: ?[]const u8 = null,
+        /// rediss://: the CA certificates (PEM) the server's certificate is
+        /// checked against, as a file or as the PEM text. Null: the URL's
+        /// ssl_ca_certs, else the system's store.
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        /// Connections in all, split between the executors. Null: ten per
+        /// executor.
+        max_connections: ?u32 = null,
+        /// How long a command waits for a connection when all are busy.
+        acquire_timeout_ms: u32 = 5000,
+        /// How long opening a connection may take; 0: no limit.
+        connect_timeout_ms: u32 = 10_000,
+        /// Connections idle this long are closed; 0: no limit.
+        idle_timeout_ms: u32 = 5 * 60 * 1000,
+        /// Open a connection per executor at start, and fail the start if
+        /// that fails.
+        connect_at_start: bool = false,
+    };
+
+    /// A MongoDB deployment, as `anole.mongodb.Options` (docs/database.md).
+    pub const Mongodb = struct {
+        /// mongodb:// or mongodb+srv:// connection string; its options win
+        /// over the fields below. Null: MONGODB_URI, else
+        /// mongodb://localhost:27017.
+        url: ?[]const u8 = null,
+        /// The database operations name no other for. Null: the URL's
+        /// path, else "test".
+        database: ?[]const u8 = null,
+        /// The CA certificates (PEM) the server's certificate is checked
+        /// against, as a file or as the PEM text: either turns TLS on, and a
+        /// URL that turns it off or stops checking is refused.
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        /// Connections at most, split between the executors (maxPoolSize;
+        /// 0: no limit).
+        max_connections: u32 = 100,
+        /// How long an operation waits for a pooled connection.
+        acquire_timeout_ms: u32 = 10_000,
+        /// How long an operation waits for a server it can use (a primary).
+        server_selection_timeout_ms: u32 = 30_000,
+        /// TCP connect and TLS handshake.
+        connect_timeout_ms: u32 = 10_000,
+    };
+
+    pub const CacheBounds = struct {
+        max_entries: u32 = 4096,
+        max_bytes: u64 = 32 << 20,
+    };
+
+    pub const Timeouts = struct {
+        /// The default deadline of a consumer request: 504 from Anole after
+        /// it. A route's `timeout_ms` overrides it (at most 16 distinct
+        /// values per server).
+        request_ms: u32 = 30_000,
+        /// How long the drain waits for requests in flight.
+        shutdown_ms: u32 = 10_000,
+        /// An idle keep-alive connection is closed after this.
+        keepalive_ms: u32 = 60_000,
+        /// Ring a consumer's doorbell again when events wait and it has not
+        /// polled for this long (a lost wake); 0 never.
+        rewake_ms: u32 = 20,
+    };
+
+    pub const Http3 = struct {
+        max_streams_bidi: u64 = 100,
+        idle_timeout_ms: u32 = 30_000,
+        /// Advertise HTTP/3 with Alt-Svc on the TLS listener's responses.
+        alt_svc: bool = true,
+        /// Take 0-RTT from resuming clients (replayable: safe methods only
+        /// run before the handshake completes).
+        early_data: bool = false,
+    };
+
+    pub const Middleware = union(enum) {
+        request_id: RequestId,
+        access_log: AccessLog,
+        compress: Compress,
+        cors: Cors,
+        jwt: Jwt,
+        rate_limit: RateLimit,
+    };
+
+    pub const RequestId = struct {
+        header: []const u8 = "X-Request-Id",
+        trust_incoming: bool = false,
+    };
+    pub const AccessLog = struct {
+        format: enum { text, json } = .text,
+        /// Paths not logged: exact, or a prefix ending in "*".
+        exclude: []const []const u8 = &.{},
+    };
+    pub const Compress = struct {};
+    pub const Cors = struct {
+        /// Empty allows every origin.
+        origins: []const []const u8 = &.{},
+        methods: ?[]const u8 = null,
+        headers: ?[]const u8 = null,
+        expose: ?[]const u8 = null,
+        credentials: bool = false,
+        max_age: ?u32 = 600,
+    };
+    pub const Jwt = struct {
+        /// The provider's JWK Set URL, fetched and refreshed; or
+        jwks_url: ?[]const u8 = null,
+        /// a JWK Set ({"keys": [...]}) given here.
+        jwks: ?std.json.Value = null,
+        issuer: ?[]const u8 = null,
+        /// Required in the token's `aud`. With `jwks_url` it must be set (a
+        /// provider's keys also sign tokens for its other clients), unless
+        /// `allow_any_audience`.
+        audience: ?[]const u8 = null,
+        /// With `jwks_url` and no `audience`: only for keys that sign for
+        /// this application alone.
+        allow_any_audience: bool = false,
+        leeway_s: i64 = 60,
+        require_exp: bool = true,
+        /// String claims a token must carry.
+        required_claims: []const []const u8 = &.{"sub"},
+        /// Each must be in the `scope` claim; 403 otherwise.
+        scopes: []const []const u8 = &.{},
+        realm: ?[]const u8 = null,
+    };
+    pub const RateLimit = struct {
+        /// Requests per window.
+        limit: u32 = 100,
+        window_ms: i64 = 60_000,
+        /// How many at once; 0 means `limit`.
+        burst: u32 = 0,
+        /// "ip" (the client's address) or "header:<name>": the header's raw
+        /// value, unverified, so only for a header a trusted proxy sets to a
+        /// verified identity (a client that varies it gets a fresh limit).
+        key: []const u8 = "ip",
+        /// Keys remembered at most (least recently used out first).
+        max_entries: u32 = 10_000,
+    };
+
+    pub const Observe = struct {
+        /// Prometheus metrics, with HTTP request counts.
+        metrics: ?Metrics = null,
+        /// /healthz and /readyz (not ready while draining).
+        health: ?Health = null,
+    };
+    pub const Metrics = struct { path: []const u8 = "/metrics" };
+    pub const Health = struct {
+        live: []const u8 = "/healthz",
+        ready: []const u8 = "/readyz",
+    };
+
+    pub const Route = struct {
+        /// "GET", "POST", ...; left out: every method.
+        method: ?[]const u8 = null,
+        /// "/users/:id", "/files/*rest".
+        path: []const u8,
+        /// Exactly one of these four:
+        /// a consumer's route id: the request goes to a consumer;
+        handler: ?u32 = null,
+        /// a fixed response, served natively;
+        respond: ?Fixed = null,
+        /// files under a directory (the path is the prefix);
+        static: ?Static = null,
+        /// a WebSocket endpoint whose events go to a consumer;
+        websocket: ?WebSocket = null,
+        /// a WebTransport endpoint (HTTP/3) whose events go to a consumer.
+        webtransport: ?WebTransport = null,
+        /// This route's request deadline (consumer routes).
+        timeout_ms: ?u32 = null,
+        /// Handler and respond routes run on the protocol's reader when
+        /// they can (HTTP/2, HTTP/3: no task per request, the answer
+        /// detached); false gives each request a task of its own.
+        no_wait: bool = true,
+        /// Keep GET answers (consumer and fixed routes) per executor.
+        cache: ?Cache = null,
+        /// After the global ones.
+        middleware: []const Middleware = &.{},
+    };
+    pub const Fixed = struct {
+        status: u16 = 200,
+        body: []const u8 = "",
+        headers: std.json.ArrayHashMap([]const u8) = .{},
+    };
+    pub const Static = struct {
+        dir: []const u8,
+        index: ?[]const u8 = "index.html",
+        /// Precompressed siblings to look for: "br", "zstd", "gzip".
+        precompressed: []const []const u8 = &.{},
+        cache_control: ?[]const u8 = null,
+        hide_dotfiles: bool = true,
+    };
+    pub const WebSocket = struct {
+        /// The consumer's route id for this endpoint's events.
+        handler: u32,
+        /// permessage-deflate when the client offers it.
+        compression: bool = true,
+        /// Close 1001 when the server drains.
+        close_on_drain: bool = true,
+        /// Pages of other origins that may open the socket, besides the
+        /// request's own host ("https://app.example.com"); "*" for any.
+        origins: []const []const u8 = &.{},
+    };
+    pub const Grpc = struct {
+        /// The services' descriptors, a serialized FileDescriptorSet with
+        /// its imports (`protoc --include_imports --descriptor_set_out`,
+        /// `buf build -o`), as base64; or
+        descriptor_set: ?[]const u8 = null,
+        /// the path of that file, read by anole_server_create. Without
+        /// descriptors, every service lists its methods, and only protobuf
+        /// (not JSON) is served: no Connect JSON, no transcoding.
+        descriptor_set_file: ?[]const u8 = null,
+        services: []const GrpcService = &.{},
+        /// grpc.health.v1.Health, served by Anole: the server ("") and
+        /// every service here SERVING until anole_grpc_health_set says
+        /// otherwise; NOT_SERVING once the server drains.
+        health: bool = false,
+    };
+    pub const GrpcService = struct {
+        /// The full name, "package.Service".
+        name: []const u8,
+        /// The consumer's route id for its calls.
+        handler: u32,
+        /// The methods served, in the order their ids follow; left out:
+        /// all of the service's, in the descriptors' order.
+        methods: ?[]const GrpcMethod = null,
+        /// The largest request message (after inflating); a larger one ends
+        /// the call with RESOURCE_EXHAUSTED.
+        max_message_size: u32 = 4 << 20,
+        /// The most request message bytes one call takes in all (each
+        /// message counted at its size plus 64).
+        max_received_bytes: u64 = 64 << 20,
+        /// How long a request message may take to arrive once it started
+        /// (and the first one of a unary or server-streaming call from the
+        /// start of the call); 0 for no limit but the deadline.
+        read_timeout_ms: u32 = 30_000,
+        /// The longest a call may run, capping the client's deadline; 0 for
+        /// none (calls without a client deadline run until they end).
+        max_call_duration_ms: u32 = 0,
+        /// When response messages are gzipped: "mirror" (when the request
+        /// was), "accepted" (whenever the client accepts gzip), "never".
+        response_compression: enum { mirror, accepted, never } = .mirror,
+        /// Request messages of a client- or bidirectional-streaming call
+        /// delivered before the consumer asks for more (anole_grpc_read).
+        read_ahead: u32 = 8,
+        /// REST routes for the methods annotated with google.api.http
+        /// (needs descriptors).
+        transcode: bool = true,
+        /// Unary and server-streaming calls that arrive whole run on the
+        /// protocol's reader, detached (as `no_wait` routes do).
+        no_wait: bool = true,
+    };
+    pub const GrpcMethod = struct {
+        name: []const u8,
+        /// The call mode; from the descriptors when left out (and checked
+        /// against them when both say).
+        kind: ?enum { unary, server_streaming, client_streaming, bidi_streaming } = null,
+        /// A unary method without side effects is also served as Connect
+        /// GET (descriptors: `idempotency_level = NO_SIDE_EFFECTS`).
+        no_side_effects: ?bool = null,
+    };
+    pub const WebTransport = struct {
+        /// The consumer's route id for this endpoint's events.
+        handler: u32,
+        /// Close each session (code 0) when the server drains, right after
+        /// ANOLE_EV_WT_DRAIN; false leaves that to the consumer (until
+        /// timeouts.shutdown_ms).
+        close_on_drain: bool = true,
+        /// Pages of other origins that may open a session, besides the
+        /// request's own host; "*" for any.
+        origins: []const []const u8 = &.{},
+        /// Datagrams a session holds for sending; past it the oldest is
+        /// dropped.
+        datagram_queue: u32 = 64,
+    };
+    pub const Cache = struct {
+        /// When the answer's Cache-Control does not say.
+        ttl_ms: u32 = 10_000,
+        /// Also keep answers to requests with credentials (only when the
+        /// answer does not depend on who asks).
+        authenticated: bool = false,
+        max_entries: u32 = 1024,
+        max_bytes: u64 = 16 << 20,
+    };
+};
+
+pub const ClientAuth = enum { none, request, require };
+
+/// A listener's `tls.client_auth`, or null when it is none of the three.
+pub fn clientAuth(text: []const u8) ?ClientAuth {
+    return std.meta.stringToEnum(ClientAuth, text);
+}
+
+pub const max_timeouts = 16;
+
+/// The most an inline body or a WebSocket message may be (one event each).
+pub const max_record_payload: u32 = 1 << 30;
+
+/// What `check` found wrong, for anole_last_error.
+pub const Problem = error{Config};
+
+pub fn methodOf(name: []const u8) ?http.Method {
+    var buf: [16]u8 = undefined;
+    if (name.len == 0 or name.len > buf.len) return null;
+    return std.meta.stringToEnum(http.Method, std.ascii.lowerString(&buf, name));
+}
+
+/// Parses `json` into `arena`, with "UnknownField at line L column C" and
+/// the like in `why` on failure.
+pub fn parse(arena: std.mem.Allocator, json: []const u8, why: *std.Io.Writer) Problem!Config {
+    var diag: std.json.Diagnostics = .{};
+    var scanner = std.json.Scanner.initCompleteInput(arena, json);
+    scanner.enableDiagnostics(&diag);
+    const cfg = std.json.parseFromTokenSourceLeaky(Config, arena, &scanner, .{ .allocate = .alloc_always }) catch |err| {
+        why.print("config: {t} at line {d} column {d}", .{ err, diag.getLine(), diag.getColumn() }) catch {};
+        return error.Config;
+    };
+    try check(cfg, why);
+    return cfg;
+}
+
+/// libpq's sslmode names ("verify-full"), as `anole.pg.SslMode`'s tags.
+pub const SslMode = enum { disable, allow, prefer, require, verify_ca, verify_full };
+
+/// `databases[].postgres.reset_session`, as `anole.pg.Options.ResetSession`.
+pub const ResetSession = enum { auto, always, off };
+
+pub fn sslMode(text: []const u8) ?SslMode {
+    var buf: [16]u8 = undefined;
+    if (text.len > buf.len) return null;
+    for (text, buf[0..text.len]) |ch, *o| o.* = if (ch == '-') '_' else ch;
+    return std.meta.stringToEnum(SslMode, buf[0..text.len]);
+}
+
+fn fail(why: *std.Io.Writer, comptime fmt: []const u8, args: anytype) Problem {
+    why.print("config: " ++ fmt, args) catch {};
+    return error.Config;
+}
+
+/// What the types cannot say.
+fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
+    if (cfg.listeners.len == 0) return fail(why, "listeners: at least one", .{});
+    if (cfg.executors > 256) return fail(why, "executors: at most 256", .{});
+    if (cfg.limits.max_inflight == 0 or cfg.limits.max_inflight > 1 << 20) return fail(why, "limits.max_inflight: 1 to 1048576", .{});
+    if (cfg.limits.inline_body_max > cfg.limits.body_max) return fail(why, "limits.inline_body_max is above limits.body_max", .{});
+    // Events carry their length in 32 bits: what goes inside one is bounded
+    // well below that (the request head comes on top of an inline body).
+    if (cfg.limits.inline_body_max > max_record_payload) return fail(why, "limits.inline_body_max: at most {d}", .{max_record_payload});
+    if (cfg.limits.ws_max_message > max_record_payload) return fail(why, "limits.ws_max_message: at most {d}", .{max_record_payload});
+    var http3_listeners: usize = 0;
+    for (cfg.listeners, 0..) |l, i| {
+        if (l.tls) |t| {
+            if (comptime features.tls != .boringssl) return fail(why, "listeners[{d}].tls: TLS is not built in (-Dtls=boringssl)", .{i});
+            const files = t.cert_file != null or t.key_file != null;
+            const pem = t.cert_pem != null or t.key_pem != null;
+            const n = @as(u8, @intFromBool(files)) + @intFromBool(pem) + @intFromBool(t.self_signed);
+            if (n != 1) return fail(why, "listeners[{d}].tls: exactly one of cert_file/key_file, cert_pem/key_pem, self_signed", .{i});
+            if (files and (t.cert_file == null or t.key_file == null)) return fail(why, "listeners[{d}].tls: cert_file and key_file go together", .{i});
+            if (pem and (t.cert_pem == null or t.key_pem == null)) return fail(why, "listeners[{d}].tls: cert_pem and key_pem go together", .{i});
+            const mode = clientAuth(t.client_auth) orelse return fail(why, "listeners[{d}].tls.client_auth: \"none\", \"request\" or \"require\"", .{i});
+            const cas = @as(u8, @intFromBool(t.client_ca_file != null)) + @intFromBool(t.client_ca_pem != null);
+            if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs one of client_ca_file, client_ca_pem", .{ i, t.client_auth });
+            if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: client_ca_file and client_ca_pem go with client_auth \"request\" or \"require\"", .{i});
+        }
+        if (l.proxy_protocol_from.len > 0 and !l.proxy_protocol) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
+        if (l.http3) {
+            if (comptime !features.http3) return fail(why, "listeners[{d}].http3: HTTP/3 is not built in (-Dhttp3)", .{i});
+            if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
+            http3_listeners += 1;
+        }
+        if (l.http2 and !features.http2 and l.tls != null) {}
+        if (l.name) |n| if (n.len == 0 or n.len > 255 or std.mem.indexOfScalar(u8, n, ':') != null)
+            return fail(why, "listeners[{d}].name: 1-255 bytes, no ':'", .{i});
+        for (cfg.listeners[0..i]) |other| if (l.name != null and other.name != null and std.mem.eql(u8, l.name.?, other.name.?))
+            return fail(why, "listeners[{d}].name \"{s}\" is taken", .{ i, l.name.? });
+    }
+    if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
+    if (cfg.grpc) |g| try checkGrpc(g, why);
+    for (cfg.databases, 0..) |d, i| {
+        if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
+        for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
+            return fail(why, "databases[{d}].name \"{s}\" is taken", .{ i, d.name });
+        const kinds = @as(u8, @intFromBool(d.sqlite != null)) + @intFromBool(d.postgres != null) + @intFromBool(d.redis != null) + @intFromBool(d.mongodb != null);
+        if (kinds != 1) return fail(why, "databases[{d}]: exactly one of sqlite, postgres, redis and mongodb", .{i});
+        if (d.sqlite) |sq| {
+            if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
+            if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
+        }
+        if (d.postgres) |p| {
+            if (comptime !features.postgres) return fail(why, "databases[{d}].postgres: PostgreSQL is not built in (-Dpostgres)", .{i});
+            if (p.sslmode) |m| {
+                if (sslMode(m) == null) return fail(why, "databases[{d}].postgres.sslmode \"{s}\": one of disable, allow, prefer, require, verify-ca, verify-full", .{ i, m });
+                if (p.url) |u| if (std.mem.indexOf(u8, u, "sslmode=") != null)
+                    return fail(why, "databases[{d}].postgres: sslmode is given twice, in the url and beside it", .{i});
+            }
+            if (p.ca_file != null and p.ca_pem != null) return fail(why, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
+            if (p.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].postgres.max_connections: at least 1", .{i});
+        }
+        if (d.redis) |r| {
+            if (comptime !features.redis) return fail(why, "databases[{d}].redis: Redis is not built in (-Dredis)", .{i});
+            if (r.ca_file != null and r.ca_pem != null) return fail(why, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
+            if (r.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].redis.max_connections: at least 1", .{i});
+        }
+        if (d.mongodb) |m| {
+            if (comptime !features.mongodb) return fail(why, "databases[{d}].mongodb: MongoDB is not built in (-Dmongodb)", .{i});
+            if (m.ca_file != null and m.ca_pem != null) return fail(why, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
+        }
+    }
+    try checkMiddleware(cfg.middleware, "middleware", why);
+    var timeouts: [max_timeouts]u32 = undefined;
+    var ntimeouts: usize = 1;
+    timeouts[0] = cfg.timeouts.request_ms;
+    for (cfg.routes, 0..) |r, i| {
+        const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
+            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null);
+        if (kinds != 1) return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport", .{i});
+        if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
+        if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
+        if (r.respond) |f| {
+            _ = http.Status.fromCode(f.status) catch return fail(why, "routes[{d}].respond.status {d} is not a status Anole knows", .{ i, f.status });
+            var it = f.headers.map.iterator();
+            while (it.next()) |h| {
+                const name = h.key_ptr.*;
+                http.core.validateHeaderName(name) catch return fail(why, "routes[{d}].respond.headers: \"{f}\" is not a header name", .{ i, std.zig.fmtString(name) });
+                if (http.core.isReservedHeader(name)) return fail(why, "routes[{d}].respond.headers: {s} is the server's to set", .{ i, name });
+                http.core.validateHeaderValue(h.value_ptr.*) catch return fail(why, "routes[{d}].respond.headers.{s}: the value holds CR, LF or NUL", .{ i, name });
+            }
+        }
+        if (r.websocket != null) {
+            if (comptime !features.websocket) return fail(why, "routes[{d}].websocket: WebSocket is not built in (-Dwebsocket)", .{i});
+            if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: a websocket route is GET", .{i});
+        }
+        if (r.webtransport) |w| {
+            if (comptime !features.http3) return fail(why, "routes[{d}].webtransport: HTTP/3 is not built in (-Dhttp3)", .{i});
+            if (r.method != null) return fail(why, "routes[{d}]: a webtransport route takes no method (an extended CONNECT)", .{i});
+            var h3 = false;
+            for (cfg.listeners) |l| h3 = h3 or l.http3;
+            if (!h3) return fail(why, "routes[{d}].webtransport: needs a listener with http3", .{i});
+            if (w.datagram_queue == 0) return fail(why, "routes[{d}].webtransport.datagram_queue: at least 1", .{i});
+        }
+        if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
+        if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
+        if (r.timeout_ms) |t| {
+            if (r.handler == null) return fail(why, "routes[{d}].timeout_ms: on handler routes", .{i});
+            if (std.mem.indexOfScalar(u32, timeouts[0..ntimeouts], t) == null) {
+                if (ntimeouts == max_timeouts) return fail(why, "routes: at most {d} distinct timeout_ms values", .{max_timeouts});
+                timeouts[ntimeouts] = t;
+                ntimeouts += 1;
+            }
+        }
+        var buf: [32]u8 = undefined;
+        try checkMiddleware(r.middleware, std.fmt.bufPrint(&buf, "routes[{d}].middleware", .{i}) catch "routes[].middleware", why);
+    }
+}
+
+fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
+    if (comptime !features.grpc) return fail(why, "grpc: gRPC is not built in (-Dgrpc)", .{});
+    if (g.descriptor_set != null and g.descriptor_set_file != null) return fail(why, "grpc: one of descriptor_set and descriptor_set_file", .{});
+    const descriptors = g.descriptor_set != null or g.descriptor_set_file != null;
+    if (g.services.len == 0) return fail(why, "grpc.services: at least one", .{});
+    for (g.services, 0..) |svc, i| {
+        if (svc.name.len == 0 or svc.name.len > 255) return fail(why, "grpc.services[{d}].name: 1-255 bytes", .{i});
+        for (g.services[0..i]) |other| if (std.mem.eql(u8, other.name, svc.name)) return fail(why, "grpc.services[{d}]: {s} twice", .{ i, svc.name });
+        if (svc.max_message_size == 0 or svc.max_message_size > max_record_payload) return fail(why, "grpc.services[{d}].max_message_size: 1 to {d}", .{ i, max_record_payload });
+        if (svc.methods == null and !descriptors) return fail(why, "grpc.services[{d}]: methods, or the descriptors (descriptor_set)", .{i});
+        const methods = svc.methods orelse continue;
+        if (methods.len > std.math.maxInt(u16)) return fail(why, "grpc.services[{d}].methods: too many", .{i});
+        for (methods, 0..) |m, j| {
+            if (m.name.len == 0 or std.mem.indexOfAny(u8, m.name, "/?# ") != null) return fail(why, "grpc.services[{d}].methods[{d}].name: a method name", .{ i, j });
+            if (m.kind == null and !descriptors) return fail(why, "grpc.services[{d}].methods[{d}].kind: needed without descriptors", .{ i, j });
+            for (methods[0..j]) |other| if (std.mem.eql(u8, other.name, m.name)) return fail(why, "grpc.services[{d}].methods: {s} twice", .{ i, m.name });
+        }
+    }
+}
+
+fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std.Io.Writer) Problem!void {
+    for (list, 0..) |m, i| switch (m) {
+        .jwt => |j| {
+            if (comptime !features.auth) return fail(why, "{s}[{d}].jwt: auth is not built in (-Dauth)", .{ where, i });
+            if ((j.jwks_url == null) == (j.jwks == null)) return fail(why, "{s}[{d}].jwt: exactly one of jwks_url and jwks", .{ where, i });
+            if (j.jwks_url != null and j.audience == null and !j.allow_any_audience)
+                return fail(why, "{s}[{d}].jwt: jwks_url needs audience (this API's identifier at the provider), or allow_any_audience: true when the keys sign for this application alone", .{ where, i });
+        },
+        .rate_limit => |r| {
+            if (!std.mem.eql(u8, r.key, "ip") and !std.mem.startsWith(u8, r.key, "header:"))
+                return fail(why, "{s}[{d}].rate_limit.key: \"ip\" or \"header:<name>\"", .{ where, i });
+            if (r.limit == 0 or r.window_ms <= 0) return fail(why, "{s}[{d}].rate_limit: limit and window_ms must be positive", .{ where, i });
+        },
+        .compress => if (comptime !features.compression) return fail(why, "{s}[{d}].compress: compression is not built in (-Dcompression)", .{ where, i }),
+        else => {},
+    };
+}
+
+/// Whether requests behind `list` can run on the protocol's reader and
+/// detach (`anole.http.Detached`): none of it may wait. A JWT middleware
+/// that fetches keys can.
+pub fn neverWaits(list: []const Config.Middleware) bool {
+    for (list) |m| switch (m) {
+        .jwt => |j| if (j.jwks_url != null) return false,
+        else => {},
+    };
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Building the server's middleware
+
+/// A rate limit keyed by the client's address or a header, on a memory
+/// limiter of its own: `anole.ratelimit.Middleware`'s answers.
+pub const RateLimitMw = struct {
+    limiter: *anole.ratelimit.MemoryLimiter,
+    header: ?[]const u8,
+    policy: anole.ratelimit.Policy,
+
+    pub const detach_safe = true;
+
+    pub fn execute(self: *const RateLimitMw, req: *http.Request, res: *http.Response, executor: anytype) !void {
+        var key_buf: [128]u8 = undefined;
+        const key = if (self.header) |h| req.headers.get(h) orelse "" else anole.ratelimit.clientAddress(req, &key_buf);
+        const r = self.limiter.limiter().take(key, 1, self.policy) catch return executor.next();
+        try res.header("RateLimit-Limit", try std.fmt.allocPrint(res.arena, "{d}", .{r.limit}));
+        try res.header("RateLimit-Remaining", try std.fmt.allocPrint(res.arena, "{d}", .{r.remaining}));
+        try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));
+        if (!r.allowed) {
+            try res.header("Retry-After", try std.fmt.allocPrint(res.arena, "{d}", .{r.retry_after_seconds}));
+            res.status = .too_many_requests;
+            res.content_type = .text;
+            res.body = "429 Too Many Requests\n";
+            return;
+        }
+        return executor.next();
+    }
+
+    pub fn deinit(self: *RateLimitMw) void {
+        self.limiter.deinit();
+    }
+};
+
+/// Anole's middleware for one configuration entry, as a handle the server
+/// owns. `keep` holds what must outlive the server's start (keyrings,
+/// limiters), freed by the engine.
+pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middleware) !http.Middleware(void) {
+    switch (m) {
+        .request_id => |c| return app.middleware(http.middleware.RequestId.init(.{ .header = c.header, .trust_incoming = c.trust_incoming })),
+        .access_log => |c| return app.middleware(anole.observe.AccessLog.init(.{
+            .format = switch (c.format) {
+                .text => .text,
+                .json => .json,
+            },
+            .exclude = c.exclude,
+        })),
+        .compress => {
+            if (comptime !features.compression) unreachable;
+            return app.middleware(http.middleware.Compress.init());
+        },
+        .cors => |c| return app.middleware(http.middleware.Cors.init(.{
+            .origins = c.origins,
+            .methods = c.methods,
+            .headers = c.headers,
+            .expose = c.expose,
+            .credentials = c.credentials,
+            .max_age = c.max_age,
+        })),
+        .jwt => |c| {
+            if (comptime !features.auth) unreachable;
+            const keys: anole.auth.bearer.Keys = if (c.jwks_url) |url| blk: {
+                const ring = try arena.create(anole.auth.Keyring);
+                ring.* = .init(app.gpa, app.io(), app.client(), url);
+                break :blk .{ .keyring = ring };
+            } else blk: {
+                const text = try std.json.Stringify.valueAlloc(arena, c.jwks.?, .{});
+                break :blk .{ .static = try anole.auth.parseJwks(arena, text) };
+            };
+            return app.middleware(anole.auth.RequireJwt.init(keys, .{
+                .issuer = c.issuer,
+                .audience = c.audience,
+                .allow_any_audience = c.allow_any_audience,
+                .leeway_seconds = c.leeway_s,
+                .require_exp = c.require_exp,
+            }, .{ .required_claims = c.required_claims, .scopes = c.scopes, .realm = c.realm }));
+        },
+        .rate_limit => |c| {
+            const limiter = try arena.create(anole.ratelimit.MemoryLimiter);
+            limiter.* = .init(app.gpa, app.io(), .{ .max_entries = c.max_entries });
+            return app.middleware(RateLimitMw{
+                .limiter = limiter,
+                .header = if (std.mem.startsWith(u8, c.key, "header:")) c.key["header:".len..] else null,
+                .policy = .{ .limit = c.limit, .window_ms = c.window_ms, .burst = c.burst },
+            });
+        },
+    }
+}
+
+pub fn precompressed(arena: std.mem.Allocator, names: []const []const u8) ![]const http.core.Precompressed {
+    const out = try arena.alloc(http.core.Precompressed, names.len);
+    for (names, out) |n, *o| {
+        o.* = std.meta.stringToEnum(http.core.Precompressed, n) orelse return error.Config;
+    }
+    return out;
+}
+
+/// A fixed response route's data.
+pub const FixedRoute = struct {
+    status: http.Status,
+    body: []const u8,
+    headers: []const [2][]const u8,
+
+    pub fn handler(req: *http.Request, res: *http.Response) anyerror!void {
+        const f: *const FixedRoute = @ptrCast(@alignCast(req.route.?.data.?));
+        res.status = f.status;
+        for (f.headers) |h| try res.header(h[0], h[1]);
+        res.body = f.body;
+    }
+};
+
+pub fn fixed(arena: std.mem.Allocator, f: Config.Fixed) !*FixedRoute {
+    const hs = try arena.alloc([2][]const u8, f.headers.map.count());
+    var it = f.headers.map.iterator();
+    var j: usize = 0;
+    while (it.next()) |kv| : (j += 1) hs[j] = .{ kv.key_ptr.*, kv.value_ptr.* };
+    const out = try arena.create(FixedRoute);
+    out.* = .{ .status = http.Status.fromCode(f.status) catch .internal_server_error, .body = f.body, .headers = hs };
+    return out;
+}
+
+test "parse: the defaults, a full document, and what is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+
+    const d = try parse(a, "{}", &why);
+    try std.testing.expectEqual(@as(usize, 1), d.listeners.len);
+    try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms);
+
+    const full_doc =
+        \\{"executors": 2,
+        \\ "listeners": [{"name": "web", "address": "127.0.0.1", "port": 0}],
+        \\ "limits": {"inline_body_max": 1024, "max_inflight": 8},
+        \\ "middleware": [{"request_id": {}}, {"cors": {"origins": ["https://a.example"]}},
+        \\                {"rate_limit": {"limit": 5, "key": "header:X-Key"}}],
+        \\ "routes": [
+        \\   {"method": "GET", "path": "/a", "handler": 1, "timeout_ms": 500, "cache": {"ttl_ms": 1000}},
+        \\   {"path": "/b", "respond": {"status": 201, "body": "x", "headers": {"x-y": "z"}}}
+    ;
+    const ws_route = ",\n   {\"path\": \"/ws\", \"websocket\": {\"handler\": 2}}";
+    const end = "\n ],\n \"observe\": {\"metrics\": {}, \"health\": {}}}";
+    // The WebSocket route only where WebSocket is built in.
+    const full = if (features.websocket) full_doc ++ ws_route ++ end else full_doc ++ end;
+    const f = try parse(a, full, &why);
+    try std.testing.expectEqual(@as(usize, if (features.websocket) 3 else 2), f.routes.len);
+    try std.testing.expectEqual(@as(?u32, 500), f.routes[0].timeout_ms);
+    try std.testing.expect(f.middleware[2] == .rate_limit);
+
+    const bad = [_][]const u8{
+        "{\"nope\": 1}",
+        "{\"routes\": [{\"path\": \"/x\"}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"handler\": 1, \"respond\": {}}]}",
+        "{\"routes\": [{\"path\": \"x\", \"handler\": 1}]}",
+        "{\"routes\": [{\"method\": \"FETCH\", \"path\": \"/x\", \"handler\": 1}]}",
+        "{\"listeners\": []}",
+        "{\"middleware\": [{\"rate_limit\": {\"key\": \"cookie\"}}]}",
+        // Framing fields are the server's; names and values must go on the wire.
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"Connection\": \"close\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"transfer-encoding\": \"chunked\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"x bad\": \"1\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"x-ok\": \"a\\r\\nb\"}}}]}",
+        // A provider's keys sign for its other clients too.
+        "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\"}}]}",
+        "{\"limits\": {\"inline_body_max\": 10, \"body_max\": 5}}",
+        // A record carries its length in 32 bits.
+        "{\"limits\": {\"inline_body_max\": 4294967295, \"body_max\": 8589934592}}",
+        "{\"limits\": {\"ws_max_message\": 4294967295}}",
+        // A database is one kind, named once, with a known sslmode given once.
+        "{\"databases\": [{\"name\": \"d\"}]}",
+        "{\"databases\": [{\"name\": \"d\", \"sqlite\": {\"path\": \"x\"}, \"postgres\": {}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"sslmode\": \"maybe\"}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"sslmode\": \"disable\", \"url\": \"postgres://h/d?sslmode=require\"}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"redis\": {}, \"postgres\": {}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"redis\": {\"max_connections\": 0}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"mongodb\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
+        "{\"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"method\": \"GET\", \"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 0}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_pem\": \"b\"}}]}",
+        "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+    };
+    for (bad) |doc| {
+        why.end = 0;
+        try std.testing.expectError(error.Config, parse(a, doc, &why));
+        try std.testing.expect(why.buffered().len > 0);
+    }
+
+    if (features.postgres) {
+        why.end = 0;
+        const p = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://db.internal/app\", \"sslmode\": \"verify-ca\", \"ca_pem\": \"-----BEGIN CERTIFICATE-----\"}}]}", &why);
+        try std.testing.expectEqual(SslMode.verify_ca, sslMode(p.databases[0].postgres.?.sslmode.?).?);
+        try std.testing.expectEqual(ResetSession.auto, p.databases[0].postgres.?.reset_session);
+        why.end = 0;
+        const always = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://localhost/app\", \"reset_session\": \"always\"}}]}", &why);
+        try std.testing.expectEqual(ResetSession.always, always.databases[0].postgres.?.reset_session);
+    }
+    if (features.auth) {
+        why.end = 0;
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"audience\": \"api\"}}]}", &why);
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"allow_any_audience\": true}}]}", &why);
+        // Inline keys are the application's own: no audience needed.
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks\": {\"keys\": []}}}]}", &why);
+    }
+}
+
+test "parse: include/anole.schema.json names every field Config has, and no other" {
+    const text = @import("anole_capi_schema").text;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+    const defs = root.object.get("$defs").?.object;
+    try SchemaCheck.walk(Config, root, defs);
+}
+
+const SchemaCheck = struct {
+    fn resolve(node: std.json.Value, defs: std.json.ObjectMap) std.json.Value {
+        var n = node;
+        while (true) {
+            if (n.object.get("$ref")) |r| {
+                n = defs.get(r.string["#/$defs/".len..]).?;
+                continue;
+            }
+            if (n.object.get("anyOf")) |any| {
+                n = any.array.items[0];
+                continue;
+            }
+            return n;
+        }
+    }
+
+    fn walk(comptime T: type, node_in: std.json.Value, defs: std.json.ObjectMap) error{SchemaOutOfDate}!void {
+        if (T == std.json.Value) return;
+        const node = resolve(node_in, defs);
+        switch (@typeInfo(T)) {
+            .optional => |o| return walk(o.child, node, defs),
+            .pointer => |p| if (p.child != u8) return walk(p.child, node.object.get("items").?, defs),
+            .@"struct" => |s| {
+                if (T == std.json.Value or T == std.json.ArrayHashMap([]const u8)) return;
+                const props = node.object.get("properties") orelse {
+                    std.debug.print("schema: no properties for {s}\n", .{@typeName(T)});
+                    return error.SchemaOutOfDate;
+                };
+                if (props.object.count() != s.field_names.len) {
+                    std.debug.print("schema: {s} has {d} fields, the schema {d}\n", .{ @typeName(T), s.field_names.len, props.object.count() });
+                    return error.SchemaOutOfDate;
+                }
+                inline for (s.field_names, s.field_types) |name, FT| {
+                    const p = props.object.get(name) orelse {
+                        std.debug.print("schema: {s}.{s} missing\n", .{ @typeName(T), name });
+                        return error.SchemaOutOfDate;
+                    };
+                    try walk(FT, p, defs);
+                }
+            },
+            .@"union" => |u| {
+                const variants = node.object.get("oneOf").?.array.items;
+                if (variants.len != u.field_names.len) return error.SchemaOutOfDate;
+                inline for (u.field_names, u.field_types) |name, FT| {
+                    const v = for (variants) |v| {
+                        if (v.object.get("properties").?.object.get(name)) |p| break p;
+                    } else {
+                        std.debug.print("schema: middleware {s} missing\n", .{name});
+                        return error.SchemaOutOfDate;
+                    };
+                    try walk(FT, v, defs);
+                }
+            },
+            else => {},
+        }
+    }
+};

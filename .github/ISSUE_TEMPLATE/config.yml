@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/xuckless/anole/security/advisories/new
+    about: Privately, so it can be fixed before it is public (see SECURITY.md).
+  - name: Ask a question
+    url: https://github.com/xuckless/anole/discussions
+    about: Questions about using Anole, and ideas still taking shape.

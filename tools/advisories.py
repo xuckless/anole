@@ -4,7 +4,8 @@
     tools/advisories.py [path/to/build.zig.zon]
 
 Versioned upstreams are checked against their GitHub security advisories,
-BoringSSL (pinned by commit, no releases) against OSV. Exits 1 when a pin is
+BoringSSL (pinned by commit, no releases) against OSV, SQLite (no GitHub
+advisories) against NVD's CVE list. Exits 1 when a pin is
 affected, 2 when a pin moved and the table below needs updating. Set
 GH_TOKEN (or GITHUB_TOKEN) to avoid GitHub's anonymous rate limit.
 """
@@ -16,18 +17,26 @@ import urllib.request
 
 # name: (advisory repo, version, pattern that must match the pin in
 # build.zig.zon). nghttp2 comes from the xuckless fork: v1.70.0 plus the
-# RFC 9113 strictness patch; ngtcp2 too: v1.25.0 plus the migration patch;
-# nghttp3 too: v1.18.0 plus nghttp3_conn_add_extra_setting.
+# RFC 9113 strictness patch; ngtcp2 too: v1.25.0 plus its patches (pinned
+# by git URL); nghttp3 too: v1.18.0 plus nghttp3_conn_add_extra_setting.
 VERSIONED = {
     "nghttp2": ("nghttp2/nghttp2", "1.70.0", r"xuckless/nghttp2/archive/0f8bc1c4271f4380409071eade31830e6e436bd6"),
-    "ngtcp2": ("ngtcp2/ngtcp2", "1.25.0", r"xuckless/ngtcp2/archive/f47d1322abb7d65e48920f3e539f113866824478"),
+    "ngtcp2": ("ngtcp2/ngtcp2", "1.25.0", r"xuckless/ngtcp2#b70d6d98d90be1af793af704bdf66b97df8dd7f1"),
     "nghttp3": ("ngtcp2/nghttp3", "1.18.0", r"xuckless/nghttp3/archive/de4bcb905eca28cdfe0e6ef4280b355e1c29660d"),
     "zlib-ng": ("zlib-ng/zlib-ng", "2.3.3", r"zlib-ng/archive/refs/tags/2\.3\.3\.tar"),
     "zstd": ("facebook/zstd", "1.5.7", r"zstd/archive/refs/tags/v1\.5\.7\.tar"),
+    "brotli": ("google/brotli", "1.2.0", r"brotli/archive/refs/tags/v1\.2\.0\.tar"),
     "yyjson": ("ibireme/yyjson", "0.13.0", r"yyjson/archive/refs/tags/0\.13\.0\.tar"),
     "hiredis": ("redis/hiredis", "1.5.0", r"hiredis/archive/refs/tags/v1\.5\.0\.tar"),
 }
 BORINGSSL = re.compile(r"google/boringssl/archive/([0-9a-f]{40})\.tar")
+# SQLite: (version, pattern that must match the amalgamation's pin).
+SQLITE = ("3.54.1", r"sqlite\.org/2026/sqlite-amalgamation-3540100\.zip")
+# CVEs NVD matches to every SQLite version because SQLite is only the
+# platform in their configurations, not the vulnerable product.
+NVD_IGNORE = {
+    "CVE-2022-31631": "PHP's PDO::quote(), SQLite as its platform",
+}
 
 
 def fetch(url, body=None):
@@ -98,6 +107,18 @@ def main():
             print(f"    {x['id']}: {x.get('summary', '')}")
         if vulns:
             affected.append("boringssl")
+
+    pinned, pattern = SQLITE
+    if not re.search(pattern, zon):
+        stale.append("sqlite")
+    else:
+        cves = fetch(f"https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:a:sqlite:sqlite:{pinned}").get("vulnerabilities", [])
+        hits = [x["cve"]["id"] for x in cves if x["cve"]["id"] not in NVD_IGNORE]
+        print(f"sqlite {pinned}: NVD " + ("AFFECTED" if hits else f"none apply ({len(cves)} matched, ignored: {', '.join(NVD_IGNORE)})"))
+        for h in hits:
+            print("    " + h)
+        if hits:
+            affected.append("sqlite")
 
     if stale:
         print("pin changed, update tools/advisories.py: " + ", ".join(stale))

@@ -2,14 +2,25 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
+//! The HTTP core (adapted from lalinsky/dusty): server, HTTP/2 engine,
+//! router, middleware, static files and client. Applications reach it as
+//! `anole.http`, and through `anole.Server`.
+
 const std = @import("std");
 
 pub const Server = @import("server.zig").Server;
+/// What takes an HTTP/1.1 connection over after an upgrade, served in
+/// bursts with the connection parked in between (`Response.adopt`).
+pub const Adopter = @import("server.zig").Adopter;
+/// One run of an `Adopter`: what it waits for input with, and how it ends.
+pub const Burst = @import("server.zig").Burst;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsPath = @import("config.zig").TlsPath;
+/// A peer range for `Listener.proxy_protocol_from`.
+pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;
@@ -18,13 +29,16 @@ pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 /// Where a response goes when a protocol engine (HTTP/2) frames it; see `Response.initSink`.
 pub const Sink = @import("sink.zig").Sink;
-/// Task placement on zio's executors, for protocol engines outside dusty
-/// (HTTP/3) that keep a connection's tasks on one executor.
+/// A response finished after its handler returned, with no task waiting
+/// (`Response.detach`): HTTP/2 and HTTP/3 requests that ran on the reader.
+pub const Detached = @import("detach.zig").Detached;
+/// Task placement on zio's executors, for protocol engines outside the
+/// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
 pub const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// One time budget shared by several blocking calls (a request, then the
 /// reads of its body), as the client's `timeout` is; for protocol clients
-/// outside dusty (HTTP/2, HTTP/3).
+/// outside the core (HTTP/2, HTTP/3).
 pub const Deadline = @import("deadline.zig").Deadline;
 /// A request body delivered unframed by a protocol engine; see `Request.body_source`.
 pub const BodySource = @import("request.zig").BodySource;
@@ -46,8 +60,16 @@ pub const ContentType = @import("http.zig").ContentType;
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
+pub const SessionCookieOpts = @import("cookie.zig").SessionCookieOpts;
 pub const validateCookieName = @import("cookie.zig").validateCookieName;
 pub const validateCookieValue = @import("cookie.zig").validateCookieValue;
+/// Whether a header name or value may go on the wire (the C ABI checks
+/// replies with them before they reach a `Response`).
+pub const validateHeaderName = @import("http.zig").validateHeaderName;
+pub const validateHeaderValue = @import("http.zig").validateHeaderValue;
+/// Response header names only the server writes (`Connection`,
+/// `Transfer-Encoding`), which `Response.header` refuses.
+pub const isReservedHeader = @import("response.zig").isReservedHeader;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
 /// `Request.locals`: per-request values a middleware hands to the handler.
 pub const Locals = @import("locals.zig").Locals;
@@ -73,9 +95,17 @@ pub const statusBody = @import("middleware.zig").statusBody;
 /// Fails when another socket already listens on the address, which
 /// SO_REUSEPORT would silently share.
 pub const checkAddressFree = @import("server.zig").checkAddressFree;
+/// A listening TCP socket, with IPV6_V6ONLY as asked (dual-stack `::`).
+pub const listenIp = @import("server.zig").listenIp;
+/// `listenIp`'s options.
+pub const ListenIpOptions = @import("server.zig").ListenIpOptions;
+/// An IPv4-mapped IPv6 address as the IPv4 address it stands for.
+pub const unmapIpv4 = @import("server.zig").unmapIpv4;
 /// What the startup line says about a listener: "https://127.0.0.1:8443
 /// (HTTP/2, HTTP/1.1)".
 pub const describeListener = @import("server.zig").describeListener;
+/// The open-file limit, and the connection cap worked out from it.
+pub const fd_limit = @import("fd_limit.zig");
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
@@ -88,6 +118,10 @@ pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;
 pub const WebSocketUpgradeOptions = @import("client.zig").WebSocketUpgradeOptions;
+pub const Redirect = @import("client.zig").Redirect;
+pub const RedirectAction = @import("client.zig").RedirectAction;
+pub const RedirectPolicy = @import("client.zig").RedirectPolicy;
+pub const isPrivateAddress = @import("client.zig").isPrivateAddress;
 
 test {
     std.testing.refAllDecls(@This());
@@ -101,9 +135,11 @@ comptime {
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");
+    _ = @import("client_redirect_test.zig");
     _ = @import("deadline.zig");
     _ = @import("cgroup.zig");
     _ = @import("somaxconn.zig");
+    _ = @import("fd_limit.zig");
     _ = @import("config.zig");
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
@@ -116,4 +152,6 @@ comptime {
     _ = @import("server/static.zig");
     _ = @import("server/static_test.zig");
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
+    if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");
+    _ = @import("block_cache.zig");
 }

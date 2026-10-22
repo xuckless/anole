@@ -2,7 +2,7 @@
 //! a blocking C library) run on a pool thread while the calling coroutine
 //! waits, so the executor goes on serving everything else.
 //!
-//!     var app = try anole.Server(App).init(gpa, .{ .blocking = .{} }, &app_state);
+//!     var app = try anole.App.init(gpa, .{ .blocking = .{} });
 //!     // in a handler:
 //!     const n = try anole.blocking.run(req.io, expensive, .{ input });
 //!
@@ -13,17 +13,40 @@
 //! runtime (none configured, or code outside `anole.Server`), `run` calls
 //! the function directly.
 //!
-//! Cancellation: a job is never interrupted (CPU work has no cancelation
-//! points). When the caller is canceled while its job runs, it still waits
-//! for the job to finish, because the job may borrow the caller's memory,
-//! and then gets `error.Canceled`.
+//! Cancellation: a job is never cut short from outside (CPU work has no
+//! cancelation points). When the caller is canceled while its job runs, it
+//! still waits for the job to finish, because the job may borrow the
+//! caller's memory, and then gets `error.Canceled`; a job that can be asked
+//! to stop early (a SQLite query, through `sqlite3_interrupt`) gets that
+//! request from `RunOptions.on_cancel`. A job whose caller was canceled
+//! before it started does not start.
 const std = @import("std");
 const zio = @import("zio");
 
+/// The pool's settings: `ServerOptions.blocking`, or `Pool.init`.
 pub const Options = struct {
     /// Jobs that run at once; more wait for a free slot. Null: half the
     /// CPUs, at least 2.
     threads: ?usize = null,
+};
+
+/// What a caller asks for besides the job (`runWith`).
+pub const RunOptions = struct {
+    /// Called when the caller is canceled while its job runs, before it
+    /// waits for the job to end: to make the job end soon (SQLite's
+    /// `sqlite3_interrupt` on the job's connection). Runs on the caller's
+    /// task, at most once, and only after the job has started; the job may
+    /// be about to finish, or between two steps, so a job that checks
+    /// state of its own set by the hook misses nothing. Not called when
+    /// there is no pool (`run` then calls the function on the caller's
+    /// task, which nothing cancels meanwhile).
+    on_cancel: ?OnCancel = null,
+};
+
+/// A callback and its context: `call(context)`.
+pub const OnCancel = struct {
+    context: ?*anyopaque,
+    call: *const fn (context: ?*anyopaque) void,
 };
 
 /// What `run(io, func, args)` returns: `func`'s result, with
@@ -36,6 +59,9 @@ pub fn Result(comptime Func: type) type {
     };
 }
 
+/// A cap on how many jobs run at once on the runtime's blocking threads.
+/// `ServerOptions.blocking` makes one for the server; `anole.blocking.run`
+/// finds it from a request's `std.Io`.
 pub const Pool = struct {
     rt: *zio.Runtime,
     threads: usize,
@@ -97,6 +123,11 @@ pub const Pool = struct {
     /// even when canceled. `func` runs outside any coroutine, so whatever
     /// it blocks on blocks only its own thread.
     pub fn run(self: *Pool, io: std.Io, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) (error{PoolClosed} || ErrorOf(Result(@TypeOf(func))))!PayloadOf(Result(@TypeOf(func))) {
+        return self.runWith(io, .{}, func, args);
+    }
+
+    /// `run`, with `options`.
+    pub fn runWith(self: *Pool, io: std.Io, options: RunOptions, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) (error{PoolClosed} || ErrorOf(Result(@TypeOf(func))))!PayloadOf(Result(@TypeOf(func))) {
         try self.acquire(io);
         defer self.release(io);
 
@@ -106,9 +137,16 @@ pub const Pool = struct {
             io: std.Io,
             result: R = undefined,
             done: std.Io.Event = .unset,
+            /// Who came first: the pool thread starting the job, or the
+            /// caller giving up on it.
+            state: std.atomic.Value(State) = .init(.queued),
+
+            const State = enum(u8) { queued, started, abandoned };
 
             fn work(job: *@This()) void {
-                job.result = @call(.auto, func, job.args);
+                if (job.state.cmpxchgStrong(.queued, .started, .acq_rel, .acquire) == null) {
+                    job.result = @call(.auto, func, job.args);
+                }
                 job.done.set(job.io);
             }
         };
@@ -119,6 +157,8 @@ pub const Pool = struct {
             return job.result;
         };
         job.done.wait(io) catch |err| {
+            const abandoned = job.state.cmpxchgStrong(.queued, .abandoned, .acq_rel, .acquire) == null;
+            if (!abandoned) if (options.on_cancel) |hook| hook.call(hook.context);
             job.done.waitUncancelable(io);
             future.await(io);
             return err;
@@ -139,8 +179,13 @@ fn PayloadOf(comptime T: type) type {
 /// Runs `func(args...)` on the pool of `io`'s runtime (see `Pool.run`), or
 /// directly when that runtime has none.
 pub fn run(io: std.Io, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Result(@TypeOf(func)) {
+    return runWith(io, .{}, func, args);
+}
+
+/// `run`, with `options` (see `RunOptions`).
+pub fn runWith(io: std.Io, options: RunOptions, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Result(@TypeOf(func)) {
     if (find(io)) |pool| {
-        return pool.run(io, func, args) catch |err| switch (err) {
+        return pool.runWith(io, options, func, args) catch |err| switch (err) {
             error.PoolClosed => @call(.auto, func, args),
             else => |e| e,
         };
@@ -276,4 +321,47 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
             return 7;
         }
     }.seven, .{}));
+}
+
+test "blocking.runWith: on_cancel asks a running job to stop, and the caller gets error.Canceled" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var pool: Pool = undefined;
+    try pool.init(rt, .{ .threads = 1 });
+    defer pool.deinit();
+
+    // A job that runs until told to stop, as a SQLite query runs until
+    // `sqlite3_interrupt`.
+    const Interruptible = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        stop: std.atomic.Value(bool) = .init(false),
+        hooks: std.atomic.Value(u32) = .init(0),
+
+        fn work(self: *@This()) error{Interrupted}!u32 {
+            self.started.store(true, .release);
+            var n: u32 = 0;
+            while (!self.stop.load(.acquire)) n +%= 1;
+            return error.Interrupted;
+        }
+        fn interrupt(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.hooks.fetchAdd(1, .monotonic);
+            self.stop.store(true, .release);
+        }
+        fn call(self: *@This(), _io: std.Io) !u32 {
+            return runWith(_io, .{ .on_cancel = .{ .context = self, .call = interrupt } }, work, .{self});
+        }
+    };
+    var job: Interruptible = .{};
+    var caller = try io.concurrent(Interruptible.call, .{ &job, io });
+    while (!job.started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectError(error.Canceled, caller.cancel(io));
+    try std.testing.expectEqual(@as(u32, 1), job.hooks.load(.monotonic));
+
+    // Not canceled: the hook is not called.
+    job = .{ .stop = .init(true) };
+    try std.testing.expectError(error.Interrupted, Interruptible.call(&job, io));
+    try std.testing.expectEqual(@as(u32, 0), job.hooks.load(.monotonic));
 }

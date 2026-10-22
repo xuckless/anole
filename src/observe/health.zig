@@ -3,6 +3,12 @@
 //! passes and the server is not draining, 503 otherwise (with the failing
 //! check named), so a load balancer stops sending traffic before shutdown.
 //!
+//! In an app, `app.health(.{})` returns one the server owns and serves:
+//!
+//!     try app.health(.{}).addCheck("db", dbReady, &pool);
+//!
+//! By hand:
+//!
 //!     var health = anole.observe.Health.init(.{});
 //!     try health.addCheck("db", dbReady, &pool);
 //!     health.registerOn(void, app.router, app.server);
@@ -13,12 +19,15 @@ const std = @import("std");
 const dusty = @import("dusty");
 const common = @import("common.zig");
 
+/// A readiness check: `ready(ctx)` says whether the dependency it watches
+/// (a database, a queue) can be used now.
 pub const Check = struct {
     name: []const u8,
     ctx: ?*anyopaque,
     ready: *const fn (ctx: ?*anyopaque) bool,
 };
 
+/// The liveness and readiness routes and their checks.
 pub const Health = struct {
     options: Options,
     checks: [16]Check = undefined,
@@ -30,13 +39,23 @@ pub const Health = struct {
     pub const Options = struct {
         /// Where `registerOn` serves the two routes.
         healthz_path: []const u8 = "/healthz",
+        /// The readiness route.
         readyz_path: []const u8 = "/readyz",
+        /// Serve both only on the listener of this name (an internal port
+        /// the load balancer reaches), 404 on the others. `/readyz` names
+        /// the failing check. Null: every listener.
+        listener: ?[]const u8 = null,
     };
 
+    /// No checks yet: `/readyz` passes until one is added or the server drains.
     pub fn init(options: Options) Health {
         return .{ .options = options };
     }
 
+    /// Adds a readiness check called `name` (shown when it fails): `/readyz`
+    /// calls `ready(ctx)` on every request and answers 503 when it returns
+    /// false. At most 16 checks (`error.TooManyChecks`). Keep `ready` quick;
+    /// it runs on the request's task.
     pub fn addCheck(self: *Health, name: []const u8, ready: *const fn (ctx: ?*anyopaque) bool, ctx: ?*anyopaque) !void {
         if (self.len == self.checks.len) return error.TooManyChecks;
         self.checks[self.len] = .{ .name = name, .ctx = ctx, .ready = ready };
@@ -54,8 +73,8 @@ pub const Health = struct {
                 return s.busy.load(.acquire).draining;
             }
         }.f;
-        common.serve(Ctx, router, self.options.healthz_path, Health, self, healthz);
-        common.serve(Ctx, router, self.options.readyz_path, Health, self, readyz);
+        common.serve(Ctx, router, self.options.healthz_path, Health, self, healthz, self.options.listener);
+        common.serve(Ctx, router, self.options.readyz_path, Health, self, readyz, self.options.listener);
     }
 
     /// Whether the server `registerOn` was given has started to drain.

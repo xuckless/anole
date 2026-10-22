@@ -8,14 +8,18 @@
 //! reads that byte from the destination connection ID and returns it as the
 //! socket's index in the group; the kernel numbers a group's sockets in the
 //! order they were bound (socket(7)), so the endpoints bind in index order.
-//! Whatever carries no such ID (a client's first Initial, with a connection
-//! ID of its own choosing, unless it happens to be `cid_len` bytes long; a
-//! truncated datagram) gets an index out of range, and for that the kernel
-//! falls back to its usual 4-tuple hash. Every packet of one handshake
-//! attempt carries the same IDs and 4-tuple, so it lands on one socket
-//! either way. Linux 4.5 and later; without the program (an older kernel)
-//! the hash decides, and the endpoints pass packets for
-//! each other on in user space instead.
+//! A long-header packet with no such ID (a client's first Initials and its
+//! 0-RTT packets, with a connection ID of its own choosing) goes by that
+//! ID's first byte, modulo the group's size: by the ID alone, not the
+//! 4-tuple, so a client whose address changes before the server's first
+//! reply reaches it (a NAT rebinding during the handshake) still reaches
+//! the endpoint that holds its connection, rather than starting a second
+//! one on another. Whatever else carries no ID of ours (a short header
+//! naming another index, a truncated datagram) gets an index out of range,
+//! and for that the kernel falls back to its usual 4-tuple hash. Linux 4.5
+//! and later; without the program (an older kernel) the hash decides, and
+//! the endpoints pass packets for each other on in user space instead, by
+//! the same rules (`indexOf`).
 //!
 //! For classic BPF on a reuseport group the kernel moves the data past the
 //! UDP header first (`run_bpf_filter` in net/core/sock_reuseport.c), so
@@ -58,6 +62,8 @@ const LEN = 0x80;
 const JEQ = 0x10;
 const JGE = 0x30;
 const JSET = 0x40;
+const ALU = 0x04;
+const MOD = 0x90;
 const K = 0x00;
 const A = 0x10;
 
@@ -67,40 +73,48 @@ pub const no_index: u32 = 0xffffffff;
 const long_index_at = 6 + index_byte;
 const short_index_at = 1 + index_byte;
 
+/// Where a long header's destination connection ID starts.
+const long_dcid_at = 6;
+
 /// The program for a group of `sockets` sockets.
-pub fn program(sockets: u8) [12]Insn {
+pub fn program(sockets: u8) [15]Insn {
     const n: u32 = sockets;
     return .{
         // 0: Too short to hold the byte either way: hash.
         .{ .code = LD | W | LEN, .jt = 0, .jf = 0, .k = 0 },
-        .{ .code = JMP | JGE | K, .jt = 0, .jf = 9, .k = long_index_at + 1 },
+        .{ .code = JMP | JGE | K, .jt = 0, .jf = 12, .k = long_index_at + 1 },
         // 2: Long header (the top bit) or short.
         .{ .code = LD | B | ABS, .jt = 0, .jf = 0, .k = 0 },
-        .{ .code = JMP | JSET | K, .jt = 0, .jf = 4, .k = 0x80 },
-        // 4: Long: only an ID of our length can be ours.
+        .{ .code = JMP | JSET | K, .jt = 0, .jf = 7, .k = 0x80 },
+        // 4: Long: an ID of our length naming a socket is ours.
         .{ .code = LD | B | ABS, .jt = 0, .jf = 0, .k = 5 },
-        .{ .code = JMP | JEQ | K, .jt = 0, .jf = 5, .k = cid_len },
+        .{ .code = JMP | JEQ | K, .jt = 0, .jf = 2, .k = cid_len },
         .{ .code = LD | B | ABS, .jt = 0, .jf = 0, .k = long_index_at },
-        .{ .code = JMP | JGE | K, .jt = 3, .jf = 2, .k = n },
-        // 8: Short.
+        .{ .code = JMP | JGE | K, .jt = 0, .jf = 5, .k = n },
+        // 8: Long, the client's own ID: its first byte, modulo the group.
+        .{ .code = LD | B | ABS, .jt = 0, .jf = 0, .k = long_dcid_at },
+        .{ .code = ALU | MOD | K, .jt = 0, .jf = 0, .k = n },
+        .{ .code = RET | A, .jt = 0, .jf = 0, .k = 0 },
+        // 11: Short.
         .{ .code = LD | B | ABS, .jt = 0, .jf = 0, .k = short_index_at },
         .{ .code = JMP | JGE | K, .jt = 1, .jf = 0, .k = n },
-        // 10: The socket.
+        // 13: The socket.
         .{ .code = RET | A, .jt = 0, .jf = 0, .k = 0 },
-        // 11: The hash.
+        // 14: The hash.
         .{ .code = RET | K, .jt = 0, .jf = 0, .k = no_index },
     };
 }
 
 /// The index the program would pick for `sockets` sockets, by the same
 /// rules, for user space: the endpoint a datagram belongs to, or null when
-/// it carries no ID of ours.
+/// the kernel's hash decides.
 pub fn indexOf(packet: []const u8, sockets: usize) ?u8 {
     if (packet.len < long_index_at + 1) return null;
-    const i = if (packet[0] & 0x80 != 0) blk: {
-        if (packet[5] != cid_len) return null;
-        break :blk packet[long_index_at];
-    } else packet[short_index_at];
+    if (packet[0] & 0x80 != 0) {
+        if (packet[5] == cid_len and packet[long_index_at] < sockets) return packet[long_index_at];
+        return @intCast(packet[long_dcid_at] % sockets);
+    }
+    const i = packet[short_index_at];
     return if (i < sockets) i else null;
 }
 
@@ -143,6 +157,7 @@ fn interpret(insns: []const Insn, packet: []const u8) u32 {
             JMP | JGE | K => pc += if (a >= i.k) i.jt else i.jf,
             JMP | JEQ | K => pc += if (a == i.k) i.jt else i.jf,
             JMP | JSET | K => pc += if (a & i.k != 0) i.jt else i.jf,
+            ALU | MOD | K => a %= i.k,
             RET | A => return a,
             RET | K => return i.k,
             else => unreachable,
@@ -185,20 +200,26 @@ test "steering program: our IDs go to their socket, anything else to the hash" {
         try std.testing.expectEqual(@as(?u8, @intCast(i)), indexOf(shortPacket(&buf, &cid), 4));
         try std.testing.expectEqual(@as(?u8, @intCast(i)), indexOf(longPacket(&buf, &cid), 4));
     }
-    // An index past the group's last socket: the hash.
+    // A short header naming an index past the group's last socket: the
+    // hash. A long one: its first byte (0x9c) modulo the group.
     const beyond = ourCid(4);
     try std.testing.expectEqual(no_index, interpret(&prog, shortPacket(&buf, &beyond)));
-    try std.testing.expectEqual(no_index, interpret(&prog, longPacket(&buf, &beyond)));
+    try std.testing.expectEqual(@as(u32, 0x9c % 4), interpret(&prog, longPacket(&buf, &beyond)));
     try std.testing.expectEqual(@as(?u8, null), indexOf(shortPacket(&buf, &beyond), 4));
-    // A client's first Initial: its own 8-byte ID, whatever its bytes say.
-    const client_cid = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 };
-    try std.testing.expectEqual(no_index, interpret(&prog, longPacket(&buf, &client_cid)));
-    try std.testing.expectEqual(@as(?u8, null), indexOf(longPacket(&buf, &client_cid), 4));
+    try std.testing.expectEqual(@as(?u8, 0x9c % 4), indexOf(longPacket(&buf, &beyond), 4));
+    // A client's first Initial: its own 8-byte ID, by its first byte, so
+    // the same socket whatever address the client sends from.
+    for ([_]u8{ 0, 1, 6, 255 }) |first| {
+        const client_cid = [_]u8{ first, 1, 2, 3, 4, 5, 6, 7 };
+        try std.testing.expectEqual(@as(u32, first % 4), interpret(&prog, longPacket(&buf, &client_cid)));
+        try std.testing.expectEqual(@as(?u8, first % 4), indexOf(longPacket(&buf, &client_cid), 4));
+        try std.testing.expectEqual(@as(u32, first % 3), interpret(&program(3), longPacket(&buf, &client_cid)));
+    }
     // A 20-byte ID: not ours either.
     var twenty: [20]u8 = @splat(1);
-    try std.testing.expectEqual(no_index, interpret(&prog, longPacket(&buf, &twenty)));
-    twenty = @splat(0);
-    try std.testing.expectEqual(no_index, interpret(&prog, longPacket(&buf, &twenty)));
+    try std.testing.expectEqual(@as(u32, 1), interpret(&prog, longPacket(&buf, &twenty)));
+    twenty = @splat(7);
+    try std.testing.expectEqual(@as(u32, 3), interpret(&prog, longPacket(&buf, &twenty)));
     // Truncated before the byte, both ways, and empty.
     const cid = ourCid(2);
     const long = longPacket(&buf, &cid);
@@ -207,9 +228,10 @@ test "steering program: our IDs go to their socket, anything else to the hash" {
     try std.testing.expectEqual(@as(?u8, null), indexOf(long[0..long_index_at], 4));
     try std.testing.expectEqual(no_index, interpret(&prog, &.{}));
     try std.testing.expectEqual(no_index, interpret(&prog, &.{0x40}));
-    // One socket: everything hashes (there is nothing to choose).
+    // One socket: there is nothing to choose.
     try std.testing.expectEqual(no_index, interpret(&program(1), shortPacket(&buf, &ourCid(1))));
     try std.testing.expectEqual(@as(u32, 0), interpret(&program(1), shortPacket(&buf, &ourCid(0))));
+    try std.testing.expectEqual(@as(u32, 0), interpret(&program(1), longPacket(&buf, &[_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 })));
 }
 
 test "fuzz: the steering program and indexOf agree, and never pick a socket past the group" {
@@ -248,20 +270,26 @@ test "steering in the kernel: each datagram reaches the socket its ID names" {
     };
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     for (&fds) |*fd| {
-        fd.* = try net.bindReusePort(address);
+        fd.* = try net.bindReusePort(address, null);
         bound += 1;
         address = boundAddress(fd.*);
     }
     try attach(fds[0], sockets);
-    const client = try net.bindReusePort(.{ .ip4 = .loopback(0) });
+    const client = try net.bindReusePort(.{ .ip4 = .loopback(0) }, null);
     defer _ = std.c.close(client);
 
     var buf: [128]u8 = undefined;
     var rx: [256]u8 = undefined;
-    for (0..3) |round| {
+    for (0..4) |round| {
         for (0..sockets) |i| {
             const cid = ourCid(@intCast(i));
-            const packet = if (round == 1) longPacket(&buf, &cid) else shortPacket(&buf, &cid);
+            // Round 3: a client's own ID, by its first byte.
+            const client_cid = [_]u8{ @intCast(i + sockets), 0xee, 2, 3, 4, 5, 6, 7 };
+            const packet = switch (round) {
+                1 => longPacket(&buf, &cid),
+                3 => longPacket(&buf, &client_cid),
+                else => shortPacket(&buf, &cid),
+            };
             try sendTo(client, address, packet);
             // Only socket i has it.
             for (fds, 0..) |fd, j| {

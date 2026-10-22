@@ -11,8 +11,11 @@
 const std = @import("std");
 const dusty = @import("dusty");
 
-pub const session_key = "_csrf";
+/// The session key the token is kept under.
+pub const session_key = @import("../session/root.zig").csrf_key;
+/// The form field a urlencoded form sends the token back in.
 pub const field_name = "_csrf";
+/// The header a script sends the token back in.
 pub const header_name = "X-CSRF-Token";
 const token_len = 43; // 256 bits, base64url
 
@@ -27,6 +30,7 @@ pub fn token(req: *dusty.Request) ![]const u8 {
     return t;
 }
 
+/// `Middleware` settings.
 pub const Config = struct {
     /// JSON bodies are skipped as jetzig does: a browser cannot send
     /// `application/json` across sites without a CORS preflight. Turn this
@@ -34,6 +38,9 @@ pub const Config = struct {
     check_json: bool = false,
 };
 
+/// Checks the token on POST, PUT, PATCH and DELETE (header first, then the
+/// form field) and answers 403 when it is missing or wrong. Other methods
+/// pass through.
 pub const Middleware = struct {
     config: Config,
 

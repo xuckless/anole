@@ -238,8 +238,13 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
-        // Headers point directly into the read buffer, no copy needed
-        self.request.headers.add(self.state.header_field, self.state.header_value) catch return -1;
+        // Headers point directly into the read buffer, no copy needed. The
+        // table starts small (`parseHeaders`) and grows to the limit.
+        const headers = &self.request.headers;
+        headers.add(self.state.header_field, self.state.header_value) catch {
+            if (!headers.grow(self.request.arena, self.request.config.max_header_count)) return -1;
+            headers.add(self.state.header_field, self.state.header_value) catch return -1;
+        };
 
         self.state.header_value = "";
         self.state.header_field = "";
@@ -632,13 +637,25 @@ pub fn BodyReader(comptime Parser: type) type {
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
             ParseError || @typeInfo(@TypeOf(decodeCause(undefined))).error_union.error_set ||
-            error{ IncompleteBody, InvalidZstd, Unexpected };
+            error{ IncompleteBody, InvalidZstd, MalformedBody, Unexpected };
 
         /// Stores what actually went wrong and reports the sentinel the
         /// vtable requires. Mirrors `fail` on the buffered body writer.
         fn fail(self: *Self, cause: Error) std.Io.Reader.StreamError {
-            self.err = cause;
+            self.err = if (Parser == RequestParser) requestCause(cause) else cause;
             return error.ReadFailed;
+        }
+
+        /// A request body the parser or the decoder refused is the client's
+        /// fault, whatever the detail: `MalformedBody`, which the server
+        /// answers 400 (`errorStatus`). Kept apart from the same names out
+        /// of a response parser, which are an upstream's fault.
+        fn requestCause(cause: Error) Error {
+            if (cause == error.CorruptInput) return error.MalformedBody;
+            inline for (comptime @typeInfo(ParseError).error_set.error_names.?) |name| {
+                if (cause == @field(anyerror, name)) return error.MalformedBody;
+            }
+            return cause;
         }
 
         pub fn init(parser: *Parser, transport: Transport, buffer: []u8) Self {
@@ -844,6 +861,13 @@ pub fn BodyReader(comptime Parser: type) type {
 
                             // Check if body is now complete after finish()
                             if (parser.isBodyComplete()) {
+                                // The end of the connection was the end of
+                                // the body. Over TLS that end must be the
+                                // peer's close_notify: a bare EOF can come
+                                // from anyone on the path.
+                                if (comptime build_options.use_tls) {
+                                    if (self.transport.tlsEndedWithoutCloseNotify()) return self.fail(error.TlsConnectionTruncated);
+                                }
                                 return error.EndOfStream;
                             }
 

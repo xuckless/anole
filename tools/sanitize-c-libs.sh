@@ -7,7 +7,7 @@
 # CI, since its tests need a git submodule the tarball lacks. BoringSSL tests
 # itself under sanitizers upstream at every commit.)
 #
-#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd]
+#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli]
 #
 # Needs clang, make, cmake, curl, tar and git (ngtcp2 and nghttp3 come from
 # the xuckless forks, whose archives lack the tests' munit submodule, so
@@ -20,7 +20,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=${SANITIZE_WORK:-$(mktemp -d)}
 mkdir -p "$work"
 libs=("$@")
-[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd)
+[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd brotli)
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 export CC=${CC:-clang}
@@ -30,7 +30,32 @@ export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
 # The URL build.zig.zon pins for a library (matched on a fragment of it).
 url_of() {
-  grep -o "\"https://[^\"]*$1[^\"]*\"" "$root/build.zig.zon" | head -1 | tr -d '"'
+  grep -oE "\"(git\+)?https://[^\"]*$1[^\"]*\"" "$root/build.zig.zon" | head -1 | tr -d '"'
+}
+
+# The SHA-256 of every file this script downloads, by URL. build.zig.zon
+# pins the unpacked tree by Zig's own hash, which this script does not
+# compute, so a pin bump adds the new tarball's line here (MAINTAINING.md).
+# The git checkouts below are pinned by commit and need none.
+sha256_of() {
+  case $1 in
+    https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz) echo f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1 ;;
+    https://github.com/ibireme/yyjson/archive/refs/tags/0.13.0.tar.gz) echo 34e0f62a2bc11ab20d601e8ca1cc2b2079503aa45119a19133d89d19b94a0fae ;;
+    https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz) echo 37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3 ;;
+    https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz) echo 816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec ;;
+    https://github.com/google/brotli/releases/download/v1.2.0/testdata.txz) echo e8624d888f13067e7635353397cf42956bf4ca1382da67f9cec8d43e800deecb ;;
+    *) echo "" ;;
+  esac
+}
+
+# Downloads $1 to the file $2 and checks it against `sha256_of`.
+download() {
+  local url=$1 out=$2 want got
+  want=$(sha256_of "$url")
+  [ -n "$want" ] || { echo "no SHA-256 for $url: add it to sha256_of in $0" >&2; exit 1; }
+  curl -fsSL "$url" -o "$out"
+  if command -v sha256sum >/dev/null; then got=$(sha256sum "$out" | cut -d' ' -f1); else got=$(shasum -a 256 "$out" | cut -d' ' -f1); fi
+  [ "$got" = "$want" ] || { echo "SHA-256 mismatch for $url: got $got, want $want" >&2; exit 1; }
 }
 
 fetch() {
@@ -39,17 +64,19 @@ fetch() {
   [ -n "$url" ] || { echo "no pinned URL matching $2" >&2; exit 1; }
   echo "== $name: $url"
   rm -rf "$work/$name" && mkdir -p "$work/$name"
-  curl -fsSL "$url" | tar -x -C "$work/$name" --strip-components=1 $( [[ $url == *.xz ]] && echo -J || echo -z )
+  download "$url" "$work/$name.tar"
+  tar -x -f "$work/$name.tar" -C "$work/$name" --strip-components=1 $( [[ $url == *.xz ]] && echo -J || echo -z )
+  rm -f "$work/$name.tar"
   cd "$work/$name"
 }
 
 for lib in "${libs[@]}"; do
   case $lib in
     ngtcp2)
-      url=$(url_of "xuckless/ngtcp2/archive")
-      [ -n "$url" ] || { echo "no pinned URL matching xuckless/ngtcp2/archive" >&2; exit 1; }
-      commit=${url##*/}
-      commit=${commit%.tar.gz}
+      # Pinned by git URL: git+https://github.com/xuckless/ngtcp2#<commit>.
+      url=$(url_of "xuckless/ngtcp2#")
+      [ -n "$url" ] || { echo "no pinned URL matching xuckless/ngtcp2#" >&2; exit 1; }
+      commit=${url##*#}
       echo "== ngtcp2: xuckless/ngtcp2 at $commit"
       rm -rf "$work/ngtcp2" && git init -q "$work/ngtcp2" && cd "$work/ngtcp2"
       git fetch -q --depth 1 https://github.com/xuckless/ngtcp2 "$commit"
@@ -96,6 +123,22 @@ for lib in "${libs[@]}"; do
       make -C tests -j"$jobs" fuzzer zstreamtest MOREFLAGS="$san" >/dev/null
       ./tests/fuzzer -T60s
       ./tests/zstreamtest -T60s
+      ;;
+    brotli)
+      fetch brotli "google/brotli/archive"
+      # Its CTest suite: the CLI round-trips files at qualities 1, 6, 9 and
+      # 11 and decodes the reference streams in tests/testdata. The corpus
+      # is a release asset of the same tag (the tag archive has a few files).
+      tag=$(url_of "google/brotli/archive")
+      tag=${tag##*/tags/}
+      tag=${tag%.tar.gz}
+      download "https://github.com/google/brotli/releases/download/$tag/testdata.txz" "$work/brotli-testdata.txz"
+      tar -xJ -f "$work/brotli-testdata.txz"
+      rm -f "$work/brotli-testdata.txz"
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" >/dev/null
+      cmake --build build -j"$jobs" >/dev/null
+      (cd build && ctest --output-on-failure -j"$jobs" | tail -3)
       ;;
     *)
       echo "unknown library: $lib" >&2

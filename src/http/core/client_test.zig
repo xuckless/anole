@@ -139,7 +139,7 @@ test "Client: connection pooling" {
             defer client.deinit();
 
             // Pool should be empty initially
-            try std.testing.expectEqual(@as(usize, 0), client.pool.idle_len);
+            try std.testing.expectEqual(@as(usize, 0), client.pool().idle_len);
 
             // First request
             {
@@ -151,7 +151,7 @@ test "Client: connection pooling" {
             }
 
             // After first response is released, connection should be in pool
-            try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+            try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
 
             // Second request should reuse the pooled connection
             {
@@ -163,7 +163,7 @@ test "Client: connection pooling" {
             }
 
             // Connection should be back in pool
-            try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+            try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
         }
     }.run, .{ &server, io });
 
@@ -207,7 +207,7 @@ test "Client: pool evicts dead connection after server goes away" {
         try std.testing.expectEqual(.ok, response.status());
         _ = try response.body();
     }
-    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
 
     // The server goes away, killing the pooled connection.
     server_future.cancel(io) catch {};
@@ -224,7 +224,7 @@ test "Client: pool evicts dead connection after server goes away" {
 
     // ...and the dead connection must be evicted, not returned to the pool,
     // so the next fetch dials fresh instead of re-acquiring it forever.
-    try std.testing.expectEqual(@as(usize, 0), client.pool.idle_len);
+    try std.testing.expectEqual(@as(usize, 0), client.pool().idle_len);
 }
 
 test "Client: redirect failing after connection release does not double-release" {
@@ -296,7 +296,7 @@ test "Client: redirect failing after connection release does not double-release"
 
     // The connection was released back to the pool before the redirect
     // failed; the failure must not release it a second time.
-    try std.testing.expectEqual(1, client.pool.idle_len);
+    try std.testing.expectEqual(1, client.pool().idle_len);
 
     // The pooled connection is still usable.
     var ok_url_buf: [64]u8 = undefined;
@@ -308,7 +308,7 @@ test "Client: redirect failing after connection release does not double-release"
         try std.testing.expectEqual(.ok, response.status());
         _ = try response.body();
     }
-    try std.testing.expectEqual(1, client.pool.idle_len);
+    try std.testing.expectEqual(1, client.pool().idle_len);
 }
 
 test "Client: a connection with an unread response body is drained and reused" {
@@ -346,8 +346,8 @@ test "Client: a connection with an unread response body is drained and reused" {
 
         try std.testing.expectEqual(.ok, response.status());
     }
-    try client.pool.drains.await(io);
-    try std.testing.expectEqual(1, client.pool.idle_len);
+    try client.pool().drains.await(io);
+    try std.testing.expectEqual(1, client.pool().idle_len);
 
     // Reused rather than joined by a second connection.
     {
@@ -356,7 +356,7 @@ test "Client: a connection with an unread response body is drained and reused" {
 
         try std.testing.expectEqualStrings("some response body", (try response.body()).?);
     }
-    try std.testing.expectEqual(1, client.pool.idle_len);
+    try std.testing.expectEqual(1, client.pool().idle_len);
 }
 
 test "Client: an unread body that is too long or stalls is not drained into the pool" {
@@ -379,8 +379,8 @@ test "Client: an unread body that is too long or stalls is not drained into the 
             var response = try client.fetch(try peer.url(), .{ .stream = true });
             defer response.deinit();
         }
-        try client.pool.drains.await(io);
-        try std.testing.expectEqual(0, client.pool.idle_len);
+        try client.pool().drains.await(io);
+        try std.testing.expectEqual(0, client.pool().idle_len);
     }
 }
 
@@ -462,15 +462,239 @@ test "Client: pool survives concurrent fetches on a shared client" {
 
     // idle_len must still agree with the list, and must respect max_idle.
     var counted: usize = 0;
-    var node = client.pool.idle.first;
+    var node = client.pool().idle.first;
     while (node) |n| : (node = n.next) counted += 1;
 
-    try std.testing.expectEqual(counted, client.pool.idle_len);
-    try std.testing.expect(client.pool.idle_len <= max_idle);
+    try std.testing.expectEqual(counted, client.pool().idle_len);
+    try std.testing.expect(client.pool().idle_len <= max_idle);
 
     // Guard against the invariants above passing on a pool that never pooled
     // anything: connections must actually be getting reused.
-    try std.testing.expect(client.pool.idle_len > 0);
+    try std.testing.expect(client.pool().idle_len > 0);
+}
+
+/// An allocator that counts what goes through it, for tests that look at
+/// what a client keeps.
+const CountingAllocator = struct {
+    child: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    allocs: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        _ = self.live.fetchAdd(len, .monotonic);
+        _ = self.allocs.fetchAdd(1, .monotonic);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(m, a, n, ra)) return false;
+        _ = self.live.fetchAdd(n, .monotonic);
+        _ = self.live.fetchSub(m.len, .monotonic);
+        return true;
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(m, a, n, ra) orelse return null;
+        _ = self.live.fetchAdd(n, .monotonic);
+        _ = self.live.fetchSub(m.len, .monotonic);
+        return p;
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+        _ = self.live.fetchSub(m.len, .monotonic);
+    }
+};
+
+/// What a JSON API answers: about 9 KB.
+const fan_in_body = body: {
+    @setEvalBranchQuota(10_000);
+    var body: []const u8 = "{\"items\":[";
+    for (0..140) |_| body = body ++ "{\"name\":\"element-xxxxxxxxxxxxxxxxxxxxxxxx\",\"number\":1,\"group\":18},";
+    break :body body ++ "{}]}";
+};
+
+test "Client: requests fanning in to one host reuse connections, not redial them" {
+    // The shape that grew a server's memory without end: many handlers at
+    // once calling one upstream through the shared client, which kept 8
+    // idle connections. Every round closed the rest and dialed them again,
+    // and their buffers went through the allocator each time.
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/data.json", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.content_type = .json;
+            res.body = fan_in_body;
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/data.json", .{server.address.ip.getPort()});
+
+    var counting: CountingAllocator = .{ .child = std.testing.allocator };
+    var client = dusty.Client.init(counting.allocator(), io, .{});
+    defer client.deinit();
+
+    const workers = 32;
+    const Worker = struct {
+        fn run(c: *dusty.Client, u: []const u8, rounds: usize) !void {
+            for (0..rounds) |_| {
+                var response = try c.fetch(u, .{});
+                defer response.deinit();
+                try std.testing.expectEqual(.ok, response.status());
+                try std.testing.expectEqual(fan_in_body.len, (try response.body()).?.len);
+            }
+        }
+    };
+    const runAll = struct {
+        fn runAll(_io: std.Io, c: *dusty.Client, u: []const u8, rounds: usize) !void {
+            var futures: [workers]std.Io.Future(@typeInfo(@TypeOf(Worker.run)).@"fn".return_type.?) = undefined;
+            var started: usize = 0;
+            defer for (futures[0..started]) |*f| f.cancel(_io) catch {};
+            while (started < workers) : (started += 1) futures[started] = try _io.concurrent(Worker.run, .{ c, u, rounds });
+            var first_err: ?anyerror = null;
+            for (futures[0..started]) |*f| f.await(_io) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+            started = 0;
+            if (first_err) |err| return err;
+        }
+    }.runAll;
+
+    try runAll(io, &client, url, 25);
+
+    // Each worker holds one connection at a time, so there are never more
+    // than `workers` busy at once, and the pool keeps every one of them:
+    // nothing is closed and dialed again (with 8 kept, as before, about a
+    // dial for every few requests).
+    const dials = client.dials.load(.monotonic);
+    try std.testing.expect(dials <= workers);
+    try std.testing.expectEqual(dials, client.pool().idle_len);
+    // What they hold is bounded: the buffers, and what a response's arena
+    // keeps (`Connection.arena_retain_limit`).
+    try std.testing.expect(counting.live.load(.monotonic) <= dials * 64 * 1024);
+
+    // And another round takes the same connections.
+    try runAll(io, &client, url, 5);
+    try std.testing.expect(client.dials.load(.monotonic) <= workers);
+}
+
+test "Client: idle limits per host and in all" {
+    const io = std.testing.io;
+    const ok = struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle;
+    const run = struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run;
+
+    // Two hosts to the pool: two ports.
+    var server_a = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server_a.deinit();
+    server_a.router.get("/", ok);
+    var future_a = try io.concurrent(run, .{&server_a});
+    defer future_a.cancel(io) catch {};
+    var server_b = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server_b.deinit();
+    server_b.router.get("/", ok);
+    var future_b = try io.concurrent(run, .{&server_b});
+    defer future_b.cancel(io) catch {};
+    try server_a.waitReady(io);
+    try server_b.waitReady(io);
+
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const host_a = try std.fmt.bufPrint(&buf_a, "http://127.0.0.1:{d}/", .{server_a.address.ip.getPort()});
+    const host_b = try std.fmt.bufPrint(&buf_b, "http://127.0.0.1:{d}/", .{server_b.address.ip.getPort()});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .max_idle_per_host = 2, .max_idle_connections = 3, .idle_timeout = null });
+    defer client.deinit();
+    const pool = client.pool();
+
+    // Three at once to one host: three connections, of which two stay.
+    {
+        var held: [3]dusty.ClientResponse = undefined;
+        for (&held) |*r| r.* = try client.fetch(host_a, .{});
+        for (&held) |*r| r.deinit();
+    }
+    try std.testing.expectEqual(3, client.dials.load(.monotonic));
+    try std.testing.expectEqual(2, pool.idle_len);
+
+    // Two to the other host: the pool's limit in all closes the oldest.
+    {
+        var held: [2]dusty.ClientResponse = undefined;
+        for (&held) |*r| r.* = try client.fetch(host_b, .{});
+        for (&held) |*r| r.deinit();
+    }
+    try std.testing.expectEqual(5, client.dials.load(.monotonic));
+    try std.testing.expectEqual(3, pool.idle_len);
+
+    // Both hosts still reuse what they have.
+    for ([_][]const u8{ host_a, host_b }) |url| {
+        var r = try client.fetch(url, .{});
+        r.deinit();
+    }
+    try std.testing.expectEqual(5, client.dials.load(.monotonic));
+}
+
+test "Client: idle connections close after idle_timeout" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.address.ip.getPort()});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .idle_timeout = .fromMilliseconds(50) });
+    defer client.deinit();
+
+    {
+        var held: [2]dusty.ClientResponse = undefined;
+        for (&held) |*r| r.* = try client.fetch(url, .{});
+        for (&held) |*r| r.deinit();
+    }
+    try std.testing.expectEqual(2, client.pool().idle_len);
+
+    // The pool's own task closes them, with no request to notice.
+    var waited: usize = 0;
+    while (client.pool().idle_len != 0 and waited < 100) : (waited += 1) try io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expectEqual(0, client.pool().idle_len);
+
+    // And the next request dials again.
+    var r = try client.fetch(url, .{});
+    r.deinit();
+    try std.testing.expectEqual(3, client.dials.load(.monotonic));
 }
 
 test "Client: WebSocket upgrade" {
@@ -1447,7 +1671,7 @@ test "Client: a stale pooled connection is retried for GET, not for POST" {
             defer resp.deinit();
             try std.testing.expectEqualStrings("first", (try resp.body()).?);
         }
-        try std.testing.expectEqual(1, client.pool.idle_len);
+        try std.testing.expectEqual(1, client.pool().idle_len);
 
         if (client.fetch(url, .{ .method = method, .body = "x" })) |r| {
             var resp = r;
@@ -1482,7 +1706,7 @@ test "Client: a 2xx CONNECT response has no body and its connection is not poole
         try std.testing.expectEqual(.ok, resp.status());
         try std.testing.expectEqual(null, try resp.body());
     }
-    try std.testing.expectEqual(0, client.pool.idle_len);
+    try std.testing.expectEqual(0, client.pool().idle_len);
     peer_future.cancel(io);
 }
 
@@ -1779,7 +2003,7 @@ test "Client: a response sent while the request body is still going out is retur
         try std.testing.expectEqual(.payload_too_large, resp.status());
         try std.testing.expectEqualStrings("too much", (try resp.body()).?);
     }
-    try std.testing.expectEqual(0, client.pool.idle_len);
+    try std.testing.expectEqual(0, client.pool().idle_len);
 
     // No answer: the write error, not the read that found nothing.
     if (fetchRejected(&client, "")) |r| {
@@ -1856,7 +2080,7 @@ test "Client: a response head that never arrives is cut off by ClientConfig.time
     try std.testing.expect(elapsed < 3000);
 
     // A request cut short leaves nothing behind to be reused.
-    try std.testing.expectEqual(0, client.pool.idle_len);
+    try std.testing.expectEqual(0, client.pool().idle_len);
 }
 
 test "Client: FetchOptions.timeout replaces the client default" {
@@ -1913,7 +2137,7 @@ test "Client: the request deadline covers the body, unless it is streamed" {
         defer client.deinit();
 
         try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
-        try std.testing.expectEqual(0, client.pool.idle_len);
+        try std.testing.expectEqual(0, client.pool().idle_len);
     }
     { // streamed: fetch returns at the head, and what follows is on the caller's time
         var peer: StallingServer = undefined;

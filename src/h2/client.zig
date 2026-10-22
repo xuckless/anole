@@ -30,8 +30,13 @@ const dusty = @import("dusty");
 const placement = dusty.placement;
 const Deadline = dusty.Deadline;
 
+/// A header field: request fields (pseudo-headers first, lower-case
+/// names) and the response's `headers` and `trailers`.
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+/// Where and how `ClientConnection.connect` connects. `host` and `port`
+/// are required; the rest has defaults. The fields mean the same as in
+/// `anole.h3.ConnectOptions`, except where a field says it is HTTP/2's own.
 pub const ConnectOptions = struct {
     /// The server's name (for TLS: SNI and certificate checks) or address.
     host: []const u8,
@@ -39,10 +44,16 @@ pub const ConnectOptions = struct {
     /// Connect here instead of resolving `host`.
     address: ?std.Io.net.IpAddress = null,
     /// TLS with ALPN "h2"; null for cleartext HTTP/2 (prior knowledge).
+    /// HTTP/2 only: HTTP/3 always runs over TLS, so its `tls` is not
+    /// optional.
     tls: ?Tls = null,
-    /// Bytes a stream may receive before the reader takes them; also the
-    /// size of each stream's receive queue.
+    /// Bytes the server may send on a stream before its reader takes them.
+    /// 64 KiB here (256 KiB over HTTP/3) because each HTTP/2 stream
+    /// allocates a receive queue of this size up front, where HTTP/3's
+    /// grows as data arrives.
     stream_window: u31 = 64 * 1024,
+    /// The same for the whole connection.
+    max_data: u31 = 16 * 1024 * 1024,
     /// For `connect`: the TCP connection and the TLS handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -50,6 +61,12 @@ pub const ConnectOptions = struct {
     /// body, unless its `RequestOptions.timeout` says otherwise. Null for
     /// no limit, which a long-lived stream wants.
     timeout: ?std.Io.Duration = .fromSeconds(30),
+    /// The most a response's header fields may take, decoded (each field
+    /// counts its name, its value and 32 bytes, as HTTP/2 counts them),
+    /// informational responses and trailers included; advertised as
+    /// SETTINGS_MAX_HEADER_LIST_SIZE. Past it the stream is reset and
+    /// fails with `error.HeadersTooLarge`.
+    max_header_list_size: u32 = default_max_header_list_size,
 
     /// The fields of `anole.http.TlsConfig`, with the same defaults.
     pub const Tls = struct {
@@ -64,11 +81,22 @@ pub const ConnectOptions = struct {
         /// Accept any certificate, for any name. For tests only.
         insecure_skip_verify: bool = false,
 
+        /// The system store, a file, a directory, PEM in memory, or none.
         pub const Ca = dusty.TlsCa;
+        /// A certificate and key, as files or PEM.
         pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
+/// `ConnectOptions.max_header_list_size` by default, and for `adopt`.
+pub const default_max_header_list_size = 64 * 1024;
+
+/// How many informational (1xx) responses may come before the final one,
+/// as in the HTTP/1.1 client.
+const max_interim_responses = 5;
+
+/// Connection-level failures. `NoH2`: the TLS server did not pick "h2"
+/// by ALPN.
 pub const Error = error{ ConnectionClosed, StreamReset, NoH2, OutOfMemory, Unexpected };
 
 /// Why a stream ended early: what `waitHead` returns, and what `readError`
@@ -82,6 +110,12 @@ pub const StreamError = error{
     Timeout,
     /// The stream was canceled (`cancel`, or the task waiting on it).
     Canceled,
+    /// The response's header fields passed `max_header_list_size`; the
+    /// stream was reset.
+    HeadersTooLarge,
+    /// More informational (1xx) responses than the client takes before a
+    /// final one; the stream was reset.
+    TooManyInterimResponses,
 };
 
 fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
@@ -89,6 +123,9 @@ fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     return .{ .duration = .{ .raw = d, .clock = .awake } };
 }
 
+/// An HTTP/2 client connection: `connect`, then `request` once per
+/// request (concurrent ones share the connection, and several tasks may
+/// make them at once), and `close`. See the file's example.
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -100,14 +137,22 @@ pub const ClientConnection = struct {
     r: *std.Io.Reader,
     w: *std.Io.Writer,
     stream_window: u31,
+    /// The connection's receive window (`ConnectOptions.max_data`).
+    max_data: u31,
+    max_header_list_size: u32,
     /// The default for `RequestOptions.timeout`.
     timeout: std.Io.Timeout,
 
     /// Serializes every nghttp2 call and guards what follows.
     mutex: std.Io.Mutex = .init,
     session: ?*c.nghttp2_session = null,
-    /// The connection is going or gone: no new streams.
+    /// The connection is going or gone: no new streams. A GOAWAY sets it,
+    /// and the streams it covers carry on.
     closing: bool = false,
+    /// The session is over: the reader has ended or a write failed. From
+    /// here nothing calls into nghttp2 but `close`, so no callback can
+    /// reach a stream any more.
+    dead: bool = false,
     /// Why it went, when it failed.
     failure: ?anyerror = null,
     write_gen: std.atomic.Value(u32) = .init(0),
@@ -152,7 +197,7 @@ pub const ClientConnection = struct {
             r = &owned.tls_reader.interface;
             w = &owned.tls_writer.interface;
         }
-        return start(gpa, io, socket, owned, r, w, opts.stream_window, timeoutFrom(opts.timeout));
+        return start(gpa, io, socket, owned, r, w, opts.stream_window, opts.max_data, opts.max_header_list_size, timeoutFrom(opts.timeout));
     }
 
     /// Takes over a connection on which the TLS handshake picked "h2", as
@@ -162,7 +207,8 @@ pub const ClientConnection = struct {
     /// closed; the caller closes it, and frees the TLS state, after
     /// `close`. Requests have no timeout unless they ask for one.
     pub fn adopt(gpa: std.mem.Allocator, io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer, socket: std.Io.net.Stream) !*ClientConnection {
-        return start(gpa, io, socket, null, reader, writer, 64 * 1024, .none);
+        const defaults: ConnectOptions = .{ .host = "", .port = 0 };
+        return start(gpa, io, socket, null, reader, writer, defaults.stream_window, defaults.max_data, defaults.max_header_list_size, .none);
     }
 
     fn dial(io: std.Io, opts: ConnectOptions) !std.Io.net.Stream {
@@ -206,6 +252,8 @@ pub const ClientConnection = struct {
         r: *std.Io.Reader,
         w: *std.Io.Writer,
         stream_window: u31,
+        max_data: u31,
+        max_header_list_size: u32,
         timeout: std.Io.Timeout,
     ) !*ClientConnection {
         const self = try gpa.create(ClientConnection);
@@ -218,6 +266,8 @@ pub const ClientConnection = struct {
             .r = r,
             .w = w,
             .stream_window = stream_window,
+            .max_data = max_data,
+            .max_header_list_size = max_header_list_size,
             .timeout = timeout,
         };
         try self.initSession();
@@ -247,10 +297,11 @@ pub const ClientConnection = struct {
         const iv = [_]c.nghttp2_settings_entry{
             .{ .settings_id = c.NGHTTP2_SETTINGS_ENABLE_PUSH, .value = 0 },
             .{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = self.stream_window },
+            .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, .value = self.max_header_list_size },
         };
         if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, &iv, iv.len) != 0) return error.OutOfMemory;
         // A connection window big enough for several busy streams.
-        _ = c.nghttp2_session_set_local_window_size(self.session, c.NGHTTP2_FLAG_NONE, 0, 1 << 24);
+        _ = c.nghttp2_session_set_local_window_size(self.session, c.NGHTTP2_FLAG_NONE, 0, self.max_data);
     }
 
     /// Sends GOAWAY, waits for the reader and writer, and frees everything
@@ -260,13 +311,14 @@ pub const ClientConnection = struct {
         {
             self.lock();
             defer self.unlock();
-            if (!self.closing) {
-                self.closing = true;
-                _ = c.nghttp2_session_terminate_session(self.session, c.NGHTTP2_NO_ERROR);
-            }
+            // Also after the server's GOAWAY, whose streams may still be
+            // open.
+            if (!self.dead) _ = c.nghttp2_session_terminate_session(self.session, c.NGHTTP2_NO_ERROR);
+            self.closing = true;
         }
         self.kickWriter();
-        self.group.await(self.io) catch {};
+        // The tasks have ended either way; a cancel is the caller's to see.
+        self.group.await(self.io) catch self.io.recancel();
         {
             self.lock();
             defer self.unlock();
@@ -311,6 +363,7 @@ pub const ClientConnection = struct {
         self.io.futexWake(u32, &self.write_gen.raw, std.math.maxInt(u32));
     }
 
+    /// Per request: a body (streamed or given whole) and the timeout.
     pub const RequestOptions = struct {
         /// The request has a body, written through `Stream.writer` and
         /// ended with `Stream.closeSend`.
@@ -318,7 +371,7 @@ pub const ClientConnection = struct {
         /// The whole request body at once, in place of `body` and the
         /// writer: copied, and sent as the server's flow control allows
         /// while the caller goes on to `waitHead`, so a server that answers
-        /// while it reads (an echo) cannot stall the call.
+        /// while it reads (an echo) cannot stall the call. HTTP/2 only.
         body_bytes: ?[]const u8 = null,
         /// Replaces `ConnectOptions.timeout` for this request. Null inherits
         /// it; `.none` lifts it. A duration runs from the call to `request`.
@@ -361,6 +414,7 @@ pub const ClientConnection = struct {
         const err = self.runReader();
         self.lock();
         self.closing = true;
+        self.dead = true;
         if (self.failure == null) self.failure = err;
         self.unlock();
         self.failAll();
@@ -409,8 +463,10 @@ pub const ClientConnection = struct {
             {
                 self.lock();
                 defer self.unlock();
-                closing = self.closing;
-                while (staging.items.len < 64 * 1024) {
+                // A GOAWAY only stops new streams: what is open finishes,
+                // and `finished` ends the loop after that.
+                closing = self.dead;
+                while (!closing and staging.items.len < 64 * 1024) {
                     var data: [*c]const u8 = undefined;
                     const n = c.nghttp2_session_mem_send2(self.session, &data);
                     if (n <= 0) break;
@@ -436,6 +492,7 @@ pub const ClientConnection = struct {
     fn writeFailed(self: *ClientConnection) void {
         self.lock();
         self.closing = true;
+        self.dead = true;
         if (self.failure == null) self.failure = error.ConnectionClosed;
         self.unlock();
         self.socket.shutdown(self.io, .both) catch {};
@@ -446,25 +503,43 @@ pub const ClientConnection = struct {
         return @ptrCast(@alignCast(p));
     }
 
+    /// Fails the stream with `cause` from a header callback: nghttp2
+    /// resets it and ignores the rest of its header block.
+    fn failHeaders(stream: *Stream, cause: StreamError) c_int {
+        if (stream.cause == null) stream.cause = cause;
+        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+
     fn onHeader(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, _: ?*anyopaque) callconv(.c) c_int {
         const stream = streamFrom(session, frame.*.hd.stream_id) orelse return 0;
+        if (frame.*.hd.type != c.NGHTTP2_HEADERS) return 0;
         const n = name[0..namelen];
         const v = value[0..valuelen];
+        // Every field of the stream's heads and trailers, counted as
+        // SETTINGS_MAX_HEADER_LIST_SIZE counts them, before any is kept.
+        stream.header_list_size +|= namelen + valuelen + 32;
+        if (stream.header_list_size > stream.conn.max_header_list_size) return failHeaders(stream, error.HeadersTooLarge);
         const arena = stream.arena.allocator();
-        if (frame.*.headers.cat == c.NGHTTP2_HCAT_RESPONSE) {
+        // After a 1xx the final response comes as HCAT_HEADERS, so what a
+        // block is goes by whether the head has come.
+        if (!stream.head_ready) {
             if (std.mem.eql(u8, n, ":status")) {
                 stream.status = std.fmt.parseInt(u16, v, 10) catch 0;
+                if (stream.status >= 100 and stream.status < 200) {
+                    stream.interim += 1;
+                    if (stream.interim > max_interim_responses) return failHeaders(stream, error.TooManyInterimResponses);
+                }
                 return 0;
             }
             stream.headers.append(arena, .{
-                .name = arena.dupe(u8, n) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE,
-                .value = arena.dupe(u8, v) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE,
-            }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-        } else if (frame.*.headers.cat == c.NGHTTP2_HCAT_HEADERS and stream.head_ready) {
+                .name = arena.dupe(u8, n) catch return failHeaders(stream, error.StreamReset),
+                .value = arena.dupe(u8, v) catch return failHeaders(stream, error.StreamReset),
+            }) catch return failHeaders(stream, error.StreamReset);
+        } else {
             stream.trailers.append(arena, .{
-                .name = arena.dupe(u8, n) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE,
-                .value = arena.dupe(u8, v) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE,
-            }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                .name = arena.dupe(u8, n) catch return failHeaders(stream, error.StreamReset),
+                .value = arena.dupe(u8, v) catch return failHeaders(stream, error.StreamReset),
+            }) catch return failHeaders(stream, error.StreamReset);
         }
         return 0;
     }
@@ -482,10 +557,10 @@ pub const ClientConnection = struct {
         const end = hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
         switch (hd.type) {
             c.NGHTTP2_HEADERS => {
-                if (frame.*.headers.cat == c.NGHTTP2_HCAT_RESPONSE and stream.status >= 200) {
+                if (!stream.head_ready and stream.status >= 200) {
                     stream.head_ready = true;
                     stream.head_event.set(self.io);
-                } else if (frame.*.headers.cat == c.NGHTTP2_HCAT_RESPONSE) {
+                } else if (!stream.head_ready) {
                     // 1xx: its fields are not the response's.
                     stream.headers.clearRetainingCapacity();
                     stream.status = 0;
@@ -545,6 +620,11 @@ pub const Stream = struct {
     deadline: Deadline,
 
     status: u16 = 0,
+    /// Informational responses so far.
+    interim: u8 = 0,
+    /// What the response's header fields have taken, as
+    /// `max_header_list_size` counts it.
+    header_list_size: usize = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
     head_ready: bool = false,
@@ -661,11 +741,15 @@ pub const Stream = struct {
         try self.head_event.wait(self.conn.io);
     }
 
+    /// The first response header named `name` (any case), once `waitHead`
+    /// has returned; null when absent.
     pub fn header(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.headers.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;
     }
 
+    /// The first trailer named `name` (any case), once the body has been
+    /// read to its end; null when absent.
     pub fn trailer(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.trailers.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;
@@ -733,19 +817,25 @@ pub const Stream = struct {
         conn.kickWriter();
     }
 
-    /// Done with the stream: an unfinished one is canceled first.
+    /// Done with the stream: an unfinished one is canceled first, and
+    /// freed once nghttp2 has closed it.
     pub fn release(self: *Stream) void {
         const conn = self.conn;
         conn.lock();
-        const open = !self.protocol_done and self.submitted and conn.session != null and !conn.closing;
+        // Also after a GOAWAY, which leaves the streams it covers open.
+        const open = !self.protocol_done and self.submitted and conn.session != null and !conn.dead;
         conn.unlock();
         if (open) self.cancel();
         conn.lock();
         defer conn.unlock();
         self.user_done = true;
-        // A stream nghttp2 never got, or one the connection's end left
-        // behind, has no close to wait for.
-        if (!self.submitted or conn.session == null or conn.closing) self.protocol_done = true;
+        // A stream nghttp2 never got, or one a dead session left behind,
+        // has no close to wait for. nghttp2 must not hand it out again.
+        if (!self.submitted or conn.session == null or conn.dead) {
+            if (self.submitted and !self.protocol_done and conn.session != null)
+                _ = c.nghttp2_session_set_stream_user_data(conn.session, self.id, null);
+            self.protocol_done = true;
+        }
         self.maybeFree();
     }
 

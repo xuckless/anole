@@ -1,0 +1,15 @@
+# Dependabot cannot read Zig's build.zig.zon: the bundled C libraries are
+# checked by tools/advisories.py (the Advisories workflow) instead. The
+# benchmark competitors under bench/ stay at the versions the published
+# numbers were measured with, so they are left out.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"

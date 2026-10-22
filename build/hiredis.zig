@@ -1,6 +1,6 @@
 //! redis/hiredis 1.5.0 (release tarball, BSD-3-Clause). Anole uses its RESP
-//! reader and command formatter only; the socket I/O is Anole's, on
-//! std.Io. net.c and async.c are compiled because hiredis.c refers to them
+//! reader only (src/redis writes the commands); the socket I/O is Anole's,
+//! on std.Io. net.c and async.c are compiled because hiredis.c refers to them
 //! (async.c includes dict.c).
 const std = @import("std");
 
@@ -18,6 +18,11 @@ pub fn library(
         .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
     });
     lib.root_module.addCSourceFiles(.{ .root = upstream.path("."), .files = sources, .flags = &.{ "-std=c99", "-D_GNU_SOURCE" } });
+    if (target.result.os.tag == .windows) {
+        // net.c's socket calls go through hiredis's Winsock shims.
+        lib.root_module.addCSourceFiles(.{ .root = upstream.path("."), .files = &.{"sockcompat.c"}, .flags = &.{"-std=c99"} });
+        lib.root_module.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
+    }
     inline for (.{ "hiredis.h", "read.h", "sds.h", "alloc.h" }) |h| lib.installHeader(upstream.path(h), "hiredis/" ++ h);
     return lib;
 }

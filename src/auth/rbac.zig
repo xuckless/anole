@@ -10,12 +10,16 @@
 const std = @import("std");
 const dusty = @import("dusty");
 
+/// A named role: the permissions it grants (`*` and `area:*` allowed) and
+/// the roles whose grants it also has.
 pub const Role = struct {
     name: []const u8,
     grants: []const []const u8 = &.{},
     includes: []const []const u8 = &.{},
 };
 
+/// Every role the application knows. A role name it does not list grants
+/// nothing.
 pub const Policy = struct {
     roles: []const Role,
 
@@ -71,9 +75,14 @@ pub const Require = struct {
     permission: []const u8,
     roles: Roles,
 
+    /// A middleware that lets a request through when one of its roles (from
+    /// `roles`) has `permission` under `policy`, which must outlive it.
     pub fn init(policy: *const Policy, permission: []const u8, roles: Roles) Require {
         return .{ .policy = policy, .permission = permission, .roles = roles };
     }
+
+    /// Does nothing after `next()`: requests behind it can detach.
+    pub const detach_safe = true;
 
     pub fn execute(self: *const Require, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
         if (!self.policy.anyAllows(try self.roles.roles(self.roles.ptr, req), self.permission)) {

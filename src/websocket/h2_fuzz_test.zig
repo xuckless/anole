@@ -9,6 +9,7 @@ const dusty = @import("dusty");
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec");
 const websocket = @import("root.zig");
+const H2Socket = @import("h2_socket.zig").H2Socket;
 const deflate = if (features.compression) @import("deflate.zig") else struct {};
 
 /// The body reader's source. One check runs at a time, so it is global: the
@@ -36,7 +37,7 @@ const Transcript = struct {
 
 fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize, compressed: bool) !Transcript {
     source = .{ .data = input, .step = step };
-    const sock = try arena.create(websocket.H2Socket);
+    const sock = try arena.create(H2Socket);
     const out = try arena.alloc(u8, 64 * 1024);
     sock.* = .{
         .io = std.testing.io,
@@ -56,8 +57,8 @@ fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize,
     // A batch's flusher task (`H2Socket.deinit` would also end the
     // response, which has none here).
     defer sock.batch.deinit(std.testing.io);
-    var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}) else {};
-    defer if (features.compression) d.deinit(arena);
+    var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}, arena) else {};
+    defer if (features.compression) d.deinit();
     var socket: websocket.Socket = .{
         .conn = .{ .h2 = sock },
         .allocator = arena,
@@ -118,9 +119,9 @@ test "fuzz: WebSocket over HTTP/2, whole and in pieces" {
             const frames = input[1..];
             const compressed = features.compression and knobs & 0x80 != 0;
             const step = 1 + (knobs & 0x1f);
-            const buf_len: usize = if (knobs & 0x40 != 0) 300 else 16 * 1024;
+            const buf_len: usize = if (knobs & 0x40 != 0) 300 else H2Socket.buffer_len;
 
-            const whole = try run(arena, frames, frames.len + 1, 16 * 1024, compressed);
+            const whole = try run(arena, frames, frames.len + 1, H2Socket.buffer_len, compressed);
             const pieces = try run(arena, frames, step, buf_len, compressed);
             try std.testing.expectEqualStrings(whole.messages.items, pieces.messages.items);
             try std.testing.expectEqual(whole.end, pieces.end);
@@ -154,10 +155,57 @@ test "H2Socket: a message, a ping and a close, whole and a byte at a time" {
         "\x89\x82\x00\x00\x00\x00hi" ++
         "\x88\x82\x00\x00\x00\x00\x03\xe8";
     for ([_]usize{ frames.len, 1 }) |step| {
-        const t = try run(arena, frames, step, 16 * 1024, false);
+        const t = try run(arena, frames, step, H2Socket.buffer_len, false);
         try std.testing.expectEqualStrings("text 5 null:Helloclose 0 1000:", t.messages.items);
         try std.testing.expectEqual(error.ConnectionClosed, t.end);
         // The pong, then the close echoed.
         try std.testing.expectEqualStrings("\x8a\x02hi\x88\x02\x03\xe8", t.out);
     }
+}
+
+test "H2Socket: RSV1 only on a compressed message's first frame, never on a control frame or a continuation" {
+    if (comptime !features.compression) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        // A ping with RSV1.
+        "\xc9\x80\x00\x00\x00\x00",
+        // A text message in pieces, RSV1 on its continuation.
+        "\x41\x81\x00\x00\x00\x00a\xc0\x81\x00\x00\x00\x00b",
+    }) |frames| {
+        const t = try run(arena, frames, frames.len, H2Socket.buffer_len, true);
+        try std.testing.expectEqual(error.ReservedRsvBit, t.end);
+        // Close 1002.
+        try std.testing.expectEqualStrings("\x88\x02\x03\xea", t.out);
+    }
+}
+
+test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sock = try arena.create(H2Socket);
+    const out = try arena.alloc(u8, 1024);
+    sock.* = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .body = undefined,
+        .out = .{ .res = undefined, .interface = .fixed(out) },
+        .in_buf = undefined,
+        .out_buf = undefined,
+        .frames = .init(.{}),
+        .max_message_size = max_message_size,
+    };
+    defer sock.batch.deinit(std.testing.io);
+    const big: [126]u8 = @splat('p');
+    try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.ping, &big, false));
+    try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.pong, &big, false));
+    try std.testing.expectError(error.LargeControlFrame, sock.ping(&big));
+    try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.ping, "x", true));
+    // A close goes out once, however often it is asked for.
+    try sock.close(.normal, "");
+    try sock.close(.going_away, "");
+    try std.testing.expectEqualStrings("\x88\x02\x03\xe8", sock.out.interface.buffered());
+    try std.testing.expectError(error.ConnectionClosed, sock.sendMessage(.text, "late", false));
 }

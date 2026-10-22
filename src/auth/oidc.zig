@@ -4,20 +4,22 @@
 //! relying-party code (OpenIDC/liboauth2, Apache-2.0), rewritten on dusty's
 //! HTTP client, the JWS verifier and std.crypto.
 //!
-//!     var provider = try oidc.Provider.discover(client, gpa, "https://accounts.google.com");
+//!     var provider = try oidc.Provider.discover(gpa, app.client(), "https://accounts.google.com");
 //!     var rp: oidc.RelyingParty = .{ .provider = &provider, .client_id = id, .client_secret = secret,
 //!                                    .redirect_uri = "https://app.example/callback", .keyring = &keyring };
 //!     // /login:    const start = try rp.begin(arena, io);  keep start.state/nonce/verifier (session), redirect to start.url
-//!     // /callback: const id = try rp.finish(arena, io, client, .{ .code = code, .state = state }, saved);
+//!     // /callback: const id = try rp.finish(req.arena, req.io, anole.client(req), .{ .code = code, .state = state }, saved);
 const std = @import("std");
 const dusty = @import("dusty");
+const Client = @import("../client.zig").Client;
 const jws = @import("jws.zig");
 const Keyring = @import("keyring.zig").Keyring;
 const zig_jwt = @import("anole_jwt");
 
 const b64 = std.base64.url_safe_no_pad;
 
-/// What a provider's discovery document says, owned by `arena`.
+/// An OpenID provider's endpoints: from its discovery document
+/// (`discover`), or a preset (`google`, `apple`).
 pub const Provider = struct {
     issuer: []const u8,
     authorization_endpoint: []const u8,
@@ -26,9 +28,15 @@ pub const Provider = struct {
     userinfo_endpoint: ?[]const u8 = null,
     arena: ?*std.heap.ArenaAllocator = null,
 
-    /// Fetches `issuer/.well-known/openid-configuration`; its `issuer`
-    /// must be `issuer` exactly (OIDC Discovery 4.3).
-    pub fn discover(client: *dusty.Client, gpa: std.mem.Allocator, issuer: []const u8) !Provider {
+    /// Fetches `issuer/.well-known/openid-configuration` with `client`
+    /// (`app.client()`); its `issuer` must be `issuer` exactly (OIDC
+    /// Discovery 4.3), else `error.IssuerMismatch`. A document that cannot
+    /// be fetched or lacks an endpoint is `error.DiscoveryFailed`. The
+    /// issuer and every endpoint must be `https://` (plain `http://` only
+    /// on loopback, for tests), else `error.InsecureEndpoint`. Free the
+    /// result with `deinit(gpa)`.
+    pub fn discover(gpa: std.mem.Allocator, client: Client, issuer: []const u8) !Provider {
+        if (!secureUrl(issuer)) return error.InsecureEndpoint;
         const arena = try gpa.create(std.heap.ArenaAllocator);
         arena.* = .init(gpa);
         errdefer {
@@ -37,7 +45,7 @@ pub const Provider = struct {
         }
         const a = arena.allocator();
         const url = try std.fmt.allocPrint(a, "{s}/.well-known/openid-configuration", .{std.mem.trimEnd(u8, issuer, "/")});
-        var response = try client.fetch(url, .{});
+        var response = try client.http.fetch(url, .{});
         defer response.deinit();
         if (response.status() != .ok) return error.DiscoveryFailed;
         const body = try a.dupe(u8, (try response.body()) orelse return error.DiscoveryFailed);
@@ -53,15 +61,22 @@ pub const Provider = struct {
         const o = doc.object;
         const got_issuer = str(o, "issuer") orelse return error.DiscoveryFailed;
         if (!std.mem.eql(u8, got_issuer, issuer)) return error.IssuerMismatch;
-        return .{
+        const provider: Provider = .{
             .issuer = got_issuer,
             .authorization_endpoint = str(o, "authorization_endpoint") orelse return error.DiscoveryFailed,
             .token_endpoint = str(o, "token_endpoint") orelse return error.DiscoveryFailed,
             .jwks_uri = str(o, "jwks_uri") orelse return error.DiscoveryFailed,
             .userinfo_endpoint = str(o, "userinfo_endpoint"),
         };
+        // The client secret, the keys and the user's code travel to these.
+        for ([_][]const u8{ provider.issuer, provider.authorization_endpoint, provider.token_endpoint, provider.jwks_uri, provider.userinfo_endpoint orelse "https://" }) |url| {
+            if (!secureUrl(url)) return error.InsecureEndpoint;
+        }
+        return provider;
     }
 
+    /// Frees what `discover` allocated, with the allocator it was given. A
+    /// preset owns nothing.
     pub fn deinit(self: *Provider, gpa: std.mem.Allocator) void {
         if (self.arena) |a| {
             a.deinit();
@@ -86,6 +101,24 @@ pub const Provider = struct {
         .jwks_uri = "https://appleid.apple.com/auth/keys",
     };
 };
+
+/// `https://`, or `http://` to a loopback host (localhost, 127.0.0.0/8,
+/// [::1]): a provider running on this machine, in tests.
+fn secureUrl(url: []const u8) bool {
+    if (std.ascii.startsWithIgnoreCase(url, "https://")) return true;
+    if (!std.ascii.startsWithIgnoreCase(url, "http://")) return false;
+    const rest = url["http://".len..];
+    var authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    if (std.mem.startsWith(u8, authority, "[")) {
+        const end = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        return std.mem.eql(u8, authority[1..end], "::1");
+    }
+    const host = authority[0 .. std.mem.indexOfScalar(u8, authority, ':') orelse authority.len];
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    const ip = std.Io.net.Ip4Address.parse(host, 0) catch return false;
+    return ip.bytes[0] == 127;
+}
 
 fn str(o: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = o.get(name) orelse return null;
@@ -145,8 +178,12 @@ pub const Callback = struct {
     state: []const u8,
 };
 
-/// The signed-in user, from the verified ID token.
+/// The signed-in user, from the verified ID token. Key accounts on
+/// `issuer` and `subject` together: a `sub` is unique only within its
+/// issuer.
 pub const Identity = struct {
+    /// The provider that vouched for the user (`iss`).
+    issuer: []const u8,
     subject: []const u8,
     email: ?[]const u8,
     email_verified: bool,
@@ -157,16 +194,23 @@ pub const Identity = struct {
     refresh_token: ?[]const u8,
 };
 
+/// This application as the provider's client: `begin` starts a sign-in,
+/// `finish` completes it at the redirect URI. A value with no state of its
+/// own: one serves every request.
 pub const RelyingParty = struct {
     provider: *const Provider,
     client_id: []const u8,
     /// client_secret_post; null with `apple_secret` or for a public client.
     client_secret: ?[]const u8 = null,
     apple_secret: ?AppleSecret = null,
+    /// Where the provider sends the user back; registered with the provider.
     redirect_uri: []const u8,
+    /// The scopes asked for, space-separated; must include `openid`.
     scope: []const u8 = "openid email profile",
     /// Apple asks for form_post when name or email is in scope.
     response_mode: ?[]const u8 = null,
+    /// The provider's signing keys (`Keyring` on its `jwks_uri`), for the ID
+    /// token.
     keyring: *Keyring,
     /// Clock skew allowed on the ID token's times.
     leeway_seconds: i64 = 60,
@@ -195,9 +239,13 @@ pub const RelyingParty = struct {
         return .{ .url = url.written(), .state = state, .nonce = nonce, .code_verifier = verifier };
     }
 
-    /// Checks the callback against what `begin` handed out, exchanges the
-    /// code, and verifies the ID token.
-    pub fn finish(self: *const RelyingParty, arena: std.mem.Allocator, io: std.Io, client: *dusty.Client, callback: Callback, saved: Start) !Identity {
+    /// Checks the callback against what `begin` handed out (`saved`, kept in
+    /// the session), exchanges the code at the token endpoint, verifies the ID
+    /// token and returns who signed in, in `arena`. Fails with
+    /// `error.StateMismatch` (a forged or stale callback),
+    /// `error.TokenRequestFailed`, `error.NoIdToken`, a `jws.Error` from the ID
+    /// token, `error.NonceMismatch`, `error.AzpMismatch` or `error.NoSubject`.
+    pub fn finish(self: *const RelyingParty, arena: std.mem.Allocator, io: std.Io, client: Client, callback: Callback, saved: Start) !Identity {
         // state: the response is to our request (CSRF, RFC 6749 10.12).
         if (callback.state.len != saved.state.len or !constTimeEql(callback.state, saved.state)) return error.StateMismatch;
 
@@ -216,7 +264,9 @@ pub const RelyingParty = struct {
         var headers = try dusty.Headers.init(arena, 4);
         try headers.put("Content-Type", "application/x-www-form-urlencoded");
         try headers.put("Accept", "application/json");
-        var response = try client.fetch(self.provider.token_endpoint, .{ .method = .post, .headers = &headers, .body = form.written() });
+        // No redirects: a 307 or 308 would send the code and the client
+        // secret on to wherever it points.
+        var response = try client.http.fetch(self.provider.token_endpoint, .{ .method = .post, .headers = &headers, .body = form.written(), .max_redirects = 0 });
         defer response.deinit();
         const body = try arena.dupe(u8, (try response.body()) orelse "");
         if (response.status() != .ok) {
@@ -243,16 +293,19 @@ pub const RelyingParty = struct {
             .issuer = self.provider.issuer,
             .audience = self.client_id,
             .leeway_seconds = self.leeway_seconds,
+            .require_iat = true,
         };
     }
 
     /// The rest of OIDC Core 3.1.3.7 on a verified ID token (azp, nonce),
     /// and who signed in.
     fn identify(self: *const RelyingParty, v: jws.Verified, tokens: std.json.ObjectMap, saved: Start) !Identity {
-        if (v.claims.get("aud")) |aud| if (aud == .array and aud.array.items.len > 1) {
-            const azp = v.string("azp") orelse return error.AzpMismatch;
-            if (!std.mem.eql(u8, azp, self.client_id)) return error.AzpMismatch;
-        };
+        // azp is required with several audiences, and checked whenever
+        // it is there: a token issued to another party is not ours.
+        const several = if (v.claims.get("aud")) |aud| aud == .array and aud.array.items.len > 1 else false;
+        if (v.claims.get("azp")) |azp| {
+            if (azp != .string or !std.mem.eql(u8, azp.string, self.client_id)) return error.AzpMismatch;
+        } else if (several) return error.AzpMismatch;
         const nonce = v.string("nonce") orelse return error.NonceMismatch;
         if (nonce.len != saved.nonce.len or !constTimeEql(nonce, saved.nonce)) return error.NonceMismatch;
 
@@ -263,6 +316,7 @@ pub const RelyingParty = struct {
             else => false,
         } else false;
         return .{
+            .issuer = v.string("iss") orelse self.provider.issuer,
             .subject = v.string("sub") orelse return error.NoSubject,
             .email = v.string("email"),
             .email_verified = verified_email,
@@ -303,7 +357,7 @@ fn param(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
 test "fuzz: OIDC discovery documents, token responses and ID token claims" {
     try @import("../fuzz.zig").bytes(struct {
         const issuer = "https://issuer.example";
-        const secret = "fuzz-secret";
+        const secret = "fuzz-secret-fuzz-secret-fuzz-sec";
         const now = 1700000000;
 
         fn encode(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
@@ -354,8 +408,10 @@ test "fuzz: OIDC discovery documents, token responses and ID token claims" {
                 else => return error.TestUnexpectedResult,
             };
             try std.testing.expect(exp > now - rp.leeway_seconds);
+            try std.testing.expect(claims.get("iat") != null);
+            if (claims.get("azp")) |azp| try std.testing.expectEqualStrings("client-1", azp.string);
             switch (claims.get("aud").?) {
-                .string => |s| try std.testing.expectEqualStrings("client-1", s),
+                .string => |str_aud| try std.testing.expectEqualStrings("client-1", str_aud),
                 .array => |a| {
                     var found = false;
                     for (a.items) |item| found = found or (item == .string and std.mem.eql(u8, item.string, "client-1"));
@@ -372,7 +428,7 @@ test "fuzz: OIDC discovery documents, token responses and ID token claims" {
     }.check, &.{
         \\{"iss":"https://issuer.example","aud":"client-1","sub":"u1","nonce":"nonce-1","exp":1700000600,"iat":1700000000}
         ,
-        \\{"iss":"https://issuer.example","aud":["client-1","other"],"azp":"client-1","sub":"u2","nonce":"nonce-1","exp":1700000600,"email":"a@b.example","email_verified":"true"}
+        \\{"iss":"https://issuer.example","aud":["client-1","other"],"azp":"client-1","sub":"u2","nonce":"nonce-1","exp":1700000600,"iat":1700000000,"email":"a@b.example","email_verified":"true"}
         ,
         \\{"iss":"https://issuer.example","aud":["other","client-1"],"sub":"u3","nonce":"nonce-1","exp":1700000600.5,"nbf":1699999990}
         ,
@@ -386,4 +442,49 @@ test "fuzz: OIDC discovery documents, token responses and ID token claims" {
         \\{"id_token":"eyJhbGciOiJIUzI1NiJ9.e30.AAAA","access_token":"at","refresh_token":"rt"}
         ,
     });
+}
+
+test "OIDC: discovery refuses plain-HTTP endpoints, except on loopback" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const doc =
+        \\{"issuer":"https://id.example","authorization_endpoint":"https://id.example/a","token_endpoint":"https://id.example/t","jwks_uri":"http://id.example/k"}
+    ;
+    try std.testing.expectError(error.InsecureEndpoint, Provider.parseDiscovery(a, doc, "https://id.example"));
+    const local =
+        \\{"issuer":"http://127.0.0.1:8000","authorization_endpoint":"http://127.0.0.1:8000/a","token_endpoint":"http://localhost:8000/t","jwks_uri":"http://[::1]:8000/k"}
+    ;
+    _ = try Provider.parseDiscovery(a, local, "http://127.0.0.1:8000");
+}
+
+test "OIDC: the ID token needs iat, and azp is checked whenever it is there" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const secret = "test-secret-test-secret-test-sec";
+    const now = 1700000000;
+    const provider: Provider = .{ .issuer = "https://id.example", .authorization_endpoint = "", .token_endpoint = "", .jwks_uri = "" };
+    const rp: RelyingParty = .{ .provider = &provider, .client_id = "client-1", .redirect_uri = "", .keyring = undefined };
+    const saved: Start = .{ .url = "", .state = "s", .nonce = "n1", .code_verifier = "" };
+    const key: jws.Key = .{ .alg = .HS256, .material = .{ .hmac = secret } };
+    const Sign = struct {
+        fn token(a: std.mem.Allocator, claims: []const u8) ![]const u8 {
+            const header = "{\"alg\":\"HS256\"}";
+            const h = b64.Encoder.encode(try a.alloc(u8, b64.Encoder.calcSize(header.len)), header);
+            const c = b64.Encoder.encode(try a.alloc(u8, b64.Encoder.calcSize(claims.len)), claims);
+            const input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h, c });
+            var mac: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, input, secret);
+            return std.fmt.allocPrint(a, "{s}.{s}", .{ input, b64.Encoder.encode(try a.alloc(u8, 43), &mac) });
+        }
+    };
+    const tokens: std.json.ObjectMap = .empty;
+    // Without iat.
+    const no_iat = try Sign.token(arena, "{\"iss\":\"https://id.example\",\"aud\":\"client-1\",\"sub\":\"u\",\"nonce\":\"n1\",\"exp\":1700000600}");
+    try std.testing.expectError(error.MissingIssuedAt, jws.verify(arena, no_iat, &.{key}, rp.idTokenPolicy(), now));
+    // A single audience, but issued to another party.
+    const other_azp = try Sign.token(arena, "{\"iss\":\"https://id.example\",\"aud\":\"client-1\",\"azp\":\"client-2\",\"sub\":\"u\",\"nonce\":\"n1\",\"exp\":1700000600,\"iat\":1700000000}");
+    const v = try jws.verify(arena, other_azp, &.{key}, rp.idTokenPolicy(), now);
+    try std.testing.expectError(error.AzpMismatch, rp.identify(v, tokens, saved));
 }

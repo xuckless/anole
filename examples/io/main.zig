@@ -26,6 +26,8 @@ const http = anole.http;
 /// Keeps the runtime's per-thread lines and the connection loops' debug
 /// lines out of a Debug build; info (startup lines, access log) stays.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const App = struct {
     client: http.Client,
@@ -89,7 +91,7 @@ fn handleFanout(app: *App, req: *anole.Request, res: *anole.Response) !void {
 
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 8081;
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     if (args.next()) |p| port = try std.fmt.parseInt(u16, p, 10);
 

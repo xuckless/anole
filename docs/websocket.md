@@ -63,6 +63,51 @@ The handler takes `(ws, req)`, `(ws)` alone, or on a `Server(App)`
 [upgrade options](#upgrade-options) (at compile time); groups have `ws` and
 `wsWith` too.
 
+## Callbacks
+
+A socket that is idle most of the time (chat, notifications, live updates)
+can be served through callbacks instead of a handler that loops:
+
+```zig
+const Chat = struct {
+    pub fn open(ws: *anole.websocket.Socket, req: *anole.Request) !void {
+        _ = req; // the request is at hand for the last time here
+        try ws.send(.text, "welcome");
+    }
+    pub fn message(ws: *anole.websocket.Socket, msg: anole.websocket.Message) !void {
+        try ws.send(msg.type, msg.data);
+    }
+    pub fn close(ws: *anole.websocket.Socket) void {
+        _ = ws; // leave rooms, free ws.context
+    }
+};
+
+app.wsCallbacks("/chat", Chat);
+```
+
+`message` is required; `open` and `close` are optional, and each may take
+the app state first on a `Server(App)`. `open` runs right after the
+handshake; `message` for each text or binary message, its data valid
+during the call; `close` once, when the socket is done, whoever ended it
+(`ws.close_code` holds the client's close code, `ws.end_error` another
+cause). A failing `open` or `message` closes the socket with 1011. Keep
+per-socket state behind `ws.context` (`ws.contextAs(T)` reads it back),
+set in `open` and freed in `close`.
+
+Over HTTP/1.1 a callback socket holds no coroutine while it waits: when
+nothing has arrived for `timeout.idle_park` (1 s), it gives up its buffers
+and parks, a few kilobytes on the heap, and the next message starts a
+coroutine for it on the same executor. The callbacks run there one at a
+time and may wait (a database call, a lock); messages that arrive meanwhile
+wait their turn. Pings are answered and replies batched as with
+`ws.next()`. `ws.send` and `ws.close` work from any task at any time; to a
+parked socket each frame goes out in one write of its own. Over HTTP/2 and
+HTTP/3 the callbacks run on the stream's task as a loop would.
+
+`app.wsCallbacksWith(path, Callbacks, options)` takes the
+[upgrade options](#upgrade-options); with `timeout` set the socket is
+closed at that deadline, parked or not. Groups have both too.
+
 ## Accepting a connection
 
 Register a normal `GET` route and call `upgrade` in the handler. It returns
@@ -90,8 +135,8 @@ The socket lives as long as the handler. It is held in the request's arena,
 so do not keep a pointer to it after the handler returns. Always
 `defer ws.deinit()`; on HTTP/2 and HTTP/3 that also ends the stream.
 
-Over HTTP/2, call `anole.websocket.upgrade`, not dusty's
-`res.upgradeWebSocket`. The dusty call handles HTTP/1.1 only and returns null
+Over HTTP/2, call `anole.websocket.upgrade`, not the HTTP core's
+`res.upgradeWebSocket`. That call handles HTTP/1.1 only and returns null
 for an HTTP/2 request. If you must keep code that uses it, turn RFC 8441 off
 in the server options (keep the stream limit, which this field replaces):
 
@@ -100,7 +145,7 @@ in the server options (keep the stream limit, which this field replaces):
 ```
 
 Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
-(the dusty call never handled HTTP/3 anyway). A plain CONNECT, without
+(`res.upgradeWebSocket` never handled HTTP/3 anyway). A plain CONNECT, without
 `:protocol`, gets 501 over HTTP/3: Anole is no proxy.
 
 ### Upgrade options
@@ -109,12 +154,49 @@ Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `allowed_origins` | `.same_origin` | The pages that may open the socket (see [Origins](#origins)). |
 | `max_message_size` | 16 MiB | The largest message `receive` assembles, measured after inflating. |
 | `timeout` | `.none` | Replaces the request timeout once the socket is open. |
 | `compression` | on with `-Dcompression` | Accept permessage-deflate when the client offers it. |
 | `deflate` | see below | Compressor settings. |
 | `close_on_drain` | true | Send close 1001 when the server starts to drain (see [Shutdown](#shutdown)). |
 | `drain_reason` | `"server shutting down"` | The reason in that close frame. |
+
+### Origins
+
+A browser sends the page's cookies with a WebSocket handshake whatever page
+opens it, and a WebSocket is not subject to CORS. Without a check, any site
+a logged-in user visits could open a socket to your server in that user's
+name and read what it receives. So `upgrade` (and `app.ws`,
+`app.wsCallbacks`, and WebTransport's `accept`) looks at the handshake's
+`Origin` header and by default lets through only pages on the request's
+own host and port, as `Host` names it (over HTTP/2 and HTTP/3,
+`:authority`; behind a trusted proxy, `X-Forwarded-Host`). The scheme is not
+compared, so a proxy that terminates TLS does not get in the way. Anything
+else gets 403 Forbidden: `upgrade` fails with `error.Forbidden`, which the
+server answers as 403 when the handler returns it.
+
+Clients that send no `Origin` (command-line tools, servers, mobile apps) are
+not affected: only browsers send it, and only they add credentials on their
+own.
+
+To let pages of other origins connect, list them, as the browser writes
+them (scheme, host, and the port unless it is the default):
+
+```zig
+var ws = (try anole.websocket.upgrade(req, res, .{
+    .allowed_origins = .{ .list = &.{ "https://app.example.com", "http://localhost:5173" } },
+})) orelse return res.fail(.bad_request, "");
+```
+
+`app.wsWith(path, handler, .{ .allowed_origins = ... })` takes the same
+options. `.any` lets every page in; use it only for an endpoint that does
+not trust cookies or other credentials the browser adds itself, such as one
+that authenticates with a token in its first message. The C ABI's WebSocket
+routes take `"origins": ["https://app.example.com"]` (or `["*"]`).
+
+The HTTP core's own `res.upgradeWebSocket` does not check `Origin`; check it
+yourself if you call it directly.
 
 ## Receiving and sending
 
@@ -290,22 +372,36 @@ fn chat(app: *App, ws: *anole.websocket.Socket, req: *anole.Request) !void {
 
 - `join(room, socket)` and `leave(room, socket)` add and remove a member. A
   room is created on the first join and removed when its last member leaves.
-- `broadcast(room, msg_type, data, except)` sends to every member except
-  `except` (pass `&ws` to skip the sender, or null for everyone) and returns
-  how many members it reached. A member whose send fails is skipped; its own
-  `receive` will see the connection end.
+  Joining a room the socket is already in does nothing.
+- `broadcast(room, msg_type, data, except)` queues the message for every
+  member except `except` (pass `&ws` to skip the sender, or null for
+  everyone) and returns for how many members it was queued. It never waits
+  for a member to be sent to.
 - `count(room)` returns the number of members.
 
-Rooms work across HTTP versions and threads: sockets on HTTP/1.1, HTTP/2 and
-HTTP/3 can share a room. A broadcast takes a snapshot of the room's members
-under a short lock and sends outside it, to each member in turn. A slow
-client therefore slows only the broadcasts that include it, and the caller
-of such a broadcast waits for its send; broadcasts to other rooms, joins and
-leaves go on meanwhile. `leave` waits for any send to the leaving socket
-that is under way, so a socket is never sent to after its handler has left
-the room and returned. For large rooms or slow clients, queue messages per
-socket in your own code instead, so one client cannot hold up the rest of
-its room.
+Rooms work across HTTP versions, tasks and threads: sockets on HTTP/1.1,
+HTTP/2 and HTTP/3 can share a room, and anything may broadcast. A broadcast
+copies the message once and adds it to each member's queue under a short
+lock. Each member with something queued has a task of its own, on the
+socket's executor, that sends its queue in order. A slow client therefore
+holds up nobody else, not even the broadcaster: it only fills its own queue.
+
+The queue is bounded. `Rooms.initOptions(allocator, .{ ... })` sets
+`anole.websocket.Rooms.Options`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `max_queued_bytes` | 1 MiB | The most broadcast bytes waiting for one member (each message counts 64 bytes more). A message is always taken when nothing waits. |
+| `on_full` | `.close` | `.close`: messages that do not fit are skipped, and a member whose send has been stuck for `close_after_ms` is closed: it gets no more broadcasts, and the send under way to it is canceled, which ends the socket's sending side. `.drop`: messages that do not fit are skipped and the member stays. |
+| `close_after_ms` | 1000 | With `.close`, how long a full member's send must have been stuck. |
+| `leave_grace_ms` | 1000 | How long `leave` lets a send under way to the leaving socket finish before it cancels it. |
+
+A member whose send fails, or that was closed, gets nothing more; its own
+`receive` sees the connection end once the peer goes or the socket's
+`timeout` passes, so give sockets in rooms a `timeout` (or call
+`req.setTimeout` before each `receive`). `leave` drops what is still queued
+for the socket and waits for a send under way, at most `leave_grace_ms`, so
+a socket is never sent to after its handler has left the room and returned.
 
 ## Browsers, HTTP/2 and HTTP/3
 

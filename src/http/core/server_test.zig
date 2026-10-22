@@ -2125,9 +2125,14 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     try slow_writer.interface.flush();
     try sync.started.wait(io);
 
-    // Idle by the time the drain starts.
+    // Idle by the time the drain starts, and accepted: one still in the
+    // listen backlog when the accept loops stop is never served (a loaded
+    // machine can take that long to accept it).
     const idle = try server.address.ip.connect(io, .{ .mode = .stream });
     defer idle.close(io);
+    while (server.active_connections.load(.acquire) < 2) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
 
     // The drain blocks on the slow handler, so it runs on a task of its own.
     var shutdown_future = try io.concurrent(struct {
@@ -3638,7 +3643,11 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
 
 /// The whole response to `request`, sent on a new connection.
 fn rawAll(io: std.Io, server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8 {
-    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    return rawAllTo(io, server.address.ip, request, out);
+}
+
+fn rawAllTo(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, out: []u8) ![]const u8 {
+    const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [512]u8 = undefined;
     var w = stream.writer(io, &wbuf);
@@ -3708,9 +3717,43 @@ test "Server: a PROXY protocol listener takes the client address from v1 and v2 
     }
 }
 
+test "Server: a PROXY protocol listener with proxy_protocol_from serves only those peers" {
+    const io = std.testing.io;
+    const trusted = [_]dusty.ProxyNetwork{try .parse("127.0.0.0/8")};
+    const elsewhere = [_]dusty.ProxyNetwork{try .parse("192.0.2.0/24")};
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{
+            .{ .address = loopback_addr, .proxy_protocol = true, .proxy_protocol_from = &trusted },
+            .{ .address = loopback_addr, .proxy_protocol = true, .proxy_protocol_from = &elsewhere },
+        },
+    }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const request = "PROXY TCP4 192.0.2.7 198.51.100.2 56324 443\r\nGET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    var out: [2048]u8 = undefined;
+    const ok = try rawAllTo(io, server.addresses[0].ip, request, &out);
+    try std.testing.expect(std.mem.endsWith(u8, ok, "192.0.2.7:56324 secure=false host=example.com"));
+
+    // 127.0.0.1 is not among the second listener's proxies: closed unanswered.
+    if (rawAllTo(io, server.addresses[1].ip, request, &out)) |none| {
+        try std.testing.expectEqual(@as(usize, 0), none.len);
+    } else |err| switch (err) {
+        error.ReadFailed => {},
+        else => |e| return e,
+    }
+}
+
 test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
     const io = std.testing.io;
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1, .trust_forwarded_host = true }, {});
     defer server.deinit();
     server.router.get("/who", WhoHandler.handle);
     var future = try io.concurrent(struct {
@@ -3728,6 +3771,142 @@ test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
     // A host with characters no host has is ignored.
     const bad = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-Host: evil.com/x y\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.endsWith(u8, bad, "secure=false host=internal:8080"));
+}
+
+test "Server: X-Forwarded-Host is ignored unless trusted, X-Forwarded-Proto when turned off" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    const request = "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\nConnection: close\r\n\r\n";
+    const resp = try rawAll(io, &server, request, &out);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "203.0.113.9:0 secure=true host=internal:8080"));
+
+    server.config.trust_forwarded_proto = false;
+    const no_proto = try rawAll(io, &server, request, &out);
+    try std.testing.expect(std.mem.endsWith(u8, no_proto, "203.0.113.9:0 secure=false host=internal:8080"));
+}
+
+test "Server: an HTTP/1.1 request needs exactly one Host" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    const none = try rawAll(io, &server, "GET /who HTTP/1.1\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, none, "HTTP/1.1 400 "));
+    const two = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, two, "HTTP/1.1 400 "));
+    const one = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, one, "host=a.example"));
+    // HTTP/1.0 had no Host requirement.
+    const old = try rawAll(io, &server, "GET /who HTTP/1.0\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, old, " 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, old, "host=-"));
+}
+
+test "Server: a request body with broken framing is a 400, and the connection closes" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.post("/take", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            const body = try req.body();
+            try res.print(.text, "{d}", .{if (body) |b| b.len else 0});
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    // A chunk size that is not hex, then a pipelined request that must
+    // not be served from the broken stream.
+    const resp = try rawAll(io, &server, "POST /take HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\nxx\r\n0\r\n\r\nPOST /take HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400 "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "HTTP/1.1 "));
+}
+
+/// Sends `request` and reads until the server closes. False when it has
+/// not within `limit_ms` (the socket is then shut down to end the read).
+fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, limit_ms: u64) !bool {
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var done: std.atomic.Value(bool) = .init(false);
+    var reader = try io.concurrent(struct {
+        fn run(s: std.Io.net.Stream, _io: std.Io, flag: *std.atomic.Value(bool)) void {
+            var rbuf: [1024]u8 = undefined;
+            var r = s.reader(_io, &rbuf);
+            _ = r.interface.discardRemaining() catch {};
+            flag.store(true, .release);
+        }
+    }.run, .{ stream, io, &done });
+    var waited: u64 = 0;
+    while (!done.load(.acquire) and waited < limit_ms) : (waited += 10) try io.sleep(.fromMilliseconds(10), .awake);
+    const closed = done.load(.acquire);
+    if (!closed) stream.shutdown(io, .both) catch {};
+    reader.await(io);
+    return closed;
+}
+
+test "Server: an unread body left after the request timed out or lifted its timeout is not drained without bound" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromMilliseconds(300), .keepalive = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    const H = struct {
+        /// Reads the body, and answers anyway when that fails (the
+        /// request timer firing).
+        fn swallow(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req.body() catch {};
+            res.body = "ok";
+        }
+        /// Lifts the request timeout and never reads the body.
+        fn unbounded(req: *dusty.Request, res: *dusty.Response) !void {
+            req.setTimeout(.none);
+            res.body = "ok";
+        }
+    };
+    server.router.post("/swallow", H.swallow);
+    server.router.post("/unbounded", H.unbounded);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // A body declared at 1000 bytes of which 10 come, then nothing.
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /unbounded HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
 }
 
 test "Server: forwarding headers are ignored without trusted hops" {
@@ -3880,6 +4059,7 @@ test "Server: a warm HTTP/1.1 keepalive connection serves requests without alloc
 }
 
 test "Server: serves on an inherited listening socket (fd)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // inherited sockets (hand-off, socket activation) are Unix only
     const io = std.testing.io;
     // Opened elsewhere, as systemd or a previous process would have.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };

@@ -109,6 +109,20 @@ fn echoDatagrams(session: *wt.Session) std.Io.Cancelable!void {
     }
 }
 
+/// Opens a one-way stream at once, says something on it and ends it,
+/// then waits for the client to close: the stream can arrive whole before
+/// the client has the 200 (its session established).
+fn pushSession(session: *wt.Session) !void {
+    const uni = try session.openUniStream();
+    try uni.writer().writeAll("pushed at once");
+    try uni.closeSend();
+    uni.release();
+    while (true) {
+        const s = session.acceptStream() catch return;
+        s.release();
+    }
+}
+
 /// RFC 9220: frames echoed until a close.
 fn wsEcho(ws: *websocket.Socket) !void {
     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
@@ -128,6 +142,8 @@ const Fixture = struct {
         http.* = .init(gpa, io, .{ .listeners = &.{} }, {});
         errdefer http.deinit();
         http.router.get("/wt", webtransport.route(void, echoSession, .{}));
+        http.router.get("/ignore", webtransport.route(void, ignoreStreams, .{}));
+        http.router.get("/push", webtransport.route(void, pushSession, .{}));
         if (features.websocket) http.router.get("/ws", websocket.route(void, wsEcho, .{}));
         const ep = try Endpoint.init(gpa, io, http, .{
             .address = .{ .ip4 = .loopback(0) },
@@ -247,6 +263,117 @@ test "WebTransport: streams both ways, datagrams, and a close the server sees" {
     try std.testing.expectEqual(@as(u32, 42), last_close.code);
     try std.testing.expectEqualStrings("bye now", last_close.reason[0..last_close.reason_len]);
     try std.testing.expectEqual(.peer, last_close.by.?);
+}
+
+test "WebTransport: a one-way stream that arrives whole before its session is established is kept for it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    // Several sessions: in some the server's stream comes with its end
+    // before the client has the 200; it was dropped then.
+    for (0..8) |_| {
+        const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/push" });
+        defer session.deinit();
+        const u = try session.acceptUniStream();
+        defer u.release();
+        const got = try u.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("pushed at once", got);
+        try session.close(0, "");
+    }
+}
+
+test "WebTransport: a peer stream reset before its session prefix completes is freed" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
+    defer session.deinit();
+
+    // Unidirectional (type 0x54) and bidirectional (signal 0x41) streams
+    // that say their type and nothing more, then reset; more of them than
+    // the server's stream limits, so its credit must come back.
+    for (0..120) |i| {
+        var tries: usize = 0;
+        const id = while (true) : (tries += 1) {
+            break session.testOpenRaw(if (i % 2 == 0) .uni_out else .bidi, if (i % 2 == 0) "\x40\x54" else "\x40\x41") catch |err| {
+                if (err != error.StreamIdBlocked or tries > 200) return err;
+                try io.sleep(.fromMilliseconds(10), .awake);
+                continue;
+            };
+        };
+        try io.sleep(.fromMilliseconds(2), .awake);
+        session.testReset(id);
+    }
+    // The connection still works.
+    const s = try session.openStream();
+    defer s.release();
+    try s.writer().writeAll("still here");
+    try s.closeSend();
+    const back = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(back);
+    try std.testing.expectEqualStrings("still here", back);
+    // Leaks show at the end, under the testing allocator.
+}
+
+/// Holds a session open without accepting any stream, until "close".
+fn ignoreStreams(session: *wt.Session, req: *dusty.Request) !void {
+    _ = req;
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const d = session.receiveDatagram(&buf) catch return;
+        if (std.mem.eql(u8, d, "close")) return session.close(0, "") catch {};
+    }
+}
+
+test "WebTransport: streams a handler never accepts hold the peer's stream credit" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/ignore", .origin = "https://localhost" });
+    defer session.deinit();
+
+    // Whole streams, ended: before, each one's credit came back as soon as
+    // QUIC was done with it, and they piled up unaccepted.
+    const Opener = struct {
+        fn run(sess: *wt.Session, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+            const payload: [1024]u8 = @splat('p');
+            for (0..400) |_| {
+                const s = sess.openUniStream() catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => return,
+                };
+                s.writer().writeAll(&payload) catch {};
+                s.closeSend() catch {};
+                s.release();
+                _ = count.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var opened: std.atomic.Value(usize) = .init(0);
+    var task = try io.concurrent(Opener.run, .{ session, &opened });
+    try io.sleep(.fromMilliseconds(1500), .awake);
+    task.cancel(io) catch {};
+    // The server's limit (100 unidirectional streams), not all 400.
+    const n = opened.load(.monotonic);
+    try std.testing.expect(n >= 50);
+    try std.testing.expect(n <= 110);
+    try session.sendDatagram("close");
 }
 
 test "WebTransport: a client that closes its session and then its connection at once still delivers the close" {
@@ -500,8 +627,8 @@ test "WebSocket over HTTP/3 (RFC 9220): echo, ping, close" {
     try std.testing.expect((try conn.waitSettings()).connect_protocol);
 
     const s = try conn.request(&.{
-        .{ .name = ":method", .value = "CONNECT" },   .{ .name = ":protocol", .value = "websocket" },
-        .{ .name = ":scheme", .value = "https" },     .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":method", .value = "CONNECT" },      .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },        .{ .name = ":path", .value = "/ws" },
         .{ .name = ":authority", .value = "localhost" }, .{ .name = "sec-websocket-version", .value = "13" },
     }, .{ .body = true, .timeout = .none });
     defer s.release();
@@ -539,8 +666,8 @@ test "WebSocket over HTTP/3: the drain closes an open socket with 1001" {
     const conn = try f.connect(gpa, io);
     defer conn.close();
     const s = try conn.request(&.{
-        .{ .name = ":method", .value = "CONNECT" },   .{ .name = ":protocol", .value = "websocket" },
-        .{ .name = ":scheme", .value = "https" },     .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":method", .value = "CONNECT" },      .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":scheme", .value = "https" },        .{ .name = ":path", .value = "/ws" },
         .{ .name = ":authority", .value = "localhost" }, .{ .name = "sec-websocket-version", .value = "13" },
     }, .{ .body = true, .timeout = .none });
     defer s.release();
@@ -612,3 +739,19 @@ const Frames = struct {
         }
     }
 };
+
+test "WebTransport: a session from a page of another origin is refused" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    try std.testing.expectError(error.WebTransportRefused, conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://evil.example" }));
+    // The connection serves the next one, from the same origin.
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
+    defer session.deinit();
+    try session.close(0, "");
+}

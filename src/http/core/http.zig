@@ -6,6 +6,8 @@ const std = @import("std");
 
 const c = @import("llhttp");
 
+/// A request method: `.get`, `.post`, `.put`, `.delete` and the rest that
+/// llhttp knows. `req.method`.
 pub const Method = enum(c.llhttp_method_t) {
     delete = c.HTTP_DELETE,
     get = c.HTTP_GET,
@@ -55,6 +57,7 @@ pub const Method = enum(c.llhttp_method_t) {
     flush = c.HTTP_FLUSH,
     query = c.HTTP_QUERY,
 
+    /// The method as it goes on the wire: "GET".
     pub fn name(self: Method) [:0]const u8 {
         return std.mem.span(c.llhttp_method_name(@backingInt(self)));
     }
@@ -81,6 +84,9 @@ test "Method: format" {
     try std.testing.expectEqualStrings("GET", result);
 }
 
+/// A response status, named as in the IANA registry: `.ok`, `.created`,
+/// `.not_found`, `.internal_server_error`... `res.status`; `@intFromEnum`
+/// gives the code.
 pub const Status = enum(c.llhttp_status_t) {
     @"continue" = c.HTTP_STATUS_CONTINUE,
     switching_protocols = c.HTTP_STATUS_SWITCHING_PROTOCOLS,
@@ -190,6 +196,7 @@ pub const Status = enum(c.llhttp_status_t) {
         return std.enums.fromInt(Status, code) orelse error.InvalidStatusCode;
     }
 
+    /// The reason phrase: "Not Found".
     pub fn name(self: Status) [:0]const u8 {
         return std.mem.span(c.llhttp_status_name(@backingInt(self)));
     }
@@ -278,11 +285,14 @@ test "Status: reason phrases are RFC 9110's" {
 }
 
 /// An IMF-fixdate (RFC 9110 5.6.7), `Sun, 06 Nov 1994 08:49:37 GMT`, of
-/// `seconds` since the epoch. A time before 1970 is given as 1970.
+/// `seconds` since the epoch. A time before 1970 is given as 1970, and one
+/// after the year 9999 (which four digits cannot hold) as its last second.
 pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {
+    // 9999-12-31T23:59:59Z.
+    const last_second: i64 = 253402300799;
     const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(std.math.clamp(seconds, 0, last_second)) };
     const day = epoch_seconds.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -339,6 +349,11 @@ test "formatHttpDate: IMF-fixdate" {
     var buf: [29]u8 = undefined;
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", formatHttpDate(&buf, 784111777));
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", formatHttpDate(&buf, -5));
+    // A file time past the year 9999 (a stored mtime is anything) is
+    // given as the last second that fits.
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300799));
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300800));
+    try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, std.math.maxInt(i64)));
 }
 
 test "Status: construct from llhttp_status_t" {
@@ -403,6 +418,22 @@ pub const Headers = struct {
         return .{ .keys = keys, .values = values, .hashes = buf[hashes_offset..] };
     }
 
+    /// Room for more in a full table, up to `max` entries: a table twice
+    /// the size from `allocator`, the entries copied over. For a table in
+    /// an arena, which keeps the old one: it starts small, so an ordinary
+    /// message's headers take little of the arena, and grows to its limit
+    /// for one with more. False at `max`, or without the memory.
+    pub fn grow(self: *Headers, allocator: std.mem.Allocator, max: usize) bool {
+        if (self.keys.len >= max) return false;
+        var bigger = Headers.init(allocator, @min(max, @max(8, self.keys.len * 2))) catch return false;
+        @memcpy(bigger.keys[0..self.len], self.keys[0..self.len]);
+        @memcpy(bigger.values[0..self.len], self.values[0..self.len]);
+        @memcpy(bigger.hashes[0..self.len], self.hashes[0..self.len]);
+        bigger.len = self.len;
+        self.* = bigger;
+        return true;
+    }
+
     pub fn deinit(self: *Headers, allocator: std.mem.Allocator) void {
         const max = self.keys.len;
         if (max == 0) return;
@@ -440,6 +471,23 @@ pub const Headers = struct {
         self.len = i + 1;
     }
 
+    /// Adds one field of an HTTP/2 or HTTP/3 request, as the HTTP/1.1
+    /// parser does: another entry for a repeated name, except `cookie`,
+    /// whose fields are joined onto the first one with "; " (RFC 9113
+    /// §8.2.3, RFC 9114 §4.2.1), in `allocator` (the request's arena).
+    pub fn addRequestField(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8) error{ TooManyHeaders, OutOfMemory }!void {
+        if (std.ascii.eqlIgnoreCase(name, "cookie")) {
+            const h = hashFn(name);
+            for (self.hashes[0..self.len], 0..) |hh, i| {
+                if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) {
+                    self.values[i] = try std.mem.concat(allocator, u8, &.{ self.values[i], "; ", value });
+                    return;
+                }
+            }
+        }
+        try self.add(name, value);
+    }
+
     /// Returns the value of the first matching entry (case-insensitive), or null.
     pub fn get(self: *const Headers, name: []const u8) ?[]const u8 {
         const h = hashFn(name);
@@ -469,6 +517,7 @@ pub const Headers = struct {
         return self.len - kept;
     }
 
+    /// How many entries there are, repeated names counted each time.
     pub fn count(self: *const Headers) usize {
         return self.len;
     }
@@ -507,6 +556,7 @@ pub const Headers = struct {
         try jw.endObject();
     }
 
+    /// Every entry in order, repeated names included.
     pub fn iterator(self: *const Headers) Iterator {
         return .{ .keys = self.keys[0..self.len], .values = self.values[0..self.len], .pos = 0 };
     }
@@ -535,10 +585,13 @@ pub const Headers = struct {
 pub const Params = struct {
     map: std.StringHashMapUnmanaged([]const u8) = .{},
 
+    /// The value of `name`, or null. Query values are already
+    /// percent-decoded.
     pub fn get(self: Params, name: []const u8) ?[]const u8 {
         return self.map.get(name);
     }
 
+    /// How many names there are.
     pub fn count(self: Params) usize {
         return self.map.count();
     }
@@ -557,6 +610,7 @@ pub const Params = struct {
         return if (std.math.isFinite(value)) value else null;
     }
 
+    /// Every name and value, in no particular order.
     pub fn iterator(self: *const Params) Iterator {
         return .{ .inner = self.map.iterator() };
     }
@@ -664,6 +718,29 @@ test "Headers: put replaces, add appends" {
     try std.testing.expectEqual(null, it.next());
 }
 
+test "Headers: addRequestField joins cookie crumbs and adds other repeats" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var headers = try Headers.init(a, 4);
+    try headers.addRequestField(a, "cookie", "a=1");
+    try headers.addRequestField(a, "accept", "text/html");
+    try headers.addRequestField(a, "Cookie", "b=2");
+    try headers.addRequestField(a, "accept", "application/json");
+    try headers.addRequestField(a, "cookie", "c=3");
+    try std.testing.expectEqualStrings("a=1; b=2; c=3", headers.get("cookie").?);
+    try std.testing.expectEqual(3, headers.count());
+    var it = headers.iterator();
+    _ = it.next();
+    try std.testing.expectEqualStrings("text/html", it.next().?.value);
+    try std.testing.expectEqualStrings("application/json", it.next().?.value);
+    try headers.addRequestField(a, "x", "y");
+    try std.testing.expectError(error.TooManyHeaders, headers.addRequestField(a, "z", "y"));
+    // A crumb joins even at capacity: it takes no entry.
+    try headers.addRequestField(a, "cookie", "d=4");
+    try std.testing.expectEqualStrings("a=1; b=2; c=3; d=4", headers.get("cookie").?);
+}
+
 test "Headers: error on overflow" {
     var headers = try Headers.init(std.testing.allocator, 1);
     defer headers.deinit(std.testing.allocator);
@@ -716,6 +793,9 @@ test "validateHeaderName: rejects empty, whitespace, colon, control" {
     try validateHeaderName("X-Custom-Header");
 }
 
+/// The media types the server knows by name, for `res.content_type` and
+/// `req.content_type`; `.unknown` for anything else (set the
+/// `Content-Type` header yourself for those).
 pub const ContentType = enum(u32) {
     text,
     html,
@@ -760,6 +840,7 @@ pub const ContentType = enum(u32) {
     multipart_form,
     unknown,
 
+    /// The type a `Content-Type` value names, parameters ignored.
     pub fn fromContentType(value: []const u8) ContentType {
         if (value.len == 0) {
             return .unknown;
@@ -819,6 +900,7 @@ pub const ContentType = enum(u32) {
         return .unknown;
     }
 
+    /// The type a file extension stands for (".css" or "css").
     pub fn fromExtension(value: []const u8) ContentType {
         if (value.len == 0) {
             return .unknown;
@@ -878,6 +960,7 @@ pub const ContentType = enum(u32) {
         return .unknown;
     }
 
+    /// The `Content-Type` value it is sent as ("text/plain; charset=UTF-8").
     pub fn toContentType(self: ContentType) []const u8 {
         return switch (self) {
             .text => "text/plain; charset=UTF-8",
@@ -943,6 +1026,7 @@ test "ContentType: parse from file extension" {
     try std.testing.expectEqual(ContentType.unknown, ContentType.fromExtension(""));
 }
 
+/// A body's `Content-Encoding`, as the server reads it on a request.
 pub const ContentEncoding = enum {
     identity,
     gzip,

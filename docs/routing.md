@@ -56,8 +56,9 @@ fn getUser(req: *anole.Request, res: *anole.Response) !void {
 }
 ```
 
-`params` and `query` have `get`, `getInt`, `getFloat`, `count` and
-`iterator`; `getInt` and `getFloat` return null for a missing or malformed
+`req.param("id")` and `req.queryParam("fields")` are the short forms of
+`req.params.get` and `req.query.get`. `params` and `query` have `get`,
+`getInt`, `getFloat`, `count` and `iterator`; `getInt` and `getFloat` return null for a missing or malformed
 value. Path parameters are the raw bytes of the path, with percent-escapes
 left as they are. Query values are decoded (`%XX` and `+`).
 
@@ -79,7 +80,7 @@ listed in two groups is two copies. To share one, take a handle with
 `app.middleware(value)` (one copy, owned by the server) and list the handle:
 
 ```zig
-const sessions = app.middleware(anole.session.Middleware.init(.{ .key = key }));
+const sessions = app.middleware(try anole.session.Middleware.init(.{ .key = key }));
 app.group("", .{sessions}).get("/me", me);
 app.group("", .{ sessions, anole.auth.csrf.Middleware.init(.{}) }).post("/notes", addNote);
 ```
@@ -155,15 +156,17 @@ app.use(Timing{});
 
 ### Built-in middleware
 
-`anole.middleware` holds dusty's:
+`anole.middleware` holds the HTTP core's, and `ResponseCache`. Sessions,
+CSRF, auth and rate limits have their own namespaces (`anole.session`,
+`anole.auth`, `anole.ratelimit`); see [auth.md](auth.md).
 
 | Middleware | What it does |
 | --- | --- |
 | `RequestId.init(.{})` | Sets `req.id` (128 random bits, hex) and sends it as `X-Request-Id`. `.header` renames it; `.trust_incoming = true` keeps a valid incoming one (only behind a proxy that sets or strips it). |
-| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path, status or error, time, client, request ID. |
+| `Logger.init()` | One access-log line per request at `info`, scope `access`: method, path (no query; `initWith(.{ .log_query = true })` logs it), status or error, time, client, request ID. |
 | `Compress.init()` | Sets `res.compress` on every response; see [Compression](#compression). |
 | `Cors.init(.{})` | CORS for browsers: any origin by default, preflights answered with 204; see [CORS](#cors). |
-| `Session.init(.{ .secret_key = ... })` | `req.session` in a signed, not encrypted, cookie. Returns an error union. |
+| `ResponseCache` | Whole responses kept per executor and answered from memory; see [Response cache](#response-cache). |
 
 ```zig
 app.use(anole.middleware.RequestId.init(.{})); // first, so the rest see req.id
@@ -206,6 +209,111 @@ asks about, so the group's `Cors` answers it. Put `Cors` ahead of
 middleware that refuses requests (authentication): a preflight carries no
 credentials.
 
+### Response cache
+
+A route can have its answers kept and served from memory, without running
+its handler, for a while:
+
+```zig
+app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed));
+```
+
+> **A cached answer is served to everyone who asks for the same URL.** The
+> cache skips requests with `Authorization`, `Cookie`, `X-API-Key` or a TLS
+> client certificate, but it can't know every way your app tells users
+> apart. If a route's answer depends on a header of your own, the client's
+> address, or anything set by middleware before the cache, add that header
+> to `credential_headers`, or refuse those requests with `cacheable`;
+> otherwise one user's page goes to the next. Authentication that runs
+> after the cache is skipped on a hit, so put it before the cache.
+
+```zig
+// A session token in a header of the app's own.
+app.get("/me", anole.cached(.{ .ttl = .fromSeconds(5), .credential_headers = &.{ "Authorization", "Cookie", "X-API-Key", "X-Session-Token" } }, me));
+// Any per-request rule.
+fn anonymousOnly(req: *const anole.Request) bool {
+    return req.headers.get("X-Tenant") == null;
+}
+app.get("/news", anole.cached(.{ .ttl = .fromSeconds(5), .cacheable = anonymousOnly }, news));
+```
+
+One cache for several routes is `app.responseCache`, used through `with`,
+`group` or `use`, and invalidated when what it serves changes:
+
+```zig
+const App = struct { db: *anole.pg.Client, pages: *anole.middleware.ResponseCache };
+
+state.pages = app.responseCache(.{ .ttl = .fromSeconds(60), .name = "pages" });
+app.with(.{state.pages}).get("/posts/:id", showPost);
+app.put("/posts/:id", editPost);
+
+fn editPost(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    const id = req.params.get("id").?;
+    // ... the update ...
+    app.pages.invalidate(.{ .path = try std.fmt.allocPrint(req.arena, "/posts/{s}", .{id}) });
+    res.status = .no_content;
+}
+```
+
+What is kept:
+
+- Answers to `GET`. A `HEAD` is answered from a kept `GET`; other methods
+  pass through.
+- Statuses a cache may keep without being told: 200, 203, 204, 300, 301,
+  308, 404 and 410. Not errors, not 304.
+- Bodies held in memory: not `sendFile`, a stream, an event stream, a
+  WebSocket upgrade, or a response with trailers. At most
+  `max_entry_bytes` (1 MiB).
+- The headers the route set (and middleware after the cache), replayed on
+  a hit. Middleware before the cache runs on every request as usual, so its
+  headers (`X-Request-Id`, CORS for the caller's origin) are fresh.
+
+What is not:
+
+- A response that sets a cookie, or whose `Cache-Control` says `no-store`,
+  `no-cache` or `private`. Its `s-maxage`, else `max-age`, is how long it is
+  kept (0: not at all); with neither, the cache's `ttl` (10 s by default).
+- Requests that carry credentials (`Authorization`, `Cookie`, `X-API-Key`;
+  `credential_headers`), or a TLS client certificate: they neither read the
+  cache nor fill it. Nor do requests `cacheable` returns false for.
+  `.authenticated = true` lets them, for routes whose answer does not depend
+  on who asks: the credentials are not part of the key.
+- `Vary: *`. Other `Vary` headers are honoured: each combination of the
+  named request headers is kept apart.
+
+The key is the scheme, the `Host` header and the target, query included as
+sent. Each executor keeps its own entries (no lock between threads), so two
+executors may answer from responses up to `ttl` apart; `invalidate(.all)`
+and `invalidate(.{ .path = "/posts/7" })` (every query and `Vary` variant
+of that path) reach every executor at once. The bounds (`max_entries`,
+1024; `max_bytes`, 16 MiB) are split between the executors, least recently
+used first out. With `app.metrics`, each cache reports
+`anole_cache_hits_total`, `anole_cache_misses_total`,
+`anole_cache_stores_total`, `anole_cache_evictions_total`,
+`anole_cache_entries` and `anole_cache_bytes`, labelled `kind="http"` and
+its name (the route's path for `anole.cached`); `cache.stats()` has the
+same numbers.
+
+The body is kept as the handler wrote it, so with `Compress` each hit is
+compressed again for its client.
+
+When not to use it:
+
+- Pages that differ by who asks, unless the difference is in the URL or a
+  `Vary` header: a session read from a cookie makes the request bypass the
+  cache, but a user identified some other way (a header not in
+  `credential_headers`, the client's address) would get another user's page.
+  Add such headers to `credential_headers`, refuse those requests in
+  `cacheable`, or keep the cache off the route.
+- Anything that must show a write at once, unless the write invalidates it.
+- Routes behind authorization middleware that runs after the cache (a
+  route's own `with`, in a group whose cache comes first): a hit skips it.
+  Put authentication before the cache, or the cache on public routes only.
+- Large downloads and files: `staticDir` already serves files with ETags
+  and ranges.
+
+For rows rather than responses, see [Caching](database.md#caching).
+
 Elsewhere in Anole: encrypted-cookie and server-side sessions, CSRF, API
 keys, roles and rate limiting ([auth.md](auth.md)); a JSON or text access
 log, metrics and tracing ([observability.md](observability.md)).
@@ -225,7 +333,7 @@ log, metrics and tracing ([observability.md](observability.md)).
 | `id`, `trace_id`, `span_id` | Set by the request ID and tracing middleware. |
 | `setLocal(key, value)`, `local(T, key)` | Values a middleware hands to the handler for this request; see [Request locals](#request-locals). |
 | `route` | The matched route; `route.?.path` is its pattern. |
-| `arena` | An allocator freed after the response. |
+| `arena` | An allocator freed after the response. Not thread-safe: only the handler's task may use it. |
 | `io` | The server's `std.Io`; see [Async work](#async-work-in-handlers). |
 
 The body is read once, whole or as a stream:
@@ -297,7 +405,7 @@ res.body = "{\"id\":42}"; // must outlive the handler: a literal or res.arena
 | `render(content_type, template, args)` | A body from a template function or type. |
 | `writer()` | A buffered body writer; `end()` it before returning. |
 | `stream(buffer)` | Sends the headers now and streams the body; `end()` it. |
-| `startEventStream(buffer)` | Server-Sent Events: `send(data, .{ .event = ... })`. |
+| `startEventStream(buffer)` | Server-Sent Events: `send(data, .{ .event = ... })`. Every CR, LF or CRLF in `data` starts a new `data:` line, so data cannot add fields of its own; `event` and `id` with a CR or LF are refused. |
 | `sendFile(dir, path, options)` | A file as the body. |
 | `setCookie(name, value, options)` | Adds a `Set-Cookie`. |
 | `trailer(name, value)` | A trailer field after the body. |
@@ -384,8 +492,25 @@ app.embedded("/favicon.ico", @embedFile("favicon.ico"), .{ .cache_control = "pub
 With `-Dcompression` (on in `web` and `full`), a response is compressed when
 the handler sets `res.compress = true`, or always through `Compress`.
 
-- zstd or gzip (zlib-ng) by the client's `Accept-Encoding` q-values, zstd on
-  a tie. Streamed bodies are compressed as they are written.
+- zstd, Brotli (`br`, with `-Dbrotli`, on in `web` and `full`) or gzip
+  (zlib-ng) by the client's `Accept-Encoding` q-values; on a tie zstd, then
+  `br`, then gzip. So browsers that offer zstd get zstd, and a client that
+  offers `gzip, br` (Safari, most HTTP benchmarks) gets `br`. `identity`
+  and `*` count as RFC 9110 says: `*` stands for every coding not named,
+  and `br;q=0` refuses one. Streamed bodies are compressed as they are
+  written, and each `flush` sends what was written so far in a form the
+  client can already decode.
+- Brotli runs at quality 5 by default
+  (`.server = .{ .response = .{ .brotli_quality = 5 } }`, 0 to 11), or per
+  response with `res.brotli_quality`. On JSON bodies of 1.5 to 12 KB,
+  quality 5 is 10-15% smaller than gzip and zstd and 8-13% smaller than
+  quality 4, at about twice gzip's CPU time; quality 6 gains under 1% more,
+  and 11 is for precompressed files (`precompressed = &.{.br}`), not for
+  responses. Its window is at most 64 KiB, so each Brotli response in
+  flight takes about 600 KiB. Its large blocks, and gzip's for a buffered
+  body, come from a cache per executor, reused from one response to the
+  next (no `mmap` or page faults per response, with glibc or musl),
+  holding at most 4 MiB and trimmed back to one encoder's worth when idle.
 - Only compressible types: text, JSON, JavaScript, XML, SVG, `+json` and
   `+xml` types and the like. Not images, video, fonts or archives.
 - Buffered bodies under 128 bytes, or that do not shrink, go out as they are.
@@ -402,7 +527,7 @@ Null disables a timeout.
 
 | Field | Default | Covers |
 | --- | --- | --- |
-| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. |
+| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. Over HTTP/2, a response still going out after its handler returned gets this long again (or `timeout.keepalive` when this is off) before the stream is reset, and any one write to a peer that stops reading is cut off after it. |
 | `timeout.read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). |
 | `timeout.keepalive` | 60 s | An idle connection between requests. |
 | `timeout.request_count` | none | Requests per keep-alive connection. |
@@ -420,6 +545,7 @@ req.setTimeout(.none); // a WebSocket or event stream
 | --- | --- | --- |
 | `max_body_size` | 1 MiB | `body()`, `bind()`, `json()` and forms fail: 413. Counted after decoding. |
 | `max_content_length` | none | A larger declared `Content-Length` is a 413 before the handler runs. Bounds streams too. |
+| `require_host` | true | An HTTP/1.1 request with no `Host`, or any with two, is a 400 (RFC 9112). |
 | `buffer_size` | 16 KiB | The request line and headers must fit: 431. |
 | `max_header_count` | 32 | Request headers: 431. |
 | `max_param_count`, `max_query_count` | 8, 32 | Path parameters and query values: 400. |
@@ -427,7 +553,10 @@ req.setTimeout(.none); // a WebSocket or event stream
 
 `response.max_header_count` (64) caps the headers a response can carry,
 those the server adds included; past it `res.header` fails with
-`TooManyHeaders`. HTTP/2's limits are in `ServerOptions.http2`
+`TooManyHeaders`. `res.addHeader` adds one that may repeat (`Vary`,
+`Link`). Both tables start with room for 16 and grow to their limits, so
+add response headers through `res.header` and `res.addHeader` rather than
+to `res.headers` directly, which only has the room it has grown to. HTTP/2's limits are in `ServerOptions.http2`
 ([server.md](server.md#http2)).
 
 ## Error handling
@@ -444,8 +573,9 @@ the client gets:
   stands for.
 - Request-body faults get a 4xx: `BodyTooBig` 413,
   `UnsupportedContentEncoding` 415, and 400 for `InvalidJsonBody` and
-  `MissingBody` (from `bind` and `json`) and a body that is not valid gzip or
-  zstd.
+  `MissingBody` (from `bind` and `json`), `IncompleteBody` (a body cut
+  short) and `MalformedBody` (broken chunked framing, or a body that is not
+  valid gzip or zstd). They are logged at `debug`, not `err`.
 - Anything else is logged at `err` and answered 500, and what the handler
   wrote is discarded. That includes `std.json`'s `SyntaxError` when the JSON
   was not the request's own (a config file, an upstream response).

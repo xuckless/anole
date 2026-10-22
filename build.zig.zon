@@ -1,6 +1,6 @@
 .{
     .name = .anole,
-    .version = "0.0.0",
+    .version = "0.1.2",
     .fingerprint = 0xe9214b117feef58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
@@ -14,11 +14,18 @@
         // give back their deeper stack pages (Linux, pinned), recvmmsg with
         // control messages and sendmmsg in sendMany, and a spawn
         // cache per executor (stacks and task allocations without the
-        // runtime's locks). The HTTP core (adapted from lalinsky/dusty) is
-        // in src/http/core, not a dependency.
+        // runtime's locks). Pinned at 683612b (`anole`): the direct accept
+        // puts back a cancel it finds pending, so an accept loop canceled
+        // before its first accept no longer parks for good (dcaf6fe);
+        // net.ReadyWatch (unused by Anole); and for Windows, streaming file
+        // reads and writes on IOCP's overlapped handles, UDP sockets that
+        // ignore an earlier datagram's ICMP error, and peer-caused socket
+        // errors logged at debug (branch windows-dev). The HTTP core
+        // (adapted from lalinsky/dusty) is in src/http/core, not a
+        // dependency.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#ebb701426b4431a1e04ab1efb1d1cb43fc7f0c12",
-            .hash = "zio-0.19.0-xHbVVCwoLQDcc162sSq2-S-Qf_mklMYRj68z71pu6dAV",
+            .url = "git+https://github.com/xuckless/zio#683612bba6b4f34ef5b989d2ca335a84008dc780",
+            .hash = "zio-0.19.0-xHbVVDqXLQDYaDoeYaMHQ9_OrsDGo4yFX61vY8m-sa_p",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -48,14 +55,21 @@
         // migrates right after a NAT rebinding (stock 1.25.0 retires it and
         // then closes with CONNECTION_ID_LIMIT_ERROR), and one that makes a
         // server PTO in the Initial space retransmit two packets, not one (a
-        // post-quantum ServerHello spans two). nghttp3 1.18.0 from
+        // post-quantum ServerHello spans two), and one that gives both
+        // PATH_CHALLENGE probes of a validation round the same data (peers
+        // that answer only the latest challenge then answer the first), and
+        // one that makes a server follow a client whose address changes
+        // during the handshake (a NAT rebinding) instead of stalling, and
+        // one that keeps pacing from sending an ACK to a new path before its
+        // PATH_CHALLENGE.
+        // Pinned by git URL and commit. nghttp3 1.18.0 from
         // Anole's fork xuckless/nghttp3, branch `anole`: the v1.18.0 tag plus
         // the release's generated version.h and bundled sfparse, and
         // nghttp3_conn_add_extra_setting, which sends the SETTINGS
         // WebTransport needs (0x2b603742 for Chrome and Firefox).
         .ngtcp2 = .{
-            .url = "https://github.com/xuckless/ngtcp2/archive/f47d1322abb7d65e48920f3e539f113866824478.tar.gz",
-            .hash = "N-V-__8AAId1QwDyGLzdKzb96fSz-DZFWxuXnebZVCUeHJ3_",
+            .url = "git+https://github.com/xuckless/ngtcp2#b70d6d98d90be1af793af704bdf66b97df8dd7f1",
+            .hash = "N-V-__8AAMCuQwCjsxFJ5ddtVQcmqA7wQVrluqzivC1f7D72",
             .lazy = true,
         },
         // -Dcompression: zlib-ng 2.3.3 (zlib-compat, runtime SIMD dispatch) and
@@ -72,6 +86,12 @@
             .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
             .lazy = true,
         },
+        // -Dbrotli: google/brotli 1.2.0, built by build/brotli.zig.
+        .brotli = .{
+            .url = "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz",
+            .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
+            .lazy = true,
+        },
         .zlib_zig = .{
             .url = "git+https://github.com/lalinsky/zlib.zig#537dbce25b1b29a0361845b019711dad35699aa6",
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
@@ -85,13 +105,23 @@
             .lazy = true,
         },
         .websocket_zig = .{
-            .url = "git+https://github.com/xuckless/websocket-zig#4bd0e5c4f46466ded5478afb0db3a2f72a264ae8",
-            .hash = "websocket-0.0.0-UEQdXjgDAgCbGTdVLwvvGXjiu9jsUWjjxE-ACul9M8HV",
+            .url = "git+https://github.com/xuckless/websocket-zig#065fac7e8b6c53e845335ccccf5a40f435d5ff30",
+            .hash = "websocket-0.0.0-UEQdXkQJAgCHF--QcM8bzQIEl_nf38Q0RouBNZuGLh6B",
             .lazy = true,
         },
         .protobuf = .{
-            .url = "git+https://github.com/Arwalk/zig-protobuf#e9e18c7664b8c950e5fc679259c968dd66ccc48b",
-            .hash = "protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv",
+            .url = "git+https://github.com/xuckless/zig-protobuf#ef23c279af0dcb12cce9eee39838c14f5955c75f",
+            .hash = "protobuf-7.0.0-0e82aj2WNAAZimii5Crz-Ce8fLdCHUW-Ra-95-3lLMnw",
+            .lazy = true,
+        },
+        // -Dgrpc: upb, protobuf's C runtime, from the protobuf 36.2 release
+        // tarball (BSD-3-Clause): the amalgamation in
+        // ruby/ext/google/protobuf_c and third_party/utf8_range, built by
+        // build/upb.zig. Only the C ABI's gRPC server links it (JSON <->
+        // protobuf from the consumer's descriptors).
+        .upb = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protobuf-36.2.tar.gz",
+            .hash = "N-V-__8AAPJv3gI7D9QT5MqUNa7RaXBRPTLdOd6eUVgbJ0Nm",
             .lazy = true,
         },
         .yyjson = .{
@@ -107,6 +137,43 @@
         .zig_jwt = .{
             .url = "git+https://github.com/xuckless/zig-jwt#243c12861835f546043dd7db0fb33b77b1a16a50",
             .hash = "zig_jwt-1.7.6-w3q9SD1JHwCv7Y7wd9cdliyEaGpggJhl1M9QbZm2oNP6",
+            .lazy = true,
+        },
+        // -Dpostgres: Anole's fork of karlseguin/pg.zig (MIT), branch
+        // `anole`: a read timeout, CancelRequest, the automatic statement
+        // cache, pool lifetimes, a refused connect's error, TLS through an
+        // injected module (Anole's BoringSSL, src/pg/tls.zig), the session
+        // reset on release (Pool.Reset: .always or .auto), parameters as a
+        // slice of tagged unions and text results (the C ABI).
+        .pg = .{
+            .url = "git+https://github.com/xuckless/pg.zig#6f47a57bd5f7d9e96440526d5b51bd7a043a8203",
+            .hash = "pg-0.0.0-Wp_7gVBZCQCvg5pWYYxKTW8zxBa1VzUO8IWy4OiYhwDA",
+            .lazy = true,
+        },
+        // Tests only, fetched only when Anole is the root build: the BSON
+        // corpus (source/bson-corpus/tests) of mongodb/specifications. The
+        // repository is CC BY-NC-SA 3.0 US, so it is fetched, never vendored
+        // or shipped.
+        .mongodb_specs = .{
+            .url = "https://github.com/mongodb/specifications/archive/7235b61bde1bc75e51f28d8f67dd935198969c02.tar.gz",
+            .hash = "N-V-__8AAHq03wFyL3GDg1B5WQRqK98uTOOjLUIriuv5DdbW",
+            .lazy = true,
+        },
+        // SQLite 3.54.1 (public domain), the amalgamation, built by
+        // build/sqlite.zig. Published 2026-10-16; sqlite.org's SHA3-256 of the
+        // zip: 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30.
+        .sqlite_amalgamation = .{
+            .url = "https://sqlite.org/2026/sqlite-amalgamation-3540100.zip",
+            .hash = "N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9",
+            .lazy = true,
+        },
+        // vrischmann/zig-sqlite from Anole's fork xuckless/zig-sqlite, branch
+        // `anole`: upstream's open Zig 0.17 port (PR #215), bindings through
+        // the translate-c package, SQLite taken from the caller (Anole's
+        // amalgamation and options header) with no SQLite fetched of its own.
+        .zig_sqlite = .{
+            .url = "git+https://github.com/xuckless/zig-sqlite#80742c3ce2b1917b44248371e02633cc942a1867",
+            .hash = "sqlite-3.54.1-F2R_a_YmBADq3G8bA-jCBgWFcQEaVlxVql4mEN2SbliG",
             .lazy = true,
         },
     },

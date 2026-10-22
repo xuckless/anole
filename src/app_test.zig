@@ -171,7 +171,7 @@ test "anole.App: listen, function middleware, with, staticDir, metrics, health, 
                 try std.testing.expectEqualStrings("ping me back", (try ws.receive()).data);
                 try ws.close(.normal, "");
                 const answer = try ws.receive();
-                try std.testing.expectEqual(http.dusty_module.WebSocket.MessageType.close, answer.type);
+                try std.testing.expectEqual(http.core.WebSocket.MessageType.close, answer.type);
             }
 
             if (features.grpc) {
@@ -372,7 +372,7 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
                 try early.put("Early-Data", "1");
                 var too_early = try dc.fetch(try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/hello", .{port}), .{ .method = .post, .headers = &early, .body = "" });
                 defer too_early.deinit();
-                try std.testing.expectEqual(@as(u16, 425), @intFromEnum(too_early.status()));
+                try std.testing.expectEqual(@as(u16, 425), @backingInt(too_early.status()));
             }
             const q = a.http3Address().?;
             var alt_buf: [64]u8 = undefined;
@@ -404,4 +404,244 @@ test "anole.App: an address listen cannot take fails listen, and waitReady with 
     defer app.deinit();
     try std.testing.expectError(error.InvalidListenAddress, app.listen("example.com:80"));
     try std.testing.expectError(error.InvalidListenAddress, app.waitReady());
+}
+
+/// What the handler saw as the client's address, without the port: one
+/// client is one address whichever family its socket was.
+fn remoteAddressBody(req: *Request, res: *Response) !void {
+    var addr = req.remote_address;
+    addr.setPort(0);
+    // "127.0.0.1:0" or "[::1]:0": the host alone.
+    const text = try std.fmt.allocPrint(res.arena, "{f}", .{addr});
+    var host = text[0 .. text.len - ":0".len];
+    if (host.len >= 2 and host[0] == '[') host = host[1 .. host.len - 1];
+    res.body = host;
+}
+
+/// Whether this machine has IPv6 loopback (`::1`): not in a container
+/// with IPv6 off.
+fn haveIpv6Loopback() bool {
+    // Through std.Io, which binds on Windows too.
+    const io = std.testing.io;
+    const lo: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };
+    const socket = lo.bind(io, .{ .mode = .dgram }) catch return false;
+    socket.close(io);
+    return true;
+}
+
+/// `GET /addr` over a fresh TCP connection to `to`: the body.
+fn rawGet(io: std.Io, to: std.Io.net.IpAddress, out: []u8) ![]const u8 {
+    const stream = try to.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET /addr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    _ = r.interface.streamRemaining(&fw) catch {};
+    const resp = fw.buffered();
+    if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n")) return error.UnexpectedStatus;
+    const head_end = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoBody;
+    return resp[head_end + 4 ..];
+}
+
+test "anole.App: listen(\":0\") takes IPv4 and IPv6 on one dual-stack socket; handlers see plain IPv4" {
+    const address_mod = @import("address.zig");
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    app.get("/addr", remoteAddressBody);
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const bound = a.addresses()[0].ip;
+            const port = bound.getPort();
+            var out: [1024]u8 = undefined;
+            if (!address_mod.dualStackAvailable()) {
+                // No IPv6 here: every IPv4 interface instead.
+                try std.testing.expect(bound == .ip4);
+                try std.testing.expectEqualStrings("127.0.0.1", try rawGet(io_, .{ .ip4 = .loopback(port) }, &out));
+                return;
+            }
+            try std.testing.expect(bound == .ip6 and std.mem.allEqual(u8, &bound.ip6.bytes, 0));
+            // An IPv4 client arrives IPv4-mapped and is reported as IPv4.
+            try std.testing.expectEqualStrings("127.0.0.1", try rawGet(io_, .{ .ip4 = .loopback(port) }, &out));
+            if (haveIpv6Loopback()) try std.testing.expectEqualStrings("::1", try rawGet(io_, .{ .ip6 = .loopback(port) }, &out));
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.listen(":0");
+    try checking.await(app.io());
+}
+
+test "anole.App: an explicit 0.0.0.0 stays IPv4 only" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.get("/addr", remoteAddressBody);
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const bound = a.addresses()[0].ip;
+            try std.testing.expect(bound == .ip4);
+            const port = bound.getPort();
+            var out: [1024]u8 = undefined;
+            try std.testing.expectEqualStrings("127.0.0.1", try rawGet(io_, .{ .ip4 = .loopback(port) }, &out));
+            if (!haveIpv6Loopback()) return;
+            if (rawGet(io_, .{ .ip6 = .loopback(port) }, &out)) |_| {
+                return error.ServedOverIpv6;
+            } else |err| try std.testing.expectEqual(error.ConnectionRefused, err);
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.listen("0.0.0.0:0");
+    try checking.await(app.io());
+}
+
+test "anole.App: metrics and health only on the listener named for them" {
+    var app = try App.init(alloc, .{
+        .listeners = &.{
+            .{ .name = "public", .port = 0 },
+            .{ .name = "admin", .port = 0 },
+        },
+        .executors = .exact(1),
+    });
+    defer app.deinit();
+    _ = app.metrics(.{ .listener = "admin" });
+    _ = app.health(.{ .listener = "admin" });
+    app.get("/", struct {
+        fn h(_: *Request, res: *Response) !void {
+            res.body = "hi";
+        }
+    }.h);
+
+    const Check = struct {
+        fn status(io: std.Io, port: u16, path: []const u8) !u16 {
+            const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+            const stream = try to.connect(io, .{ .mode = .stream });
+            defer stream.close(io);
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(io, &wbuf);
+            try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+            try w.interface.flush();
+            var rbuf: [4096]u8 = undefined;
+            var r = stream.reader(io, &rbuf);
+            var out: [8192]u8 = undefined;
+            var fw: std.Io.Writer = .fixed(&out);
+            _ = r.interface.streamRemaining(&fw) catch {};
+            return std.fmt.parseInt(u16, fw.buffered()[9..12], 10);
+        }
+
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const public = a.addresses()[0].ip.getPort();
+            const admin = a.addresses()[1].ip.getPort();
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, public, "/"));
+            try std.testing.expectEqual(@as(u16, 404), try status(io_, public, "/metrics"));
+            try std.testing.expectEqual(@as(u16, 404), try status(io_, public, "/readyz"));
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, admin, "/metrics"));
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, admin, "/readyz"));
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, admin, "/healthz"));
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.run();
+    try checking.await(app.io());
+}
+
+test "anole.App: an unsafe request marked as early data gets 425, HTTP/3 or not" {
+    // No HTTP/3 here (a build without it does the same): the mark can come
+    // from a proxy in front.
+    var app = try App.init(alloc, .{ .executors = .exact(1), .listen_tls_http3 = false });
+    defer app.deinit();
+    app.post("/pay", struct {
+        fn h(_: *Request, res: *Response) !void {
+            res.body = "paid";
+        }
+    }.h);
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const port = a.addresses()[0].ip.getPort();
+            const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+            const stream = try to.connect(io_, .{ .mode = .stream });
+            defer stream.close(io_);
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(io_, &wbuf);
+            // As a proxy that took the request in TLS early data forwards it.
+            try w.interface.writeAll("POST /pay HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            try w.interface.flush();
+            var rbuf: [1024]u8 = undefined;
+            var r = stream.reader(io_, &rbuf);
+            var out: [1024]u8 = undefined;
+            var fw: std.Io.Writer = .fixed(&out);
+            _ = r.interface.streamRemaining(&fw) catch {};
+            try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 425 "));
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.listen("127.0.0.1:0");
+    try checking.await(app.io());
+}
+
+test "anole.App: listenTls(\":0\") serves HTTP/3 to 127.0.0.1 and ::1 on one socket, through Retry" {
+    if (comptime !features.http3) return error.SkipZigTest;
+    const address_mod = @import("address.zig");
+    // Every new connection proves its address with a Retry token first,
+    // which binds the token to the (IPv4-mapped) address it came from.
+    var app = try App.init(alloc, .{ .executors = .exact(2), .http3 = .{ .alt_svc = false, .validate_address = true } });
+    defer app.deinit();
+    app.get("/addr", remoteAddressBody);
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const q = a.http3Address().?;
+            const dual = address_mod.dualStackAvailable();
+            try std.testing.expectEqual(dual, q == .ip6);
+            const port = q.getPort();
+            try std.testing.expectEqualStrings("127.0.0.1", try h3Get(io_, .{ .ip4 = .loopback(port) }));
+            if (dual and haveIpv6Loopback()) try std.testing.expectEqualStrings("::1", try h3Get(io_, .{ .ip6 = .loopback(port) }));
+        }
+
+        var body_buf: [64]u8 = undefined;
+
+        fn h3Get(io_: std.Io, to: std.Io.net.IpAddress) ![]const u8 {
+            const conn = try h3.ClientConnection.connect(alloc, io_, .{
+                .host = "localhost",
+                .address = to,
+                .port = to.getPort(),
+                .tls = .{ .insecure_skip_verify = true },
+                .connect_timeout = .fromSeconds(3),
+            });
+            defer conn.close();
+            const s = try conn.request(&.{
+                .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/addr" },
+                .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+            }, .{});
+            defer s.release();
+            try s.waitHead();
+            if (s.status != 200) return error.UnexpectedStatus;
+            const body = try s.reader().allocRemaining(alloc, .unlimited);
+            defer alloc.free(body);
+            @memcpy(body_buf[0..body.len], body);
+            return body_buf[0..body.len];
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.listenTls(":0", .dev_self_signed);
+    try checking.await(app.io());
 }

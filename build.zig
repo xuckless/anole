@@ -2,8 +2,9 @@
 //!
 //! Features are chosen with `-Dprofile=minimal|web|full` (default `full`) and
 //! overridden one by one with `-Dtls=boringssl|none`, `-Dhttp2`, `-Dhttp3`,
-//! `-Dgrpc`, `-Dwebsocket` and `-Dauth`. The result is exposed to Zig code as
-//! the `build_options` module (re-exported as `anole.features`).
+//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and
+//! the rest below. The result is exposed to Zig code as the `build_options`
+//! module (re-exported as `anole.features`).
 //!
 //! Every C library is a lazy dependency in build.zig.zon and is requested only
 //! when a feature that needs it is on, so `-Dprofile=minimal` fetches and
@@ -14,13 +15,15 @@
 //!   test-flags  the test binary for every preset and edge combination, sharing
 //!               one build of each C library (run when the target is native)
 //!   <example>   install examples/<example> (hello, rest, websocket, grpc, auth,
-//!               clients, observe, full)
+//!               clients, observe, sqlite, full)
 //!   run-<example>  run it (`zig build run-rest -- 127.0.0.1:4000`)
 //!   full        examples/full, every listener spelled out (also part of the
 //!               default install step; the h2spec and restart scripts drive it)
 //!   bench-server  the Anole side of bench/run.sh (with -Doptimize=ReleaseFast)
 //!   io          install examples/io (handlers waiting on I/O through std.Io)
 //!   run-io      run examples/io (`zig build run-io -- 8081`)
+//!   docs        the API reference (Zig autodoc of the `anole` module) in
+//!               zig-out/docs; the docs site (site/) serves it at /anole/api/
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -30,8 +33,11 @@ const ngtcp2_build = @import("build/ngtcp2.zig");
 const nghttp3_build = @import("build/nghttp3.zig");
 const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
+const brotli_build = @import("build/brotli.zig");
 const yyjson_build = @import("build/yyjson.zig");
+const upb_build = @import("build/upb.zig");
 const hiredis_build = @import("build/hiredis.zig");
+const sqlite_build = @import("build/sqlite.zig");
 
 /// This file's struct, for `b.lazyImport` (which must name the build.zig that declares the dependency).
 const build_zig = @This();
@@ -60,18 +66,28 @@ pub const Features = struct {
     /// gzip/deflate (zlib-ng) and zstd: response compression and request
     /// decompression.
     compression: bool,
+    /// Brotli (google/brotli) as a third response coding next to zstd and
+    /// gzip. Needs `compression`.
+    brotli: bool,
     /// JSON on yyjson (`anole.json`).
     json: bool,
     /// Redis/Valkey on hiredis (`anole.redis`): session and rate-limit
     /// stores.
     redis: bool,
+    /// The PostgreSQL client (`anole.pg`).
+    postgres: bool,
+    /// SQLite, the library built in (`anole.sqlite`).
+    sqlite: bool,
+    /// The MongoDB client (`anole.mongodb`) and its BSON codec
+    /// (`anole.bson`).
+    mongodb: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .json = false, .redis = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .json = true, .redis = false },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .json = true, .redis = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true },
         };
     }
 
@@ -79,6 +95,7 @@ pub const Features = struct {
     pub fn invalid(f: Features) ?[]const u8 {
         if (f.grpc and !f.http2) return "-Dgrpc=true requires -Dhttp2=true (gRPC runs over HTTP/2 with trailers)";
         if (f.http3 and f.tls == .none) return "-Dhttp3=true requires -Dtls=boringssl (QUIC always uses TLS 1.3)";
+        if (f.brotli and !f.compression) return "-Dbrotli=true requires -Dcompression=true (Brotli is one of the Compress middleware's codings)";
         return null;
     }
 
@@ -86,13 +103,14 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis;
+        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite or f.grpc;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
-            (!f.compression or have.compression) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
-            (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth);
+            (!f.compression or have.compression) and (!f.brotli or have.brotli) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
+            (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth) and
+            (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb);
     }
 };
 
@@ -110,11 +128,35 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
     .{ .name = "full-no-compression", .features = blk: {
         var f = Features.preset(.full);
         f.compression = false;
+        f.brotli = false;
+        break :blk f;
+    } },
+    // zstd and gzip without Brotli.
+    .{ .name = "full-no-brotli", .features = blk: {
+        var f = Features.preset(.full);
+        f.brotli = false;
         break :blk f;
     } },
     .{ .name = "http2-no-grpc", .features = blk: {
         var f = Features.preset(.full);
         f.grpc = false;
+        break :blk f;
+    } },
+    // Everything but the database connectors.
+    .{ .name = "db-none", .features = blk: {
+        var f = Features.preset(.full);
+        f.postgres = false;
+        f.sqlite = false;
+        f.mongodb = false;
+        break :blk f;
+    } },
+    // The connectors on HTTP/1.1 alone: no TLS (plain connections only),
+    // no JSON, no compression.
+    .{ .name = "db-only", .features = blk: {
+        var f = Features.preset(.minimal);
+        f.postgres = true;
+        f.sqlite = true;
+        f.mongodb = true;
         break :blk f;
     } },
 };
@@ -221,21 +263,22 @@ pub fn addProtoModule(b: *std.Build, anole_dep: *std.Build.Dependency, proto: Pr
 }
 
 /// zig-protobuf's pinned protoc for the machine running the build (its
-/// `build_util.getProtocBin`, which its build.zig does not export).
+/// `build_util.getProtocBin`, which its build.zig does not export). Google's
+/// release binaries, pinned by hash in zig-protobuf's build.zig.zon; on
+/// Windows the win64 one (also on arm64 Windows, which runs x64 programs).
 fn protocBinary(pb_builder: *std.Build) ?std.Build.LazyPath {
-    const os = switch (builtin.os.tag) {
-        .macos => "osx",
-        .linux => "linux",
-        else => @compileError("protoc: Anole builds on Linux and macOS"),
+    const name = switch (builtin.os.tag) {
+        .windows => "protoc-win64",
+        .macos, .linux => "protoc-" ++ (if (builtin.os.tag == .macos) "osx" else "linux") ++ "-" ++ switch (builtin.cpu.arch) {
+            .aarch64 => "aarch_64",
+            .x86_64 => "x86_64",
+            .x86 => "x86_32",
+            else => @compileError("protoc: no pinned binary for this CPU"),
+        },
+        else => @compileError("protoc: Anole builds on Linux, macOS and Windows"),
     };
-    const arch = switch (builtin.cpu.arch) {
-        .aarch64 => "aarch_64",
-        .x86_64 => "x86_64",
-        .x86 => "x86_32",
-        else => @compileError("protoc: no pinned binary for this CPU"),
-    };
-    const dep = pb_builder.lazyDependency("protoc-" ++ os ++ "-" ++ arch, .{}) orelse return null;
-    return dep.path("bin/protoc");
+    const dep = pb_builder.lazyDependency(name, .{}) orelse return null;
+    return dep.path(if (builtin.os.tag == .windows) "bin/protoc.exe" else "bin/protoc");
 }
 
 /// The `package` a .proto file in the project declares, or null. The
@@ -312,6 +355,10 @@ pub const App = struct {
 pub fn addApp(b: *std.Build, options: AppOptions) App {
     const target = options.target orelse b.standardTargetOptions(.{});
     const optimize = options.optimize orelse b.standardOptimizeOption(.{});
+    // Not refused (it is the fastest build), but said: a server takes
+    // untrusted input, and ReleaseFast turns a bug Zig would stop at into
+    // undefined behaviour.
+    if (optimize == .fast or optimize == .small) std.log.warn("{s}: -Doptimize={s} turns Zig's safety checks off (a bug that would stop the server can corrupt memory instead); Anole recommends -Doptimize=ReleaseSafe for production", .{ options.name, if (optimize == .fast) "ReleaseFast" else "ReleaseSmall" });
     const anole_dep = if (options.profile) |profile|
         b.dependency(options.dependency, .{ .target = target, .optimize = optimize, .profile = profile })
     else
@@ -349,11 +396,18 @@ pub fn build(b: *std.Build) void {
 
     // Options are declared before the lazy-dependency return below: one
     // first declared after it is "invalid" on a fresh cache's first pass.
-    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port");
+    const redis_test_port = b.option(u16, "redis-test-port", "Run the Redis tests against a live Redis/Valkey on this port of 127.0.0.1");
+    const redis_test_url = b.option([]const u8, "redis-test-url", "Run the Redis tests against a live Redis/Valkey at this URL (redis://, rediss://...)");
+    const postgres_test_url = b.option([]const u8, "postgres-test-url", "Run the PostgreSQL tests against a live server at this URL (postgres://...)");
+    const mongodb_test_url = b.option([]const u8, "mongodb-test-url", "Run the MongoDB tests against a live server at this URL (mongodb://...)");
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
     const use_llvm = b.option(bool, "llvm", "Build the unit tests with LLVM (needed for --fuzz on x86_64-linux)");
+    // The BSON corpus, a test-only download: requested here so a fresh cache
+    // fetches it with the C libraries, and never for a project depending on
+    // Anole.
+    const mongodb_specs = if (b.isRoot() and features.mongodb) b.lazyDependency("mongodb_specs", .{}) else null;
 
     // C libraries, requested only for the features that are on. On the first
     // configure pass a missing lazy dependency yields null; the build runner
@@ -370,29 +424,102 @@ pub fn build(b: *std.Build) void {
 
     // Core: zio (runtime) and the HTTP core (src/http/core), always on.
     const core = Core.init(b, c_mods, target, optimize);
+    // pg.zig's TLS: Anole's BoringSSL client (src/pg/tls.zig).
+    if (c_mods.pg_tls) |pg| pg.addImport("tls", b.createModule(.{
+        .root_source_file = b.path("src/pg/tls.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "anole_dusty_tls", .module = core.tls_seam.? }},
+    }));
+
+    // BSON (src/bson), the codec under the MongoDB client: pure Zig, its own
+    // module, imported by the anole module as "bson" when -Dmongodb is on
+    // (here or in a test-flags combination); nothing compiles it otherwise.
+    const bson_mod = b.createModule(.{ .root_source_file = b.path("src/bson/root.zig"), .target = target, .optimize = optimize });
 
     // The public `anole` module, for `b.dependency("anole", ...).module("anole")`.
-    const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .public = true });
+    const anole_mod = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .public = true });
     // zig-protobuf's runtime, which the code `addProtoGen` generates imports
     // as "protobuf": `anole_dep.module("protobuf")`.
     if (c_mods.protobuf) |m| _ = b.modules.getOrPutValue(b.graph.arena, "protobuf", m) catch @panic("OOM");
+
+    // docs: Zig's autodoc for the `anole` module, in zig-out/docs (the docs
+    // site serves it at /anole/api/). It documents the features that are on,
+    // so run it with the default full profile. Only the docs are emitted
+    // (-fno-emit-bin), though the C libraries the module links are built.
+    if (b.isRoot()) {
+        const docs_obj = b.addObject(.{ .name = "anole", .root_module = anole_mod });
+        const install_docs = b.addInstallDirectory(.{
+            .source_dir = docs_obj.getEmittedDocs(),
+            .install_dir = .prefix,
+            .install_subdir = "docs",
+        });
+        b.step("docs", "Generate the API reference (Zig autodoc for the anole module) into zig-out/docs").dependOn(&install_docs.step);
+    }
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
 
+    // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
+    // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
+    if (features.postgres) {
+        const pg_tests = b.addTest(.{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const run_pg_tests = b.addRunArtifact(pg_tests);
+        run_pg_tests.has_side_effects = postgres_test_url != null;
+        b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
+    }
+    // That the options header reached the compiled SQLite (build/sqlite.zig).
+    if (c_mods.sqlite_build_test) |run| test_step.dependOn(&run.step);
+    // test-sqlite: the SQLite tests alone ("sqlite: ...").
+    if (features.sqlite) {
+        const sqlite_tests = b.addTest(.{ .name = "anole-test-sqlite", .root_module = tests.root_module, .filters = &.{"sqlite:"}, .use_llvm = use_llvm });
+        b.step("test-sqlite", "Run the SQLite tests").dependOn(&b.addRunArtifact(sqlite_tests).step);
+    }
+    // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
+    // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
+    if (features.mongodb) {
+        const mongo_tests = b.addTest(.{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const run_mongo_tests = b.addRunArtifact(mongo_tests);
+        run_mongo_tests.has_side_effects = mongodb_test_url != null;
+        b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
+    }
+
+    // test-redis: the Redis tests alone ("redis: ..."), the session store's
+    // and the rate limiter's among them; with -Dredis-test-url (or
+    // -Dredis-test-port), against that server (tests/redis/run.sh).
+    if (features.redis) {
+        const redis_tests = b.addTest(.{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const run_redis_tests = b.addRunArtifact(redis_tests);
+        run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
+        b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
+    }
+
+    // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
+    // HTTP/3 detached answers, the configuration parser).
+    {
+        const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
+        b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
+    }
+    // test-grpc: the gRPC tests alone (the native server and client, JSON
+    // transcoding, and the C ABI's gRPC server).
+    if (features.grpc) {
+        const grpc_tests = b.addTest(.{ .name = "anole-test-grpc", .root_module = tests.root_module, .filters = &.{ "gRPC", "transcoding", "capi grpc" }, .use_llvm = use_llvm });
+        b.step("test-grpc", "Run the gRPC tests (native, transcoding, the C ABI's)").dependOn(&b.addRunArtifact(grpc_tests).step);
+    }
+
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
     // on what Anole builds into it: BoringSSL through src/tls/dusty_tls.zig,
-    // nghttp2, zlib-ng and zstd. Part of `test`, and `core-test` alone.
-    if (core.dusty_by[1][1][1] != null and target.query.isNative()) {
-        const core_full = core.dusty_by[1][1][1].?;
+    // nghttp2, zlib-ng, zstd and Brotli. Part of `test`, and `core-test` alone.
+    if (core.dusty_by[1][1][1][@intFromBool(features.brotli)] != null and target.query.isNative()) {
+        const core_full = core.dusty_by[1][1][1][@intFromBool(features.brotli)].?;
         // A second instance of the same sources and imports, but with the
         // core's zio stub: its tests run on std.testing.io, and the real
         // zio's timers need a zio task.
@@ -443,7 +570,7 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
-        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng and zstd").dependOn(&run_core_tests.step);
+        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli").dependOn(&run_core_tests.step);
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -460,27 +587,73 @@ pub fn build(b: *std.Build) void {
         }
         const t = b.addTest(.{
             .name = b.fmt("anole-test-{s}", .{combo.name}),
-            .root_module = anoleModule(b, .{ .features = combo.features, .core = core, .c = c_mods, .target = target, .optimize = optimize, .for_test = true }),
+            .root_module = anoleModule(b, .{ .features = combo.features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true }),
         });
         const run = b.addRunArtifact(t);
         run.skip_foreign_checks = true;
         flags_step.dependOn(&run.step);
     }
 
-    // tests/tls_duplex.zig: the multi-threaded full-duplex TLS check.
-    if (features.needsTls()) {
-        const duplex = b.addExecutable(.{
-            .name = "tls-duplex",
+    // BSON (src/bson) and the MongoDB client's pure parts (src/mongodb:
+    // the connection string, SCRAM, the topology state machine), with
+    // -Dmongodb. The BSON tests' "fuzz:" targets get src/fuzz.zig as the
+    // module "fuzz".
+    if (features.mongodb) {
+        const bson = bson_mod;
+        const bson_tests = b.addTest(.{
+            .name = "bson-test",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/tls_duplex.zig"),
+                .root_source_file = b.path("src/bson/root.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
             }),
+            .use_llvm = use_llvm,
         });
-        const run_duplex = b.addRunArtifact(duplex);
-        run_duplex.skip_foreign_checks = true;
-        test_step.dependOn(&run_duplex.step);
+        const run_bson_tests = b.addRunArtifact(bson_tests);
+        run_bson_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_bson_tests.step);
+        const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
+        bson_step.dependOn(&run_bson_tests.step);
+        const mongodb_spec_step = b.step("mongodb-spec-test", "Run the MongoDB client's spec tests (connection string, URI options, auth, SDAM) from mongodb/specifications");
+        // tests/bson/corpus_test.zig over the corpus files, which it embeds:
+        // both are copied into one generated directory.
+        if (mongodb_specs) |specs| {
+            const files = b.addWriteFiles();
+            _ = files.addCopyDirectory(specs.path("source/bson-corpus/tests"), "corpus", .{ .include_extensions = &.{".json"} });
+            const corpus_tests = b.addTest(.{
+                .name = "bson-corpus",
+                .root_module = b.createModule(.{
+                    .root_source_file = files.addCopyFile(b.path("tests/bson/corpus_test.zig"), "corpus_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "bson", .module = bson }},
+                }),
+                .use_llvm = use_llvm,
+            });
+            const run_corpus = b.addRunArtifact(corpus_tests);
+            run_corpus.skip_foreign_checks = true;
+            test_step.dependOn(&run_corpus.step);
+            bson_step.dependOn(&run_corpus.step);
+
+            // src/mongodb/spec_test.zig reads the spec's JSON test files at
+            // run time, from the specification's `source` directory.
+            const spec_tests = b.addTest(.{
+                .name = "mongodb-spec-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/mongodb/spec_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "bson", .module = bson }},
+                }),
+                .use_llvm = use_llvm,
+            });
+            const run_spec = b.addRunArtifact(spec_tests);
+            run_spec.skip_foreign_checks = true;
+            run_spec.setCwd(specs.path("source"));
+            test_step.dependOn(&run_spec.step);
+            mongodb_spec_step.dependOn(&run_spec.step);
+        }
     }
 
     // examples/<name>: one per protocol or area, each built by `zig build
@@ -495,6 +668,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
         .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },
         .{ .name = "observe", .needs = true, .about = "metrics, tracing, access logs and health checks" },
+        .{ .name = "postgres", .needs = features.postgres, .about = "a posts API on PostgreSQL (DATABASE_URL), on port 3000" },
+        .{ .name = "sqlite", .needs = features.sqlite, .about = "a to-do API on SQLite (todos.db, or a path after --), on port 3000" },
+        .{ .name = "mongodb", .needs = features.mongodb, .about = "a users API on MongoDB (MONGODB_URI), on port 3000" },
+        .{ .name = "redis", .needs = features.redis, .about = "a counter, a cache, a leaderboard and pub/sub on Redis (REDIS_URL), on port 3000" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;
@@ -528,6 +705,20 @@ pub fn build(b: *std.Build) void {
             const run_rest_test = b.addRunArtifact(rest_test);
             run_rest_test.skip_foreign_checks = true;
             test_step.dependOn(&run_rest_test.step);
+        }
+        if (std.mem.eql(u8, ex.name, "sqlite")) {
+            const sqlite_test = b.addTest(.{
+                .name = "sqlite-example-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/sqlite_example_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "sqlite_example", .module = ex_mod } },
+                }),
+            });
+            const run_sqlite_test = b.addRunArtifact(sqlite_test);
+            run_sqlite_test.skip_foreign_checks = true;
+            test_step.dependOn(&run_sqlite_test.step);
         }
         const run_ex = b.addRunArtifact(ex_exe);
         run_ex.addPassthruArgs();
@@ -568,6 +759,249 @@ pub fn build(b: *std.Build) void {
         });
         b.step("bench-server", "Build the benchmark server (bench/run.sh; use -Doptimize=ReleaseFast)").dependOn(&b.addInstallArtifact(bench, .{}).step);
         test_step.dependOn(&bench.step);
+    }
+
+    // capi: libanole, the C ABI (include/anole.h) as a static and a shared
+    // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
+    {
+        const capi_mod = b.createModule(.{
+            .root_source_file = b.path("src/capi/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            // Linked into shared objects (a Node addon, a Python extension).
+            .pic = true,
+            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+        });
+        const capi_opts = b.addOptions();
+        capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+        capi_mod.addOptions("capi_options", capi_opts);
+        // The C++ runtime symbols BoringSSL's objects need, so that libanole
+        // needs no libstdc++ or libc++ in the final link (Linux has no
+        // std::__1 in libstdc++ at all).
+        if ((target.result.os.tag == .linux or target.result.os.tag.isDarwin()) and features.tls == .boringssl) {
+            capi_mod.link_libcpp = true;
+            capi_mod.addCSourceFile(.{ .file = b.path("src/capi/cxx_shim.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
+        }
+        const capi_step = b.step("capi", "Build libanole (static and shared, only anole_* exported) and install include/anole.h");
+        // capi-zig: the Zig part alone, as a static library (not
+        // self-contained), e.g. to check that it cross-compiles.
+        const zig_lib = b.addLibrary(.{ .name = "anole_zig", .linkage = .static, .root_module = capi_mod });
+        b.step("capi-zig", "Build only the Zig part of libanole (libanole_zig.a, not self-contained)").dependOn(&b.addInstallArtifact(zig_lib, .{}).step);
+        // Packing, with Zig alone: one relocatable object holds the Zig
+        // code, every C library it links (the linker pulls in what is
+        // used), compiler-rt and, in Debug, the UBSan runtime; it needs only
+        // libc. tools/capi_symbols.zig then hides every symbol but anole_*,
+        // and the two libraries are made from that object.
+        const symbols_tool = b.addExecutable(.{
+            .name = "capi_symbols",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/capi_symbols.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const os = target.result.os.tag;
+        const packable = os == .linux or os.isDarwin();
+        var lib_obj: std.Build.LazyPath = undefined;
+        var shared_lib: *std.Build.Step.Compile = undefined;
+        var static_lib_opt: ?*std.Build.Step.Compile = null;
+        if (packable) {
+            const merged = b.addObject(.{ .name = "anole", .root_module = capi_mod });
+            merged.bundle_compiler_rt = true;
+            merged.bundle_ubsan_rt = true;
+            const hide = b.addRunArtifact(symbols_tool);
+            hide.addArg("hide");
+            hide.addFileArg(merged.getEmittedBin());
+            lib_obj = hide.addOutputFileArg("anole.o");
+            // Mach-O: the merge drops N_ALT_ENTRY/N_NO_DEAD_STRIP, which the
+            // tool takes back from the inputs (tools/capi_symbols.zig).
+            if (os.isDarwin()) for (linkedInputs(b, capi_mod)) |input| hide.addFileArg(input);
+            const static_lib = b.addLibrary(.{
+                .name = "anole",
+                .linkage = .static,
+                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+            });
+            static_lib.root_module.addObjectFile(lib_obj);
+            capi_step.dependOn(&b.addInstallArtifact(static_lib, .{}).step);
+            static_lib_opt = static_lib;
+            shared_lib = b.addLibrary(.{
+                .name = "anole",
+                .linkage = .dynamic,
+                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .pic = true }),
+            });
+            shared_lib.root_module.addObjectFile(lib_obj);
+        } else {
+            // COFF cannot merge objects into one, and a DLL exports only
+            // what is dllexport (the anole_* functions): Windows gets
+            // anole.dll and its import library, linked from the module.
+            shared_lib = b.addLibrary(.{ .name = "anole", .linkage = .dynamic, .root_module = capi_mod });
+            shared_lib.bundle_compiler_rt = true;
+            shared_lib.bundle_ubsan_rt = true;
+        }
+        capi_step.dependOn(&b.addInstallArtifact(shared_lib, .{}).step);
+        // The symbol check runs with every build of libanole on Linux and
+        // macOS: the object and the shared library export anole_* alone.
+        if (packable) for ([_]std.Build.LazyPath{ lib_obj, shared_lib.getEmittedBin() }) |file| {
+            const check = b.addRunArtifact(symbols_tool);
+            check.addArg("check");
+            check.addFileArg(file);
+            check.expectExitCode(0);
+            capi_step.dependOn(&check.step);
+        };
+
+        // capi-test (also part of `test`): anole.h's layout against
+        // src/capi/abi.zig (the header through translate-c), the symbol
+        // check, and the C suite (tests/capi/consumer.c) on libanole.a.
+        const capi_test_step = b.step("capi-test", "Test the C ABI: anole.h layout, exported symbols, the C suite");
+        if (b.lazyImport(@This(), "translate_c")) |tc| if (b.lazyDependency("translate_c", .{})) |tc_dep| {
+            const header: tc.Translator = .init(tc_dep, .{
+                .name = "anole_h",
+                .c_source_file = b.path("include/anole.h"),
+                .target = target,
+                .optimize = optimize,
+            });
+            const abi_test = b.addTest(.{
+                .name = "capi-abi-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/capi/abi_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "capi_abi", .module = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize }) },
+                        .{ .name = "anole_h", .module = header.mod },
+                    },
+                }),
+            });
+            capi_test_step.dependOn(&b.addRunArtifact(abi_test).step);
+        };
+        if (static_lib_opt) |static_lib| {
+            capi_test_step.dependOn(capi_step);
+            const consumer = b.addExecutable(.{
+                .name = "capi-consumer",
+                .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+            });
+            consumer.root_module.addCSourceFile(.{ .file = b.path("tests/capi/consumer.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+            consumer.root_module.addIncludePath(b.path("include"));
+            consumer.root_module.linkLibrary(static_lib);
+            const run_consumer = b.addRunArtifact(consumer);
+            run_consumer.addArg("test");
+            // The client of the suite's WebTransport test, in Zig (C has
+            // no WebTransport client): its path is the second argument.
+            const wt_client: ?*std.Build.Step.Compile = if (features.http3) b.addExecutable(.{
+                .name = "capi-wt-client",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/capi/wt_client.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                }),
+            }) else null;
+            if (wt_client) |wc| run_consumer.addArtifactArg(wc);
+            // Its progress lines and Anole's warnings (a drain cut short on
+            // purpose) on the terminal; a failure is its exit code.
+            run_consumer.stdio = .inherit;
+            run_consumer.has_side_effects = true;
+            // The PostgreSQL part of the suite, against that server.
+            if (postgres_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_POSTGRES_URL", url);
+            if (redis_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
+            if (mongodb_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
+            capi_test_step.dependOn(&run_consumer.step);
+            b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
+
+            // The gRPC suite (tests/capi/grpc.c): its own process, as one
+            // anole_server is allowed per process.
+            if (features.grpc) {
+                const grpc_c = b.addExecutable(.{
+                    .name = "capi-grpc",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                grpc_c.root_module.addCSourceFile(.{ .file = b.path("tests/capi/grpc.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                grpc_c.root_module.addIncludePath(b.path("include"));
+                grpc_c.root_module.linkLibrary(static_lib);
+                const run_grpc_c = b.addRunArtifact(grpc_c);
+                run_grpc_c.stdio = .inherit;
+                run_grpc_c.has_side_effects = true;
+                capi_test_step.dependOn(&run_grpc_c.step);
+                const grpc_step = b.step("capi-grpc", "Build the C gRPC consumers (tests/capi/grpc.c; grpc_interop.c, grpc.testing.TestService for tests/grpc/interop/run.sh)");
+                grpc_step.dependOn(&b.addInstallArtifact(grpc_c, .{}).step);
+                const interop_c = b.addExecutable(.{
+                    .name = "capi-grpc-interop",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                interop_c.root_module.addCSourceFile(.{ .file = b.path("tests/capi/grpc_interop.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                interop_c.root_module.addIncludePath(b.path("include"));
+                interop_c.root_module.linkLibrary(static_lib);
+                grpc_step.dependOn(&b.addInstallArtifact(interop_c, .{}).step);
+                // Compiled with capi-test, so it cannot rot; run by hand or in CI.
+                capi_test_step.dependOn(&interop_c.step);
+            }
+
+            // A TLS listener in a program linked with dead-stripping, as
+            // bindings and release links are (tests/capi/tls_start.c): the
+            // packed object must survive being cut at its symbols. Zig's
+            // linker here; the system's in capi-test-asan.
+            const tls_driver = if (features.tls == .boringssl) b.addExecutable(.{
+                .name = "capi-tls-start-driver",
+                .root_module = b.createModule(.{ .root_source_file = b.path("tests/capi/tls_start.zig"), .target = b.graph.host, .optimize = .Debug }),
+            }) else null;
+            if (tls_driver) |driver| {
+                const tls_start = b.addExecutable(.{
+                    .name = "capi-tls-start",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                tls_start.root_module.addCSourceFile(.{ .file = b.path("tests/capi/tls_start.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                tls_start.root_module.addIncludePath(b.path("include"));
+                tls_start.root_module.linkLibrary(static_lib);
+                tls_start.link_gc_sections = true; // Mach-O -dead_strip, ELF --gc-sections
+                const run_tls_start = b.addRunArtifact(driver);
+                run_tls_start.addArtifactArg(tls_start);
+                run_tls_start.has_side_effects = true;
+                run_tls_start.stdio = .inherit;
+                capi_test_step.dependOn(&run_tls_start.step);
+            }
+
+            // capi-test-asan: the C suite built by the system C compiler
+            // with AddressSanitizer and UBSan (Zig ships no ASan runtime);
+            // libanole itself keeps Zig's own safety checks.
+            const asan_step = b.step("capi-test-asan", "Run the C ABI suite built with -fsanitize=address,undefined, and a TLS listener in a dead-stripped link (needs a system cc)");
+            const cc = b.addSystemCommand(&.{ "cc", "-O1", "-g", "-std=c11", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined" });
+            cc.addPrefixedDirectoryArg("-I", b.path("include"));
+            cc.addFileArg(b.path("tests/capi/consumer.c"));
+            cc.addFileArg(static_lib.getEmittedBin());
+            if (os == .linux) cc.addArgs(&.{ "-lpthread", "-ldl", "-lm" });
+            cc.addArg("-o");
+            const asan_exe = cc.addOutputFileArg("capi-consumer-asan");
+            const run_asan = std.Build.Step.Run.create(b, "run capi-consumer-asan");
+            run_asan.addFileArg(asan_exe);
+            run_asan.addArg("test");
+            if (wt_client) |wc| run_asan.addArtifactArg(wc);
+            run_asan.has_side_effects = true;
+            run_asan.stdio = .inherit;
+            // Zig's threads install a signal stack of their own (for the
+            // stack-overflow handler); ASan's would unmap it at thread exit.
+            run_asan.setEnvironmentVariable("ASAN_OPTIONS", "use_sigaltstack=0");
+            if (postgres_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_POSTGRES_URL", url);
+            if (redis_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
+            if (mongodb_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
+            asan_step.dependOn(&run_asan.step);
+            if (tls_driver) |driver| {
+                const ds = b.addSystemCommand(&.{ "cc", "-O2", "-std=c11" });
+                ds.addPrefixedDirectoryArg("-I", b.path("include"));
+                ds.addFileArg(b.path("tests/capi/tls_start.c"));
+                ds.addFileArg(static_lib.getEmittedBin());
+                if (os == .linux) ds.addArgs(&.{ "-Wl,--gc-sections", "-lpthread", "-ldl", "-lm" }) else ds.addArg("-Wl,-dead_strip");
+                ds.addArg("-o");
+                const ds_exe = ds.addOutputFileArg("capi-tls-start-cc");
+                const run_ds = b.addRunArtifact(driver);
+                run_ds.addFileArg(ds_exe);
+                run_ds.has_side_effects = true;
+                run_ds.stdio = .inherit;
+                asan_step.dependOn(&run_ds.step);
+            }
+        }
+        test_step.dependOn(capi_test_step);
+        capi_step.dependOn(&b.addInstallHeaderFile(b.path("include/anole.h"), "anole.h").step);
     }
 
     // tls-public-check: outbound HTTPS against public hosts (needs the network).
@@ -760,7 +1194,8 @@ pub fn build(b: *std.Build) void {
 
 /// Reads -Dprofile and the per-feature overrides. A feature that depends on a
 /// turned-off one follows it when it was not set explicitly (`-Dtls=none`
-/// turns http3 off, `-Dhttp2=false` turns grpc off); an explicit contradiction
+/// turns http3 off, `-Dhttp2=false` turns grpc off, `-Dcompression=false`
+/// brotli); an explicit contradiction
 /// is an error.
 fn resolveFeatures(b: *std.Build) Features {
     const profile = b.option(Profile, "profile", "Feature preset: minimal (HTTP/1.1 only), web, full (default)") orelse .full;
@@ -771,8 +1206,12 @@ fn resolveFeatures(b: *std.Build) Features {
     const websocket = b.option(bool, "websocket", "WebSocket (overrides the profile)");
     const auth = b.option(bool, "auth", "Auth: JWT, OIDC, sessions, API keys (overrides the profile)");
     const compression = b.option(bool, "compression", "gzip/deflate (zlib-ng) and zstd (overrides the profile)");
+    const brotli = b.option(bool, "brotli", "Brotli response compression (google/brotli); needs -Dcompression=true (overrides the profile)");
     const json = b.option(bool, "json", "JSON on yyjson (overrides the profile)");
     const redis = b.option(bool, "redis", "Redis/Valkey client on hiredis (overrides the profile)");
+    const postgres = b.option(bool, "postgres", "PostgreSQL client (overrides the profile)");
+    const sqlite = b.option(bool, "sqlite", "SQLite, built in (overrides the profile)");
+    const mongodb = b.option(bool, "mongodb", "MongoDB client (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -782,11 +1221,16 @@ fn resolveFeatures(b: *std.Build) Features {
     if (websocket) |v| f.websocket = v;
     if (auth) |v| f.auth = v;
     if (compression) |v| f.compression = v;
+    if (brotli) |v| f.brotli = v;
     if (json) |v| f.json = v;
     if (redis) |v| f.redis = v;
+    if (postgres) |v| f.postgres = v;
+    if (sqlite) |v| f.sqlite = v;
+    if (mongodb) |v| f.mongodb = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
+    if (!f.compression and brotli == null) f.brotli = false;
 
     if (f.invalid()) |msg| {
         std.debug.print("error: invalid Anole feature flags: {s}\n", .{msg});
@@ -826,15 +1270,15 @@ const LlHttp = struct {
 const Core = struct {
     zio: *std.Build.Module,
     llhttp: LlHttp,
-    /// dusty instances by [tls][http2][compression]. One exists for each
-    /// combination this build can satisfy: TLS needs BoringSSL in the build,
-    /// HTTP/2 nghttp2, compression zlib-ng. Different arguments give separate
-    /// dusty instances, so test-flags can build every combination side by
-    /// side.
-    dusty_by: [2][2][2]?*std.Build.Module,
+    /// dusty instances by [tls][http2][compression][brotli]. One exists for
+    /// each combination this build can satisfy: TLS needs BoringSSL in the
+    /// build, HTTP/2 nghttp2, compression zlib-ng, Brotli google/brotli and
+    /// compression. Different arguments give separate dusty instances, so
+    /// test-flags can build every combination side by side.
+    dusty_by: [2][2][2][2]?*std.Build.Module,
     /// src/h2/client.zig for each HTTP/2 dusty instance, which imports it as
     /// `h2_client` (and it imports that dusty back), by the same index.
-    h2_client_by: [2][2][2]?*std.Build.Module,
+    h2_client_by: [2][2][2][2]?*std.Build.Module,
     /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
 
@@ -850,33 +1294,37 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(null))), .h2_client_by = @splat(@splat(@splat(null))), .tls_seam = seam };
+        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
                 if (http2 and c_mods.nghttp2 == null) continue;
                 for ([_]bool{ false, true }) |compression| {
                     if (compression and c_mods.zlib == null) continue;
-                    const dusty_mod = coreModule(
-                        b,
-                        zio_mod,
-                        core.llhttp,
-                        if (tls) seam else null,
-                        if (http2) c_mods.nghttp2 else null,
-                        if (compression) c_mods.zlib else null,
-                        if (compression) c_mods.zstd else null,
-                        target,
-                        optimize,
-                    );
-                    core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)] = dusty_mod;
-                    if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)] = h2ClientModule(
-                        b,
-                        dusty_mod,
-                        c_mods.nghttp2.?,
-                        if (tls) seam else null,
-                        target,
-                        optimize,
-                    );
+                    for ([_]bool{ false, true }) |brotli| {
+                        if (brotli and (!compression or c_mods.brotli == null)) continue;
+                        const dusty_mod = coreModule(
+                            b,
+                            zio_mod,
+                            core.llhttp,
+                            if (tls) seam else null,
+                            if (http2) c_mods.nghttp2 else null,
+                            if (compression) c_mods.zlib else null,
+                            if (compression) c_mods.zstd else null,
+                            if (brotli) c_mods.brotli else null,
+                            target,
+                            optimize,
+                        );
+                        core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
+                        if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
+                            b,
+                            dusty_mod,
+                            c_mods.nghttp2.?,
+                            if (tls) seam else null,
+                            target,
+                            optimize,
+                        );
+                    }
                 }
             }
         }
@@ -884,11 +1332,11 @@ const Core = struct {
     }
 
     fn dusty(core: Core, f: Features) *std.Build.Module {
-        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
+        return core.dusty_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)][@intFromBool(f.brotli)].?;
     }
 
     fn h2Client(core: Core, f: Features) *std.Build.Module {
-        return core.h2_client_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)].?;
+        return core.h2_client_by[@intFromBool(f.needsTls())][@intFromBool(f.http2)][@intFromBool(f.compression)][@intFromBool(f.brotli)].?;
     }
 
     /// The HTTP/2 client, as its own module so dusty's client can take it
@@ -919,7 +1367,7 @@ const Core = struct {
     }
 
     /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one
-    /// combination of TLS, HTTP/2 and compression. What a combination leaves
+    /// combination of TLS, HTTP/2, compression and Brotli. What a combination leaves
     /// out gets the core's stub instead (`tls`, `zlib`), or no import at all.
     fn coreModule(
         b: *std.Build,
@@ -929,6 +1377,7 @@ const Core = struct {
         nghttp2: ?*std.Build.Module,
         zlib: ?*std.Build.Module,
         zstd: ?*std.Build.Module,
+        brotli: ?*std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -943,6 +1392,7 @@ const Core = struct {
         opts.addOption(bool, "use_http2", nghttp2 != null);
         opts.addOption(bool, "use_zlib", zlib != null);
         opts.addOption(bool, "use_zstd", zstd != null);
+        opts.addOption(bool, "use_brotli", brotli != null);
         mod.addOptions("build_options", opts);
         // The real runtime, so timeouts use zio.AutoCancel; the core's own
         // tests use src/http/core/zio_stub.zig instead.
@@ -953,6 +1403,7 @@ const Core = struct {
         if (nghttp2) |m| mod.addImport("nghttp2", m);
         if (zlib) |m| mod.addImport("zlib", m) else mod.addAnonymousImport("zlib", .{ .root_source_file = b.path("src/http/core/zlib_stub.zig") });
         if (zstd) |m| mod.addImport("zstd", m);
+        if (brotli) |m| mod.addImport("brotli", m);
         mod.addImport("llhttp", llhttp.mod);
         // llhttp is a library of its own, not C sources of this module, so
         // the module holds only Zig: Zig 0.17's fuzzer cannot take clang's
@@ -983,6 +1434,8 @@ const CModules = struct {
     zlib_c: ?*std.Build.Module = null,
     /// zstd.h (compression)
     zstd: ?*std.Build.Module = null,
+    /// brotli/encode.h and brotli/decode.h (brotli)
+    brotli: ?*std.Build.Module = null,
     /// xuckless/websocket-zig, the sans-IO frame codec for WebSocket over
     /// HTTP/2 (websocket). Pure Zig, but fetched lazily like the C libraries.
     websocket: ?*std.Build.Module = null,
@@ -990,10 +1443,22 @@ const CModules = struct {
     protobuf: ?*std.Build.Module = null,
     /// yyjson.h (json)
     yyjson: ?*std.Build.Module = null,
+    /// src/capi/upb_shim.h over upb (grpc): the C ABI's gRPC JSON.
+    upb: ?*std.Build.Module = null,
     /// hiredis.h (redis)
     hiredis: ?*std.Build.Module = null,
     /// xuckless/zig-jwt (auth).
     jwt: ?*std.Build.Module = null,
+    /// xuckless/pg.zig (postgres), pure Zig, fetched lazily. Two instances:
+    /// one whose `tls` import is Anole's BoringSSL client (src/pg/tls.zig,
+    /// added in `build` once the core's TLS module exists), and one built
+    /// without TLS, for builds that leave it out.
+    pg_tls: ?*std.Build.Module = null,
+    pg_plain: ?*std.Build.Module = null,
+    /// xuckless/zig-sqlite's `sqlite` module over the SQLite amalgamation
+    /// (sqlite), and the build test of the two (tests only).
+    sqlite: ?*std.Build.Module = null,
+    sqlite_build_test: ?*std.Build.Step.Run = null,
 
     /// Null while lazy dependencies are still being fetched.
     fn init(b: *std.Build, f: Features, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ?CModules {
@@ -1006,25 +1471,39 @@ const CModules = struct {
         const nghttp3_dep = if (f.http3) b.lazyDependency("nghttp3", .{}) else null;
         const zlib_ng_dep = if (f.compression) b.lazyDependency("zlib_ng", .{}) else null;
         const zstd_dep = if (f.compression) b.lazyDependency("zstd", .{}) else null;
+        const brotli_dep = if (f.brotli) b.lazyDependency("brotli", .{}) else null;
         // Only its src/root.zig is used (its module would compile a second,
         // vendored zlib).
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
         const websocket_dep = if (f.websocket) b.lazyDependency("websocket_zig", .{ .target = target, .optimize = optimize }) else null;
         const protobuf_dep = if (f.grpc) b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) else null;
         const yyjson_dep = if (f.json) b.lazyDependency("yyjson", .{}) else null;
+        const upb_dep = if (f.grpc) b.lazyDependency("upb", .{}) else null;
         const hiredis_dep = if (f.redis) b.lazyDependency("hiredis", .{}) else null;
         const jwt_dep = if (f.auth) b.lazyDependency("zig_jwt", .{ .target = target, .optimize = optimize }) else null;
+        const pg_tls_dep = if (f.postgres and f.needsTls()) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .injected }) else null;
+        const pg_plain_dep = if (f.postgres) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .none }) else null;
+        // zig-sqlite translates the amalgamation's sqlite3.h, so its
+        // arguments need the amalgamation first: one more configure pass on
+        // a fresh cache.
+        const sqlite_dep = if (f.sqlite) b.lazyDependency("sqlite_amalgamation", .{}) else null;
+        const sqlite_config = if (sqlite_dep != null) sqlite_build.configHeader(b) else null;
+        const zig_sqlite_dep = if (sqlite_dep) |up| b.lazyDependency("zig_sqlite", sqlite_build.zigSqliteArgs(up, sqlite_config.?, target, optimize)) else null;
 
         if (f.needsTranslateC() and tc_dep == null) return null;
         if (f.http2 and nghttp2_dep == null) return null;
         if (f.needsTls() and boringssl_dep == null) return null;
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
+        if (f.brotli and brotli_dep == null) return null;
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
+        if (f.grpc and upb_dep == null) return null;
         if (f.redis and hiredis_dep == null) return null;
         if (f.auth and jwt_dep == null) return null;
+        if (f.postgres and (pg_plain_dep == null or (f.needsTls() and pg_tls_dep == null))) return null;
+        if (f.sqlite and (sqlite_dep == null or zig_sqlite_dep == null)) return null;
 
         // Both vendor sfparse and export the same symbols; stop if they differ.
         if (nghttp2_dep != null and nghttp3_dep != null) nghttp3_build.checkSharedSfparse(b, nghttp2_dep.?, nghttp3_dep.?);
@@ -1033,6 +1512,13 @@ const CModules = struct {
         if (websocket_dep) |dep| m.websocket = dep.module("websocket");
         if (protobuf_dep) |dep| m.protobuf = dep.module("protobuf");
         if (jwt_dep) |dep| m.jwt = dep.module("zig-jwt");
+        if (pg_tls_dep) |dep| m.pg_tls = dep.module("pg");
+        if (pg_plain_dep) |dep| m.pg_plain = dep.module("pg");
+        if (zig_sqlite_dep) |dep| {
+            const lib = sqlite_build.library(b, sqlite_dep.?, sqlite_config.?, target, optimize);
+            m.sqlite = sqlite_build.module(dep, lib);
+            m.sqlite_build_test = sqlite_build.buildTest(b, m.sqlite.?, target, optimize);
+        }
         if (!f.needsTranslateC()) return m;
         // Available whenever tc_dep is; resolved here because the result is a comptime type.
         const tc_build = b.lazyImport(build_zig, "translate_c") orelse return null;
@@ -1059,9 +1545,17 @@ const CModules = struct {
             const lib = yyjson_build.library(b, up, target, optimize);
             m.yyjson = yyjson_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
+        if (upb_dep) |up| {
+            const lib = upb_build.library(b, up, target, optimize);
+            m.upb = upb_build.module(b, Translator, tc_dep.?, lib, target, optimize);
+        }
         if (zstd_dep) |up| {
             const lib = zstd_build.library(b, up, target, optimize);
             m.zstd = zstd_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
+        if (brotli_dep) |up| {
+            const lib = brotli_build.library(b, up, target, optimize);
+            m.brotli = brotli_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
 
         if (nghttp2_dep) |up| {
@@ -1114,6 +1608,11 @@ const AnoleModuleOptions = struct {
     /// Add test-only imports (the h3 layout probe).
     for_test: bool = false,
     redis_test_port: ?u16 = null,
+    redis_test_url: ?[]const u8 = null,
+    postgres_test_url: ?[]const u8 = null,
+    mongodb_test_url: ?[]const u8 = null,
+    /// src/bson as a module, for -Dmongodb.
+    bson: ?*std.Build.Module = null,
 };
 
 /// src/root.zig with its own build_options and only the binding modules its
@@ -1128,11 +1627,20 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "websocket", f.websocket);
     options.addOption(bool, "auth", f.auth);
     options.addOption(bool, "compression", f.compression);
+    options.addOption(bool, "brotli", f.brotli);
     options.addOption(bool, "json", f.json);
     options.addOption(bool, "redis", f.redis);
-    // A live Redis/Valkey for tests (`-Dredis-test-port=6379`), else those
-    // tests skip.
+    options.addOption(bool, "postgres", f.postgres);
+    options.addOption(bool, "sqlite", f.sqlite);
+    options.addOption(bool, "mongodb", f.mongodb);
+    // Live servers for tests (`-Dredis-test-port=6379` or
+    // `-Dredis-test-url=redis://...`,
+    // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
+    // else those tests skip.
     options.addOption(?u16, "redis_test_port", o.redis_test_port);
+    options.addOption(?[]const u8, "redis_test_url", o.redis_test_url);
+    options.addOption(?[]const u8, "postgres_test_url", o.postgres_test_url);
+    options.addOption(?[]const u8, "mongodb_test_url", o.mongodb_test_url);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
@@ -1149,11 +1657,24 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         mod.addImport("anole_h2_client", o.core.h2Client(f));
     }
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
-    if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
+    if (f.grpc) {
+        mod.addImport("protobuf", o.c.protobuf.?);
+        mod.addImport("anole_upb_c", o.c.upb.?);
+    }
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
+    if (f.mongodb) mod.addImport("bson", o.bson.?);
     if (f.auth) mod.addImport("anole_jwt", o.c.jwt.?);
+    if (f.postgres) mod.addImport("anole_pg", if (f.needsTls()) o.c.pg_tls.? else o.c.pg_plain.?);
+    if (f.sqlite) mod.addImport("anole_sqlite", o.c.sqlite.?);
     // The generated test service (tests/grpc/gen), outside src/.
+    // The C ABI's configuration schema, for the test that keeps it in step
+    // with src/capi/config.zig.
+    if (o.for_test) {
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
+        mod.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
+    }
     if (f.grpc and o.for_test) mod.addImport("anole_test_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/anole/test.pb.zig"),
         .target = o.target,
@@ -1167,11 +1688,30 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         .optimize = o.optimize,
         .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
     }));
+    // The test services' descriptors (a FileDescriptorSet with imports,
+    // made by the pinned protoc), for the C ABI's gRPC tests: what a
+    // consumer passes as grpc.descriptor_set.
+    if (f.grpc and o.for_test) if (b.lazyDependency("protobuf", .{ .target = b.graph.host })) |pb_dep| if (protocBinary(pb_dep.builder)) |protoc| {
+        const run = b.addRunFile(protoc);
+        run.setName("protoc test descriptors");
+        run.addArg("--include_imports");
+        const set = run.addPrefixedOutputFileArg("--descriptor_set_out=", "test.binpb");
+        run.addArg("-I");
+        run.addDirectoryArg(b.path("tests/grpc/proto"));
+        run.addArg("-I");
+        run.addDirectoryArg(b.path("src/grpc/proto"));
+        run.addFileArg(b.path("tests/grpc/proto/echo.proto"));
+        run.addFileArg(b.path("tests/grpc/proto/transcode.proto"));
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(set, "test.binpb");
+        mod.addAnonymousImport("anole_test_descriptors", .{ .root_source_file = wf.add("descriptors.zig", "pub const set = @embedFile(\"test.binpb\");\n") });
+    };
     if (f.compression) {
         mod.addImport("anole_zlib", o.c.zlib.?);
         mod.addImport("anole_zlib_c", o.c.zlib_c.?);
         mod.addImport("anole_zstd_c", o.c.zstd.?);
     }
+    if (f.brotli) mod.addImport("anole_brotli_c", o.c.brotli.?);
     if (f.needsTls()) {
         mod.addImport("anole_boringssl_c", o.c.boringssl.?);
         mod.addImport("anole_dusty_tls", o.core.tls_seam.?);
@@ -1182,4 +1722,23 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         if (o.for_test) mod.addImport("anole_h3_layout", o.c.h3_layout.?);
     }
     return mod;
+}
+
+/// Every static library and object a module links, through the modules it
+/// imports and the libraries those link (for tools/capi_symbols.zig).
+fn linkedInputs(b: *std.Build, root: *std.Build.Module) []const std.Build.LazyPath {
+    var out: std.ArrayList(std.Build.LazyPath) = .empty;
+    var seen: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, void) = .empty;
+    var todo: std.ArrayList(*std.Build.Module) = .empty;
+    todo.append(b.allocator, root) catch @panic("OOM");
+    while (todo.pop()) |top| for (top.getGraph().modules) |m| for (m.link_objects.items) |lo| switch (lo) {
+        .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
+        .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
+            if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
+            out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
+            todo.append(b.allocator, c.root_module) catch @panic("OOM");
+        },
+        else => {},
+    };
+    return out.items;
 }

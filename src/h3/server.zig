@@ -79,32 +79,72 @@ const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 const hold_ns = std.time.ns_per_ms;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
-/// QUIC v2 first when the client offers both.
-const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
+/// Retries an endpoint remembers (`Endpoint.retried`), and for how long:
+/// as long as a Retry's token is good.
+const retried_len = 64;
+const retried_ttl = 10 * std.time.ns_per_s;
 
+/// A Retry sent for a client's first flight (`Endpoint.retried`).
+const Retried = struct {
+    /// The client's original destination ID; `at` 0 for an empty slot.
+    dcid: net.CidKey = .{ .len = 0, .bytes = @splat(0) },
+    remote: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
+    at: u64 = 0,
+};
+/// The versions a connection may end up on, in order of preference
+/// (`Options.prefer_v2`): RFC 9368's compatible version negotiation moves
+/// a client that started in one to the first of these it also lists.
+const versions_v2_first = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
+const versions_v1_first = [_]u32{ c.NGTCP2_PROTO_VER_V1, c.NGTCP2_PROTO_VER_V2 };
+
+/// The versions in `options`' order of preference.
+fn preferredVersions(options: *const Options) []const u32 {
+    return if (options.prefer_v2) &versions_v2_first else &versions_v1_first;
+}
+
+/// An `Endpoint`'s settings (`anole.h3.EndpointOptions`). A server sets
+/// them from `ServerOptions.Http3` and its TLS listener.
 pub const Options = struct {
+    /// The UDP address to bind.
     address: std.Io.net.IpAddress,
+    /// IPV6_V6ONLY on an IPv6 `address`: false takes IPv4 clients too on
+    /// the same socket (`::` serving both families), true IPv6 alone,
+    /// null the system's default. Ignored for IPv4 and inherited sockets.
+    ipv6_only: ?bool = null,
     /// PEM: the certificate chain (leaf first) and its key. Read by
     /// `init` only; a reload passes its own (`Endpoint.loadTls`).
     cert_pem: []const u8,
     key_pem: []const u8,
-    /// Requests a client may have open at once on a connection.
+    /// Requests a client may have open at once on a connection. A request
+    /// counts until its stream has ended and its handler has returned, so
+    /// requests the client resets do not free room while their handlers
+    /// still run.
     max_streams_bidi: u64 = 100,
     /// Connection and per-stream receive windows.
     max_data: u64 = 16 << 20,
     max_stream_data: u64 = 1 << 20,
-    idle_timeout_ms: u32 = 30_000,
+    /// How long a connection may sit idle before it is closed.
+    idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// Validate every client address with a Retry round trip before
     /// keeping state for it (costs one RTT; resists spoofed floods).
     validate_address: bool = false,
     /// How long a drain lets requests finish before closing connections.
     drain_timeout_ms: u32 = 10_000,
-    /// Largest request header section.
+    /// Largest request header section: decoded names and values plus 32
+    /// bytes a field, as SETTINGS_MAX_FIELD_SECTION_SIZE counts them. A
+    /// larger head, or one with more fields than the server's
+    /// `request.max_header_count`, is answered 431 and never kept whole.
     max_field_section_size: u64 = 64 * 1024,
     /// Also speak HTTP/0.9 over QUIC (ALPN "hq-interop"), serving the files
     /// under this directory: what the QUIC interop runner's tests use. Only
     /// for interop testing; it bypasses the router and every middleware.
+    /// `init` refuses it (`error.HqInteropNotAllowed`) unless the program's
+    /// root file declares `pub const anole_hq_interop = true;`.
     hq_interop_root: ?[]const u8 = null,
+    /// Move a client that offers QUIC v2 (RFC 9369) beside v1 to v2,
+    /// through compatible version negotiation (RFC 9368). False keeps such
+    /// a client on v1, unless it starts in v2. Either way both are spoken.
+    prefer_v2: bool = true,
     /// Mutual TLS: ask for client certificates and verify them, as the TCP
     /// listener does. Handlers read the certificate with
     /// `Request.peerCertificate`.
@@ -114,6 +154,9 @@ pub const Options = struct {
     /// kernel steers datagrams among them by connection ID (`Endpoint`).
     /// Elsewhere always one. At most 255.
     sockets: u16 = 1,
+    /// The name requests report in `Request.listener.name`: the TCP
+    /// listener's whose port this one serves HTTP/3 for.
+    listener_name: []const u8 = "",
     /// Serve this UDP socket, opened elsewhere (systemd, or the process
     /// this one replaces), instead of binding `address`.
     fd: ?std.posix.fd_t = null,
@@ -194,7 +237,7 @@ fn transportParams(options: *const Options) ngtcp2.TransportParams {
     params.initial_max_streams_uni = 3 + if (options.webtransport) options.webtransport_max_streams_uni else 0;
     // HTTP datagrams (RFC 9297), for WebTransport.
     if (options.webtransport) params.max_datagram_frame_size = 65535;
-    params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+    params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
     return params;
 }
 
@@ -250,6 +293,10 @@ pub const Stats = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Connections accepted.
     accepted: std.atomic.Value(u64) = .init(0),
+    /// Retry packets sent: to validate an address (`validate_address`),
+    /// for a ClientHello whose start was missing, and again to a client
+    /// that has not yet acted on one (`Endpoint.retried`).
+    retries: std.atomic.Value(u64) = .init(0),
     /// Packets handled on another thread than the endpoint's own: always
     /// zero; counted in test builds only.
     foreign: std.atomic.Value(u64) = .init(0),
@@ -316,10 +363,28 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Connections that closed with request tasks still running, each
         /// waiting for them in a task of its own (`retire`).
         finishers: std.Io.Group = .init,
+        /// Tests only: the next accepted connection fails after its first
+        /// packet was read, as when its IDs cannot be registered.
+        test_fail_accept: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+        /// Tests only: new connections given up with request tasks
+        /// already running.
+        test_given_up_with_tasks: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
         draining: bool = false,
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
+        /// The latest Retries sent because a client's first Initial
+        /// arrived without the start of its ClientHello (ngtcp2 then wants
+        /// a Retry rather than keep the rest unvalidated): until the client
+        /// acts on the Retry, it may resend its whole ClientHello without a
+        /// token, which would otherwise start a second connection beside
+        /// the one the Retry leads to (neqo, whose ClientHello leads with
+        /// a later piece, in the runner's handshakecorruption case). Such
+        /// an Initial gets a Retry again. A ring: under a flood, older
+        /// entries are overwritten, and their clients merely get the
+        /// second connection. Only the endpoint task touches it.
+        retried: [retried_len]Retried = @splat(.{}),
+        retried_next: usize = 0,
         /// The listener requests report (address, `secure`).
         listener: dusty.Listener,
         /// Requests that came in 0-RTT: run before the handshake completed
@@ -377,6 +442,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// The listener: its endpoints, their sockets bound (or adopted) in
         /// order, and the steering program on them. Returns the first.
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
+            if (options.hq_interop_root != null and !hq_interop_allowed) return error.HqInteropNotAllowed;
             const inherited: []const std.posix.fd_t = if (options.fd) |*fd| fd[0..1] else options.fds;
             const count: usize = if (inherited.len > 0)
                 inherited.len
@@ -394,7 +460,9 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // Several sockets share the port: none but ours may be on it
             // already. An inherited group is ours.
-            if (inherited.len == 0 and count > 1) try net.checkUdpAddressFree(options.address);
+            if (inherited.len == 0 and count > 1) try net.checkUdpAddressFree(options.address, options.ipv6_only);
+            // Only an IPv6 socket takes IPV6_V6ONLY (zio refuses it on IPv4).
+            const ipv6_only: ?bool = if (options.address == .ip6) options.ipv6_only else null;
             var made: usize = 0;
             errdefer for (shared.endpoints[0..made]) |ep| ep.deinitOne();
             var bind_to = options.address;
@@ -402,9 +470,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const socket = if (inherited.len > 0)
                     try adoptSocket(io, inherited[i], options.address)
                 else if (count == 1)
-                    try bind_to.bind(io, .{ .mode = .dgram, .protocol = .udp })
+                    try bind_to.bind(io, .{ .mode = .dgram, .protocol = .udp, .ip6_only = ipv6_only })
                 else
-                    try bindMember(io, bind_to);
+                    try bindMember(io, bind_to, ipv6_only);
                 shared.endpoints[i] = initOne(gpa, io, http, options, socket, @intCast(i), shared, secret) catch |err| {
                     socket.close(io);
                     return err;
@@ -423,8 +491,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         /// One more socket of the group, SO_REUSEPORT, as zio wants it.
-        fn bindMember(io: std.Io, at: std.Io.net.IpAddress) !std.Io.net.Socket {
-            const fd = try net.bindReusePort(at);
+        fn bindMember(io: std.Io, at: std.Io.net.IpAddress, ipv6_only: ?bool) !std.Io.net.Socket {
+            // One socket per listener there (`init`).
+            if (comptime builtin.os.tag == .windows) unreachable;
+            const fd = try net.bindReusePort(at, ipv6_only);
             return adoptSocket(io, fd, at) catch |err| {
                 _ = std.c.close(fd);
                 return err;
@@ -448,7 +518,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .index = index,
                 .shared = shared,
                 .secret = secret,
-                .listener = .{ .address = .{ .ip = socket.address } },
+                .listener = .{ .address = .{ .ip = socket.address }, .name = options.listener_name },
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },
@@ -460,6 +530,8 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Wraps a UDP socket this process did not open. Under zio, which
         /// drives its own sockets non-blocking, it is made so too.
         fn adoptSocket(io: std.Io, fd: std.posix.fd_t, configured: std.Io.net.IpAddress) !std.Io.net.Socket {
+            // Inherited sockets come from hand-off, which is Unix only.
+            if (comptime builtin.os.tag == .windows) return error.InheritedSocketUnsupported;
             const sc = std.c;
             var kind: c_int = 0;
             var kind_len: std.posix.socklen_t = @sizeOf(c_int);
@@ -543,7 +615,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             var tls = try quic_tls.Context.init(.{
                 .cert_pem = options.cert_pem,
                 .key_pem = options.key_pem,
-                .hq_interop = options.hq_interop_root != null,
+                .hq_interop = hq_interop_allowed and options.hq_interop_root != null,
                 .client_auth = options.client_auth,
                 .early_data = options.early_data,
             });
@@ -563,22 +635,23 @@ pub fn Endpoint(comptime Ctx: type) type {
             return newTlsContext(options);
         }
 
-        /// A certificate reload, second step: connections that start from
-        /// now on, on every endpoint of the listener, handshake with `tls`,
-        /// which takes over the session ticket keys, so tickets issued
-        /// before still resume. Connections already open keep the context
-        /// they started with (each `SSL` holds a reference to it). Safe from
-        /// any task or thread.
         /// Turns WebTransport on for every endpoint of the listener, for
         /// connections that start from now on.
         pub fn enableWebTransport(self: *Self) void {
             for (self.shared.endpoints) |e| e.options.webtransport = true;
         }
 
+        /// A certificate reload, second step: connections that start from
+        /// now on, on every endpoint of the listener, handshake with `tls`,
+        /// which takes over the session ticket keys, so tickets issued
+        /// before still resume, unless the client CAs or mode changed:
+        /// those sessions must not outlive the policy that verified them. Connections already open keep the context
+        /// they started with (each `SSL` holds a reference to it). Safe from
+        /// any task or thread.
         pub fn useTls(self: *Self, tls: quic_tls.Context) void {
             const shared = self.shared;
             lockTls(shared);
-            dusty_tls.carryTicketKeys(tls.ctx, shared.tls.ctx);
+            if (tls.sameClientAuth(&shared.tls)) dusty_tls.carryTicketKeys(tls.ctx, shared.tls.ctx);
             var old = shared.tls;
             shared.tls = tls;
             shared.tls_lock.unlock();
@@ -1053,22 +1126,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// endpoint task and its inbox task both call it, on one executor,
         /// so it keeps nothing in the endpoint across a yield.
         fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
-            var vc: c.ngtcp2_version_cid = undefined;
-            switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, scid_len)) {
-                0 => {},
-                c.NGTCP2_ERR_VERSION_NEGOTIATION => {
-                    self.sendVersionNegotiation(from, local, &vc);
-                    return;
-                },
-                else => return,
-            }
+            const vc, const dcid = switch (net.classify(data, scid_len)) {
+                .drop => return,
+                .version_negotiation => |vc| return self.sendVersionNegotiation(from, local, &vc),
+                .packet => |p| .{ p.vc, p.dcid },
+            };
             if (self.owner(data)) |ep| return self.forward(ep, from, local, ecn, data);
             _ = self.stats.packets.fetchAdd(1, .monotonic);
             if (builtin.is_test) if (self.thread) |t| if (t != std.Thread.getCurrentId()) {
                 _ = self.stats.foreign.fetchAdd(1, .monotonic);
             };
             const remote: Addr = .from(from);
-            if (self.lookup(.of(vc.dcid[0..vc.dcidlen]))) |conn| {
+            if (self.lookup(dcid)) |conn| {
                 defer conn.unref();
                 conn.onPacket(remote, local, ecn, data, ts);
                 return;
@@ -1126,6 +1195,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
+            if (hd.tokenlen == 0 and self.wasRetried(&hd.dcid, remote.ip())) {
+                // Its ClientHello again, sent before our Retry reached it.
+                return self.sendRetry(&hd, remote, local, data.len * 3);
+            }
+
             const conn = Conn.create(self, remote, local, &hd, pocid, token_type) catch |err| {
                 log.debug("new connection: {t}", .{err});
                 return;
@@ -1137,14 +1211,21 @@ pub fn Endpoint(comptime Ctx: type) type {
             const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), &pi, data, now(self.io));
             if (rv != 0) {
                 conn.unlock();
-                if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, local, data.len * 3);
-                conn.destroy();
+                if (rv == c.NGTCP2_ERR_RETRY) {
+                    self.rememberRetry(&hd.dcid, remote.ip());
+                    self.sendRetry(&hd, remote, local, data.len * 3);
+                }
+                self.giveUp(conn);
                 return;
             }
             conn.unlock();
 
+            if (builtin.is_test) if (self.test_fail_accept) {
+                self.test_fail_accept = false;
+                return self.giveUp(conn);
+            };
             self.associate(.ofCid(&hd.dcid), conn) catch {
-                conn.destroy();
+                self.giveUp(conn);
                 return;
             };
             var scids: [8]c.ngtcp2_cid = undefined;
@@ -1159,6 +1240,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             _ = self.stats.accepted.fetchAdd(1, .monotonic);
         }
 
+        /// Frees a connection `accept` will not keep. Its first packet may
+        /// already have started request tasks (0-RTT), which hold it: then
+        /// it ends as any other does, once they have.
+        fn giveUp(self: *Self, conn: *Conn) void {
+            if (conn.tasks.load(.acquire) == 0) return conn.destroy();
+            if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .monotonic);
+            conn.retired = true;
+            placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
+        }
+
         fn sendVersionNegotiation(self: *Self, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, vc: *const c.ngtcp2_version_cid) void {
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             var unused: [1]u8 = undefined;
@@ -1167,6 +1258,22 @@ pub fn Endpoint(comptime Ctx: type) type {
             const versions = [_]u32{ (vc.version & 0xf0f0f0f0) | 0x0a0a0a0a, c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
             const n = c.ngtcp2_pkt_write_version_negotiation(&buf, buf.len, unused[0], vc.scid, vc.scidlen, vc.dcid, vc.dcidlen, &versions, versions.len);
             if (n > 0) self.send(to, from, buf[0..@intCast(n)]);
+        }
+
+        fn rememberRetry(self: *Self, dcid: *const c.ngtcp2_cid, remote: std.Io.net.IpAddress) void {
+            self.retried[self.retried_next] = .{ .dcid = .ofCid(dcid), .remote = remote, .at = @max(now(self.io), 1) };
+            self.retried_next = (self.retried_next + 1) % retried_len;
+        }
+
+        /// Whether `rememberRetry` saw this client's first flight lately.
+        fn wasRetried(self: *Self, dcid: *const c.ngtcp2_cid, remote: std.Io.net.IpAddress) bool {
+            const key: net.CidKey = .ofCid(dcid);
+            const t = now(self.io);
+            for (&self.retried) |*r| {
+                if (r.at == 0 or t -| r.at > retried_ttl) continue;
+                if (r.dcid.len == key.len and std.mem.eql(u8, r.dcid.bytes[0..r.dcid.len], key.bytes[0..key.len]) and r.remote.eql(&remote)) return true;
+            }
+            return false;
         }
 
         fn sendRetry(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote_in: Addr, from: ?std.Io.net.IpAddress, max_len: usize) void {
@@ -1180,7 +1287,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (token_len < 0) return;
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             const n = c.ngtcp2_crypto_write_retry(&buf, @min(buf.len, max_len), chd.version, &chd.scid, &scid, &chd.dcid, &token, @intCast(token_len));
-            if (n > 0) self.send(remote.ip(), from, buf[0..@intCast(n)]);
+            if (n <= 0) return;
+            _ = self.stats.retries.fetchAdd(1, .monotonic);
+            self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
         fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr, from: ?std.Io.net.IpAddress) void {
@@ -1278,6 +1387,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Requests of the latest round whose handlers have yet to
             /// answer or wait: the flush holds for them (`hold_ns`).
             holding: std.atomic.Value(u32) = .init(0),
+            /// The latest round carried 0-RTT requests or completed the
+            /// handshake: its flush does not hold. A client that sent 0-RTT
+            /// sees its data acknowledged, and its handshake finished, in
+            /// the very next flight, not a hold later: clients whose RTT
+            /// guess is still tiny otherwise count that data lost and send
+            /// it again in 1-RTT.
+            hold_off: std.atomic.Value(bool) = .init(false),
             drain: enum { none, notice, final } = .none,
             /// The connection speaks "hq-interop", not HTTP/3.
             hq: bool = false,
@@ -1315,10 +1431,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.token_type = token_type;
                 settings.rand_ctx = .{ .native_handle = conn };
                 settings.max_window = 6 * ep.options.max_data;
-                // QUIC v2 (RFC 9369) when the client offers it, through
-                // compatible version negotiation; v1 otherwise.
-                settings.preferred_versions = &preferred_versions;
-                settings.preferred_versionslen = preferred_versions.len;
+                // QUIC v2 (RFC 9369) when the client offers it and
+                // `prefer_v2` is on, through compatible version
+                // negotiation; v1 otherwise.
+                const versions = preferredVersions(&ep.options);
+                settings.preferred_versions = versions.ptr;
+                settings.preferred_versionslen = versions.len;
                 settings.max_stream_window = 6 * ep.options.max_stream_data;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
@@ -1492,6 +1610,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.round_ts = ts;
                     _ = conn.round.fetchAdd(1, .monotonic);
                     conn.holding.store(0, .monotonic);
+                    conn.hold_off.store(false, .monotonic);
                     conn.hold_until = ts + hold_ns;
                 }
                 var r = remote;
@@ -1546,7 +1665,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
                         conn.unlock();
                     }
-                    if (conn.holding.load(.monotonic) > 0 and now(io) < conn.hold_until) {
+                    if (conn.holding.load(.monotonic) > 0 and !conn.hold_off.load(.monotonic) and now(io) < conn.hold_until) {
                         // Requests of the latest batch are still on their
                         // way to an answer: their packets, and the ACK
                         // that would otherwise leave alone, wait a little
@@ -1783,6 +1902,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer _ = io.swapCancelProtection(protection);
                 conn.lock();
                 conn.close(.closed);
+                // Responses still detached have nobody to go to.
+                var i: usize = 0;
+                while (i < conn.streams.count()) {
+                    const s = conn.streams.values()[i];
+                    const before = conn.streams.count();
+                    if (s.detached != null) {
+                        s.reset = true;
+                        abortDetached(s);
+                    }
+                    // Freed (and swapped out) by the abort: look at the
+                    // same index again.
+                    if (conn.streams.count() == before) i += 1;
+                }
                 conn.unlock();
                 conn.group.cancel(io);
                 conn.forget();
@@ -1941,6 +2073,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 stream.round = conn.round.load(.monotonic);
                 stream.holds = true;
                 _ = conn.holding.fetchAdd(1, .monotonic);
+                // 0-RTT: the handshake's flight and the ACK go at once.
+                if (!conn.handshakeDone()) conn.hold_off.store(true, .monotonic);
                 _ = conn.tasks.fetchAdd(1, .acq_rel);
                 placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
                     _ = conn.tasks.fetchSub(1, .acq_rel);
@@ -2031,6 +2165,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             early: bool = false,
             /// `:protocol`, on an extended CONNECT (RFC 9220).
             protocol: []const u8 = "",
+            /// The head's decoded size so far (names, values and 32 bytes a
+            /// field, as SETTINGS_MAX_FIELD_SECTION_SIZE counts it).
+            head_bytes: u64 = 0,
+            /// The head went past `max_field_section_size` or the request's
+            /// `max_header_count`: the rest of it is not kept, and the
+            /// request is answered 431 without reaching a handler.
+            head_too_large: bool = false,
             /// Who still holds the stream.
             refs: struct { quic: bool = true, handler: bool = false } = .{},
             /// The connection's flush waits for this request's answer
@@ -2048,6 +2189,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             await_body: bool = false,
             spill: std.ArrayList(u8) = .empty,
             spill_pos: usize = 0,
+            /// The handler detached the response (`dusty.Detached`): the
+            /// request and response live on in the stream's arena, and the
+            /// handler's hold on the stream goes when it is finished or
+            /// aborted.
+            detached: ?*Exchange = null,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2117,7 +2263,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .handler => s.refs.handler = false,
                 }
                 if (s.refs.quic or s.refs.handler) return;
-                _ = s.conn.streams.swapRemove(s.id);
+                const conn = s.conn;
+                _ = conn.streams.swapRemove(s.id);
+                // The client may open another request only now: one it
+                // reset still counts while its handler runs.
+                _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 s.free();
             }
 
@@ -2149,7 +2299,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unlock();
                     conn.kick();
                 }
-                s.serve(false) catch |err| return s.failed(err);
+                _ = s.serve(false) catch |err| return s.failed(err);
             }
 
             /// A `no_wait` route's request, whole, on the endpoint task.
@@ -2160,7 +2310,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.unlock();
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
-                    s.serve(true) catch |err| s.failed(err) catch {
+                    if (s.serve(true)) |served| {
+                        // Finished later; the stream is held till then.
+                        if (served == .detached) return;
+                    } else |err| s.failed(err) catch {
                         // The endpoint task itself is canceled: it stops
                         // reading once these requests are done.
                         conn.ep.io.recancel();
@@ -2213,8 +2366,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// `inline_mode`: on the endpoint task (a `no_wait` route),
-            /// with no request timeout, whose timer would cancel that task.
-            fn serve(s: *Stream, inline_mode: bool) !void {
+            /// with no request timeout, whose timer would cancel that task;
+            /// its response may be detached (`dusty.Detached`), and then the
+            /// stream is held until it is finished.
+            fn serve(s: *Stream, inline_mode: bool) !Served {
                 const conn = s.conn;
                 const ep = conn.ep;
                 const server = ep.http;
@@ -2228,7 +2383,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer timer.clear();
                 if (!inline_mode) if (server.config.timeout.request) |d| setTimeout(&timer, io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
-                var request: dusty.Request = .{
+                // On the stack (warm, no allocation); `detachedRelocate`
+                // moves it to the stream's arena if the handler detaches.
+                var on_stack: Exchange = undefined;
+                const ex: *Exchange = &on_stack;
+                const request = &ex.request;
+                request.* = .{
                     .arena = arena,
                     .io = io,
                     .parser = undefined,
@@ -2243,29 +2403,52 @@ pub fn Endpoint(comptime Ctx: type) type {
                     ._timeout_context = if (inline_mode) null else &timer,
                     ._set_timeout = if (inline_mode) null else setTimeout,
                 };
-                var body_reader: BodyReader = .init(s);
+                const body_reader = &ex.body_reader;
+                body_reader.* = .init(s);
                 request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
-                var sink_state: StreamSink = .{ .stream = s };
-                var response = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
-                server.configureResponse(&response);
-                defer response.deinit();
-                response.request = &request;
-                request.response = &response;
+                const sink_state = &ex.sink_state;
+                sink_state.* = .{ .stream = s };
+                const response = &ex.response;
+                response.* = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
+                server.configureResponse(response);
+                var detached = false;
+                defer if (!detached) response.deinit();
+                response.request = request;
+                request.response = response;
+                if (inline_mode) {
+                    ex.attached = false;
+                    response.detach_engine = &detach_engine;
+                    response.detach_ctx = ex;
+                }
 
+                if (s.head_too_large) {
+                    response.status = .request_header_fields_too_large;
+                    try response.write();
+                    return .done;
+                }
                 if (s.method.len == 0 or s.path.len == 0) {
                     response.status = .bad_request;
-                    return response.write();
+                    {
+                        try response.write();
+                        return .done;
+                    }
                 }
                 request.method = parseMethod(s.method) orelse {
                     response.status = .not_implemented;
-                    return response.write();
+                    {
+                        try response.write();
+                        return .done;
+                    }
                 };
                 if (request.method == .connect) {
                     // A plain CONNECT (a proxy's tunnel) is not served.
                     if (s.protocol.len == 0) {
                         response.status = .not_implemented;
-                        return response.write();
+                        {
+                            try response.write();
+                            return .done;
+                        }
                     }
                     // An extended CONNECT (RFC 9220; nghttp3 has checked
                     // its pseudo-headers) is routed as the GET that the
@@ -2299,9 +2482,12 @@ pub fn Endpoint(comptime Ctx: type) type {
 
                 request.headers = dusty.Headers.init(arena, server.config.request.max_header_count) catch return error.OutOfMemory;
                 var too_many = false;
-                for (s.headers.items) |f| request.headers.put(f.name, f.value) catch {
-                    too_many = true;
-                    break;
+                for (s.headers.items) |f| request.headers.addRequestField(arena, f.name, f.value) catch |err| switch (err) {
+                    error.TooManyHeaders => {
+                        too_many = true;
+                        break;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
                 };
                 if (!too_many and request.headers.get("Host") == null and s.authority.len > 0) {
                     request.headers.put("Host", s.authority) catch {
@@ -2316,7 +2502,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (too_many) {
                     response.status = .request_header_fields_too_large;
-                    return response.write();
+                    {
+                        try response.write();
+                        return .done;
+                    }
                 }
                 request.applyEntityHeaders();
                 if (server.config.request.max_content_length) |max| {
@@ -2324,7 +2513,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.status = .payload_too_large;
                         response.content_type = .text;
                         response.body = "413 Content Too Large\n";
-                        return response.write();
+                        {
+                            try response.write();
+                            return .done;
+                        }
                     };
                 }
                 // Where the client is now: a migration moves it.
@@ -2332,7 +2524,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const peer = Addr.fromNgtcp2(c.ngtcp2_conn_get_path2(conn.q).*.remote).ip();
                 request.peer_certificate = quic_tls.peerCertificate(conn.ssl);
                 conn.unlock();
-                server.applyForwardedFrom(&request, peer);
+                server.applyForwardedFrom(request, peer);
                 // The client is on our TLS, whatever proxies say.
                 request.secure = true;
 
@@ -2343,16 +2535,28 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                     } else {
                         response.status = .expectation_failed;
-                        return response.write();
+                        {
+                            try response.write();
+                            return .done;
+                        }
                     }
                 }
 
-                server.dispatch(&request, &response) catch |err| switch (err) {
+                server.dispatch(request, response) catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
                     else => |e| return e,
                 };
+                if (response.detached) |d| {
+                    // Finished later, from the moved copy.
+                    detached = true;
+                    conn.lock();
+                    s.detached = exchangeOf(d);
+                    conn.unlock();
+                    return .detached;
+                }
                 try response.write();
+                return .done;
             }
 
             /// Every byte of the response body is in the ring and handed
@@ -2412,6 +2616,96 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
         };
+
+        /// One request and its response, with what they point at: on the
+        /// handler's stack, or in the stream's arena for a request that
+        /// runs on the endpoint task, whose response may be detached.
+        const Exchange = struct {
+            request: dusty.Request,
+            response: dusty.Response,
+            sink_state: StreamSink,
+            body_reader: BodyReader,
+            /// Its response went on from a task (`detachedAttach`),
+            /// counted in `Conn.tasks`.
+            attached: bool,
+        };
+
+        const Served = enum { done, detached };
+
+        /// How a detached response is finished, attached to a task, or let
+        /// go (`dusty.Detached`).
+        const detach_engine: dusty.Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+
+        /// The exchange, from the endpoint's stack into the stream's
+        /// arena, its pointers into itself moved along.
+        fn detachedRelocate(d: *dusty.Detached) error{OutOfMemory}!*anyopaque {
+            const old = exchangeOf(d);
+            const ex = try old.response.arena.create(Exchange);
+            ex.* = old.*;
+            ex.request.response = &ex.response;
+            ex.response.request = &ex.request;
+            ex.request.body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response.sink = ex.sink_state.sink();
+            ex.response.detach_ctx = ex;
+            d.request = &ex.request;
+            d.response = &ex.response;
+            return ex;
+        }
+
+        fn exchangeOf(d: *dusty.Detached) *Exchange {
+            return @ptrCast(@alignCast(d.engine_ctx));
+        }
+
+        /// Writes the response (or handles `result`'s error as a handler's),
+        /// then lets go of the stream. On the endpoint's executor: the
+        /// owner's task, or the task `detachedAttach` was for.
+        fn detachedEnd(d: *dusty.Detached, result: anyerror!void) void {
+            const ex = exchangeOf(d);
+            const s = ex.sink_state.stream;
+            const conn = s.conn;
+            if (result) |_| {
+                ex.response.write() catch |err| s.failed(err) catch {};
+            } else |err| s.failed(err) catch {};
+            ex.response.deinit();
+            conn.lock();
+            s.detached = null;
+            if (!s.body_done and !s.reset)
+                _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+            s.release(.handler);
+            conn.unlock();
+            conn.kick();
+            // Last: the driver may free the connection once no task runs.
+            if (ex.attached) _ = conn.tasks.fetchSub(1, .acq_rel);
+        }
+
+        /// The response goes on from a task, in the connection's group:
+        /// its body writes may now wait for the peer.
+        fn detachedAttach(d: *dusty.Detached) ?*std.Io.Group {
+            const ex = exchangeOf(d);
+            const s = ex.sink_state.stream;
+            const conn = s.conn;
+            ex.attached = true;
+            _ = conn.tasks.fetchAdd(1, .acq_rel);
+            conn.lock();
+            defer conn.unlock();
+            s.inline_mode = false;
+            return &conn.group;
+        }
+
+        fn detachedEnter(_: *dusty.Detached) void {}
+
+        /// The stream or its connection ended with the response still
+        /// detached (not attached): the owner hears of it, and the stream
+        /// is let go. Locked.
+        fn abortDetached(s: *Stream) void {
+            const ex = s.detached orelse return;
+            const d = ex.response.detached.?;
+            if (d.state != .detached) return;
+            s.detached = null;
+            d.abort();
+            ex.response.deinit();
+            s.release(.handler);
+        }
 
         fn isWebTransport(protocol: []const u8) bool {
             // "webtransport" in draft-02 (Chrome, Firefox) and up to
@@ -2802,6 +3096,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             const p = c.ngtcp2_conn_get_path2(conn.q);
             const n = c.ngtcp2_crypto_generate_regular_token(&token, &conn.ep.secret, conn.ep.secret.len, p.*.remote.addr, p.*.remote.addrlen, wallClock(conn.ep.io));
             if (n > 0) _ = c.ngtcp2_conn_submit_new_token(conn.q, &token, @intCast(n));
+            // HANDSHAKE_DONE and the ACK of the client's Finished go in the
+            // next flight, not after the requests of this round.
+            conn.hold_off.store(true, .monotonic);
             if (conn.ep.options.early_data and c.SSL_session_reused(conn.ssl) != 0)
                 log.debug("resumed; 0-RTT: {s}", .{quic_tls.earlyDataReason(conn.ssl)});
             // Requests held for the handshake may go on.
@@ -2885,11 +3182,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (rv != 0) return rv;
             if (conn.hq_streams.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
-                _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
                     if (!(s.ended and s.allSent() and s.body_done)) s.reset = true;
+                    // Gone with its response detached: the owner lets go now.
+                    if (s.reset) abortDetached(s);
+                    // Its credit comes back once the handler is done too.
                     s.release(.quic);
+                } else {
+                    _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 }
             }
             conn.kick();
@@ -2956,7 +3257,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvTxKey(_: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
             if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
             const conn = connOf(user_data);
-            if (quic_tls.isHq(conn.ssl)) {
+            if (hq_interop_allowed and quic_tls.isHq(conn.ssl)) {
                 conn.hq = true;
                 return 0;
             }
@@ -3028,9 +3329,17 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
             // Trailers on a request are not passed on.
-            if (s.started) return 0;
+            if (s.started or s.head_too_large) return 0;
             const arena = s.arena.allocator();
             const v = h.nghttp3_rcbuf_get_buf(value);
+            const n = h.nghttp3_rcbuf_get_buf(name);
+            // nghttp3 only advertises the limit; it is enforced here, as
+            // the fields arrive, so nothing past it is kept.
+            s.head_bytes += @as(u64, n.len) + v.len + 32;
+            if (s.head_bytes > s.conn.ep.options.max_field_section_size) {
+                s.head_too_large = true;
+                return 0;
+            }
             const val = arena.dupe(u8, v.base[0..v.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
             switch (token) {
                 h.NGHTTP3_QPACK_TOKEN__PATH => s.path = val,
@@ -3039,7 +3348,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 h.NGHTTP3_QPACK_TOKEN__PROTOCOL => s.protocol = val,
                 h.NGHTTP3_QPACK_TOKEN__SCHEME => {},
                 else => {
-                    const n = h.nghttp3_rcbuf_get_buf(name);
+                    if (s.headers.items.len >= s.conn.ep.http.config.request.max_header_count) {
+                        s.head_too_large = true;
+                        return 0;
+                    }
                     const key = arena.dupe(u8, n.base[0..n.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                     s.headers.append(arena, .{ .name = key, .value = val }) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 },
@@ -3122,6 +3434,13 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
     };
 }
+
+/// Whether `Options.hq_interop_root` may be used: only in a program built
+/// for the QUIC interop runner, whose root file says so.
+const hq_interop_allowed = blk: {
+    const root = @import("root");
+    break :blk @hasDecl(root, "anole_hq_interop") and root.anole_hq_interop;
+};
 
 /// The 0-RTT context a connection of an endpoint with `options` gets, from
 /// a throwaway connection with fixed IDs: for tests that compare endpoints

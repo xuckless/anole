@@ -446,9 +446,9 @@ test "h2 client: the system trust store by default, a CA in memory, mutual TLS f
 
     // The default is the system store, which has certificates in it and
     // does not trust a development certificate.
-    const system = (try anole_tls.dusty_tls.clientStore(gpa, io, @as(dusty.TlsCa, .system))).?;
-    defer anole_tls.dusty_tls.releaseStore(system);
-    try std.testing.expect(anole_tls.dusty_tls.storeCertCount(system) > 0);
+    const system = (try @import("anole_dusty_tls").clientStore(gpa, io, @as(dusty.TlsCa, .system))).?;
+    defer @import("anole_dusty_tls").releaseStore(system);
+    try std.testing.expect(@import("anole_dusty_tls").storeCertCount(system) > 0);
 
     var srv = try Running.start(gpa, io, &.{.{ .address = loopback, .tls = .{
         .pem = .{ .cert = server_pem.cert, .key = server_pem.key },
@@ -534,7 +534,7 @@ test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout,
         try std.testing.expect(response.headers().get("content-length") != null);
     }
     // The same connection, from the pool.
-    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
     {
         const big = try gpa.alloc(u8, 300 * 1024);
         defer gpa.free(big);
@@ -544,7 +544,7 @@ test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout,
         try std.testing.expectEqual(.ok, response.status());
         try std.testing.expect(std.mem.eql(u8, big, (try response.body()).?));
     }
-    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
     {
         var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{ .method = .head });
         defer response.deinit();
@@ -578,5 +578,213 @@ test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout,
         defer response.deinit();
         try std.testing.expectEqual(@as(u8, 1), response.version().major);
         try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+    }
+}
+
+/// A scripted HTTP/2 server for the client: the test feeds the frames the
+/// client reads (`send`), and what the client writes is thrown away. The
+/// client runs on it through `adopt`, over a loopback socket pair that
+/// carries nothing (the session's end shuts it down).
+const Scripted = struct {
+    io: std.Io,
+    queue: std.Io.Queue(u8),
+    queue_buf: [256 * 1024]u8 = undefined,
+    reader: std.Io.Reader,
+    read_buf: [16 * 1024]u8 = undefined,
+    discarding: std.Io.Writer.Discarding,
+    write_buf: [4096]u8 = undefined,
+    listener: std.Io.net.Server,
+    near: std.Io.net.Stream,
+    far: std.Io.net.Stream,
+
+    fn create(gpa: std.mem.Allocator, io: std.Io) !*Scripted {
+        const self = try gpa.create(Scripted);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .io = io,
+            .queue = undefined,
+            .reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = stream } },
+            .discarding = undefined,
+            .listener = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{}),
+            .near = undefined,
+            .far = undefined,
+        };
+        self.queue = .init(&self.queue_buf);
+        self.reader.buffer = &self.read_buf;
+        self.discarding = .init(&self.write_buf);
+        self.near = try self.listener.socket.address.connect(io, .{ .mode = .stream });
+        self.far = try self.listener.accept(io);
+        // The server's connection preface: an empty SETTINGS.
+        try self.send(&frame(4, 0, 0, ""));
+        return self;
+    }
+
+    fn destroy(self: *Scripted, gpa: std.mem.Allocator) void {
+        self.near.close(self.io);
+        self.far.close(self.io);
+        self.listener.deinit(self.io);
+        gpa.destroy(self);
+    }
+
+    fn adopt(self: *Scripted, gpa: std.mem.Allocator) !*h2.ClientConnection {
+        return h2.ClientConnection.adopt(gpa, self.io, &self.reader, &self.discarding.writer, self.near);
+    }
+
+    fn send(self: *Scripted, bytes: []const u8) !void {
+        try self.queue.putAll(self.io, bytes);
+    }
+
+    /// The client reads the end of the connection.
+    fn end(self: *Scripted) void {
+        self.queue.close(self.io);
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Scripted = @alignCast(@fieldParentPtr("reader", r));
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = self.queue.get(self.io, dest, 1) catch return error.EndOfStream;
+        w.advance(n);
+        return n;
+    }
+};
+
+/// One HTTP/2 frame: its 9-byte header and `payload`.
+fn frame(comptime kind: u8, comptime flags: u8, comptime id: u31, comptime payload: []const u8) [9 + payload.len]u8 {
+    var out: [9 + payload.len]u8 = undefined;
+    std.mem.writeInt(u24, out[0..3], payload.len, .big);
+    out[3] = kind;
+    out[4] = flags;
+    std.mem.writeInt(u32, out[5..9], id, .big);
+    @memcpy(out[9..], payload);
+    return out;
+}
+
+fn waitClosing(conn: *h2.ClientConnection, io: std.Io) !void {
+    var tries: usize = 0;
+    while (conn.isOpen()) : (tries += 1) {
+        if (tries > 400) return error.TestTimeout;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+test "h2 client: a stream released after a graceful GOAWAY stays valid until the server ends it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+
+    const s = try request(conn, "/", .{});
+    // Its HEADERS go out before the GOAWAY comes.
+    try io.sleep(.fromMilliseconds(20), .awake);
+    // GOAWAY, last stream 1, NO_ERROR: stream 1 is still the server's to
+    // answer.
+    try peer.send(&frame(7, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }));
+    try waitClosing(conn, io);
+    s.release();
+    // The answer to the released stream: HEADERS (:status 200), then DATA
+    // with END_STREAM.
+    try peer.send(&frame(1, 0x4, 1, &.{0x88}));
+    try peer.send(&frame(0, 0x1, 1, "late"));
+    try io.sleep(.fromMilliseconds(50), .awake);
+    peer.end();
+}
+
+test "h2 client: a graceful GOAWAY lets the streams it covers finish" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.send(&frame(7, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }));
+    try waitClosing(conn, io);
+    try std.testing.expectError(error.ConnectionClosed, request(conn, "/", .{}));
+    // Give the client time to act on the GOAWAY before the answer comes.
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.send(&frame(1, 0x4, 1, &.{0x88}));
+    try peer.send(&frame(0, 0x1, 1, "finished"));
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const body = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("finished", body);
+}
+
+test "h2 client: a response head past the header list limit resets the stream" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    // :status 200, one 100-byte field added to the dynamic table, then 600
+    // one-byte references to it: about 80 KB decoded from 700 bytes.
+    const head = [_]u8{ 0x88, 0x40, 5 } ++ "x-big" ++ [_]u8{100} ++ @as([100]u8, @splat('v')) ++ @as([600]u8, @splat(0xbe));
+    try peer.send(&frame(1, 0x4, 1, head));
+    try std.testing.expectError(error.HeadersTooLarge, s.waitHead());
+
+    // The connection carries on.
+    const t = try request(conn, "/", .{});
+    defer t.release();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.send(&frame(1, 0x5, 3, &.{0x88}));
+    try t.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), t.status);
+}
+
+test "h2 client: informational responses before the final one, up to a limit" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    // :status 103 (a literal on the static name), with a link field.
+    const early = [_]u8{ 0x08, 3 } ++ "103" ++ [_]u8{ 0x00, 4 } ++ "link" ++ [_]u8{5} ++ "</a>;";
+    {
+        // Five, then the response: its head and fields, not theirs.
+        const s = try request(conn, "/", .{});
+        defer s.release();
+        try io.sleep(.fromMilliseconds(20), .awake);
+        for (0..5) |_| try peer.send(&frame(1, 0x4, 1, early));
+        try peer.send(&frame(1, 0x4, 1, [_]u8{ 0x88, 0x00, 1 } ++ "x" ++ [_]u8{1} ++ "y"));
+        try peer.send(&frame(0, 0x1, 1, "ok"));
+        try s.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), s.status);
+        try std.testing.expectEqualStrings("y", s.header("x").?);
+        try std.testing.expect(s.header("link") == null);
+        const body = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("ok", body);
+    }
+    {
+        // Six is one too many.
+        const s = try request(conn, "/", .{});
+        defer s.release();
+        try io.sleep(.fromMilliseconds(20), .awake);
+        for (0..6) |_| try peer.send(&frame(1, 0x4, 3, early));
+        try std.testing.expectError(error.TooManyInterimResponses, s.waitHead());
     }
 }

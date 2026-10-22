@@ -1,0 +1,173 @@
+name: Release checks
+
+# The protocol suites against ReleaseFast builds, plus the bundled C
+# libraries' own tests under ASan and UBSan. CI runs the suites on Debug and
+# ReleaseSafe builds, where Zig's safety checks stop a bug at the faulty line;
+# ReleaseFast has none of them (and no UBSan traps in the bundled C), so an
+# out-of-bounds bug there corrupts memory instead of stopping. These checks
+# run what deployments that choose ReleaseFast get, at every release tag and
+# on demand.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  h2spec:
+    name: h2spec (ReleaseFast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-h2spec
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Build examples/full
+        run: zig build full -Doptimize=ReleaseFast --summary all
+      - name: Fetch h2spec 2.6.0, pinned by SHA-256
+        run: |
+          curl -fsSL -o h2spec.tar.gz https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          echo "157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318  h2spec.tar.gz" | sha256sum -c -
+          tar xzf h2spec.tar.gz h2spec
+      - name: h2spec over h2c and over TLS
+        run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/full
+
+  autobahn:
+    name: Autobahn (ReleaseFast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-autobahn
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Build the echo peer
+        run: zig build autobahn-echo -Doptimize=ReleaseFast --summary all
+      - name: Autobahn fuzzing client
+        run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
+
+  h3:
+    name: HTTP/3 against aioquic, and restarts (ReleaseFast, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-h3
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Build the HTTP/3 test server and client
+        run: zig build h3-test-server h3-test-client -Doptimize=ReleaseFast --summary all
+      - name: Server and client against aioquic
+        run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
+      - name: Build examples/full
+        run: zig build full -Doptimize=ReleaseFast --summary all
+      - name: SIGUSR2 restarts with HTTP/3, under a stand-in for systemd's notify socket
+        run: tests/restart/run.sh ./zig-out/bin/full
+
+  quic-interop:
+    name: QUIC interop runner (ReleaseFast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-quic-interop
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Install tshark
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo add-apt-repository -y ppa:wireshark-dev/nightly &&
+              sudo apt-get update -qq &&
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark &&
+              exit 0
+            sleep $((i * 15))
+          done
+          exit 1
+      # The interop server built here in ReleaseFast; run.sh would build it
+      # ReleaseSafe.
+      - name: Build the interop server
+        run: zig build h3-interop-server -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/fast" --summary all
+      - name: tests/interop/run.sh
+        run: tests/interop/run.sh ngtcp2,quic-go
+        env:
+          ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
+          ANOLE_INTEROP_BIN: ${{ runner.temp }}/fast/bin/h3-interop-server
+      - name: Keep the logs of a failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
+        with:
+          name: release-quic-interop-logs
+          path: ${{ runner.temp }}/interop/logs
+          retention-days: 7
+
+  grpc-interop:
+    name: gRPC interop (ReleaseFast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-grpc-interop
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7 (v7.0.0)
+        with:
+          go-version: stable
+      - name: Build the interop server and client
+        run: zig build grpc-interop-server grpc-interop-client -Doptimize=ReleaseFast --summary all
+      - name: Interop test cases (grpc-go client, Anole server)
+        run: tests/grpc/interop/run.sh ./zig-out/bin/grpc-interop-server
+      - name: Interop test cases (Anole client, grpc-go server)
+        run: tests/grpc/interop/run-client.sh ./zig-out/bin/grpc-interop-client
+      - name: Interop test cases over TLS (grpc-go client, Anole server)
+        run: tests/grpc/interop/run.sh --tls ./zig-out/bin/grpc-interop-server
+      - name: Interop test cases over TLS (Anole client, grpc-go server)
+        run: tests/grpc/interop/run-client.sh --tls ./zig-out/bin/grpc-interop-client
+      - name: grpc HTTP/2 server checks
+        run: tests/grpc/interop/run-http2.sh ./zig-out/bin/grpc-interop-server
+
+  capi:
+    name: C ABI suite against a ReleaseFast libanole (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-capi
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: anole.h layout, the C suite, the engine over HTTP/2 and HTTP/3
+        run: zig build capi-test test-capi-engine -Doptimize=ReleaseFast --summary all
+
+  # The C libraries' own test suites under ASan and UBSan, from the pinned
+  # tarballs (the Sanitizers workflow, run for the release too).
+  sanitizers:
+    name: Bundled C libraries under ASan and UBSan
+    uses: ./.github/workflows/sanitize.yml

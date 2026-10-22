@@ -15,8 +15,10 @@ nghttp2 and the rest) itself.
 mkdir api && cd api
 zig init
 rm src/root.zig
-zig fetch --save git+https://github.com/xuckless/anole#<tag or commit>
+zig fetch --save git+https://github.com/xuckless/anole#v0.1.2
 ```
+
+(`#v0.1.2` is the latest release; a later tag or a commit works the same way.)
 
 Replace the `build.zig` that `zig init` wrote with this one:
 
@@ -33,7 +35,7 @@ pub fn build(b: *std.Build) void {
 
 `addApp` makes the executable, gives it the `anole` module, installs it and
 adds `zig build run`. `-Doptimize` and `-Dtarget` work as usual, and
-`.profile = .web` leaves out HTTP/3, gRPC and Redis (the
+`.profile = .web` leaves out HTTP/3, gRPC, MongoDB and Redis (the
 [build flags](../README.md#build-flags)).
 
 And `src/main.zig`:
@@ -61,7 +63,8 @@ curl localhost:3000/   # Hello, World!
 
 The first build compiles the C libraries, which takes a minute or two; later
 builds reuse them. The server logs
-`listening on http://0.0.0.0:3000 (HTTP/1.1, HTTP/2 cleartext)` and serves
+`listening on http://[::]:3000 (HTTP/1.1, HTTP/2 cleartext; IPv6 and IPv4)`
+(`http://0.0.0.0:3000` where the system has no IPv6) and serves
 until Ctrl-C or SIGTERM, then lets the requests in flight finish and
 returns. A Debug build also logs a line for each runtime thread it starts
 and stops; `pub const std_options = anole.std_options;` in `main.zig` keeps
@@ -76,12 +79,15 @@ const std = @import("std");
 const anole = @import("anole");
 
 pub const std_options = anole.std_options;
+pub const panic = anole.panic;
 
 const Todo = struct { id: usize, title: []const u8, done: bool = false };
 const NewTodo = struct { title: []const u8 };
 
 const App = struct {
     gpa: std.mem.Allocator,
+    /// SHA-256 of the API key; the key itself is not kept.
+    api_key_digest: [32]u8,
     mutex: std.Io.Mutex = .init,
     todos: std.ArrayList(Todo) = .empty,
 
@@ -119,14 +125,22 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
     try res.json(todo);
 }
 
-fn requireKey(req: *anole.Request, _: *anole.Response, next: anole.Next) !void {
+fn sha256(text: []const u8) [32]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &d, .{});
+    return d;
+}
+
+fn requireKey(app: *App, req: *anole.Request, _: *anole.Response, next: anole.Next) !void {
     const key = req.headers.get("X-Api-Key") orelse return error.Unauthorized;
-    if (!std.mem.eql(u8, key, "secret")) return error.Forbidden;
+    // Constant time: how long the check takes says nothing about the key.
+    if (!std.crypto.timing_safe.eql([32]u8, sha256(key), app.api_key_digest)) return error.Forbidden;
     return next.call();
 }
 
 pub fn main(init: std.process.Init) !void {
-    var state: App = .{ .gpa = init.gpa };
+    const api_key = init.environ_map.get("API_KEY") orelse return error.NoApiKey;
+    var state: App = .{ .gpa = init.gpa, .api_key_digest = sha256(api_key) };
     defer state.deinit();
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
@@ -144,9 +158,10 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 ```sh
-curl -H 'X-Api-Key: secret' -d '{"title":"write docs"}' localhost:3000/api/todos
+export API_KEY=$(openssl rand -base64 32)   # zig build run reads it
+curl -H "X-Api-Key: $API_KEY" -d '{"title":"write docs"}' localhost:3000/api/todos
 # {"id":1,"title":"write docs","done":false}
-curl -H 'X-Api-Key: secret' 'localhost:3000/api/todos?limit=10'
+curl -H "X-Api-Key: $API_KEY" 'localhost:3000/api/todos?limit=10'
 # [{"id":1,"title":"write docs","done":false}]
 curl localhost:3000/api/todos/1
 # {"error":"Unauthorized"}
@@ -180,7 +195,12 @@ What each piece does:
   `{"error":"..."}`; by default a request that sent or accepts JSON gets JSON
   and others get text.
 - **Middleware.** A function that takes `next` and calls `next.call()` to
-  go on, or returns an error or a `res.fail` answer to stop. `app.use` adds
+  go on, or returns an error or a `res.fail` answer to stop. Like a
+  handler, it may take the state first. Secrets such as the API key come
+  from the environment or a secret store, never from source, and are
+  compared in constant time (`std.crypto.timing_safe.eql`);
+  `anole.auth.apikey` issues and checks per-user keys
+  ([auth.md](auth.md#api-keys)). `app.use` adds
   middleware for every request (before the routes), and `app.group(prefix,
   .{...})` for the routes under a prefix. `app.with(.{...})` does the same
   without a prefix, for single routes.
@@ -252,8 +272,8 @@ options and call `run`:
 
 ```zig
 var app = try anole.App.init(init.gpa, .{
-    .http = .{ .address = "0.0.0.0", .port = 80 },
-    .https = .{ .address = "0.0.0.0", .port = 443, .cert = .fromFiles("fullchain.pem", "privkey.pem") },
+    .http = .{ .address = "", .port = 80 }, // "": every interface, IPv6 and IPv4
+    .https = .{ .address = "", .port = 443, .cert = .fromFiles("fullchain.pem", "privkey.pem") },
 });
 defer app.deinit();
 app.get("/", hello);
@@ -428,7 +448,8 @@ package) cannot make outbound HTTPS calls.
   restarts.
 - [websocket.md](websocket.md), [webtransport.md](webtransport.md), [grpc.md](grpc.md),
   [clients.md](clients.md) (outbound HTTP from a handler with
-  `anole.client(req)`), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,
+  `anole.client(req)`), [database.md](database.md) (PostgreSQL, SQLite,
+  MongoDB, Redis), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,
   rate limits), [observability.md](observability.md) (metrics, tracing,
   health checks).
 - [from-fiber.md](from-fiber.md): Fiber's API next to Anole's.

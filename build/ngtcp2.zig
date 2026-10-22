@@ -100,7 +100,24 @@ pub fn library(
     mod.addCMacro("NGTCP2_STATICLIB", "1");
     mod.addIncludePath(upstream.path("lib/includes"));
     mod.addIncludePath(upstream.path("lib"));
-    mod.addCSourceFiles(.{ .root = upstream.path("lib"), .files = &sources, .flags = &c_flags });
+    if (target.result.os.tag == .windows) {
+        // ngtcp2_str.c calls SecureZeroMemory, from windows.h, which the
+        // Winsock headers bring in only without NGTCP2_USE_GENERIC_SOCKADDR
+        // (`generic_sockaddr`): compiled through a file that includes it.
+        var files: [sources.len - 1][]const u8 = undefined;
+        var n: usize = 0;
+        for (sources) |f| if (!std.mem.eql(u8, f, "ngtcp2_str.c")) {
+            files[n] = f;
+            n += 1;
+        };
+        mod.addCSourceFiles(.{ .root = upstream.path("lib"), .files = b.dupeStrings(&files), .flags = &c_flags });
+        mod.addCSourceFile(.{
+            .file = b.addWriteFiles().add("ngtcp2_str_windows.c", "#include <windows.h>\n#include \"ngtcp2_str.c\"\n"),
+            .flags = &c_flags,
+        });
+    } else {
+        mod.addCSourceFiles(.{ .root = upstream.path("lib"), .files = &sources, .flags = &c_flags });
+    }
     lib.installHeadersDirectory(upstream.path("lib/includes/ngtcp2"), "ngtcp2", .{
         .include_extensions = &.{".h"},
     });
@@ -184,6 +201,7 @@ pub fn module(
         .optimize = optimize,
     });
     t.defineCMacro("NGTCP2_STATICLIB", "1");
+    if (target.result.os.tag == .windows) for (generic_sockaddr) |d| t.defineCMacro(d[0], d[1]);
     t.addIncludePath(upstream.path("lib/includes"));
     t.addIncludePath(upstream.path("crypto/includes"));
     t.addIncludePath(boringssl_include);
@@ -191,6 +209,17 @@ pub fn module(
     t.mod.linkLibrary(crypto_lib);
     return t.mod;
 }
+
+/// On Windows, ngtcp2's own socket address types instead of Winsock's:
+/// mingw's sockaddr_in6 holds a bitfield union (SCOPE_ID), which translate-c
+/// turns opaque, and ngtcp2_transport_params with it. The layouts are the
+/// same (Anole passes std's sockaddr_in6 through ngtcp2_addr), and the
+/// definitions must match between the C build and the bindings.
+const generic_sockaddr = [_][2][]const u8{
+    .{ "NGTCP2_USE_GENERIC_SOCKADDR", "1" },
+    .{ "NGTCP2_AF_INET", "2" },
+    .{ "NGTCP2_AF_INET6", "23" },
+};
 
 /// Per-OS replacements for the config.h that ngtcp2's CMake/autotools would generate
 /// (cmakeconfig.h.in). Only the macros the lib/ and crypto/ sources actually test are set.
@@ -224,7 +253,16 @@ pub fn configureC(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void
             mod.addCMacro("HAVE_DECL_BE64TOH", "0");
             mod.addCMacro("HAVE_DECL_BSWAP_64", "0");
         },
-        else => @panic("ngtcp2: unsupported target OS (Anole supports Linux and macOS)"),
+        .windows => {
+            for (generic_sockaddr) |d| mod.addCMacro(d[0], d[1]);
+            // ngtcp2's Windows paths test WIN32, which CMake defines and
+            // clang in strict C mode does not (_byteswap_*, SecureZeroMemory).
+            mod.addCMacro("WIN32", "1");
+            mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+            mod.addCMacro("HAVE_DECL_BE64TOH", "0");
+            mod.addCMacro("HAVE_DECL_BSWAP_64", "0");
+        },
+        else => @panic("ngtcp2: unsupported target OS (Anole supports Linux, macOS and Windows)"),
     }
     if (target.result.cpu.arch.endian() == .big) mod.addCMacro("WORDS_BIGENDIAN", "1");
 }

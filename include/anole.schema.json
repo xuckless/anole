@@ -1,0 +1,1579 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xuckless/anole/blob/main/include/anole.schema.json",
+  "title": "Anole C ABI configuration",
+  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error. ABI 0.2.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "executors": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 256,
+      "default": 0,
+      "description": "Executor threads; 0 for one per CPU (cgroup-aware)."
+    },
+    "listeners": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/Listener"
+      },
+      "description": "Default: one on 127.0.0.1:8080."
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "timeouts": {
+      "$ref": "#/$defs/Timeouts"
+    },
+    "http3": {
+      "$ref": "#/$defs/Http3"
+    },
+    "trusted_proxy_hops": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255,
+      "default": 0,
+      "description": "Proxies in front whose X-Forwarded-For (and PROXY protocol) Anole trusts for the client's address."
+    },
+    "trust_forwarded_proto": {
+      "type": "boolean",
+      "default": true,
+      "description": "With trusted_proxy_hops: the last X-Forwarded-Proto value says whether the request is secure."
+    },
+    "trust_forwarded_host": {
+      "type": "boolean",
+      "default": false,
+      "description": "With trusted_proxy_hops: the last X-Forwarded-Host value is the request's host (only when every proxy in front sets it)."
+    },
+    "middleware": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Middleware"
+      },
+      "description": "Native middleware for every route, in order."
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Route"
+      }
+    },
+    "grpc": {
+      "$ref": "#/$defs/Grpc"
+    },
+    "observe": {
+      "$ref": "#/$defs/Observe"
+    },
+    "databases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Database"
+      },
+      "description": "Databases for anole_db_*, opened at start."
+    }
+  },
+  "$defs": {
+    "Listener": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Unique, 1-255 bytes, no ':'. Requests carry it (`listener` in the record). Default \"http-<port>\" / \"https-<port>\"."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "address": {
+          "type": "string",
+          "description": "\"127.0.0.1\" (this machine, the default), \"\" (every interface, IPv6 and IPv4), \"0.0.0.0\", \"::\"."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 8080,
+          "description": "0 picks a free port (anole_server_port)."
+        },
+        "unix": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A unix domain socket at this path instead of address and port."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "http1": {
+          "type": "boolean",
+          "default": true
+        },
+        "http2": {
+          "type": "boolean",
+          "default": true,
+          "description": "HTTP/2: h2 by ALPN over TLS, h2c (prior knowledge) in cleartext."
+        },
+        "http3": {
+          "type": "boolean",
+          "default": false,
+          "description": "HTTP/3 over UDP on a TLS listener (one per server); its port follows the listeners' in anole_server_port."
+        },
+        "proxy_protocol": {
+          "type": "boolean",
+          "default": false,
+          "description": "Connections start with a PROXY protocol header."
+        },
+        "proxy_protocol_from": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "With proxy_protocol: the proxies allowed to send one (addresses or CIDR networks); empty: any peer."
+        }
+      }
+    },
+    "Tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "PEM file, read at start and by anole_server_reload_certificates."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "PEM text, instead of files."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "key_pem": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "self_signed": {
+          "type": "boolean",
+          "default": false,
+          "description": "A fresh self-signed certificate for localhost (development)."
+        },
+        "alpn": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "ALPN protocols in order; default h2, http/1.1."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_auth": {
+          "type": "string",
+          "enum": [
+            "none",
+            "request",
+            "require"
+          ],
+          "default": "none",
+          "description": "Mutual TLS: \"request\" asks for a client certificate and checks one that is sent; \"require\" refuses a client without one. Also over HTTP/3. Requests carry the certificate (ANOLE_REQ_PEER_CERT)."
+        },
+        "client_ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "PEM file of the CAs client certificates must chain to (with client_auth request or require)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same CAs as PEM text, instead of client_ca_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "Exactly one of cert_file + key_file, cert_pem + key_pem, self_signed."
+    },
+    "Limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "body_max": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1048576,
+          "description": "The largest request body, inline or streamed: past it, 413."
+        },
+        "inline_body_max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1073741824,
+          "default": 65536,
+          "description": "Bodies up to this come inline in the request record; larger ones are read with anole_req_read."
+        },
+        "max_inflight": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576,
+          "default": 1024,
+          "description": "Requests handed to consumers and not yet answered, per executor; past it, 503."
+        },
+        "queue": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "Events waiting for a consumer, per executor; 0 = twice max_inflight."
+        },
+        "stream_high_water": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "Bytes waiting in a streamed response before anole_stream_write answers ANOLE_BUSY."
+        },
+        "ws_high_water": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 1048576,
+          "description": "Bytes waiting on a WebSocket before anole_ws_send answers ANOLE_BUSY."
+        },
+        "ws_max_message": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1073741824,
+          "default": 1048576,
+          "description": "The largest WebSocket message, in or out (after inflating)."
+        },
+        "max_connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "Open connections at most; 0 follows the open-file limit."
+        },
+        "db_result_max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 16777216,
+          "description": "The largest database answer (its record's bytes); past it, ANOLE_E_TOOBIG."
+        }
+      }
+    },
+    "Timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A consumer request's default deadline: 504 from Anole after it."
+        },
+        "shutdown_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long a drain waits for requests in flight."
+        },
+        "keepalive_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 60000,
+          "description": "An idle keep-alive connection is closed after this."
+        },
+        "rewake_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 20,
+          "description": "Ring a consumer's doorbell again when its events stay unpolled this long (a lost wake); 0 never."
+        }
+      }
+    },
+    "Http3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_streams_bidi": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000
+        },
+        "alt_svc": {
+          "type": "boolean",
+          "default": true,
+          "description": "Advertise HTTP/3 with Alt-Svc on the TLS listener's responses."
+        },
+        "early_data": {
+          "type": "boolean",
+          "default": false,
+          "description": "Take 0-RTT from resuming clients (replayable: only safe methods run before the handshake completes)."
+        }
+      }
+    },
+    "Middleware": {
+      "description": "One native middleware, as an object with a single key naming it.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "request_id": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "header": {
+                  "type": "string"
+                },
+                "trust_incoming": {
+                  "type": "boolean",
+                  "default": false
+                }
+              }
+            }
+          },
+          "required": [
+            "request_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "access_log": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "format": {
+                  "enum": [
+                    "text",
+                    "json"
+                  ]
+                },
+                "exclude": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Paths not logged: exact, or a prefix ending in '*'."
+                }
+              }
+            }
+          },
+          "required": [
+            "access_log"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "compress": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {},
+              "description": "zstd, Brotli or gzip, as the client accepts."
+            }
+          },
+          "required": [
+            "compress"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cors": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "origins": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Empty allows every origin."
+                },
+                "methods": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "headers": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "expose": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "credentials": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "max_age": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "default": 600
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "required": [
+            "cors"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "jwt": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "jwks_url": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "description": "The provider's JWK Set URL, fetched and refreshed."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "jwks": {
+                  "description": "A JWK Set ({\"keys\": [...]}) given here.",
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "issuer": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "audience": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Required in the token's aud. Required with jwks_url (a provider's keys also sign tokens for its other clients), unless allow_any_audience."
+                },
+                "allow_any_audience": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "With jwks_url and no audience: only for keys that sign for this application alone."
+                },
+                "leeway_s": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 60
+                },
+                "require_exp": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "required_claims": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "scopes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Each must be in the scope claim; 403 otherwise."
+                },
+                "realm": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "description": "Exactly one of jwks_url and jwks; jwks_url needs audience (or allow_any_audience). The verified claims reach the consumer as JSON (`claims`)."
+            }
+          },
+          "required": [
+            "jwt"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rate_limit": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295,
+                  "default": 100
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "default": 60000
+                },
+                "burst": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 0,
+                  "description": "0 means limit."
+                },
+                "key": {
+                  "type": "string",
+                  "pattern": "^(ip|header:.+)$",
+                  "description": "\"ip\" (the client's address) or \"header:<name>\" (the header's raw value, unverified: only for a header a trusted proxy sets to a verified identity, since a client that varies it gets a fresh limit each time)."
+                },
+                "max_entries": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000
+                }
+              }
+            }
+          },
+          "required": [
+            "rate_limit"
+          ]
+        }
+      ]
+    },
+    "Observe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metrics": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "health": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "live": {
+                  "type": "string"
+                },
+                "ready": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "Route": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "GET",
+                "HEAD",
+                "POST",
+                "PUT",
+                "DELETE",
+                "CONNECT",
+                "OPTIONS",
+                "TRACE",
+                "PATCH",
+                "get",
+                "head",
+                "post",
+                "put",
+                "delete",
+                "connect",
+                "options",
+                "trace",
+                "patch"
+              ],
+              "description": "GET, POST, ...; left out: every method."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "\"/users/:id\", \"/files/*rest\"."
+        },
+        "handler": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "A consumer's route id: requests go to a consumer."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "respond": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Fixed"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "static": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Static"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "websocket": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WebSocket"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "webtransport": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WebTransport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "This route's request deadline (handler routes; at most 16 distinct values per server)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "no_wait": {
+          "type": "boolean",
+          "default": true,
+          "description": "Handler and respond routes run on the HTTP/2 and HTTP/3 reader when they can (no task per request); false gives each request a task."
+        },
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cache"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "middleware": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Middleware"
+          },
+          "description": "After the global ones."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "description": "Exactly one of handler, respond, static, websocket, webtransport."
+    },
+    "Fixed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 999,
+          "default": 200
+        },
+        "body": {
+          "type": "string"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "propertyNames": {
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+            "not": {
+              "pattern": "^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg])$"
+            }
+          },
+          "description": "Not Connection or Transfer-Encoding: the server writes those."
+        }
+      }
+    },
+    "Static": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dir": {
+          "type": "string"
+        },
+        "index": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "precompressed": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "br",
+              "zstd",
+              "gzip"
+            ]
+          }
+        },
+        "cache_control": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hide_dotfiles": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "dir"
+      ]
+    },
+    "WebSocket": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The consumer's route id for this endpoint's events."
+        },
+        "compression": {
+          "type": "boolean",
+          "default": true,
+          "description": "permessage-deflate when offered."
+        },
+        "close_on_drain": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close 1001 when the server drains."
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Pages of other origins that may open the socket, besides the request's own host (\"https://app.example.com\"); \"*\" for any. A browser handshake from any other origin gets 403."
+        }
+      },
+      "required": [
+        "handler"
+      ]
+    },
+    "WebTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The consumer's route id for this endpoint's events."
+        },
+        "close_on_drain": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close each session (code 0) when the server drains, right after ANOLE_EV_WT_DRAIN; false leaves that to the consumer (until timeouts.shutdown_ms)."
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Pages of other origins that may open a session, besides the request's own host; \"*\" for any. A browser request from any other origin gets 403."
+        },
+        "datagram_queue": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 64,
+          "description": "Datagrams a session holds for sending; past it the oldest is dropped (counted in anole_server_stats)."
+        }
+      },
+      "required": [
+        "handler"
+      ],
+      "description": "A WebTransport endpoint (draft-02, over HTTP/3): sessions, streams and datagrams go to a consumer. Needs a listener with http3; takes no method."
+    },
+    "Database": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "What anole_db_find looks it up by: unique, 1-255 bytes."
+        },
+        "sqlite": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sqlite"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "postgres": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Postgres"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "redis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Redis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mongodb": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Mongodb"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_entries": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 4096
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 33554432
+            }
+          },
+          "description": "Bounds of the answers kept for queries with cache_ttl_ms, over every executor."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "description": "A database for anole_db_*: exactly one of sqlite, postgres, redis and mongodb."
+    },
+    "Sqlite": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "A file (created when missing), or \":memory:\"."
+        },
+        "readers": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "Read-only connections beside the writer; left out: one per executor, at most 8; 0: everything on the writer."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "busy_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a statement waits for a lock another process holds."
+        },
+        "statement_cache": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 64,
+          "description": "Prepared statements kept per connection."
+        },
+        "pragmas": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Run on every connection as it opens."
+        },
+        "init": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "SQL run once at start, before the listeners open: a schema."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "Postgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "postgres://user:password@host:port/database?params. Null: DATABASE_URL, else libpq's variables (PGHOST, PGUSER...)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sslmode": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "disable",
+                "allow",
+                "prefer",
+                "require",
+                "verify-ca",
+                "verify-full"
+              ],
+              "description": "libpq's sslmode. Null: the URL's, else PGSSLMODE, else verify-full for a server on another host and prefer on this machine."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file of the CA certificates the server's certificate is checked against; with one, the certificate is always checked."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections in all, split between the executors. Null: the URL's pool_max_conns, else twice the executors, at least 4."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a query waits for a connection when all are busy."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long opening a connection may take; 0: no limit."
+        },
+        "statement_cache_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 256,
+          "description": "Statements each connection keeps prepared."
+        },
+        "max_lifetime_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 3600000,
+          "description": "Connections older than this are closed; 0: no limit."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 1800000,
+          "description": "Connections idle this long are closed; 0: no limit."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open a connection per executor at start, and fail the start if that fails."
+        },
+        "application_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reset_session": {
+          "enum": [
+            "auto",
+            "always",
+            "off"
+          ],
+          "default": "auto",
+          "description": "What happens to a connection's session when a query gives it back: \"auto\" resets it when what the query ran may have changed it, \"always\" on every release, \"off\" never."
+        },
+        "init": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "SQL run once at start, before the listeners open: a schema."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "A PostgreSQL database (anole.pg; docs/database.md)."
+    },
+    "Redis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "redis://user:password@host:6379/0, rediss:// for TLS, or unix:///path?db=0. Null: REDIS_URL, else redis://127.0.0.1:6379."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "rediss://: a PEM file of the CA certificates the server's certificate is checked against. Null: the URL's ssl_ca_certs, else the system's store."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections in all, split between the executors. Null: ten per executor."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a command waits for a connection when all are busy."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long opening a connection may take; 0: no limit."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 300000,
+          "description": "Connections idle this long are closed; 0: no limit."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open a connection per executor at start, and fail the start if that fails."
+        }
+      },
+      "description": "A Redis or Valkey server (anole.redis; docs/database.md)."
+    },
+    "Mongodb": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "mongodb:// or mongodb+srv:// connection string; its options win over the fields below. Null: MONGODB_URI, else mongodb://localhost:27017."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "database": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The database operations name no other for. Null: the URL's path, else \"test\"."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file of the CA certificates the server's certificate is checked against; turns TLS on."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 100,
+          "description": "Connections at most, split between the executors (maxPoolSize; 0: no limit)."
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long an operation waits for a pooled connection."
+        },
+        "server_selection_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "How long an operation waits for a server it can use (a primary)."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "TCP connect and TLS handshake."
+        }
+      },
+      "description": "A MongoDB deployment (anole.mongodb; docs/database.md)."
+    },
+    "Cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ttl_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "When the answer's Cache-Control does not say."
+        },
+        "authenticated": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also keep answers to requests with credentials."
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 1024
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 16777216
+        }
+      }
+    },
+    "Grpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "gRPC services whose methods the consumer implements (-Dgrpc). Anole serves gRPC over HTTP/2, gRPC-Web, Connect and JSON transcoding, with framing, compression, deadlines, limits and health; messages reach the consumer as protobuf bytes (ANOLE_EV_GRPC_CALL).",
+      "properties": {
+        "descriptor_set": {
+          "type": "string",
+          "description": "The services' descriptors: a serialized google.protobuf.FileDescriptorSet with its imports (protoc --include_imports --descriptor_set_out, buf build -o), base64. With descriptors Anole knows each method's call mode and serves JSON (Connect JSON, gRPC-Web JSON, google.api.http transcoding) by converting to and from protobuf; without them every service lists its methods and only protobuf is served."
+        },
+        "descriptor_set_file": {
+          "type": "string",
+          "description": "The same, as the path of the file (read by anole_server_create). One of descriptor_set and descriptor_set_file."
+        },
+        "services": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/GrpcService"
+          }
+        },
+        "health": {
+          "type": "boolean",
+          "default": false,
+          "description": "Serve grpc.health.v1.Health: the server (\"\") and every service here SERVING until anole_grpc_health_set says otherwise, NOT_SERVING once the server drains."
+        }
+      },
+      "required": [
+        "services"
+      ]
+    },
+    "GrpcService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "The service's full name, \"package.Service\"."
+        },
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The consumer's route id for this service's calls (anole_grpc_call_event.route_id)."
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GrpcMethod"
+          },
+          "description": "The methods served, in the order of their method_id. Left out: all of the service's, in the descriptors' order (needs descriptors)."
+        },
+        "max_message_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1073741824,
+          "default": 4194304,
+          "description": "The largest request message, after inflating; a larger one ends the call with RESOURCE_EXHAUSTED. A consumer's poll buffer must hold a call record with one."
+        },
+        "max_received_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 67108864,
+          "description": "Request message bytes one call takes in all (each counted at its size plus 64); past it, RESOURCE_EXHAUSTED."
+        },
+        "read_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "How long a request message may take once it started arriving; 0 for no limit but the deadline."
+        },
+        "max_call_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "The longest a call may run, capping the client's deadline; 0 for none."
+        },
+        "response_compression": {
+          "enum": [
+            "mirror",
+            "accepted",
+            "never"
+          ],
+          "default": "mirror",
+          "description": "When response messages are gzipped: when the request's were (mirror), whenever the client accepts gzip (accepted), never."
+        },
+        "read_ahead": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 8,
+          "description": "Request messages of a client- or bidirectional-streaming call delivered before the consumer asks for more (anole_grpc_read)."
+        },
+        "transcode": {
+          "type": "boolean",
+          "default": true,
+          "description": "REST routes for the methods annotated with google.api.http (needs descriptors)."
+        },
+        "no_wait": {
+          "type": "boolean",
+          "default": true,
+          "description": "Unary and server-streaming calls that arrive whole over HTTP/2 or HTTP/3 run with no task (detached), as no_wait routes do."
+        }
+      },
+      "required": [
+        "name",
+        "handler"
+      ]
+    },
+    "GrpcMethod": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The method's name, as in the .proto (\"SayHello\")."
+        },
+        "kind": {
+          "enum": [
+            "unary",
+            "server_streaming",
+            "client_streaming",
+            "bidi_streaming"
+          ],
+          "description": "The call mode; needed without descriptors, else checked against them."
+        },
+        "no_side_effects": {
+          "type": "boolean",
+          "description": "Also serve the method as Connect GET (unary only). Default: the descriptors' idempotency_level = NO_SIDE_EFFECTS."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  }
+}

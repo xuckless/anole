@@ -1,24 +1,37 @@
 //! Copied from fanyang89/grpc-lite (MIT, Copyright (c) 2026 grpc-lite contributors),
 //! src/metadata.zig at commit db3c400bf70419742ebcb42fe316ba8b754b4975; see THIRD_PARTY_NOTICES.
+//!
+//! gRPC metadata: key/value pairs carried as HTTP/2 headers and trailers.
+//! Keys are lower case; a key ending in `-bin` carries binary values,
+//! base64-encoded on the wire. Handlers read request metadata with
+//! `Call.metadata` and add their own with `Call.addHeader` and
+//! `Call.addTrailer`; this list is what the client returns.
 const std = @import("std");
 
+/// One metadata pair.
 pub const Entry = struct {
     key: []const u8,
     value: []const u8,
 };
 
+/// What `Metadata.appendDecoded` did with a value: kept it, or dropped
+/// it as an ASCII value with characters gRPC does not allow.
 pub const IncomingResult = enum { appended, discarded };
 
+/// A value ready for the wire: the value itself, or (for a `-bin` key)
+/// its base64 form, which the caller frees with `deinit`.
 pub const OutboundValue = union(enum) {
     borrowed: []const u8,
     owned: []u8,
 
+    /// The bytes to send.
     pub fn bytes(self: OutboundValue) []const u8 {
         return switch (self) {
             inline else => |value| value,
         };
     }
 
+    /// Frees the base64 copy, if one was made.
     pub fn deinit(self: OutboundValue, allocator: std.mem.Allocator) void {
         switch (self) {
             .borrowed => {},
@@ -27,14 +40,18 @@ pub const OutboundValue = union(enum) {
     }
 };
 
+/// A list of metadata pairs that owns copies of its keys and values. A key
+/// may appear more than once.
 pub const Metadata = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
 
+    /// An empty list.
     pub fn init(allocator: std.mem.Allocator) Metadata {
         return .{ .allocator = allocator };
     }
 
+    /// Frees every key and value.
     pub fn deinit(self: *Metadata) void {
         for (self.entries.items) |entry| {
             self.allocator.free(entry.key);
@@ -44,6 +61,11 @@ pub const Metadata = struct {
         self.* = undefined;
     }
 
+    /// Adds a copy of `key` and `value`. Fails with
+    /// `error.InvalidMetadataKey` for a key that is not lower-case
+    /// `a-z0-9-_.` or starts with "grpc-" (reserved), and with
+    /// `error.InvalidMetadataValue` for a non-binary value outside
+    /// printable ASCII.
     pub fn append(self: *Metadata, key: []const u8, value: []const u8) !void {
         if (!isApplicationKey(key)) return error.InvalidMetadataKey;
         if (!isBinaryKey(key) and !isValidAsciiValue(value)) return error.InvalidMetadataValue;
@@ -63,6 +85,9 @@ pub const Metadata = struct {
         });
     }
 
+    /// Adds a pair as it came off the wire: a `-bin` value is base64-decoded
+    /// (a comma-separated list becomes one entry per value), and an ASCII
+    /// value with characters gRPC does not allow is dropped (`.discarded`).
     pub fn appendDecoded(self: *Metadata, key: []const u8, value: []const u8) !IncomingResult {
         if (!isApplicationKey(key)) return error.InvalidMetadataKey;
         if (!isBinaryKey(key)) {
@@ -92,6 +117,7 @@ pub const Metadata = struct {
         return .appended;
     }
 
+    /// The first value under `key`, or null.
     pub fn getFirst(self: *const Metadata, key: []const u8) ?[]const u8 {
         for (self.entries.items) |entry| {
             if (std.mem.eql(u8, entry.key, key)) return entry.value;
@@ -99,11 +125,14 @@ pub const Metadata = struct {
         return null;
     }
 
+    /// Every pair, in the order added.
     pub fn items(self: *const Metadata) []const Entry {
         return self.entries.items;
     }
 };
 
+/// Whether `key` is a valid metadata key: non-empty, lower-case letters,
+/// digits, '-', '_' and '.', not a pseudo-header.
 pub fn isValidKey(key: []const u8) bool {
     if (key.len == 0 or key[0] == ':') return false;
     for (key) |byte| switch (byte) {
@@ -113,20 +142,26 @@ pub fn isValidKey(key: []const u8) bool {
     return true;
 }
 
+/// A valid key that is not reserved for gRPC itself ("grpc-...").
 pub fn isApplicationKey(key: []const u8) bool {
     return isValidKey(key) and !std.mem.startsWith(u8, key, "grpc-");
 }
 
+/// Whether `value` is non-empty printable ASCII, as a non-binary value
+/// must be.
 pub fn isValidAsciiValue(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |byte| if (byte < 0x20 or byte > 0x7e) return false;
     return true;
 }
 
+/// Whether `key` ends in "-bin", so its values are binary.
 pub fn isBinaryKey(key: []const u8) bool {
     return std.mem.endsWith(u8, key, "-bin");
 }
 
+/// `value` as it goes on the wire under `key`: base64 for a `-bin` key,
+/// else unchanged.
 pub fn encodeOutboundValue(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !OutboundValue {
     if (!isBinaryKey(key)) return .{ .borrowed = value };
 

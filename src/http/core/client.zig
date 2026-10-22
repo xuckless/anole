@@ -35,6 +35,7 @@ const ContentType = http.ContentType;
 const ContentEncoding = http.ContentEncoding;
 
 const WebSocket = @import("websocket.zig").WebSocket;
+const placement = @import("placement.zig");
 
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
@@ -100,8 +101,28 @@ pub const ClientConfig = struct {
     max_redirects: u8 = 10,
     /// Maximum response body size in bytes.
     max_response_size: usize = 10_485_760, // 10MB
-    /// Maximum idle connections to keep in pool (0 = no pooling).
-    max_idle_connections: u8 = 8,
+    /// Idle connections kept for reuse, in all, by each executor's pool
+    /// (one pool per executor on zio, one in all elsewhere); 0 turns
+    /// pooling off. Past it, the connection idle longest is closed.
+    max_idle_connections: u16 = 1024,
+    /// Idle connections kept for reuse to one host (scheme, host and port,
+    /// or unix socket), by each executor's pool; 0 turns pooling off.
+    ///
+    /// Generous on purpose: when many requests fan in to one upstream,
+    /// every connection beyond this that comes back is closed and the next
+    /// request dials again, which costs a handshake, a socket in TIME_WAIT
+    /// and memory churn on every round. Idle connections are only ever as
+    /// many as were busy at once, and `idle_timeout` closes them after a
+    /// burst. (Go's MaxIdleConnsPerHost of 2 is the cautionary tale; hyper
+    /// and reqwest keep no per-host limit.)
+    max_idle_per_host: u16 = 256,
+    /// How long a pooled connection may sit unused before it is closed:
+    /// by the pool's own task (one per executor, only while connections
+    /// are idle), or when it is next looked at. A shorter `Keep-Alive:
+    /// timeout=N` from the server wins. Null keeps idle connections until
+    /// the server closes them or the pool evicts them. 90 s, as Go's
+    /// IdleConnTimeout and hyper's default.
+    idle_timeout: ?std.Io.Duration = .fromSeconds(90),
     /// Buffer size (bytes) for reading the response head: the status line
     /// and all headers. This is also the limit on it -- parsed header names
     /// and values are slices into this buffer rather than copies, so the head
@@ -136,6 +157,55 @@ pub const ClientConfig = struct {
     /// connection on which the server picks h2 carries one request at a time
     /// and is pooled like an HTTP/1.1 one. Defaults off.
     http2: bool = false,
+    /// Decides every redirect before it is followed (within
+    /// `max_redirects`). Without one, redirects are followed, except one
+    /// that would send the request's body (a 307 or 308) to another host,
+    /// or to the same host over plain http from https: that response is
+    /// returned as it is.
+    check_redirect: ?RedirectPolicy = null,
+    /// Refuse to talk to loopback, private, link-local (cloud metadata
+    /// among them), shared, multicast and unspecified addresses, IPv4 and
+    /// IPv6: `fetch` fails with `error.AddressNotAllowed` after the TCP
+    /// connect, before any byte is sent, on the first hop and on every
+    /// redirect. For clients that fetch URLs from untrusted input. Checks
+    /// the address actually connected to, so a name that resolves to such
+    /// an address is refused too. Unix sockets are not checked.
+    deny_private_addresses: bool = false,
+};
+
+/// A redirect about to be followed, as `RedirectPolicy.check` sees it.
+pub const Redirect = struct {
+    /// 301, 302, 303, 307 or 308.
+    status: u16,
+    /// The URL that answered with the redirect.
+    from: Uri,
+    /// Where the redirect points, resolved against `from`.
+    to: Uri,
+    /// The next request's method and whether it carries a body, after the
+    /// change 301, 302 and 303 make to non-GET requests.
+    method: Method,
+    has_body: bool,
+    /// Redirects already followed.
+    hops: u8,
+    /// `to` has another scheme, host or port than `from`.
+    cross_origin: bool,
+};
+
+/// What to do with a redirect.
+pub const RedirectAction = enum {
+    /// Follow it.
+    follow,
+    /// Return the redirect response itself.
+    stop,
+    /// Fail the fetch with `error.RedirectRefused`.
+    fail,
+};
+
+/// `ClientConfig.check_redirect`: `check(context, redirect)` decides each
+/// redirect. It runs on the fetching task and must not block.
+pub const RedirectPolicy = struct {
+    context: ?*anyopaque = null,
+    check: *const fn (context: ?*anyopaque, redirect: *const Redirect) RedirectAction,
 };
 
 /// TLS settings for the HTTP client.
@@ -264,7 +334,24 @@ const TlsRef = struct {
 
 /// Parse a URL string into a std.Uri.
 fn parseUrl(url: []const u8) !Uri {
-    return Uri.parse(url) catch return error.InvalidUrl;
+    const uri = Uri.parse(url) catch return error.InvalidUrl;
+    try checkRequestTarget(uri);
+    return uri;
+}
+
+/// The path and query go into the request line (or `:path`) as they are,
+/// so they may hold only the visible ASCII a request target allows:
+/// `std.Uri.parse` lets through spaces, controls (CR, LF) and bytes past
+/// 0x7f. Percent-encode those. Checked when a URL is parsed and again
+/// before every request line, for redirect targets too.
+fn checkRequestTarget(uri: Uri) error{InvalidUrl}!void {
+    if (!isTargetText(uri.path.percent_encoded)) return error.InvalidUrl;
+    if (uri.query) |query| if (!isTargetText(query.percent_encoded)) return error.InvalidUrl;
+}
+
+fn isTargetText(bytes: []const u8) bool {
+    for (bytes) |b| if (b <= 0x20 or b >= 0x7f) return false;
+    return true;
 }
 
 /// Get port and protocol from URI.
@@ -298,7 +385,7 @@ fn uriPath(uri: Uri) []const u8 {
     return path;
 }
 
-/// Pool of idle connections for reuse.
+/// Pool of idle connections for reuse: one per executor (`Client.pools`).
 ///
 /// `acquire`/`release` are safe to call from multiple tasks running in
 /// parallel: `idle`/`idle_len` are guarded by `mutex`, and the critical
@@ -309,29 +396,58 @@ fn uriPath(uri: Uri) []const u8 {
 ///
 /// A connection released with its response body unread is handed to a task
 /// in `drains`, which discards the rest of the body and then releases it.
-/// `deinit` cancels those tasks, so they close their connections instead.
+/// While connections that can expire are idle, a task in `reaper` (`reap`)
+/// closes them as they do. `deinit` cancels both, so a drain closes its
+/// connection instead.
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex,
+    /// Oldest first: a released connection goes to the end, `acquire`
+    /// takes the newest that matches, and eviction the oldest.
     idle: std.DoublyLinkedList,
     idle_len: usize,
-    max_idle: u8,
+    max_idle: u16,
+    max_idle_per_host: u16,
+    idle_timeout: ?std.Io.Duration,
+    /// Whether `reap` is running or about to (guarded by `mutex`).
+    reaping: bool = false,
     drains: std.Io.Group = .init,
+    reaper: std.Io.Group = .init,
 
     /// Bounds on the unread body a background drain discards to keep a
     /// connection, the same as Go's net/http.
     const drain_max_bytes = 256 << 10;
     const drain_timeout: std.Io.Duration = .fromMilliseconds(50);
+    /// The shortest `reap` sleeps, so expiries close together are closed
+    /// in one round.
+    const reap_min_sleep: std.Io.Duration = .fromMilliseconds(10);
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_idle: u8) ConnectionPool {
+    /// `ClientConfig`'s pool settings.
+    pub const Limits = struct {
+        max_idle: u16 = 1024,
+        max_idle_per_host: u16 = 256,
+        idle_timeout: ?std.Io.Duration = .fromSeconds(90),
+
+        pub fn fromConfig(config: ClientConfig) Limits {
+            return .{
+                .max_idle = config.max_idle_connections,
+                .max_idle_per_host = config.max_idle_per_host,
+                .idle_timeout = config.idle_timeout,
+            };
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, limits: Limits) ConnectionPool {
         return .{
             .allocator = allocator,
             .io = io,
             .mutex = .init,
             .idle = .{},
             .idle_len = 0,
-            .max_idle = max_idle,
+            .max_idle = limits.max_idle,
+            .max_idle_per_host = limits.max_idle_per_host,
+            .idle_timeout = limits.idle_timeout,
         };
     }
 
@@ -339,13 +455,41 @@ pub const ConnectionPool = struct {
         // A drain that completes during the cancel releases its connection
         // into `idle`; a canceled one closes its own.
         self.drains.cancel(self.io);
+        self.reaper.cancel(self.io);
 
         // Close and free all idle connections
-        while (self.idle.popFirst()) |node| {
-            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", node));
-            conn.deinit();
-            self.allocator.destroy(conn);
+        while (self.idle.popFirst()) |node| destroy(self, fromNode(node));
+    }
+
+    /// Whether released connections are kept at all.
+    pub fn pooling(self: *const ConnectionPool) bool {
+        return self.max_idle != 0 and self.max_idle_per_host != 0;
+    }
+
+    fn fromNode(node: *std.DoublyLinkedList.Node) *Connection {
+        return @alignCast(@fieldParentPtr("pool_node", node));
+    }
+
+    fn destroy(self: *ConnectionPool, conn: *Connection) void {
+        conn.deinit();
+        self.allocator.destroy(conn);
+    }
+
+    /// When idle `conn` is due to be closed: at the server's `Keep-Alive`
+    /// timeout or `idle_timeout` after it was pooled, whichever is first;
+    /// null for never.
+    fn expiry(self: *const ConnectionPool, conn: *const Connection) ?std.Io.Timestamp {
+        var at = conn.idle_deadline;
+        if (self.idle_timeout) |timeout| {
+            const ours = conn.pooled_at.addDuration(timeout);
+            if (at == null or ours.nanoseconds < at.?.nanoseconds) at = ours;
         }
+        return at;
+    }
+
+    fn expired(self: *const ConnectionPool, conn: *const Connection, now: std.Io.Timestamp) bool {
+        const at = self.expiry(conn) orelse return false;
+        return now.nanoseconds >= at.nanoseconds;
     }
 
     /// Try to acquire an existing connection for the given host:port, protocol, and optional unix socket path.
@@ -355,7 +499,7 @@ pub const ConnectionPool = struct {
 
         // Connections found expired along the way. They are already out of the
         // pool and owned by us, so they get closed after the lock is dropped.
-        var expired: std.DoublyLinkedList = .{};
+        var expired_list: std.DoublyLinkedList = .{};
 
         const found = found: {
             self.mutex.lockUncancelable(io);
@@ -364,19 +508,16 @@ pub const ConnectionPool = struct {
             // Search from end (most recently used)
             var node = self.idle.last;
             while (node) |n| {
-                const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
+                const conn = fromNode(n);
                 node = n.prev;
 
                 if (conn.matches(remote_host, remote_port, protocol, unix_socket_path)) {
                     self.idle.remove(n);
                     self.idle_len -= 1;
 
-                    // Check if connection has expired due to idle timeout
-                    if (conn.idle_deadline) |deadline| {
-                        if (now.nanoseconds >= deadline.nanoseconds) {
-                            expired.append(n);
-                            continue;
-                        }
+                    if (self.expired(conn, now)) {
+                        expired_list.append(n);
+                        continue;
                     }
 
                     break :found conn;
@@ -385,60 +526,76 @@ pub const ConnectionPool = struct {
             break :found null;
         };
 
-        while (expired.popFirst()) |n| {
-            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
-            conn.deinit();
-            self.allocator.destroy(conn);
-        }
+        while (expired_list.popFirst()) |n| self.destroy(fromNode(n));
 
         return found;
     }
 
-    /// Release a connection back to the pool, or close it if pool is full or connection is closing.
+    /// Release a connection back to the pool, or close it if the pool is
+    /// off or the connection is closing. A full pool (in all, or for the
+    /// connection's host) closes its oldest idle connection to make room.
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
         // Don't pool connections that are closing
-        if (conn.closing or self.max_idle == 0) {
-            conn.deinit();
-            self.allocator.destroy(conn);
+        if (conn.closing or !self.pooling()) {
+            self.destroy(conn);
             return;
         }
 
         // Reset before taking the lock; it only touches this connection.
         conn.reset() catch {
-            conn.deinit();
-            self.allocator.destroy(conn);
+            self.destroy(conn);
             return;
         };
+        conn.pooled_at = std.Io.Timestamp.now(self.io, .awake);
 
+        var start_reaper = false;
         const evicted: ?*Connection = evicted: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            // If pool is full, evict the oldest connection
-            var old: ?*Connection = null;
-            if (self.idle_len >= self.max_idle) {
-                if (self.idle.popFirst()) |old_node| {
-                    old = @alignCast(@fieldParentPtr("pool_node", old_node));
-                    self.idle_len -= 1;
-                }
+            // The oldest idle connection to the same place, and whether
+            // the host already has its fill.
+            var same: usize = 0;
+            var oldest_same: ?*std.DoublyLinkedList.Node = null;
+            var node = self.idle.first;
+            while (node) |n| : (node = n.next) {
+                const other = fromNode(n);
+                if (!other.matches(conn.host(), conn.port, conn.protocol, conn.unixPath())) continue;
+                if (oldest_same == null) oldest_same = n;
+                same += 1;
+                if (same >= self.max_idle_per_host) break;
+            }
+
+            var old: ?*std.DoublyLinkedList.Node = null;
+            if (same >= self.max_idle_per_host) {
+                old = oldest_same;
+            } else if (self.idle_len >= self.max_idle) {
+                old = self.idle.first;
+            }
+            if (old) |n| {
+                self.idle.remove(n);
+                self.idle_len -= 1;
             }
 
             self.idle.append(&conn.pool_node);
             self.idle_len += 1;
-            break :evicted old;
+
+            if (!self.reaping and self.expiry(conn) != null) {
+                self.reaping = true;
+                start_reaper = true;
+            }
+            break :evicted if (old) |n| fromNode(n) else null;
         };
 
         // Closing suspends, so it must happen outside the critical section.
-        if (evicted) |old| {
-            old.deinit();
-            self.allocator.destroy(old);
-        }
+        if (evicted) |old| self.destroy(old);
+        if (start_reaper) self.startReaper();
     }
 
     /// Hands `conn` to a background drain, or returns false if no task
     /// could be had for it, in which case the caller still owns it.
     fn startDrain(self: *ConnectionPool, conn: *Connection) bool {
-        self.drains.concurrent(self.io, drain, .{ self, conn }) catch return false;
+        placement.concurrent(&self.drains, self.io, .local, drain, .{ self, conn }) catch return false;
         return true;
     }
 
@@ -463,6 +620,48 @@ pub const ConnectionPool = struct {
             error.ReadFailed => return body_reader.err orelse error.Unexpected,
         };
         return conn.parser.isBodyComplete();
+    }
+
+    /// Starts `reap`, on this executor. Without a task for it, idle
+    /// connections still expire when `acquire` comes across them.
+    fn startReaper(self: *ConnectionPool) void {
+        placement.concurrent(&self.reaper, self.io, .local, reap, .{self}) catch {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.reaping = false;
+        };
+    }
+
+    /// Closes idle connections as they expire, sleeping until the next one
+    /// does, and ends when none left can (`release` starts it again).
+    fn reap(self: *ConnectionPool) std.Io.Cancelable!void {
+        while (true) {
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            var expired_list: std.DoublyLinkedList = .{};
+            const next: ?std.Io.Timestamp = next: {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                var soonest: ?std.Io.Timestamp = null;
+                var node = self.idle.first;
+                while (node) |n| {
+                    node = n.next;
+                    const at = self.expiry(fromNode(n)) orelse continue;
+                    if (now.nanoseconds >= at.nanoseconds) {
+                        self.idle.remove(n);
+                        self.idle_len -= 1;
+                        expired_list.append(n);
+                    } else if (soonest == null or at.nanoseconds < soonest.?.nanoseconds) {
+                        soonest = at;
+                    }
+                }
+                if (soonest == null) self.reaping = false;
+                break :next soonest;
+            };
+            while (expired_list.popFirst()) |n| self.destroy(fromNode(n));
+            const at = next orelse return;
+            const wait = now.durationTo(at);
+            try self.io.sleep(if (wait.nanoseconds < reap_min_sleep.nanoseconds) reap_min_sleep else wait, .awake);
+        }
     }
 };
 
@@ -523,7 +722,11 @@ pub const Connection = struct {
     // Keep-Alive tracking
     request_count: u16 = 0,
     keep_alive: KeepAliveParams = .{},
+    /// When the server's `Keep-Alive: timeout` says the idle connection
+    /// goes, if it said.
     idle_deadline: ?std.Io.Timestamp = null,
+    /// When it last went back to the pool (`ConnectionPool.idle_timeout`).
+    pooled_at: std.Io.Timestamp = .{ .nanoseconds = 0 },
 
     // When the handshake picked "h2": the session, which reads and writes the
     // connection from then on, and the stream of the request in flight.
@@ -560,6 +763,7 @@ pub const Connection = struct {
         self.request_count = 0;
         self.keep_alive = .{};
         self.idle_deadline = null;
+        self.pooled_at = .{ .nanoseconds = 0 };
 
         // Store host for connection pooling
         const len: u8 = @intCast(@min(remote_host.len, self.host_buffer.len));
@@ -737,9 +941,15 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
+    /// What a pooled connection's arena keeps of what a response took
+    /// (the head's copies, a body read whole): enough for the usual JSON
+    /// answer to come and go without the allocator, while one big body
+    /// does not stay with the connection for as long as it is pooled.
+    const arena_retain_limit = 32 * 1024;
+
     pub fn reset(self: *Connection) !void {
         // Reset for reuse (connection pooling)
-        _ = self.arena.reset(.retain_capacity);
+        _ = self.arena.reset(.{ .retain_with_limit = arena_retain_limit });
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.reset();
         try self.parser.init(&self.parsed_response, self.max_response_headers);
@@ -845,7 +1055,7 @@ pub const Connection = struct {
         // was read through a decoder: what the decoder holds was already
         // counted. A failed read leaves no such guarantee.
         if (!self.parser.isBodyComplete()) {
-            const drainable = !self.closing and self.pool.max_idle != 0 and
+            const drainable = !self.closing and self.pool.pooling() and
                 !self.parser.hasFailed() and self.getReadError() == null and
                 (self.parsed_response.content_length orelse 0) <= ConnectionPool.drain_max_bytes;
             if (drainable and self.pool.startDrain(self)) return;
@@ -1028,11 +1238,23 @@ pub const ClientResponse = struct {
 /// Connections are freed and reset from background tasks as well as from
 /// requests, so `allocator` must be thread-safe whenever `io` runs tasks in
 /// parallel.
+///
+/// On zio each executor has a pool of its own (`pools`), as `anole.db`'s
+/// connectors do: a request takes and gives back connections on its own
+/// executor, so a connection stays on one thread, and no lock is contended
+/// across them. Elsewhere there is one pool.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     config: ClientConfig,
-    pool: ConnectionPool,
+    /// One per executor of `io`'s runtime, up to `max_pools` (executors
+    /// past it share, by index modulo); the first `pool_count` are used.
+    pools: [max_pools]ConnectionPool,
+    pool_count: usize,
+    /// Connections opened so far (each a dial, and a handshake for
+    /// HTTPS): with requests steady, it should stop growing once the
+    /// pools hold what is busy at once.
+    dials: std.atomic.Value(u64),
     tls_state: TlsState,
     tls_lock: std.Io.RwLock,
     tls_loaded: std.atomic.Value(bool),
@@ -1046,12 +1268,18 @@ pub const Client = struct {
         client_cert: ?tls.config.CertKeyPair = null,
     };
 
+    /// The most pools a client has.
+    pub const max_pools = 64;
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
+        const limits: ConnectionPool.Limits = .fromConfig(config);
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
-            .pool = ConnectionPool.init(allocator, io, config.max_idle_connections),
+            .pools = @splat(ConnectionPool.init(allocator, io, limits)),
+            .pool_count = @min(@max(placement.executorCount(io) orelse 1, 1), max_pools),
+            .dials = .init(0),
             .tls_state = .{},
             .tls_lock = .init,
             .tls_loaded = std.atomic.Value(bool).init(false),
@@ -1109,7 +1337,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.pool.deinit();
+        for (self.pools[0..self.pool_count]) |*p| p.deinit();
         self.tls_state.ca_bundle.deinit(self.allocator);
         if (comptime has_trust_store) if (self.tls_state.trust) |*t| t.deinit();
         if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
@@ -1126,13 +1354,37 @@ pub const Client = struct {
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
         // Pinned here, so every redirect and the body share one budget.
         const deadline: Deadline = .init(self.io, options.timeout orelse self.defaultTimeout());
-        return deadline.run(fetchInternal, .{ self, FetchState{
+        return deadline.run(fetchFollowing, .{ self, FetchState{
             .uri = uri,
             .port = info.port,
             .protocol = info.protocol,
             .options = options,
             .redirects_remaining = max_redirects,
         } });
+    }
+
+    /// One request per hop, in a loop rather than a call per redirect, so
+    /// the stack does not grow with `max_redirects`. A hop's URL and
+    /// Referer live in `hops`, the two sets taking turns: the next hop
+    /// reads the last one's while it writes its own.
+    fn fetchFollowing(self: *Client, first: FetchState) !ClientResponse {
+        var hops: [2]HopBuffers = undefined;
+        var initial_host: [255]u8 = undefined;
+        var state = first;
+        var turn: u1 = 0;
+        while (true) : (turn +%= 1) {
+            switch (try self.fetchInternal(state, &hops[turn], &initial_host)) {
+                .done => |response| return response,
+                .next => |next| state = next,
+            }
+        }
+    }
+
+    /// The pool of the executor the calling task runs on: the first one
+    /// off zio's executors (`std.Io.Threaded`, a blocking-pool thread).
+    pub fn pool(self: *Client) *ConnectionPool {
+        const index = placement.currentExecutor(self.io) orelse 0;
+        return &self.pools[index % self.pool_count];
     }
 
     fn defaultTimeout(self: *const Client) std.Io.Timeout {
@@ -1152,11 +1404,12 @@ pub const Client = struct {
         // (e.g. the WebSocket upgrade path) must pass false.
         advertise_http2: bool,
     ) !*Connection {
-        if (self.pool.acquire(host, port, protocol, unix_socket_path)) |conn| {
+        const p = self.pool();
+        if (p.acquire(host, port, protocol, unix_socket_path)) |conn| {
             if (advertise_http2 or conn.http_version != .http_2) return conn;
             // An HTTP/2 connection cannot carry what this is for (a
             // WebSocket upgrade); it stays for the next fetch.
-            self.pool.release(conn);
+            p.release(conn);
         }
         return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
     }
@@ -1178,13 +1431,15 @@ pub const Client = struct {
             break :tcp try addr.connect(self.io, .{ .mode = .stream });
         } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
         errdefer stream.close(self.io);
+        if (self.config.deny_private_addresses and unix_socket_path == null and isPrivateAddress(stream.socket.address))
+            return error.AddressNotAllowed;
 
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
         try conn.init(
             self.allocator,
             self.io,
-            &self.pool,
+            self.pool(),
             stream,
             host,
             port,
@@ -1195,6 +1450,7 @@ pub const Client = struct {
             unix_socket_path,
             advertise_http2,
         );
+        _ = self.dials.fetchAdd(1, .monotonic);
         return conn;
     }
 
@@ -1278,7 +1534,7 @@ pub const Client = struct {
         return .{ .ws = ws, .conn = conn };
     }
 
-    fn fetchInternal(self: *Client, state: FetchState) !ClientResponse {
+    fn fetchInternal(self: *Client, state: FetchState, bufs: *HopBuffers, initial_host_buf: *[255]u8) !Hop {
         var host_buffer: [255]u8 = undefined;
         const host = try uriHost(state.uri, &host_buffer);
 
@@ -1293,12 +1549,12 @@ pub const Client = struct {
         // after that release to avoid releasing the connection twice.
         const advertise_http2 = has_h2_client and self.config.http2 and state.protocol == .https;
         var reused = true;
-        var conn = self.pool.acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
+        var conn = self.pool().acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
             reused = false;
             break :blk try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
         };
         var conn_released = false;
-        errdefer if (!conn_released) self.pool.release(conn);
+        errdefer if (!conn_released) conn.pool.release(conn);
 
         var lost = false;
         self.sendRequest(conn, state, host, &lost) catch |err| {
@@ -1306,7 +1562,7 @@ pub const Client = struct {
             // picked up. Retried on a new one under the same conditions as
             // Go's net/http.
             if (!lost or !reused or !isReplayable(state.options)) return err;
-            self.pool.release(conn);
+            conn.pool.release(conn);
             conn_released = true;
             conn = try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
             conn_released = false;
@@ -1327,36 +1583,15 @@ pub const Client = struct {
 
         // Check for redirects
         const status_code = @backingInt(conn.parsed_response.status);
-        if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) {
+        if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) redirect: {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
-                var resolve_buf: [2048]u8 = undefined;
-                if (location.len > resolve_buf.len) return error.InvalidUrl;
-                @memcpy(resolve_buf[0..location.len], location);
-                var aux_buf: []u8 = resolve_buf[0..];
+                if (location.len > bufs.resolve.len) return error.InvalidUrl;
+                @memcpy(bufs.resolve[0..location.len], location);
+                var aux_buf: []u8 = bufs.resolve[0..];
                 const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
                 const redirect_info = try uriPortAndProtocol(redirect_uri);
-
-                if (!conn.parser.shouldKeepAlive() or self.pool.max_idle == 0) conn.closing = true;
-
-                // Drain small redirect bodies (up to 2KB) so the connection can
-                // be returned to the pool rather than closed.
-                if (!conn.closing and conn.bodyPending()) {
-                    const max_drain = 2048;
-                    var drain_buf: [1024]u8 = undefined;
-                    // No decoding: this is throwing the body away to keep the
-                    // connection, so what it would decode to does not matter.
-                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &drain_buf);
-                    _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
-                        error.ReadFailed => {
-                            conn.closing = true;
-                            return body_reader.err orelse error.Unexpected;
-                        },
-                    };
-                    if (!conn.parser.isBodyComplete()) conn.closing = true;
-                }
-                self.pool.release(conn);
-                conn_released = true;
+                try checkRequestTarget(redirect_uri);
 
                 // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
                 // QUERY keeps its method and body on 301/302 (RFC 10008, Section 2.5).
@@ -1374,13 +1609,65 @@ pub const Client = struct {
                     }
                 }
 
+                var redirect_host_buffer: [255]u8 = undefined;
+                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
+                const same_origin = redirect_info.protocol == state.protocol and redirect_info.port == state.port and
+                    std.ascii.eqlIgnoreCase(redirect_host, host);
+
+                // Whether to follow it: the policy hook decides when there is
+                // one. Without one, a body goes only to the same host (or the
+                // same host over https); a redirect that would carry it
+                // elsewhere is returned as the response.
+                const action: RedirectAction = if (self.config.check_redirect) |policy|
+                    policy.check(policy.context, &.{
+                        .status = @intCast(status_code),
+                        .from = state.uri,
+                        .to = redirect_uri,
+                        .method = redirect_options.method,
+                        .has_body = redirect_options.body != null,
+                        .hops = (state.options.max_redirects orelse self.config.max_redirects) -| state.redirects_remaining,
+                        .cross_origin = !same_origin,
+                    })
+                else if (redirect_options.body != null and !sameHostOrUpgrade(state.protocol, state.port, host, redirect_info.protocol, redirect_info.port, redirect_host))
+                    .stop
+                else
+                    .follow;
+                switch (action) {
+                    .follow => {},
+                    .stop => break :redirect,
+                    .fail => return error.RedirectRefused,
+                }
+
+                if (!conn.parser.shouldKeepAlive() or !conn.pool.pooling()) conn.closing = true;
+
+                // Drain small redirect bodies (up to 2KB) so the connection can
+                // be returned to the pool rather than closed.
+                if (!conn.closing and conn.bodyPending()) {
+                    const max_drain = 2048;
+                    var drain_buf: [1024]u8 = undefined;
+                    // No decoding: this is throwing the body away to keep the
+                    // connection, so what it would decode to does not matter.
+                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &drain_buf);
+                    _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
+                        error.ReadFailed => {
+                            conn.closing = true;
+                            return body_reader.err orelse error.Unexpected;
+                        },
+                    };
+                    if (!conn.parser.isBodyComplete()) conn.closing = true;
+                }
+                conn.pool.release(conn);
+                conn_released = true;
+
                 // Strip sensitive headers when:
                 //   - already stripping from a previous hop, OR
                 //   - crossing to a different domain/host (same-domain and subdomain keep headers), OR
                 //   - downgrading from https to http (credentials would travel in plaintext).
-                var redirect_host_buffer: [255]u8 = undefined;
-                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
-                const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
+                // The first hop's host is kept for the hops after it.
+                const effective_initial_host = if (state.initial_host.len == 0) blk: {
+                    @memcpy(initial_host_buf[0..host.len], host);
+                    break :blk initial_host_buf[0..host.len];
+                } else state.initial_host;
                 const redirect_strip_sensitive = state.strip_sensitive_headers or
                     !isDomainOrSubdomain(redirect_host, effective_initial_host) or
                     (state.protocol == .https and redirect_info.protocol == .http);
@@ -1388,29 +1675,31 @@ pub const Client = struct {
                 // Strip body-related headers when there is no body to send.
                 const redirect_strip_body = redirect_options.body == null;
 
-                // Compute Referer for the next hop (RFC 7231 §5.5.2).
-                // Don't send Referer when downgrading https→http (would leak in plaintext).
-                // If the user already set a Referer header, forward it as-is.
-                var referer_buf: [2048]u8 = undefined;
+                // Compute Referer for the next hop, as browsers' default
+                // policy (strict-origin-when-cross-origin) does: the whole
+                // URL within one origin, only the origin across origins, and
+                // none on a downgrade from https to http. If the user already
+                // set a Referer header, forward it as-is.
                 const redirect_referer: ?[]const u8 = blk: {
                     if (state.protocol == .https and redirect_info.protocol == .http) break :blk null;
                     if (redirect_options.headers) |h| {
                         if (h.get("Referer")) |existing| break :blk existing;
                     }
-                    var w = std.Io.Writer.fixed(&referer_buf);
+                    var w = std.Io.Writer.fixed(&bufs.referer);
                     state.uri.writeToStream(&w, .{
                         .scheme = true,
                         .authority = true,
                         .authentication = false, // strip userinfo — never leak credentials in Referer
-                        .path = true,
-                        .query = true,
+                        .path = same_origin,
+                        .query = same_origin,
                         .fragment = false, // strip fragment — not sent to servers per RFC 7231
                         .port = true,
                     }) catch break :blk null;
+                    if (!same_origin) w.writeByte('/') catch break :blk null;
                     break :blk w.buffered();
                 };
 
-                return self.fetchInternal(.{
+                return .{ .next = .{
                     .uri = redirect_uri,
                     .port = redirect_info.port,
                     .protocol = redirect_info.protocol,
@@ -1420,7 +1709,7 @@ pub const Client = struct {
                     .strip_sensitive_headers = redirect_strip_sensitive,
                     .strip_body_headers = redirect_strip_body,
                     .referer = redirect_referer,
-                });
+                } };
             }
         }
 
@@ -1438,7 +1727,7 @@ pub const Client = struct {
         // Under the request's deadline, which ends with this call. A body
         // left on the wire is the caller's to read, on the caller's time.
         if (!state.options.stream) _ = try response.body();
-        return response;
+        return .{ .done = response };
     }
 
     /// Writes the request on `conn` and reads the response head. `lost` is
@@ -1522,6 +1811,7 @@ pub const Client = struct {
     fn sendRequestH2(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
         if (comptime !has_h2_client) unreachable;
         try http.validateHeaderValue(host);
+        try checkRequestTarget(state.uri);
         const arena = conn.arena.allocator();
         const path = uriPath(state.uri);
         var fields: H2Fields = .{ .arena = arena };
@@ -1600,6 +1890,66 @@ fn isReplayable(options: FetchOptions) bool {
     return headers.get("Idempotency-Key") != null or headers.get("X-Idempotency-Key") != null;
 }
 
+/// Whether `address` is one `deny_private_addresses` refuses: anything
+/// but a global unicast address. IPv4 inside IPv6 (mapped, compatible,
+/// NAT64, 6to4) is judged by its IPv4 address.
+pub fn isPrivateAddress(address: std.Io.net.IpAddress) bool {
+    switch (address) {
+        .ip4 => |a| return isPrivateIp4(a.bytes),
+        .ip6 => |a| {
+            const b = a.bytes;
+            const zero10 = std.mem.allEqual(u8, b[0..10], 0);
+            // ::ffff:a.b.c.d and the deprecated ::a.b.c.d (which covers ::
+            // and ::1).
+            if (zero10 and ((b[10] == 0xff and b[11] == 0xff) or (b[10] == 0 and b[11] == 0)))
+                return isPrivateIp4(b[12..16].*);
+            // 64:ff9b::/96, NAT64.
+            if (std.mem.eql(u8, b[0..12], &.{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 })) return isPrivateIp4(b[12..16].*);
+            // 2002::/16, 6to4.
+            if (b[0] == 0x20 and b[1] == 0x02) return isPrivateIp4(b[2..6].*);
+            // fc00::/7 unique local, fe80::/10 link-local, fec0::/10
+            // site-local, ff00::/8 multicast.
+            if (b[0] & 0xfe == 0xfc) return true;
+            if (b[0] == 0xfe and b[1] & 0x80 != 0) return true;
+            if (b[0] == 0xff) return true;
+            return false;
+        },
+    }
+}
+
+fn isPrivateIp4(b: [4]u8) bool {
+    return switch (b[0]) {
+        0, 10, 127 => true, // this network, private, loopback
+        100 => b[1] & 0xc0 == 64, // 100.64.0.0/10, shared (CGN)
+        169 => b[1] == 254, // link-local, cloud metadata
+        172 => b[1] & 0xf0 == 16, // 172.16.0.0/12
+        192 => (b[1] == 168) or (b[1] == 0 and b[2] == 0), // 192.168.0.0/16, 192.0.0.0/24
+        198 => b[1] & 0xfe == 18, // 198.18.0.0/15, benchmarking
+        else => b[0] >= 224, // multicast, reserved, broadcast
+    };
+}
+
+/// What one hop of `fetch` came to: the response, or the redirect to follow.
+const Hop = union(enum) {
+    done: ClientResponse,
+    next: FetchState,
+};
+
+/// Where a hop resolves its redirect's URL and writes the Referer for the
+/// next one.
+const HopBuffers = struct {
+    resolve: [2048]u8,
+    referer: [2048]u8,
+};
+
+/// Whether a redirect keeps the request's body on one host: the same
+/// scheme and port, or the same host moving from http to https.
+fn sameHostOrUpgrade(from: Protocol, from_port: u16, from_host: []const u8, to: Protocol, to_port: u16, to_host: []const u8) bool {
+    if (!std.ascii.eqlIgnoreCase(from_host, to_host)) return false;
+    if (from == to) return from_port == to_port;
+    return from == .http and to == .https;
+}
+
 const FetchState = struct {
     uri: Uri,
     port: u16,
@@ -1640,6 +1990,7 @@ const WriteUpgradeRequestOptions = struct {
 /// the connection so it can only report the sentinel, which is the caller's
 /// to resolve -- the same split `writeRequest` has.
 fn writeUpgradeRequest(writer: *std.Io.Writer, opts: WriteUpgradeRequestOptions) !void {
+    try checkRequestTarget(opts.uri);
     const path = uriPath(opts.uri);
     if (opts.uri.query) |query| {
         try writer.print("GET {s}?{s} HTTP/1.1\r\n", .{ path, query.percent_encoded });
@@ -1682,6 +2033,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     try http.validateHeaderValue(opts.host);
 
     // Request line - path with query
+    try checkRequestTarget(opts.uri);
     const path = uriPath(opts.uri);
     if (opts.uri.query) |query| {
         try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ opts.method.name(), path, query.percent_encoded });
@@ -2753,6 +3105,59 @@ test "writeRequest: does not override user-provided Referer" {
     try std.testing.expect(std.mem.indexOf(u8, written, "http://example.com/old") == null);
 }
 
+test "writeRequest: refuses a path or query with bytes a request target cannot hold" {
+    const bad = [_][]const u8{
+        "http://example.com/a\r\nX-Injected: 1",
+        "http://example.com/search?q=a\r\n\r\nGET /admin HTTP/1.1",
+        "http://example.com/a b",
+        "http://example.com/?q=a b",
+        "http://example.com/\x00",
+        "http://example.com/\x7f",
+        "http://example.com/caf\xc3\xa9",
+    };
+    for (bad) |url| {
+        // Refused when parsed, or else when written.
+        const uri = parseUrl(url) catch |err| {
+            try std.testing.expectEqual(error.InvalidUrl, err);
+            continue;
+        };
+        var buf: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try std.testing.expectError(error.InvalidUrl, writeRequest(&writer, .{
+            .method = .get,
+            .uri = uri,
+            .host = "example.com",
+            .port = 80,
+            .protocol = .http,
+        }));
+    }
+    // Percent-encoded, the same bytes are fine.
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = try parseUrl("http://example.com/caf%C3%A9?q=a%0D%0Ab+c"),
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+    });
+    try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "GET /caf%C3%A9?q=a%0D%0Ab+c HTTP/1.1\r\n"));
+}
+
+test "writeUpgradeRequest: refuses a path or query with bytes a request target cannot hold" {
+    const uri: Uri = .{ .scheme = "ws", .host = .{ .percent_encoded = "example.com" }, .path = .{ .percent_encoded = "/chat" }, .query = .{ .percent_encoded = "room=1\r\nX: y" } };
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(error.InvalidUrl, writeUpgradeRequest(&writer, .{
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .headers = null,
+    }));
+}
+
 test "redirect: Referer strips userinfo and fragment" {
     // Verify that writeToStream with authentication=false, fragment=false
     // produces a clean Referer without credentials or fragment.
@@ -2942,8 +3347,8 @@ test "Connection.release: the Keep-Alive timeout is in seconds" {
         _ = try resp.body();
     }
 
-    try std.testing.expectEqual(1, client.pool.idle_len);
-    const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool.idle.first.?));
+    try std.testing.expectEqual(1, client.pool().idle_len);
+    const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool().idle.first.?));
     const now = std.Io.Timestamp.now(io, .awake);
     const left = conn.idle_deadline.?.nanoseconds - now.nanoseconds;
     // Five seconds, less however long the release took to get here.

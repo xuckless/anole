@@ -15,9 +15,16 @@ var keys: [3]Ed.KeyPair = undefined;
 var served: std.atomic.Value(usize) = .init(1);
 var delay_ms: std.atomic.Value(u32) = .init(0);
 var fetches: std.atomic.Value(usize) = .init(0);
+/// The endpoint answers 503 while set (the provider is down).
+var down: std.atomic.Value(bool) = .init(false);
 
 fn jwks(req: *dusty.Request, res: *dusty.Response) !void {
     _ = fetches.fetchAdd(1, .monotonic);
+    if (down.load(.monotonic)) {
+        res.status = .service_unavailable;
+        res.body = "down";
+        return;
+    }
     try req.io.sleep(.fromMilliseconds(delay_ms.load(.monotonic)), .awake);
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(res.arena, "{\"keys\":[");
@@ -34,7 +41,7 @@ fn jwks(req: *dusty.Request, res: *dusty.Response) !void {
 /// A token signed with key `n` (1-based) and named `k<n>`.
 fn token(arena: std.mem.Allocator, io: std.Io, n: usize) ![]const u8 {
     const header = try std.fmt.allocPrint(arena, "{{\"alg\":\"EdDSA\",\"kid\":\"k{d}\"}}", .{n});
-    const claims = try std.fmt.allocPrint(arena, "{{\"sub\":\"u{d}\",\"exp\":{d}}}", .{ n, std.Io.Clock.real.now(io).toSeconds() + 600 });
+    const claims = try std.fmt.allocPrint(arena, "{{\"sub\":\"u{d}\",\"aud\":\"api\",\"exp\":{d}}}", .{ n, std.Io.Clock.real.now(io).toSeconds() + 600 });
     const h = try arena.alloc(u8, b64.Encoder.calcSize(header.len));
     const c = try arena.alloc(u8, b64.Encoder.calcSize(claims.len));
     const input = try std.fmt.allocPrint(arena, "{s}.{s}", .{ b64.Encoder.encode(h, header), b64.Encoder.encode(c, claims) });
@@ -48,7 +55,7 @@ fn verifyTimed(keyring: *Keyring, io: std.Io, tok: []const u8, sub: []const u8) 
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const start = std.Io.Clock.awake.now(io);
-    const v = try keyring.verify(arena_state.allocator(), tok, .{});
+    const v = try keyring.verify(arena_state.allocator(), tok, .{ .audience = "api" });
     try std.testing.expectEqualStrings(sub, v.string("sub").?);
     return start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
 }
@@ -77,7 +84,7 @@ test "Keyring: one fetch for concurrent verifiers, and known keys never wait on 
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{server.address.ip.getPort()});
-    var keyring = Keyring.init(gpa, io, &client, url);
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
     defer keyring.deinit();
     keyring.min_refresh_seconds = 0;
 
@@ -147,7 +154,7 @@ test "Keyring: requests waiting on a fetch that fails get an error, and nothing 
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{port});
-    var keyring = Keyring.init(gpa, io, &client, url);
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
     defer keyring.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -167,4 +174,91 @@ test "Keyring: requests waiting on a fetch that fails get an error, and nothing 
     try std.testing.expectEqual(@as(usize, 4), failed.load(.monotonic));
     try std.testing.expect(!keyring.fetching);
     try std.testing.expect(keyring.current == null);
+}
+
+/// A keyring on the fake endpoint, which serves k1.
+const Fixture = struct {
+    /// Static: the server keeps the slice.
+    const loopback = [_]dusty.Listener{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
+
+    server: dusty.Server(void),
+    future: std.Io.Future(anyerror!void),
+    client: dusty.Client,
+    url_buf: [64]u8,
+    keyring: Keyring,
+
+    fn serve(s: *dusty.Server(void)) anyerror!void {
+        try s.run();
+    }
+
+    fn init(f: *Fixture, gpa: std.mem.Allocator, io: std.Io) !void {
+        f.server = dusty.Server(void).init(gpa, io, .{ .listeners = &loopback }, {});
+        errdefer f.server.deinit();
+        f.server.router.get("/jwks", jwks);
+        f.future = try io.concurrent(serve, .{&f.server});
+        try f.server.waitReady(io);
+        f.client = dusty.Client.init(gpa, io, .{});
+        const url = try std.fmt.bufPrint(&f.url_buf, "http://127.0.0.1:{d}/jwks", .{f.server.address.ip.getPort()});
+        f.keyring = Keyring.init(gpa, io, .{ .http = &f.client }, url);
+    }
+
+    fn deinit(f: *Fixture, io: std.Io) void {
+        f.keyring.deinit();
+        f.client.deinit();
+        f.future.cancel(io) catch {};
+        f.server.deinit();
+    }
+};
+
+test "Keyring: a policy without an audience is refused" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    for (&keys) |*k| k.* = Ed.KeyPair.generate(io);
+    served.store(1, .monotonic);
+    delay_ms.store(0, .monotonic);
+
+    var f: Fixture = undefined;
+    try f.init(gpa, io);
+    defer f.deinit(io);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t1 = try token(arena, io, 1);
+    // A provider's keys sign tokens for every one of its clients.
+    try std.testing.expectError(error.AudienceRequired, f.keyring.verify(arena, t1, .{}));
+    _ = try f.keyring.verify(arena, t1, .{ .audience = "api" });
+}
+
+test "Keyring: past its TTL, a provider outage leaves the keys in hand, and failed fetches back off" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    for (&keys) |*k| k.* = Ed.KeyPair.generate(io);
+    served.store(1, .monotonic);
+    delay_ms.store(0, .monotonic);
+    down.store(false, .monotonic);
+    defer down.store(false, .monotonic);
+
+    var f: Fixture = undefined;
+    try f.init(gpa, io);
+    defer f.deinit(io);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const t1 = try token(arena_state.allocator(), io, 1);
+
+    _ = try verifyTimed(&f.keyring, io, t1, "u1");
+    const fetched = fetches.load(.monotonic);
+    // The set is past its TTL, and the provider is down.
+    f.keyring.current.?.fetched_at -= f.keyring.ttl_seconds + 10;
+    down.store(true, .monotonic);
+    for (0..20) |_| _ = try verifyTimed(&f.keyring, io, t1, "u1");
+    // One attempt, then a pause before the next.
+    try std.testing.expectEqual(fetched + 1, fetches.load(.monotonic));
+
+    // Past the grace period the stale keys are no longer used.
+    f.keyring.current.?.fetched_at -= 400 * 24 * 3600;
+    try std.testing.expectError(error.JwksFetchFailed, verifyTimed(&f.keyring, io, t1, "u1"));
 }

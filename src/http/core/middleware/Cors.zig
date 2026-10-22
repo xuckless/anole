@@ -19,6 +19,7 @@ const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
+/// `Cors.init`'s settings.
 pub const Config = struct {
     /// The origins allowed, each as the browser sends it: scheme and host,
     /// and the port when it is not the default (`https://app.example`).
@@ -92,6 +93,10 @@ pub fn init(config: Config) Cors {
     return self;
 }
 
+/// Only sets headers before `next()`: requests behind it can detach
+/// (`Detached`).
+pub const detach_safe = true;
+
 pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anytype) !void {
     const origin = req.headers.get("Origin");
     const preflight = req.method == .options and origin != null and
@@ -113,7 +118,7 @@ pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anyty
         try res.header("Access-Control-Allow-Headers", headers);
     } else if (req.headers.get("Access-Control-Request-Headers")) |asked| {
         try res.header("Access-Control-Allow-Headers", asked);
-        try res.headers.add("Vary", "Access-Control-Request-Headers");
+        try res.addHeader("Vary", "Access-Control-Request-Headers");
     }
     if (self.max_age_len > 0) try res.header("Access-Control-Max-Age", self.max_age_buf[0..self.max_age_len]);
 }
@@ -127,7 +132,7 @@ fn allowOrigin(self: *const Cors, res: *Response, origin: ?[]const u8) !bool {
         try res.header("Access-Control-Allow-Origin", "*");
         return true;
     }
-    try res.headers.add("Vary", "Origin");
+    try res.addHeader("Vary", "Origin");
     const o = origin orelse return false;
     if (!self.listed(o)) return false;
     // Echoed only once it matched a configured origin byte for byte.

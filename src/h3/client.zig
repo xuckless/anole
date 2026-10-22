@@ -53,20 +53,33 @@ const burst = 10;
 /// Largest UDP payload read.
 const max_datagram = 65527;
 
+/// A header field: request fields (pseudo-headers first, lower-case
+/// names) and the response's `headers` and `trailers`.
 pub const Header = struct { name: []const u8, value: []const u8 };
 
+/// Where and how `ClientConnection.connect` connects. `host` and `port`
+/// are required; the rest has defaults. Always TLS: QUIC has no
+/// cleartext.
 pub const ConnectOptions = struct {
     /// The server's name (SNI and the certificate check) or address.
     host: []const u8,
     port: u16,
     /// Send here instead of resolving `host`.
     address: ?std.Io.net.IpAddress = null,
+    /// How the server's certificate is checked, and the client's own.
+    /// Always TLS: QUIC has no cleartext form (HTTP/2's `tls` is optional).
     tls: Tls = .{},
-    /// Bytes the server may send on a stream before its reader takes them.
-    stream_window: u32 = 256 * 1024,
+    /// Bytes the server may send on a stream before its reader takes them,
+    /// as in `anole.h2`. 256 KiB here (64 KiB over HTTP/2): an HTTP/3
+    /// stream's receive buffer grows as data arrives rather than being
+    /// allocated whole, and ngtcp2 widens the window (up to 6x) on a fast
+    /// path.
+    stream_window: u31 = 256 * 1024,
     /// The same for the whole connection.
-    max_data: u32 = 16 * 1024 * 1024,
-    idle_timeout_ms: u32 = 30_000,
+    max_data: u31 = 16 * 1024 * 1024,
+    /// HTTP/3 only: QUIC closes the connection after this long with
+    /// nothing received (its idle timeout). HTTP/2 over TCP has none.
+    idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// For `connect`: resolving `host` and the QUIC handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -74,20 +87,32 @@ pub const ConnectOptions = struct {
     /// body, unless its `RequestOptions.timeout` says otherwise. Null for
     /// no limit, which a long-lived stream wants.
     timeout: ?std.Io.Duration = .fromSeconds(30),
-    /// Where tickets are kept, to resume sessions (one round trip less, no
-    /// certificate) and for `early_data`. Shared by any connections.
+    /// The most a response's header fields may take, decoded (name, value
+    /// and 32 bytes per field), informational responses and trailers
+    /// included; advertised as SETTINGS_MAX_FIELD_SECTION_SIZE. Past it the
+    /// stream fails with `error.HeadersTooLarge`.
+    max_header_list_size: u32 = 64 * 1024,
+    /// HTTP/3 only: where tickets are kept, to resume sessions (one round
+    /// trip less, no certificate) and for `early_data`. Shared by any
+    /// connections.
     session_cache: ?*SessionCache = null,
-    /// With a ticket for this server that allows it: send requests in
-    /// 0-RTT, before the handshake completes. `connect` then returns at
+    /// HTTP/3 only: with a ticket for this server that allows it, send
+    /// requests in 0-RTT, before the handshake completes. `connect` then returns at
     /// once, and `request` sends GET, HEAD and OPTIONS (or any request, with
     /// `RequestOptions.early`) right away; others wait for the handshake.
     /// Early data can be replayed by anyone who records it, so send in it
     /// only what is harmless to repeat.
     early_data: bool = false,
-    /// Speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
+    /// HTTP/3 only: speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
     /// HTTP datagrams, and streams the server may open.
     webtransport: bool = false,
+    /// HTTP/3 only: start in QUIC v1 and offer v2 (RFC 9369) beside it,
+    /// so a server that prefers v2 moves the connection there through
+    /// compatible version negotiation (RFC 9368). `quicVersion` says which
+    /// one it ended on.
+    quic_v2: bool = false,
 
+    /// The fields of `anole.h2.ConnectOptions.Tls`, with the same defaults.
     pub const Tls = struct {
         /// The certificate authorities the server's certificate must chain
         /// to, as for `anole.h2`: the system store by default, loaded on the
@@ -100,11 +125,14 @@ pub const ConnectOptions = struct {
         /// TLS): files or PEM in memory, read on every `connect`.
         client_certificate: ?ClientCertificate = null,
 
+        /// The system store, a file, a directory, PEM in memory, or none.
         pub const Ca = dusty.TlsCa;
+        /// A certificate and key, as files or PEM.
         pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
+/// Connection-level failures.
 pub const Error = error{ ConnectionClosed, StreamReset, OutOfMemory, Unexpected };
 
 /// `Tls.client_certificate` as PEM for `quic_tls`: read from its files, or
@@ -144,7 +172,16 @@ pub const StreamError = error{
     Timeout,
     /// The stream was canceled (`cancel`, or the task waiting on it).
     Canceled,
+    /// The response's header fields passed `max_header_list_size`.
+    HeadersTooLarge,
+    /// More informational (1xx) responses than the client takes before a
+    /// final one.
+    TooManyInterimResponses,
 };
+
+/// How many informational (1xx) responses may come before the final one,
+/// as in the HTTP/1.1 and HTTP/2 clients.
+const max_interim_responses = 5;
 
 fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     const d = duration orelse return .none;
@@ -173,6 +210,9 @@ pub const Rebind = enum {
     /// ends: the server notices the new address and validates it.
     nat,
 };
+/// An HTTP/3 client connection: `connect`, then `request` once per
+/// request (concurrent ones share the connection, and several tasks may
+/// make them at once), and `close`. See the file's example.
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -219,6 +259,8 @@ pub const ClientConnection = struct {
     wt: ?*webtransport.Core = null,
     /// The server's SETTINGS, once they arrived.
     peer_settings: ?PeerSettings = null,
+    /// `ConnectOptions.max_header_list_size`.
+    max_header_list_size: u32 = 64 * 1024,
 
     /// What the server's SETTINGS allow (`waitSettings`).
     pub const PeerSettings = struct {
@@ -263,6 +305,7 @@ pub const ClientConnection = struct {
             .tx = tx,
             .rx = rx,
             .timeout = timeoutFrom(options.timeout),
+            .max_header_list_size = options.max_header_list_size,
         };
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
@@ -293,6 +336,11 @@ pub const ClientConnection = struct {
         var initial_pkt_num: [4]u8 = undefined;
         io.random(&initial_pkt_num);
         settings.initial_pkt_num = std.mem.readInt(u32, &initial_pkt_num, .little) & 0x7fffffff;
+        const v1_and_v2 = [_]u32{ c.NGTCP2_PROTO_VER_V1, c.NGTCP2_PROTO_VER_V2 };
+        if (options.quic_v2) {
+            settings.available_versions = &v1_and_v2;
+            settings.available_versionslen = v1_and_v2.len;
+        }
 
         var params: ngtcp2.TransportParams = undefined;
         ngtcp2.transportParamsDefault(&params);
@@ -305,7 +353,7 @@ pub const ClientConnection = struct {
         params.initial_max_streams_bidi = if (options.webtransport) 100 else 0;
         params.initial_max_streams_uni = if (options.webtransport) 103 else 3;
         if (options.webtransport) params.max_datagram_frame_size = 65535;
-        params.max_idle_timeout = @as(u64, options.idle_timeout_ms) * c.NGTCP2_MILLISECONDS;
+        params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
         params.active_connection_id_limit = 7;
         params.grease_quic_bit = 1;
 
@@ -352,18 +400,29 @@ pub const ClientConnection = struct {
 
     /// Where this connection's tickets are filed: the server, and every
     /// TLS setting that decides whether a session may be trusted.
+    /// One field of `cacheKey`'s digest, length first, so fields cannot
+    /// run into each other.
+    fn hashField(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, bytes.len, .little);
+        hash.update(&len);
+        hash.update(bytes);
+    }
+
+    /// The TLS settings by SHA-256: a ticket must never go to a connection
+    /// that trusts other CAs or presents another identity.
     fn cacheKey(gpa: std.mem.Allocator, options: ConnectOptions, identity: ?Identity) ![]u8 {
-        var hash: std.hash.Wyhash = .init(0);
+        var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
         const ca = options.tls.ca;
-        hash.update(@tagName(ca));
+        hashField(&hash, @tagName(ca));
         switch (ca) {
-            .file, .dir => |src| hash.update(src.path),
-            .pem => |text| hash.update(text),
+            .file, .dir => |src| hashField(&hash, src.path),
+            .pem => |text| hashField(&hash, text),
             .system, .none => {},
         }
-        hash.update(&.{@intFromBool(options.tls.insecure_skip_verify)});
-        if (identity) |id| hash.update(id.pem.cert_pem);
-        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, hash.final() });
+        hashField(&hash, &.{@intFromBool(options.tls.insecure_skip_verify)});
+        if (identity) |id| hashField(&hash, id.pem.cert_pem);
+        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, &hash.finalResult() });
     }
 
     /// What became of 0-RTT on this connection.
@@ -371,6 +430,15 @@ pub const ClientConnection = struct {
         self.lock();
         defer self.unlock();
         return self.early;
+    }
+
+    /// The QUIC version the connection runs on (1, or 0x6b3343cf for v2):
+    /// v1 unless `ConnectOptions.quic_v2` offered v2 and the server took
+    /// it. Final once the handshake has completed.
+    pub fn quicVersion(self: *ClientConnection) u32 {
+        self.lock();
+        defer self.unlock();
+        return c.ngtcp2_conn_get_negotiated_version(self.q);
     }
 
     /// The handshake resumed an earlier session (from `session_cache`).
@@ -633,9 +701,11 @@ pub const ClientConnection = struct {
         }
     }
 
+    /// The CONNECT request `openWebTransport` sends.
     pub const WebTransportOptions = struct {
         /// `:authority`, the server's name (and port, if not 443).
         authority: []const u8,
+        /// `:path`, the WebTransport endpoint's route.
         path: []const u8 = "/",
         /// The `Origin` a browser would send, if any.
         origin: ?[]const u8 = null,
@@ -701,6 +771,7 @@ pub const ClientConnection = struct {
         }
     };
 
+    /// Per request: a body, the timeout, and 0-RTT.
     pub const RequestOptions = struct {
         /// The request has a body, written through `Stream.writer` and
         /// ended with `Stream.closeSend`.
@@ -709,7 +780,7 @@ pub const ClientConnection = struct {
         /// `anole.h2`: null inherits it, `.none` lifts it, and past it the
         /// stream is reset and its waits fail with `error.Timeout`.
         timeout: ?std.Io.Timeout = null,
-        /// While a 0-RTT handshake is going (`ConnectOptions.early_data`):
+        /// HTTP/3 only. While a 0-RTT handshake is going (`ConnectOptions.early_data`):
         /// true sends this request in early data, false waits for the
         /// handshake, null decides by method (GET, HEAD and OPTIONS go).
         /// Only what is harmless to repeat belongs in early data.
@@ -977,6 +1048,7 @@ pub const ClientConnection = struct {
         settings.qpack_max_dtable_capacity = 4096;
         settings.qpack_blocked_streams = 100;
         settings.h3_datagram = @intFromBool(self.wt != null);
+        settings.max_field_section_size = self.max_header_list_size;
         var hc: ?*h.nghttp3_conn = null;
         if (nghttp3.connClientNew(&hc, &h3_callbacks, &settings, h.nghttp3_mem_default(), self) != 0) return error.Http3SetupFailed;
         errdefer h.nghttp3_conn_del(hc);
@@ -1230,8 +1302,20 @@ pub const ClientConnection = struct {
         return 0;
     }
 
+    /// Counts a field against `max_header_list_size`; false once the
+    /// stream is past it (or ended), when the field is not kept.
+    fn countField(s: *Stream, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf) bool {
+        if (s.cause != null) return false;
+        s.header_list_size +|= h.nghttp3_rcbuf_get_buf(name).len + h.nghttp3_rcbuf_get_buf(value).len + 32;
+        if (s.header_list_size <= s.conn.max_header_list_size) return true;
+        // The rest of the block is dropped; `release` resets the stream.
+        s.endEarly(error.HeadersTooLarge);
+        return false;
+    }
+
     fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
+        if (!countField(s, name, value)) return 0;
         const v = h.nghttp3_rcbuf_get_buf(value);
         if (token == h.NGHTTP3_QPACK_TOKEN__STATUS) {
             s.status = std.fmt.parseInt(u16, v.base[0..v.len], 10) catch 0;
@@ -1246,12 +1330,16 @@ pub const ClientConnection = struct {
     fn onH3EndHeaders(_: ?*h.nghttp3_conn, _: i64, fin: c_int, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         const s = streamOfUser(sud) orelse return 0;
-        if (s.status >= 200) {
+        if (s.cause != null) {
+            // Failed (`countField`): no head.
+        } else if (s.status >= 200) {
             s.head_ready = true;
         } else {
             // 1xx: its fields are not the response's.
             s.headers.clearRetainingCapacity();
             s.status = 0;
+            s.interim += 1;
+            if (s.interim > max_interim_responses) s.endEarly(error.TooManyInterimResponses);
         }
         if (fin != 0) s.body_done = true;
         self.kick();
@@ -1260,6 +1348,7 @@ pub const ClientConnection = struct {
 
     fn onH3RecvTrailer(_: ?*h.nghttp3_conn, _: i64, _: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
+        if (!countField(s, name, value)) return 0;
         const n = h.nghttp3_rcbuf_get_buf(name);
         const v = h.nghttp3_rcbuf_get_buf(value);
         s.addField(&s.trailers, n.base[0..n.len], v.base[0..v.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -1331,6 +1420,11 @@ pub const Stream = struct {
     deadline: Deadline,
 
     status: u16 = 0,
+    /// Informational responses so far.
+    interim: u8 = 0,
+    /// What the response's header fields have taken, as
+    /// `max_header_list_size` counts it.
+    header_list_size: usize = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
     head_ready: bool = false,
@@ -1465,11 +1559,15 @@ pub const Stream = struct {
         };
     }
 
+    /// The first response header named `name` (any case), once `waitHead`
+    /// has returned; null when absent.
     pub fn header(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.headers.items) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
         return null;
     }
 
+    /// The first trailer named `name` (any case), once the body has been
+    /// read to its end; null when absent.
     pub fn trailer(self: *const Stream, name: []const u8) ?[]const u8 {
         for (self.trailers.items) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
         return null;

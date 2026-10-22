@@ -28,7 +28,7 @@ const h3 = anole.h3;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
     const cmd = args.next() orelse return error.Usage;
     const rt = try anole.zio.Runtime.init(gpa, .{});

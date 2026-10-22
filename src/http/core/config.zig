@@ -6,6 +6,7 @@ const std = @import("std");
 const ContentType = @import("http.zig").ContentType;
 const HttpRequest = @import("request.zig").Request;
 const HttpResponse = @import("response.zig").Response;
+const proxy_protocol = @import("proxy_protocol.zig");
 
 /// How the server's own error answers (a 404, a 500, `Response.fail`) are
 /// written. `ServerConfig.errors`.
@@ -104,6 +105,7 @@ pub fn addCertsFromPem(
 /// rather than a hope.
 pub const body_read_reserve = 1024;
 
+/// A file named by path, optionally relative to an open directory.
 pub const TlsPath = struct {
     path: []const u8,
     /// Directory `path` is resolved against. Defaults to the current working
@@ -111,6 +113,8 @@ pub const TlsPath = struct {
     dir: ?std.Io.Dir = null,
 };
 
+/// Where a listener binds, or a server's bound address: an IP address
+/// and port, or a Unix socket path.
 pub const Address = union(enum) {
     ip: std.Io.net.IpAddress,
     unix: std.Io.net.UnixAddress,
@@ -143,7 +147,17 @@ pub const Listener = struct {
     /// to that silently.
     kernel_backlog: ?u31 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
+    /// Ignored on Windows, where SO_REUSEADDR would let another socket
+    /// bind the same port.
     reuse_address: bool = true,
+    /// IPV6_V6ONLY for a listener on an IPv6 address. False takes IPv4
+    /// clients too on the same socket (`::` then serves both families):
+    /// they arrive as IPv4-mapped addresses (`::ffff:127.0.0.1`), which
+    /// requests report as plain IPv4. True takes IPv6 alone. Null leaves
+    /// the system's default (IPv6 alone on macOS and Windows; on Linux,
+    /// `net.ipv6.bindv6only`, normally both). Ignored for IPv4 addresses,
+    /// and for an inherited socket (`fd`), which is bound already.
+    ipv6_only: ?bool = null,
     /// Serve cleartext HTTP/2 to a client that opens with the HTTP/2
     /// connection preface ("prior knowledge", RFC 9113 §3.3), alongside
     /// HTTP/1.x on the same port. Needs the `use_http2` build option, and
@@ -151,6 +165,16 @@ pub const Listener = struct {
     /// `Tls.alpn_protocols` instead. The deprecated `Upgrade: h2c` is not
     /// supported.
     http2_prior_knowledge: bool = false,
+    /// Serve HTTP/1.x here. Off, the listener speaks HTTP/2 alone: on a
+    /// cleartext listener (with `http2_prior_knowledge`) a connection that
+    /// does not open with the HTTP/2 preface is closed, and on a TLS one a
+    /// connection whose ALPN did not agree on "h2" is closed after the
+    /// handshake (leave "http/1.1" out of `Tls.alpn_protocols` too).
+    http1: bool = true,
+    /// What the application calls this listener ("admin", "public"), for
+    /// handlers and middleware that tell listeners apart through
+    /// `Request.listener`. Not used by the server itself.
+    name: []const u8 = "",
     /// Every connection here starts with a PROXY protocol header, v1 or v2
     /// (HAProxy, nginx `proxy_protocol on`, AWS NLB, Envoy), read before
     /// TLS: the client address it carries becomes `Request.remote_address`,
@@ -159,8 +183,14 @@ pub const Listener = struct {
     /// `Timeout.read_header`.
     ///
     /// Only for a listener that nothing but the proxy can reach, since
-    /// whoever connects chooses the address the header claims.
+    /// whoever connects chooses the address the header claims; or name
+    /// the proxies in `proxy_protocol_from`.
     proxy_protocol: bool = false,
+    /// With `proxy_protocol`: the peers allowed to connect and send the
+    /// header (`proxy_protocol.Network.parse("10.0.0.0/8")`). A connection
+    /// from anywhere else is closed before anything is read. Empty trusts
+    /// every peer. Ignored on a unix socket listener.
+    proxy_protocol_from: []const proxy_protocol.Network = &.{},
     /// An already listening socket to serve instead of binding `address`:
     /// one handed over by systemd socket activation (`LISTEN_FDS`) or by
     /// the process this one replaces. `address` should still say what it
@@ -232,9 +262,22 @@ test "Listener.acceptorCount: log2 of the CPUs, at least two, unless given" {
     try std.testing.expectEqual(1, zero.acceptorCount(128));
 }
 
+/// The HTTP core's settings; through Anole, `anole.ServerOptions.server`
+/// (whose `listeners`, `http2`, `errors` and `error_handler` Anole sets
+/// from its own fields):
+///
+///     var app = try anole.App.init(gpa, .{ .server = .{
+///         .timeout = .{ .request = .fromSeconds(60) },
+///         .request = .{ .max_body_size = 8 * 1024 * 1024 },
+///     } });
 pub const ServerConfig = struct {
+    /// Request, header, keep-alive and shutdown time limits.
     timeout: Timeout = .{},
+    /// Limits on what a request may bring: body size, header and
+    /// parameter counts, the head's buffer.
     request: Request = .{},
+    /// How responses are written: buffer size, `Date`, the default
+    /// content type, header count, Brotli quality.
     response: Response = .{},
     /// HTTP/2 connections (with the `use_http2` build option): reached
     /// through ALPN "h2" on a TLS listener or `Listener.http2_prior_knowledge`.
@@ -253,18 +296,43 @@ pub const ServerConfig = struct {
     /// Only enable this when the server is unreachable except through that
     /// many trusted proxies. Otherwise a client can supply the header itself
     /// and choose the address reported to handlers.
+    ///
+    /// Only the selected entry is read; the ones left of it are the
+    /// client's own. One that is not an address gives `remote_address`
+    /// 0.0.0.0, never the proxy's address.
     trusted_proxy_hops: usize = 0,
+    /// With `trusted_proxy_hops`: the last `X-Forwarded-Proto` value sets
+    /// `Request.secure`. The nearest proxy must set (overwrite) the header
+    /// on every request, as nginx does only with `proxy_set_header
+    /// X-Forwarded-Proto $scheme`; otherwise the client's own value passes
+    /// through.
+    trust_forwarded_proto: bool = true,
+    /// With `trusted_proxy_hops`: the last `X-Forwarded-Host` value is what
+    /// `Request.host` returns. Off by default: a proxy that does not
+    /// overwrite the header lets a client choose the host that links,
+    /// redirects and cache keys are built from. Turn it on only when the
+    /// nearest proxy sets the header on every request.
+    trust_forwarded_host: bool = false,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
-    /// An open connection costs about 2K, 33K more under TLS, and
-    /// `request.buffer_size + response.write_buffer_size + 9K` more while a
-    /// request is being served, or for as long as it is open with
-    /// `request.keep_buffers_between_requests` on. A request with a body
-    /// with a `Content-Encoding` takes 70K more while `request.decompress`
-    /// is on.
-    max_connections: ?u32 = 10_000,
+    /// The default, `max_connections_from_fd_limit`, is worked out when the
+    /// server starts, from the process's open-file limit (the soft
+    /// RLIMIT_NOFILE) less what is kept back for other descriptors (see
+    /// `fd_limit.maxConnections`): past that limit `accept` fails anyway.
+    /// 10,000 on Windows, which has no such limit.
+    ///
+    /// An idle connection costs a few kilobytes, about 9K under TLS on Linux
+    /// once parked (`timeout.idle_park`; about 20K while it keeps its task),
+    /// and
+    /// `request.buffer_size + 12K` more while a request is being served, or
+    /// for as long as it is open with `request.keep_buffers_between_requests`
+    /// on, of which an ordinary request touches one page; and
+    /// `response.write_buffer_size` more while its response is being
+    /// written. A request with a body with a `Content-Encoding` takes 70K
+    /// more while `request.decompress` is on.
+    max_connections: ?u32 = max_connections_from_fd_limit,
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
     errors: ErrorFormat = .auto,
@@ -274,6 +342,10 @@ pub const ServerConfig = struct {
     /// without a context of its own. A context's `uncaughtError` comes
     /// first.
     error_handler: ?ErrorHandler = null,
+    /// `max_connections`'s default: worked out from the open-file limit
+    /// when the server starts.
+    pub const max_connections_from_fd_limit: u32 = std.math.maxInt(u32);
+
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.
@@ -300,11 +372,14 @@ pub const ServerConfig = struct {
         /// TLS module (tls.zig refuses it).
         alpn_protocols: []const []const u8 = &.{},
 
+        /// A certificate chain and private key as PEM text.
         pub const Pem = struct {
             cert: []const u8,
             key: []const u8,
         };
 
+        /// Mutual TLS: which CAs a client certificate must chain to, and
+        /// whether one is required.
         pub const ClientAuth = struct {
             /// Certificate authorities used to verify client certificates.
             /// `.none` is rejected by listen().
@@ -317,6 +392,7 @@ pub const ServerConfig = struct {
         };
     };
 
+    /// HTTP/2 limits and windows (`anole.ServerOptions.http2`).
     pub const Http2 = struct {
         /// SETTINGS_MAX_CONCURRENT_STREAMS: streams a client may have open
         /// at once. Each costs a task and, once it sends a body, a buffer
@@ -332,6 +408,18 @@ pub const ServerConfig = struct {
         /// 6.5 MB/s at 10 ms), while one that never reads holds only
         /// `stream_window`. No larger than `stream_window`: stays as is.
         stream_window_reading: u31 = 1024 * 1024,
+        /// The most memory the raised windows (`stream_window_reading`) of
+        /// one connection's streams take at once: 16 streams reading at
+        /// the default. A stream whose handler reads past it keeps
+        /// `stream_window`, and reads at that pace.
+        ///
+        /// What else a connection's streams can hold: up to
+        /// `max_concurrent_streams` body buffers of `stream_window`, and
+        /// for each handler that reads its whole body (`Request.body`) up
+        /// to `Request.max_body_size`. Size memory for `max_connections`
+        /// times that, or lower `max_concurrent_streams` and
+        /// `max_body_size`.
+        reading_window_budget: usize = 16 * 1024 * 1024,
         /// Request body bytes in flight across all streams of a
         /// connection. It holds no memory of its own (the streams' body
         /// buffers do), so it is generous: several uploads at once share
@@ -347,6 +435,13 @@ pub const ServerConfig = struct {
         stream_reset_rate: u64 = 33,
         /// CONTINUATION frames allowed after one HEADERS (CVE-2024-28182).
         max_continuations: usize = 8,
+        /// Streams the server may refuse before they reach a handler (a
+        /// header list past `max_header_list_size`, or one nghttp2's checks
+        /// reject) in a burst, refilled at `refused_stream_rate` per
+        /// second, before the connection is closed with
+        /// GOAWAY(ENHANCE_YOUR_CALM).
+        refused_stream_burst: u64 = 100,
+        refused_stream_rate: u64 = 10,
         /// Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441), so a
         /// client may open a WebSocket, or another protocol, on a stream
         /// with an extended CONNECT. Such a request reaches the router as a
@@ -362,11 +457,18 @@ pub const ServerConfig = struct {
         inline_no_wait: bool = true,
     };
 
+    /// `ServerConfig.timeout`.
     pub const Timeout = struct {
         /// Maximum time to complete a request, including handler work and the
         /// response. TLS handshakes use the same timeout as a separate phase.
         /// Defaults to 30 seconds; set to null for long-lived handlers, or
         /// replace it from a handler with `Request.setTimeout`.
+        ///
+        /// HTTP/2 also bounds what follows the handler with it (or with
+        /// `keepalive` when this is null): a response not all sent this
+        /// long after its handler returned (a peer that gives no flow
+        /// control window) is reset, and a single write the peer does not
+        /// read for this long closes the connection.
         ///
         /// Costs a second task per connection on any backend but zio, so on
         /// `std.Io.Threaded` setting either timeout means two threads per
@@ -384,6 +486,21 @@ pub const ServerConfig = struct {
         keepalive: ?std.Io.Duration = .fromSeconds(60),
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
+        /// How long an HTTP/1.1 connection waits for its next request on a
+        /// task of its own before it parks: the task ends, and the
+        /// connection waits as a small heap object until its socket is
+        /// readable, when a new task is started on the same executor to
+        /// serve it. A connection that sends again sooner keeps its task,
+        /// so a busy one never pays for parking. One that was parked this
+        /// long or longer parks again as soon as it has answered what woke
+        /// it, so that waking many mostly idle connections at once needs
+        /// tasks for about as many as are being served at a time. Only with something to
+        /// park: nothing buffered, and on TLS nothing pending in either
+        /// direction. A parked connection's `keepalive` (or first
+        /// `request`) deadline is kept to about a second. Null or zero
+        /// keeps idle connections on their task. Only on zio with pinned
+        /// executors; elsewhere connections never park.
+        idle_park: ?std.Io.Duration = .fromSeconds(1),
         /// Maximum time a graceful shutdown waits for the connections still
         /// in flight. Null waits for all of them, however long they take --
         /// which for a connection that never closes on its own, such as a
@@ -391,6 +508,7 @@ pub const ServerConfig = struct {
         shutdown: ?std.Io.Duration = .fromSeconds(30),
     };
 
+    /// `ServerConfig.request`.
     pub const Request = struct {
         /// Maximum size (bytes) for request body. Applies to the body a
         /// handler sees, so for a compressed request it bounds what was
@@ -407,6 +525,11 @@ pub const ServerConfig = struct {
         /// and before any 100 Continue. Unlike `max_body_size` this bounds
         /// streamed bodies too. Null leaves it to `max_body_size`.
         max_content_length: ?usize = null,
+        /// An HTTP/1.1 request without a `Host` field, or any request with
+        /// more than one, is answered 400 (RFC 9112 §3.2), so every part
+        /// of the server and any cache in front agree on the host. False
+        /// accepts them, for old clients that omit it.
+        require_host: bool = true,
         /// Undo `Content-Encoding` on request bodies. A coding we cannot
         /// undo fails the read with `error.UnsupportedContentEncoding`
         /// rather than handing the handler bytes it would misread.
@@ -445,12 +568,14 @@ pub const ServerConfig = struct {
         max_multiform_count: usize = 32,
     };
 
+    /// `ServerConfig.response`.
     pub const Response = struct {
         /// Buffer size (bytes) for writing to the connection while a request
         /// is served. A response head and a body that fits behind it go out
         /// in one write; a streamed chunk, an event or a WebSocket frame is
-        /// assembled in it and sent as it is finished. Taken with the
-        /// request's read buffer, and given back with it. Must not be 0.
+        /// assembled in it and sent as it is finished. Taken from a pool at
+        /// the response's first write, and given back once it is out, so a
+        /// request still waiting to answer holds none. Must not be 0.
         ///
         /// 16K is the most a TLS record carries, so under TLS a smaller
         /// buffer sends what passes through it, a file or a body written in
@@ -466,6 +591,12 @@ pub const ServerConfig = struct {
         /// (`Date`, `Content-Encoding`, `Vary`, ...) included. Past it,
         /// `Response.header` fails with `error.TooManyHeaders`.
         max_header_count: usize = 64,
+        /// Brotli's quality (0 to 11) for responses compressed as `br`
+        /// (`res.compress` with `-Dbrotli`). 5, the usual on-the-fly
+        /// choice: on JSON of 1.5 to 12 KB it is 8-13% smaller than 4 and
+        /// 10-15% smaller than gzip, at about 1.3x the time of 4; 6 adds
+        /// under 1%. 11 is for precompressed files, not responses.
+        brotli_quality: u4 = 5,
     };
 };
 

@@ -71,17 +71,19 @@ pub fn concurrent(
     return group.concurrent(io, func, args);
 }
 
-/// How many executors accept loops can be spread over, or null when
-/// placement does not apply (not zio).
 /// The index of the executor the calling task runs on, the one `.executor`
 /// takes: for work started elsewhere (a drain, say) that belongs on a
-/// connection's executor. Null off zio, or off an executor of `io`'s runtime.
+/// connection's executor, or for state kept per executor (`anole.db`'s
+/// pools). Null off zio, or off an executor of `io`'s runtime (a thread of
+/// its blocking pool, say).
 pub fn currentExecutor(io: std.Io) ?usize {
     if (comptime !have_zio or !@hasDecl(zio.Runtime, "currentExecutor")) return null;
     const rt = zio.Runtime.fromIo(io) orelse return null;
     return rt.currentExecutor() orelse null;
 }
 
+/// How many executors accept loops can be spread over, or null when
+/// placement does not apply (not zio).
 pub fn executorCount(io: std.Io) ?usize {
     if (comptime !have_zio) return null;
     const rt = zio.Runtime.fromIo(io) orelse return null;

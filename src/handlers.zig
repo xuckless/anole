@@ -1,6 +1,6 @@
-//! Handler and middleware shapes `Server` takes beside dusty's own: a plain
-//! `(req, res)` handler on a server with state (adapted at comptime), and
-//! middleware written as a function rather than a struct.
+//! Handler and middleware shapes `Server` takes beside the HTTP core's own:
+//! a plain `(req, res)` handler on a server with state (adapted at
+//! comptime), and middleware written as a function rather than a struct.
 //!
 //!     fn requireKey(req: *anole.Request, _: *anole.Response, next: anole.Next) !void {
 //!         if (req.headers.get("X-Api-Key") == null) return error.Unauthorized;
@@ -10,6 +10,7 @@
 //!     app.with(.{requireKey}).get("/admin", h);  // this route only
 const std = @import("std");
 const dusty = @import("dusty");
+const ResponseCache = @import("cache/response.zig").ResponseCache;
 
 /// `handler` as the router of a `Server(Ctx)` takes it: as it is when it
 /// already has that shape, or wrapped when it is a `(req, res)` handler on a
@@ -17,6 +18,7 @@ const dusty = @import("dusty");
 pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Handler {
     const F = @TypeOf(handler);
     if (comptime isNoWait(F)) return adapt(Ctx, F.no_wait_handler);
+    if (comptime isCached(F)) return adapt(Ctx, F.cached_handler);
     const info = switch (@typeInfo(F)) {
         .@"fn" => |f| f,
         else => @compileError("a handler is a function taking (*anole.Request, *anole.Response), not " ++ @typeName(F)),
@@ -53,6 +55,7 @@ pub fn noWait(comptime handler: anytype) NoWait(handler) {
     return .{};
 }
 
+/// The type `noWait` returns: a marker the route methods recognise.
 pub fn NoWait(comptime handler: anytype) type {
     if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function, not " ++ @typeName(@TypeOf(handler)));
     return struct {
@@ -64,9 +67,37 @@ fn isNoWait(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "no_wait_handler");
 }
 
+/// `handler`, with its answers kept and served from memory by a
+/// `ResponseCache` of the route's own (see `anole.middleware.ResponseCache`
+/// for what is kept, and when not):
+///
+///     app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed));
+///
+/// A hit runs neither the handler nor anything after the cache; the
+/// server's and the groups' middleware runs as for any request. Takes a
+/// handler marked with `noWait` too.
+pub fn cached(comptime options: ResponseCache.Options, comptime handler: anytype) Cached(options, handler) {
+    return .{};
+}
+
+/// The type `cached` returns: a marker the route methods recognise.
+pub fn Cached(comptime options: ResponseCache.Options, comptime handler: anytype) type {
+    return struct {
+        pub const cached_handler = handler;
+        pub const cache_options = options;
+    };
+}
+
+/// Whether `T` is the type `cached` returns.
+pub fn isCached(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "cached_handler");
+}
+
 /// The router options a handler as `Server` takes it implies.
 pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
-    return .{ .no_wait = comptime isNoWait(@TypeOf(handler)) };
+    const F = @TypeOf(handler);
+    if (comptime isCached(F)) return routeOptions(F.cached_handler);
+    return .{ .no_wait = comptime isNoWait(F) };
 }
 
 /// What a function middleware calls to run the rest of the chain (the
@@ -77,6 +108,7 @@ pub const Next = struct {
     executor: *anyopaque,
     next_fn: *const fn (executor: *anyopaque) anyerror!void,
 
+    /// Runs the rest of the chain and returns its error, if any.
     pub fn call(self: Next) anyerror!void {
         return self.next_fn(self.executor);
     }
@@ -89,6 +121,8 @@ pub fn func(comptime f: anytype) Func(f) {
     return .{};
 }
 
+/// The middleware type `func` returns for `f`. A compile error when `f`
+/// does not take `anole.Next` last.
 pub fn Func(comptime f: anytype) type {
     const params = @typeInfo(@TypeOf(f)).@"fn".param_types;
     if (params.len != 3 and params.len != 4 or params[params.len - 1] != Next)
@@ -124,7 +158,7 @@ test "adapt: a (req, res) handler on a server with state" {
             res.status = .accepted;
         }
         fn stateful(s: *State, _: *dusty.Request, res: *dusty.Response) !void {
-            res.status = @enumFromInt(s.n);
+            res.status = @fromBackingInt(@intCast(s.n));
         }
     };
     const a: dusty.Router(State).Handler = adapt(State, H.plain);

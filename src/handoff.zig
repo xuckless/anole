@@ -10,13 +10,23 @@
 //! for its stateless resets and address validation tokens through a pipe
 //! of its own (`ANOLE_H3_SECRET_FD`): see `Server.run` for what happens to
 //! the QUIC connections.
+//!
+//! Unix only: Windows has no fd inheritance by number, fork or SIGUSR2.
+//! There `supported` is false, nothing is ever inherited, and `spawn` fails
+//! with `error.Unsupported` (the server never calls it there).
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
+const sd_notify = @import("sd_notify.zig");
+
+/// False on Windows (see above).
+pub const supported = builtin.os.tag != .windows;
 
 pub const Fd = std.posix.fd_t;
-/// Room for a few TCP listeners and an HTTP/3 socket per core.
-pub const max_listeners = 8 + 255;
+/// Room for `max_tcp_listeners` TCP listeners and an HTTP/3 socket per
+/// core.
+pub const max_listeners = max_tcp_listeners + 255;
+pub const max_tcp_listeners = 64;
 
 /// The listening sockets handed to this process, with their names.
 pub const Inherited = struct {
@@ -56,6 +66,7 @@ pub const Inherited = struct {
 /// The sockets passed in by systemd or a predecessor: `LISTEN_PID` must
 /// be this process, `LISTEN_FDS` how many, starting at fd 3.
 pub fn inherited(environ: std.process.Environ) ?Inherited {
+    if (comptime !supported) return null;
     const out = parseListenEnv(
         environ.getPosix("LISTEN_PID"),
         environ.getPosix("LISTEN_FDS"),
@@ -67,9 +78,47 @@ pub fn inherited(environ: std.process.Environ) ?Inherited {
     return out;
 }
 
+pub const SocketKind = enum {
+    /// A listening TCP or unix stream socket.
+    listener,
+    /// A UDP socket (HTTP/3).
+    datagram,
+};
+
+/// Checks that an inherited `fd` is what it is to be used as: a socket of
+/// `kind` (listening, for a stream), of an IP family when `ip`, else a unix
+/// one. A wrong descriptor at 3.. (another unit's socket, a file, a stale
+/// `LISTEN_FDS`) is refused at start rather than served on.
+pub fn checkInherited(fd: Fd, kind: SocketKind, ip: bool) error{InheritedSocketMismatch}!void {
+    if (comptime !supported) return;
+    var storage: c.sockaddr.storage = undefined;
+    var len: c.socklen_t = @sizeOf(c.sockaddr.storage);
+    if (c.getsockname(fd, @ptrCast(&storage), &len) != 0) return error.InheritedSocketMismatch;
+    const family = storage.family;
+    const family_ok = if (ip) family == c.AF.INET or family == c.AF.INET6 else family == c.AF.UNIX;
+    if (!family_ok) return error.InheritedSocketMismatch;
+    var typ: c_int = 0;
+    var typ_len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.TYPE, &typ, &typ_len) != 0) return error.InheritedSocketMismatch;
+    switch (kind) {
+        .listener => {
+            if (typ != c.SOCK.STREAM) return error.InheritedSocketMismatch;
+            // Whether it listens: Linux answers SO_ACCEPTCONN; macOS does
+            // not (ENOPROTOOPT), so there the type has to do.
+            if (comptime builtin.os.tag != .linux) return;
+            var listening: c_int = 0;
+            var l_len: c.socklen_t = @sizeOf(c_int);
+            if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.ACCEPTCONN, &listening, &l_len) != 0 or listening == 0)
+                return error.InheritedSocketMismatch;
+        },
+        .datagram => if (typ != c.SOCK.DGRAM or !ip) return error.InheritedSocketMismatch,
+    }
+}
+
 /// What `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` say to the process
 /// `self_pid`; the names are slices of `names_text`.
 fn parseListenEnv(pid_text: ?[]const u8, fds_text: ?[]const u8, names_text: ?[]const u8, self_pid: c.pid_t) ?Inherited {
+    if (comptime !supported) return null;
     const pid = std.fmt.parseInt(c.pid_t, pid_text orelse return null, 10) catch return null;
     if (pid != self_pid) return null;
     const count = std.fmt.parseInt(usize, fds_text orelse return null, 10) catch return null;
@@ -88,6 +137,7 @@ fn parseListenEnv(pid_text: ?[]const u8, fds_text: ?[]const u8, names_text: ?[]c
 /// (`inherited` is not null), so a stale variable cannot name some other
 /// file.
 pub fn inheritedSecret(environ: std.process.Environ) ?[32]u8 {
+    if (comptime !supported) return null;
     const text = environ.getPosix("ANOLE_H3_SECRET_FD") orelse return null;
     const fd = std.fmt.parseInt(Fd, text, 10) catch return null;
     defer _ = c.close(fd);
@@ -103,11 +153,13 @@ pub fn inheritedSecret(environ: std.process.Environ) ?[32]u8 {
 
 /// Whether a predecessor started this process and waits for it to serve.
 pub fn isSuccessor(environ: std.process.Environ) bool {
+    if (comptime !supported) return false;
     return environ.getPosix("ANOLE_READY_FD") != null;
 }
 
 /// Tells the predecessor that this process is serving, if it is waiting.
 pub fn notifyReady(environ: std.process.Environ) void {
+    if (comptime !supported) return;
     const text = environ.getPosix("ANOLE_READY_FD") orelse return;
     const fd = std.fmt.parseInt(Fd, text, 10) catch return;
     _ = c.write(fd, "1", 1);
@@ -123,6 +175,7 @@ pub const Successor = struct {
     /// Waits up to `timeout_ms` for the successor to say it is serving,
     /// without holding the executor's thread.
     pub fn waitReady(self: Successor, io: std.Io, timeout_ms: u32) bool {
+        if (comptime !supported) unreachable; // `spawn` never made one
         defer _ = c.close(self.ready_fd);
         var waited: u32 = 0;
         while (waited < timeout_ms) : (waited += 50) {
@@ -139,6 +192,7 @@ pub const Successor = struct {
     /// Stops a successor that never reported serving, so two servers do
     /// not share the sockets, and reaps it.
     pub fn abandon(self: Successor) void {
+        if (comptime !supported) unreachable; // `spawn` never made one
         _ = c.kill(self.pid, c.SIG.KILL);
         var status: c_int = 0;
         _ = c.waitpid(self.pid, &status, 0);
@@ -148,6 +202,7 @@ pub const Successor = struct {
 /// Starts a new copy of this program, with the same arguments and
 /// environment, holding `listeners`, and `h3_secret` if given.
 pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minimal, listeners: []const Listener, h3_secret: ?*const [32]u8) !Successor {
+    if (comptime !supported) return error.Unsupported;
     if (listeners.len == 0 or listeners.len > max_listeners) return error.TooManyListeners;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -192,9 +247,13 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
     for (process.environ.block.slice) |entry| {
         const e = std.mem.span(entry.?);
         if (std.mem.startsWith(u8, e, "LISTEN_") or std.mem.startsWith(u8, e, "ANOLE_READY_FD=") or
-            std.mem.startsWith(u8, e, "ANOLE_H3_SECRET_FD=")) continue;
+            std.mem.startsWith(u8, e, "ANOLE_H3_SECRET_FD=") or std.mem.eql(u8, e, sd_notify.placeholder)) continue;
         try env.append(arena, entry);
     }
+    // systemd's socket, which this process took out of its own environment
+    // (`sd_notify.take`): the successor reports to it.
+    if (sd_notify.taken()) |path|
+        try env.append(arena, try std.fmt.allocPrintSentinel(arena, "NOTIFY_SOCKET={s}", .{path}, 0));
     try env.append(arena, try std.fmt.allocPrintSentinel(arena, "LISTEN_FDS={d}", .{listeners.len}, 0));
     var names: std.ArrayList(u8) = .empty;
     for (listeners, 0..) |l, i| {
@@ -253,6 +312,7 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, process: std.process.Init.Minim
 }
 
 test "Inherited.find: by name, else by position" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     var named: Inherited = .{ .count = 2 };
     named.fds[0] = 3;
     named.fds[1] = 4;
@@ -270,6 +330,7 @@ test "Inherited.find: by name, else by position" {
 }
 
 test "Inherited.findAll: every socket of a name in order, else the rest by position" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     var named: Inherited = .{ .count = 5 };
     const names = [_][]const u8{ "http", "h3", "https", "h3", "h3" };
     for (0..5) |i| {
@@ -292,6 +353,7 @@ test "Inherited.findAll: every socket of a name in order, else the rest by posit
 }
 
 test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     var p: [2]Fd = undefined;
     try std.testing.expectEqual(@as(c_int, 0), c.pipe(&p));
     defer _ = c.close(p[1]);
@@ -313,7 +375,37 @@ test "inheritedSecret: 32 bytes from the pipe a predecessor names, once" {
     try std.testing.expect(!isSuccessor(none));
 }
 
+test "checkInherited: only a socket of the kind it is to be used as" {
+    if (comptime !supported) return error.SkipZigTest;
+    var addr: c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    const tcp = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    defer _ = c.close(tcp);
+    try std.testing.expect(c.bind(tcp, @ptrCast(&addr), @sizeOf(c.sockaddr.in)) == 0);
+    // Bound, not yet listening: refused (where the system says).
+    if (builtin.os.tag == .linux) try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(tcp, .listener, true));
+    try std.testing.expect(c.listen(tcp, 1) == 0);
+    try checkInherited(tcp, .listener, true);
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(tcp, .listener, false));
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(tcp, .datagram, true));
+
+    const udp = c.socket(c.AF.INET, c.SOCK.DGRAM, 0);
+    defer _ = c.close(udp);
+    try std.testing.expect(c.bind(udp, @ptrCast(&addr), @sizeOf(c.sockaddr.in)) == 0);
+    try checkInherited(udp, .datagram, true);
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(udp, .listener, true));
+
+    // Not a socket at all, and no descriptor.
+    var fds: [2]Fd = undefined;
+    try std.testing.expect(c.pipe(&fds) == 0);
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(fds[0], .listener, true));
+    try std.testing.expectError(error.InheritedSocketMismatch, checkInherited(-1, .datagram, true));
+}
+
 test "fuzz: LISTEN_PID, LISTEN_FDS and LISTEN_FDNAMES" {
+    if (comptime !supported) return error.SkipZigTest; // file descriptors by number: Unix only
     try @import("fuzz.zig").bytes(struct {
         fn check(input: []const u8) !void {
             // The three values, newline-separated; a missing one is unset.

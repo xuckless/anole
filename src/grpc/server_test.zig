@@ -6,6 +6,7 @@ const dusty = @import("dusty");
 const c = @import("anole_nghttp2_c");
 const pb = @import("anole_test_pb");
 const grpc = @import("root.zig");
+const frame = @import("frame.zig");
 const features = @import("build_options");
 
 const Echo = pb.Echo(grpc.Call, anyerror);
@@ -121,7 +122,7 @@ const Client = struct {
             var enc: std.Io.Writer.Allocating = .init(gpa);
             defer enc.deinit();
             try m.encode(&enc.writer, gpa);
-            const framed = try grpc.frame.encodeWithCompression(gpa, enc.written(), compression);
+            const framed = try frame.encodeWithCompression(gpa, enc.written(), compression);
             defer gpa.free(framed);
             try body.writer.writeAll(framed);
         }
@@ -174,7 +175,7 @@ const Client = struct {
     fn responses(self: *Client, arena: std.mem.Allocator) ![]pb.EchoResponse {
         var list: std.ArrayList(pb.EchoResponse) = .empty;
         var r: std.Io.Reader = .fixed(self.data.items);
-        while (try grpc.frame.readMessage(&r, arena, 1 << 20, .gzip)) |m| {
+        while (try frame.readMessage(&r, arena, 1 << 20, .gzip)) |m| {
             var mr: std.Io.Reader = .fixed(m.payload);
             try list.append(arena, try pb.EchoResponse.decode(&mr, arena));
         }
@@ -365,7 +366,7 @@ fn http1(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, port: u16
 fn encodeReq(arena: std.mem.Allocator, req: pb.EchoRequest) ![]const u8 {
     var enc: std.Io.Writer.Allocating = .init(arena);
     try req.encode(&enc.writer, arena);
-    return grpc.frame.encode(arena, enc.written());
+    return frame.encode(arena, enc.written());
 }
 
 test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1.1" {
@@ -399,7 +400,7 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         try std.testing.expectEqual(@as(u16, 200), r.status);
         try std.testing.expectEqualStrings("application/grpc-web+proto", r.content_type);
         var reader: std.Io.Reader = .fixed(r.body);
-        const msg = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        const msg = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
         var mr: std.Io.Reader = .fixed(msg.payload);
         try std.testing.expectEqualStrings("web", (try pb.EchoResponse.decode(&mr, arena)).message);
         const rest = reader.buffered();
@@ -416,7 +417,7 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         var reader: std.Io.Reader = .fixed(try decodeChunks(arena, r.body));
         var count: usize = 0;
         while (reader.buffered().len > 0 and reader.buffered()[0] != 0x80) {
-            _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+            _ = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
             count += 1;
         }
         try std.testing.expectEqual(@as(usize, 3), count);
@@ -441,11 +442,125 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
         const r = try http1(gpa, arena, io, port, "/anole.test.Echo/ServerStream", "application/connect+proto", try encodeReq(arena, .{ .message = "s", .repeat = 2 }));
         try std.testing.expectEqual(@as(u16, 200), r.status);
         var reader: std.Io.Reader = .fixed(r.body);
-        _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
-        _ = (try grpc.frame.readMessage(&reader, arena, 1024, .identity)).?;
+        _ = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
+        _ = (try frame.readMessage(&reader, arena, 1024, .identity)).?;
         const end = reader.buffered();
         try std.testing.expectEqual(@as(u8, 0x02), end[0]);
         try std.testing.expectEqualStrings("{}", end[5..]);
+    }
+}
+
+test "gRPC: request messages that nest too deeply or claim more than they hold fail the call" {
+    const gpa = std.testing.allocator;
+    // Stacks as `anole.Server` sizes them by default.
+    const rt = try zio.Runtime.init(gpa, .{ .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 256 * 1024 } });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+    const port = server.address.ip.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Unknown start-group tags, nested far deeper than a task's stack
+    // could recurse.
+    const groups = try arena.alloc(u8, 300_000);
+    @memset(groups, 3 << 3 | 3); // field 3: not one of EchoRequest's
+    // A string field claiming 2^31 - 1 bytes, with none of them.
+    const huge = "\x0a\xff\xff\xff\xff\x07";
+    for ([_][]const u8{ groups, huge }) |message| {
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/grpc-web+proto", try frame.encode(arena, message));
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "grpc-status:13\r\n") != null);
+    }
+    // Connect JSON nested past the JSON depth limit.
+    var deep: std.ArrayList(u8) = .empty;
+    try deep.appendSlice(arena, "{\"x\":");
+    try deep.appendNTimes(arena, '[', 200);
+    try deep.appendNTimes(arena, ']', 200);
+    try deep.appendSlice(arena, "}");
+    const j = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/json", deep.items);
+    try std.testing.expectEqual(@as(u16, 500), j.status);
+    // The server still answers.
+    const ok = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/json", "{\"message\":\"still here\"}");
+    try std.testing.expectEqual(@as(u16, 200), ok.status);
+}
+
+const slowExchange = @import("transcode_test.zig").slowExchange;
+
+/// An HTTP/1.1 gRPC-Web request head for `path` with a body of `len` bytes.
+fn webHead(buf: []u8, path: []const u8, len: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "POST {s} HTTP/1.1\r\nHost: x\r\nContent-Type: application/grpc-web+proto\r\nContent-Length: {d}\r\n\r\n", .{ path, len });
+}
+
+test "gRPC: per-call limits on what a client sends and how slowly" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.registerWith(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    }, .{ .max_received_bytes = 1000, .read_timeout = .fromMilliseconds(200) });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+    const addr = server.address.ip;
+    const port = addr.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        // A few messages fit the call's 1000 bytes; twenty of 100 do not.
+        const few = try Client.call(gpa, io, addr, "/anole.test.Echo/ClientStream", &.{ .{ .message = "a" }, .{ .message = "b" } }, &.{});
+        defer few.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), few.grpc_status);
+        const many: [20]pb.EchoRequest = @splat(.{ .message = &x100 });
+        const cl = try Client.call(gpa, io, addr, "/anole.test.Echo/ClientStream", &many, &.{});
+        defer cl.deinit();
+        try std.testing.expectEqual(@as(?u32, 8), cl.grpc_status);
+    }
+
+    const message = try encodeReq(arena, .{ .message = "hi" });
+    var head_buf: [256]u8 = undefined;
+    {
+        // A unary request that declares 100 bytes and sends 2 is cut off
+        // after the read timeout, and the connection then closes rather
+        // than wait for the rest of the body.
+        const head = try webHead(&head_buf, "/anole.test.Echo/Unary", 105);
+        const answer = try slowExchange(gpa, io, port, &.{ head, "\x00\x00\x00\x00\x64ab" }, .zero, "(until the server closes)", .fromSeconds(5));
+        defer gpa.free(answer);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:4\r\n") != null);
+    }
+    {
+        // A client stream may pause between messages longer than the read
+        // timeout...
+        const head = try webHead(&head_buf, "/anole.test.Echo/ClientStream", 2 * message.len);
+        const answer = try slowExchange(gpa, io, port, &.{ head, message, message }, .fromMilliseconds(400), "grpc-status:", .fromSeconds(5));
+        defer gpa.free(answer);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:0\r\n") != null);
+    }
+    {
+        // ...but not within one.
+        const head = try webHead(&head_buf, "/anole.test.Echo/ClientStream", 2 * message.len);
+        const answer = try slowExchange(gpa, io, port, &.{ head, message, message[0..3], message[3..] }, .fromMilliseconds(400), "grpc-status:", .fromSeconds(5));
+        defer gpa.free(answer);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:4\r\n") != null);
     }
 }
 
@@ -518,6 +633,19 @@ test "gRPC client: every call mode, an error status, a client deadline and metad
         while (try s.receive()) |m| : (n += 1) try std.testing.expectEqual(@as(i32, @intCast(n)), m.index);
         try std.testing.expectEqual(@as(usize, 4), n);
         try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+    {
+        // A call takes at most `max_received_bytes` of responses in all
+        // (each counted at its size plus 64): 40 messages of about 70
+        // bytes do not fit 1000.
+        var s = try client.stream("ServerStream", arena, .{ .max_received_bytes = 1000 });
+        defer s.deinit();
+        try s.send(.{ .message = "n", .repeat = 40 });
+        try s.closeSend();
+        var n: usize = 0;
+        while (try s.receive()) |_| n += 1;
+        try std.testing.expect(n > 0 and n < 40);
+        try std.testing.expectEqual(grpc.Code.resource_exhausted, s.status.?.code);
     }
     {
         var s = try client.stream("ClientStream", arena, .{ .compression = if (features.compression) .gzip else .identity });
@@ -669,8 +797,8 @@ test "gRPC: generic UNKNOWN, initial metadata after the head, per-registration l
         // gzip, then base64.
         var enc: std.Io.Writer.Allocating = .init(arena);
         try (pb.EchoRequest{ .message = "squeezed" }).encode(&enc.writer, arena);
-        const framed = try grpc.frame.encodeWithCompression(arena, enc.written(), .gzip);
-        const gz = framed[grpc.frame.header_size..];
+        const framed = try frame.encodeWithCompression(arena, enc.written(), .gzip);
+        const gz = framed[frame.header_size..];
         const b64 = try arena.alloc(u8, std.base64.url_safe.Encoder.calcSize(gz.len));
         _ = std.base64.url_safe.Encoder.encode(b64, gz);
         // Padding, if any, percent-encoded.

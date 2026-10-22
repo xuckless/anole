@@ -6,6 +6,7 @@
 //! (MIT).
 const std = @import("std");
 const c = @import("ngtcp2.zig").c;
+const dusty_tls = @import("anole_dusty_tls");
 
 const log = std.log.scoped(.anole_h3);
 
@@ -25,20 +26,30 @@ pub const ClientAuth = struct {
     mode: enum { request, require } = .require,
 };
 
+/// What a listener's QUIC TLS context is built from.
 pub const ServerOptions = struct {
     /// The leaf certificate followed by any intermediates.
     cert_pem: []const u8,
+    /// The private key, PEM.
     key_pem: []const u8,
-    /// Also accept ALPN "hq-interop" (after "h3").
+    /// Also accept ALPN "hq-interop", and then take whichever of the two
+    /// the client lists first (`accept_h3_hq`).
     hq_interop: bool = false,
+    /// Ask clients for a certificate (mutual TLS).
     client_auth: ?ClientAuth = null,
     /// Accept 0-RTT (early data) from clients resuming a session. Each
     /// connection must then also get `setEarlyDataContext`.
     early_data: bool = false,
 };
 
+/// A listener's TLS context for QUIC (TLS 1.3 only, ALPN "h3"), shared by
+/// its connections.
 pub const Context = struct {
     ctx: *c.SSL_CTX,
+    /// The session context its sessions are made in: the same for two
+    /// contexts exactly when they verify client certificates the same way
+    /// (`sameClientAuth`).
+    session_context: [32]u8,
 
     /// Everything a listener's handshakes share, built in one place: a
     /// certificate reload builds a new `Context` from new options.
@@ -50,8 +61,20 @@ pub const Context = struct {
         if (c.ngtcp2_crypto_boringssl_configure_server_context(ctx) != 0) return error.TlsSetupFailed;
         _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
         c.SSL_CTX_set_alpn_select_cb(ctx, selectAlpn, @ptrCast(@constCast(if (options.hq_interop) &accept_h3_hq else &accept_h3)));
-        const sid_ctx = "anole h3";
-        _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
+        // A session resumes only under the client-auth policy it was made
+        // under (a resumed session's client certificate is not verified
+        // again): `options.client_auth` is part of the context.
+        var session_context: [32]u8 = @splat(0);
+        if (options.client_auth) |ca| {
+            var ca_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(ca.ca_der, &ca_digest, .{});
+            session_context = dusty_tls.clientAuthSessionContext("anole h3", @backingInt(ca.mode), ca_digest);
+            if (c.SSL_CTX_set_session_id_context(ctx, &session_context, session_context.len) != 1) return error.OutOfMemory;
+        } else {
+            const sid_ctx = "anole h3";
+            @memcpy(session_context[0..sid_ctx.len], sid_ctx);
+            if (c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
+        }
         try useIdentity(.ctx, ctx, options.cert_pem, options.key_pem);
         if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsKeyMismatch;
         if (options.client_auth) |ca| try requestClientCertificates(ctx, ca);
@@ -60,9 +83,17 @@ pub const Context = struct {
         // (`dusty_tls.installTicketKeys`), which a reload carries over, and
         // every connection of a listener, on any executor, shares them.
         if (options.early_data) c.SSL_CTX_set_early_data_enabled(ctx, 1);
-        return .{ .ctx = ctx };
+        return .{ .ctx = ctx, .session_context = session_context };
     }
 
+    /// Whether the two verify client certificates the same way: both not
+    /// at all, or the same mode against the same CAs.
+    pub fn sameClientAuth(a: *const Context, b: *const Context) bool {
+        return std.mem.eql(u8, &a.session_context, &b.session_context);
+    }
+
+    /// Drops this reference to the context; connections still using it
+    /// keep theirs.
     pub fn deinit(self: *Context) void {
         c.SSL_CTX_free(self.ctx);
         self.* = undefined;
@@ -96,13 +127,24 @@ pub fn earlyDataReason(ssl: *const c.SSL) []const u8 {
     return if (text) |t| std.mem.span(t) else "unknown";
 }
 
-/// What a listener accepts, in its order of preference.
-const Accept = struct { protocols: []const []const u8 };
+/// What a listener accepts.
+const Accept = struct {
+    protocols: []const []const u8,
+    /// Take the first protocol the client lists that is among
+    /// `protocols`, rather than the first of `protocols` the client lists.
+    client_order: bool = false,
+};
 const accept_h3: Accept = .{ .protocols = &.{alpn_h3} };
-const accept_h3_hq: Accept = .{ .protocols = &.{ alpn_h3, alpn_hq } };
+/// The interop runner's clients say what a test case wants by the order
+/// they list protocols in: msquic's offers "hq-interop" first, "h3" after,
+/// and speaks HTTP/0.9 whatever comes back, so by our order it got "h3"
+/// and failed every hq case. A client that wants HTTP/3 lists "h3" first
+/// (or alone).
+const accept_h3_hq: Accept = .{ .protocols = &.{ alpn_h3, alpn_hq }, .client_order = true };
 
-/// Picks the first protocol of ours (`arg`) the client offers, or refuses
-/// the handshake: an HTTP/3 endpoint speaks nothing else.
+/// Picks a protocol of ours (`arg`) the client offers, by `Accept`'s
+/// order, or refuses the handshake: an HTTP/3 endpoint speaks nothing
+/// else.
 fn selectAlpn(
     _: ?*c.SSL,
     out: [*c][*c]const u8,
@@ -112,21 +154,58 @@ fn selectAlpn(
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
     const accept: *const Accept = @ptrCast(@alignCast(arg.?));
-    for (accept.protocols) |want| {
-        var offer = in[0..in_len];
-        while (offer.len > 0) {
-            const n = offer[0];
-            if (1 + @as(usize, n) > offer.len) break;
-            if (std.mem.eql(u8, offer[0 .. 1 + n], want)) {
-                out.* = offer[1..].ptr;
-                out_len.* = n;
-                return c.SSL_TLSEXT_ERR_OK;
-            }
-            offer = offer[1 + n ..];
-        }
+    if (pickAlpn(accept, in[0..in_len])) |p| {
+        out.* = p.ptr;
+        out_len.* = @intCast(p.len);
+        return c.SSL_TLSEXT_ERR_OK;
     }
     log.debug("client offered no ALPN we speak", .{});
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+/// The protocol name (without its length byte) `selectAlpn` picks from
+/// the client's list `offer` (ALPN wire format), or null.
+fn pickAlpn(accept: *const Accept, offer: []const u8) ?[]const u8 {
+    if (accept.client_order) {
+        var rest = offer;
+        while (rest.len > 0) {
+            const n = rest[0];
+            if (1 + @as(usize, n) > rest.len) return null;
+            for (accept.protocols) |want| if (std.mem.eql(u8, rest[0 .. 1 + n], want)) return rest[1 .. 1 + n];
+            rest = rest[1 + n ..];
+        }
+        return null;
+    }
+    for (accept.protocols) |want| {
+        var rest = offer;
+        while (rest.len > 0) {
+            const n = rest[0];
+            if (1 + @as(usize, n) > rest.len) break;
+            if (std.mem.eql(u8, rest[0 .. 1 + n], want)) return rest[1 .. 1 + n];
+            rest = rest[1 + n ..];
+        }
+    }
+    return null;
+}
+
+test "h3 ALPN: h3 alone normally; with hq-interop, the client's order decides" {
+    const msquic = "\x0ahq-interop\x02h3\x05hq-29\x05h3-29";
+    const h3_first = "\x02h3\x0ahq-interop";
+    const neither = "\x05h3-29\x08http/1.1";
+    const truncated = "\x02h3\x0ahq-int";
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3, msquic).?);
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3, h3_first).?);
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3, "\x0ahq-interop"));
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3, neither));
+    // msquic's interop client lists hq-interop first and speaks HTTP/0.9.
+    try std.testing.expectEqualStrings("hq-interop", pickAlpn(&accept_h3_hq, msquic).?);
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3_hq, h3_first).?);
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3_hq, "\x05h3-29\x02h3").?);
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3_hq, neither));
+    // A malformed list: what precedes the bad entry still counts.
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3_hq, truncated).?);
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3_hq, "\x0ahq-int"));
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3_hq, ""));
 }
 
 /// The listener's policy, as the TCP listener's (src/tls/dusty_tls.zig)

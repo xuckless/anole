@@ -145,6 +145,11 @@ pub const Limits = struct {
     /// on the way, or its handler not yet accepting), on one connection.
     /// Past it, such streams are refused.
     buffered_streams: usize = 32,
+    /// A session's streams from the peer that its handler has not
+    /// accepted yet, each way. Past it, new ones are refused. The peer's
+    /// stream credit comes back only as streams are released, so this
+    /// bounds what a handler that accepts slowly (or never) holds.
+    incoming_streams: usize = 100,
     /// Datagrams kept for a session's handler, and their bytes; past
     /// either, new ones are dropped (datagrams are unreliable). A burst of
     /// small ones (a client's requests, say) arrives faster than any
@@ -223,9 +228,10 @@ pub const Core = struct {
     /// have ended), and the connection with them.
     pub fn destroy(core: *Core) void {
         const gpa = core.gpa;
-        // Orphans are among them.
+        // Orphans are among them, but for those QUIC is done with.
         var it = core.streams.valueIterator();
         while (it.next()) |s| s.*.free();
+        for (core.orphans.items) |s| if (s.protocol_done) s.free();
         core.streams.deinit(gpa);
         core.orphans.deinit(gpa);
         core.undecided.deinit(gpa);
@@ -250,11 +256,17 @@ pub const Core = struct {
     }
 
     /// The connection is gone: every waiter wakes to it. Locked.
+    ///
+    /// Sessions are not ended here but by their capsule readers, which
+    /// first read what their CONNECT streams had already received and
+    /// then see those streams fail (`.connection`) or end (`.peer`). A
+    /// peer's close capsule that arrived just before its CONNECTION_CLOSE,
+    /// possibly in the same batch of datagrams with no task run in
+    /// between, so still counts as the peer's close, whichever task runs
+    /// first.
     pub fn connectionClosed(core: *Core) void {
         if (core.closed) return;
         core.closed = true;
-        var sessions = core.sessions.valueIterator();
-        while (sessions.next()) |s| s.*.endLocked(.{ .code = 0, .reason = "", .by = .connection });
         var it = core.streams.valueIterator();
         while (it.next()) |s| {
             const stream = s.*;
@@ -378,6 +390,9 @@ pub const Core = struct {
             s.recv_err = error.StreamReset;
             s.reset_code = fromHttp3Error(code);
         }
+        // Reset before it said its session: no use to anyone. Refused
+        // both ways, so QUIC closes it and it is freed.
+        if (!s.prefix_done) s.disown(error_id);
         core.host.kick();
         return true;
     }
@@ -404,19 +419,24 @@ pub const Core = struct {
         const s = e.value;
         s.protocol_done = true;
         if (std.mem.indexOfScalar(*Stream, core.orphans.items, s)) |i| {
+            // A one-way stream that arrived whole before its session was
+            // established (the server opened it right after its 200): kept,
+            // with its data and end, for the session. `destroy` or
+            // `dropOrphans` frees it if the session never comes.
+            if (s.in_fin and s.recv_err == null) {
+                s.dequeue();
+                core.host.kick();
+                return true;
+            }
             _ = core.orphans.swapRemove(i);
             s.user_done = true;
         }
+        // A peer's stream no session took (its prefix never completed):
+        // nobody else will let go of it.
+        if (!s.local and s.session == null) s.user_done = true;
         if (!s.in_fin and s.recv_err == null and s.kind != .uni_out) s.recv_err = error.StreamReset;
         if (!s.fin_sent and s.send_err == null and s.kind != .uni_in) s.send_err = error.StreamReset;
         s.dequeue();
-        // The peer may open another in its place.
-        if (core.isPeers(stream_id)) {
-            if (isUni(stream_id))
-                _ = c.ngtcp2_conn_extend_max_streams_uni(core.q, 1)
-            else
-                _ = c.ngtcp2_conn_extend_max_streams_bidi(core.q, 1);
-        }
         s.maybeFree();
         core.host.kick();
         return true;
@@ -548,6 +568,7 @@ pub const CloseInfo = struct {
     },
 };
 
+/// What session and stream calls fail with.
 pub const Error = error{
     /// The session is closed (by either side, or the connection went).
     SessionClosed,
@@ -556,7 +577,9 @@ pub const Error = error{
     StreamReset,
     /// The peer asked for no more data on the stream (`Stream.stopCode`).
     StreamStopped,
+    /// The QUIC connection closed.
     ConnectionClosed,
+    /// The waiting task was canceled (the server stopping).
     Canceled,
 };
 
@@ -589,6 +612,8 @@ pub const Session = struct {
     /// The capsule reader and the drain watch.
     tasks: std.Io.Group = .init,
 
+    /// For `start`: `anole.webtransport.accept` fills it from its
+    /// `AcceptOptions`.
     pub const Options = struct {
         /// The server's drain signal: on it, a DRAIN_WEBTRANSPORT_SESSION
         /// capsule goes out, and with `close_on_drain` the session closes.
@@ -672,12 +697,13 @@ pub const Session = struct {
     /// A stream of this session, to its queue. Locked.
     fn deliver(self: *Session, s: *Stream) void {
         const gpa = self.core.gpa;
+        const queue = if (s.kind == .bidi) &self.incoming_bidi else &self.incoming_uni;
+        if (queue.items.len >= self.core.limits.incoming_streams) return s.disown(error_buffered_stream_rejected);
         s.session = self;
         self.members.append(gpa, s) catch {
             s.session = null;
             return s.disown(error_buffered_stream_rejected);
         };
-        const queue = if (s.kind == .bidi) &self.incoming_bidi else &self.incoming_uni;
         queue.append(gpa, s) catch {
             _ = self.members.pop();
             s.session = null;
@@ -705,6 +731,7 @@ pub const Session = struct {
         core.host.kick();
     }
 
+    /// Whether neither side has closed the session yet.
     pub fn isOpen(self: *Session) bool {
         const host = self.core.host;
         host.lock();
@@ -740,20 +767,11 @@ pub const Session = struct {
     }
 
     fn acceptFrom(self: *Session, kind: Stream.Kind) Error!*Stream {
-        const core = self.core;
         while (true) {
-            const gen = core.host.gen.load(.acquire);
-            core.host.lock();
-            const queue = if (kind == .bidi) &self.incoming_bidi else &self.incoming_uni;
-            if (queue.items.len > 0) {
-                const s = queue.orderedRemove(0);
-                core.host.unlock();
-                return s;
-            }
-            const still_open = self.state == .open;
-            core.host.unlock();
-            if (!still_open) return error.SessionClosed;
-            try core.wait(gen);
+            const gen = self.generation();
+            if (self.tryAccept(if (kind == .bidi) .bidi else .uni)) |s| return s;
+            if (!self.isOpen()) return error.SessionClosed;
+            try self.core.wait(gen);
         }
     }
 
@@ -769,37 +787,175 @@ pub const Session = struct {
     }
 
     fn open(self: *Session, kind: Stream.Kind) (Error || error{OutOfMemory})!*Stream {
-        const core = self.core;
         while (true) {
-            const gen = core.host.gen.load(.acquire);
-            core.host.lock();
-            if (self.state != .open) {
-                core.host.unlock();
-                return error.SessionClosed;
-            }
-            var id: i64 = -1;
-            const rv = if (kind == .bidi)
-                c.ngtcp2_conn_open_bidi_stream(core.q, &id, null)
-            else
-                c.ngtcp2_conn_open_uni_stream(core.q, &id, null);
-            if (rv == c.NGTCP2_ERR_STREAM_ID_BLOCKED) {
-                core.host.unlock();
-                try core.wait(gen);
-                continue;
-            }
-            if (rv != 0) {
-                core.host.unlock();
-                return error.ConnectionClosed;
-            }
-            const s = self.adopt(id, kind) catch |err| {
-                _ = c.ngtcp2_conn_shutdown_stream(core.q, 0, id, error_session_gone);
-                core.host.unlock();
-                return err;
-            };
-            core.host.unlock();
-            core.host.kick();
-            return s;
+            const gen = self.generation();
+            if (try self.tryOpen(if (kind == .bidi) .bidi else .uni)) |s| return s;
+            try self.core.wait(gen);
         }
+    }
+
+    // -- Without waiting ---------------------------------------------------
+    //
+    // For a caller that runs a session from one task and does its own
+    // waiting (the C ABI's session driver): read `generation`, look with
+    // the `try` calls, and `waitChange` only when none had anything.
+
+    /// The connection's change count: read it before looking.
+    pub fn generation(self: *Session) u32 {
+        return self.core.host.gen.load(.acquire);
+    }
+
+    /// Waits until something on the connection changes after `gen`.
+    pub fn waitChange(self: *Session, gen: u32) std.Io.Cancelable!void {
+        return self.core.wait(gen);
+    }
+
+    /// Wakes `waitChange` (and the connection's other waiters). From a
+    /// task of the runtime on the connection's executor.
+    pub fn wake(self: *Session) void {
+        self.core.host.kick();
+    }
+
+    pub const Direction = enum { bidi, uni };
+
+    /// The next stream the peer opened, if any: both ways (`.bidi`) or
+    /// read-only (`.uni`).
+    pub fn tryAccept(self: *Session, dir: Direction) ?*Stream {
+        const host = self.core.host;
+        host.lock();
+        defer host.unlock();
+        const queue = if (dir == .bidi) &self.incoming_bidi else &self.incoming_uni;
+        if (queue.items.len == 0) return null;
+        return queue.orderedRemove(0);
+    }
+
+    /// Opens a stream (`.uni`: write-only), or null while the peer's
+    /// stream limit is reached.
+    pub fn tryOpen(self: *Session, dir: Direction) (Error || error{OutOfMemory})!?*Stream {
+        const core = self.core;
+        core.host.lock();
+        if (self.state != .open or core.closed) {
+            core.host.unlock();
+            return if (self.state != .open) error.SessionClosed else error.ConnectionClosed;
+        }
+        var id: i64 = -1;
+        const rv = if (dir == .bidi)
+            c.ngtcp2_conn_open_bidi_stream(core.q, &id, null)
+        else
+            c.ngtcp2_conn_open_uni_stream(core.q, &id, null);
+        if (rv == c.NGTCP2_ERR_STREAM_ID_BLOCKED) {
+            core.host.unlock();
+            return null;
+        }
+        if (rv != 0) {
+            core.host.unlock();
+            return error.ConnectionClosed;
+        }
+        const s = self.adopt(id, if (dir == .bidi) .bidi else .uni_out) catch |err| {
+            _ = c.ngtcp2_conn_shutdown_stream(core.q, 0, id, error_session_gone);
+            core.host.unlock();
+            return err;
+        };
+        core.host.unlock();
+        core.host.kick();
+        return s;
+    }
+
+    /// The next datagram received, if any; give it back with
+    /// `freeDatagram`.
+    pub fn takeDatagram(self: *Session) ?[]u8 {
+        const host = self.core.host;
+        host.lock();
+        defer host.unlock();
+        if (self.datagrams_in.items.len == 0) return null;
+        const d = self.datagrams_in.orderedRemove(0);
+        self.datagrams_in_bytes -= d.len;
+        return d;
+    }
+
+    pub fn freeDatagram(self: *Session, d: []u8) void {
+        self.core.gpa.free(d);
+    }
+
+    /// Queues `data` as one datagram; false, with nothing queued, while
+    /// the connection's queue is full.
+    pub fn trySendDatagram(self: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+        const d = try self.prefixDatagram(data);
+        const queued = self.queueDatagram(d, data.len) catch |err| {
+            self.core.gpa.free(d);
+            return err;
+        };
+        if (!queued) self.core.gpa.free(d);
+        return queued;
+    }
+
+    /// `data` behind the session's prefix, in a new buffer.
+    fn prefixDatagram(self: *Session, data: []const u8) error{OutOfMemory}![]u8 {
+        const qsid: u64 = @as(u64, @intCast(self.id)) / 4;
+        const d = try self.core.gpa.alloc(u8, varintLen(qsid) + data.len);
+        const n = putVarint(d, qsid);
+        @memcpy(d[n..], data);
+        return d;
+    }
+
+    /// Takes `d` (a prefixed datagram of `len` payload bytes) into the
+    /// connection's queue, or false when it is full.
+    fn queueDatagram(self: *Session, d: []u8, len: usize) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+        const core = self.core;
+        core.host.lock();
+        if (self.state != .open or core.closed) {
+            core.host.unlock();
+            return if (self.state != .open) error.SessionClosed else error.ConnectionClosed;
+        }
+        if (len > self.maxDatagramLocked()) {
+            core.host.unlock();
+            return error.DatagramTooLarge;
+        }
+        if (core.datagrams_out.items.len >= core.limits.datagrams_out) {
+            core.host.unlock();
+            return false;
+        }
+        core.datagrams_out.append(core.gpa, d) catch {
+            core.host.unlock();
+            return error.OutOfMemory;
+        };
+        core.host.unlock();
+        core.host.kick();
+        return true;
+    }
+
+    /// Tests only: opens a stream of `kind` that starts with `head`
+    /// instead of a whole prefix, held by nobody. Returns its ID, for
+    /// `testReset`.
+    pub fn testOpenRaw(self: *Session, kind: Stream.Kind, head: []const u8) !i64 {
+        if (!@import("builtin").is_test) @compileError("tests only");
+        const core = self.core;
+        core.host.lock();
+        defer core.host.unlock();
+        var id: i64 = -1;
+        const rv = if (kind == .bidi)
+            c.ngtcp2_conn_open_bidi_stream(core.q, &id, null)
+        else
+            c.ngtcp2_conn_open_uni_stream(core.q, &id, null);
+        if (rv != 0) return error.StreamIdBlocked;
+        const s = try Stream.create(core, id, kind, true);
+        s.user_done = true;
+        _ = try s.out.write(core.gpa, head);
+        try core.streams.put(core.gpa, id, s);
+        s.enqueue();
+        core.host.kick();
+        return id;
+    }
+
+    /// Tests only: resets a `testOpenRaw` stream's sending side.
+    pub fn testReset(self: *Session, id: i64) void {
+        if (!@import("builtin").is_test) @compileError("tests only");
+        const core = self.core;
+        core.host.lock();
+        defer core.host.unlock();
+        if (core.streams.get(id)) |s| s.send_err = error.StreamReset;
+        _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, id, 0);
+        core.host.kick();
     }
 
     /// A stream this side opened: the type (or signal) and the session ID
@@ -826,7 +982,7 @@ pub const Session = struct {
     pub fn receiveDatagram(self: *Session, buf: []u8) (Error || error{NoSpaceLeft})![]u8 {
         const core = self.core;
         while (true) {
-            const gen = core.host.gen.load(.acquire);
+            const gen = self.generation();
             core.host.lock();
             if (self.datagrams_in.items.len > 0) {
                 const d = self.datagrams_in.items[0];
@@ -876,36 +1032,16 @@ pub const Session = struct {
     /// Sends `data` as one datagram, waiting while many are queued. It may
     /// be lost; nothing says whether it arrived.
     pub fn sendDatagram(self: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!void {
-        const core = self.core;
-        const qsid: u64 = @as(u64, @intCast(self.id)) / 4;
-        const d = try core.gpa.alloc(u8, varintLen(qsid) + data.len);
+        const d = try self.prefixDatagram(data);
         var queued = false;
-        defer if (!queued) core.gpa.free(d);
-        const n = putVarint(d, qsid);
-        @memcpy(d[n..], data);
+        defer if (!queued) self.core.gpa.free(d);
         while (true) {
-            const gen = core.host.gen.load(.acquire);
-            core.host.lock();
-            if (self.state != .open) {
-                core.host.unlock();
-                return error.SessionClosed;
-            }
-            if (data.len > self.maxDatagramLocked()) {
-                core.host.unlock();
-                return error.DatagramTooLarge;
-            }
-            if (core.datagrams_out.items.len < core.limits.datagrams_out) {
-                core.datagrams_out.append(core.gpa, d) catch {
-                    core.host.unlock();
-                    return error.OutOfMemory;
-                };
+            const gen = self.generation();
+            if (try self.queueDatagram(d, data.len)) {
                 queued = true;
-                core.host.unlock();
-                core.host.kick();
                 return;
             }
-            core.host.unlock();
-            try core.wait(gen);
+            try self.core.wait(gen);
         }
     }
 
@@ -921,7 +1057,11 @@ pub const Session = struct {
             return;
         }
         self.endLocked(.{ .code = code, .reason = message, .by = .local });
+        // The connection is gone (the session's capsule reader has not
+        // ended it yet): no capsule can go out.
+        const gone = core.closed;
         core.host.unlock();
+        if (gone) return self.endChannel();
         var capsule: [8 + 8 + 4 + max_close_message]u8 = undefined;
         var n = putVarint(&capsule, capsule_close);
         n += putVarint(capsule[n..], 4 + message.len);
@@ -1061,6 +1201,7 @@ pub const Stream = struct {
     user_done: bool,
     protocol_done: bool = false,
 
+    /// Bidirectional, or one-way in (accepted) or out (opened).
     pub const Kind = enum { bidi, uni_in, uni_out };
 
     fn create(core: *Core, id: i64, kind: Kind, local: bool) !*Stream {
@@ -1102,6 +1243,15 @@ pub const Stream = struct {
             if (std.mem.indexOfScalar(*Stream, session.members.items, s)) |i| _ = session.members.swapRemove(i);
         }
         s.dequeue();
+        // The peer may open another in its place: only now, so streams
+        // waiting to be accepted count against its limit.
+        const core = s.core;
+        if (!s.local and !core.closed) {
+            if (Core.isUni(s.id))
+                _ = c.ngtcp2_conn_extend_max_streams_uni(core.q, 1)
+            else
+                _ = c.ngtcp2_conn_extend_max_streams_bidi(core.q, 1);
+        }
         s.free();
     }
 
@@ -1173,6 +1323,8 @@ pub const Stream = struct {
     fn disown(s: *Stream, code: u64) void {
         s.user_done = true;
         s.refuse(code);
+        // An orphan QUIC was already done with: nothing else frees it.
+        if (s.protocol_done) s.maybeFree();
     }
 
     /// Resets the stream both ways with `code`. Locked.
@@ -1207,10 +1359,12 @@ pub const Stream = struct {
         return &s.writer_iface;
     }
 
+    /// Why reading failed (`StreamReset`, `SessionClosed`...), or null.
     pub fn readError(s: *const Stream) ?Error {
         return s.read_err;
     }
 
+    /// Why writing failed (`StreamStopped`, `SessionClosed`...), or null.
     pub fn writeError(s: *const Stream) ?Error {
         return s.write_err;
     }
@@ -1294,6 +1448,79 @@ pub const Stream = struct {
         core.host.kick();
     }
 
+    /// What `tryRead` found: `n` bytes; `fin` when the peer's end has
+    /// been read (with them or before); `err` when the stream ended early
+    /// (`resetCode` for the peer's code). All empty: nothing yet.
+    pub const Poll = struct { n: usize = 0, fin: bool = false, err: ?Error = null };
+
+    /// Reads what has arrived into `buf`, without waiting.
+    pub fn tryRead(s: *Stream, buf: []u8) Poll {
+        const core = s.core;
+        if (s.kind == .uni_out) return .{ .fin = true };
+        core.host.lock();
+        const n = s.takeLocked(buf);
+        const out: Poll = .{
+            .n = n,
+            .fin = s.in_fin and s.in_start == s.in.items.len,
+            .err = if (n == 0 and !s.in_fin) s.recv_err else null,
+        };
+        core.host.unlock();
+        if (n > 0) core.host.kick();
+        return out;
+    }
+
+    /// Copies what fits of `bytes` into the stream's send buffer without
+    /// waiting: 0 while it is full (until the peer acknowledges more).
+    /// Bypasses `writer`'s buffer: use one or the other.
+    pub fn tryWrite(s: *Stream, bytes: []const u8) Error!usize {
+        const core = s.core;
+        if (s.kind == .uni_in) return error.StreamReset;
+        core.host.lock();
+        if (s.send_err != null or s.send_closed or core.closed) {
+            const err = s.send_err orelse if (core.closed) error.ConnectionClosed else error.StreamReset;
+            core.host.unlock();
+            return err;
+        }
+        const n = s.out.write(core.gpa, bytes) catch {
+            core.host.unlock();
+            return error.ConnectionClosed;
+        };
+        if (n > 0) s.enqueue();
+        core.host.unlock();
+        if (n > 0) core.host.kick();
+        return n;
+    }
+
+    /// Why the sending side ended early (`StreamStopped`, with `stopCode`;
+    /// `StreamReset`; `SessionClosed`...), or null while it can send.
+    pub fn sendError(s: *Stream) ?Error {
+        const host = s.core.host;
+        host.lock();
+        defer host.unlock();
+        return s.send_err;
+    }
+
+    /// Up to `dest.len` received bytes, giving the peer that much credit.
+    /// Locked.
+    fn takeLocked(s: *Stream, dest: []u8) usize {
+        const core = s.core;
+        const avail = s.in.items[s.in_start..];
+        if (avail.len == 0 or dest.len == 0) return 0;
+        const n = @min(avail.len, dest.len);
+        @memcpy(dest[0..n], avail[0..n]);
+        s.in_start += n;
+        if (s.in_start == s.in.items.len) {
+            s.in.clearRetainingCapacity();
+            s.in_start = 0;
+        } else if (s.in_start >= 64 * 1024) {
+            s.in.replaceRangeAssumeCapacity(0, s.in_start, &.{});
+            s.in_start = 0;
+        }
+        // The peer may send that much more.
+        if (!s.protocol_done and !core.closed) bridge.consume(core.q, s.id, n);
+        return n;
+    }
+
     fn readStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const s: *Stream = @alignCast(@fieldParentPtr("reader_iface", r));
         const core = s.core;
@@ -1303,20 +1530,8 @@ pub const Stream = struct {
         while (true) {
             const gen = core.host.gen.load(.acquire);
             core.host.lock();
-            const avail = s.in.items[s.in_start..];
-            if (avail.len > 0) {
-                const n = @min(avail.len, dest.len);
-                @memcpy(dest[0..n], avail[0..n]);
-                s.in_start += n;
-                if (s.in_start == s.in.items.len) {
-                    s.in.clearRetainingCapacity();
-                    s.in_start = 0;
-                } else if (s.in_start >= 64 * 1024) {
-                    s.in.replaceRangeAssumeCapacity(0, s.in_start, &.{});
-                    s.in_start = 0;
-                }
-                // The peer may send that much more.
-                if (!s.protocol_done and !core.closed) bridge.consume(core.q, s.id, n);
+            const n = s.takeLocked(dest);
+            if (n > 0) {
                 core.host.unlock();
                 core.host.kick();
                 w.advance(n);

@@ -71,6 +71,8 @@ const Client = struct {
     in_len: usize = 0,
     /// DATA frames received.
     data_frames: usize = 0,
+    /// The `origin` header to send, if any.
+    origin: ?[]const u8 = null,
 
     fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
@@ -129,9 +131,11 @@ const Client = struct {
             nv(":path", "/chat"),
             nv(":authority", "localhost"),
             nv("sec-websocket-version", "13"),
+            nv("origin", self.origin orelse ""),
         };
+        const n: usize = if (self.origin != null) nva.len else nva.len - 1;
         var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = self }, .read_callback = provide };
-        self.stream_id = c.nghttp2_submit_request2(self.session, null, &nva, nva.len, &provider, self);
+        self.stream_id = c.nghttp2_submit_request2(self.session, null, &nva, n, &provider, self);
         if (self.stream_id < 0) return error.Http2Submit;
         try self.pumpUntil(struct {
             fn f(cl: *Client) bool {
@@ -420,6 +424,65 @@ test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 ans
     try std.testing.expect(route_ended_clean.load(.acquire));
 }
 
+var callbacks_closed: std.atomic.Value(bool) = .init(false);
+
+/// `callbacks`' handler shape, which over HTTP/2 runs on the stream's task.
+const CallbackEcho = struct {
+    pub fn open(ws: *websocket.Socket, _: *dusty.Request) !void {
+        try ws.send(.text, "hi");
+    }
+    pub fn message(ws: *websocket.Socket, msg: websocket.Message) !void {
+        try ws.send(msg.type, msg.data);
+    }
+    pub fn close(ws: *websocket.Socket) void {
+        callbacks_closed.store(ws.close_code == .normal, .release);
+    }
+};
+
+test "WebSocket over HTTP/2: callbacks(): open, echo, ping, close" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    callbacks_closed.store(false, .release);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", websocket.callbacks(void, CallbackEcho, .{}));
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("hi", try client.nextFrame(&op, &buf));
+    try client.sendFrame(.text, "through callbacks");
+    try std.testing.expectEqualStrings("through callbacks", try client.nextFrame(&op, &buf));
+    try client.sendFrame(.ping, "p");
+    try std.testing.expectEqualStrings("p", try client.nextFrame(&op, &buf));
+    try std.testing.expectEqual(wsc.Opcode.pong, op);
+    try client.sendFrame(.close, &.{ 0x03, 0xe8 });
+    const closing = try client.nextFrame(&op, &buf);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    try std.testing.expectEqual(@as(u16, 1000), std.mem.readInt(u16, closing[0..2], .big));
+    for (0..200) |_| {
+        if (callbacks_closed.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(callbacks_closed.load(.acquire));
+}
+
 fn startEcho(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!void) {
     server.router.get("/chat", echo);
     const future = try io.concurrent(struct {
@@ -492,4 +555,31 @@ test "WebSocket over HTTP/2: an answer held for a batch goes out while the handl
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("wait", try client.nextFrame(&op, &buf));
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+}
+
+test "WebSocket over HTTP/2: a page from another origin gets 403, one from the same origin its socket" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    var future = try startEcho(&server, io);
+    defer future.cancel(io) catch {};
+
+    var evil: Client = undefined;
+    try evil.init(io, server.address.ip);
+    defer evil.deinit();
+    evil.origin = "https://evil.example";
+    try evil.open();
+    try std.testing.expectEqual(@as(u16, 403), evil.status);
+
+    var own: Client = undefined;
+    try own.init(io, server.address.ip);
+    defer own.deinit();
+    own.origin = "http://localhost";
+    try own.open();
+    try std.testing.expectEqual(@as(u16, 200), own.status);
 }

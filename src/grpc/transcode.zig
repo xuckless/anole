@@ -325,6 +325,15 @@ pub const Leaf = struct {
     /// For an enum: whether a name is one of its values. Checked here, as
     /// the body's decoding skips unknown values.
     known: ?*const fn (name: []const u8) bool = null,
+    /// Or, for an enum known only at run time: `known_in(enum_ctx, name)`.
+    known_in: ?*const fn (ctx: *const anyopaque, name: []const u8) bool = null,
+    enum_ctx: ?*const anyopaque = null,
+
+    fn isKnown(leaf: Leaf, name: []const u8) bool {
+        if (leaf.known) |f| return f(name);
+        if (leaf.known_in) |f| return f(leaf.enum_ctx.?, name);
+        return false;
+    }
 };
 
 fn EnumNames(comptime E: type) type {
@@ -353,6 +362,11 @@ pub const Names = struct {
 
     pub fn slice(self: *const Names) []const []const u8 {
         return self.buf[0..self.len];
+    }
+
+    /// Adds the next name of the path; false past `max_field_depth`.
+    pub fn append(self: *Names, name: []const u8) bool {
+        return self.push(name);
     }
 };
 
@@ -530,11 +544,33 @@ pub fn decodeRequest(
     query: []const u8,
     diag: *Diagnostic,
 ) DecodeError!Req {
-    const whole_body = comptime std.mem.eql(u8, body, "*");
+    const fields = struct {
+        pub fn lookup(_: @This(), path: []const u8, names: *Names) ?Leaf {
+            return transcodeLookup(Req, path, names);
+        }
+    }{};
+    return decodeJson(Req, arena, try requestJson(arena, body, body_text, captures, query, diag, fields), diag);
+}
+
+const transcodeLookup = lookup;
+
+/// `decodeRequest`'s message as JSON text, for any message description:
+/// `fields.lookup(path, *Names) ?Leaf` says what a field path names (the C
+/// ABI's gRPC server answers from descriptors, at run time).
+pub fn requestJson(
+    arena: std.mem.Allocator,
+    body: []const u8,
+    body_text: []const u8,
+    captures: []const Capture,
+    query: []const u8,
+    diag: *Diagnostic,
+    fields: anytype,
+) DecodeError![]const u8 {
+    const whole_body = std.mem.eql(u8, body, "*");
     const has_body = body.len > 0 and std.mem.trim(u8, body_text, " \t\r\n").len > 0;
     if (has_body and !jsonDepthWithin(body_text, max_json_depth)) return invalid(diag, "the request body nests too deeply");
     // The common case for a custom method: the body is the message.
-    if (whole_body and captures.len == 0) return decodeJson(Req, arena, if (has_body) body_text else "{}", diag);
+    if (whole_body and captures.len == 0) return if (has_body) body_text else "{}";
 
     var root: std.json.ObjectMap = .empty;
     if (has_body) {
@@ -549,9 +585,14 @@ pub fn decodeRequest(
             try setField(arena, &root, &.{body}, value, false);
         }
     }
-    for (captures) |capture| {
-        var names: Names = .{};
-        const leaf = lookup(Req, capture.field, &names) orelse return invalid(diag, "a path variable names no field");
+    // Each variable's field as the message's own names, whichever spelling
+    // the template used, for the query parameters to be checked against.
+    var bound_names: [max_variables]Names = undefined;
+    if (captures.len > max_variables) return invalid(diag, "too many path variables");
+    for (captures, 0..) |capture, i| {
+        const names = &bound_names[i];
+        names.* = .{};
+        const leaf = fields.lookup(capture.field, names) orelse return invalid(diag, "a path variable names no field");
         const text = decodePath(arena, capture.raw, capture.multi) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidEscape => return invalid(diag, "malformed percent-encoding in the path"),
@@ -575,16 +616,15 @@ pub fn decodeRequest(
             } else "";
             var names: Names = .{};
             // Not a field: ignored, like a cache-buster or a tracking tag.
-            const leaf = lookup(Req, key, &names) orelse continue;
+            const leaf = fields.lookup(key, &names) orelse continue;
             // Fields the path or the body set are theirs.
-            if (bound(names.slice(), captures, body)) continue;
+            if (bound(names.slice(), bound_names[0..captures.len], body)) continue;
             const value = valueOf(leaf, text) orelse
                 return invalid(diag, try std.fmt.allocPrint(arena, "query parameter {s}: invalid value", .{key}));
             try setField(arena, &root, names.slice(), value, leaf.repeated);
         }
     }
-    const text = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = root }, .{}) catch return error.OutOfMemory;
-    return decodeJson(Req, arena, text, diag);
+    return std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = root }, .{}) catch return error.OutOfMemory;
 }
 
 fn decodeJson(comptime Req: type, arena: std.mem.Allocator, text: []const u8, diag: *Diagnostic) DecodeError!Req {
@@ -596,15 +636,16 @@ fn decodeJson(comptime Req: type, arena: std.mem.Allocator, text: []const u8, di
 }
 
 /// Whether a field path is set by the path (a variable at it, above it or
-/// below it) or by the body field.
-fn bound(names: []const []const u8, captures: []const Capture, body: []const u8) bool {
+/// below it) or by the body field. Both sides are the message's own field
+/// names, as `lookup` resolves them, so the template and the query may
+/// each spell a field either way.
+fn bound(names: []const []const u8, variables: []const Names, body: []const u8) bool {
     if (body.len > 0 and std.mem.eql(u8, names[0], body)) return true;
-    for (captures) |capture| {
-        var it = std.mem.splitScalar(u8, capture.field, '.');
-        var i: usize = 0;
-        while (it.next()) |part| : (i += 1) {
-            if (i == names.len) return true;
-            if (!std.mem.eql(u8, part, names[i])) break;
+    for (variables) |variable| {
+        const parts = variable.slice();
+        const n = @min(parts.len, names.len);
+        for (parts[0..n], names[0..n]) |a, b| {
+            if (!std.mem.eql(u8, a, b)) break;
         } else return true;
     }
     return false;
@@ -624,7 +665,7 @@ fn valueOf(leaf: Leaf, text: []const u8) ?std.json.Value {
             null,
         .enumeration => if (std.fmt.parseInt(i32, text, 10)) |n|
             .{ .integer = n }
-        else |_| if (leaf.known.?(text)) .{ .string = text } else null,
+        else |_| if (leaf.isKnown(text)) .{ .string = text } else null,
         .message, .map => null,
     };
 }
@@ -809,11 +850,17 @@ pub fn registerMethod(
                 return server.serveTranscoded(M, handler, rule.body, rule.response_body, ctx, req, res, captures, opts);
             }
         };
-        addBinding(Ctx, router, rule.method, &B.template, B.serve, options, where ++ " (" ++ rule.pattern ++ ")");
+        addBinding(Ctx, router, rule.method, &B.template, B.serve, options, where ++ " (" ++ rule.pattern ++ ")", false);
     }
 }
 
-fn addBinding(
+/// Adds one binding (its `template`, which lives as long as the router)
+/// to `router`: its own route, or a route other bindings of the same shape
+/// share. `serve` runs when the template matched, with `options` (whose
+/// `data` it may read). `no_wait`: the route's requests may run on the
+/// protocol's reader (`dusty.RouteOptions.no_wait`), for the first binding
+/// that makes its route.
+pub fn addBinding(
     comptime Ctx: type,
     router: *dusty.Router(Ctx),
     method: dusty.Method,
@@ -821,6 +868,7 @@ fn addBinding(
     serve: *const ServeFn,
     options: *const server.RegisterOptions,
     where: []const u8,
+    no_wait: bool,
 ) void {
     const alloc = router.arena.allocator();
     const binding = alloc.create(Binding) catch @panic("OOM");
@@ -879,7 +927,7 @@ fn addBinding(
     };
     const bindings = alloc.create(Bindings) catch @panic("OOM");
     bindings.* = .{ .first = binding };
-    router.addRoute(method, path.items, Dispatch(Ctx).handle, bindings);
+    router.addRouteWith(method, path.items, Dispatch(Ctx).handle, .{ .data = bindings, .no_wait = no_wait });
 }
 
 fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method) void {

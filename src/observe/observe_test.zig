@@ -60,7 +60,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
     defer client.deinit();
     var endpoint_buf: [64]u8 = undefined;
     const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = endpoint, .service_name = "test-api", .interval_ms = 50 });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "test-api", .interval_ms = 50 });
     var exporter_live = true;
     defer if (exporter_live) exporter.deinit();
     try exporter.start();
@@ -127,6 +127,20 @@ test "access log: text and JSON lines" {
     try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
 }
 
+test "access log: a request ID cannot add JSON fields" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/x";
+    req.id = "x\",\"status\":200,\"y\":\"\\";
+    const json = try observe.access_log.format(arena, .json, &req, 403, 1, 0, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqual(@as(i64, 403), parsed.object.get("status").?.integer);
+    try std.testing.expectEqualStrings(req.id, parsed.object.get("request_id").?.string);
+}
+
 fn relay(req: *dusty.Request, res: *dusty.Response) !void {
     var buf: [55]u8 = undefined;
     res.body = try res.arena.dupe(u8, observe.trace.outgoing(req, &buf) orelse "none");
@@ -145,7 +159,7 @@ test "observe: an unsampled caller's context is passed on; error statuses as sen
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
     // Never started: nothing here is recorded, or sent anywhere.
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .sample_all = false });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .sample_all = false });
     defer exporter.deinit();
     var registry = observe.metrics.Registry.init(gpa, io);
     defer registry.deinit();
@@ -288,9 +302,10 @@ test "observe: the exporter stops at once, not after its interval" {
     defer client.deinit();
     // Nothing listens there: the one span is dropped, then the task pauses
     // for its (long) interval until deinit wakes it.
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval_ms = 60_000 });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval_ms = 60_000 });
     try exporter.start();
     var span: observe.trace.Span = undefined;
+    span.db = null;
     span.name_len = 0;
     span.method_len = 0;
     span.route_len = 0;
@@ -316,7 +331,7 @@ test "observe: exclude keeps probes out of metrics and traces" {
 
     var client = dusty.Client.init(gpa, io, .{});
     defer client.deinit();
-    var exporter = try observe.trace.Exporter.init(gpa, io, &client, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .exclude = &observe.probe_paths });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .exclude = &observe.probe_paths });
     defer exporter.deinit();
     var registry = observe.metrics.Registry.init(gpa, io);
     defer registry.deinit();
@@ -350,4 +365,21 @@ test "observe: exclude keeps probes out of metrics and traces" {
     var spans: [8]observe.trace.Span = undefined;
     try std.testing.expectEqual(@as(usize, 1), try exporter.queue.get(io, &spans, 0));
     try std.testing.expectEqualStrings("/users/:id", spans[0].route[0..spans[0].route_len]);
+}
+
+test "access log: the query is left out unless log_query" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/callback?code=secret-code&state=s";
+    const json = try observe.access_log.format(arena, .json, &req, 200, 1, 0, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqualStrings("/callback", parsed.object.get("path").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, json, "secret-code") == null);
+    const text = try observe.access_log.format(arena, .text, &req, 200, 1, 0, null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret-code") == null);
+    const kept = try observe.access_log.formatLine(arena, .{ .format = .text, .log_query = true }, &req, 200, 1, 0, null);
+    try std.testing.expect(std.mem.startsWith(u8, kept, "GET /callback?code=secret-code&state=s 200 "));
 }

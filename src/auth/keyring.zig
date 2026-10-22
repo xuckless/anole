@@ -6,20 +6,42 @@
 //! wait for that one fetch, and requests the current keys can serve go on
 //! verifying while it runs. Verification runs outside the lock too, on a
 //! reference-counted set, so a rotation never frees keys in use.
+//!
+//! When the provider cannot be reached, the keys in hand stay in use for
+//! `stale_seconds` past their TTL, and a failed fetch is not tried again
+//! for a while (`retry_seconds`, doubling up to `max_retry_seconds`), so an
+//! outage neither fails every request nor turns each one into a fetch.
 const std = @import("std");
-const dusty = @import("dusty");
 const jws = @import("jws.zig");
+const Client = @import("../client.zig").Client;
 
+const log = std.log.scoped(.anole_auth);
+
+/// A provider's JWK Set behind a URL, fetched on first use and kept. Give it
+/// the server's client (`app.client()`) and the provider's `jwks_uri`:
+///
+///     var keyring = anole.auth.Keyring.init(gpa, app.io(), app.client(), provider.jwks_uri);
+///     defer keyring.deinit();
 pub const Keyring = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    client: *dusty.Client,
+    client: Client,
     url: []const u8,
     /// Keys are refetched this long after the last fetch.
     ttl_seconds: i64 = 3600,
     /// Fetches for an unknown `kid` are at least this far apart, so a
     /// stream of bogus tokens cannot make us hammer the provider.
     min_refresh_seconds: i64 = 60,
+    /// While refetching fails, keys past their TTL are still used for this
+    /// long (a day by default): an outage at the provider does not fail
+    /// every request at once. Rotation away from a compromised key needs
+    /// the provider to be reachable either way.
+    stale_seconds: i64 = 24 * 3600,
+    /// After a failed fetch, the next waits this long, doubling with each
+    /// failure up to `max_retry_seconds`. Meanwhile requests use the stale
+    /// keys, or fail at once (`error.JwksFetchFailed`) when there are none.
+    retry_seconds: i64 = 5,
+    max_retry_seconds: i64 = 300,
 
     /// Guards the fields below; never held across I/O or a verification.
     mutex: std.Io.Mutex = .init,
@@ -32,6 +54,9 @@ pub const Keyring = struct {
     generation: u64 = 0,
     /// When the last fetch began (for `min_refresh_seconds`).
     attempted_at: i64 = std.math.minInt(i64) / 2,
+    /// Fetches failed in a row, and when the next may run.
+    failures: u32 = 0,
+    retry_at: i64 = std.math.minInt(i64) / 2,
 
     /// One fetched set, kept alive while verifications use it.
     const Set = struct {
@@ -42,7 +67,10 @@ pub const Keyring = struct {
         refs: usize = 1,
     };
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *dusty.Client, url: []const u8) Keyring {
+    /// A keyring for the JWK Set at `url`, fetched through `client` (the
+    /// server's, `app.client()` or `anole.client(io)`). Nothing is fetched
+    /// until the first `verify`. `client`'s server and `url` must outlive it.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: Client, url: []const u8) Keyring {
         return .{ .gpa = gpa, .io = io, .client = client, .url = url };
     }
 
@@ -57,11 +85,15 @@ pub const Keyring = struct {
     }
 
     /// Verifies `token` with the provider's keys and checks it against
-    /// `policy`. Fetches the set on first use, on expiry, and once more
+    /// `policy`, which must name an `audience` (`error.AudienceRequired`
+    /// otherwise, unless `allow_any_audience`). Fetches the set on first use, on expiry, and once more
     /// when the token's key is unknown. A request that finds a fetch
     /// running waits for it only when the current keys cannot serve it;
     /// if that fetch fails, it gets `error.JwksFetchFailed`.
     pub fn verify(self: *Keyring, arena: std.mem.Allocator, token: []const u8, policy: jws.Policy) !jws.Verified {
+        // A provider's keys sign for every one of its clients: without an
+        // audience, their tokens for other applications would pass here.
+        if (policy.audience == null and !policy.allow_any_audience) return error.AudienceRequired;
         const set = (try self.obtain(null)).?;
         defer self.release(set);
         return jws.verify(arena, token, set.keys, policy, self.now()) catch |err| switch (err) {
@@ -76,10 +108,11 @@ pub const Keyring = struct {
     }
 
     /// With `seen` null: a set within its TTL, fetching one (or waiting
-    /// for the fetch running) when there is none. With `seen`: a set newer
+    /// for the fetch running) when there is none; while fetches fail, the
+    /// set within `stale_seconds` past its TTL. With `seen`: a set newer
     /// than `seen`, fetching one unless the last fetch began less than
-    /// `min_refresh_seconds` ago; null when there is none. The caller
-    /// releases what it gets.
+    /// `min_refresh_seconds` ago or fetches are backing off; null when
+    /// there is none. The caller releases what it gets.
     fn obtain(self: *Keyring, seen: ?*Set) !?*Set {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
@@ -96,14 +129,22 @@ pub const Keyring = struct {
             if (waited_for) |g| if (g != self.generation) {
                 // The fetch we waited for ended without a set we can use.
                 if (seen != null) return null;
-                return error.JwksFetchFailed;
+                return self.staleLocked(t) orelse error.JwksFetchFailed;
             };
             if (self.fetching) {
+                // Stale keys serve while the fetch runs; only a request
+                // with nothing to verify with waits for it.
+                if (seen == null) if (self.staleLocked(t)) |stale| return stale;
                 waited_for = self.generation;
                 try self.fetched.wait(self.io, &self.mutex);
                 continue;
             }
             if (seen != null and t - self.attempted_at < self.min_refresh_seconds) return null;
+            if (t < self.retry_at) {
+                // Backing off after a failed fetch.
+                if (seen != null) return null;
+                return self.staleLocked(t) orelse error.JwksFetchFailed;
+            }
 
             // This caller fetches, unlocked; the others wait for it.
             self.fetching = true;
@@ -114,10 +155,29 @@ pub const Keyring = struct {
             self.fetching = false;
             self.generation +%= 1;
             self.fetched.broadcast(self.io);
-            const set = try fresh;
+            const set = fresh catch |err| {
+                if (err == error.Canceled) return err;
+                self.failures +|= 1;
+                const shift: u6 = @intCast(@min(self.failures - 1, 20));
+                self.retry_at = t + @min(self.max_retry_seconds, self.retry_seconds << shift);
+                log.warn("JWKS fetch from {s} failed ({t}); next try in {d}s", .{ self.url, err, self.retry_at - t });
+                if (seen == null) if (self.staleLocked(t)) |stale| return stale;
+                return err;
+            };
+            self.failures = 0;
+            self.retry_at = std.math.minInt(i64) / 2;
             if (self.current) |old| self.dropLocked(old);
             self.current = set;
         }
+    }
+
+    /// The current set while it is within `stale_seconds` past its TTL,
+    /// with a reference taken; null otherwise.
+    fn staleLocked(self: *Keyring, t: i64) ?*Set {
+        const cur = self.current orelse return null;
+        if (t - cur.fetched_at > self.ttl_seconds +| self.stale_seconds) return null;
+        cur.refs += 1;
+        return cur;
     }
 
     fn release(self: *Keyring, set: *Set) void {
@@ -141,7 +201,7 @@ pub const Keyring = struct {
         const set = try self.gpa.create(Set);
         set.* = .{ .arena = .init(self.gpa), .keys = &.{}, .fetched_at = 0 };
         errdefer self.free(set);
-        var response = try self.client.fetch(self.url, .{});
+        var response = try self.client.http.fetch(self.url, .{});
         defer response.deinit();
         if (response.status() != .ok) return error.JwksFetchFailed;
         const body = (try response.body()) orelse return error.JwksFetchFailed;
