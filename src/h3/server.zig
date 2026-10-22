@@ -95,7 +95,10 @@ pub const Options = struct {
     /// `init` only; a reload passes its own (`Endpoint.loadTls`).
     cert_pem: []const u8,
     key_pem: []const u8,
-    /// Requests a client may have open at once on a connection.
+    /// Requests a client may have open at once on a connection. A request
+    /// counts until its stream has ended and its handler has returned, so
+    /// requests the client resets do not free room while their handlers
+    /// still run.
     max_streams_bidi: u64 = 100,
     /// Connection and per-stream receive windows.
     max_data: u64 = 16 << 20,
@@ -2181,7 +2184,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .handler => s.refs.handler = false,
                 }
                 if (s.refs.quic or s.refs.handler) return;
-                _ = s.conn.streams.swapRemove(s.id);
+                const conn = s.conn;
+                _ = conn.streams.swapRemove(s.id);
+                // The client may open another request only now: one it
+                // reset still counts while its handler runs.
+                _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 s.free();
             }
 
@@ -3094,13 +3101,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (rv != 0) return rv;
             if (conn.hq_streams.fetchSwapRemove(stream_id)) |e| e.value.free(conn.ep.gpa);
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
-                _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
                     if (!(s.ended and s.allSent() and s.body_done)) s.reset = true;
                     // Gone with its response detached: the owner lets go now.
                     if (s.reset) abortDetached(s);
+                    // Its credit comes back once the handler is done too.
                     s.release(.quic);
+                } else {
+                    _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
                 }
             }
             conn.kick();

@@ -33,6 +33,10 @@ breaking changes are listed anyway.
   datagram (for example because that datagram also carried an error) no
   longer frees state that a 0-RTT request started from the same datagram
   still uses. Only servers with `early_data` on were affected.
+- HTTP/3 server: a request the client resets now keeps counting against
+  `max_streams_bidi` until its handler returns. Before, its stream credit
+  came back at once, so handlers of reset requests could pile up past the
+  limit (the HTTP/3 form of HTTP/2's "rapid reset").
 - HTTP/3: `http3.hq_interop_root` (the QUIC interop runner's HTTP/0.9 file
   server, which bypasses the router and middleware) is refused with
   `error.HqInteropNotAllowed` unless the program's root file declares

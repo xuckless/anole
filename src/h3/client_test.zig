@@ -146,6 +146,17 @@ fn fields(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = out.items;
 }
 
+/// GET /hold: runs for a second, counting the handlers running at once.
+var holding_now: std.atomic.Value(u32) = .init(0);
+var holding_peak: std.atomic.Value(u32) = .init(0);
+fn holdHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    const n = holding_now.fetchAdd(1, .acq_rel) + 1;
+    defer _ = holding_now.fetchSub(1, .acq_rel);
+    _ = holding_peak.fetchMax(n, .acq_rel);
+    req.io.sleep(.fromSeconds(1), .awake) catch {};
+    res.body = "held";
+}
+
 /// A `no_wait` handler that waits all the same.
 fn slowNoWait(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromMilliseconds(20), .awake);
@@ -212,6 +223,7 @@ const Fixture = struct {
         http.router.get("/download", download);
         http.router.get("/bighead", bigHead);
         http.router.get("/fields", fields);
+        http.router.get("/hold", holdHandler);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -617,6 +629,37 @@ test "h3 server: hq_interop_root is refused outside the interop runner's program
         .key_pem = pem.key,
         .hq_interop_root = ".",
     }));
+}
+
+test "h3 server: requests the client cancels keep their stream credit until their handlers end" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    holding_peak.store(0, .monotonic);
+
+    // Forty requests, each canceled once its handler has started: the
+    // server's limit is 8 streams at once, handlers included.
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..40) |_| try group.concurrent(io, struct {
+        fn one(cn: *client.ClientConnection, i: std.Io) std.Io.Cancelable!void {
+            const st = request(cn, "GET", "/hold", .{}) catch return;
+            try i.sleep(.fromMilliseconds(30), .awake);
+            st.release();
+        }
+    }.one, .{ conn, io });
+    try group.await(io);
+    try std.testing.expect(holding_peak.load(.monotonic) <= 8);
+
+    // The connection carries on once they are done.
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
 }
 
 test "h3 server: Response.abort resets the stream, and the connection carries on" {
