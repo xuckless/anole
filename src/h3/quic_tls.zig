@@ -67,7 +67,7 @@ pub const Context = struct {
         if (options.client_auth) |ca| {
             var ca_digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(ca.ca_der, &ca_digest, .{});
-            session_context = dusty_tls.clientAuthSessionContext("anole h3", @intFromEnum(ca.mode), ca_digest);
+            session_context = dusty_tls.clientAuthSessionContext("anole h3", @backingInt(ca.mode), ca_digest);
             if (c.SSL_CTX_set_session_id_context(ctx, &session_context, session_context.len) != 1) return error.OutOfMemory;
         } else {
             const sid_ctx = "anole h3";

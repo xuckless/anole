@@ -340,7 +340,7 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
         // verified again, so one from before the client CAs changed (a
         // reload) must not resume.
         const ca_digest = if (ca.trust) |t| t.digest else digestOf(ca.root_ca.bytes.items);
-        const sid_ctx = clientAuthSessionContext("anole tcp", @intFromEnum(ca.auth_type), ca_digest);
+        const sid_ctx = clientAuthSessionContext("anole tcp", @backingInt(ca.auth_type), ca_digest);
         if (c.SSL_set_session_id_context(ssl, &sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
         // The CertificateRequest also names the acceptable CAs, so a client
         // holding several certificates can pick the right one.

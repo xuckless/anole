@@ -96,11 +96,13 @@ pub fn main(init: std.process.Init) !void {
     const otlp_endpoint = init.environ_map.get("OTEL_EXPORTER_OTLP_ENDPOINT") orelse "http://127.0.0.1:4318";
 
     var app: App = .{ .port = port, .lookups = undefined, .maintenance_gauge = undefined };
-    var server = try anole.Server(App).init(init.gpa, .{ .listeners = &.{
-        .{ .name = "public", .address = "127.0.0.1", .port = port },
-        // Operators only: loopback (or a private interface), never public.
-        .{ .name = "admin", .address = "127.0.0.1", .port = port + 1 },
-    } }, &app);
+    var server = try anole.Server(App).init(init.gpa, .{
+        .listeners = &.{
+            .{ .name = "public", .address = "127.0.0.1", .port = port },
+            // Operators only: loopback (or a private interface), never public.
+            .{ .name = "admin", .address = "127.0.0.1", .port = port + 1 },
+        },
+    }, &app);
     defer server.deinit();
 
     // Order matters only for what runs first: the IDs are set before the

@@ -31,7 +31,7 @@ const max_chunks = 4096;
 const State = enum(u32) { free, open };
 
 fn pack(gen: u32, state: State) u64 {
-    return (@as(u64, gen) << 32) | @intFromEnum(state);
+    return (@as(u64, gen) << 32) | @backingInt(state);
 }
 
 const OutMsg = struct {
@@ -202,7 +202,7 @@ fn onMessage(_: ?*anyopaque, sock: *Socket, msg: websocket.Message) anyerror!voi
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     const ev: *abi.WsMessageEvent = @ptrCast(rec.ptr);
     ev.* = .{
-        .ev = .{ .type = @intFromEnum(abi.EventType.ws_message), .len = @intCast(n), .handle = s.handle(s.gen()) },
+        .ev = .{ .type = @backingInt(abi.EventType.ws_message), .len = @intCast(n), .handle = s.handle(s.gen()) },
         .route_id = s.route.id,
         .type = if (msg.type == .text) @intCast(abi.WS_TEXT) else @intCast(abi.WS_BINARY),
         .data = .{ .off = @sizeOf(abi.WsMessageEvent), .len = @intCast(msg.data.len) },
@@ -242,7 +242,7 @@ fn onClose(_: ?*anyopaque, sock: *Socket) void {
     sock.context = null;
     s.socket = null;
 
-    const code: u16 = if (sock.close_code) |c| @intFromEnum(c) else if (sock.end_error != null) 1006 else 1005;
+    const code: u16 = if (sock.close_code) |c| @backingInt(c) else if (sock.end_error != null) 1006 else 1005;
     if (newRecord(@sizeOf(abi.WsCloseEvent), .ws_close, s.handle(g))) |rec| {
         const ev: *abi.WsCloseEvent = @ptrCast(rec.ptr);
         ev.route_id = s.route.id;
@@ -259,7 +259,7 @@ fn newRecord(size: usize, typ: abi.EventType, h: u64) ![]align(8) u8 {
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     @memset(rec, 0);
     const ev: *abi.Event = @ptrCast(rec.ptr);
-    ev.* = .{ .type = @intFromEnum(typ), .len = @intCast(n), .handle = h };
+    ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = h };
     return rec;
 }
 
@@ -322,7 +322,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
             sent += m.data.len;
             if (m.owned) gpa.free(m.data) else x.postSent(s.handle(g), m.data);
         }
-        if (close_code) |c| sock.close(@enumFromInt(c), reason) catch {};
+        if (close_code) |c| sock.close(@fromBackingInt(@intCast(c)), reason) catch {};
         s.acquire();
         s.bytes -|= sent;
         const drained = s.want_event and s.bytes <= high / 2;

@@ -89,13 +89,13 @@ pub const SlotState = enum(u32) {
 };
 
 fn pack(gen: u32, state: SlotState) u64 {
-    return (@as(u64, gen) << 32) | @intFromEnum(state);
+    return (@as(u64, gen) << 32) | @backingInt(state);
 }
 fn genOf(word: u64) u32 {
     return @intCast(word >> 32);
 }
 fn stateOf(word: u64) SlotState {
-    return @enumFromInt(@as(u32, @truncate(word)));
+    return @fromBackingInt(@intCast(@as(u32, @truncate(word))));
 }
 
 /// A handle as the consumer sees it: which executor, which slot, which
@@ -288,7 +288,7 @@ fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     @memset(rec[@sizeOf(abi.Event)..], 0);
     const ev: *abi.Event = @ptrCast(rec.ptr);
-    ev.* = .{ .type = @intFromEnum(typ), .len = @intCast(n), .handle = handle };
+    ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = handle };
     return rec;
 }
 
@@ -1816,7 +1816,7 @@ pub const Head = struct {
         @memset(out[pos..size_], 0);
         const rec: *align(1) abi.RequestEvent = @ptrCast(out.ptr);
         rec.* = .{
-            .ev = .{ .type = @intFromEnum(typ), .len = @intCast(size_), .handle = handle },
+            .ev = .{ .type = @backingInt(typ), .len = @intCast(size_), .handle = handle },
             .route_id = h.route_id,
             .method = methodCode(req.method),
             .version = req.version_major * 10 + req.version_minor,
@@ -1924,7 +1924,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
         if (e.phase.load(.acquire) == .stopped and !c.stopped_sent) {
             if (out.len < @sizeOf(abi.Event)) return error.TooBig;
             const hdr: *align(1) abi.Event = @ptrCast(out.ptr);
-            hdr.* = .{ .type = @intFromEnum(abi.EventType.stopped), .len = @sizeOf(abi.Event), .handle = 0 };
+            hdr.* = .{ .type = @backingInt(abi.EventType.stopped), .len = @sizeOf(abi.Event), .handle = 0 };
             c.stopped_sent = true;
             return @sizeOf(abi.Event);
         }

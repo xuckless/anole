@@ -1295,9 +1295,9 @@ pub fn Engine(comptime Ctx: type) type {
                     response.content_type = .text;
                     response.body = "413 Content Too Large\n";
                     {
-                    try response.write();
-                    return .done;
-                }
+                        try response.write();
+                        return .done;
+                    }
                 };
             }
             server.applyForwarded(request, conn.connection);
@@ -1308,9 +1308,9 @@ pub fn Engine(comptime Ctx: type) type {
                 } else {
                     response.status = .expectation_failed;
                     {
-                    try response.write();
-                    return .done;
-                }
+                        try response.write();
+                        return .done;
+                    }
                 }
             }
 

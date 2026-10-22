@@ -2368,9 +2368,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                     if (s.protocol.len == 0) {
                         response.status = .not_implemented;
                         {
-                        try response.write();
-                        return .done;
-                    }
+                            try response.write();
+                            return .done;
+                        }
                     }
                     // An extended CONNECT (RFC 9220; nghttp3 has checked
                     // its pseudo-headers) is routed as the GET that the
@@ -2436,9 +2436,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                         response.content_type = .text;
                         response.body = "413 Content Too Large\n";
                         {
-                        try response.write();
-                        return .done;
-                    }
+                            try response.write();
+                            return .done;
+                        }
                     };
                 }
                 // Where the client is now: a migration moves it.
@@ -2458,9 +2458,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                     } else {
                         response.status = .expectation_failed;
                         {
-                        try response.write();
-                        return .done;
-                    }
+                            try response.write();
+                            return .done;
+                        }
                     }
                 }
 
@@ -2480,7 +2480,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 try response.write();
                 return .done;
             }
-
 
             /// Every byte of the response body is in the ring and handed
             /// to nghttp3. Locked.
