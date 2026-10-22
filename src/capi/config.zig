@@ -163,7 +163,9 @@ pub const Config = struct {
         window_ms: i64 = 60_000,
         /// How many at once; 0 means `limit`.
         burst: u32 = 0,
-        /// "ip" (the client's address) or "header:<name>".
+        /// "ip" (the client's address) or "header:<name>": the header's raw
+        /// value, unverified, so only for a header a trusted proxy sets to a
+        /// verified identity (a client that varies it gets a fresh limit).
         key: []const u8 = "ip",
         /// Keys remembered at most (least recently used out first).
         max_entries: u32 = 10_000,

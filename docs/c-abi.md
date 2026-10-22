@@ -230,6 +230,12 @@ here and runs on Anole's threads:
   provider), since a provider's keys also sign tokens for its other
   clients; `allow_any_audience: true` is only for keys that sign for this
   application alone. The configuration is refused otherwise.
+- `rate_limit` keys on the client's address (`"key": "ip"`, IPv6 clients
+  by their /64) or on a header's raw value (`"header:<name>"`). The header
+  is taken as the client sent it, unverified: a client that varies it gets
+  a fresh limit each time. Use `header:` only when a proxy in front sets
+  that header to a verified identity and overwrites any the client sent.
+  Requests without the header share one limit.
 - `cache` keeps GET answers per executor (the response cache) and serves
   hits without reaching the consumer.
 - `no_wait: false` gives each request a task (for comparisons).

@@ -573,7 +573,7 @@
                 "key": {
                   "type": "string",
                   "pattern": "^(ip|header:.+)$",
-                  "description": "\"ip\" or \"header:<name>\"."
+                  "description": "\"ip\" (the client's address) or \"header:<name>\" (the header's raw value, unverified: only for a header a trusted proxy sets to a verified identity, since a client that varies it gets a fresh limit each time)."
                 },
                 "max_entries": {
                   "type": "integer",
