@@ -112,6 +112,10 @@ pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;
 pub const WebSocketUpgradeOptions = @import("client.zig").WebSocketUpgradeOptions;
+pub const Redirect = @import("client.zig").Redirect;
+pub const RedirectAction = @import("client.zig").RedirectAction;
+pub const RedirectPolicy = @import("client.zig").RedirectPolicy;
+pub const isPrivateAddress = @import("client.zig").isPrivateAddress;
 
 test {
     std.testing.refAllDecls(@This());
@@ -125,6 +129,7 @@ comptime {
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");
+    _ = @import("client_redirect_test.zig");
     _ = @import("deadline.zig");
     _ = @import("cgroup.zig");
     _ = @import("somaxconn.zig");

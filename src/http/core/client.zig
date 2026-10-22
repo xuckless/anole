@@ -136,6 +136,55 @@ pub const ClientConfig = struct {
     /// connection on which the server picks h2 carries one request at a time
     /// and is pooled like an HTTP/1.1 one. Defaults off.
     http2: bool = false,
+    /// Decides every redirect before it is followed (within
+    /// `max_redirects`). Without one, redirects are followed, except one
+    /// that would send the request's body (a 307 or 308) to another host,
+    /// or to the same host over plain http from https: that response is
+    /// returned as it is.
+    check_redirect: ?RedirectPolicy = null,
+    /// Refuse to talk to loopback, private, link-local (cloud metadata
+    /// among them), shared, multicast and unspecified addresses, IPv4 and
+    /// IPv6: `fetch` fails with `error.AddressNotAllowed` after the TCP
+    /// connect, before any byte is sent, on the first hop and on every
+    /// redirect. For clients that fetch URLs from untrusted input. Checks
+    /// the address actually connected to, so a name that resolves to such
+    /// an address is refused too. Unix sockets are not checked.
+    deny_private_addresses: bool = false,
+};
+
+/// A redirect about to be followed, as `RedirectPolicy.check` sees it.
+pub const Redirect = struct {
+    /// 301, 302, 303, 307 or 308.
+    status: u16,
+    /// The URL that answered with the redirect.
+    from: Uri,
+    /// Where the redirect points, resolved against `from`.
+    to: Uri,
+    /// The next request's method and whether it carries a body, after the
+    /// change 301, 302 and 303 make to non-GET requests.
+    method: Method,
+    has_body: bool,
+    /// Redirects already followed.
+    hops: u8,
+    /// `to` has another scheme, host or port than `from`.
+    cross_origin: bool,
+};
+
+/// What to do with a redirect.
+pub const RedirectAction = enum {
+    /// Follow it.
+    follow,
+    /// Return the redirect response itself.
+    stop,
+    /// Fail the fetch with `error.RedirectRefused`.
+    fail,
+};
+
+/// `ClientConfig.check_redirect`: `check(context, redirect)` decides each
+/// redirect. It runs on the fetching task and must not block.
+pub const RedirectPolicy = struct {
+    context: ?*anyopaque = null,
+    check: *const fn (context: ?*anyopaque, redirect: *const Redirect) RedirectAction,
 };
 
 /// TLS settings for the HTTP client.
@@ -1143,13 +1192,30 @@ pub const Client = struct {
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
         // Pinned here, so every redirect and the body share one budget.
         const deadline: Deadline = .init(self.io, options.timeout orelse self.defaultTimeout());
-        return deadline.run(fetchInternal, .{ self, FetchState{
+        return deadline.run(fetchFollowing, .{ self, FetchState{
             .uri = uri,
             .port = info.port,
             .protocol = info.protocol,
             .options = options,
             .redirects_remaining = max_redirects,
         } });
+    }
+
+    /// One request per hop, in a loop rather than a call per redirect, so
+    /// the stack does not grow with `max_redirects`. A hop's URL and
+    /// Referer live in `hops`, the two sets taking turns: the next hop
+    /// reads the last one's while it writes its own.
+    fn fetchFollowing(self: *Client, first: FetchState) !ClientResponse {
+        var hops: [2]HopBuffers = undefined;
+        var initial_host: [255]u8 = undefined;
+        var state = first;
+        var turn: u1 = 0;
+        while (true) : (turn +%= 1) {
+            switch (try self.fetchInternal(state, &hops[turn], &initial_host)) {
+                .done => |response| return response,
+                .next => |next| state = next,
+            }
+        }
     }
 
     fn defaultTimeout(self: *const Client) std.Io.Timeout {
@@ -1195,6 +1261,8 @@ pub const Client = struct {
             break :tcp try addr.connect(self.io, .{ .mode = .stream });
         } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
         errdefer stream.close(self.io);
+        if (self.config.deny_private_addresses and unix_socket_path == null and isPrivateAddress(stream.socket.address))
+            return error.AddressNotAllowed;
 
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
@@ -1295,7 +1363,7 @@ pub const Client = struct {
         return .{ .ws = ws, .conn = conn };
     }
 
-    fn fetchInternal(self: *Client, state: FetchState) !ClientResponse {
+    fn fetchInternal(self: *Client, state: FetchState, bufs: *HopBuffers, initial_host_buf: *[255]u8) !Hop {
         var host_buffer: [255]u8 = undefined;
         const host = try uriHost(state.uri, &host_buffer);
 
@@ -1344,15 +1412,60 @@ pub const Client = struct {
 
         // Check for redirects
         const status_code = @backingInt(conn.parsed_response.status);
-        if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) {
+        if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) redirect: {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
-                var resolve_buf: [2048]u8 = undefined;
-                if (location.len > resolve_buf.len) return error.InvalidUrl;
-                @memcpy(resolve_buf[0..location.len], location);
-                var aux_buf: []u8 = resolve_buf[0..];
+                if (location.len > bufs.resolve.len) return error.InvalidUrl;
+                @memcpy(bufs.resolve[0..location.len], location);
+                var aux_buf: []u8 = bufs.resolve[0..];
                 const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
                 const redirect_info = try uriPortAndProtocol(redirect_uri);
+                try checkRequestTarget(redirect_uri);
+
+                // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
+                // QUERY keeps its method and body on 301/302 (RFC 10008, Section 2.5).
+                // 307/308 preserve the original method and body.
+                var redirect_options = state.options;
+                if (status_code == 301 or status_code == 302 or status_code == 303) {
+                    const method = redirect_options.method;
+                    const keeps_method = method == .get or method == .head or
+                        (method == .query and status_code != 303);
+                    if (!keeps_method) {
+                        redirect_options.method = .get;
+                        redirect_options.body = null;
+                    } else if (status_code == 303) {
+                        redirect_options.body = null;
+                    }
+                }
+
+                var redirect_host_buffer: [255]u8 = undefined;
+                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
+                const same_origin = redirect_info.protocol == state.protocol and redirect_info.port == state.port and
+                    std.ascii.eqlIgnoreCase(redirect_host, host);
+
+                // Whether to follow it: the policy hook decides when there is
+                // one. Without one, a body goes only to the same host (or the
+                // same host over https); a redirect that would carry it
+                // elsewhere is returned as the response.
+                const action: RedirectAction = if (self.config.check_redirect) |policy|
+                    policy.check(policy.context, &.{
+                        .status = @intCast(status_code),
+                        .from = state.uri,
+                        .to = redirect_uri,
+                        .method = redirect_options.method,
+                        .has_body = redirect_options.body != null,
+                        .hops = (state.options.max_redirects orelse self.config.max_redirects) -| state.redirects_remaining,
+                        .cross_origin = !same_origin,
+                    })
+                else if (redirect_options.body != null and !sameHostOrUpgrade(state.protocol, state.port, host, redirect_info.protocol, redirect_info.port, redirect_host))
+                    .stop
+                else
+                    .follow;
+                switch (action) {
+                    .follow => {},
+                    .stop => break :redirect,
+                    .fail => return error.RedirectRefused,
+                }
 
                 if (!conn.parser.shouldKeepAlive() or self.pool.max_idle == 0) conn.closing = true;
 
@@ -1375,29 +1488,15 @@ pub const Client = struct {
                 self.pool.release(conn);
                 conn_released = true;
 
-                // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
-                // QUERY keeps its method and body on 301/302 (RFC 10008, Section 2.5).
-                // 307/308 preserve the original method and body.
-                var redirect_options = state.options;
-                if (status_code == 301 or status_code == 302 or status_code == 303) {
-                    const method = redirect_options.method;
-                    const keeps_method = method == .get or method == .head or
-                        (method == .query and status_code != 303);
-                    if (!keeps_method) {
-                        redirect_options.method = .get;
-                        redirect_options.body = null;
-                    } else if (status_code == 303) {
-                        redirect_options.body = null;
-                    }
-                }
-
                 // Strip sensitive headers when:
                 //   - already stripping from a previous hop, OR
                 //   - crossing to a different domain/host (same-domain and subdomain keep headers), OR
                 //   - downgrading from https to http (credentials would travel in plaintext).
-                var redirect_host_buffer: [255]u8 = undefined;
-                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
-                const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
+                // The first hop's host is kept for the hops after it.
+                const effective_initial_host = if (state.initial_host.len == 0) blk: {
+                    @memcpy(initial_host_buf[0..host.len], host);
+                    break :blk initial_host_buf[0..host.len];
+                } else state.initial_host;
                 const redirect_strip_sensitive = state.strip_sensitive_headers or
                     !isDomainOrSubdomain(redirect_host, effective_initial_host) or
                     (state.protocol == .https and redirect_info.protocol == .http);
@@ -1405,29 +1504,31 @@ pub const Client = struct {
                 // Strip body-related headers when there is no body to send.
                 const redirect_strip_body = redirect_options.body == null;
 
-                // Compute Referer for the next hop (RFC 7231 §5.5.2).
-                // Don't send Referer when downgrading https→http (would leak in plaintext).
-                // If the user already set a Referer header, forward it as-is.
-                var referer_buf: [2048]u8 = undefined;
+                // Compute Referer for the next hop, as browsers' default
+                // policy (strict-origin-when-cross-origin) does: the whole
+                // URL within one origin, only the origin across origins, and
+                // none on a downgrade from https to http. If the user already
+                // set a Referer header, forward it as-is.
                 const redirect_referer: ?[]const u8 = blk: {
                     if (state.protocol == .https and redirect_info.protocol == .http) break :blk null;
                     if (redirect_options.headers) |h| {
                         if (h.get("Referer")) |existing| break :blk existing;
                     }
-                    var w = std.Io.Writer.fixed(&referer_buf);
+                    var w = std.Io.Writer.fixed(&bufs.referer);
                     state.uri.writeToStream(&w, .{
                         .scheme = true,
                         .authority = true,
                         .authentication = false, // strip userinfo — never leak credentials in Referer
-                        .path = true,
-                        .query = true,
+                        .path = same_origin,
+                        .query = same_origin,
                         .fragment = false, // strip fragment — not sent to servers per RFC 7231
                         .port = true,
                     }) catch break :blk null;
+                    if (!same_origin) w.writeByte('/') catch break :blk null;
                     break :blk w.buffered();
                 };
 
-                return self.fetchInternal(.{
+                return .{ .next = .{
                     .uri = redirect_uri,
                     .port = redirect_info.port,
                     .protocol = redirect_info.protocol,
@@ -1437,7 +1538,7 @@ pub const Client = struct {
                     .strip_sensitive_headers = redirect_strip_sensitive,
                     .strip_body_headers = redirect_strip_body,
                     .referer = redirect_referer,
-                });
+                } };
             }
         }
 
@@ -1455,7 +1556,7 @@ pub const Client = struct {
         // Under the request's deadline, which ends with this call. A body
         // left on the wire is the caller's to read, on the caller's time.
         if (!state.options.stream) _ = try response.body();
-        return response;
+        return .{ .done = response };
     }
 
     /// Writes the request on `conn` and reads the response head. `lost` is
@@ -1616,6 +1717,66 @@ fn isReplayable(options: FetchOptions) bool {
     }
     const headers = options.headers orelse return false;
     return headers.get("Idempotency-Key") != null or headers.get("X-Idempotency-Key") != null;
+}
+
+/// Whether `address` is one `deny_private_addresses` refuses: anything
+/// but a global unicast address. IPv4 inside IPv6 (mapped, compatible,
+/// NAT64, 6to4) is judged by its IPv4 address.
+pub fn isPrivateAddress(address: std.Io.net.IpAddress) bool {
+    switch (address) {
+        .ip4 => |a| return isPrivateIp4(a.bytes),
+        .ip6 => |a| {
+            const b = a.bytes;
+            const zero10 = std.mem.allEqual(u8, b[0..10], 0);
+            // ::ffff:a.b.c.d and the deprecated ::a.b.c.d (which covers ::
+            // and ::1).
+            if (zero10 and ((b[10] == 0xff and b[11] == 0xff) or (b[10] == 0 and b[11] == 0)))
+                return isPrivateIp4(b[12..16].*);
+            // 64:ff9b::/96, NAT64.
+            if (std.mem.eql(u8, b[0..12], &.{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 })) return isPrivateIp4(b[12..16].*);
+            // 2002::/16, 6to4.
+            if (b[0] == 0x20 and b[1] == 0x02) return isPrivateIp4(b[2..6].*);
+            // fc00::/7 unique local, fe80::/10 link-local, fec0::/10
+            // site-local, ff00::/8 multicast.
+            if (b[0] & 0xfe == 0xfc) return true;
+            if (b[0] == 0xfe and b[1] & 0x80 != 0) return true;
+            if (b[0] == 0xff) return true;
+            return false;
+        },
+    }
+}
+
+fn isPrivateIp4(b: [4]u8) bool {
+    return switch (b[0]) {
+        0, 10, 127 => true, // this network, private, loopback
+        100 => b[1] & 0xc0 == 64, // 100.64.0.0/10, shared (CGN)
+        169 => b[1] == 254, // link-local, cloud metadata
+        172 => b[1] & 0xf0 == 16, // 172.16.0.0/12
+        192 => (b[1] == 168) or (b[1] == 0 and b[2] == 0), // 192.168.0.0/16, 192.0.0.0/24
+        198 => b[1] & 0xfe == 18, // 198.18.0.0/15, benchmarking
+        else => b[0] >= 224, // multicast, reserved, broadcast
+    };
+}
+
+/// What one hop of `fetch` came to: the response, or the redirect to follow.
+const Hop = union(enum) {
+    done: ClientResponse,
+    next: FetchState,
+};
+
+/// Where a hop resolves its redirect's URL and writes the Referer for the
+/// next one.
+const HopBuffers = struct {
+    resolve: [2048]u8,
+    referer: [2048]u8,
+};
+
+/// Whether a redirect keeps the request's body on one host: the same
+/// scheme and port, or the same host moving from http to https.
+fn sameHostOrUpgrade(from: Protocol, from_port: u16, from_host: []const u8, to: Protocol, to_port: u16, to_host: []const u8) bool {
+    if (!std.ascii.eqlIgnoreCase(from_host, to_host)) return false;
+    if (from == to) return from_port == to_port;
+    return from == .http and to == .https;
 }
 
 const FetchState = struct {

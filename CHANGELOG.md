@@ -22,6 +22,14 @@ breaking changes are listed anyway.
   `fetch`, redirects, WebSocket upgrades and HTTP/2 alike, instead of being
   written into the request line. Percent-encode such bytes; URLs that
   carried raw UTF-8 now fail (breaking).
+- HTTP client redirects: across origins the `Referer` is only the origin
+  (browsers' default policy); a 307 or 308 that would carry the body to
+  another host is not followed, and its response is returned (breaking for
+  callers that relied on it; `ClientConfig.check_redirect` can allow it).
+  New: `ClientConfig.check_redirect` (follow, stop or fail each redirect)
+  and `ClientConfig.deny_private_addresses` (refuse loopback, private,
+  link-local and similar addresses, after DNS, on every hop). Redirects are
+  followed in a loop, so the stack no longer grows with `max_redirects`.
 
 ### C ABI (ABI 0.1)
 

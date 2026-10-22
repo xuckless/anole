@@ -104,6 +104,35 @@ byte past 0x7f in either fails the request with `error.InvalidUrl`, and so
 does a redirect to such a URL. Build query strings from data with
 `std.Uri.Component.percentEncode` or an equivalent, never by pasting it in.
 
+### Redirects
+
+`fetch` follows up to `max_redirects` (10) redirects: 301, 302, 303, 307 and
+308. 301, 302 and 303 turn a request other than GET and HEAD into a GET
+without a body (QUERY keeps both on 301 and 302); 307 and 308 keep the
+method and body. Along the way:
+
+- `Authorization`, `Cookie` and the proxy credentials are dropped once a
+  redirect leaves the first host and its subdomains, or goes from https to
+  http.
+- The `Referer` is the previous URL within one origin, only its origin
+  (`https://host/`) across origins, and none from https to http, as
+  browsers do by default. One you set yourself is sent as it is.
+- A body follows a 307 or 308 only to the same host (or from http to https
+  on it). A redirect that would take it elsewhere is not followed: `fetch`
+  returns the 307 or 308 response.
+
+`ClientConfig.check_redirect` replaces that last rule with your own: a
+function that sees each redirect (`status`, `from`, `to`, `method`,
+`has_body`, `hops`, `cross_origin`) and returns `.follow`, `.stop` (return
+the redirect response) or `.fail` (`error.RedirectRefused`).
+
+For a client that fetches URLs from untrusted input (webhooks, link
+previews), set `ClientConfig.deny_private_addresses = true`. It refuses
+loopback, private, link-local (cloud metadata included), shared, multicast
+and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
+The check is on the address the connection reached, after DNS, on every
+hop, before any byte of the request is sent.
+
 `ClientConfig.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
 ALPN on HTTPS connections. A server that picks it gets the request over
 HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
