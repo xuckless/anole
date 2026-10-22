@@ -294,8 +294,20 @@ var rs: anole.session.RedisStore = .{ .client = redis, .gpa = gpa }; // keys "an
 var sessions = try anole.session.Middleware.init(.{ .store = rs.store() });
 ```
 
-A store is a vtable of `load`, `save` and `destroy` (`anole.session.Store`),
-so you can bring your own.
+`MemoryStore` sweeps expired sessions as new ones are written and keeps at
+most `max_entries` (100,000; `MemoryStore.initOptions(gpa, io, .{
+.max_entries = n })`): past it, the session written longest ago is dropped,
+with a warning in the log.
+
+A store is a vtable of `load`, `save`, `destroy`, `update` and `touch`
+(`anole.session.Store`), so you can bring your own. After the handler, the
+middleware writes a session the request changed with `update`, and renews
+one it only read with `touch`; both must do nothing and return false when
+the session no longer exists (Redis `SET ... XX` and `EXPIRE`). That way a
+request still running when the user logged out, or when another request
+called `regenerate`, cannot bring the old session back. A store without
+`update` or `touch` gets `load` followed by `save`, which leaves a short
+window for that.
 
 ### A new session at sign-in
 

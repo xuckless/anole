@@ -27,6 +27,17 @@ breaking changes are listed anyway.
   renewed while the session is in use), and the signature covers the
   cookie's name. Cookies signed before this release are no longer accepted
   (users sign in again); no configuration change needed.
+- Server-side sessions: a request that loaded a session before it was
+  destroyed (a logout, `regenerate` from another request) no longer writes
+  it back when it ends. The middleware now writes a session only when the
+  request changed it, and only if it still exists (`Store.update`, Redis
+  `SET ... XX`), and renews an unchanged one with `Store.touch` (Redis
+  `EXPIRE`). `Store.VTable` has the two new optional entries; a custom store
+  without them falls back to `load` + `save`, so implement them.
+- `MemoryStore` sweeps expired sessions as new ones are written, and holds
+  at most `max_entries` (100,000 by default, `MemoryStore.initOptions`);
+  before, sessions created and never seen again (anonymous visitors, CSRF
+  tokens on a login form) stayed in memory for good.
 
 ### C ABI (ABI 0.1)
 
