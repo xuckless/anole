@@ -65,10 +65,16 @@ static void sleep_ms(int ms) {
   nanosleep(&ts, NULL);
 }
 
-static void on_log(void *ud, int level, anole_str scope, anole_str msg) {
+/* The bound TCP port of listener i. */
+static uint16_t port_of(anole_server *s, uint32_t i) {
+  anole_listener_info info = {sizeof info};
+  return anole_server_listener(s, i, &info) == ANOLE_OK ? info.port : 0;
+}
+
+static void on_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
   (void)ud;
   if (level <= ANOLE_LOG_WARN || getenv("CAPI_LOG"))
-    fprintf(stderr, "[%d %.*s] %.*s\n", level, (int)scope.len, scope.ptr, (int)msg.len, msg.ptr);
+    fprintf(stderr, "[%u %.*s] %.*s\n", level, (int)scope.len, scope.ptr, (int)msg.len, msg.ptr);
 }
 
 /* ---- the consumer -------------------------------------------------------------- */
@@ -115,7 +121,7 @@ static void drop(anole_grpc_call c) {
 }
 
 static anole_str md_of(const anole_grpc_call_event *ev, const char *name) {
-  const anole_span *sp = (const anole_span *)(ev + 1);
+  const anole_span *sp = anole_grpc_metadata((const anole_grpc_call_event *)ev);
   for (uint16_t i = 0; i < ev->nmetadata; i++) {
     anole_str k = anole_event_str(ev, sp[2 * i]);
     if (k.len == strlen(name) && memcmp(k.ptr, name, k.len) == 0) return anole_event_str(ev, sp[2 * i + 1]);
@@ -141,7 +147,7 @@ static void pump_busy(call_state *st) {
       return; /* ANOLE_EV_WRITABLE comes */
     }
   }
-  CHECK(anole_grpc_finish(st->call, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_OK);
+  CHECK(anole_grpc_finish(st->call, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_OK);
   drop(st->call);
 }
 
@@ -155,14 +161,14 @@ static void on_call(const anole_grpc_call_event *ev) {
   CHECK(ev->protocol == (ev->version == 20 ? ANOLE_GRPC_PROTOCOL_GRPC : ANOLE_GRPC_PROTOCOL_GRPC_WEB));
   switch (ev->method_id) {
     case M_UNARY: {
-      CHECK(is(method, "/anole.test.Echo/Unary") && ev->kind == ANOLE_GRPC_UNARY);
+      CHECK(is(method, "/anole.test.Echo/Unary") && ev->kind == ANOLE_GRPC_KIND_UNARY);
       CHECK(ev->flags & ANOLE_GRPC_CALL_MESSAGE);
       /* The protocols' own headers are not metadata. */
       CHECK(md_of(ev, "content-type").ptr == NULL && md_of(ev, "te").ptr == NULL);
       CHECK(ev->version == 20 || md_of(ev, "x-grpc-web").len == 1);
       if (is(msg, "fail")) {
         anole_header t[2] = {{S("x-why"), S("test")}, {S("x-raw-bin"), {"\x00\x01\xff", 3}}};
-        CHECK(anole_grpc_finish(c, ANOLE_GRPC_NOT_FOUND, S("no such thing"), t, 2) == ANOLE_OK);
+        CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_NOT_FOUND, S("no such thing"), t, 2) == ANOLE_OK);
         return;
       }
       if (is(msg, "hold")) {
@@ -179,7 +185,7 @@ static void on_call(const anole_grpc_call_event *ev) {
         anole_header ctl[1] = {{S("x-a"), S("line\r\nbreak")}};
         CHECK(anole_grpc_send_headers(c, ctl, 1) == ANOLE_E_INVALID);
         /* OK without the message: refused for a unary call. */
-        CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_E_STATE);
+        CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_E_STATE);
         CHECK(anole_grpc_read(c, 1) == ANOLE_E_STATE);
         anole_header h[1] = {{S("x-initial"), S("yes")}};
         CHECK(anole_grpc_send_headers(c, h, 1) == ANOLE_OK);
@@ -190,16 +196,16 @@ static void on_call(const anole_grpc_call_event *ev) {
         CHECK(anole_grpc_send(c, "again", 5, 0) == ANOLE_E_STATE);
         anole_str trace = md_of(ev, "x-trace");
         anole_header t[1] = {{S("x-echoed"), trace}};
-        CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), t, 1) == ANOLE_OK);
-        CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_E_GONE);
+        CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), t, 1) == ANOLE_OK);
+        CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_E_GONE);
         return;
       }
       /* Echo, borrowed: ANOLE_EV_SENT is not awaited (the record outlives the call here). */
-      CHECK(anole_grpc_send(c, msg.ptr, msg.len, ANOLE_GRPC_SEND_FINISH) == ANOLE_OK);
+      CHECK(anole_grpc_send(c, msg.ptr, msg.len, ANOLE_GRPC_F_FINISH) == ANOLE_OK);
       return;
     }
     case M_SERVER: {
-      CHECK(ev->kind == ANOLE_GRPC_SERVER_STREAMING);
+      CHECK(ev->kind == ANOLE_GRPC_KIND_SERVER_STREAMING);
       if (is(msg, "busy")) {
         call_state *st = state_of(c, 1);
         st->busy = 1;
@@ -221,7 +227,7 @@ static void on_call(const anole_grpc_call_event *ev) {
         static char kb[1024];
         memset(kb, 'w', sizeof kb);
         for (int i = 0; i < 64; i++) CHECK(anole_grpc_send_wait(c, kb, sizeof kb, 5000) == ANOLE_OK);
-        CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_OK);
+        CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_OK);
         return;
       }
       int n = 0;
@@ -229,10 +235,10 @@ static void on_call(const anole_grpc_call_event *ev) {
       for (int i = 0; i < n; i++) {
         char m[32];
         int k = snprintf(m, sizeof m, "tick%d", i);
-        anole_status r = anole_grpc_send(c, m, (size_t)k, i == n - 1 ? ANOLE_GRPC_SEND_FINISH : 0);
+        anole_status r = anole_grpc_send(c, m, (size_t)k, i == n - 1 ? ANOLE_GRPC_F_FINISH : 0);
         CHECK(r == ANOLE_OK || r == ANOLE_BUSY);
       }
-      if (n == 0) CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_OK);
+      if (n == 0) CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_OK);
       return;
     }
     case M_CLIENT:
@@ -270,9 +276,9 @@ static void on_half_close(anole_grpc_call c) {
   if (st->kind == M_CLIENT) {
     CHECK(anole_grpc_send(c, st->acc, st->acc_len, 0) == ANOLE_OK);
     anole_header t[1] = {{S("x-count"), S("done")}};
-    CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), t, 1) == ANOLE_OK);
+    CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), t, 1) == ANOLE_OK);
   } else {
-    CHECK(anole_grpc_finish(c, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_OK);
+    CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_OK);
   }
   drop(c);
 }
@@ -547,13 +553,13 @@ int main(void) {
   anole_server_options o = {sizeof o, {json, strlen(json)}, 0, 0, on_log, NULL};
   anole_server *s = NULL;
   CHECK(anole_server_create(&o, &s) == ANOLE_OK);
-  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_SHARED};
+  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
   CHECK(anole_consumer_attach(s, &co, &consumer) == ANOLE_OK);
   /* Health before start: kept until the service exists. */
   CHECK(anole_grpc_health_set(s, S("later.Service"), ANOLE_GRPC_HEALTH_NOT_SERVING) == ANOLE_OK);
   CHECK(anole_grpc_health_set(s, S("x"), 7) == ANOLE_E_INVALID);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  CHECK(anole_server_port(s, 0, &port) == ANOLE_OK);
+  port = port_of(s, 0); CHECK(port != 0);
   pthread_t t;
   CHECK(pthread_create(&t, NULL, consumer_main, NULL) == 0);
   reply *r = malloc(sizeof *r);
@@ -640,7 +646,7 @@ int main(void) {
     long long us = atomic_load(&held_timeout_us);
     CHECK(us > 0 && us <= 200000);
     wait_for(&last_abort, h);
-    CHECK(anole_grpc_send(h, "late", 4, ANOLE_GRPC_SEND_FINISH) == ANOLE_E_GONE);
+    CHECK(anole_grpc_send(h, "late", 4, ANOLE_GRPC_F_FINISH) == ANOLE_E_GONE);
     printf("ok deadline\n");
   }
   /* A cancel: the client resets the stream (HTTP/2, cleartext; HTTP/1.1
@@ -654,7 +660,7 @@ int main(void) {
     CHECK(atomic_load(&held_timeout_us) == -1);
     h2_frame(fd, 3, 0, 1, "\x00\x00\x00\x08", 4); /* RST_STREAM, CANCEL */
     wait_for(&last_abort, h);
-    CHECK(anole_grpc_finish(h, ANOLE_GRPC_OK, S(""), NULL, 0) == ANOLE_E_GONE);
+    CHECK(anole_grpc_finish(h, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_E_GONE);
     close(fd);
     printf("ok cancel\n");
   }
@@ -682,8 +688,8 @@ int main(void) {
     printf("ok health\n");
   }
   /* Handles of another kind are not calls. */
-  CHECK(anole_grpc_finish(0, 0, S(""), NULL, 0) == ANOLE_E_GONE);
-  CHECK(anole_grpc_send(12345, "x", 1, 0) == ANOLE_E_GONE);
+  CHECK(anole_grpc_finish(0, 0, S(""), NULL, 0) == ANOLE_E_INVALID);
+  CHECK(anole_grpc_send(12345, "x", 1, 0) == ANOLE_E_INVALID);
   CHECK(anole_grpc_send(1, "x", 1, 64) == ANOLE_E_INVALID);
 
   free(r);

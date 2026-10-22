@@ -181,7 +181,7 @@ static void drop(anole_grpc_call c) {
 }
 
 static anole_str md_of(const anole_grpc_call_event *ev, const char *name) {
-  const anole_span *sp = (const anole_span *)(ev + 1);
+  const anole_span *sp = anole_grpc_metadata((const anole_grpc_call_event *)ev);
   for (uint16_t i = 0; i < ev->nmetadata; i++) {
     anole_str k = anole_event_str(ev, sp[2 * i]);
     if (k.len == strlen(name) && memcmp(k.ptr, name, k.len) == 0) return anole_event_str(ev, sp[2 * i + 1]);
@@ -266,7 +266,7 @@ static void on_call(const anole_grpc_call_event *ev) {
   switch (ev->method_id) {
     case EMPTY:
       ok_or_gone(anole_grpc_send(c, "", 0, 0));
-      finish(st, ANOLE_GRPC_OK, NULL, 0);
+      finish(st, ANOLE_GRPC_STATUS_OK, NULL, 0);
       return;
     case UNARY:
     case CACHEABLE: {
@@ -286,7 +286,7 @@ static void on_call(const anole_grpc_call_event *ev) {
         }
       }
       if (expect_compressed && !(ev->flags & ANOLE_GRPC_CALL_COMPRESSED)) {
-        finish(st, ANOLE_GRPC_INVALID_ARGUMENT, (const unsigned char *)"expected a compressed request", 29);
+        finish(st, ANOLE_GRPC_STATUS_INVALID_ARGUMENT, (const unsigned char *)"expected a compressed request", 29);
         return;
       }
       if (status.code != 0) {
@@ -295,18 +295,18 @@ static void on_call(const anole_grpc_call_event *ev) {
       }
       size_t n = payload_message(out_buf, size);
       ok_or_gone(anole_grpc_send(c, out_buf, n, 0));
-      finish(st, ANOLE_GRPC_OK, NULL, 0);
+      finish(st, ANOLE_GRPC_STATUS_OK, NULL, 0);
       return;
     }
     case STREAM_OUT:
-      if (stream_out(st, (const unsigned char *)msg.ptr, msg.len, 1)) finish(st, ANOLE_GRPC_OK, NULL, 0);
+      if (stream_out(st, (const unsigned char *)msg.ptr, msg.len, 1)) finish(st, ANOLE_GRPC_STATUS_OK, NULL, 0);
       return;
     case STREAM_IN:
     case FULL_DUPLEX:
     case HALF_DUPLEX:
       return; /* messages follow */
     default:
-      finish(st, ANOLE_GRPC_UNIMPLEMENTED, (const unsigned char *)"not implemented", 15);
+      finish(st, ANOLE_GRPC_STATUS_UNIMPLEMENTED, (const unsigned char *)"not implemented", 15);
       return;
   }
 }
@@ -356,7 +356,7 @@ static void on_half_close(anole_grpc_call c) {
       }
     }
   }
-  finish(st, ANOLE_GRPC_OK, NULL, 0);
+  finish(st, ANOLE_GRPC_STATUS_OK, NULL, 0);
 }
 
 int main(int argc, char **argv) {
@@ -384,7 +384,7 @@ int main(int argc, char **argv) {
   anole_server *s = NULL;
   CHECK(anole_server_create(&o, &s) == ANOLE_OK);
   anole_consumer *consumer = NULL;
-  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_SHARED};
+  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
   CHECK(anole_consumer_attach(s, &co, &consumer) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
   fprintf(stderr, "capi grpc interop server on 127.0.0.1:%s (%s)\n", argv[1], argc >= 4 ? "TLS" : "h2c");

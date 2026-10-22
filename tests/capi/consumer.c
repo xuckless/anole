@@ -50,11 +50,11 @@ static double now_ms(void) {
 }
 
 static atomic_int log_lines;
-static void on_log(void *ud, int level, anole_str scope, anole_str msg) {
+static void on_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
   (void)ud;
   atomic_fetch_add(&log_lines, 1);
   if (level <= ANOLE_LOG_WARN || getenv("CAPI_LOG"))
-    fprintf(stderr, "[%d %.*s] %.*s\n", level, (int)scope.len, scope.ptr, (int)msg.len, msg.ptr);
+    fprintf(stderr, "[%u %.*s] %.*s\n", level, (int)scope.len, scope.ptr, (int)msg.len, msg.ptr);
 }
 
 static anole_server *make_server(const char *json) {
@@ -62,6 +62,28 @@ static anole_server *make_server(const char *json) {
   anole_server *s = NULL;
   CHECK(anole_server_create(&o, &s) == ANOLE_OK);
   return s;
+}
+
+/* Whether anole_last_error_name() is `want`. */
+static int name_is(const char *want) {
+  anole_str n = anole_last_error_name();
+  return n.len == strlen(want) && memcmp(n.ptr, want, n.len) == 0;
+}
+
+/* The bound TCP port of listener i; i = the number of listeners: the HTTP/3
+   UDP port, when a listener serves it. 0 when there is none. */
+static uint16_t port_of(anole_server *s, uint32_t i) {
+  uint32_t n = anole_server_listener_count(s);
+  anole_listener_info info = {sizeof info};
+  if (i < n) {
+    CHECK(anole_server_listener(s, i, &info) == ANOLE_OK);
+    return info.port;
+  }
+  for (uint32_t k = 0; k < n; k++) {
+    CHECK(anole_server_listener(s, k, &info) == ANOLE_OK);
+    if (info.udp_port) return info.udp_port;
+  }
+  return 0;
 }
 
 /* ---- a tiny blocking HTTP/1.1 client ------------------------------------------ */
@@ -249,6 +271,7 @@ struct consumer_state {
   atomic_uintptr_t last_sent;
   atomic_ullong ws_handle;
   atomic_ullong last_abort; /* the handle of the latest ANOLE_EV_ABORT */
+  atomic_int last_abort_reason, last_abort_status;
   uint64_t batches, events;
   int spin_us; /* serve: CAPI_SPIN_US */
 };
@@ -278,7 +301,7 @@ static void *consumer_main(void *arg) {
     }
     return NULL;
   }
-  int fd = anole_consumer_fd(cs->c);
+  int fd = (int)anole_consumer_fd(cs->c);
   while (!atomic_load(&cs->stopped)) {
     if (atomic_load(&cs->paused)) {
       usleep(1000);
@@ -290,7 +313,7 @@ static void *consumer_main(void *arg) {
     double idle_since = 0;
     for (;;) {
       /* Optionally spin (NOARM polls) for spin_us before arming the doorbell. */
-      int64_t n = anole_poll(cs->c, cs->buf, sizeof cs->buf, cs->spin_us > 0 ? ANOLE_POLL_NOARM : 0);
+      int64_t n = anole_poll(cs->c, cs->buf, sizeof cs->buf, cs->spin_us > 0 ? ANOLE_POLL_F_NOARM : 0);
       CHECK(n >= 0);
       if (n == 0 && cs->spin_us > 0) {
         double t = now_ms();
@@ -376,19 +399,19 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
   anole_req h = r->ev.handle;
   switch (r->route_id) {
   case R_HELLO:
-    CHECK(anole_respond(h, 200, text_plain, 1, "Hello, World!", 13, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(h, 200, text_plain, 1, "Hello, World!", 13, 0) == ANOLE_OK);
     break;
   case R_ECHO: {
     if (r->flags & ANOLE_REQ_BODY_INLINE) {
       anole_str b = anole_event_str(r, r->body);
-      CHECK(anole_respond(h, 200, text_plain, 1, b.ptr, b.len, 0) == ANOLE_OK);
+      CHECK(anole_req_respond(h, 200, text_plain, 1, b.ptr, b.len, 0) == ANOLE_OK);
     } else {
       CHECK(r->flags & ANOLE_REQ_BODY_STREAM);
       CHECK(r->body.len == 0);
       static char body[BODY_MAX];
       size_t n = read_body(h, body, sizeof body);
       CHECK(r->content_length == UINT64_MAX || r->content_length == n);
-      CHECK(anole_respond(h, 200, text_plain, 1, body, n, 0) == ANOLE_OK);
+      CHECK(anole_req_respond(h, 200, text_plain, 1, body, n, 0) == ANOLE_OK);
     }
     break;
   }
@@ -406,29 +429,29 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
     char out[256];
     int n = snprintf(out, sizeof out, "user %.*s %.*s %.*s", (int)id.len, id.ptr, (int)xt.len, xt.ptr,
                      (int)r->query.len, (const char *)r + r->query.off);
-    CHECK(anole_respond(h, 200, text_plain, 1, out, (size_t)n, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(h, 200, text_plain, 1, out, (size_t)n, 0) == ANOLE_OK);
     break;
   }
   case R_RELEASE:
-    CHECK(anole_release(h) == ANOLE_OK);
+    CHECK(anole_req_fail(h, 0, (anole_str){0}) == ANOLE_OK);
     break;
   case R_BORROW:
-    CHECK(anole_respond(h, 200, text_plain, 1, big_body, BIG_LEN, ANOLE_BODY_BORROW) == ANOLE_OK);
+    CHECK(anole_req_respond(h, 200, text_plain, 1, big_body, BIG_LEN, ANOLE_BODY_BORROW) == ANOLE_OK);
     break;
   case R_STREAM: {
-    CHECK(anole_stream_start(h, 200, text_plain, 1) == ANOLE_OK);
-    CHECK(anole_stream_write(h, "one,", 4, 0) == ANOLE_OK);
-    CHECK(anole_stream_write(h, big_body, 1000, ANOLE_BODY_BORROW) == ANOLE_OK);
-    CHECK(anole_stream_write_wait(h, ",two", 4, 1000) == ANOLE_OK);
+    CHECK(anole_req_stream_start(h, 200, text_plain, 1) == ANOLE_OK);
+    CHECK(anole_req_stream_write(h, "one,", 4, 0) == ANOLE_OK);
+    CHECK(anole_req_stream_write(h, big_body, 1000, ANOLE_BODY_BORROW) == ANOLE_OK);
+    CHECK(anole_req_stream_write_wait(h, ",two", 4, 1000) == ANOLE_OK);
     anole_header tr = {{"x-trailer", 9}, {"done", 4}};
-    CHECK(anole_stream_end(h, &tr, 1) == ANOLE_OK);
-    CHECK(anole_stream_write(h, "late", 4, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_stream_end(h, &tr, 1) == ANOLE_OK);
+    CHECK(anole_req_stream_write(h, "late", 4, 0) == ANOLE_E_GONE);
     break;
   }
   case R_FILE: {
     int fd = open(file_path, O_RDONLY);
     CHECK(fd >= 0);
-    CHECK(anole_respond_fd(h, 200, text_plain, 1, fd, 6, 5) == ANOLE_OK);
+    CHECK(anole_req_respond_fd(h, 200, text_plain, 1, fd, 6, 5) == ANOLE_OK);
     close(fd);
     break;
   }
@@ -440,12 +463,12 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
     int n = snprintf(out, sizeof out, "%d %.*s %d %d %.*s %.*s %zu", r->method, (int)m.len, m.ptr, r->version,
                      (r->flags & ANOLE_REQ_SECURE) != 0, (int)ln.len, ln.ptr, (int)ra.len, ra.ptr, id.len);
     /* No TLS here, so no client certificate. */
-    CHECK((r->flags & ANOLE_REQ_PEER_CERT) == 0 && r->peer_cert == 0 && anole_request_peer_cert(r).len == 0);
-    CHECK(anole_respond(h, 200, text_plain, 1, out, (size_t)n, 0) == ANOLE_OK);
+    CHECK((r->flags & ANOLE_REQ_PEER_CERT) == 0 && r->peer_cert.len == 0 && anole_event_str(r, r->peer_cert).len == 0);
+    CHECK(anole_req_respond(h, 200, text_plain, 1, out, (size_t)n, 0) == ANOLE_OK);
     break;
   }
   default:
-    CHECK(anole_respond(h, 404, NULL, 0, NULL, 0, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(h, 404, NULL, 0, NULL, 0, 0) == ANOLE_OK);
   }
 }
 
@@ -460,10 +483,15 @@ static void on_event(consumer_state *cs, const anole_event *ev) {
     atomic_fetch_add(&cs->sent, 1);
     break;
   }
-  case ANOLE_EV_ABORT:
+  case ANOLE_EV_ABORT: {
+    const anole_abort_event *ab = (const anole_abort_event *)ev;
+    CHECK(ab->ev.len == sizeof *ab);
+    atomic_store(&cs->last_abort_reason, ab->reason);
+    atomic_store(&cs->last_abort_status, ab->status);
     atomic_store(&cs->last_abort, ev->handle);
     atomic_fetch_add(&cs->aborts, 1);
     break;
+  }
   case ANOLE_EV_WS_OPEN: {
     const anole_request_event *r = (const anole_request_event *)ev;
     CHECK(r->route_id == R_WS);
@@ -500,7 +528,6 @@ static void on_event(consumer_state *cs, const anole_event *ev) {
   }
   case ANOLE_EV_BODY:
   case ANOLE_EV_WRITABLE:
-  case ANOLE_EV_WS_DRAIN:
     break;
   default:
     CHECK(!"unknown event type");
@@ -786,8 +813,11 @@ static void test_main_server(void) {
     CHECK(anole_consumer_attach(s, &co, &late) == ANOLE_E_STATE && late == NULL);
   }
   uint16_t port = 0;
-  CHECK(anole_server_port(s, 0, &port) == ANOLE_OK && port != 0);
-  CHECK(anole_server_port(s, 1, &port) == ANOLE_E_INVALID);
+  port = port_of(s, 0); CHECK(port != 0);
+  {
+    anole_listener_info past = {sizeof past};
+    CHECK(anole_server_listener(s, 1, &past) == ANOLE_E_INVALID);
+  }
   start_consumer(&cs);
 
   response r;
@@ -897,26 +927,27 @@ static void test_main_server(void) {
     CHECK(pthread_create(&t, NULL, async_get, &a) == 0);
     CHECK(wait_for(&cs.nheld, 1));
     anole_req h = cs.held[0];
-    CHECK(anole_respond(h, 999, NULL, 0, NULL, 0, 0) == ANOLE_E_INVALID); /* still owed */
-    CHECK(anole_respond(h, 201, NULL, 0, "late-ok", 7, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(h, 999, NULL, 0, NULL, 0, 0) == ANOLE_E_INVALID); /* still owed */
+    CHECK(anole_req_respond(h, 201, NULL, 0, "late-ok", 7, 0) == ANOLE_OK);
     pthread_join(t, NULL);
     CHECK(a.r.status == 201 && strcmp(a.r.body, "late-ok") == 0);
     response_free(&a.r);
-    CHECK(anole_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_release(h) == ANOLE_E_GONE);
-    CHECK(anole_stream_write(h, "x", 1, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_fail(h, 0, (anole_str){0}) == ANOLE_E_GONE);
+    CHECK(anole_handle_release(h) == ANOLE_OK); /* a cleanup call: over is success */
+    CHECK(anole_req_stream_write(h, "x", 1, 0) == ANOLE_E_GONE);
     char rb[8];
     CHECK(anole_req_read(h, rb, sizeof rb, 0) == ANOLE_E_GONE);
-    CHECK(anole_respond(0, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_respond(h + 1, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_respond(h ^ (1ull << 60), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
+    CHECK(anole_req_respond(0, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_INVALID); /* 0 is no handle */
+    CHECK(anole_req_respond(h + 1, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h ^ (1ull << 60), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
     /* Every error answer sets its own text: none is left over from an earlier call. */
     CHECK(str_has(anole_last_error(), "invalid"));
-    CHECK(anole_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(str_has(anole_last_error(), "stale"));
-    CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (have_websocket ? ANOLE_E_GONE : ANOLE_E_UNSUPPORTED));
+    CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (have_websocket ? ANOLE_E_INVALID : ANOLE_E_UNSUPPORTED)); /* wrong kind */
 
     /* slot reuse: same executor and slot, newer generation, old one stays GONE */
     anole_req first = h;
@@ -929,19 +960,19 @@ static void test_main_server(void) {
       CHECK(wait_for(&cs.nheld, 1));
       anole_req h2 = cs.held[0];
       anole_header bad = {{"bad name", 8}, {"v", 1}};
-      CHECK(anole_respond(h2, 200, &bad, 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      CHECK(anole_req_respond(h2, 200, &bad, 1, NULL, 0, 0) == ANOLE_E_INVALID);
       anole_header bad_value = {{"x-ok", 4}, {"a\r\nb", 4}};
-      CHECK(anole_respond(h2, 200, &bad_value, 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      CHECK(anole_req_respond(h2, 200, &bad_value, 1, NULL, 0, 0) == ANOLE_E_INVALID);
       anole_header framing[] = {{{"Connection", 10}, {"close", 5}}, {{"transfer-encoding", 17}, {"chunked", 7}}};
-      CHECK(anole_respond(h2, 200, &framing[0], 1, NULL, 0, 0) == ANOLE_E_INVALID);
-      CHECK(anole_respond(h2, 200, &framing[1], 1, NULL, 0, 0) == ANOLE_E_INVALID);
-      CHECK(anole_respond(h2, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
+      CHECK(anole_req_respond(h2, 200, &framing[0], 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      CHECK(anole_req_respond(h2, 200, &framing[1], 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      CHECK(anole_req_respond(h2, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
       pthread_join(t, NULL);
       CHECK(b.r.status == 200);
       response_free(&b.r);
       if ((h2 >> 32) == (first >> 32) && h2 != first) {
         CHECK((uint32_t)h2 > (uint32_t)first);
-        CHECK(anole_respond(first, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+        CHECK(anole_req_respond(first, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
         reused = 1;
       }
     }
@@ -966,7 +997,7 @@ static void test_main_server(void) {
       CHECK(a.r.status == 504);
       CHECK(a.ms >= lo[i] && a.ms < hi[i]);
       CHECK(wait_for(&cs.nheld, 1));
-      CHECK(anole_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+      CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
       response_free(&a.r);
       printf("ok deadline %s (504 after %.0f ms)\n", paths[i], a.ms);
     }
@@ -985,7 +1016,7 @@ static void test_main_server(void) {
        theirs in flight. */
     for (int i = 0; i < 1000 && atomic_load(&cs.last_abort) != cs.held[0]; i++) usleep(2000);
     CHECK(atomic_load(&cs.last_abort) == cs.held[0]);
-    CHECK(anole_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
   }
   printf("ok client gone\n");
 
@@ -1112,7 +1143,7 @@ static void test_main_server(void) {
     CHECK(anole_server_drain(s) == ANOLE_OK); /* again: no-op */
     CHECK(anole_server_wait(s, 0) == ANOLE_E_TIMEOUT);
     usleep(100 * 1000);
-    CHECK(anole_respond(cs.held[0], 200, NULL, 0, "drained", 7, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, "drained", 7, 0) == ANOLE_OK);
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
     async_req *answered = a.r.status == 200 ? &a : &b, *dropped = answered == &a ? &b : &a;
@@ -1120,7 +1151,7 @@ static void test_main_server(void) {
     CHECK(dropped->r.status == 504 || dropped->r.eof);
     CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
     double took = now_ms() - t0;
-    CHECK(anole_respond(cs.held[1], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(cs.held[1], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     pthread_join(cs.thread, NULL);
     CHECK(atomic_load(&cs.stopped));
     /* after the stop, polls return 0 */
@@ -1168,7 +1199,7 @@ static void test_stale_across_servers(void) {
     CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
     CHECK(anole_server_start(s) == ANOLE_OK);
     uint16_t port = 0;
-    CHECK(anole_server_port(s, 0, &port) == ANOLE_OK);
+    port = port_of(s, 0); CHECK(port != 0);
     conn_reader cr = {0};
     cr.fd = dial(port);
     send_request(cr.fd, "GET", "/hold", NULL, 0);
@@ -1184,8 +1215,8 @@ static void test_stale_across_servers(void) {
     }
     /* The old handle, as a late answer from the first server's test would
        send it: refused, and the new request untouched. */
-    CHECK(anole_respond(old, 200, text_plain, 1, "old", 3, 0) == ANOLE_E_GONE);
-    CHECK(anole_respond(h, 200, text_plain, 1, "new", 3, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(old, 200, text_plain, 1, "old", 3, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h, 200, text_plain, 1, "new", 3, 0) == ANOLE_OK);
     response r;
     response_init(&r);
     read_response(&cr, &r, 0);
@@ -1206,13 +1237,13 @@ static void test_shared_consumer(void) {
   snprintf(json, sizeof json, test_config, 1, 128 * 1024, 2, 5000, 300, have_websocket ? ws_route : "");
   anole_server *s = make_server(json);
   static consumer_state cs[2];
-  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_SHARED};
+  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
   anole_consumer *c = NULL;
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_consumer_fd(c) == -1);
   CHECK(anole_server_start(s) == ANOLE_OK);
   uint16_t port;
-  CHECK(anole_server_port(s, 0, &port) == ANOLE_OK);
+  port = port_of(s, 0); CHECK(port != 0);
   for (int i = 0; i < 2; i++) {
     cs[i].c = c;
     cs[i].on_event = on_event;
@@ -1328,16 +1359,16 @@ static void test_db(void) {
 
   /* exec with every value type */
   anole_str ins = LIT("INSERT INTO items (name, qty, price, data) VALUES (?, ?, ?, ?)");
-  anole_db_value v[4] = {{ANOLE_DB_TEXT, 0, {.s = LIT("apple")}},
-                         {ANOLE_DB_INT, 0, {.i = 3}},
-                         {ANOLE_DB_FLOAT, 0, {.f = 1.25}},
-                         {ANOLE_DB_BLOB, 0, {.s = LIT("\x00\x01\x02")}}};
+  anole_db_value v[4] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("apple")}},
+                         {ANOLE_DB_TYPE_INT, 0, {.i = 3}},
+                         {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.25}},
+                         {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("\x00\x01\x02")}}};
   CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 10) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 10 && r->status == ANOLE_OK && r->changes == 1 && r->last_insert_rowid == 1);
   CHECK(r->ncolumns == 0 && r->nrows == 0 && r->http_status == 0);
   v[0].v.s = LIT("pear");
-  v[1].type = ANOLE_DB_NULL;
+  v[1].type = ANOLE_DB_TYPE_NULL;
   CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 11) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->last_insert_rowid == 2);
@@ -1348,12 +1379,12 @@ static void test_db(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 12 && r->status == ANOLE_OK && r->ncolumns == 5 && r->nrows == 2);
   CHECK(str_is(db_column(r, 1), "label"));
-  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_INT && db_cell(r, 0, 0)->v.i == 1);
-  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 1)->v.s), "apple"));
-  CHECK(db_cell(r, 0, 3)->type == ANOLE_DB_FLOAT && db_cell(r, 0, 3)->v.f == 1.25);
-  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_BLOB && db_cell(r, 0, 4)->v.s.len == 3);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 1);
+  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TYPE_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 1)->v.s), "apple"));
+  CHECK(db_cell(r, 0, 3)->type == ANOLE_DB_TYPE_FLOAT && db_cell(r, 0, 3)->v.f == 1.25);
+  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_TYPE_BLOB && db_cell(r, 0, 4)->v.s.len == 3);
   CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 4)->v.s).ptr, "\x00\x01\x02", 3) == 0);
-  CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_NULL);
+  CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_TYPE_NULL);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE);
 
   /* failures: a unique key, a syntax error, a wrong value type */
@@ -1435,7 +1466,7 @@ static void test_db(void) {
   enum { MANY = 200 };
   static int seen[MANY];
   memset(seen, 0, sizeof seen);
-  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_F_COALESCE, 0, 0, 0, {NULL, 0}};
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
@@ -1516,18 +1547,18 @@ static void test_db_postgres(void) {
 
   /* every value type, sent as the parameter's type or as text */
   anole_str ins = LIT("INSERT INTO anole_capi_items (name, qty, price, ok, data, at) VALUES ($1, $2, $3, $4, $5, $6)");
-  anole_db_value v[6] = {{ANOLE_DB_TEXT, 0, {.s = LIT("apple")}},     {ANOLE_DB_INT, 0, {.i = 3}},
-                         {ANOLE_DB_FLOAT, 0, {.f = 1.25}},            {ANOLE_DB_BOOL, 0, {.i = 1}},
-                         {ANOLE_DB_BLOB, 0, {.s = LIT("\x00\x01\x02")}}, {ANOLE_DB_TEXT, 0, {.s = LIT("2026-10-22T10:00:00Z")}}};
+  anole_db_value v[6] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("apple")}},     {ANOLE_DB_TYPE_INT, 0, {.i = 3}},
+                         {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.25}},            {ANOLE_DB_TYPE_BOOL, 0, {.i = 1}},
+                         {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("\x00\x01\x02")}}, {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("2026-10-22T10:00:00Z")}}};
   CHECK(anole_db_exec(db, c, ins, v, 6, NULL, 10) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 10 && r->status == ANOLE_OK && r->changes == 1 && r->last_insert_rowid == 0);
   /* RETURNING through a query; an int sent to a text parameter */
   anole_str ret = LIT("INSERT INTO anole_capi_items (name, qty) VALUES ($1::text, $2) RETURNING id");
-  anole_db_value v2[2] = {{ANOLE_DB_INT, 0, {.i = 42}}, {ANOLE_DB_NULL, 0, {.i = 0}}};
+  anole_db_value v2[2] = {{ANOLE_DB_TYPE_INT, 0, {.i = 42}}, {ANOLE_DB_TYPE_NULL, 0, {.i = 0}}};
   CHECK(anole_db_query(db, c, ret, v2, 2, NULL, 11) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
-  CHECK(r->status == ANOLE_OK && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_INT && db_cell(r, 0, 0)->v.i == 2);
+  CHECK(r->status == ANOLE_OK && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 2);
   CHECK(db_cell(r, 0, 0)->db_type == 20);
 
   /* a read: converted cells, the rest as text, each with its type OID */
@@ -1536,18 +1567,18 @@ static void test_db_postgres(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->ncolumns == 7 && r->nrows == 2);
   CHECK(str_is(db_column(r, 1), "label"));
-  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_INT && db_cell(r, 0, 0)->v.i == 1);
-  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TEXT && db_cell(r, 0, 1)->db_type == 25);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 1);
+  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TYPE_TEXT && db_cell(r, 0, 1)->db_type == 25);
   CHECK(str_is(anole_event_str(r, db_cell(r, 0, 1)->v.s), "apple"));
-  CHECK(db_cell(r, 0, 2)->type == ANOLE_DB_INT && db_cell(r, 0, 2)->v.i == 3 && db_cell(r, 0, 2)->db_type == 23);
-  CHECK(db_cell(r, 0, 3)->type == ANOLE_DB_TEXT && db_cell(r, 0, 3)->db_type == 1700);
+  CHECK(db_cell(r, 0, 2)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 2)->v.i == 3 && db_cell(r, 0, 2)->db_type == 23);
+  CHECK(db_cell(r, 0, 3)->type == ANOLE_DB_TYPE_TEXT && db_cell(r, 0, 3)->db_type == 1700);
   CHECK(str_is(anole_event_str(r, db_cell(r, 0, 3)->v.s), "1.25"));
-  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_BOOL && db_cell(r, 0, 4)->v.i == 1);
-  CHECK(db_cell(r, 0, 5)->type == ANOLE_DB_BLOB && db_cell(r, 0, 5)->v.s.len == 3);
+  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_TYPE_BOOL && db_cell(r, 0, 4)->v.i == 1);
+  CHECK(db_cell(r, 0, 5)->type == ANOLE_DB_TYPE_BLOB && db_cell(r, 0, 5)->v.s.len == 3);
   CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 5)->v.s).ptr, "\x00\x01\x02", 3) == 0);
-  CHECK(db_cell(r, 0, 6)->type == ANOLE_DB_TEXT && db_cell(r, 0, 6)->db_type == 1184);
+  CHECK(db_cell(r, 0, 6)->type == ANOLE_DB_TYPE_TEXT && db_cell(r, 0, 6)->db_type == 1184);
   CHECK(str_is(anole_event_str(r, db_cell(r, 1, 1)->v.s), "42"));
-  CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_NULL && db_cell(r, 1, 2)->db_type == 23);
+  CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_TYPE_NULL && db_cell(r, 1, 2)->db_type == 23);
 
   /* failures: a unique key, a syntax error, a value PostgreSQL refuses */
   CHECK(anole_db_exec(db, c, ins, v, 6, NULL, 13) == ANOLE_OK);
@@ -1598,7 +1629,7 @@ static void test_db_postgres(void) {
     }
   }
   anole_str as_int = LIT("SELECT $1::int4");
-  anole_db_value half = {ANOLE_DB_FLOAT, 0, {.f = 1.5}};
+  anole_db_value half = {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.5}};
   CHECK(anole_db_query(db, c, as_int, &half, 1, NULL, 15) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_DB && str_is(anole_event_str(r, r->error_code), "22P02"));
@@ -1625,7 +1656,7 @@ static void test_db_postgres(void) {
   enum { MANY = 200 };
   static int seen[MANY];
   memset(seen, 0, sizeof seen);
-  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_F_COALESCE, 0, 0, 0, {NULL, 0}};
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
@@ -1692,50 +1723,50 @@ static void test_db_redis(void) {
   static unsigned char rec[1 << 20];
   const anole_db_result_event *r;
   anole_str del = LIT("DEL"), set = LIT("SET"), get = LIT("GET"), rpush = LIT("RPUSH"), lrange = LIT("LRANGE");
-  anole_db_value keys[3] = {{ANOLE_DB_TEXT, 0, {.s = LIT("anole:capi:s")}},
-                            {ANOLE_DB_TEXT, 0, {.s = LIT("anole:capi:l")}},
-                            {ANOLE_DB_TEXT, 0, {.s = LIT("anole:capi:n")}}};
+  anole_db_value keys[3] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:s")}},
+                            {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:l")}},
+                            {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:n")}}};
   CHECK(anole_db_exec(db, c, del, keys, 3, NULL, 1) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->nrows == 0);
 
   /* SET with binary-safe bytes and an int, then GET */
-  anole_db_value sv[4] = {keys[0], {ANOLE_DB_BLOB, 0, {.s = LIT("v\x00w")}}, {ANOLE_DB_TEXT, 0, {.s = LIT("EX")}},
-                          {ANOLE_DB_INT, 0, {.i = 60}}};
+  anole_db_value sv[4] = {keys[0], {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("v\x00w")}}, {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("EX")}},
+                          {ANOLE_DB_TYPE_INT, 0, {.i = 60}}};
   CHECK(anole_db_query(db, c, set, sv, 4, NULL, 2) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->ncolumns == 0 && r->nrows == 1);
-  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 0)->v.s), "OK"));
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 0)->v.s), "OK"));
   CHECK(anole_db_query(db, c, get, keys, 1, NULL, 3) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
-  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_BLOB && db_cell(r, 0, 0)->v.s.len == 3);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_BLOB && db_cell(r, 0, 0)->v.s.len == 3);
   CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 0)->v.s).ptr, "v\x00w", 3) == 0);
   CHECK(anole_db_query(db, c, get, &keys[2], 1, NULL, 4) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
-  CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_NULL);
+  CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_NULL);
 
   /* exec: an integer reply as `changes` */
-  anole_db_value lv[4] = {keys[1], {ANOLE_DB_TEXT, 0, {.s = LIT("a")}}, {ANOLE_DB_INT, 0, {.i = 2}},
-                          {ANOLE_DB_FLOAT, 0, {.f = 2.5}}};
+  anole_db_value lv[4] = {keys[1], {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("a")}}, {ANOLE_DB_TYPE_INT, 0, {.i = 2}},
+                          {ANOLE_DB_TYPE_FLOAT, 0, {.f = 2.5}}};
   CHECK(anole_db_exec(db, c, rpush, lv, 4, NULL, 5) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->changes == 3);
 
   /* an array; a nested reply from a script, in preorder */
-  anole_db_value rv[3] = {keys[1], {ANOLE_DB_INT, 0, {.i = 0}}, {ANOLE_DB_INT, 0, {.i = -1}}};
+  anole_db_value rv[3] = {keys[1], {ANOLE_DB_TYPE_INT, 0, {.i = 0}}, {ANOLE_DB_TYPE_INT, 0, {.i = -1}}};
   CHECK(anole_db_query(db, c, lrange, rv, 3, NULL, 6) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
-  CHECK(r->nrows == 4 && db_cell(r, 0, 0)->type == ANOLE_DB_ARRAY && db_cell(r, 0, 0)->v.i == 3);
+  CHECK(r->nrows == 4 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_ARRAY && db_cell(r, 0, 0)->v.i == 3);
   CHECK(str_is(anole_event_str(r, db_cell(r, 0, 3)->v.s), "2.5"));
   anole_str eval = LIT("EVAL");
-  anole_db_value ev[2] = {{ANOLE_DB_TEXT, 0, {.s = LIT("return {1, {2, 'x'}, 3}")}}, {ANOLE_DB_INT, 0, {.i = 0}}};
+  anole_db_value ev[2] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("return {1, {2, 'x'}, 3}")}}, {ANOLE_DB_TYPE_INT, 0, {.i = 0}}};
   CHECK(anole_db_query(db, c, eval, ev, 2, NULL, 7) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->nrows == 6);
-  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_ARRAY && db_cell(r, 0, 0)->v.i == 3);
-  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_INT && db_cell(r, 0, 1)->v.i == 1);
-  CHECK(db_cell(r, 0, 2)->type == ANOLE_DB_ARRAY && db_cell(r, 0, 2)->v.i == 2);
-  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_BLOB && db_cell(r, 0, 5)->v.i == 3);
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_ARRAY && db_cell(r, 0, 0)->v.i == 3);
+  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 1)->v.i == 1);
+  CHECK(db_cell(r, 0, 2)->type == ANOLE_DB_TYPE_ARRAY && db_cell(r, 0, 2)->v.i == 2);
+  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_TYPE_BLOB && db_cell(r, 0, 5)->v.i == 3);
 
   /* a server error; an empty command */
   anole_str incr = LIT("INCR");
@@ -1764,7 +1795,7 @@ static void test_db_redis(void) {
 
   /* many at once, coalesced */
   enum { MANY = 200 };
-  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_F_COALESCE, 0, 0, 0, {NULL, 0}};
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, get, keys, 1, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
@@ -1775,7 +1806,7 @@ static void test_db_redis(void) {
 
   /* a timeout: a blocking pop that waits longer */
   anole_str blpop = LIT("BLPOP");
-  anole_db_value bv[2] = {keys[2], {ANOLE_DB_INT, 0, {.i = 5}}};
+  anole_db_value bv[2] = {keys[2], {ANOLE_DB_TYPE_INT, 0, {.i = 5}}};
   anole_db_options quick = {sizeof quick, 0, 100, 0, 0, {NULL, 0}};
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, blpop, bv, 2, &quick, 30) == ANOLE_OK);
@@ -1785,7 +1816,7 @@ static void test_db_redis(void) {
 
   /* an answer past limits.db_result_max */
   anole_str setrange = LIT("SETRANGE");
-  anole_db_value sr[3] = {keys[2], {ANOLE_DB_INT, 0, {.i = 100000}}, {ANOLE_DB_TEXT, 0, {.s = LIT("x")}}};
+  anole_db_value sr[3] = {keys[2], {ANOLE_DB_TYPE_INT, 0, {.i = 100000}}, {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("x")}}};
   CHECK(anole_db_exec(db, c, setrange, sr, 3, NULL, 31) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->changes == 100001);
@@ -1856,7 +1887,7 @@ static void bb_str(bson_b *b, const char *name, const char *v, size_t n) {
 static void bb_doc(bson_b *b, const char *name) { bb_key(b, 0x03, name), bb_begin(b); }
 static void bb_arr(bson_b *b, const char *name) { bb_key(b, 0x04, name), bb_begin(b); }
 static anole_db_value bb_value(const bson_b *b) {
-  anole_db_value v = {ANOLE_DB_BLOB, 0, {.s = {(const char *)b->buf, b->len}}};
+  anole_db_value v = {ANOLE_DB_TYPE_BLOB, 0, {.s = {(const char *)b->buf, b->len}}};
   return v;
 }
 
@@ -1953,7 +1984,7 @@ static void test_db_mongodb(void) {
   p[0] = bb_value(&b1);
   CHECK(anole_db_query(db, c, ins1, p, 1, NULL, 2) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
-  CHECK(r->status == ANOLE_OK && r->ncolumns == 1 && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_BSON);
+  CHECK(r->status == ANOLE_OK && r->ncolumns == 1 && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_BSON);
   CHECK(str_is(db_column(r, 0), "document"));
   {
     anole_str d = anole_event_str(r, db_cell(r, 0, 0)->v.s);
@@ -1994,7 +2025,7 @@ static void test_db_mongodb(void) {
   anole_str count = LIT("countDocuments items");
   CHECK(anole_db_query(db, c, count, NULL, 0, NULL, 6) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
-  CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_INT && db_cell(r, 0, 0)->v.i == 3);
+  CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 3);
   anole_str agg = LIT("aggregate items");
   b1.len = 0;
   bb_begin(&b1), bb_doc(&b1, "0"), bb_doc(&b1, "$group"), bb_key(&b1, 0x0A, "_id"), bb_doc(&b1, "total"),
@@ -2047,7 +2078,7 @@ static void test_db_mongodb(void) {
   CHECK(anole_db_query(db, c, bare, NULL, 0, NULL, 13) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->http_status == 400);
-  anole_db_value text = {ANOLE_DB_TEXT, 0, {.s = LIT("{}")}};
+  anole_db_value text = {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("{}")}};
   CHECK(anole_db_query(db, c, find, &text, 1, NULL, 14) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->http_status == 400);
@@ -2075,7 +2106,7 @@ static void test_db_mongodb(void) {
 
   /* many at once, coalesced */
   enum { MANY = 200 };
-  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_F_COALESCE, 0, 0, 0, {NULL, 0}};
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
@@ -2163,7 +2194,7 @@ static wt_ent *wt_add(wt_state *st, anole_wt_stream h, anole_wt session, int uni
 }
 
 static void wt_forget(wt_state *st, wt_ent *e) {
-  CHECK(anole_wt_stream_release(e->h) == ANOLE_OK);
+  CHECK(anole_handle_release(e->h) == ANOLE_OK);
   /* Stale at once. */
   CHECK(anole_wt_stream_write(e->h, "x", 1, 0) == ANOLE_E_GONE);
   e->used = 0;
@@ -2189,24 +2220,24 @@ static void wt_event(wt_state *st, const anole_event *ev) {
     st->opened++;
     CHECK(anole_wt_max_datagram(ev->handle) > 0);
     anole_wt_stream u = 0;
-    CHECK(anole_wt_open_stream(ev->handle, ANOLE_WT_UNI, &u) == ANOLE_OK && u != 0);
+    CHECK(anole_wt_open_stream(ev->handle, ANOLE_WT_F_UNI, &u) == ANOLE_OK && u != 0);
     /* Bit 0 is ANOLE_BODY_BORROW on every send-type call: a borrowed
        write does not end the stream (ANOLE_EV_SENT follows); unknown flag
        bits are refused. */
     CHECK(anole_wt_stream_write(u, wt_borrowed, 6, ANOLE_BODY_BORROW) == ANOLE_OK);
     CHECK(anole_wt_stream_write(u, "x", 1, 0x80) == ANOLE_E_INVALID);
-    CHECK(anole_wt_stream_write(u, "from C", 6, ANOLE_WT_FIN) == ANOLE_OK);
+    CHECK(anole_wt_stream_write(u, "from C", 6, ANOLE_WT_F_FIN) == ANOLE_OK);
     /* Written with its end: still goes out whole after the release. */
     CHECK(anole_wt_stream_write(u, "more", 4, 0) == ANOLE_E_INVALID);
-    CHECK(anole_wt_stream_release(u) == ANOLE_OK);
+    CHECK(anole_handle_release(u) == ANOLE_OK);
     CHECK(anole_wt_open_stream(ev->handle, 4, &u) == ANOLE_E_INVALID);
     break;
   }
   case ANOLE_EV_WT_STREAM: {
     const anole_wt_stream_event *se = (const anole_wt_stream_event *)ev;
     CHECK(se->session == st->session && se->route_id == 5);
-    wt_add(st, ev->handle, se->session, (se->flags & ANOLE_WT_UNI) != 0, 0);
-    if (se->flags & ANOLE_WT_UNI) CHECK(anole_wt_stream_write(ev->handle, "x", 1, 0) == ANOLE_E_INVALID);
+    wt_add(st, ev->handle, se->session, (se->flags & ANOLE_WT_F_UNI) != 0, 0);
+    if (se->flags & ANOLE_WT_F_UNI) CHECK(anole_wt_stream_write(ev->handle, "x", 1, 0) == ANOLE_E_INVALID);
     break;
   }
   case ANOLE_EV_WT_DATA: {
@@ -2214,7 +2245,7 @@ static void wt_event(wt_state *st, const anole_event *ev) {
     wt_ent *e = wt_find(st, ev->handle);
     CHECK(e != NULL);
     anole_str d = anole_event_str(de, de->data);
-    int fin = (de->flags & ANOLE_WT_FIN) != 0;
+    int fin = (de->flags & ANOLE_WT_F_FIN) != 0;
     if (e->uni || e->ours) {
       CHECK(e->len + d.len <= sizeof e->got);
       memcpy(e->got + e->len, d.ptr, d.len);
@@ -2232,9 +2263,9 @@ static void wt_event(wt_state *st, const anole_event *ev) {
          has "thanked", and a stream is stale from its session's close on. */
       anole_wt session = e->session;
       wt_forget(st, e);
-      CHECK(anole_wt_send_datagram(session, out, (size_t)n) == ANOLE_OK);
+      CHECK(anole_wt_send_datagram(session, out, (size_t)n, 0) == ANOLE_OK);
     } else {
-      anole_status rc = anole_wt_stream_write(ev->handle, d.ptr, d.len, fin ? ANOLE_WT_FIN : 0);
+      anole_status rc = anole_wt_stream_write(ev->handle, d.ptr, d.len, fin ? ANOLE_WT_F_FIN : 0);
       CHECK(rc == ANOLE_OK || rc == ANOLE_BUSY);
       if (fin) wt_forget(st, e);
     }
@@ -2245,12 +2276,12 @@ static void wt_event(wt_state *st, const anole_event *ev) {
     anole_str d = anole_event_str(de, de->data);
     char out[128];
     int n = snprintf(out, sizeof out, "echo:%.*s", (int)d.len, d.ptr);
-    CHECK(anole_wt_send_datagram(ev->handle, out, (size_t)n) == ANOLE_OK);
+    CHECK(anole_wt_send_datagram(ev->handle, out, (size_t)n, 0) == ANOLE_OK);
     if (d.len == 4 && memcmp(d.ptr, "open", 4) == 0) {
       anole_wt_stream b = 0;
       CHECK(anole_wt_open_stream(ev->handle, 0, &b) == ANOLE_OK);
       wt_add(st, b, ev->handle, 0, 1);
-      CHECK(anole_wt_stream_write(b, "from C", 6, ANOLE_WT_FIN) == ANOLE_OK);
+      CHECK(anole_wt_stream_write(b, "from C", 6, ANOLE_WT_F_FIN) == ANOLE_OK);
     }
     break;
   }
@@ -2287,7 +2318,7 @@ static void test_webtransport(void) {
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
   uint16_t port = 0;
-  CHECK(anole_server_port(s, 1, &port) == ANOLE_OK && port != 0);
+  port = port_of(s, 1); CHECK(port != 0);
 
   pid_t pid = fork();
   CHECK(pid >= 0);
@@ -2322,15 +2353,15 @@ static void test_webtransport(void) {
   CHECK(st.released >= 3);
   CHECK(st.borrow_sent == 1);
   /* The session and its streams are stale after the close. */
-  CHECK(anole_wt_close(st.session, 0, LIT("")) == ANOLE_E_GONE);
-  CHECK(anole_wt_send_datagram(st.session, "x", 1) == ANOLE_E_GONE);
+  CHECK(anole_wt_close(st.session, 0, LIT("")) == ANOLE_OK); /* a cleanup call */
+  CHECK(anole_wt_send_datagram(st.session, "x", 1, 0) == ANOLE_E_GONE);
   CHECK(anole_wt_max_datagram(st.session) == ANOLE_E_GONE);
   anole_wt_stream x = 0;
   CHECK(anole_wt_open_stream(st.session, 0, &x) == ANOLE_E_GONE);
   CHECK(anole_wt_stream_write(st.first_stream, "x", 1, 0) == ANOLE_E_GONE);
-  CHECK(anole_wt_stream_reset(st.first_stream, 1) == ANOLE_E_GONE);
+  CHECK(anole_wt_stream_reset(st.first_stream, 1) == ANOLE_OK);
   /* A request handle is not a session. */
-  CHECK(anole_wt_close(1, 0, LIT("")) == ANOLE_E_GONE);
+  CHECK(anole_wt_close(1, 0, LIT("")) == ANOLE_E_INVALID); /* no wt handle */
   anole_stats stats = {sizeof stats};
   CHECK(anole_server_stats(s, &stats) == ANOLE_OK && stats.wt_sessions == 0);
   CHECK(anole_server_drain(s) == ANOLE_OK);
@@ -2364,31 +2395,811 @@ static void test_tls(void) {
                                 " \"proxy_protocol\": true, \"proxy_protocol_from\": [\"127.0.0.1\", \"10.0.0.0/8\"]}]}");
   CHECK(anole_server_start(p) == ANOLE_OK);
   /* No TLS listener: nothing to reload. */
-  CHECK(anole_server_reload_tls(p, 0, NULL, 0, NULL, 0) == ANOLE_E_STATE);
-  CHECK(anole_server_reload_certificates(p) == ANOLE_E_STATE);
+  CHECK(anole_server_reload_tls(p, 0, (anole_str){0}, (anole_str){0}) == ANOLE_E_STATE);
+  CHECK(anole_server_reload_tls(p, 0, (anole_str){0}, (anole_str){0}) == ANOLE_E_STATE);
   CHECK(anole_server_drain(p) == ANOLE_OK);
   CHECK(anole_server_wait(p, -1) == ANOLE_OK);
   anole_server_destroy(p);
 
   anole_server *s = make_server("{\"listeners\": [{\"port\": 0, \"tls\": {\"self_signed\": true}}]}");
   /* Not running yet. */
-  CHECK(anole_server_reload_tls(s, 0, NULL, 0, NULL, 0) == ANOLE_E_STATE);
+  CHECK(anole_server_reload_tls(s, 0, (anole_str){0}, (anole_str){0}) == ANOLE_E_STATE);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  CHECK(anole_server_reload_tls(s, 0, NULL, 0, NULL, 0) == ANOLE_OK);
-  CHECK(anole_server_reload_tls(s, 2, NULL, 0, NULL, 0) == ANOLE_E_INVALID);
-  CHECK(anole_server_reload_tls(s, 0, NULL, 0, "k", 1) == ANOLE_E_INVALID);
-  CHECK(anole_server_reload_tls(s, ANOLE_TLS_PEM, "c", 0, "k", 1) == ANOLE_E_INVALID);
+  CHECK(anole_server_reload_tls(s, 0, (anole_str){0}, (anole_str){0}) == ANOLE_OK);
+  CHECK(anole_server_reload_tls(s, 2, (anole_str){0}, (anole_str){0}) == ANOLE_E_INVALID);
+  CHECK(anole_server_reload_tls(s, 0, (anole_str){0}, (anole_str){"k", 1}) == ANOLE_E_INVALID);
+  CHECK(anole_server_reload_tls(s, ANOLE_TLS_F_PEM, (anole_str){"c", 0}, (anole_str){"k", 1}) == ANOLE_E_INVALID);
   const char junk[] = "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n";
-  CHECK(anole_server_reload_tls(s, ANOLE_TLS_PEM, junk, strlen(junk), junk, strlen(junk)) == ANOLE_E_INVALID);
+  CHECK(anole_server_reload_tls(s, ANOLE_TLS_F_PEM, (anole_str){junk, strlen(junk)}, (anole_str){junk, strlen(junk)}) == ANOLE_E_INVALID);
   CHECK(anole_last_error().len > 0);
   const char *missing = "/nonexistent/anole-cert.pem";
-  CHECK(anole_server_reload_tls(s, 0, missing, strlen(missing), missing, strlen(missing)) == ANOLE_E_SYSTEM);
+  CHECK(anole_server_reload_tls(s, 0, (anole_str){missing, strlen(missing)}, (anole_str){missing, strlen(missing)}) == ANOLE_E_SYSTEM);
+  CHECK(name_is("CertificateFileUnreadable") && anole_last_errno() == ENOENT);
   /* Still serving the certificate it had: a reload from it works. */
-  CHECK(anole_server_reload_certificates(s) == ANOLE_OK);
+  CHECK(anole_server_reload_tls(s, 0, (anole_str){0}, (anole_str){0}) == ANOLE_OK);
   CHECK(anole_server_drain(s) == ANOLE_OK);
   CHECK(anole_server_wait(s, -1) == ANOLE_OK);
   anole_server_destroy(s);
   printf("ok tls: mutual TLS and proxy settings in the configuration, anole_server_reload_tls's refusals\n");
+}
+
+/* ---- ABI 0.7: the rules the header states ----------------------------------------- */
+
+static uint64_t gone_count(anole_server *s) {
+  anole_stats st = {sizeof st};
+  CHECK(anole_server_stats(s, &st) == ANOLE_OK);
+  return st.gone;
+}
+
+/* A server with one consumer that the test thread polls itself. */
+static anole_server *polled_server(const char *json, anole_consumer **c) {
+  anole_server *s = make_server(json);
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  CHECK(anole_consumer_attach(s, &co, c) == ANOLE_OK);
+  return s;
+}
+
+static void stop_polled(anole_server *s) {
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+  anole_server_destroy(s);
+}
+
+/* Polls until an event of `type` arrives (others are skipped); its record, in
+   a buffer that lives until the next call. */
+static const anole_event *next_event(anole_consumer *c, uint32_t type) {
+  static _Alignas(8) unsigned char buf[256 * 1024];
+  for (int i = 0; i < 100; i++) {
+    int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      if (ev->type == type) return ev;
+      off += ev->len;
+    }
+  }
+  CHECK(!"the event did not arrive");
+  return NULL;
+}
+
+/* How many events of `type` arrive within `ms` (a poll that never blocks). */
+static int count_events(anole_consumer *c, uint32_t type, int ms) {
+  static _Alignas(8) unsigned char buf[256 * 1024];
+  int count = 0;
+  for (int waited = 0; waited <= ms; waited += 5) {
+    int64_t n = anole_poll(c, buf, sizeof buf, 0);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      if (ev->type == type) count++;
+      off += ev->len;
+    }
+    usleep(5000);
+  }
+  return count;
+}
+
+/* A client thread: GET `path`. */
+static async_req *start_get(uint16_t port, const char *path, pthread_t *t) {
+  async_req *a = calloc(1, sizeof *a);
+  CHECK(a);
+  a->port = port;
+  a->path = path;
+  response_init(&a->r);
+  CHECK(pthread_create(t, NULL, async_get, a) == 0);
+  return a;
+}
+
+/* Joins it and returns the status; `want`, when given, is in the body. */
+static int finish_get(async_req *a, pthread_t t, const char *want) {
+  pthread_join(t, NULL);
+  int status = a->r.status;
+  if (want) CHECK(strstr(a->r.body, want) != NULL);
+  response_free(&a->r);
+  free(a);
+  return status;
+}
+
+#define HOLD_CONFIG                                                                                   \
+  "{\"listeners\":[{\"name\":\"main\",\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"       \
+  "\"timeouts\":{\"request_ms\":%d,\"shutdown_ms\":%d},"                                             \
+  "\"limits\":{\"body_max\":20000,\"inline_body_max\":1000},"                                        \
+  "\"routes\":[{\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1},"                               \
+  "{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":200},"                       \
+  "{\"method\":\"POST\",\"path\":\"/echo\",\"handler\":2}%s]}"
+
+static anole_server *hold_server(anole_consumer **c, int request_ms, int shutdown_ms, const char *extra) {
+  char json[2048];
+  snprintf(json, sizeof json, HOLD_CONFIG, request_ms, shutdown_ms, extra);
+  anole_server *s = polled_server(json, c);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  return s;
+}
+
+static void test_abi07_rules(void) {
+  /* the version rule */
+  CHECK(anole_abi_version() == ANOLE_ABI_VERSION);
+  CHECK(ANOLE_ABI_COMPATIBLE(anole_abi_version()));
+  CHECK(!ANOLE_ABI_COMPATIBLE(ANOLE_ABI_VERSION + 1));
+  CHECK(!ANOLE_ABI_COMPATIBLE(ANOLE_ABI_VERSION - 1));
+
+  int have_sqlite = anole_has_feature(LIT("sqlite"));
+  const char *json = have_sqlite
+                         ? "{\"listeners\":[{\"port\":0}],\"databases\":[{\"name\":\"d\",\"sqlite\":{\"path\":\":memory:\"}}]}"
+                         : "{\"listeners\":[{\"port\":0}]}";
+  anole_server *s = make_server(json);
+
+  /* an options struct larger than the library knows: fine when the extra
+     bytes are zero, refused otherwise */
+  struct {
+    anole_consumer_options o;
+    uint64_t extra;
+  } big;
+  memset(&big, 0, sizeof big);
+  big.o.size = sizeof big;
+  anole_consumer *c = NULL;
+  big.extra = 1;
+  CHECK(anole_consumer_attach(s, &big.o, &c) == ANOLE_E_INVALID && c == NULL && name_is("UnknownField"));
+  big.extra = 0;
+  CHECK(anole_consumer_attach(s, &big.o, &c) == ANOLE_OK && c != NULL);
+
+  /* unknown flag bits are refused on every call that takes flags */
+  static _Alignas(8) unsigned char buf[4096];
+  const uint32_t bad = 1u << 31;
+  CHECK(anole_poll(c, buf, sizeof buf, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  anole_req fr = (1ull << 28) | 1; /* a request handle, as the library reads it */
+  CHECK(anole_req_respond(fr, 200, NULL, 0, NULL, 0, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  CHECK(anole_req_stream_write(fr, "x", 1, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  CHECK(anole_server_reload_tls(s, bad, (anole_str){0}, (anole_str){0}) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  if (anole_has_feature(LIT("websocket"))) {
+    CHECK(anole_ws_send((2ull << 28) | 1, ANOLE_WS_TEXT, "x", 1, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  }
+  if (anole_has_feature(LIT("webtransport"))) {
+    anole_wt_stream out = 0;
+    CHECK(anole_wt_send_datagram((4ull << 28) | 1, "x", 1, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+    CHECK(anole_wt_stream_write((5ull << 28) | 1, "x", 1, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+    CHECK(anole_wt_open_stream((4ull << 28) | 1, bad, &out) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  }
+  if (anole_has_feature(LIT("grpc"))) {
+    CHECK(anole_grpc_send((3ull << 28) | 1, "x", 1, bad) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  }
+  if (have_sqlite) {
+    anole_db *d = NULL;
+    CHECK(anole_db_find(s, LIT("d"), &d) == ANOLE_OK);
+    anole_db_options o = {sizeof o};
+    o.flags = bad;
+    CHECK(anole_db_query(d, c, LIT("select 1"), NULL, 0, &o, 0) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+    o.flags = 0;
+    o.reserved = 1;
+    CHECK(anole_db_query(d, c, LIT("select 1"), NULL, 0, &o, 0) == ANOLE_E_INVALID && name_is("ReservedNotZero"));
+    anole_db_value v = {ANOLE_DB_TYPE_INT, 1, {.i = 1}};
+    CHECK(anole_db_query(d, c, LIT("select ?"), &v, 1, NULL, 0) == ANOLE_E_INVALID && name_is("ReservedNotZero"));
+  }
+  anole_server_destroy(s);
+  printf("ok abi 0.7: version rule, oversize options, unknown flags and reserved fields\n");
+}
+
+static void test_cleanup_rules(void) {
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 500, "");
+  uint16_t port = port_of(s, 0);
+  pthread_t t;
+
+  /* a request answered: every cleanup call is OK afterwards, uncounted, and
+     leaves the last error alone */
+  async_req *a = start_get(port, "/hold", &t);
+  anole_req h = next_request(c);
+  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 200);
+  usleep(50 * 1000);
+  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_E_GONE && name_is("Gone"));
+  uint64_t gone = gone_count(s);
+  CHECK(anole_handle_release(h) == ANOLE_OK);
+  CHECK(anole_handle_release(h) == ANOLE_OK);
+  CHECK(anole_req_abort(h) == ANOLE_OK);
+  CHECK(name_is("Gone"));
+  CHECK(gone_count(s) == gone);
+
+  /* wrong kind and 0 are misuse, never GONE or OK */
+  CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (anole_has_feature(LIT("websocket")) ? ANOLE_E_INVALID : ANOLE_E_UNSUPPORTED));
+  if (anole_has_feature(LIT("websocket"))) CHECK(name_is("WrongHandleKind"));
+  CHECK(anole_handle_release(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(anole_handle_release(((uint64_t)15 << 28) | 1) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(anole_req_abort(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(anole_req_fail(0, 500, (anole_str){0}) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(gone_count(s) == gone);
+
+  /* anole_req_fail: an error answer in the server's error format */
+  a = start_get(port, "/hold", &t);
+  anole_req hb = next_request(c);
+  CHECK(anole_req_fail(hb, 200, LIT("nope")) == ANOLE_E_INVALID); /* still owed */
+  CHECK(anole_req_fail(hb, 404, LIT("nope")) == ANOLE_OK);
+  CHECK(finish_get(a, t, "nope") == 404);
+  a = start_get(port, "/hold", &t);
+  hb = next_request(c);
+  CHECK(anole_req_fail(hb, 0, (anole_str){0}) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 500);
+
+  /* a request not answered: anole_handle_release answers 500 */
+  a = start_get(port, "/hold", &t);
+  hb = next_request(c);
+  CHECK(anole_handle_release(hb) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 500);
+  CHECK(anole_handle_release(hb) == ANOLE_OK);
+
+  /* a streaming one: cut short, the connection closed */
+  conn_reader cr = {0};
+  cr.fd = dial(port);
+  send_request(cr.fd, "GET", "/hold", NULL, 0);
+  anole_req hs = next_request(c);
+  CHECK(anole_req_stream_start(hs, 200, text_plain, 1) == ANOLE_OK);
+  CHECK(anole_req_stream_write(hs, "one,", 4, 0) == ANOLE_OK);
+  response head;
+  response_init(&head);
+  read_response(&cr, &head, 1);
+  CHECK(head.status == 200);
+  CHECK(anole_handle_release(hs) == ANOLE_OK);
+  char tmp[256];
+  ssize_t k;
+  while ((k = read(cr.fd, tmp, sizeof tmp)) > 0) {
+  }
+  CHECK(k == 0);
+  response_free(&head);
+  close(cr.fd);
+  CHECK(anole_handle_release(hs) == ANOLE_OK);
+
+  /* anole_req_abort: the HTTP/1.1 client reads EOF with no status line */
+  conn_reader ca = {0};
+  ca.fd = dial(port);
+  send_request(ca.fd, "GET", "/hold", NULL, 0);
+  anole_req ha = next_request(c);
+  CHECK(anole_req_abort(ha) == ANOLE_OK);
+  response ar;
+  response_init(&ar);
+  read_response(&ca, &ar, 0);
+  CHECK(ar.eof && ar.status == 0);
+  response_free(&ar);
+  close(ca.fd);
+  CHECK(anole_req_abort(ha) == ANOLE_OK);
+  CHECK(anole_req_respond(ha, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+
+  /* ordinary failures name themselves */
+  static _Alignas(8) unsigned char mis[64];
+  CHECK(anole_poll(c, mis + 1, 32, 0) == ANOLE_E_INVALID && name_is("Invalid"));
+  stop_polled(s);
+
+  /* a handle kept from a destroyed server: cleanup is OK, answers are GONE,
+     also with no server at all */
+  anole_server *s2 = hold_server(&c, 5000, 200, "");
+  conn_reader cl = {0};
+  cl.fd = dial(port_of(s2, 0));
+  send_request(cl.fd, "GET", "/hold", NULL, 0);
+  anole_req old = next_request(c);
+  stop_polled(s2);
+  close(cl.fd);
+  CHECK(anole_handle_release(old) == ANOLE_OK);
+  CHECK(anole_req_respond(old, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+  anole_server *s3 = hold_server(&c, 5000, 200, "");
+  CHECK(anole_handle_release(old) == ANOLE_OK);
+  CHECK(anole_req_respond(old, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+  stop_polled(s3);
+  printf("ok cleanup calls are idempotent, wrong kinds are invalid, req_fail, req_abort, handle_release\n");
+}
+
+static void test_error_identity(void) {
+  /* configuration problems carry a token */
+  anole_server *x = NULL;
+  anole_server_options o = {sizeof o, LIT("{\"nope\": 1}"), 0, 0, NULL, NULL};
+  CHECK(anole_server_create(&o, &x) == ANOLE_E_CONFIG && name_is("UnknownKey"));
+  o.config_json = LIT("{");
+  CHECK(anole_server_create(&o, &x) == ANOLE_E_CONFIG && name_is("SyntaxError"));
+  o.config_json = LIT("{\"listeners\":[{\"port\":70000}]}");
+  CHECK(anole_server_create(&o, &x) == ANOLE_E_CONFIG);
+
+  /* an address in use: the listener, the token and the OS error */
+  int blocker = socket(AF_INET, SOCK_STREAM, 0);
+  CHECK(blocker >= 0);
+  struct sockaddr_in a = {0};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  CHECK(bind(blocker, (struct sockaddr *)&a, sizeof a) == 0 && listen(blocker, 1) == 0);
+  socklen_t alen = sizeof a;
+  CHECK(getsockname(blocker, (struct sockaddr *)&a, &alen) == 0);
+  uint16_t taken = ntohs(a.sin_port);
+  char json[512];
+  snprintf(json, sizeof json, "{\"listeners\":[{\"name\":\"api\",\"address\":\"127.0.0.1\",\"port\":%u}]}", taken);
+  anole_server *s = make_server(json);
+  CHECK(anole_server_start(s) == ANOLE_E_SYSTEM);
+  CHECK(name_is("AddressInUse") && anole_last_errno() == EADDRINUSE);
+  anole_str why = anole_last_error();
+  CHECK(why.len > 0 && memmem(why.ptr, why.len, "api", 3) != NULL);
+  anole_listener_info info = {sizeof info};
+  CHECK(anole_server_listener(s, 0, &info) == ANOLE_OK);
+  CHECK(info.state == ANOLE_LISTENER_FAILED && info.error_errno == EADDRINUSE && str_is(info.error_name, "AddressInUse"));
+  anole_server_destroy(s);
+  close(blocker);
+  s = make_server(json);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  stop_polled(s);
+
+  /* a file descriptor that is none */
+  anole_consumer *c = NULL;
+  s = hold_server(&c, 5000, 200, "");
+  pthread_t t;
+  async_req *r = start_get(port_of(s, 0), "/hold", &t);
+  anole_req h = next_request(c);
+  CHECK(anole_req_respond_fd(h, 200, NULL, 0, 1000000, 0, 0) == ANOLE_E_INVALID);
+  CHECK(anole_last_errno() == EBADF);
+  CHECK(anole_req_respond(h, 200, NULL, 0, "ok", 2, 0) == ANOLE_OK);
+  CHECK(finish_get(r, t, "ok") == 200);
+
+  /* ANOLE_E_TOOBIG says how big: a request with a big header */
+  {
+    int fd = dial(port_of(s, 0));
+    char head[6000];
+    int n = snprintf(head, sizeof head, "GET /hold HTTP/1.1\r\nHost: x\r\nX-Big: ");
+    memset(head + n, 'a', 5000);
+    n += 5000;
+    memcpy(head + n, "\r\n\r\n", 4);
+    n += 4;
+    CHECK(write(fd, head, (size_t)n) == n);
+    static _Alignas(8) unsigned char small[64], whole[64 * 1024];
+    int64_t rc = 0;
+    for (int i = 0; i < 400; i++) {
+      rc = anole_poll(c, small, sizeof small, 0);
+      if (rc != 0) break;
+      usleep(5000);
+    }
+    CHECK(rc == ANOLE_E_TOOBIG && name_is("TooBig"));
+    const anole_event *hdr = (const anole_event *)small;
+    CHECK(hdr->type == ANOLE_EV_NONE && hdr->handle == 0 && hdr->len >= 5000 && hdr->len % 8 == 0);
+    uint32_t need = hdr->len;
+    rc = anole_poll(c, whole, need, 0);
+    CHECK(rc == (int64_t)need && ((const anole_event *)whole)->len == need);
+    CHECK(anole_req_respond(((const anole_event *)whole)->handle, 200, NULL, 0, NULL, 0, 0) == ANOLE_OK);
+    close(fd);
+  }
+  stop_polled(s);
+
+  /* a publish to a server that is not running */
+  if (anole_has_feature(LIT("websocket"))) {
+    s = make_server("{\"listeners\":[{\"port\":0}]}");
+    CHECK(anole_ws_publish(s, LIT("t"), ANOLE_WS_TEXT, "x", 1, 0) == ANOLE_E_STATE && name_is("NotRunning"));
+    anole_server_destroy(s);
+  }
+  printf("ok error identity: tokens, errno, the failing listener, TOOBIG sizes\n");
+}
+
+static void test_abort_reasons(void) {
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 300, "");
+  uint16_t port = port_of(s, 0);
+  pthread_t t;
+
+  /* a deadline: 504, and the consumer hears why */
+  async_req *a = start_get(port, "/short", &t);
+  anole_req h = next_request(c);
+  CHECK(finish_get(a, t, NULL) == 504);
+  const anole_abort_event *ab = (const anole_abort_event *)next_event(c, ANOLE_EV_ABORT);
+  CHECK(ab->ev.len == 24 && ab->ev.handle == h && ab->reason == ANOLE_ABORT_DEADLINE && ab->status == 504);
+
+  /* the client leaves while the request is out */
+  conn_reader cr = {0};
+  cr.fd = dial(port);
+  send_request(cr.fd, "GET", "/hold", NULL, 0);
+  h = next_request(c);
+  close(cr.fd);
+  ab = (const anole_abort_event *)next_event(c, ANOLE_EV_ABORT);
+  CHECK(ab->ev.handle == h && ab->reason == ANOLE_ABORT_CLIENT && ab->status == 0);
+
+  /* a streamed body past body_max */
+  int fd = dial(port);
+  const char *head = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+  CHECK(write(fd, head, strlen(head)) == (ssize_t)strlen(head));
+  static char chunk[8000];
+  memset(chunk, 'b', sizeof chunk);
+  for (int i = 0; i < 5; i++) {
+    char size[32];
+    int n = snprintf(size, sizeof size, "%x\r\n", (unsigned)sizeof chunk);
+    if (write(fd, size, (size_t)n) != n) break;
+    if (write(fd, chunk, sizeof chunk) != (ssize_t)sizeof chunk) break;
+    if (write(fd, "\r\n", 2) != 2) break;
+  }
+  h = next_request(c);
+  ab = (const anole_abort_event *)next_event(c, ANOLE_EV_ABORT);
+  CHECK(ab->ev.handle == h && ab->reason == ANOLE_ABORT_BODY && ab->status == 413);
+  close(fd);
+  stop_polled(s);
+
+  /* the drain's deadline cuts a request nobody answered */
+  s = hold_server(&c, 5000, 200, "");
+  port = port_of(s, 0);
+  cr.fd = dial(port);
+  send_request(cr.fd, "GET", "/hold", NULL, 0);
+  h = next_request(c);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  ab = (const anole_abort_event *)next_event(c, ANOLE_EV_ABORT);
+  CHECK(ab->ev.handle == h && ab->reason == ANOLE_ABORT_DRAIN);
+  close(cr.fd);
+  CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok abort reasons: deadline, client, body, drain\n");
+}
+
+static void test_sent_once(void) {
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 300, "");
+  uint16_t port = port_of(s, 0);
+  pthread_t t;
+  static const char body[] = "a borrowed body";
+  const uint64_t addr = (uint64_t)(uintptr_t)body;
+
+  /* a borrowed whole answer, then an empty one: one SENT each */
+  async_req *a = start_get(port, "/hold", &t);
+  anole_req h = next_request(c);
+  CHECK(anole_req_respond(h, 200, text_plain, 1, body, sizeof body - 1, ANOLE_BODY_BORROW) == ANOLE_OK);
+  CHECK(finish_get(a, t, "borrowed") == 200);
+  const anole_sent_event *se = (const anole_sent_event *)next_event(c, ANOLE_EV_SENT);
+  CHECK(se->data == addr && se->len == sizeof body - 1);
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  CHECK(anole_req_respond(h, 200, text_plain, 1, body, 0, ANOLE_BODY_BORROW) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 200);
+  se = (const anole_sent_event *)next_event(c, ANOLE_EV_SENT);
+  CHECK(se->data == addr && se->len == 0);
+
+  /* a streamed answer: a borrowed write and an empty borrowed write */
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  CHECK(anole_req_stream_start(h, 200, text_plain, 1) == ANOLE_OK);
+  CHECK(anole_req_stream_write(h, body, 8, ANOLE_BODY_BORROW) == ANOLE_OK);
+  CHECK(anole_req_stream_write(h, body + 8, 0, ANOLE_BODY_BORROW) == ANOLE_OK);
+  CHECK(anole_req_stream_end(h, NULL, 0) == ANOLE_OK);
+  CHECK(finish_get(a, t, "a borrowe") == 200);
+  int seen_data = 0, seen_empty = 0;
+  for (int i = 0; i < 2; i++) {
+    se = (const anole_sent_event *)next_event(c, ANOLE_EV_SENT);
+    if (se->data == addr && se->len == 8) seen_data++;
+    if (se->data == addr + 8 && se->len == 0) seen_empty++;
+  }
+  CHECK(seen_data == 1 && seen_empty == 1);
+  CHECK(count_events(c, ANOLE_EV_SENT, 100) == 0);
+
+  /* a borrowed answer on a stale handle takes nothing and produces nothing */
+  CHECK(anole_req_respond(h, 200, NULL, 0, body, 4, ANOLE_BODY_BORROW) == ANOLE_E_GONE);
+  CHECK(count_events(c, ANOLE_EV_SENT, 100) == 0);
+
+  /* the client leaves first: one SENT if the call was taken, none if not */
+  conn_reader cr = {0};
+  cr.fd = dial(port);
+  send_request(cr.fd, "GET", "/hold", NULL, 0);
+  h = next_request(c);
+  close(cr.fd);
+  usleep(100 * 1000);
+  int rc = anole_req_respond(h, 200, text_plain, 1, body, sizeof body - 1, ANOLE_BODY_BORROW);
+  CHECK(rc == ANOLE_OK || rc == ANOLE_E_GONE);
+  CHECK(count_events(c, ANOLE_EV_SENT, 300) == (rc == ANOLE_OK ? 1 : 0));
+  stop_polled(s);
+  printf("ok SENT: exactly one per borrowing call that was taken\n");
+}
+
+static void test_listener_info(void) {
+  int quic = anole_has_feature(LIT("tls")) && anole_has_feature(LIT("http3"));
+  const char *json = quic ? "{\"listeners\":[{\"name\":\"plain\",\"address\":\"127.0.0.1\",\"port\":0},"
+                            "{\"name\":\"secure\",\"address\":\"127.0.0.1\",\"port\":0,\"tls\":{\"self_signed\":true},\"http3\":true}]}"
+                          : "{\"listeners\":[{\"name\":\"plain\",\"address\":\"127.0.0.1\",\"port\":0}]}";
+  anole_server *s = make_server(json);
+  uint32_t n = anole_server_listener_count(s);
+  CHECK(n == (quic ? 2u : 1u));
+  anole_listener_info info = {sizeof info};
+  for (uint32_t i = 0; i < n; i++) {
+    CHECK(anole_server_listener(s, i, &info) == ANOLE_OK);
+    CHECK(info.state == ANOLE_LISTENER_PENDING && info.port == 0 && info.udp_port == 0);
+    CHECK(str_is(info.address, "127.0.0.1:0"));
+  }
+  CHECK(anole_server_listener(s, n, &info) == ANOLE_E_INVALID);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  CHECK(anole_server_listener(s, 0, &info) == ANOLE_OK);
+  CHECK(info.state == ANOLE_LISTENER_LISTENING && info.port != 0 && info.udp_port == 0);
+  CHECK(str_is(info.name, "plain") && (info.flags & ANOLE_LISTENER_F_HTTP1));
+  char want[32];
+  snprintf(want, sizeof want, "127.0.0.1:%u", info.port);
+  CHECK(str_is(info.address, want));
+  CHECK(info.error_errno == 0 && info.error_name.len == 0);
+  if (quic) {
+    CHECK(anole_server_listener(s, 1, &info) == ANOLE_OK);
+    CHECK(info.state == ANOLE_LISTENER_LISTENING && info.port != 0 && info.udp_port != 0);
+    CHECK((info.flags & ANOLE_LISTENER_F_TLS) && (info.flags & ANOLE_LISTENER_F_HTTP3));
+  }
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+  for (uint32_t i = 0; i < n; i++) {
+    CHECK(anole_server_listener(s, i, &info) == ANOLE_OK);
+    CHECK(info.state == ANOLE_LISTENER_CLOSED);
+  }
+  anole_server_destroy(s);
+  printf("ok listener info: states, ports, flags\n");
+}
+
+static void test_open_before_start(void) {
+  int have_sqlite = anole_has_feature(LIT("sqlite"));
+  const char *json = have_sqlite
+                         ? "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                           "\"databases\":[{\"name\":\"d\",\"sqlite\":{\"path\":\":memory:\"}}],"
+                           "\"observe\":{\"health\":{\"checks\":[\"app\"]}}}"
+                         : "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                           "\"observe\":{\"health\":{\"checks\":[\"app\"]}}}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  CHECK(anole_server_open(s) == ANOLE_OK);
+  CHECK(anole_server_open(s) == ANOLE_E_STATE);
+  anole_listener_info info = {sizeof info};
+  CHECK(anole_server_listener(s, 0, &info) == ANOLE_OK && info.state == ANOLE_LISTENER_PENDING && info.port == 0);
+  if (have_sqlite) {
+    anole_db *d = NULL;
+    CHECK(anole_db_find(s, LIT("d"), &d) == ANOLE_OK);
+    CHECK(anole_db_exec(d, c, LIT("create table t(x)"), NULL, 0, NULL, 7) == ANOLE_OK);
+    const anole_db_result_event *res = (const anole_db_result_event *)next_event(c, ANOLE_EV_DB_RESULT);
+    CHECK(res->user_data == 7 && res->status == ANOLE_OK);
+  }
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  uint16_t port = port_of(s, 0);
+  CHECK(port != 0);
+  response r;
+  response_init(&r);
+  request(port, "GET", "/readyz", NULL, &r);
+  CHECK(r.status == 503 && strstr(r.body, "app") != NULL);
+  CHECK(anole_server_set_ready(s, LIT("app"), 1) == ANOLE_OK);
+  request(port, "GET", "/readyz", NULL, &r);
+  CHECK(r.status == 200);
+  CHECK(anole_server_set_ready(s, LIT("nope"), 1) == ANOLE_E_INVALID && name_is("UnknownCheck"));
+  response_free(&r);
+  stop_polled(s);
+
+  /* opened, never started: destroy binds nothing and frees everything */
+  s = polled_server(json, &c);
+  CHECK(anole_server_open(s) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok anole_server_open: databases before traffic, readiness checks, destroy after open\n");
+}
+
+static void *destroy_thread(void *arg) {
+  anole_server_destroy(arg);
+  return NULL;
+}
+
+static void test_destroy_on_consumer_thread(void) {
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 10000, "");
+  uint16_t port = port_of(s, 0);
+  /* one request never answered, one streaming */
+  conn_reader c1 = {0}, c2 = {0};
+  c1.fd = dial(port);
+  send_request(c1.fd, "GET", "/hold", NULL, 0);
+  (void)next_request(c);
+  c2.fd = dial(port);
+  send_request(c2.fd, "GET", "/hold", NULL, 0);
+  anole_req hs = next_request(c);
+  CHECK(anole_req_stream_start(hs, 200, text_plain, 1) == ANOLE_OK);
+  CHECK(anole_req_stream_write(hs, "a", 1, 0) == ANOLE_OK);
+  response head;
+  response_init(&head);
+  read_response(&c2, &head, 1);
+  CHECK(head.status == 200);
+  response_free(&head);
+  /* destroy without a drain, from a thread that is not Anole's */
+  double t0 = now_ms();
+  pthread_t t;
+  CHECK(pthread_create(&t, NULL, destroy_thread, s) == 0);
+  pthread_join(t, NULL);
+  CHECK(now_ms() - t0 < 2000);
+  response r1;
+  response_init(&r1);
+  read_response(&c1, &r1, 0);
+  CHECK(r1.status == 503);
+  response_free(&r1);
+  char tmp[256];
+  ssize_t k;
+  while ((k = read(c2.fd, tmp, sizeof tmp)) > 0) {
+  }
+  CHECK(k == 0);
+  close(c1.fd);
+  close(c2.fd);
+  printf("ok destroy without a drain answers what is owed at once (%.0f ms)\n", now_ms() - t0);
+}
+
+static void test_log_callback_per_server(void) {
+  int before = atomic_load(&log_lines);
+  anole_server *a = make_server("{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}]}");
+  CHECK(anole_server_start(a) == ANOLE_OK);
+  stop_polled(a);
+  int after_a = atomic_load(&log_lines);
+  CHECK(after_a > before);
+  /* a later server without a callback logs to stderr, not to the old one */
+  anole_server_options o = {sizeof o, LIT("{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"limits\":{\"max_inflight\":16}}"), 0, ANOLE_LOG_INFO, NULL, NULL};
+  anole_server *b = NULL;
+  CHECK(anole_server_create(&o, &b) == ANOLE_OK);
+  CHECK(anole_server_start(b) == ANOLE_OK);
+  stop_polled(b);
+  CHECK(atomic_load(&log_lines) == after_a);
+  printf("ok the log callback belongs to its server\n");
+}
+
+static pthread_t sig_main;
+static atomic_int sig_count, sig_wrong;
+static void on_usr1(int sig) {
+  (void)sig;
+  atomic_fetch_add(&sig_count, 1);
+  if (!pthread_equal(pthread_self(), sig_main)) atomic_fetch_add(&sig_wrong, 1);
+}
+
+static void test_signals_stay_off_anole_threads(void) {
+  sig_main = pthread_self();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = on_usr1;
+  sigemptyset(&sa.sa_mask);
+  CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 200, "");
+  for (int i = 0; i < 50; i++) {
+    CHECK(kill(getpid(), SIGUSR1) == 0);
+    usleep(1000);
+  }
+  CHECK(atomic_load(&sig_wrong) == 0 && atomic_load(&sig_count) == 50);
+  stop_polled(s);
+  signal(SIGUSR1, SIG_DFL);
+  printf("ok signals never run on Anole's threads\n");
+}
+
+static void test_fork_child(void) {
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 200, "");
+  uint16_t port = port_of(s, 0);
+  pthread_t t;
+  async_req *a = start_get(port, "/hold", &t);
+  anole_req old = next_request(c);
+  fflush(stdout);
+  pid_t pid = fork();
+  CHECK(pid >= 0);
+  if (pid == 0) {
+    alarm(10);
+    if (anole_server_drain(s) != ANOLE_E_STATE) _exit(1);
+    if (anole_server_listener_count(s) != 0) _exit(2);
+    if (anole_handle_release(old) != ANOLE_OK) _exit(3);
+    anole_server *own = NULL;
+    anole_server_options o = {sizeof o, LIT("{}"), 0, 0, NULL, NULL};
+    if (anole_server_create(&o, &own) != ANOLE_OK) _exit(4);
+    _exit(0);
+  }
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  /* the parent's server still serves */
+  CHECK(anole_req_respond(old, 200, NULL, 0, "still", 5, 0) == ANOLE_OK);
+  CHECK(finish_get(a, t, "still") == 200);
+  stop_polled(s);
+  printf("ok a forked child cannot use its parent's server and may create its own\n");
+}
+
+static void test_consumer_without_executor(void) {
+  anole_server *s = make_server("{\"executors\":1,\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],"
+                                "\"routes\":[{\"path\":\"/x\",\"handler\":1}]}");
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  anole_consumer *c1 = NULL, *c2 = NULL;
+  CHECK(anole_consumer_attach(s, &co, &c1) == ANOLE_OK);
+  CHECK(anole_consumer_attach(s, &co, &c2) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_E_STATE && name_is("ConsumerWithoutExecutor"));
+  anole_server_destroy(s);
+  printf("ok a consumer that would get no executor is refused at start\n");
+}
+
+static atomic_int wake_a, wake_b;
+static void on_wake_a(void *ud) {
+  (void)ud;
+  atomic_fetch_add(&wake_a, 1);
+}
+static void on_wake_b(void *ud) {
+  (void)ud;
+  atomic_fetch_add(&wake_b, 1);
+}
+
+static void test_set_wake(void) {
+  char json[2048];
+  snprintf(json, sizeof json, HOLD_CONFIG, 5000, 200, "");
+  anole_server *s = make_server(json);
+  anole_consumer_options co = {sizeof co, on_wake_a, NULL, 0};
+  anole_consumer *c = NULL;
+  CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+  CHECK(anole_consumer_fd(c) == -1);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  uint16_t port = port_of(s, 0);
+  conn_reader c1 = {0}, c2 = {0}, c3 = {0};
+  c1.fd = dial(port);
+  send_request(c1.fd, "GET", "/hold", NULL, 0);
+  CHECK(wait_for(&wake_a, 1));
+  (void)next_request(c);
+  /* the doorbell fd instead of the callback */
+  CHECK(anole_consumer_set_wake(c, NULL, NULL) == ANOLE_OK);
+  int a_before = atomic_load(&wake_a);
+  intptr_t fd = anole_consumer_fd(c);
+  CHECK(fd >= 0);
+  c2.fd = dial(port);
+  send_request(c2.fd, "GET", "/hold", NULL, 0);
+  struct pollfd p = {(int)fd, POLLIN, 0};
+  CHECK(poll(&p, 1, 3000) == 1);
+  (void)next_request(c);
+  CHECK(atomic_load(&wake_a) == a_before);
+  /* and another callback */
+  CHECK(anole_consumer_set_wake(c, on_wake_b, NULL) == ANOLE_OK);
+  CHECK(anole_consumer_fd(c) == -1);
+  c3.fd = dial(port);
+  send_request(c3.fd, "GET", "/hold", NULL, 0);
+  CHECK(wait_for(&wake_b, 1));
+  CHECK(atomic_load(&wake_a) == a_before);
+  (void)next_request(c);
+  close(c1.fd);
+  close(c2.fd);
+  close(c3.fd);
+  stop_polled(s);
+  printf("ok anole_consumer_set_wake: callback to fd to another callback\n");
+}
+
+/* The WebSocket side: ANOLE_EV_WRITABLE signals room (no event 9), and a
+   borrowed send is reported once. */
+static void test_ws_writable_and_sent(void) {
+  if (!have_websocket) return;
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                     "\"limits\":{\"ws_high_water\":65536,\"ws_max_message\":1048576},"
+                     "\"routes\":[{\"path\":\"/ws\",\"websocket\":{\"handler\":10}}]}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  conn_reader cr;
+  ws_connect(&cr, port_of(s, 0));
+  const anole_event *open = next_event(c, ANOLE_EV_WS_OPEN);
+  anole_ws w = open->handle;
+
+  /* a borrowed send is reported sent exactly once */
+  static const char hello[] = "hello, borrowed";
+  CHECK(anole_ws_send(w, ANOLE_WS_TEXT, hello, sizeof hello - 1, ANOLE_BODY_BORROW) == ANOLE_OK);
+  char out[70000];
+  size_t len = 0;
+  CHECK(ws_read_frame(&cr, out, sizeof out, &len) == 1 && len == sizeof hello - 1);
+  const anole_sent_event *se = (const anole_sent_event *)next_event(c, ANOLE_EV_SENT);
+  CHECK(se->data == (uint64_t)(uintptr_t)hello && se->len == sizeof hello - 1);
+
+  /* past the high-water mark: BUSY, then ANOLE_EV_WRITABLE for the socket */
+  static char blob[60000];
+  memset(blob, 'w', sizeof blob);
+  int sent = 0;
+  anole_status rc = ANOLE_OK;
+  while (rc == ANOLE_OK && sent < 400) {
+    rc = anole_ws_send(w, ANOLE_WS_BINARY, blob, sizeof blob, 0);
+    CHECK(rc == ANOLE_OK || rc == ANOLE_BUSY);
+    sent++;
+  }
+  CHECK(rc == ANOLE_BUSY);
+  /* the client reads everything; the room signal arrives as WRITABLE */
+  for (int i = 0; i < sent; i++) {
+    CHECK(ws_read_frame(&cr, out, sizeof out, &len) == 2 && len == sizeof blob);
+  }
+  static _Alignas(8) unsigned char buf[64 * 1024];
+  int writable = 0;
+  for (int tries = 0; tries < 100 && !writable; tries++) {
+    int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      CHECK(ev->type != 9); /* retired */
+      if (ev->type == ANOLE_EV_WRITABLE && ev->handle == w) writable = 1;
+      off += ev->len;
+    }
+  }
+  CHECK(writable);
+  close(cr.fd);
+  stop_polled(s);
+  printf("ok WebSocket: WRITABLE signals room, borrowed sends are reported once\n");
 }
 
 /* A hang fails the run instead of holding CI until the job's timeout: the
@@ -2422,6 +3233,20 @@ static int run_tests(void) {
   test_db_mongodb();
   test_webtransport();
   test_tls();
+  test_abi07_rules();
+  test_cleanup_rules();
+  test_error_identity();
+  test_abort_reasons();
+  test_sent_once();
+  test_listener_info();
+  test_open_before_start();
+  test_destroy_on_consumer_thread();
+  test_log_callback_per_server();
+  test_signals_stay_off_anole_threads();
+  test_fork_child();
+  test_consumer_without_executor();
+  test_set_wake();
+  test_ws_writable_and_sent();
   printf("PASS\n");
   return 0;
 }
@@ -2437,12 +3262,12 @@ static void bench_event(consumer_state *cs, const anole_event *ev) {
     anole_str id = param_of(r, "id");
     char out[128];
     int n = snprintf(out, sizeof out, "user %.*s", (int)id.len, id.ptr);
-    anole_respond(h, 200, text_plain, 1, out, (size_t)n, 0);
+    anole_req_respond(h, 200, text_plain, 1, out, (size_t)n, 0);
   } else if (r->route_id == R_ECHO) {
     anole_str b = anole_event_str(r, r->body);
-    anole_respond(h, 200, text_plain, 1, b.ptr, b.len, 0);
+    anole_req_respond(h, 200, text_plain, 1, b.ptr, b.len, 0);
   } else {
-    anole_respond(h, 200, text_plain, 1, "Hello, World!", 13, 0);
+    anole_req_respond(h, 200, text_plain, 1, "Hello, World!", 13, 0);
   }
 }
 

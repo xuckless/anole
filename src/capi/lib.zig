@@ -441,10 +441,10 @@ fn reloadFailure(err: anyerror, cert_path: ?[]const u8, key_path: ?[]const u8) i
         } else if (key_path != null and !fileReadable(key_path.?)) which = "KeyFileUnreadable";
         return named(abi.E_SYSTEM, which, engine.errorErrno(err), "anole_server_reload_tls: {t}", .{err});
     }
-    if (std.mem.eql(u8, token, "InvalidCertificate") or std.mem.eql(u8, token, "InvalidKey") or
-        std.mem.eql(u8, token, "KeyMismatch") or std.mem.eql(u8, token, "InvalidClientCa"))
-        return named(abi.E_INVALID, token, 0, "anole_server_reload_tls: {t}", .{err});
-    return named(abi.E_SYSTEM, token, engine.errorErrno(err), "anole_server_reload_tls: {t}", .{err});
+    // The OS refusing is the system's; anything else did not load.
+    if (err == error.SystemResources or err == error.ProcessFdQuotaExceeded or err == error.SystemFdQuotaExceeded)
+        return named(abi.E_SYSTEM, token, engine.errorErrno(err), "anole_server_reload_tls: {t}", .{err});
+    return named(abi.E_INVALID, token, 0, "anole_server_reload_tls: {t}", .{err});
 }
 
 fn fileReadable(path: []const u8) bool {

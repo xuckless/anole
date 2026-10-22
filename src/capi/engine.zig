@@ -1119,6 +1119,14 @@ pub const Engine = struct {
         e.io = app.io();
         const nexec = app.rt.executors.items.len;
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
+        // Executor e feeds consumer e mod M: one past the executors would
+        // never get an event.
+        if (e.consumers.items.len > nexec) {
+            var w: std.Io.Writer = .fixed(&e.start_why);
+            w.print("{d} consumers but only {d} executors: consumer {d} would get no events", .{ e.consumers.items.len, nexec, nexec }) catch {};
+            e.start_why_len = w.end;
+            return e.failStartDeinit(&app, error.ConsumerWithoutExecutor);
+        }
         e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
         // The routes come from the configuration: a conflict between them
         // is ANOLE_E_CONFIG, not a panic in the host process. Those Anole
