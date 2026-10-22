@@ -458,6 +458,13 @@ pub fn build(b: *std.Build) void {
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
+    // The C ABI's configuration schema, for the test that keeps it in step
+    // with src/capi/config.zig.
+    {
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
+        tests.root_module.addAnonymousImport("anole_capi_schema", .{ .root_source_file = wf.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
+    }
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
@@ -499,7 +506,7 @@ pub fn build(b: *std.Build) void {
     // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
     // HTTP/3 detached answers, the configuration parser).
     {
-        const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: the defaults" }, .use_llvm = use_llvm });
+        const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
         b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
     }
 

@@ -512,3 +512,70 @@ test "parse: the defaults, a full document, and what is refused" {
         try std.testing.expect(why.buffered().len > 0);
     }
 }
+
+test "parse: include/anole.schema.json names every field Config has, and no other" {
+    const text = @import("anole_capi_schema").text;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+    const defs = root.object.get("$defs").?.object;
+    try SchemaCheck.walk(Config, root, defs);
+}
+
+const SchemaCheck = struct {
+    fn resolve(node: std.json.Value, defs: std.json.ObjectMap) std.json.Value {
+        var n = node;
+        while (true) {
+            if (n.object.get("$ref")) |r| {
+                n = defs.get(r.string["#/$defs/".len..]).?;
+                continue;
+            }
+            if (n.object.get("anyOf")) |any| {
+                n = any.array.items[0];
+                continue;
+            }
+            return n;
+        }
+    }
+
+    fn walk(comptime T: type, node_in: std.json.Value, defs: std.json.ObjectMap) error{SchemaOutOfDate}!void {
+        if (T == std.json.Value) return;
+        const node = resolve(node_in, defs);
+        switch (@typeInfo(T)) {
+            .optional => |o| return walk(o.child, node, defs),
+            .pointer => |p| if (p.child != u8) return walk(p.child, node.object.get("items").?, defs),
+            .@"struct" => |s| {
+                if (T == std.json.Value or T == std.json.ArrayHashMap([]const u8)) return;
+                const props = node.object.get("properties") orelse {
+                    std.debug.print("schema: no properties for {s}\n", .{@typeName(T)});
+                    return error.SchemaOutOfDate;
+                };
+                if (props.object.count() != s.field_names.len) {
+                    std.debug.print("schema: {s} has {d} fields, the schema {d}\n", .{ @typeName(T), s.field_names.len, props.object.count() });
+                    return error.SchemaOutOfDate;
+                }
+                inline for (s.field_names, s.field_types) |name, FT| {
+                    const p = props.object.get(name) orelse {
+                        std.debug.print("schema: {s}.{s} missing\n", .{ @typeName(T), name });
+                        return error.SchemaOutOfDate;
+                    };
+                    try walk(FT, p, defs);
+                }
+            },
+            .@"union" => |u| {
+                const variants = node.object.get("oneOf").?.array.items;
+                if (variants.len != u.field_names.len) return error.SchemaOutOfDate;
+                inline for (u.field_names, u.field_types) |name, FT| {
+                    const v = for (variants) |v| {
+                        if (v.object.get("properties").?.object.get(name)) |p| break p;
+                    } else {
+                        std.debug.print("schema: middleware {s} missing\n", .{name});
+                        return error.SchemaOutOfDate;
+                    };
+                    try walk(FT, v, defs);
+                }
+            },
+            else => {},
+        }
+    }
+};
