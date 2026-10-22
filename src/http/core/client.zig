@@ -264,7 +264,24 @@ const TlsRef = struct {
 
 /// Parse a URL string into a std.Uri.
 fn parseUrl(url: []const u8) !Uri {
-    return Uri.parse(url) catch return error.InvalidUrl;
+    const uri = Uri.parse(url) catch return error.InvalidUrl;
+    try checkRequestTarget(uri);
+    return uri;
+}
+
+/// The path and query go into the request line (or `:path`) as they are,
+/// so they may hold only the visible ASCII a request target allows:
+/// `std.Uri.parse` lets through spaces, controls (CR, LF) and bytes past
+/// 0x7f. Percent-encode those. Checked when a URL is parsed and again
+/// before every request line, for redirect targets too.
+fn checkRequestTarget(uri: Uri) error{InvalidUrl}!void {
+    if (!isTargetText(uri.path.percent_encoded)) return error.InvalidUrl;
+    if (uri.query) |query| if (!isTargetText(query.percent_encoded)) return error.InvalidUrl;
+}
+
+fn isTargetText(bytes: []const u8) bool {
+    for (bytes) |b| if (b <= 0x20 or b >= 0x7f) return false;
+    return true;
 }
 
 /// Get port and protocol from URI.
@@ -1522,6 +1539,7 @@ pub const Client = struct {
     fn sendRequestH2(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
         if (comptime !has_h2_client) unreachable;
         try http.validateHeaderValue(host);
+        try checkRequestTarget(state.uri);
         const arena = conn.arena.allocator();
         const path = uriPath(state.uri);
         var fields: H2Fields = .{ .arena = arena };
@@ -1640,6 +1658,7 @@ const WriteUpgradeRequestOptions = struct {
 /// the connection so it can only report the sentinel, which is the caller's
 /// to resolve -- the same split `writeRequest` has.
 fn writeUpgradeRequest(writer: *std.Io.Writer, opts: WriteUpgradeRequestOptions) !void {
+    try checkRequestTarget(opts.uri);
     const path = uriPath(opts.uri);
     if (opts.uri.query) |query| {
         try writer.print("GET {s}?{s} HTTP/1.1\r\n", .{ path, query.percent_encoded });
@@ -1682,6 +1701,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     try http.validateHeaderValue(opts.host);
 
     // Request line - path with query
+    try checkRequestTarget(opts.uri);
     const path = uriPath(opts.uri);
     if (opts.uri.query) |query| {
         try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ opts.method.name(), path, query.percent_encoded });
@@ -2751,6 +2771,59 @@ test "writeRequest: does not override user-provided Referer" {
     const written = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Referer: http://custom.example.com/\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "http://example.com/old") == null);
+}
+
+test "writeRequest: refuses a path or query with bytes a request target cannot hold" {
+    const bad = [_][]const u8{
+        "http://example.com/a\r\nX-Injected: 1",
+        "http://example.com/search?q=a\r\n\r\nGET /admin HTTP/1.1",
+        "http://example.com/a b",
+        "http://example.com/?q=a b",
+        "http://example.com/\x00",
+        "http://example.com/\x7f",
+        "http://example.com/caf\xc3\xa9",
+    };
+    for (bad) |url| {
+        // Refused when parsed, or else when written.
+        const uri = parseUrl(url) catch |err| {
+            try std.testing.expectEqual(error.InvalidUrl, err);
+            continue;
+        };
+        var buf: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try std.testing.expectError(error.InvalidUrl, writeRequest(&writer, .{
+            .method = .get,
+            .uri = uri,
+            .host = "example.com",
+            .port = 80,
+            .protocol = .http,
+        }));
+    }
+    // Percent-encoded, the same bytes are fine.
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = try parseUrl("http://example.com/caf%C3%A9?q=a%0D%0Ab+c"),
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+    });
+    try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "GET /caf%C3%A9?q=a%0D%0Ab+c HTTP/1.1\r\n"));
+}
+
+test "writeUpgradeRequest: refuses a path or query with bytes a request target cannot hold" {
+    const uri: Uri = .{ .scheme = "ws", .host = .{ .percent_encoded = "example.com" }, .path = .{ .percent_encoded = "/chat" }, .query = .{ .percent_encoded = "room=1\r\nX: y" } };
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(error.InvalidUrl, writeUpgradeRequest(&writer, .{
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .headers = null,
+    }));
 }
 
 test "redirect: Referer strips userinfo and fragment" {

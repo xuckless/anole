@@ -17,6 +17,11 @@ breaking changes are listed anyway.
   final one. Past either the stream fails with `error.HeadersTooLarge` or
   `error.TooManyInterimResponses` (new members of `StreamError`). The HTTP/2
   client also reads a final response that follows a 1xx correctly now.
+- HTTP client: a URL whose path or query holds a space, a control
+  character or a byte past 0x7f is refused with `error.InvalidUrl`, for
+  `fetch`, redirects, WebSocket upgrades and HTTP/2 alike, instead of being
+  written into the request line. Percent-encode such bytes; URLs that
+  carried raw UTF-8 now fail (breaking).
 
 ### C ABI (ABI 0.1)
 

@@ -98,6 +98,12 @@ defer response.deinit();
 Other `FetchOptions`: `max_redirects`, `timeout`, `decompress`, `stream`, and
 `unix_socket_path` (for a server on a Unix socket, such as Docker's).
 
+The URL's path and query go into the request as they are, so they must be
+percent-encoded: a space, a control character (CR and LF among them) or a
+byte past 0x7f in either fails the request with `error.InvalidUrl`, and so
+does a redirect to such a URL. Build query strings from data with
+`std.Uri.Component.percentEncode` or an equivalent, never by pasting it in.
+
 `ClientConfig.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
 ALPN on HTTPS connections. A server that picks it gets the request over
 HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
