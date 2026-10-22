@@ -748,7 +748,7 @@ pub const Conn = struct {
     }
 
     /// Gives the writer back, for the next call or transaction.
-    pub fn release(self: Conn) void {
+    pub fn release(self: *const Conn) void {
         self.db.unlockWriter(self.io);
     }
 };
