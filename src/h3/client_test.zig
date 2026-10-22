@@ -1025,10 +1025,19 @@ pub const Relay = struct {
             };
             r.mutex.lockUncancelable(r.io);
             r.client = dg.from;
+            // Per datagram, not per read: on Linux one read can bring a
+            // GRO batch of several.
+            var drop: u32 = 0;
             if (r.drop_up > 0) {
-                r.drop_up -= 1;
-                r.mutex.unlock(r.io);
-                continue;
+                var batch = dg;
+                var n: u32 = 0;
+                while (batch.next()) |_| n += 1;
+                drop = @min(n, r.drop_up);
+                r.drop_up -= drop;
+                if (drop == n) {
+                    r.mutex.unlock(r.io);
+                    continue;
+                }
             }
             const hold = if (r.answered) r.hold_ms else 0;
             if (hold > 0) r.hold_ms = 0;
@@ -1043,7 +1052,13 @@ pub const Relay = struct {
             }
             r.mutex.unlock(r.io);
             if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
-            while (dg.next()) |d| via.send(r.io, r.server, null, 0, d, d.len);
+            while (dg.next()) |d| {
+                if (drop > 0) {
+                    drop -= 1;
+                    continue;
+                }
+                via.send(r.io, r.server, null, 0, d, d.len);
+            }
         }
     }
 
