@@ -504,6 +504,59 @@ test "anole.App: an explicit 0.0.0.0 stays IPv4 only" {
     try checking.await(app.io());
 }
 
+test "anole.App: metrics and health only on the listener named for them" {
+    var app = try App.init(alloc, .{
+        .listeners = &.{
+            .{ .name = "public", .port = 0 },
+            .{ .name = "admin", .port = 0 },
+        },
+        .executors = .exact(1),
+    });
+    defer app.deinit();
+    _ = app.metrics(.{ .listener = "admin" });
+    _ = app.health(.{ .listener = "admin" });
+    app.get("/", struct {
+        fn h(_: *Request, res: *Response) !void {
+            res.body = "hi";
+        }
+    }.h);
+
+    const Check = struct {
+        fn status(io: std.Io, port: u16, path: []const u8) !u16 {
+            const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+            const stream = try to.connect(io, .{ .mode = .stream });
+            defer stream.close(io);
+            var wbuf: [256]u8 = undefined;
+            var w = stream.writer(io, &wbuf);
+            try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+            try w.interface.flush();
+            var rbuf: [4096]u8 = undefined;
+            var r = stream.reader(io, &rbuf);
+            var out: [8192]u8 = undefined;
+            var fw: std.Io.Writer = .fixed(&out);
+            _ = r.interface.streamRemaining(&fw) catch {};
+            return std.fmt.parseInt(u16, fw.buffered()[9..12], 10);
+        }
+
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const public = a.addresses()[0].ip.getPort();
+            const admin = a.addresses()[1].ip.getPort();
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, public, "/"));
+            try std.testing.expectEqual(@as(u16, 404), try status(io_, public, "/metrics"));
+            try std.testing.expectEqual(@as(u16, 404), try status(io_, public, "/readyz"));
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, admin, "/metrics"));
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, admin, "/readyz"));
+            try std.testing.expectEqual(@as(u16, 200), try status(io_, admin, "/healthz"));
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    try app.run();
+    try checking.await(app.io());
+}
+
 test "anole.App: an unsafe request marked as early data gets 425, HTTP/3 or not" {
     // No HTTP/3 here (a build without it does the same): the mark can come
     // from a proxy in front.

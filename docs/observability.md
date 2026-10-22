@@ -27,10 +27,14 @@ try health.addCheck("db", dbReady, &pool);
 // ... routes ...
 ```
 
-- `metrics(.{ .path, .http, .exclude })` returns the registry for metrics of
-  your own; `.http = false` leaves out the request metrics.
-- `health(.{ .healthz_path, .readyz_path })` returns the `Health` for
-  `addCheck`; readiness fails once the server drains.
+- `metrics(.{ .path, .http, .exclude, .listener })` returns the registry for
+  metrics of your own; `.http = false` leaves out the request metrics.
+- `health(.{ .healthz_path, .readyz_path, .listener })` returns the `Health`
+  for `addCheck`; readiness fails once the server drains.
+- `.listener` serves those routes only on the listener of that name (from
+  `Options.listeners`), and answers 404 on the others. Without it they are
+  on every listener, the public one included: see
+  [Keep them off the public port](#keep-them-off-the-public-port).
 - `tracing(.{ .endpoint, .service_name, .sample_all, .exclude, ... })`
   exports through the server's own client. The endpoint and the service
   name default to `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
@@ -70,6 +74,28 @@ var health = anole.observe.Health.init(.{});
 try health.addCheck("db", dbReady, &pool);
 health.registerOn(void, app.router, app.server);
 ```
+
+### Keep them off the public port
+
+`/metrics` lists every route pattern, the error names handlers return and
+the databases the app uses, and `/readyz` names the check that fails. That
+is for your scraper and load balancer, not for the internet. Serve them on
+an internal listener:
+
+```zig
+var app = try anole.App.init(gpa, .{ .listeners = &.{
+    .{ .name = "public", .address = "0.0.0.0", .port = 8080 },
+    .{ .name = "admin", .address = "127.0.0.1", .port = 9090 }, // or a private interface
+} });
+_ = app.metrics(.{ .listener = "admin" });
+_ = app.health(.{ .listener = "admin" });
+```
+
+Otherwise keep the whole port private (a firewall, the proxy not routing
+those paths), or put an authentication middleware in front with `use`:
+global middleware runs before these routes. By hand,
+`registry.serveOnListener(Ctx, router, "/metrics", "admin")` and
+`Health.init(.{ .listener = "admin" })` do the same.
 
 `app.use` copies each middleware, so the copies must not point at values
 that move: keep the exporter, registry and health values alive for as long

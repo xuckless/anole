@@ -302,9 +302,17 @@ pub const Registry = struct {
 
     /// Serves `render` at `path` ("/metrics" by convention) on `router`.
     /// Each registry serves its own metrics, so two servers in one process
-    /// can each have one. The registry must outlive the router.
+    /// can each have one. The registry must outlive the router. The route
+    /// names routes, errors and databases: serve it where only the scraper
+    /// reaches (`serveOnListener`).
     pub fn serveOn(self: *Registry, comptime Ctx: type, router: *dusty.Router(Ctx), path: []const u8) void {
-        common.serve(Ctx, router, path, Registry, self, handle);
+        common.serve(Ctx, router, path, Registry, self, handle, null);
+    }
+
+    /// `serveOn`, answering only on the listener called `listener`
+    /// (`req.listener.name`), and 404 on the others.
+    pub fn serveOnListener(self: *Registry, comptime Ctx: type, router: *dusty.Router(Ctx), path: []const u8, listener: ?[]const u8) void {
+        common.serve(Ctx, router, path, Registry, self, handle, listener);
     }
 
     fn handle(self: *Registry, _: *dusty.Request, res: *dusty.Response) anyerror!void {

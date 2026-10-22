@@ -92,6 +92,12 @@ breaking changes are listed anyway.
   sign-in codes, reset tokens and API keys. `access_log.format` drops it
   too; `formatLine` takes the option. Log consumers that parsed the query
   out of `path` need `log_query`.
+- `app.metrics(.{ .listener = "admin" })`, `app.health(.{ .listener = ... })`
+  (and `Registry.serveOnListener`, `Health.Options.listener`) serve
+  `/metrics`, `/healthz` and `/readyz` on one named listener only, 404
+  elsewhere. Without it they are on every listener, as before;
+  docs/observability.md now says how to keep them off the public port,
+  since they name routes, errors, databases and failing checks.
 
 ### C ABI (ABI 0.1)
 

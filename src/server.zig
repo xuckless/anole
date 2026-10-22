@@ -446,6 +446,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             client_registered: bool,
             metrics: ?*observe.metrics.Registry = null,
             metrics_path: []const u8 = "",
+            metrics_listener: ?[]const u8 = null,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -1616,7 +1617,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const extras = self.extras;
             if (extras.routes_added) return;
             extras.routes_added = true;
-            if (extras.metrics) |r| r.serveOn(Ctx, self.router, extras.metrics_path);
+            if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
             if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
         }
 
@@ -1643,6 +1644,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             http: bool = true,
             /// Paths the HTTP metrics leave out.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Serve `path` only on the listener of this name
+            /// (`Options.Listener.name`, an internal port the scraper
+            /// reaches), 404 on the others. Null: on every listener,
+            /// public ones included, and the metrics name routes, errors
+            /// and databases; then keep the port private or put auth
+            /// middleware in front (global `use` middleware runs first).
+            listener: ?[]const u8 = null,
         };
 
         /// Prometheus metrics at `/metrics`, with the HTTP request counts,
@@ -1657,6 +1665,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             r.* = .init(self.gpa, self.rt.io());
             self.extras.metrics = r;
             self.extras.metrics_path = opts.path;
+            self.extras.metrics_listener = opts.listener;
             if (opts.http) self.use(observe.metrics.HttpMetrics.init(r, .{ .exclude = opts.exclude }) catch @panic("OOM"));
             return r;
         }

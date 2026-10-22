@@ -41,6 +41,10 @@ pub const Health = struct {
         healthz_path: []const u8 = "/healthz",
         /// The readiness route.
         readyz_path: []const u8 = "/readyz",
+        /// Serve both only on the listener of this name (an internal port
+        /// the load balancer reaches), 404 on the others. `/readyz` names
+        /// the failing check. Null: every listener.
+        listener: ?[]const u8 = null,
     };
 
     /// No checks yet: `/readyz` passes until one is added or the server drains.
@@ -69,8 +73,8 @@ pub const Health = struct {
                 return s.busy.load(.acquire).draining;
             }
         }.f;
-        common.serve(Ctx, router, self.options.healthz_path, Health, self, healthz);
-        common.serve(Ctx, router, self.options.readyz_path, Health, self, readyz);
+        common.serve(Ctx, router, self.options.healthz_path, Health, self, healthz, self.options.listener);
+        common.serve(Ctx, router, self.options.readyz_path, Health, self, readyz, self.options.listener);
     }
 
     /// Whether the server `registerOn` was given has started to drain.
