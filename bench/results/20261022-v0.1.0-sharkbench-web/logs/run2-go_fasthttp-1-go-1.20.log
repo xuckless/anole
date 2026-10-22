@@ -1,0 +1,338 @@
+ -> Running 2 benchmarks:
+    - benchmark/web/go/fasthttp-1-go-1.20 (Default v1.20 / FastHTTP v1)
+    - benchmark/web/go/fasthttp-1-go-1.20 (Default v1.24 / FastHTTP v1)
+ -> Building image
+ Image data-web-data-source Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 588B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 345B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/debian:13-slim
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/rust:1.86
+#4 DONE 0.3s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 728B done
+#6 DONE 0.0s
+
+#7 [runtime 1/3] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#7 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#7 DONE 0.0s
+
+#8 [builder 1/5] FROM docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
+#8 resolve docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 0.0s done
+#8 DONE 0.1s
+
+#9 [builder 2/5] WORKDIR /app
+#9 CACHED
+
+#10 [runtime 2/3] COPY --from=builder /app/target/release/app /app
+#10 CACHED
+
+#11 [builder 4/5] COPY src ./src
+#11 CACHED
+
+#12 [builder 3/5] COPY Cargo.toml Cargo.lock ./
+#12 CACHED
+
+#13 [builder 5/5] RUN cargo build --release
+#13 CACHED
+
+#14 [runtime 3/3] COPY static ./static
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:443e4a74e3ca778552fa9cc2232f95a53e54cb5e09064ab072b0340ed39d7d6f done
+#15 exporting config sha256:33c0a732cb91a5f80636cea1c51ca80d7f3bbd22b21d35a38ef654eda7b511d1 done
+#15 exporting attestation manifest sha256:53488b8737ece699cc104e3ae1c55454333e9586a97772602ae1f8f91af6bf31 0.0s done
+#15 exporting manifest list sha256:a6d4b2ce731289539b71bb6661f9531f2e3c0cb5e456f35ac1c96b48ac8c0fc5
+#15 exporting manifest list sha256:a6d4b2ce731289539b71bb6661f9531f2e3c0cb5e456f35ac1c96b48ac8c0fc5 0.0s done
+#15 naming to docker.io/library/data-web-data-source:latest done
+#15 unpacking to docker.io/library/data-web-data-source:latest 0.0s done
+#15 DONE 0.1s
+
+#16 resolving provenance for metadata file
+#16 DONE 0.0s
+ Image data-web-data-source Built 
+ -> Dropping page cache
+ -> Starting container
+ Container web_data_source Creating 
+ Container web_data_source Created 
+ Container web_data_source Starting 
+ Container web_data_source Started 
+
+ -> [1/2] Benchmarking benchmark/web/go/fasthttp-1-go-1.20 (Default v1.20 / FastHTTP v1)
+ - Language: Go
+ - Mode: Default
+ - Language version: ["1.20", "1.24"]
+ - Language version regex: Default
+ - Framework: FastHTTP
+ - Framework stdlib: false
+ - Framework website: https://github.com/valyala/fasthttp
+ - Framework flavor: Default
+ - Framework version: ["1"]
+ - Framework version regex: "Default"
+ - Concurrency: None
+ - Copy: None
+
+ -> Copied benchmark/web/go/fasthttp-1-go-1.20 to tmp
+ -> Pulling golang:1.20
+1.20: Pulling from library/golang
+Digest: sha256:8f9af7094d0cb27cc783c697ac5ba25efdc4da35f8526db21f7aebb0b0b4f18a
+Status: Image is up to date for golang:1.20
+docker.io/library/golang:1.20
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 212B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/golang:1.20
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 143B done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [1/6] FROM docker.io/library/golang:1.20@sha256:8f9af7094d0cb27cc783c697ac5ba25efdc4da35f8526db21f7aebb0b0b4f18a
+#6 resolve docker.io/library/golang:1.20@sha256:8f9af7094d0cb27cc783c697ac5ba25efdc4da35f8526db21f7aebb0b0b4f18a
+#6 resolve docker.io/library/golang:1.20@sha256:8f9af7094d0cb27cc783c697ac5ba25efdc4da35f8526db21f7aebb0b0b4f18a 0.0s done
+#6 DONE 0.0s
+
+#7 [2/6] WORKDIR /app
+#7 CACHED
+
+#5 [internal] load build context
+#5 transferring context: 3.22kB done
+#5 DONE 0.0s
+
+#8 [3/6] COPY . .
+#8 DONE 0.1s
+
+#9 [4/6] RUN go get main
+#9 0.965 go: downloading github.com/valyala/fasthttp v1.54.0
+#9 0.965 go: downloading github.com/goccy/go-json v0.10.3
+#9 1.043 go: downloading github.com/klauspost/compress v1.17.7
+#9 1.043 go: downloading github.com/andybalholm/brotli v1.1.0
+#9 1.043 go: downloading github.com/valyala/bytebufferpool v1.0.0
+#9 DONE 2.7s
+
+#10 [5/6] RUN go build -o main .
+#10 DONE 8.0s
+
+#11 [6/6] RUN chmod +x main
+#11 DONE 0.2s
+
+#12 exporting to image
+#12 exporting layers
+#12 exporting layers 1.9s done
+#12 exporting manifest sha256:e5a3ca6e1c1c7de2e9ff896577609953179175d853e7bc8e9d9fb4d9450f2d82 0.0s done
+#12 exporting config sha256:382dcbb9d39a62ec0e5e724ac75830bdec7f52fd4ed247f477dfc9709f9ad0c0 0.0s done
+#12 exporting attestation manifest sha256:2b24c3c00e10548fe69610342927fa1a869163def2b790db088ff1081d3334a9 0.0s done
+#12 exporting manifest list sha256:c8482664753a1fedac3eafac5e299b7937ba9523c3459c7a94d347cb831df1da 0.0s done
+#12 naming to docker.io/library/tmp-benchmark:latest done
+#12 unpacking to docker.io/library/tmp-benchmark:latest
+#12 unpacking to docker.io/library/tmp-benchmark:latest 0.7s done
+#12 DONE 2.7s
+
+#13 resolving provenance for metadata file
+#13 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 14067 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Warmup]: Running...
+ -> [Warmup]: t = 15055 ms, RAM = 19.50 MB, {"rps_median": 4847, "rps_p99": 4739, "latency_median": 491, "latency_p99": 91392, "errors": 0}, {"success": 72568, "time": 15016}
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 15097 ms, RAM = 19.17 MB, {"rps_median": 4869, "rps_p99": 4771, "latency_median": 490, "latency_p99": 91592, "errors": 0}, {"success": 72657, "time": 15077}
+ -> [Run #2]: Running...
+ -> [Run #2]: t = 15098 ms, RAM = 20.38 MB, {"rps_median": 4927, "rps_p99": 4847, "latency_median": 486, "latency_p99": 91356, "errors": 0}, {"success": 74120, "time": 15079}
+ -> [Run #3]: Running...
+ -> [Run #3]: t = 15102 ms, RAM = 20.69 MB, {"rps_median": 5038, "rps_p99": 4938, "latency_median": 465, "latency_p99": 91186, "errors": 0}, {"success": 75863, "time": 15080}
+ -> [Run #4]: Running...
+ -> [Run #4]: t = 15096 ms, RAM = 20.60 MB, {"rps_median": 4976, "rps_p99": 4815, "latency_median": 474, "latency_p99": 91341, "errors": 0}, {"success": 74278, "time": 15077}
+ -> [Run #5]: Running...
+ -> [Run #5]: t = 15101 ms, RAM = 20.67 MB, {"rps_median": 4920, "rps_p99": 4789, "latency_median": 470, "latency_p99": 91364, "errors": 0}, {"success": 74474, "time": 15081}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Writing result:
+    - language: Go
+    - mode: Default
+    - version: 1.20
+    - framework: FastHTTP
+    - framework_stdlib: false
+    - framework_website: https://github.com/valyala/fasthttp
+    - framework_flavor: Default
+    - framework_version: 1
+    - concurrency: 32
+    - path: go/fasthttp-1-go-1.20
+    - rps_median: 4927
+    - rps_p99: 4815
+    - latency_median: 474
+    - latency_p99: 91356
+    - memory_median: 21369978
+    - memory_p99: 24809308
+    - errors: 0
+    - build_time: 14067
+
+ -> [2/2] Benchmarking benchmark/web/go/fasthttp-1-go-1.20 (Default v1.24 / FastHTTP v1)
+ -> Copied benchmark/web/go/fasthttp-1-go-1.20 to tmp
+ -> Pulling golang:1.24
+1.24: Pulling from library/golang
+Digest: sha256:d2d2bc1c84f7e60d7d2438a3836ae7d0c847f4888464e7ec9ba3a1339a1ee804
+Status: Image is up to date for golang:1.24
+docker.io/library/golang:1.24
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 212B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/golang:1.24
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 143B done
+#4 DONE 0.0s
+
+#5 [1/6] FROM docker.io/library/golang:1.24@sha256:d2d2bc1c84f7e60d7d2438a3836ae7d0c847f4888464e7ec9ba3a1339a1ee804
+#5 resolve docker.io/library/golang:1.24@sha256:d2d2bc1c84f7e60d7d2438a3836ae7d0c847f4888464e7ec9ba3a1339a1ee804 0.0s done
+#5 DONE 0.0s
+
+#6 [2/6] WORKDIR /app
+#6 CACHED
+
+#7 [internal] load build context
+#7 transferring context: 3.22kB done
+#7 DONE 0.0s
+
+#8 [3/6] COPY . .
+#8 DONE 0.1s
+
+#9 [4/6] RUN go get main
+#9 0.966 go: downloading github.com/valyala/fasthttp v1.54.0
+#9 0.966 go: downloading github.com/goccy/go-json v0.10.3
+#9 1.040 go: downloading github.com/andybalholm/brotli v1.1.0
+#9 1.040 go: downloading github.com/klauspost/compress v1.17.7
+#9 1.040 go: downloading github.com/valyala/bytebufferpool v1.0.0
+#9 DONE 2.4s
+
+#10 [5/6] RUN go build -o main .
+#10 DONE 7.6s
+
+#11 [6/6] RUN chmod +x main
+#11 DONE 0.2s
+
+#12 exporting to image
+#12 exporting layers
+#12 exporting layers 2.3s done
+#12 exporting manifest sha256:8808873acadb6d6be2ab4261781db17af900ec74c9e63faaeab70f005ac91dda 0.0s done
+#12 exporting config sha256:f46c93fe741fe533cd82d3e1fcb018e97995f7128db7d17bfcd52476d6f685f3 0.0s done
+#12 exporting attestation manifest sha256:a56131bd4ca4ece2698c7c6fcdf1dce2c3e0fc3d02879469f19a8e7ce4012f2b 0.0s done
+#12 exporting manifest list sha256:1d8487fb3111ef8584d239b408126a13d046142ada45263ced2aa275d1b41978 0.0s done
+#12 naming to docker.io/library/tmp-benchmark:latest done
+#12 unpacking to docker.io/library/tmp-benchmark:latest
+#12 unpacking to docker.io/library/tmp-benchmark:latest 0.7s done
+#12 DONE 3.1s
+
+#13 resolving provenance for metadata file
+#13 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 13809 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Warmup]: Running...
+ -> [Warmup]: t = 15047 ms, RAM = 20.79 MB, {"rps_median": 5369, "rps_p99": 4985, "latency_median": 556, "latency_p99": 90323, "errors": 0}, {"success": 79692, "time": 15013}
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 15105 ms, RAM = 20.99 MB, {"rps_median": 5485, "rps_p99": 5223, "latency_median": 503, "latency_p99": 90698, "errors": 0}, {"success": 82388, "time": 15085}
+ -> [Run #2]: Running...
+ -> [Run #2]: t = 15097 ms, RAM = 21.17 MB, {"rps_median": 5593, "rps_p99": 5460, "latency_median": 486, "latency_p99": 90571, "errors": 0}, {"success": 84103, "time": 15076}
+ -> [Run #3]: Running...
+ -> [Run #3]: t = 15100 ms, RAM = 21.25 MB, {"rps_median": 5560, "rps_p99": 5471, "latency_median": 479, "latency_p99": 90718, "errors": 0}, {"success": 84253, "time": 15078}
+ -> [Run #4]: Running...
+ -> [Run #4]: t = 15096 ms, RAM = 21.71 MB, {"rps_median": 5555, "rps_p99": 5404, "latency_median": 490, "latency_p99": 90497, "errors": 0}, {"success": 83830, "time": 15075}
+ -> [Run #5]: Running...
+ -> [Run #5]: t = 15104 ms, RAM = 21.81 MB, {"rps_median": 5593, "rps_p99": 5526, "latency_median": 487, "latency_p99": 90375, "errors": 0}, {"success": 84467, "time": 15082}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Writing result:
+    - language: Go
+    - mode: Default
+    - version: 1.24
+    - framework: FastHTTP
+    - framework_stdlib: false
+    - framework_website: https://github.com/valyala/fasthttp
+    - framework_flavor: Default
+    - framework_version: 1
+    - concurrency: 32
+    - path: go/fasthttp-1-go-1.20
+    - rps_median: 5560
+    - rps_p99: 5460
+    - latency_median: 487
+    - latency_p99: 90571
+    - memory_median: 22198353
+    - memory_p99: 27294433
+    - errors: 0
+    - build_time: 13809
+ -> Stopping container
+ Container web_data_source Stopping 
+ Container web_data_source Stopped 
+ Container web_data_source Removing 
+ Container web_data_source Removed 
+ Dangling images Removing 
+ Image data-web-data-source:latest Removing 
+ Image data-web-data-source:latest Removed 
+ Dangling images Removed 
+Docker stats reader thread finished

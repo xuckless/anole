@@ -1,0 +1,1043 @@
+ -> Running 1 benchmarks:
+    - benchmark/web/cpp/drogon-1.9 (GCC v14 / Drogon v1.9)
+ -> Building image
+ Image data-web-data-source Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 588B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 345B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/debian:13-slim
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/rust:1.86
+#4 DONE 0.3s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 728B done
+#6 DONE 0.0s
+
+#7 [builder 1/5] FROM docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
+#7 resolve docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 0.0s done
+#7 DONE 0.0s
+
+#8 [runtime 1/3] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#8 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#8 DONE 0.1s
+
+#9 [builder 2/5] WORKDIR /app
+#9 CACHED
+
+#10 [builder 5/5] RUN cargo build --release
+#10 CACHED
+
+#11 [builder 3/5] COPY Cargo.toml Cargo.lock ./
+#11 CACHED
+
+#12 [builder 4/5] COPY src ./src
+#12 CACHED
+
+#13 [runtime 2/3] COPY --from=builder /app/target/release/app /app
+#13 CACHED
+
+#14 [runtime 3/3] COPY static ./static
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:443e4a74e3ca778552fa9cc2232f95a53e54cb5e09064ab072b0340ed39d7d6f done
+#15 exporting config sha256:33c0a732cb91a5f80636cea1c51ca80d7f3bbd22b21d35a38ef654eda7b511d1 done
+#15 exporting attestation manifest sha256:53a50ef1e7eb96360a1ea75c29265ab03301dc348d9e81b02aea0f1f0ec5c020
+#15 exporting attestation manifest sha256:53a50ef1e7eb96360a1ea75c29265ab03301dc348d9e81b02aea0f1f0ec5c020 0.0s done
+#15 exporting manifest list sha256:8cecaad8c1ad789c2122c3d703970f69efbfeb2622b03c60286260a5de4bef5c 0.0s done
+#15 naming to docker.io/library/data-web-data-source:latest done
+#15 unpacking to docker.io/library/data-web-data-source:latest 0.0s done
+#15 DONE 0.1s
+
+#16 resolving provenance for metadata file
+#16 DONE 0.0s
+ Image data-web-data-source Built 
+ -> Dropping page cache
+ -> Starting container
+ Container web_data_source Creating 
+ Container web_data_source Created 
+ Container web_data_source Starting 
+ Container web_data_source Started 
+
+ -> [1/1] Benchmarking benchmark/web/cpp/drogon-1.9 (GCC v14 / Drogon v1.9)
+ - Language: C++
+ - Mode: GCC
+ - Language version: ["14"]
+ - Language version regex: Default
+ - Framework: Drogon
+ - Framework stdlib: false
+ - Framework website: https://drogonframework.github.io/drogon-docs/#/
+ - Framework flavor: Default
+ - Framework version: ["1.9"]
+ - Framework version regex: "Default"
+ - Concurrency: None
+ - Copy: None
+
+ -> Copied benchmark/web/cpp/drogon-1.9 to tmp
+ -> Pulling gcc:14
+14: Pulling from library/gcc
+Digest: sha256:db19db55a3bd1f836212a76854c4f6c7c4ccb0c9a9426dbf542e3505bc8cdfec
+Status: Image is up to date for gcc:14
+docker.io/library/gcc:14
+ -> Pulling debian:13-slim
+13-slim: Pulling from library/debian
+Digest: sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+Status: Image is up to date for debian:13-slim
+docker.io/library/debian:13-slim
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 1.16kB done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/gcc:14
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/debian:13-slim
+#4 DONE 0.0s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 143B done
+#5 DONE 0.0s
+
+#6 [builder 1/7] FROM docker.io/library/gcc:14@sha256:db19db55a3bd1f836212a76854c4f6c7c4ccb0c9a9426dbf542e3505bc8cdfec
+#6 resolve docker.io/library/gcc:14@sha256:db19db55a3bd1f836212a76854c4f6c7c4ccb0c9a9426dbf542e3505bc8cdfec 0.0s done
+#6 CACHED
+
+#7 [stage-1 1/4] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#7 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#7 CACHED
+
+#8 [internal] load build context
+#8 transferring context: 6.54kB done
+#8 DONE 0.0s
+
+#9 [stage-1 2/4] RUN apt-get update &&     apt-get install -y --no-install-recommends         libjsoncpp26         uuid-runtime         zlib1g         openssl         libbrotli1         libpq5         libmariadb3     && rm -rf /var/lib/apt/lists/*
+#9 0.262 Get:1 http://deb.debian.org/debian trixie InRelease [140 kB]
+#9 0.284 Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+#9 0.293 Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]
+#9 0.305 Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9678 kB]
+#9 0.599 Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [4412 B]
+#9 0.599 Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [269 kB]
+#9 1.025 Fetched 10.2 MB in 1s (12.9 MB/s)
+#9 1.025 Reading package lists...
+#9 1.316 Reading package lists...
+#9 1.602 Building dependency tree...
+#9 1.663 Reading state information...
+#9 1.745 zlib1g is already the newest version (1:1.3.dfsg+really1.3.1-1+b1).
+#9 1.745 zlib1g set to manually installed.
+#9 1.745 The following additional packages will be installed:
+#9 1.745   adduser libapparmor1 libcom-err2 libgssapi-krb5-2 libk5crypto3 libkeyutils1
+#9 1.745   libkrb5-3 libkrb5support0 libldap2 libsasl2-2 libsasl2-modules-db
+#9 1.745   libsystemd-shared mariadb-common mysql-common systemd
+#9 1.745 Suggested packages:
+#9 1.745   liblocale-gettext-perl perl cron quota krb5-doc krb5-user libarchive13t64
+#9 1.745   libbpf1 libcryptsetup12 libdw1t64 libelf1t64 libfido2-1 libgcrypt20
+#9 1.745   libidn2-0 libip4tc2 libp11-kit0 libpwquality1 libqrencode4 libtss2-rc0t64
+#9 1.745   ca-certificates systemd-container systemd-homed systemd-userdbd systemd-boot
+#9 1.745   systemd-resolved systemd-repart libtss2-tcti-device0 polkitd
+#9 1.745 Recommended packages:
+#9 1.745   krb5-locales libldap-common ca-certificates libsasl2-modules libkmod2
+#9 1.745   default-dbus-system-bus | dbus-system-bus linux-sysctl-defaults
+#9 1.745   systemd-timesyncd | time-daemon systemd-cryptsetup
+#9 1.843 The following NEW packages will be installed:
+#9 1.843   adduser libapparmor1 libbrotli1 libcom-err2 libgssapi-krb5-2 libjsoncpp26
+#9 1.843   libk5crypto3 libkeyutils1 libkrb5-3 libkrb5support0 libldap2 libmariadb3
+#9 1.844   libpq5 libsasl2-2 libsasl2-modules-db libsystemd-shared mariadb-common
+#9 1.844   mysql-common openssl systemd uuid-runtime
+#9 1.890 0 upgraded, 21 newly installed, 0 to remove and 0 not upgraded.
+#9 1.890 Need to get 8784 kB of archives.
+#9 1.890 After this operation, 26.4 MB of additional disk space will be used.
+#9 1.890 Get:1 http://deb.debian.org/debian trixie/main amd64 libsystemd-shared amd64 257.13-1~deb13u1 [2155 kB]
+#9 1.964 Get:2 http://deb.debian.org/debian trixie/main amd64 libapparmor1 amd64 4.1.0-1 [43.7 kB]
+#9 1.965 Get:3 http://deb.debian.org/debian trixie/main amd64 systemd amd64 257.13-1~deb13u1 [3094 kB]
+#9 2.020 Get:4 http://deb.debian.org/debian trixie/main amd64 adduser all 3.152 [191 kB]
+#9 2.020 Get:5 http://deb.debian.org/debian trixie/main amd64 uuid-runtime amd64 2.41.5-0+deb13u1 [60.7 kB]
+#9 2.020 Get:6 http://deb.debian.org/debian trixie/main amd64 libbrotli1 amd64 1.1.0-2+b7 [307 kB]
+#9 2.029 Get:7 http://deb.debian.org/debian trixie/main amd64 libcom-err2 amd64 1.47.2-3+b12 [25.0 kB]
+#9 2.029 Get:8 http://deb.debian.org/debian trixie/main amd64 libkrb5support0 amd64 1.21.3-5+deb13u1 [33.1 kB]
+#9 2.030 Get:9 http://deb.debian.org/debian trixie/main amd64 libk5crypto3 amd64 1.21.3-5+deb13u1 [81.2 kB]
+#9 2.031 Get:10 http://deb.debian.org/debian trixie/main amd64 libkeyutils1 amd64 1.6.3-6 [9456 B]
+#9 2.031 Get:11 http://deb.debian.org/debian trixie/main amd64 libkrb5-3 amd64 1.21.3-5+deb13u1 [326 kB]
+#9 2.035 Get:12 http://deb.debian.org/debian trixie/main amd64 libgssapi-krb5-2 amd64 1.21.3-5+deb13u1 [138 kB]
+#9 2.040 Get:13 http://deb.debian.org/debian trixie/main amd64 libjsoncpp26 amd64 1.9.6-3 [81.7 kB]
+#9 2.040 Get:14 http://deb.debian.org/debian trixie/main amd64 libsasl2-modules-db amd64 2.1.28+dfsg1-9 [19.8 kB]
+#9 2.040 Get:15 http://deb.debian.org/debian trixie/main amd64 libsasl2-2 amd64 2.1.28+dfsg1-9 [57.5 kB]
+#9 2.042 Get:16 http://deb.debian.org/debian trixie/main amd64 libldap2 amd64 2.6.10+dfsg-1 [194 kB]
+#9 2.044 Get:17 http://deb.debian.org/debian trixie/main amd64 mysql-common all 5.8+1.1.1 [6784 B]
+#9 2.044 Get:18 http://deb.debian.org/debian trixie/main amd64 mariadb-common all 1:11.8.6-0+deb13u1 [29.5 kB]
+#9 2.049 Get:19 http://deb.debian.org/debian trixie/main amd64 libmariadb3 amd64 1:11.8.6-0+deb13u1 [187 kB]
+#9 2.051 Get:20 http://deb.debian.org/debian trixie/main amd64 libpq5 amd64 17.11-0+deb13u1 [237 kB]
+#9 2.054 Get:21 http://deb.debian.org/debian-security trixie-security/main amd64 openssl amd64 3.5.7-1~deb13u3 [1508 kB]
+#9 2.171 debconf: unable to initialize frontend: Dialog
+#9 2.171 debconf: (TERM is not set, so the dialog frontend is not usable.)
+#9 2.171 debconf: falling back to frontend: Readline
+#9 2.171 debconf: unable to initialize frontend: Readline
+#9 2.171 debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC entries checked: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.40.1 /usr/local/share/perl/5.40.1 /usr/lib/x86_64-linux-gnu/perl5/5.40 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.40 /usr/share/perl/5.40 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 8, <STDIN> line 21.)
+#9 2.171 debconf: falling back to frontend: Teletype
+#9 2.173 debconf: unable to initialize frontend: Teletype
+#9 2.173 debconf: (This frontend requires a controlling tty.)
+#9 2.173 debconf: falling back to frontend: Noninteractive
+#9 2.458 Fetched 8784 kB in 0s (39.1 MB/s)
+#9 2.479 Selecting previously unselected package libsystemd-shared:amd64.
+#9 2.479 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 4951 files and directories currently installed.)
+#9 2.486 Preparing to unpack .../libsystemd-shared_257.13-1~deb13u1_amd64.deb ...
+#9 2.507 Unpacking libsystemd-shared:amd64 (257.13-1~deb13u1) ...
+#9 2.585 Selecting previously unselected package libapparmor1:amd64.
+#9 2.586 Preparing to unpack .../libapparmor1_4.1.0-1_amd64.deb ...
+#9 2.591 Unpacking libapparmor1:amd64 (4.1.0-1) ...
+#9 2.615 Setting up libsystemd-shared:amd64 (257.13-1~deb13u1) ...
+#9 2.647 Selecting previously unselected package systemd.
+#9 2.647 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 4964 files and directories currently installed.)
+#9 2.651 Preparing to unpack .../systemd_257.13-1~deb13u1_amd64.deb ...
+#9 2.659 Unpacking systemd (257.13-1~deb13u1) ...
+#9 2.766 Selecting previously unselected package adduser.
+#9 2.767 Preparing to unpack .../archives/adduser_3.152_all.deb ...
+#9 2.771 Unpacking adduser (3.152) ...
+#9 2.796 Setting up adduser (3.152) ...
+#9 2.833 Selecting previously unselected package uuid-runtime.
+#9 2.833 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 5986 files and directories currently installed.)
+#9 2.836 Preparing to unpack .../00-uuid-runtime_2.41.5-0+deb13u1_amd64.deb ...
+#9 2.840 Unpacking uuid-runtime (2.41.5-0+deb13u1) ...
+#9 2.866 Selecting previously unselected package libbrotli1:amd64.
+#9 2.867 Preparing to unpack .../01-libbrotli1_1.1.0-2+b7_amd64.deb ...
+#9 2.870 Unpacking libbrotli1:amd64 (1.1.0-2+b7) ...
+#9 2.904 Selecting previously unselected package libcom-err2:amd64.
+#9 2.904 Preparing to unpack .../02-libcom-err2_1.47.2-3+b12_amd64.deb ...
+#9 2.907 Unpacking libcom-err2:amd64 (1.47.2-3+b12) ...
+#9 2.931 Selecting previously unselected package libkrb5support0:amd64.
+#9 2.933 Preparing to unpack .../03-libkrb5support0_1.21.3-5+deb13u1_amd64.deb ...
+#9 2.935 Unpacking libkrb5support0:amd64 (1.21.3-5+deb13u1) ...
+#9 2.960 Selecting previously unselected package libk5crypto3:amd64.
+#9 2.961 Preparing to unpack .../04-libk5crypto3_1.21.3-5+deb13u1_amd64.deb ...
+#9 2.964 Unpacking libk5crypto3:amd64 (1.21.3-5+deb13u1) ...
+#9 2.990 Selecting previously unselected package libkeyutils1:amd64.
+#9 2.991 Preparing to unpack .../05-libkeyutils1_1.6.3-6_amd64.deb ...
+#9 2.994 Unpacking libkeyutils1:amd64 (1.6.3-6) ...
+#9 3.017 Selecting previously unselected package libkrb5-3:amd64.
+#9 3.018 Preparing to unpack .../06-libkrb5-3_1.21.3-5+deb13u1_amd64.deb ...
+#9 3.021 Unpacking libkrb5-3:amd64 (1.21.3-5+deb13u1) ...
+#9 3.058 Selecting previously unselected package libgssapi-krb5-2:amd64.
+#9 3.059 Preparing to unpack .../07-libgssapi-krb5-2_1.21.3-5+deb13u1_amd64.deb ...
+#9 3.062 Unpacking libgssapi-krb5-2:amd64 (1.21.3-5+deb13u1) ...
+#9 3.089 Selecting previously unselected package libjsoncpp26:amd64.
+#9 3.091 Preparing to unpack .../08-libjsoncpp26_1.9.6-3_amd64.deb ...
+#9 3.093 Unpacking libjsoncpp26:amd64 (1.9.6-3) ...
+#9 3.116 Selecting previously unselected package libsasl2-modules-db:amd64.
+#9 3.117 Preparing to unpack .../09-libsasl2-modules-db_2.1.28+dfsg1-9_amd64.deb ...
+#9 3.120 Unpacking libsasl2-modules-db:amd64 (2.1.28+dfsg1-9) ...
+#9 3.144 Selecting previously unselected package libsasl2-2:amd64.
+#9 3.145 Preparing to unpack .../10-libsasl2-2_2.1.28+dfsg1-9_amd64.deb ...
+#9 3.147 Unpacking libsasl2-2:amd64 (2.1.28+dfsg1-9) ...
+#9 3.178 Selecting previously unselected package libldap2:amd64.
+#9 3.179 Preparing to unpack .../11-libldap2_2.6.10+dfsg-1_amd64.deb ...
+#9 3.181 Unpacking libldap2:amd64 (2.6.10+dfsg-1) ...
+#9 3.220 Selecting previously unselected package mysql-common.
+#9 3.221 Preparing to unpack .../12-mysql-common_5.8+1.1.1_all.deb ...
+#9 3.230 Unpacking mysql-common (5.8+1.1.1) ...
+#9 3.257 Selecting previously unselected package mariadb-common.
+#9 3.259 Preparing to unpack .../13-mariadb-common_1%3a11.8.6-0+deb13u1_all.deb ...
+#9 3.263 Unpacking mariadb-common (1:11.8.6-0+deb13u1) ...
+#9 3.289 Selecting previously unselected package libmariadb3:amd64.
+#9 3.320 Preparing to unpack .../14-libmariadb3_1%3a11.8.6-0+deb13u1_amd64.deb ...
+#9 3.360 Unpacking libmariadb3:amd64 (1:11.8.6-0+deb13u1) ...
+#9 3.399 Selecting previously unselected package libpq5:amd64.
+#9 3.401 Preparing to unpack .../15-libpq5_17.11-0+deb13u1_amd64.deb ...
+#9 3.404 Unpacking libpq5:amd64 (17.11-0+deb13u1) ...
+#9 3.435 Selecting previously unselected package openssl.
+#9 3.436 Preparing to unpack .../16-openssl_3.5.7-1~deb13u3_amd64.deb ...
+#9 3.438 Unpacking openssl (3.5.7-1~deb13u3) ...
+#9 3.495 Setting up mysql-common (5.8+1.1.1) ...
+#9 3.525 update-alternatives: using /etc/mysql/my.cnf.fallback to provide /etc/mysql/my.cnf (my.cnf) in auto mode
+#9 3.531 Setting up libkeyutils1:amd64 (1.6.3-6) ...
+#9 3.545 Setting up libapparmor1:amd64 (4.1.0-1) ...
+#9 3.559 Setting up libbrotli1:amd64 (1.1.0-2+b7) ...
+#9 3.572 Setting up systemd (257.13-1~deb13u1) ...
+#9 3.624 Created symlink '/etc/systemd/system/getty.target.wants/getty@tty1.service' → '/usr/lib/systemd/system/getty@.service'.
+#9 3.628 Created symlink '/etc/systemd/system/multi-user.target.wants/remote-fs.target' → '/usr/lib/systemd/system/remote-fs.target'.
+#9 3.631 Created symlink '/etc/systemd/system/sysinit.target.wants/systemd-pstore.service' → '/usr/lib/systemd/system/systemd-pstore.service'.
+#9 3.634 Initializing machine ID from random generator.
+#9 3.648 Creating group 'systemd-journal' with GID 999.
+#9 3.648 Creating group 'systemd-network' with GID 998.
+#9 3.648 Creating user 'systemd-network' (systemd Network Management) with UID 998 and GID 998.
+#9 3.675 /usr/lib/tmpfiles.d/legacy.conf:14: Duplicate line for path "/run/lock", ignoring.
+#9 3.684 Setting up libcom-err2:amd64 (1.47.2-3+b12) ...
+#9 3.692 Setting up libkrb5support0:amd64 (1.21.3-5+deb13u1) ...
+#9 3.700 Setting up libsasl2-modules-db:amd64 (2.1.28+dfsg1-9) ...
+#9 3.709 Setting up mariadb-common (1:11.8.6-0+deb13u1) ...
+#9 3.719 update-alternatives: using /etc/mysql/mariadb.cnf to provide /etc/mysql/my.cnf (my.cnf) in auto mode
+#9 3.725 Setting up libjsoncpp26:amd64 (1.9.6-3) ...
+#9 3.734 Setting up libmariadb3:amd64 (1:11.8.6-0+deb13u1) ...
+#9 3.743 Setting up libk5crypto3:amd64 (1.21.3-5+deb13u1) ...
+#9 3.751 Setting up libsasl2-2:amd64 (2.1.28+dfsg1-9) ...
+#9 3.760 Setting up uuid-runtime (2.41.5-0+deb13u1) ...
+#9 3.867 invoke-rc.d: could not determine current runlevel
+#9 3.870 invoke-rc.d: policy-rc.d denied execution of start.
+#9 3.925 Created symlink '/etc/systemd/system/sockets.target.wants/uuidd.socket' → '/usr/lib/systemd/system/uuidd.socket'.
+#9 3.984 Setting up libkrb5-3:amd64 (1.21.3-5+deb13u1) ...
+#9 3.993 Setting up openssl (3.5.7-1~deb13u3) ...
+#9 4.005 Setting up libldap2:amd64 (2.6.10+dfsg-1) ...
+#9 4.013 Setting up libgssapi-krb5-2:amd64 (1.21.3-5+deb13u1) ...
+#9 4.023 Setting up libpq5:amd64 (17.11-0+deb13u1) ...
+#9 4.032 Processing triggers for libc-bin (2.41-12+deb13u4) ...
+#9 DONE 4.2s
+
+#10 [builder 2/7] RUN apt-get update &&     apt-get install -y --no-install-recommends         git         make         cmake         libjsoncpp-dev         zlib1g-dev         uuid-dev     && rm -rf /var/lib/apt/lists/*
+#10 0.281 Get:1 http://deb.debian.org/debian trixie InRelease [140 kB]
+#10 0.303 Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+#10 0.314 Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]
+#10 0.323 Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9678 kB]
+#10 0.934 Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [4412 B]
+#10 0.934 Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [269 kB]
+#10 1.365 Fetched 10.2 MB in 1s (9090 kB/s)
+#10 1.365 Reading package lists...
+#10 1.662 Reading package lists...
+#10 1.957 Building dependency tree...
+#10 2.016 Reading state information...
+#10 2.108 git is already the newest version (1:2.47.3-0+deb13u1).
+#10 2.108 make is already the newest version (4.4.1-2).
+#10 2.108 zlib1g-dev is already the newest version (1:1.3.dfsg+really1.3.1-1+b1).
+#10 2.108 uuid-dev is already the newest version (2.41.5-0+deb13u1).
+#10 2.108 uuid-dev set to manually installed.
+#10 2.108 Suggested packages:
+#10 2.108   cmake-doc cmake-format elpa-cmake-mode ninja-build
+#10 2.140 The following NEW packages will be installed:
+#10 2.140   cmake cmake-data libjsoncpp-dev libjsoncpp26 librhash1 libuv1t64
+#10 2.187 0 upgraded, 6 newly installed, 0 to remove and 15 not upgraded.
+#10 2.187 Need to get 14.6 MB of archives.
+#10 2.187 After this operation, 55.1 MB of additional disk space will be used.
+#10 2.187 Get:1 http://deb.debian.org/debian trixie/main amd64 cmake-data all 3.31.6-2 [2268 kB]
+#10 2.252 Get:2 http://deb.debian.org/debian trixie/main amd64 libjsoncpp26 amd64 1.9.6-3 [81.7 kB]
+#10 2.253 Get:3 http://deb.debian.org/debian trixie/main amd64 librhash1 amd64 1.4.5-1 [132 kB]
+#10 2.255 Get:4 http://deb.debian.org/debian trixie/main amd64 libuv1t64 amd64 1.50.0-2 [154 kB]
+#10 2.266 Get:5 http://deb.debian.org/debian trixie/main amd64 cmake amd64 3.31.6-2 [12.0 MB]
+#10 2.733 Get:6 http://deb.debian.org/debian trixie/main amd64 libjsoncpp-dev amd64 1.9.6-3 [25.0 kB]
+#10 2.829 debconf: unable to initialize frontend: Dialog
+#10 2.829 debconf: (TERM is not set, so the dialog frontend is not usable.)
+#10 2.829 debconf: falling back to frontend: Readline
+#10 2.833 debconf: unable to initialize frontend: Readline
+#10 2.833 debconf: (This frontend requires a controlling tty.)
+#10 2.833 debconf: falling back to frontend: Teletype
+#10 2.835 debconf: unable to initialize frontend: Teletype
+#10 2.835 debconf: (This frontend requires a controlling tty.)
+#10 2.835 debconf: falling back to frontend: Noninteractive
+#10 3.144 Fetched 14.6 MB in 1s (24.8 MB/s)
+#10 3.172 Selecting previously unselected package cmake-data.
+#10 3.172 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 26244 files and directories currently installed.)
+#10 3.206 Preparing to unpack .../0-cmake-data_3.31.6-2_all.deb ...
+#10 3.217 Unpacking cmake-data (3.31.6-2) ...
+#10 3.470 Selecting previously unselected package libjsoncpp26:amd64.
+#10 3.474 Preparing to unpack .../1-libjsoncpp26_1.9.6-3_amd64.deb ...
+#10 3.483 Unpacking libjsoncpp26:amd64 (1.9.6-3) ...
+#10 3.520 Selecting previously unselected package librhash1:amd64.
+#10 3.523 Preparing to unpack .../2-librhash1_1.4.5-1_amd64.deb ...
+#10 3.526 Unpacking librhash1:amd64 (1.4.5-1) ...
+#10 3.569 Selecting previously unselected package libuv1t64:amd64.
+#10 3.572 Preparing to unpack .../3-libuv1t64_1.50.0-2_amd64.deb ...
+#10 3.578 Unpacking libuv1t64:amd64 (1.50.0-2) ...
+#10 3.614 Selecting previously unselected package cmake.
+#10 3.617 Preparing to unpack .../4-cmake_3.31.6-2_amd64.deb ...
+#10 3.620 Unpacking cmake (3.31.6-2) ...
+#10 3.861 Selecting previously unselected package libjsoncpp-dev:amd64.
+#10 3.864 Preparing to unpack .../5-libjsoncpp-dev_1.9.6-3_amd64.deb ...
+#10 3.867 Unpacking libjsoncpp-dev:amd64 (1.9.6-3) ...
+#10 3.899 Setting up libuv1t64:amd64 (1.50.0-2) ...
+#10 3.907 Setting up libjsoncpp26:amd64 (1.9.6-3) ...
+#10 3.916 Setting up cmake-data (3.31.6-2) ...
+#10 3.927 Setting up librhash1:amd64 (1.4.5-1) ...
+#10 3.935 Setting up libjsoncpp-dev:amd64 (1.9.6-3) ...
+#10 3.944 Setting up cmake (3.31.6-2) ...
+#10 3.952 Processing triggers for libc-bin (2.41-12+deb13u4) ...
+#10 DONE 4.2s
+
+#11 [builder 3/7] RUN git clone --recurse-submodules --branch v1.9.11 https://github.com/drogonframework/drogon &&     cd drogon &&     mkdir build &&     cd build &&     cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF .. &&     make -j$(nproc) &&     make install
+#11 0.174 Cloning into 'drogon'...
+#11 1.566 Note: switching to 'a22956b82b6b221ceeff83913c3014ce0d048555'.
+#11 1.566 
+#11 1.566 You are in 'detached HEAD' state. You can look around, make experimental
+#11 1.566 changes and commit them, and you can discard any commits you make in this
+#11 1.566 state without impacting any branches by switching back to a branch.
+#11 1.566 
+#11 1.566 If you want to create a new branch to retain commits you create, you may
+#11 1.566 do so (now or later) by using -c with the switch command. Example:
+#11 1.566 
+#11 1.566   git switch -c <new-branch-name>
+#11 1.566 
+#11 1.566 Or undo this operation with:
+#11 1.566 
+#11 1.566   git switch -
+#11 1.566 
+#11 1.566 Turn off this advice by setting config variable advice.detachedHead to false
+#11 1.566 
+#11 1.609 Submodule 'trantor' (https://github.com/an-tao/trantor.git) registered for path 'trantor'
+#11 1.610 Cloning into '/drogon/trantor'...
+#11 2.409 Submodule path 'trantor': checked out '43fd79b2dbac59608a819ebba167e8fe2c079d90'
+#11 2.484 -- The C compiler identification is GNU 14.4.0
+#11 2.557 -- The CXX compiler identification is GNU 14.4.0
+#11 2.561 -- Detecting C compiler ABI info
+#11 2.612 -- Detecting C compiler ABI info - done
+#11 2.619 -- Check for working C compiler: /usr/bin/cc - skipped
+#11 2.619 -- Detecting C compile features
+#11 2.620 -- Detecting C compile features - done
+#11 2.627 -- Detecting CXX compiler ABI info
+#11 2.697 -- Detecting CXX compiler ABI info - done
+#11 2.704 -- Check for working CXX compiler: /usr/local/bin/c++ - skipped
+#11 2.704 -- Detecting CXX compile features
+#11 2.705 -- Detecting CXX compile features - done
+#11 2.709 -- compiler: GNU
+#11 2.713 -- Performing Test COMPILER_HAS_HIDDEN_VISIBILITY
+#11 2.786 -- Performing Test COMPILER_HAS_HIDDEN_VISIBILITY - Success
+#11 2.787 -- Performing Test COMPILER_HAS_HIDDEN_INLINE_VISIBILITY
+#11 2.855 -- Performing Test COMPILER_HAS_HIDDEN_INLINE_VISIBILITY - Success
+#11 2.855 -- Performing Test COMPILER_HAS_DEPRECATED_ATTR
+#11 2.929 -- Performing Test COMPILER_HAS_DEPRECATED_ATTR - Success
+#11 2.929 -- Looking for C++ include any
+#11 3.030 -- Looking for C++ include any - found
+#11 3.030 -- Looking for C++ include string_view
+#11 3.140 -- Looking for C++ include string_view - found
+#11 3.140 -- Looking for C++ include coroutine
+#11 3.175 -- Looking for C++ include coroutine - not found
+#11 3.175 CMake Deprecation Warning at trantor/CMakeLists.txt:1 (cmake_minimum_required):
+#11 3.175   Compatibility with CMake < 3.10 will be removed from a future version of
+#11 3.175   CMake.
+#11 3.175 
+#11 3.175   Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+#11 3.175   to tell CMake that the project requires at least <min> but has been updated
+#11 3.175   to work with policies introduced by <max> or earlier.
+#11 3.175 
+#11 3.175 
+#11 3.207 -- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.5.7")
+#11 3.208 -- Trantor using SSL library: OpenSSL
+#11 3.210 -- Could NOT find c-ares (missing: C-ARES_INCLUDE_DIRS C-ARES_LIBRARIES) 
+#11 3.210 -- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+#11 3.267 -- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+#11 3.267 -- Found Threads: TRUE
+#11 3.368 -- Could NOT find Doxygen (missing: DOXYGEN_EXECUTABLE) 
+#11 3.369 -- Looking for C++ include filesystem
+#11 3.650 -- Looking for C++ include filesystem - found
+#11 3.650 -- Performing Test CXX_FILESYSTEM_NO_LINK_NEEDED
+#11 3.938 -- Performing Test CXX_FILESYSTEM_NO_LINK_NEEDED - Success
+#11 3.938 -- Found std::filesystem
+#11 3.938 -- use c++17
+#11 4.207 -- Found Jsoncpp: /usr/include/jsoncpp
+#11 4.213 -- jsoncpp version:1.9.6
+#11 4.215 -- yaml-cpp not used
+#11 4.216 -- Found UUID: /usr/lib/x86_64-linux-gnu/libuuid.so
+#11 4.330 -- Found Brotli: /usr/lib/x86_64-linux-gnu/libbrotlidec.so
+#11 4.330 -- Brotli found
+#11 4.339 -- Found PostgreSQL: /usr/lib/x86_64-linux-gnu/libpq.so (found version "17.11")
+#11 4.339 -- pg inc: /usr/include/postgresql
+#11 4.339 -- Found pg: /usr/lib/x86_64-linux-gnu/libpq.so
+#11 4.339 -- libpq inc path:/usr/include/postgresql
+#11 4.339 -- libpq lib:/usr/lib/x86_64-linux-gnu/libpq.so
+#11 4.423 -- The libpq supports batch mode
+#11 4.425 -- MySQL Include dir: /usr/include/mariadb
+#11 4.425 -- MySQL client libraries: /usr/lib/x86_64-linux-gnu/libmysqlclient_r.so
+#11 4.428 -- Ok! We find mariadb!
+#11 4.428 -- Looking for mysql_optionsv in MySQL_lib
+#11 4.494 -- Looking for mysql_optionsv in MySQL_lib - found
+#11 4.494 -- Mariadb support mysql_optionsv
+#11 4.498 -- Ok! We find sqlite3!
+#11 4.498 -- Could NOT find Hiredis (missing: HIREDIS_LIBRARY HIREDIS_INCLUDE_DIR) 
+#11 4.502 -- Found ZLIB: /usr/lib/x86_64-linux-gnu/libz.so (found version "1.3.1")
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/cmake.csp
+#11 4.505 -- view classname:cmake
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/config_json.csp
+#11 4.505 -- view classname:config_json
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/config_yaml.csp
+#11 4.505 -- view classname:config_yaml
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/demoMain.csp
+#11 4.505 -- view classname:demoMain
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/filter_cc.csp
+#11 4.505 -- view classname:filter_cc
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/filter_h.csp
+#11 4.505 -- view classname:filter_h
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/gitignore.csp
+#11 4.505 -- view classname:gitignore
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/model_cc.csp
+#11 4.505 -- view classname:model_cc
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/model_h.csp
+#11 4.505 -- view classname:model_h
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/model_json.csp
+#11 4.505 -- view classname:model_json
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/plugin_cc.csp
+#11 4.505 -- view classname:plugin_cc
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/plugin_h.csp
+#11 4.505 -- view classname:plugin_h
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/restful_controller_base_cc.csp
+#11 4.505 -- view classname:restful_controller_base_cc
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/restful_controller_base_h.csp
+#11 4.505 -- view classname:restful_controller_base_h
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/restful_controller_cc.csp
+#11 4.505 -- view classname:restful_controller_cc
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/restful_controller_custom_cc.csp
+#11 4.505 -- view classname:restful_controller_custom_cc
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/restful_controller_custom_h.csp
+#11 4.505 -- view classname:restful_controller_custom_h
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/restful_controller_h.csp
+#11 4.505 -- view classname:restful_controller_h
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/test_cmake.csp
+#11 4.505 -- view classname:test_cmake
+#11 4.505 -- cspFile:/drogon/drogon_ctl/templates/test_main.csp
+#11 4.505 -- view classname:test_main
+#11 4.505 -- bin:bin
+#11 4.508 -- Could NOT find Doxygen (missing: DOXYGEN_EXECUTABLE) 
+#11 4.518 -- Configuring done (2.1s)
+#11 4.534 -- Generating done (0.0s)
+#11 4.534 -- Build files have been written to: /drogon/build
+#11 4.570 [  0%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/TimingWheel.cc.o
+#11 4.571 [  3%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/Utilities.cc.o
+#11 4.571 [  4%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/Date.cc.o
+#11 4.571 [  5%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/EventLoop.cc.o
+#11 4.572 [  2%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/SerialTaskQueue.cc.o
+#11 4.572 [  4%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/ConcurrentTaskQueue.cc.o
+#11 4.572 [  5%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/LogStream.cc.o
+#11 4.572 [  6%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/Logger.cc.o
+#11 4.572 [  7%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/InetAddress.cc.o
+#11 4.572 [  0%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/AsyncFileLogger.cc.o
+#11 4.572 [  7%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/MsgBuffer.cc.o
+#11 4.572 [  7%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/EventLoopThreadPool.cc.o
+#11 4.572 [  7%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/EventLoopThread.cc.o
+#11 4.573 [  8%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/TcpServer.cc.o
+#11 4.573 [  9%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/Acceptor.cc.o
+#11 4.573 [ 10%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/Poller.cc.o
+#11 4.574 [ 10%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/Connector.cc.o
+#11 4.574 [ 11%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/TcpClient.cc.o
+#11 4.574 [ 11%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/Socket.cc.o
+#11 4.574 [ 11%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/AsyncStreamBufferNode.cc.o
+#11 4.575 [ 14%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/Channel.cc.o
+#11 4.575 [ 14%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/poller/EpollPoller.cc.o
+#11 4.575 [ 14%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/TcpConnectionImpl.cc.o
+#11 4.575 [ 14%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/MemBufferNode.cc.o
+#11 4.575 [ 12%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/StreamBufferNode.cc.o
+#11 4.575 [ 15%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/TimerQueue.cc.o
+#11 4.576 [ 16%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/poller/KQueue.cc.o
+#11 4.577 [ 16%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/Timer.cc.o
+#11 4.941 [ 17%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/poller/PollPoller.cc.o
+#11 5.036 [ 17%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/FileBufferNodeUnix.cc.o
+#11 5.067 [ 18%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/tlsprovider/OpenSSLProvider.cc.o
+#11 5.087 [ 18%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/utils/crypto/openssl.cc.o
+#11 5.105 [ 19%] Building CXX object trantor/CMakeFiles/trantor.dir/trantor/net/inner/NormalResolver.cc.o
+#11 6.389 [ 20%] Linking CXX static library libtrantor.a
+#11 6.428 [ 20%] Built target trantor
+#11 6.445 [ 21%] Building CXX object CMakeFiles/drogon.dir/lib/src/Cookie.cc.o
+#11 6.445 [ 22%] Building CXX object CMakeFiles/drogon.dir/lib/src/DrTemplateBase.cc.o
+#11 6.445 [ 22%] Building CXX object CMakeFiles/drogon.dir/lib/src/DrClassMap.cc.o
+#11 6.446 [ 23%] Building CXX object CMakeFiles/drogon.dir/lib/src/AOPAdvice.cc.o
+#11 6.446 [ 24%] Building CXX object CMakeFiles/drogon.dir/lib/src/AccessLogger.cc.o
+#11 6.446 [ 25%] Building CXX object CMakeFiles/drogon.dir/lib/src/MiddlewaresFunction.cc.o
+#11 6.446 [ 26%] Building CXX object CMakeFiles/drogon.dir/lib/src/ConfigAdapterManager.cc.o
+#11 6.446 [ 26%] Building CXX object CMakeFiles/drogon.dir/lib/src/ConfigLoader.cc.o
+#11 6.446 [ 26%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpAppFrameworkImpl.cc.o
+#11 6.446 [ 26%] Building CXX object CMakeFiles/drogon.dir/lib/src/CacheFile.cc.o
+#11 6.447 [ 27%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpBinder.cc.o
+#11 6.447 [ 28%] Building CXX object CMakeFiles/drogon.dir/lib/src/GlobalFilters.cc.o
+#11 6.447 [ 28%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpConnectionLimit.cc.o
+#11 6.447 [ 29%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpControllerBinder.cc.o
+#11 6.448 [ 29%] Building CXX object CMakeFiles/drogon.dir/lib/src/FixedWindowRateLimiter.cc.o
+#11 6.448 [ 30%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpClientImpl.cc.o
+#11 6.448 [ 31%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpFileImpl.cc.o
+#11 6.448 [ 32%] Building CXX object CMakeFiles/drogon.dir/lib/src/Histogram.cc.o
+#11 6.448 [ 32%] Building CXX object CMakeFiles/drogon.dir/lib/src/Hodor.cc.o
+#11 6.448 [ 32%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpRequestImpl.cc.o
+#11 6.448 [ 33%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpResponseImpl.cc.o
+#11 6.449 [ 34%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpServer.cc.o
+#11 6.449 [ 34%] Building CXX object CMakeFiles/drogon.dir/lib/src/RequestStream.cc.o
+#11 6.449 [ 37%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpFileUploadRequest.cc.o
+#11 6.449 [ 36%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpControllersRouter.cc.o
+#11 6.449 [ 35%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpUtils.cc.o
+#11 6.449 [ 37%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpResponseParser.cc.o
+#11 6.449 [ 37%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpRequestParser.cc.o
+#11 6.782 [ 37%] Building CXX object CMakeFiles/drogon.dir/lib/src/HttpViewData.cc.o
+#11 6.991 [ 38%] Building CXX object CMakeFiles/drogon.dir/lib/src/IntranetIpFilter.cc.o
+#11 7.103 [ 38%] Building CXX object CMakeFiles/drogon.dir/lib/src/JsonConfigAdapter.cc.o
+#11 7.124 /drogon/lib/src/HttpUtils.cc:62:10: warning: 'drogon::CT_APPLICATION_X_JAVASCRIPT' is deprecated: use CT_TEXT_JAVASCRIPT [-Wdeprecated-declarations]
+#11 7.124    62 |         {CT_APPLICATION_X_JAVASCRIPT,
+#11 7.124       |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+#11 7.124 In file included from /drogon/lib/src/HttpUtils.h:18,
+#11 7.124                  from /drogon/lib/src/HttpUtils.cc:15:
+#11 7.124 /drogon/lib/inc/drogon/HttpTypes.h:106:5: note: declared here
+#11 7.124   106 |     CT_APPLICATION_X_JAVASCRIPT [[deprecated("use CT_TEXT_JAVASCRIPT")]],
+#11 7.124       |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+#11 7.224 /drogon/lib/src/HttpUtils.cc: In lambda function:
+#11 7.224 /drogon/lib/src/HttpUtils.cc:733:23: warning: 'drogon::CT_APPLICATION_X_JAVASCRIPT' is deprecated: use CT_TEXT_JAVASCRIPT [-Wdeprecated-declarations]
+#11 7.224   733 |         extensionMap_[CT_APPLICATION_X_JAVASCRIPT] =
+#11 7.224       |                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+#11 7.224 /drogon/lib/inc/drogon/HttpTypes.h:106:5: note: declared here
+#11 7.224   106 |     CT_APPLICATION_X_JAVASCRIPT [[deprecated("use CT_TEXT_JAVASCRIPT")]],
+#11 7.224       |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+#11 7.272 [ 39%] Building CXX object CMakeFiles/drogon.dir/lib/src/ListenerManager.cc.o
+#11 7.285 [ 39%] Building CXX object CMakeFiles/drogon.dir/lib/src/LocalHostFilter.cc.o
+#11 7.412 [ 40%] Building CXX object CMakeFiles/drogon.dir/lib/src/MultiPart.cc.o
+#11 7.415 [ 41%] Building CXX object CMakeFiles/drogon.dir/lib/src/MultipartStreamParser.cc.o
+#11 7.526 [ 41%] Building CXX object CMakeFiles/drogon.dir/lib/src/NotFound.cc.o
+#11 7.635 [ 42%] Building CXX object CMakeFiles/drogon.dir/lib/src/PluginsManager.cc.o
+#11 8.049 [ 42%] Building CXX object CMakeFiles/drogon.dir/lib/src/PromExporter.cc.o
+#11 8.072 [ 43%] Building CXX object CMakeFiles/drogon.dir/lib/src/RangeParser.cc.o
+#11 8.257 [ 43%] Building CXX object CMakeFiles/drogon.dir/lib/src/RealIpResolver.cc.o
+#11 8.257 [ 44%] Building CXX object CMakeFiles/drogon.dir/lib/src/RateLimiter.cc.o
+#11 8.321 [ 45%] Building CXX object CMakeFiles/drogon.dir/lib/src/SecureSSLRedirector.cc.o
+#11 8.411 [ 45%] Building CXX object CMakeFiles/drogon.dir/lib/src/Redirector.cc.o
+#11 8.417 [ 45%] Building CXX object CMakeFiles/drogon.dir/lib/src/SlashRemover.cc.o
+#11 8.418 [ 46%] Building CXX object CMakeFiles/drogon.dir/lib/src/SessionManager.cc.o
+#11 8.453 [ 47%] Building CXX object CMakeFiles/drogon.dir/lib/src/SlidingWindowRateLimiter.cc.o
+#11 8.529 [ 48%] Building CXX object CMakeFiles/drogon.dir/lib/src/StaticFileRouter.cc.o
+#11 8.602 [ 48%] Building CXX object CMakeFiles/drogon.dir/lib/src/TaskTimeoutFlag.cc.o
+#11 8.735 [ 49%] Building CXX object CMakeFiles/drogon.dir/lib/src/TokenBucketRateLimiter.cc.o
+#11 8.779 [ 49%] Building CXX object CMakeFiles/drogon.dir/lib/src/Utilities.cc.o
+#11 8.818 [ 50%] Building CXX object CMakeFiles/drogon.dir/lib/src/WebSocketClientImpl.cc.o
+#11 8.868 [ 50%] Building CXX object CMakeFiles/drogon.dir/lib/src/WebSocketConnectionImpl.cc.o
+#11 8.952 [ 51%] Building CXX object CMakeFiles/drogon.dir/lib/src/YamlConfigAdapter.cc.o
+#11 9.142 [ 52%] Building CXX object CMakeFiles/drogon.dir/lib/src/drogon_test.cc.o
+#11 9.177 [ 52%] Building CXX object CMakeFiles/drogon.dir/lib/src/SharedLibManager.cc.o
+#11 9.209 [ 53%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/postgresql_impl/PostgreSQLResultImpl.cc.o
+#11 9.347 [ 53%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/postgresql_impl/PgListener.cc.o
+#11 9.357 [ 54%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/postgresql_impl/PgBatchConnection.cc.o
+#11 9.513 [ 54%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/mysql_impl/MysqlConnection.cc.o
+#11 9.812 [ 55%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/mysql_impl/MysqlResultImpl.cc.o
+#11 9.841 [ 56%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/sqlite3_impl/Sqlite3Connection.cc.o
+#11 9.886 [ 56%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/sqlite3_impl/Sqlite3ResultImpl.cc.o
+#11 9.977 [ 57%] Building CXX object CMakeFiles/drogon.dir/lib/src/RedisClientSkipped.cc.o
+#11 10.56 [ 57%] Building CXX object CMakeFiles/drogon.dir/lib/src/RedisResultSkipped.cc.o
+#11 10.66 [ 58%] Building CXX object CMakeFiles/drogon.dir/lib/src/RedisClientManagerSkipped.cc.o
+#11 10.71 [ 59%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/ArrayParser.cc.o
+#11 10.75 [ 59%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/Criteria.cc.o
+#11 10.77 [ 60%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/DbClient.cc.o
+#11 10.78 [ 60%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/DbClientImpl.cc.o
+#11 10.82 [ 61%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/DbClientLockFree.cc.o
+#11 10.88 [ 61%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/DbConnection.cc.o
+#11 11.13 [ 62%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/DbListener.cc.o
+#11 11.15 [ 63%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/Exception.cc.o
+#11 11.18 [ 63%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/Field.cc.o
+#11 11.22 [ 64%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/Result.cc.o
+#11 11.26 [ 64%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/Row.cc.o
+#11 11.51 [ 65%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/SqlBinder.cc.o
+#11 11.53 [ 65%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/TransactionImpl.cc.o
+#11 11.71 [ 66%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/RestfulController.cc.o
+#11 11.98 [ 67%] Building CXX object CMakeFiles/drogon.dir/orm_lib/src/DbClientManager.cc.o
+#11 15.26 [ 67%] Linking CXX static library libdrogon.a
+#11 15.35 [ 67%] Built target drogon
+#11 15.36 [ 67%] Building CXX object drogon_ctl/CMakeFiles/_drogon_ctl.dir/main.cc.o
+#11 15.36 [ 68%] Building CXX object drogon_ctl/CMakeFiles/_drogon_ctl.dir/cmd.cc.o
+#11 15.36 [ 68%] Building CXX object drogon_ctl/CMakeFiles/_drogon_ctl.dir/create.cc.o
+#11 15.36 [ 69%] Building CXX object drogon_ctl/CMakeFiles/_drogon_ctl.dir/create_view.cc.o
+#11 17.71 [ 69%] Linking CXX executable _drogon_ctl
+#11 17.78 [ 69%] Built target _drogon_ctl
+#11 17.79 [ 69%] Generating gitignore.h, gitignore.cc
+#11 17.79 [ 71%] Generating demoMain.h, demoMain.cc
+#11 17.79 [ 70%] Generating filter_h.h, filter_h.cc
+#11 17.79 [ 72%] Generating model_json.h, model_json.cc
+#11 17.79 [ 72%] Generating plugin_h.h, plugin_h.cc
+#11 17.79 [ 74%] Generating cmake.h, cmake.cc
+#11 17.79 [ 74%] Generating test_main.h, test_main.cc
+#11 17.79 [ 75%] Generating config_json.h, config_json.cc
+#11 17.79 [ 76%] Generating model_cc.h, model_cc.cc
+#11 17.79 [ 76%] Generating config_yaml.h, config_yaml.cc
+#11 17.79 [ 76%] Generating restful_controller_custom_cc.h, restful_controller_custom_cc.cc
+#11 17.79 [ 76%] Generating filter_cc.h, filter_cc.cc
+#11 17.79 [ 76%] Generating model_h.h, model_h.cc
+#11 17.79 [ 76%] Generating restful_controller_base_h.h, restful_controller_base_h.cc
+#11 17.79 [ 76%] Generating test_cmake.h, test_cmake.cc
+#11 17.79 [ 77%] Generating restful_controller_h.h, restful_controller_h.cc
+#11 17.79 [ 79%] Generating restful_controller_base_cc.h, restful_controller_base_cc.cc
+#11 17.79 [ 80%] Generating restful_controller_custom_h.h, restful_controller_custom_h.cc
+#11 17.79 [ 80%] Generating plugin_cc.h, plugin_cc.cc
+#11 17.79 create view:/drogon/drogon_ctl/templates/filter_h.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/filter_h.csp
+#11 17.79 create view:/drogon/drogon_ctl/templates/model_json.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/model_json.csp
+#11 17.79 className=filter_h
+#11 17.79 className=model_json
+#11 17.79 create view:/drogon/drogon_ctl/templates/cmake.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/cmake.csp
+#11 17.79 className=cmake
+#11 17.79 create view:/drogon/drogon_ctl/templates/demoMain.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/demoMain.csp
+#11 17.79 className=demoMain
+#11 17.79 create view:/drogon/drogon_ctl/templates/plugin_h.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/plugin_h.csp
+#11 17.79 className=plugin_h
+#11 17.79 create view:/drogon/drogon_ctl/templates/config_yaml.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/config_yaml.csp
+#11 17.79 [ 81%] Generating restful_controller_cc.h, restful_controller_cc.cc
+#11 17.79 className=config_yaml
+#11 17.79 create view:/drogon/drogon_ctl/templates/gitignore.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/gitignore.csp
+#11 17.79 className=gitignore
+#11 17.79 create view:/drogon/drogon_ctl/templates/restful_controller_custom_cc.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/restful_controller_custom_cc.csp
+#11 17.79 className=restful_controller_custom_cc
+#11 17.79 create view:/drogon/drogon_ctl/templates/model_cc.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/model_cc.csp
+#11 17.79 className=model_cc
+#11 17.79 create view:/drogon/drogon_ctl/templates/filter_cc.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/filter_cc.csp
+#11 17.79 className=filter_cc
+#11 17.79 create view:/drogon/drogon_ctl/templates/test_cmake.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/test_cmake.csp
+#11 17.79 className=test_cmake
+#11 17.79 create view:/drogon/drogon_ctl/templates/test_main.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/test_main.csp
+#11 17.79 create view:/drogon/drogon_ctl/templates/config_json.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/config_json.csp
+#11 17.79 className=test_main
+#11 17.79 className=config_json
+#11 17.79 create view:/drogon/drogon_ctl/templates/restful_controller_h.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/restful_controller_h.csp
+#11 17.79 className=restful_controller_h
+#11 17.79 create view:/drogon/drogon_ctl/templates/model_h.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/model_h.csp
+#11 17.79 className=model_h
+#11 17.79 create view:/drogon/drogon_ctl/templates/restful_controller_base_h.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/restful_controller_base_h.csp
+#11 17.79 className=restful_controller_base_h
+#11 17.79 create view:/drogon/drogon_ctl/templates/plugin_cc.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/plugin_cc.csp
+#11 17.79 className=plugin_cc
+#11 17.79 create view:/drogon/drogon_ctl/templates/restful_controller_custom_h.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/restful_controller_custom_h.csp
+#11 17.79 className=restful_controller_custom_h
+#11 17.79 create view:/drogon/drogon_ctl/templates/restful_controller_base_cc.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/restful_controller_base_cc.csp
+#11 17.79 className=restful_controller_base_cc
+#11 17.79 create view:/drogon/drogon_ctl/templates/restful_controller_cc.csp
+#11 17.79 create HttpView Class file by /drogon/drogon_ctl/templates/restful_controller_cc.csp
+#11 17.79 className=restful_controller_cc
+#11 17.87 [ 81%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create_filter.cc.o
+#11 17.87 [ 81%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create_plugin.cc.o
+#11 17.87 [ 83%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/main.cc.o
+#11 17.87 [ 83%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/cmake.cc.o
+#11 17.87 [ 84%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/config_json.cc.o
+#11 17.87 [ 84%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/cmd.cc.o
+#11 17.87 [ 87%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create.cc.o
+#11 17.87 [ 81%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create_view.cc.o
+#11 17.87 [ 86%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create_controller.cc.o
+#11 17.87 [ 83%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/help.cc.o
+#11 17.87 [ 86%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/version.cc.o
+#11 17.87 [ 88%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create_model.cc.o
+#11 17.87 [ 89%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/create_project.cc.o
+#11 17.87 [ 89%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/filter_h.cc.o
+#11 17.87 [ 90%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/filter_cc.cc.o
+#11 17.87 [ 90%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/press.cc.o
+#11 17.87 [ 91%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/gitignore.cc.o
+#11 17.87 [ 91%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/config_yaml.cc.o
+#11 17.87 [ 92%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/model_h.cc.o
+#11 17.87 [ 93%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/demoMain.cc.o
+#11 17.87 [ 93%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/model_json.cc.o
+#11 17.87 [ 93%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/restful_controller_base_cc.cc.o
+#11 17.87 [ 94%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/restful_controller_custom_cc.cc.o
+#11 17.87 [ 95%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/restful_controller_base_h.cc.o
+#11 17.87 [ 95%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/model_cc.cc.o
+#11 17.87 [ 96%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/plugin_cc.cc.o
+#11 17.87 [ 96%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/restful_controller_cc.cc.o
+#11 17.87 [ 97%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/plugin_h.cc.o
+#11 18.37 [ 98%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/restful_controller_custom_h.cc.o
+#11 18.56 [ 98%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/restful_controller_h.cc.o
+#11 18.74 [ 99%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/test_cmake.cc.o
+#11 18.86 [ 99%] Building CXX object drogon_ctl/CMakeFiles/drogon_ctl.dir/test_main.cc.o
+#11 23.47 [100%] Linking CXX executable drogon_ctl
+#11 23.61 [100%] Built target drogon_ctl
+#11 23.66 [ 20%] Built target trantor
+#11 23.73 [ 67%] Built target drogon
+#11 23.75 [ 69%] Built target _drogon_ctl
+#11 23.79 [100%] Built target drogon_ctl
+#11 23.80 Install the project...
+#11 23.81 -- Install configuration: "Release"
+#11 23.81 -- Installing: /usr/local/lib/libtrantor.a
+#11 23.81 -- Installing: /usr/local/include/trantor/exports.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/EventLoop.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/EventLoopThread.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/EventLoopThreadPool.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/InetAddress.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/TcpClient.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/TcpConnection.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/TcpServer.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/AsyncStream.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/callbacks.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/Resolver.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/Channel.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/Certificate.h
+#11 23.81 -- Installing: /usr/local/include/trantor/net/TLSPolicy.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/AsyncFileLogger.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/ConcurrentTaskQueue.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/Date.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/Funcs.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/LockFreeQueue.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/LogStream.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/Logger.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/MsgBuffer.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/NonCopyable.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/ObjectPool.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/SerialTaskQueue.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/TaskQueue.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/TimingWheel.h
+#11 23.81 -- Installing: /usr/local/include/trantor/utils/Utilities.h
+#11 23.81 -- Installing: /usr/local/lib/cmake/Trantor/TrantorConfig.cmake
+#11 23.81 -- Installing: /usr/local/lib/cmake/Trantor/TrantorConfigVersion.cmake
+#11 23.81 -- Installing: /usr/local/lib/cmake/Trantor/Findc-ares.cmake
+#11 23.81 -- Installing: /usr/local/lib/cmake/Trantor/FindBotan.cmake
+#11 23.81 -- Installing: /usr/local/lib/cmake/Trantor/TrantorTargets.cmake
+#11 23.81 -- Installing: /usr/local/lib/cmake/Trantor/TrantorTargets-release.cmake
+#11 23.81 -- Installing: /usr/local/bin/drogon_ctl
+#11 23.82 -- Installing: /usr/local/bin/dg_ctl
+#11 23.82 -- Installing: /usr/local/lib/libdrogon.a
+#11 23.82 -- Installing: /usr/local/include/drogon/Attribute.h
+#11 23.82 -- Installing: /usr/local/include/drogon/CacheMap.h
+#11 23.82 -- Installing: /usr/local/include/drogon/Cookie.h
+#11 23.82 -- Installing: /usr/local/include/drogon/DrClassMap.h
+#11 23.82 -- Installing: /usr/local/include/drogon/DrObject.h
+#11 23.82 -- Installing: /usr/local/include/drogon/DrTemplate.h
+#11 23.82 -- Installing: /usr/local/include/drogon/DrTemplateBase.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpAppFramework.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpBinder.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpClient.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpController.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpFilter.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpMiddleware.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpRequest.h
+#11 23.82 -- Installing: /usr/local/include/drogon/RequestStream.h
+#11 23.82 -- Installing: /usr/local/include/drogon/HttpResponse.h
+#11 23.83 -- Installing: /usr/local/include/drogon/HttpSimpleController.h
+#11 23.83 -- Installing: /usr/local/include/drogon/HttpTypes.h
+#11 23.83 -- Installing: /usr/local/include/drogon/HttpViewData.h
+#11 23.83 -- Installing: /usr/local/include/drogon/IntranetIpFilter.h
+#11 23.83 -- Installing: /usr/local/include/drogon/IOThreadStorage.h
+#11 23.83 -- Installing: /usr/local/include/drogon/LocalHostFilter.h
+#11 23.83 -- Installing: /usr/local/include/drogon/MultiPart.h
+#11 23.83 -- Installing: /usr/local/include/drogon/NotFound.h
+#11 23.83 -- Installing: /usr/local/include/drogon/Session.h
+#11 23.83 -- Installing: /usr/local/include/drogon/UploadFile.h
+#11 23.83 -- Installing: /usr/local/include/drogon/WebSocketClient.h
+#11 23.83 -- Installing: /usr/local/include/drogon/WebSocketConnection.h
+#11 23.83 -- Installing: /usr/local/include/drogon/WebSocketController.h
+#11 23.83 -- Installing: /usr/local/include/drogon/drogon.h
+#11 23.83 -- Installing: /usr/local/include/drogon/version.h
+#11 23.83 -- Installing: /usr/local/include/drogon/drogon_callbacks.h
+#11 23.83 -- Installing: /usr/local/include/drogon/PubSubService.h
+#11 23.83 -- Installing: /usr/local/include/drogon/drogon_test.h
+#11 23.83 -- Installing: /usr/local/include/drogon/RateLimiter.h
+#11 23.83 -- Installing: /usr/local/include/drogon/exports.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/ArrayParser.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/BaseBuilder.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/Criteria.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/DbClient.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/DbConfig.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/DbListener.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/DbTypes.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/Exception.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/Field.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/FunctionTraits.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/Mapper.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/CoroMapper.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/Result.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/ResultIterator.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/Row.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/RowIterator.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/SqlBinder.h
+#11 23.83 -- Installing: /usr/local/include/drogon/orm/RestfulController.h
+#11 23.83 -- Installing: /usr/local/include/drogon/nosql/RedisClient.h
+#11 23.83 -- Installing: /usr/local/include/drogon/nosql/RedisResult.h
+#11 23.83 -- Installing: /usr/local/include/drogon/nosql/RedisSubscriber.h
+#11 23.83 -- Installing: /usr/local/include/drogon/nosql/RedisException.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/coroutine.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/FunctionTraits.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/HttpConstraint.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/OStringStream.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/Utilities.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Counter.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Metric.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Registry.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Collector.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Sample.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Gauge.h
+#11 23.83 -- Installing: /usr/local/include/drogon/utils/monitoring/Histogram.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/Plugin.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/Redirector.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/SecureSSLRedirector.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/AccessLogger.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/RealIpResolver.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/Hodor.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/SlashRemover.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/GlobalFilters.h
+#11 23.83 -- Installing: /usr/local/include/drogon/plugins/PromExporter.h
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/DrogonConfig.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/DrogonConfigVersion.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindUUID.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindJsoncpp.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindSQLite3.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindMySQL.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/Findpg.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindBrotli.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/Findcoz-profiler.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindHiredis.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/FindFilesystem.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/DrogonUtilities.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/ParseAndAddDrogonTests.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/DrogonTargets.cmake
+#11 23.83 -- Installing: /usr/local/lib/cmake/Drogon/DrogonTargets-release.cmake
+#11 DONE 23.9s
+
+#12 [builder 4/7] WORKDIR /server
+#12 DONE 0.1s
+
+#13 [builder 5/7] COPY . .
+#13 DONE 0.1s
+
+#14 [builder 6/7] RUN mkdir build &&     cd build &&     cmake -DCMAKE_BUILD_TYPE=Release .. &&     make -j$(nproc)
+#14 0.154 CMake Warning (dev) in CMakeLists.txt:
+#14 0.154   No project() command is present.  The top-level CMakeLists.txt file must
+#14 0.154   contain a literal, direct call to the project() command.  Add a line of
+#14 0.154   code such as
+#14 0.154 
+#14 0.154     project(ProjectName)
+#14 0.154 
+#14 0.154   near the top of the file, but after cmake_minimum_required().
+#14 0.154 
+#14 0.154   CMake is pretending there is a "project(Project)" command on the first
+#14 0.154   line.
+#14 0.154 This warning is for project developers.  Use -Wno-dev to suppress it.
+#14 0.154 
+#14 0.154 CMake Warning (dev) in CMakeLists.txt:
+#14 0.154   cmake_minimum_required() should be called prior to this top-level project()
+#14 0.154   call.  Please see the cmake-commands(7) manual for usage documentation of
+#14 0.154   both commands.
+#14 0.154 This warning is for project developers.  Use -Wno-dev to suppress it.
+#14 0.154 
+#14 0.188 -- The C compiler identification is GNU 14.4.0
+#14 0.234 -- The CXX compiler identification is GNU 14.4.0
+#14 0.238 -- Detecting C compiler ABI info
+#14 0.297 -- Detecting C compiler ABI info - done
+#14 0.304 -- Check for working C compiler: /usr/bin/cc - skipped
+#14 0.304 -- Detecting C compile features
+#14 0.305 -- Detecting C compile features - done
+#14 0.313 -- Detecting CXX compiler ABI info
+#14 0.386 -- Detecting CXX compiler ABI info - done
+#14 0.393 -- Check for working CXX compiler: /usr/local/bin/c++ - skipped
+#14 0.393 -- Detecting CXX compile features
+#14 0.394 -- Detecting CXX compile features - done
+#14 0.400 -- Found Jsoncpp: /usr/include/jsoncpp
+#14 0.404 -- jsoncpp version:1.9.6
+#14 0.433 -- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.5.7")
+#14 0.434 -- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+#14 0.490 -- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+#14 0.491 -- Found Threads: TRUE
+#14 0.493 -- Found UUID: /usr/lib/x86_64-linux-gnu/libuuid.so
+#14 0.496 -- Found ZLIB: /usr/lib/x86_64-linux-gnu/libz.so (found version "1.3.1")
+#14 0.503 -- Found PostgreSQL: /usr/lib/x86_64-linux-gnu/libpq.so (found version "17.11")
+#14 0.503 -- pg inc: /usr/include/postgresql
+#14 0.504 -- Found pg: /usr/lib/x86_64-linux-gnu/libpq.so
+#14 0.505 -- Found SQLite3: /usr/lib/x86_64-linux-gnu/libsqlite3.so
+#14 0.506 -- MySQL Include dir: /usr/include/mariadb
+#14 0.506 -- MySQL client libraries: /usr/lib/x86_64-linux-gnu/libmysqlclient_r.so
+#14 0.506 -- Found MySQL: /usr/lib/x86_64-linux-gnu/libmysqlclient_r.so
+#14 0.507 -- Found Brotli: /usr/lib/x86_64-linux-gnu/libbrotlidec.so
+#14 0.508 -- Looking for C++ include filesystem
+#14 0.790 -- Looking for C++ include filesystem - found
+#14 0.790 -- Performing Test CXX_FILESYSTEM_NO_LINK_NEEDED
+#14 1.093 -- Performing Test CXX_FILESYSTEM_NO_LINK_NEEDED - Success
+#14 1.102 -- Configuring done (0.9s)
+#14 1.104 -- Generating done (0.0s)
+#14 1.104 -- Build files have been written to: /server/build
+#14 1.135 [ 33%] Building CXX object CMakeFiles/drogon.dir/main.cpp.o
+#14 1.136 [ 66%] Building CXX object CMakeFiles/drogon.dir/PeriodicTableController.cpp.o
+#14 2.684 [100%] Linking CXX executable drogon
+#14 2.811 [100%] Built target drogon
+#14 DONE 2.8s
+
+#15 [stage-1 3/4] COPY --from=builder /server/build/drogon drogon
+#15 DONE 0.1s
+
+#16 exporting to image
+#16 exporting layers
+#16 exporting layers 0.6s done
+#16 exporting manifest sha256:ecffbe704f731567866d7f85a55c6769c1bc9e185296880e3bd8437c54d8d252 0.0s done
+#16 exporting config sha256:2a3ee35ca3ad7d6252adc94051c0c96de86c32dcc4183f18e8308099d5385d2f 0.0s done
+#16 exporting attestation manifest sha256:a0c0159401f618d543c054fd4402db3b3238fece2298cf2c35f07da4a058c473 0.0s done
+#16 exporting manifest list sha256:28e526b67023a593fe8571c9040ea3d5dc4f237249871f420e38d9c3aae576e2 0.0s done
+#16 naming to docker.io/library/tmp-benchmark:latest done
+#16 unpacking to docker.io/library/tmp-benchmark:latest
+#16 unpacking to docker.io/library/tmp-benchmark:latest 0.2s done
+#16 DONE 0.9s
+
+#17 resolving provenance for metadata file
+#17 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 32543 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Warmup]: Running...
+ -> [Warmup]: t = 15077 ms, RAM = 9.95 MB, {"rps_median": 6986, "rps_p99": 6553, "latency_median": 4270, "latency_p99": 12936, "errors": 0}, {"success": 103859, "time": 15035}
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 15059 ms, RAM = 10.25 MB, {"rps_median": 7002, "rps_p99": 6876, "latency_median": 4141, "latency_p99": 13836, "errors": 0}, {"success": 105564, "time": 15039}
+ -> [Run #2]: Running...
+ -> [Run #2]: t = 15050 ms, RAM = 10.64 MB, {"rps_median": 7123, "rps_p99": 6935, "latency_median": 4083, "latency_p99": 13727, "errors": 0}, {"success": 106662, "time": 15032}
+ -> [Run #3]: Running...
+ -> [Run #3]: t = 15052 ms, RAM = 9.87 MB, {"rps_median": 7192, "rps_p99": 7063, "latency_median": 4055, "latency_p99": 12595, "errors": 0}, {"success": 108327, "time": 15035}
+ -> [Run #4]: Running...
+ -> [Run #4]: t = 15048 ms, RAM = 10.68 MB, {"rps_median": 7208, "rps_p99": 7058, "latency_median": 4057, "latency_p99": 12660, "errors": 0}, {"success": 108437, "time": 15030}
+ -> [Run #5]: Running...
+ -> [Run #5]: t = 15060 ms, RAM = 10.68 MB, {"rps_median": 7183, "rps_p99": 7132, "latency_median": 4058, "latency_p99": 13370, "errors": 0}, {"success": 108365, "time": 15041}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Image tmp-benchmark:latest Removing 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Writing result:
+    - language: C++
+    - mode: GCC
+    - version: 14
+    - framework: Drogon
+    - framework_stdlib: false
+    - framework_website: https://drogonframework.github.io/drogon-docs/#/
+    - framework_flavor: Default
+    - framework_version: 1.9
+    - concurrency: 32
+    - path: cpp/drogon-1.9
+    - rps_median: 7183
+    - rps_p99: 7058
+    - latency_median: 4058
+    - latency_p99: 13370
+    - memory_median: 10747904
+    - memory_p99: 11964252
+    - errors: 0
+    - build_time: 32543
+ -> Keeping old values (rps_median: 7329 > 7183)
+ -> Stopping container
+ Container web_data_source Stopping 
+ Container web_data_source Stopped 
+ Container web_data_source Removing 
+ Container web_data_source Removed 
+ Dangling images Removing 
+ Image data-web-data-source:latest Removing 
+ Image data-web-data-source:latest Removed 
+ Dangling images Removed 
+Docker stats reader thread finished

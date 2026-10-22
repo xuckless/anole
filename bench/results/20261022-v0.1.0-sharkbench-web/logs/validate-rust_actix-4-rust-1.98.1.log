@@ -1,0 +1,561 @@
+ -> Running 1 benchmarks:
+    - benchmark/web/rust/actix-4-rust-1.98.1 (Default v1.98.1 / Actix v4)
+ -> Building image
+ Image data-web-data-source Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 588B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 345B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/rust:1.86
+#3 ...
+
+#4 [internal] load metadata for docker.io/library/debian:13-slim
+#4 DONE 0.2s
+
+#3 [internal] load metadata for docker.io/library/rust:1.86
+#3 DONE 0.2s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 728B done
+#6 DONE 0.0s
+
+#7 [runtime 1/3] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#7 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#7 DONE 0.0s
+
+#8 [builder 1/5] FROM docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
+#8 resolve docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 0.0s done
+#8 DONE 0.0s
+
+#9 [builder 3/5] COPY Cargo.toml Cargo.lock ./
+#9 CACHED
+
+#10 [runtime 2/3] COPY --from=builder /app/target/release/app /app
+#10 CACHED
+
+#11 [builder 2/5] WORKDIR /app
+#11 CACHED
+
+#12 [builder 4/5] COPY src ./src
+#12 CACHED
+
+#13 [builder 5/5] RUN cargo build --release
+#13 CACHED
+
+#14 [runtime 3/3] COPY static ./static
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:443e4a74e3ca778552fa9cc2232f95a53e54cb5e09064ab072b0340ed39d7d6f done
+#15 exporting config sha256:33c0a732cb91a5f80636cea1c51ca80d7f3bbd22b21d35a38ef654eda7b511d1 done
+#15 exporting attestation manifest sha256:920b42c4df4f3479f44a8ac40012ce2f4a20881524e3c82f6ded2d2ac7c52095
+#15 exporting attestation manifest sha256:920b42c4df4f3479f44a8ac40012ce2f4a20881524e3c82f6ded2d2ac7c52095 0.0s done
+#15 exporting manifest list sha256:339013d52b438c1b64b37e79347830ba174eae3841c0cbaeb764cc9f7fcb225c 0.0s done
+#15 naming to docker.io/library/data-web-data-source:latest done
+#15 unpacking to docker.io/library/data-web-data-source:latest 0.1s done
+#15 DONE 0.1s
+
+#16 resolving provenance for metadata file
+#16 DONE 0.0s
+ Image data-web-data-source Built 
+ -> Dropping page cache
+ -> Starting container
+ Container web_data_source Creating 
+ Container web_data_source Created 
+ Container web_data_source Starting 
+ Container web_data_source Started 
+
+ -> [1/1] Benchmarking benchmark/web/rust/actix-4-rust-1.98.1 (Default v1.98.1 / Actix v4)
+ - Language: Rust
+ - Mode: Default
+ - Language version: ["1.98.1"]
+ - Language version regex: Default
+ - Framework: Actix
+ - Framework stdlib: false
+ - Framework website: https://actix.rs
+ - Framework flavor: Default
+ - Framework version: ["4"]
+ - Framework version regex: "Default"
+ - Concurrency: None
+ - Copy: None
+
+ -> Copied benchmark/web/rust/actix-4-rust-1.98.1 to tmp
+ -> Pulling rust:1.98.1
+1.98.1: Pulling from library/rust
+ed8a5e9f2f6f: Pulling fs layer
+42f0cc32f2e3: Pulling fs layer
+6eefb2f5d3e9: Pulling fs layer
+38985a14f2b1: Pulling fs layer
+e7272a918094: Pulling fs layer
+6eefb2f5d3e9: Download complete
+ed8a5e9f2f6f: Download complete
+42f0cc32f2e3: Download complete
+a90298135267: Download complete
+b9cfe81e8cec: Download complete
+6eefb2f5d3e9: Pull complete
+42f0cc32f2e3: Pull complete
+38985a14f2b1: Download complete
+e7272a918094: Download complete
+38985a14f2b1: Pull complete
+e7272a918094: Pull complete
+ed8a5e9f2f6f: Pull complete
+Digest: sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+Status: Downloaded newer image for rust:1.98.1
+docker.io/library/rust:1.98.1
+ -> Pulling debian:13
+13: Pulling from library/debian
+5ec37b31f678: Download complete
+Digest: sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308
+Status: Downloaded newer image for debian:13
+docker.io/library/debian:13
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 296B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/debian:13
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/rust:1.98.1
+#4 DONE 0.0s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 143B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 DONE 0.0s
+
+#7 [builder 1/5] FROM docker.io/library/rust:1.98.1@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+#7 resolve docker.io/library/rust:1.98.1@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 0.0s done
+#7 DONE 0.1s
+
+#8 [runtime 1/2] FROM docker.io/library/debian:13@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308
+#8 resolve docker.io/library/debian:13@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 0.0s done
+#8 DONE 0.1s
+
+#6 [internal] load build context
+#6 transferring context: 2.25kB done
+#6 DONE 0.1s
+
+#9 [builder 2/5] WORKDIR /app
+#9 DONE 0.1s
+
+#10 [builder 3/5] COPY Cargo.* ./
+#10 DONE 0.0s
+
+#11 [builder 4/5] COPY src ./src
+#11 DONE 0.0s
+
+#12 [builder 5/5] RUN cargo build --release
+#12 0.341     Updating crates.io index
+#12 2.497      Locking 217 packages to latest Rust 1.98.1 compatible versions
+#12 2.502       Adding brotli-decompressor v6.0.1 (available: v6.1.1)
+#12 2.510       Adding reqwest v0.11.27 (available: v0.13.5)
+#12 2.530  Downloading crates ...
+#12 2.592   Downloaded actix-macros v0.2.5
+#12 2.597   Downloaded actix-rt v2.15.0
+#12 2.602   Downloaded actix-codec v0.5.4
+#12 2.603   Downloaded actix-router v0.5.4
+#12 2.611   Downloaded equivalent v1.0.3
+#12 2.611   Downloaded potential_utf v0.1.6
+#12 2.612   Downloaded actix-http v3.19.0
+#12 2.616   Downloaded find-msvc-tools v0.1.15
+#12 2.617   Downloaded flate2 v1.1.10
+#12 2.620   Downloaded crypto-common v0.2.2
+#12 2.622   Downloaded log v0.4.34
+#12 2.627   Downloaded encoding_rs v0.8.42
+#12 2.633   Downloaded local-channel v0.1.5
+#12 2.633   Downloaded powerfmt v0.2.1
+#12 2.634   Downloaded quote v1.0.47
+#12 2.635   Downloaded foreign-types-shared v0.1.1
+#12 2.635   Downloaded icu_normalizer_data v2.3.0
+#12 2.636   Downloaded parking_lot_core v0.9.12
+#12 2.637   Downloaded deranged v0.5.9
+#12 2.638   Downloaded getrandom v0.4.3
+#12 2.640   Downloaded jobserver v0.1.35
+#12 2.645   Downloaded cookie v0.16.2
+#12 2.646   Downloaded chacha20 v0.10.2
+#12 2.647   Downloaded digest v0.11.3
+#12 2.648   Downloaded futures-util v0.3.34
+#12 2.654   Downloaded idna v1.1.0
+#12 2.656   Downloaded form_urlencoded v1.2.2
+#12 2.656   Downloaded httpdate v1.0.3
+#12 2.657   Downloaded actix-server v2.10.0
+#12 2.658   Downloaded alloc-no-stdlib v3.0.0
+#12 2.659   Downloaded bytes v1.12.1
+#12 2.661   Downloaded derive_more v2.1.1
+#12 2.667   Downloaded futures-sink v0.3.34
+#12 2.668   Downloaded h2 v0.3.27
+#12 2.671   Downloaded http-body v0.4.6
+#12 2.672   Downloaded litemap v0.8.3
+#12 2.673   Downloaded local-waker v0.1.4
+#12 2.674   Downloaded pkg-config v0.3.34
+#12 2.674   Downloaded proc-macro2 v1.0.107
+#12 2.676   Downloaded block-buffer v0.12.1
+#12 2.676   Downloaded cfg-if v1.0.5
+#12 2.677   Downloaded rand v0.10.3
+#12 2.679   Downloaded adler2 v2.0.1
+#12 2.680   Downloaded icu_provider v2.3.1
+#12 2.681   Downloaded idna_adapter v1.2.2
+#12 2.681   Downloaded openssl-macros v0.1.1
+#12 2.682   Downloaded openssl-sys v0.9.117
+#12 2.684   Downloaded actix-utils v3.0.2
+#12 2.685   Downloaded errno v0.3.14
+#12 2.686   Downloaded fnv v1.0.7
+#12 2.686   Downloaded foreign-types v0.3.2
+#12 2.687   Downloaded futures-core v0.3.34
+#12 2.687   Downloaded httparse v1.10.1
+#12 2.688   Downloaded ipnet v2.12.2
+#12 2.689   Downloaded mime v0.3.17
+#12 2.690   Downloaded multiversion_no_op v1.0.0
+#12 2.690   Downloaded native-tls v0.2.18
+#12 2.691   Downloaded num-conv v0.2.2
+#12 2.691   Downloaded openssl-probe v0.2.1
+#12 2.692   Downloaded parking_lot v0.12.5
+#12 2.693   Downloaded bytestring v1.5.1
+#12 2.694   Downloaded core_detect v1.0.0
+#12 2.694   Downloaded futures-task v0.3.34
+#12 2.695   Downloaded hyper-tls v0.5.0
+#12 2.695   Downloaded percent-encoding v2.3.2
+#12 2.696   Downloaded foldhash v0.2.0
+#12 2.696   Downloaded cpufeatures v0.3.1
+#12 2.697   Downloaded crc32fast v1.5.3
+#12 2.698   Downloaded displaydoc v0.2.7
+#12 2.699   Downloaded futures-channel v0.3.34
+#12 2.700   Downloaded itoa v1.0.18
+#12 2.701   Downloaded pin-project-lite v0.2.17
+#12 2.704   Downloaded alloc-stdlib v0.3.0
+#12 2.704   Downloaded convert_case v0.10.0
+#12 2.705   Downloaded hybrid-array v0.4.15
+#12 2.706   Downloaded impl-more v0.3.10
+#12 2.707   Downloaded lock_api v0.4.14
+#12 2.708   Downloaded once_cell v1.21.4
+#12 2.709   Downloaded actix-service v2.0.3
+#12 2.710   Downloaded actix-web-codegen v4.4.0
+#12 2.712   Downloaded const-oid v0.10.2
+#12 2.713   Downloaded sha1 v0.11.0
+#12 2.714   Downloaded icu_collections v2.3.0
+#12 2.717   Downloaded icu_locale_core v2.3.0
+#12 2.720   Downloaded bitflags v2.13.2
+#12 2.722   Downloaded base64 v0.22.1
+#12 2.724   Downloaded rustc_version v0.4.1
+#12 2.725   Downloaded utf8_iter v1.0.4
+#12 2.725   Downloaded zerofrom v0.1.8
+#12 2.726   Downloaded icu_properties_data v2.3.0
+#12 2.731   Downloaded language-tags v0.3.2
+#12 2.732   Downloaded miniz_oxide v0.9.1
+#12 2.733   Downloaded mio v1.2.4
+#12 2.736   Downloaded base64 v0.21.7
+#12 2.738   Downloaded derive_more-impl v2.1.1
+#12 2.741   Downloaded http v0.2.12
+#12 2.742   Downloaded tokio-macros v2.7.2
+#12 2.743   Downloaded zerofrom-derive v0.1.8
+#12 2.743   Downloaded serde_urlencoded v0.7.1
+#12 2.744   Downloaded tower-service v0.3.3
+#12 2.744   Downloaded indexmap v2.14.2
+#12 2.746   Downloaded icu_properties v2.3.0
+#12 2.748   Downloaded version_check v0.9.5
+#12 2.748   Downloaded memchr v2.8.3
+#12 2.751   Downloaded sync_wrapper v0.1.2
+#12 2.751   Downloaded hashbrown v0.17.1
+#12 2.754   Downloaded scopeguard v1.2.0
+#12 2.755   Downloaded cc v1.9.0
+#12 2.757   Downloaded stable_deref_trait v1.2.1
+#12 2.757   Downloaded want v0.3.2
+#12 2.758   Downloaded hyper v0.14.32
+#12 2.762   Downloaded aho-corasick v1.1.5
+#12 2.765   Downloaded time-core v0.1.9
+#12 2.804   Downloaded brotli-decompressor v6.0.1
+#12 2.808   Downloaded try-lock v0.2.5
+#12 2.808   Downloaded yoke-derive v0.8.4
+#12 2.809   Downloaded actix-web v4.17.0
+#12 2.816   Downloaded openssl v0.10.81
+#12 2.821   Downloaded rustls-pemfile v1.0.4
+#12 2.822   Downloaded zerovec-derive v0.11.6
+#12 2.823   Downloaded rand_core v0.10.1
+#12 2.824   Downloaded slab v0.4.12
+#12 2.824   Downloaded rustversion v1.0.23
+#12 2.825   Downloaded writeable v0.6.4
+#12 2.826   Downloaded simdutf8 v0.1.5
+#12 2.828   Downloaded shlex v2.0.1
+#12 2.828   Downloaded simd-adler32 v0.3.10
+#12 2.829   Downloaded icu_normalizer v2.3.0
+#12 2.835   Downloaded unicode-xid v0.2.6
+#12 2.835   Downloaded tokio-native-tls v0.3.1
+#12 2.836   Downloaded zmij v1.0.23
+#12 2.843   Downloaded semver v1.0.28
+#12 2.845   Downloaded signal-hook-registry v1.4.8
+#12 2.845   Downloaded tracing-attributes v0.1.31
+#12 2.847   Downloaded brotli v9.0.0
+#12 2.856   Downloaded libc v0.2.191
+#12 2.893   Downloaded tinystr v0.8.4
+#12 2.894   Downloaded zstd-safe v8.2.0
+#12 2.895   Downloaded synstructure v0.14.0
+#12 2.896   Downloaded time-macros v0.2.32
+#12 2.897   Downloaded yoke v0.8.3
+#12 2.898   Downloaded zstd v0.14.3
+#12 2.900   Downloaded smallvec v1.16.3
+#12 2.900   Downloaded unicode-ident v1.0.27
+#12 2.902   Downloaded socket2 v0.5.10
+#12 2.903   Downloaded ryu v1.0.23
+#12 2.904   Downloaded serde_core v1.0.229
+#12 2.906   Downloaded tracing-core v0.1.36
+#12 2.907   Downloaded serde_derive v1.0.229
+#12 2.912   Downloaded socket2 v0.6.5
+#12 2.913   Downloaded zerotrie v0.2.5
+#12 2.916   Downloaded serde v1.0.229
+#12 2.917   Downloaded url v2.5.8
+#12 2.919   Downloaded regex-lite v0.1.9
+#12 2.920   Downloaded unicode-segmentation v1.13.3
+#12 2.922   Downloaded typenum v1.20.1
+#12 2.927   Downloaded zerovec v0.11.8
+#12 2.943   Downloaded tokio-util v0.7.20
+#12 2.950   Downloaded reqwest v0.11.27
+#12 2.953   Downloaded serde_json v1.0.154
+#12 2.957   Downloaded regex v1.13.1
+#12 2.962   Downloaded tracing v0.1.44
+#12 2.979   Downloaded vcpkg v0.2.15
+#12 3.018   Downloaded zlib-rs v0.6.8
+#12 3.021   Downloaded time v0.3.55
+#12 3.029   Downloaded syn v3.0.9
+#12 3.035   Downloaded syn v2.0.119
+#12 3.041   Downloaded regex-syntax v0.8.11
+#12 3.072   Downloaded regex-automata v0.4.18
+#12 3.087   Downloaded zstd-sys v2.1.2+zstd.1.5.7
+#12 3.096   Downloaded tokio v1.54.1
+#12 3.160    Compiling proc-macro2 v1.0.107
+#12 3.160    Compiling quote v1.0.47
+#12 3.160    Compiling unicode-ident v1.0.27
+#12 3.160    Compiling libc v0.2.191
+#12 3.160    Compiling cfg-if v1.0.5
+#12 3.160    Compiling shlex v2.0.1
+#12 3.160    Compiling find-msvc-tools v0.1.15
+#12 3.160    Compiling pin-project-lite v0.2.17
+#12 3.160    Compiling smallvec v1.16.3
+#12 3.160    Compiling pkg-config v0.3.34
+#12 3.163    Compiling log v0.4.34
+#12 3.166    Compiling bytes v1.12.1
+#12 3.167    Compiling parking_lot_core v0.9.12
+#12 3.170    Compiling scopeguard v1.2.0
+#12 3.172    Compiling stable_deref_trait v1.2.1
+#12 3.176    Compiling futures-core v0.3.34
+#12 3.182    Compiling serde_core v1.0.229
+#12 3.183    Compiling once_cell v1.21.4
+#12 3.184    Compiling itoa v1.0.18
+#12 3.185    Compiling vcpkg v0.2.15
+#12 3.185    Compiling litemap v0.8.3
+#12 3.186    Compiling memchr v2.8.3
+#12 3.186    Compiling futures-sink v0.3.34
+#12 3.186    Compiling fnv v1.0.7
+#12 3.186    Compiling writeable v0.6.4
+#12 3.186    Compiling rustversion v1.0.23
+#12 3.186    Compiling icu_properties_data v2.3.0
+#12 3.186    Compiling futures-task v0.3.34
+#12 3.253    Compiling lock_api v0.4.14
+#12 3.257    Compiling icu_normalizer_data v2.3.0
+#12 3.257    Compiling utf8_iter v1.0.4
+#12 3.257    Compiling slab v0.4.12
+#12 3.270    Compiling bitflags v2.13.2
+#12 3.274    Compiling percent-encoding v2.3.2
+#12 3.282    Compiling typenum v1.20.1
+#12 3.302    Compiling equivalent v1.0.3
+#12 3.310    Compiling hashbrown v0.17.1
+#12 3.320    Compiling httparse v1.10.1
+#12 3.324    Compiling serde v1.0.229
+#12 3.332    Compiling openssl v0.10.81
+#12 3.347    Compiling foreign-types-shared v0.1.1
+#12 3.352    Compiling unicode-segmentation v1.13.3
+#12 3.356    Compiling tracing-core v0.1.36
+#12 3.391    Compiling foreign-types v0.3.2
+#12 3.392    Compiling getrandom v0.4.3
+#12 3.392    Compiling httpdate v1.0.3
+#12 3.392    Compiling native-tls v0.2.18
+#12 3.401    Compiling futures-util v0.3.34
+#12 3.419    Compiling zmij v1.0.23
+#12 3.421    Compiling alloc-no-stdlib v3.0.0
+#12 3.426    Compiling zstd-safe v8.2.0
+#12 3.434    Compiling crc32fast v1.5.3
+#12 3.461    Compiling cpufeatures v0.3.1
+#12 3.468    Compiling rand_core v0.10.1
+#12 3.483    Compiling alloc-stdlib v0.3.0
+#12 3.499    Compiling form_urlencoded v1.2.2
+#12 3.499    Compiling openssl-probe v0.2.1
+#12 3.517    Compiling unicode-xid v0.2.6
+#12 3.521    Compiling local-waker v0.1.4
+#12 3.527    Compiling version_check v0.9.5
+#12 3.549    Compiling try-lock v0.2.5
+#12 3.567    Compiling multiversion_no_op v1.0.0
+#12 3.578    Compiling num-conv v0.2.2
+#12 3.582    Compiling regex-syntax v0.8.11
+#12 3.586    Compiling serde_json v1.0.154
+#12 3.587    Compiling core_detect v1.0.0
+#12 3.620    Compiling time-core v0.1.9
+#12 3.669    Compiling aho-corasick v1.1.5
+#12 3.677    Compiling convert_case v0.10.0
+#12 3.677    Compiling adler2 v2.0.1
+#12 3.677    Compiling simd-adler32 v0.3.10
+#12 3.689    Compiling const-oid v0.10.2
+#12 3.690    Compiling simdutf8 v0.1.5
+#12 3.697    Compiling want v0.3.2
+#12 3.712    Compiling cookie v0.16.2
+#12 3.728    Compiling encoding_rs v0.8.42
+#12 3.744    Compiling chacha20 v0.10.2
+#12 3.759    Compiling http v0.2.12
+#12 3.765    Compiling time-macros v0.2.32
+#12 3.795    Compiling miniz_oxide v0.9.1
+#12 3.806    Compiling bytestring v1.5.1
+#12 3.860    Compiling tracing v0.1.44
+#12 3.872    Compiling indexmap v2.14.2
+#12 3.897    Compiling brotli-decompressor v6.0.1
+#12 3.932    Compiling actix-service v2.0.3
+#12 3.936    Compiling futures-channel v0.3.34
+#12 3.942    Compiling tower-service v0.3.3
+#12 3.945    Compiling mime v0.3.17
+#12 3.976    Compiling syn v3.0.9
+#12 3.980    Compiling syn v2.0.119
+#12 3.985    Compiling regex-lite v0.1.9
+#12 4.022    Compiling ryu v1.0.23
+#12 4.033    Compiling powerfmt v0.2.1
+#12 4.049    Compiling deranged v0.5.9
+#12 4.141    Compiling hybrid-array v0.4.15
+#12 4.154    Compiling flate2 v1.1.10
+#12 4.166    Compiling actix-utils v3.0.2
+#12 4.193    Compiling local-channel v0.1.5
+#12 4.212    Compiling foldhash v0.2.0
+#12 4.253    Compiling errno v0.3.14
+#12 4.259    Compiling socket2 v0.6.5
+#12 4.264    Compiling mio v1.2.4
+#12 4.282    Compiling socket2 v0.5.10
+#12 4.292    Compiling jobserver v0.1.35
+#12 4.355    Compiling signal-hook-registry v1.4.8
+#12 4.365    Compiling base64 v0.22.1
+#12 4.403    Compiling parking_lot v0.12.5
+#12 4.434    Compiling language-tags v0.3.2
+#12 4.480    Compiling cc v1.9.0
+#12 4.544    Compiling http-body v0.4.6
+#12 4.550    Compiling rand v0.10.3
+#12 4.590    Compiling block-buffer v0.12.1
+#12 4.608    Compiling crypto-common v0.2.2
+#12 4.620    Compiling base64 v0.21.7
+#12 4.701    Compiling ipnet v2.12.2
+#12 4.708    Compiling sync_wrapper v0.1.2
+#12 4.719    Compiling impl-more v0.3.10
+#12 4.857    Compiling rustls-pemfile v1.0.4
+#12 4.937    Compiling brotli v9.0.0
+#12 5.266    Compiling time v0.3.55
+#12 5.361    Compiling digest v0.11.3
+#12 5.470    Compiling regex-automata v0.4.18
+#12 5.475    Compiling sha1 v0.11.0
+#12 5.749    Compiling actix-router v0.5.4
+#12 5.798    Compiling openssl-sys v0.9.117
+#12 5.802    Compiling zstd-sys v2.1.2+zstd.1.5.7
+#12 7.240    Compiling synstructure v0.14.0
+#12 7.273    Compiling tracing-attributes v0.1.31
+#12 7.274    Compiling openssl-macros v0.1.1
+#12 7.274    Compiling derive_more-impl v2.1.1
+#12 7.657    Compiling zerofrom-derive v0.1.8
+#12 7.657    Compiling yoke-derive v0.8.4
+#12 7.657    Compiling zerovec-derive v0.11.6
+#12 7.657    Compiling displaydoc v0.2.7
+#12 7.657    Compiling tokio-macros v2.7.2
+#12 7.657    Compiling serde_derive v1.0.229
+#12 7.659    Compiling actix-web-codegen v4.4.0
+#12 7.864    Compiling actix-macros v0.2.5
+#12 7.993    Compiling regex v1.13.1
+#12 8.085    Compiling tokio v1.54.1
+#12 8.405    Compiling zerofrom v0.1.8
+#12 8.471    Compiling yoke v0.8.3
+#12 8.586    Compiling zerovec v0.11.8
+#12 8.586    Compiling zerotrie v0.2.5
+#12 8.787    Compiling derive_more v2.1.1
+#12 8.998    Compiling tinystr v0.8.4
+#12 8.998    Compiling potential_utf v0.1.6
+#12 9.041    Compiling icu_collections v2.3.0
+#12 9.067    Compiling icu_locale_core v2.3.0
+#12 9.484    Compiling icu_provider v2.3.1
+#12 9.571    Compiling serde_urlencoded v0.7.1
+#12 9.627    Compiling icu_normalizer v2.3.0
+#12 9.627    Compiling icu_properties v2.3.0
+#12 10.05    Compiling idna_adapter v1.2.2
+#12 10.08    Compiling idna v1.1.0
+#12 10.22    Compiling url v2.5.8
+#12 10.37    Compiling tokio-util v0.7.20
+#12 10.37    Compiling actix-rt v2.15.0
+#12 10.37    Compiling tokio-native-tls v0.3.1
+#12 10.58    Compiling actix-server v2.10.0
+#12 10.69    Compiling h2 v0.3.27
+#12 10.69    Compiling actix-codec v0.5.4
+#12 12.31    Compiling hyper v0.14.32
+#12 12.58    Compiling zstd v0.14.3
+#12 12.69    Compiling actix-http v3.19.0
+#12 13.54    Compiling hyper-tls v0.5.0
+#12 13.61    Compiling reqwest v0.11.27
+#12 13.78    Compiling actix-web v4.17.0
+#12 16.04    Compiling app v0.1.0 (/app)
+#12 16.92     Finished `release` profile [optimized] target(s) in 16.70s
+#12 DONE 17.4s
+
+#13 [runtime 2/2] COPY --from=builder /app/target/release/app /app
+#13 DONE 0.0s
+
+#14 exporting to image
+#14 exporting layers
+#14 exporting layers 0.2s done
+#14 exporting manifest sha256:2d11e8fb6100e815bd68d4de168294e4233418d28b74584c71e6820a4aa0c244 done
+#14 exporting config sha256:8cc06c90e530305096aff7d34f2f2d811f8152e69eef643fc2abb1521df3a160 done
+#14 exporting attestation manifest sha256:bbcf66ff2d7a6384aa8bdb4f1f488f0ffd081b29963c4660b453350493a92ce4 done
+#14 exporting manifest list sha256:9094d8d975fbad2c380ae00803cba1c6bcccc058b6f46d5dcc1159f76f4b2728 done
+#14 naming to docker.io/library/tmp-benchmark:latest done
+#14 unpacking to docker.io/library/tmp-benchmark:latest 0.0s done
+#14 DONE 0.3s
+
+#15 resolving provenance for metadata file
+#15 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 18375 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 2060 ms, RAM = 2.37 MB, {"rps_median": 29791, "rps_p99": 29791, "latency_median": 1042, "latency_p99": 1573, "errors": 0}, {"success": 59914, "time": 2022}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Stopping container
+ Container web_data_source Stopping 
+ Container web_data_source Stopped 
+ Container web_data_source Removing 
+ Container web_data_source Removed 
+ Dangling images Removing 
+ Image data-web-data-source:latest Removing 
+ Image data-web-data-source:latest Removed 
+ Dangling images Removed 
+Docker stats reader thread finished

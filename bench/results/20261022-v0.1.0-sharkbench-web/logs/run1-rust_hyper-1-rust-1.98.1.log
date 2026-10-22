@@ -1,0 +1,340 @@
+ -> Running 1 benchmarks:
+    - benchmark/web/rust/hyper-1-rust-1.98.1 (Default v1.98.1 / Hyper v1)
+ -> Building image
+ Image data-web-data-source Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 588B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 345B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/debian:13-slim
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/rust:1.86
+#4 DONE 0.2s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 728B done
+#6 DONE 0.0s
+
+#7 [runtime 1/3] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#7 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#7 DONE 0.0s
+
+#8 [builder 1/5] FROM docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
+#8 resolve docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 0.0s done
+#8 DONE 0.0s
+
+#9 [builder 2/5] WORKDIR /app
+#9 CACHED
+
+#10 [builder 4/5] COPY src ./src
+#10 CACHED
+
+#11 [builder 5/5] RUN cargo build --release
+#11 CACHED
+
+#12 [builder 3/5] COPY Cargo.toml Cargo.lock ./
+#12 CACHED
+
+#13 [runtime 2/3] COPY --from=builder /app/target/release/app /app
+#13 CACHED
+
+#14 [runtime 3/3] COPY static ./static
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:443e4a74e3ca778552fa9cc2232f95a53e54cb5e09064ab072b0340ed39d7d6f done
+#15 exporting config sha256:33c0a732cb91a5f80636cea1c51ca80d7f3bbd22b21d35a38ef654eda7b511d1 done
+#15 exporting attestation manifest sha256:d422589f5f15674935908370d571c17c15e75291224c78866662d59ae3ab689a done
+#15 exporting manifest list sha256:b7ca000e7254c4b9c7c91966b8ba6b230f3f0a44ce84a2e5da4904250051bd2f done
+#15 naming to docker.io/library/data-web-data-source:latest done
+#15 unpacking to docker.io/library/data-web-data-source:latest 0.0s done
+#15 DONE 0.1s
+
+#16 resolving provenance for metadata file
+#16 DONE 0.0s
+ Image data-web-data-source Built 
+ -> Dropping page cache
+ -> Starting container
+ Container web_data_source Creating 
+ Container web_data_source Created 
+ Container web_data_source Starting 
+ Container web_data_source Started 
+
+ -> [1/1] Benchmarking benchmark/web/rust/hyper-1-rust-1.98.1 (Default v1.98.1 / Hyper v1)
+ - Language: Rust
+ - Mode: Default
+ - Language version: ["1.98.1"]
+ - Language version regex: Default
+ - Framework: Hyper
+ - Framework stdlib: false
+ - Framework website: https://hyper.rs
+ - Framework flavor: Default
+ - Framework version: ["1"]
+ - Framework version regex: "Default"
+ - Concurrency: None
+ - Copy: None
+
+ -> Copied benchmark/web/rust/hyper-1-rust-1.98.1 to tmp
+ -> Pulling rust:1.98.1
+1.98.1: Pulling from library/rust
+Digest: sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+Status: Image is up to date for rust:1.98.1
+docker.io/library/rust:1.98.1
+ -> Pulling debian:13
+13: Pulling from library/debian
+Digest: sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308
+Status: Image is up to date for debian:13
+docker.io/library/debian:13
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 296B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/rust:1.98.1
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/debian:13
+#4 DONE 0.0s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 143B done
+#5 DONE 0.0s
+
+#6 [runtime 1/2] FROM docker.io/library/debian:13@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308
+#6 resolve docker.io/library/debian:13@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 0.0s done
+#6 CACHED
+
+#7 [builder 1/5] FROM docker.io/library/rust:1.98.1@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+#7 resolve docker.io/library/rust:1.98.1@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 0.0s done
+#7 DONE 0.0s
+
+#8 [builder 2/5] WORKDIR /app
+#8 CACHED
+
+#9 [internal] load build context
+#9 transferring context: 7.15kB done
+#9 DONE 0.0s
+
+#10 [builder 3/5] COPY Cargo.* ./
+#10 DONE 0.0s
+
+#11 [builder 4/5] COPY src ./src
+#11 DONE 0.0s
+
+#12 [builder 5/5] RUN cargo build --release
+#12 0.278     Updating crates.io index
+#12 24.08      Locking 70 packages to latest Rust 1.98.1 compatible versions
+#12 24.10  Downloading crates ...
+#12 24.16   Downloaded equivalent v1.0.3
+#12 24.17   Downloaded atomic-waker v1.1.2
+#12 24.18   Downloaded base64 v0.23.1
+#12 24.18   Downloaded futures-core v0.3.34
+#12 24.18   Downloaded tokio-macros v2.7.2
+#12 24.19   Downloaded cfg-if v1.0.5
+#12 24.19   Downloaded errno v0.3.14
+#12 24.19   Downloaded futures-task v0.3.34
+#12 24.20   Downloaded ipnet v2.12.2
+#12 24.21   Downloaded http-body-util v0.1.5
+#12 24.21   Downloaded lock_api v0.4.14
+#12 24.21   Downloaded thiserror v2.0.21
+#12 24.21   Downloaded httpdate v1.0.3
+#12 24.21   Downloaded itoa v1.0.18
+#12 24.21   Downloaded once_cell v1.21.4
+#12 24.21   Downloaded parking_lot_core v0.9.12
+#12 24.21   Downloaded percent-encoding v2.3.2
+#12 24.21   Downloaded scopeguard v1.2.0
+#12 24.21   Downloaded smallvec v1.16.3
+#12 24.21   Downloaded want v0.3.2
+#12 24.22   Downloaded futures-sink v0.3.34
+#12 24.22   Downloaded http-body v1.1.0
+#12 24.22   Downloaded tower-layer v0.3.3
+#12 24.22   Downloaded try-lock v0.2.5
+#12 24.22   Downloaded fnv v1.0.7
+#12 24.22   Downloaded tower-service v0.3.3
+#12 24.22   Downloaded quote v1.0.47
+#12 24.22   Downloaded zmij v1.0.23
+#12 24.22   Downloaded serde v1.0.229
+#12 24.22   Downloaded signal-hook-registry v1.4.8
+#12 24.22   Downloaded pin-project-lite v0.2.17
+#12 24.23   Downloaded thiserror-impl v2.0.21
+#12 24.24   Downloaded parking_lot v0.12.5
+#12 24.24   Downloaded serde_derive v1.0.229
+#12 24.24   Downloaded slab v0.4.12
+#12 24.24   Downloaded unicode-ident v1.0.27
+#12 24.24   Downloaded bytes v1.12.1
+#12 24.24   Downloaded futures-channel v0.3.34
+#12 24.24   Downloaded tracing-core v0.1.36
+#12 24.24   Downloaded serde_core v1.0.229
+#12 24.25   Downloaded httparse v1.10.1
+#12 24.25   Downloaded socket2 v0.6.5
+#12 24.25   Downloaded proc-macro2 v1.0.107
+#12 24.26   Downloaded tokio-util v0.7.20
+#12 24.27   Downloaded memchr v2.8.3
+#12 24.27   Downloaded serde_json v1.0.154
+#12 24.28   Downloaded http v1.5.0
+#12 24.28   Downloaded mio v1.2.4
+#12 24.28   Downloaded hyper-util v0.1.21
+#12 24.28   Downloaded indexmap v2.14.2
+#12 24.29   Downloaded hyper v1.12.0
+#12 24.29   Downloaded h2 v0.4.20
+#12 24.29   Downloaded futures-util v0.3.34
+#12 24.31   Downloaded hashbrown v0.17.1
+#12 24.33   Downloaded syn v3.0.9
+#12 24.35   Downloaded tracing v0.1.44
+#12 24.39   Downloaded libc v0.2.191
+#12 24.41   Downloaded tokio v1.54.1
+#12 24.46    Compiling proc-macro2 v1.0.107
+#12 24.46    Compiling quote v1.0.47
+#12 24.46    Compiling libc v0.2.191
+#12 24.46    Compiling unicode-ident v1.0.27
+#12 24.46    Compiling parking_lot_core v0.9.12
+#12 24.46    Compiling bytes v1.12.1
+#12 24.46    Compiling pin-project-lite v0.2.17
+#12 24.46    Compiling scopeguard v1.2.0
+#12 24.46    Compiling futures-core v0.3.34
+#12 24.46    Compiling itoa v1.0.18
+#12 24.46    Compiling cfg-if v1.0.5
+#12 24.46    Compiling smallvec v1.16.3
+#12 24.46    Compiling once_cell v1.21.4
+#12 24.46    Compiling httparse v1.10.1
+#12 24.46    Compiling equivalent v1.0.3
+#12 24.46    Compiling futures-sink v0.3.34
+#12 24.46    Compiling serde_core v1.0.229
+#12 24.46    Compiling hashbrown v0.17.1
+#12 24.46    Compiling try-lock v0.2.5
+#12 24.46    Compiling fnv v1.0.7
+#12 24.47    Compiling slab v0.4.12
+#12 24.47    Compiling atomic-waker v1.1.2
+#12 24.47    Compiling zmij v1.0.23
+#12 24.47    Compiling futures-task v0.3.34
+#12 24.47    Compiling serde_json v1.0.154
+#12 24.47    Compiling serde v1.0.229
+#12 24.47    Compiling httpdate v1.0.3
+#12 24.47    Compiling thiserror v2.0.21
+#12 24.56    Compiling lock_api v0.4.14
+#12 24.56    Compiling want v0.3.2
+#12 24.57    Compiling base64 v0.23.1
+#12 24.57    Compiling tower-layer v0.3.3
+#12 24.58    Compiling tower-service v0.3.3
+#12 24.58    Compiling percent-encoding v2.3.2
+#12 24.58    Compiling ipnet v2.12.2
+#12 24.59    Compiling memchr v2.8.3
+#12 24.60    Compiling futures-channel v0.3.34
+#12 24.60    Compiling futures-util v0.3.34
+#12 24.65    Compiling tracing-core v0.1.36
+#12 24.84    Compiling tracing v0.1.44
+#12 24.91    Compiling indexmap v2.14.2
+#12 24.97    Compiling http v1.5.0
+#12 24.97    Compiling syn v3.0.9
+#12 25.14    Compiling errno v0.3.14
+#12 25.14    Compiling socket2 v0.6.5
+#12 25.14    Compiling mio v1.2.4
+#12 25.19    Compiling signal-hook-registry v1.4.8
+#12 25.23    Compiling parking_lot v0.12.5
+#12 25.32    Compiling http-body v1.1.0
+#12 25.37    Compiling http-body-util v0.1.5
+#12 25.92    Compiling tokio-macros v2.7.2
+#12 25.92    Compiling serde_derive v1.0.229
+#12 25.92    Compiling thiserror-impl v2.0.21
+#12 26.09    Compiling tokio v1.54.1
+#12 27.95    Compiling tokio-util v0.7.20
+#12 28.16    Compiling h2 v0.4.20
+#12 29.24    Compiling hyper v1.12.0
+#12 29.84    Compiling hyper-util v0.1.21
+#12 30.69    Compiling app v0.1.0 (/app)
+#12 35.73     Finished `release` profile [optimized] target(s) in 35.55s
+#12 DONE 35.8s
+
+#13 [runtime 2/2] COPY --from=builder /app/target/release/app /app
+#13 DONE 0.3s
+
+#14 exporting to image
+#14 exporting layers 0.1s done
+#14 exporting manifest sha256:2729520ef793630edf2f85206ca2ca7a000975a859a6d5b4595d882066198bfb done
+#14 exporting config sha256:68da491434a462310738c522ef90c571d3b3fd4decacf4109b909a9cdcfe720d done
+#14 exporting attestation manifest sha256:28b5aadee90932bbd2de4cae33f79a3224181d96b501b4da561ffb4ac9512513 done
+#14 exporting manifest list sha256:286c82a4f569826f3b3b158934a62958a044415f12ad88dce6452778a89230d0 done
+#14 naming to docker.io/library/tmp-benchmark:latest
+#14 naming to docker.io/library/tmp-benchmark:latest done
+#14 unpacking to docker.io/library/tmp-benchmark:latest 0.0s done
+#14 DONE 0.1s
+
+#15 resolving provenance for metadata file
+#15 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 36525 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Warmup]: Running...
+ -> [Warmup]: t = 15160 ms, RAM = 6.85 MB, {"rps_median": 34494, "rps_p99": 34450, "latency_median": 911, "latency_p99": 1366, "errors": 0}, {"success": 517232, "time": 15114}
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 15152 ms, RAM = 7.72 MB, {"rps_median": 34783, "rps_p99": 34585, "latency_median": 904, "latency_p99": 1353, "errors": 0}, {"success": 521307, "time": 15130}
+ -> [Run #2]: Running...
+ -> [Run #2]: t = 15162 ms, RAM = 7.37 MB, {"rps_median": 34675, "rps_p99": 34533, "latency_median": 907, "latency_p99": 1360, "errors": 0}, {"success": 519641, "time": 15139}
+ -> [Run #3]: Running...
+ -> [Run #3]: t = 15144 ms, RAM = 7.04 MB, {"rps_median": 34621, "rps_p99": 34586, "latency_median": 906, "latency_p99": 1357, "errors": 0}, {"success": 519709, "time": 15122}
+ -> [Run #4]: Running...
+ -> [Run #4]: t = 15135 ms, RAM = 6.98 MB, {"rps_median": 34790, "rps_p99": 34725, "latency_median": 904, "latency_p99": 1350, "errors": 0}, {"success": 521847, "time": 15110}
+ -> [Run #5]: Running...
+ -> [Run #5]: t = 15161 ms, RAM = 7.09 MB, {"rps_median": 34707, "rps_p99": 34569, "latency_median": 906, "latency_p99": 1370, "errors": 0}, {"success": 519805, "time": 15138}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Writing result:
+    - language: Rust
+    - mode: Default
+    - version: 1.98.1
+    - framework: Hyper
+    - framework_stdlib: false
+    - framework_website: https://hyper.rs
+    - framework_flavor: Default
+    - framework_version: 1
+    - concurrency: 32
+    - path: rust/hyper-1-rust-1.98.1
+    - rps_median: 34707
+    - rps_p99: 34585
+    - latency_median: 906
+    - latency_p99: 1357
+    - memory_median: 7385120
+    - memory_p99: 8798601
+    - errors: 0
+    - build_time: 36525
+ -> Stopping container
+ Container web_data_source Stopping 
+ Container web_data_source Stopped 
+ Container web_data_source Removing 
+ Container web_data_source Removed 
+ Dangling images Removing 
+ Image data-web-data-source:latest Removing 
+ Image data-web-data-source:latest Removed 
+ Dangling images Removed 
+Docker stats reader thread finished

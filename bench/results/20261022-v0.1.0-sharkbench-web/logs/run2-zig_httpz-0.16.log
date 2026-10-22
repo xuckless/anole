@@ -1,0 +1,208 @@
+ -> Running 1 benchmarks:
+    - benchmark/web/zig/httpz-0.16 (Default v0.16.0 / httpz v03658c279937066201aba8c0a8f1936d821d0709)
+ -> Building image
+ Image data-web-data-source Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 588B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 345B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/debian:13-slim
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/rust:1.86
+#4 DONE 0.3s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 728B done
+#6 DONE 0.0s
+
+#7 [runtime 1/3] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#7 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#7 DONE 0.0s
+
+#8 [builder 1/5] FROM docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
+#8 resolve docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 0.0s done
+#8 DONE 0.0s
+
+#9 [builder 2/5] WORKDIR /app
+#9 CACHED
+
+#10 [builder 4/5] COPY src ./src
+#10 CACHED
+
+#11 [runtime 2/3] COPY --from=builder /app/target/release/app /app
+#11 CACHED
+
+#12 [builder 3/5] COPY Cargo.toml Cargo.lock ./
+#12 CACHED
+
+#13 [builder 5/5] RUN cargo build --release
+#13 CACHED
+
+#14 [runtime 3/3] COPY static ./static
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:443e4a74e3ca778552fa9cc2232f95a53e54cb5e09064ab072b0340ed39d7d6f done
+#15 exporting config sha256:33c0a732cb91a5f80636cea1c51ca80d7f3bbd22b21d35a38ef654eda7b511d1 done
+#15 exporting attestation manifest sha256:c792760ddd3b50d4bbf437500b933c1366b602f23770a6d2cc64955ce984c722 done
+#15 exporting manifest list sha256:b4cc14ec03bbf7bd39d52cab11eb4cdaac83198493d00eb36ef003d3e7d6a122 done
+#15 naming to docker.io/library/data-web-data-source:latest done
+#15 unpacking to docker.io/library/data-web-data-source:latest 0.0s done
+#15 DONE 0.0s
+
+#16 resolving provenance for metadata file
+#16 DONE 0.0s
+ Image data-web-data-source Built 
+ -> Dropping page cache
+ -> Starting container
+ Container web_data_source Creating 
+ Container web_data_source Created 
+ Container web_data_source Starting 
+ Container web_data_source Started 
+
+ -> [1/1] Benchmarking benchmark/web/zig/httpz-0.16 (Default v0.16.0 / httpz v03658c279937066201aba8c0a8f1936d821d0709)
+ - Language: Zig
+ - Mode: Default
+ - Language version: ["0.16.0"]
+ - Language version regex: Default
+ - Framework: httpz
+ - Framework stdlib: false
+ - Framework website: https://github.com/karlseguin/http.zig
+ - Framework flavor: Default
+ - Framework version: ["03658c279937066201aba8c0a8f1936d821d0709"]
+ - Framework version regex: "Default"
+ - Concurrency: None
+ - Copy: None
+
+ -> Copied benchmark/web/zig/httpz-0.16 to tmp
+ -> Pulling baredevcontainer/zig:0.16.0
+0.16.0: Pulling from baredevcontainer/zig
+Digest: sha256:30e13f6ec44474582a9000301a0e523a332b618bf8c89dafa589cf4393174b41
+Status: Image is up to date for baredevcontainer/zig:0.16.0
+docker.io/baredevcontainer/zig:0.16.0
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 357B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/baredevcontainer/zig:0.16.0
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 143B done
+#4 DONE 0.0s
+
+#5 [1/6] FROM docker.io/baredevcontainer/zig:0.16.0@sha256:30e13f6ec44474582a9000301a0e523a332b618bf8c89dafa589cf4393174b41
+#5 resolve docker.io/baredevcontainer/zig:0.16.0@sha256:30e13f6ec44474582a9000301a0e523a332b618bf8c89dafa589cf4393174b41 0.0s done
+#5 DONE 0.0s
+
+#6 [2/6] WORKDIR /app
+#6 CACHED
+
+#7 [internal] load build context
+#7 transferring context: 4.44kB done
+#7 DONE 0.0s
+
+#8 [3/6] COPY src ./src
+#8 DONE 0.0s
+
+#9 [4/6] COPY build.zig ./build.zig
+#9 DONE 0.0s
+
+#10 [5/6] RUN zig fetch --save "git+https://github.com/karlseguin/http.zig#03658c279937066201aba8c0a8f1936d821d0709"
+#10 DONE 1.0s
+
+#11 [6/6] RUN zig build --release=fast
+#11 DONE 28.2s
+
+#12 exporting to image
+#12 exporting layers
+#12 exporting layers 2.7s done
+#12 exporting manifest sha256:cea0ff59e963ab4863cd2052be71c85527bf77aaafbfccd944a84d2056d73db0 0.0s done
+#12 exporting config sha256:d75915616e225ff1e9d9d6907139f0140828c5bb42131cc93c364e1e3ff66d5b 0.0s done
+#12 exporting attestation manifest sha256:8b2e78ebce062037cae270fa745e880583a0d1c96b4439c854f9c9a141139948 0.0s done
+#12 exporting manifest list sha256:2054a99449d3076069a542e21f7a5a6767004852dbfc4f45391af2ef5598b208 0.0s done
+#12 naming to docker.io/library/tmp-benchmark:latest done
+#12 unpacking to docker.io/library/tmp-benchmark:latest
+#12 unpacking to docker.io/library/tmp-benchmark:latest 0.6s done
+#12 DONE 3.3s
+
+#13 resolving provenance for metadata file
+#13 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 32901 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Warmup]: Running...
+ -> [Warmup]: t = 15129 ms, RAM = 27.97 MB, {"rps_median": 12965, "rps_p99": 12902, "latency_median": 193, "latency_p99": 88505, "errors": 0}, {"success": 195587, "time": 15089}
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 15107 ms, RAM = 27.51 MB, {"rps_median": 12955, "rps_p99": 12796, "latency_median": 193, "latency_p99": 88687, "errors": 0}, {"success": 195159, "time": 15087}
+ -> [Run #2]: Running...
+ -> [Run #2]: t = 15092 ms, RAM = 27.66 MB, {"rps_median": 12933, "rps_p99": 12878, "latency_median": 192, "latency_p99": 88671, "errors": 0}, {"success": 195198, "time": 15072}
+ -> [Run #3]: Running...
+ -> [Run #3]: t = 15104 ms, RAM = 27.80 MB, {"rps_median": 12879, "rps_p99": 12843, "latency_median": 195, "latency_p99": 88540, "errors": 0}, {"success": 194342, "time": 15085}
+ -> [Run #4]: Running...
+ -> [Run #4]: t = 15101 ms, RAM = 27.82 MB, {"rps_median": 12919, "rps_p99": 12855, "latency_median": 191, "latency_p99": 88795, "errors": 0}, {"success": 195045, "time": 15082}
+ -> [Run #5]: Running...
+ -> [Run #5]: t = 15097 ms, RAM = 27.80 MB, {"rps_median": 12919, "rps_p99": 12830, "latency_median": 191, "latency_p99": 88928, "errors": 0}, {"success": 194838, "time": 15078}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Writing result:
+    - language: Zig
+    - mode: Default
+    - version: 0.16.0
+    - framework: httpz
+    - framework_stdlib: false
+    - framework_website: https://github.com/karlseguin/http.zig
+    - framework_flavor: Default
+    - framework_version: 03658c279937066201aba8c0a8f1936d821d0709
+    - concurrency: 32
+    - path: zig/httpz-0.16
+    - rps_median: 12919
+    - rps_p99: 12843
+    - latency_median: 192
+    - latency_p99: 88687
+    - memory_median: 29003612
+    - memory_p99: 29790044
+    - errors: 0
+    - build_time: 32901
+ -> Stopping container
+ Container web_data_source Stopping 
+ Container web_data_source Stopped 
+ Container web_data_source Removing 
+ Container web_data_source Removed 
+ Dangling images Removing 
+ Image data-web-data-source:latest Removing 
+ Image data-web-data-source:latest Removed 
+ Dangling images Removed 
+Docker stats reader thread finished

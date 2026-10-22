@@ -1,0 +1,31 @@
+validate zig/anole-0.1 exit 0
+validate zig/httpz-0.16 exit 0
+validate rust/actix-4-rust-1.98.1 exit 0
+validate rust/hyper-1-rust-1.98.1 exit 0
+validate go/fasthttp-1-go-1.20 exit 0
+validate cpp/drogon-1.9 exit 0
+round 1 zig/anole-0.1 exit 0: 33338 rps p50 653us p99 1300us 23.74MB err 0;33152 rps p50 533us p99 1138us 25.99MB err 0;32859 rps p50 546us p99 1170us 28.54MB err 0;33264 rps p50 545us p99 1174us 31.31MB err 0;32912 rps p50 546us p99 1273us 34.59MB err 0;
+round 1 zig/httpz-0.16 exit 0: 12890 rps p50 191us p99 88840us 28.07MB err 0;12909 rps p50 190us p99 88964us 27.94MB err 0;12844 rps p50 195us p99 88806us 27.91MB err 0;12891 rps p50 192us p99 88857us 27.85MB err 0;12905 rps p50 192us p99 88970us 27.98MB err 0;
+round 1 rust/actix-4-rust-1.98.1 exit 0: 30101 rps p50 1047us p99 1609us 9.32MB err 0;30127 rps p50 1041us p99 1554us 8.63MB err 0;30108 rps p50 1042us p99 1551us 8.82MB err 0;30119 rps p50 1042us p99 1552us 8.62MB err 0;30119 rps p50 1041us p99 1552us 8.73MB err 0;
+round 1 rust/hyper-1-rust-1.98.1 exit 0: 34783 rps p50 904us p99 1353us 7.72MB err 0;34675 rps p50 907us p99 1360us 7.37MB err 0;34621 rps p50 906us p99 1357us 7.04MB err 0;34790 rps p50 904us p99 1350us 6.98MB err 0;34707 rps p50 906us p99 1370us 7.09MB err 0;
+round 1 go/fasthttp-1-go-1.20 exit 0: 4743 rps p50 488us p99 91591us 19.88MB err 0;4811 rps p50 480us p99 91579us 19.65MB err 0;4867 rps p50 483us p99 91335us 19.85MB err 0;4819 rps p50 479us p99 91446us 20.43MB err 0;4831 rps p50 473us p99 91599us 20.40MB err 0;5484 rps p50 503us p99 90607us 20.75MB err 0;5410 rps p50 502us p99 90504us 21.40MB err 0;5536 rps p50 491us p99 90565us 21.94MB err 0;5593 rps p50 495us p99 90523us 21.59MB err 0;5690 rps p50 487us p99 90405us 22.22MB err 0;
+round 1 cpp/drogon-1.9 exit 0: 7087 rps p50 4121us p99 13822us 10.48MB err 0;7329 rps p50 3989us p99 12872us 10.64MB err 0;7352 rps p50 4003us p99 12776us 10.99MB err 0;7394 rps p50 3979us p99 12777us 10.97MB err 0;7285 rps p50 4021us p99 12866us 10.60MB err 0;
+round 2 zig/anole-0.1 exit 0: 33155 rps p50 570us p99 1174us 29.73MB err 0;32821 rps p50 573us p99 1227us 35.21MB err 0;33009 rps p50 545us p99 1158us 36.75MB err 0;32829 rps p50 546us p99 1204us 37.69MB err 0;33489 rps p50 542us p99 1106us 38.80MB err 0;
+round 2 zig/httpz-0.16 exit 0: 12955 rps p50 193us p99 88687us 27.51MB err 0;12933 rps p50 192us p99 88671us 27.66MB err 0;12879 rps p50 195us p99 88540us 27.80MB err 0;12919 rps p50 191us p99 88795us 27.82MB err 0;12919 rps p50 191us p99 88928us 27.80MB err 0;
+round 2 rust/actix-4-rust-1.98.1 exit 0: 30115 rps p50 1046us p99 1601us 9.15MB err 0;30181 rps p50 1039us p99 1555us 8.87MB err 0;30200 rps p50 1038us p99 1545us 9.76MB err 0;30157 rps p50 1040us p99 1547us 9.03MB err 0;30187 rps p50 1039us p99 1543us 9.80MB err 0;
+round 2 rust/hyper-1-rust-1.98.1 exit 0: 34890 rps p50 904us p99 1379us 7.39MB err 0;34913 rps p50 900us p99 1345us 6.99MB err 0;34783 rps p50 904us p99 1359us 6.60MB err 0;34832 rps p50 903us p99 1348us 7.19MB err 0;34857 rps p50 901us p99 1355us 6.91MB err 0;
+round 2 go/fasthttp-1-go-1.20 exit 0: 4869 rps p50 490us p99 91592us 19.17MB err 0;4927 rps p50 486us p99 91356us 20.38MB err 0;5038 rps p50 465us p99 91186us 20.69MB err 0;4976 rps p50 474us p99 91341us 20.60MB err 0;4920 rps p50 470us p99 91364us 20.67MB err 0;5485 rps p50 503us p99 90698us 20.99MB err 0;5593 rps p50 486us p99 90571us 21.17MB err 0;5560 rps p50 479us p99 90718us 21.25MB err 0;5555 rps p50 490us p99 90497us 21.71MB err 0;5593 rps p50 487us p99 90375us 21.81MB err 0;
+round 2 cpp/drogon-1.9 exit 0: 7002 rps p50 4141us p99 13836us 10.25MB err 0;7123 rps p50 4083us p99 13727us 10.64MB err 0;7192 rps p50 4055us p99 12595us 9.87MB err 0;7208 rps p50 4057us p99 12660us 10.68MB err 0;7183 rps p50 4058us p99 13370us 10.68MB err 0;
+
+[exited with code 0]
+
+Sharkbench web (sharkbench/sharkbench 3e1d4b1, its own runner), 1 CPU container, concurrency 32.
+Protocol: one unmeasured --validate pass per entry (builds cached), then 2 interleaved rounds,
+70 s idle before each invocation; each invocation = 1 warm-up + 5 x 15 s runs (fasthttp: 2 Go versions).
+Median of all measured runs:
+  hyper     34,783 req/s  p50 904us  p99 1.36ms  7.0 MB
+  anole     32,960 req/s  p50 546us  p99 1.19ms  30.5 MB (climbs 19 -> 39 MB within each container)
+  actix     30,119 req/s  p50 1.04ms p99 1.55ms  8.8 MB
+  httpz     12,907 req/s  p50 192us  p99 88.8ms  27.9 MB
+  drogon     7,188 req/s  p50 4.06ms p99 12.9ms  10.6 MB
+  fasthttp   5,204 req/s  p50 488us  p99 91.0ms  20.7 MB

@@ -1,0 +1,9 @@
+language: Zig
+mode: Default
+version:
+  - '0.17.0'
+framework: anole
+framework_website: https://github.com/xuckless/anole
+framework_flavor: Default
+framework_version:
+  - 'v0.1.0'

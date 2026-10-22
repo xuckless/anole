@@ -1,0 +1,259 @@
+ -> Running 1 benchmarks:
+    - benchmark/web/zig/anole-0.1 (Default v0.17.0 / anole vv0.1.0)
+ -> Building image
+ Image data-web-data-source Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 588B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 345B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/debian:13-slim
+#3 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/rust:1.86
+#4 DONE 0.3s
+
+#5 [internal] load .dockerignore
+#5 transferring context: 2B done
+#5 DONE 0.0s
+
+#6 [internal] load build context
+#6 transferring context: 728B done
+#6 DONE 0.0s
+
+#7 [runtime 1/3] FROM docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+#7 resolve docker.io/library/debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad 0.0s done
+#7 DONE 0.0s
+
+#8 [builder 1/5] FROM docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
+#8 resolve docker.io/library/rust:1.86@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 0.0s done
+#8 DONE 0.0s
+
+#9 [builder 2/5] WORKDIR /app
+#9 CACHED
+
+#10 [builder 5/5] RUN cargo build --release
+#10 CACHED
+
+#11 [runtime 2/3] COPY --from=builder /app/target/release/app /app
+#11 CACHED
+
+#12 [builder 3/5] COPY Cargo.toml Cargo.lock ./
+#12 CACHED
+
+#13 [builder 4/5] COPY src ./src
+#13 CACHED
+
+#14 [runtime 3/3] COPY static ./static
+#14 CACHED
+
+#15 exporting to image
+#15 exporting layers done
+#15 exporting manifest sha256:443e4a74e3ca778552fa9cc2232f95a53e54cb5e09064ab072b0340ed39d7d6f done
+#15 exporting config sha256:33c0a732cb91a5f80636cea1c51ca80d7f3bbd22b21d35a38ef654eda7b511d1 done
+#15 exporting attestation manifest sha256:0610cce1f1e3d7557b0316aad13f2d137786c75de0dcb25320df2dc27dc44ec3 done
+#15 exporting manifest list sha256:5840d88be0366c72a13b136d06ec1ab1d3471c1d00a0b6692721aa28b79bcc66 done
+#15 naming to docker.io/library/data-web-data-source:latest done
+#15 unpacking to docker.io/library/data-web-data-source:latest 0.0s done
+#15 DONE 0.1s
+
+#16 resolving provenance for metadata file
+#16 DONE 0.0s
+ Image data-web-data-source Built 
+ -> Dropping page cache
+ -> Starting container
+ Container web_data_source Creating 
+ Container web_data_source Created 
+ Container web_data_source Starting 
+ Container web_data_source Started 
+
+ -> [1/1] Benchmarking benchmark/web/zig/anole-0.1 (Default v0.17.0 / anole vv0.1.0)
+ - Language: Zig
+ - Mode: Default
+ - Language version: ["0.17.0"]
+ - Language version regex: Default
+ - Framework: anole
+ - Framework stdlib: false
+ - Framework website: https://github.com/xuckless/anole
+ - Framework flavor: Default
+ - Framework version: ["v0.1.0"]
+ - Framework version regex: "Default"
+ - Concurrency: None
+ - Copy: None
+
+ -> Copied benchmark/web/zig/anole-0.1 to tmp
+ -> Pulling alpine:3.20
+3.20: Pulling from library/alpine
+Digest: sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+Status: Image is up to date for alpine:3.20
+docker.io/library/alpine:3.20
+ -> Dropping page cache
+ -> Building image
+ Image tmp-benchmark Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 548B done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 1.15kB done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/alpine:3.20
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 143B done
+#4 DONE 0.0s
+
+#5 [build 1/7] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#5 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc done
+#5 CACHED
+
+#6 [internal] load build context
+#6 transferring context: 2.61kB done
+#6 DONE 0.0s
+
+#7 [build 2/7] RUN apk add --no-cache ca-certificates curl git tar xz
+#7 0.150 fetch https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz
+#7 0.238 fetch https://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64/APKINDEX.tar.gz
+#7 0.370 (1/18) Installing ca-certificates (20261020-r0)
+#7 0.396 (2/18) Installing brotli-libs (1.1.0-r2)
+#7 0.419 (3/18) Installing c-ares (1.33.1-r0)
+#7 0.429 (4/18) Installing libunistring (1.2-r0)
+#7 0.455 (5/18) Installing libidn2 (2.3.7-r0)
+#7 0.467 (6/18) Installing nghttp2-libs (1.62.1-r0)
+#7 0.477 (7/18) Installing libpsl (0.21.5-r1)
+#7 0.486 (8/18) Installing zstd-libs (1.5.6-r0)
+#7 0.510 (9/18) Installing libcurl (8.14.1-r2)
+#7 0.531 (10/18) Installing curl (8.14.1-r2)
+#7 0.544 (11/18) Installing libexpat (2.8.1-r0)
+#7 0.554 (12/18) Installing pcre2 (10.43-r0)
+#7 0.576 (13/18) Installing git (2.45.4-r0)
+#7 0.739 (14/18) Installing git-init-template (2.45.4-r0)
+#7 0.748 (15/18) Installing libacl (2.3.2-r0)
+#7 0.757 (16/18) Installing tar (1.35-r2)
+#7 0.776 (17/18) Installing xz-libs (5.8.3-r0)
+#7 0.790 (18/18) Installing xz (5.8.3-r0)
+#7 0.809 Executing busybox-1.36.1-r31.trigger
+#7 0.816 Executing ca-certificates-20261020-r0.trigger
+#7 0.830 OK: 21 MiB in 32 packages
+#7 DONE 0.9s
+
+#8 [build 3/7] WORKDIR /server
+#8 DONE 0.0s
+
+#9 [build 4/7] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#9 0.110   % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+#9 0.110                                  Dload  Upload   Total   Spent    Left  Speed
+#9 0.110   0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0 54.6M    0  239k    0     0   249k      0  0:03:44 --:--:--  0:03:44  249k 10 54.6M   10 6143k    0     0  3146k      0  0:00:17  0:00:01  0:00:16 3147k 34 54.6M   34 18.8M    0     0  6602k      0  0:00:08  0:00:02  0:00:06 6601k 55 54.6M   55 30.0M    0     0  7825k      0  0:00:07  0:00:03  0:00:04 7825k 67 54.6M   67 37.1M    0     0  7663k      0  0:00:07  0:00:04  0:00:03 7663k 81 54.6M   81 44.8M    0     0  7711k      0  0:00:07  0:00:05  0:00:02 9145k 93 54.6M   93 51.2M    0     0  7565k      0  0:00:07  0:00:06  0:00:01 9294k100 54.6M  100 54.6M    0     0  7541k      0  0:00:07  0:00:07 --:--:-- 8154k
+#9 DONE 7.8s
+
+#10 [build 5/7] COPY build.zig build.zig.zon ./
+#10 DONE 0.1s
+
+#11 [build 6/7] COPY src ./src
+#11 DONE 0.0s
+
+#12 [build 7/7] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#12 51.98 info: fetching lazy dependency translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx
+#12 51.98 info: fetching lazy dependency N-V-__8AAP98WQBOcqCV-jYjCmw19Aw3aCtmPAMilcMGfLOK
+#12 51.98 info: fetching lazy dependency N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq
+#12 51.98 info: fetching lazy dependency N-V-__8AAId1QwDyGLzdKzb96fSz-DZFWxuXnebZVCUeHJ3_
+#12 51.98 info: fetching lazy dependency N-V-__8AAEFLFQDX6X1kJVbgLtI2HqUnToQWeqwqMuAlG7Oa
+#12 51.98 info: fetching lazy dependency N-V-__8AAPaJcABkB6U-96R7h2xuXX5TlDMvwPbE4PucPI59
+#12 51.98 info: fetching lazy dependency N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5
+#12 51.98 info: fetching lazy dependency N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_
+#12 51.98 info: fetching lazy dependency zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom
+#12 51.98 info: fetching lazy dependency websocket-0.0.0-UEQdXjgDAgCbGTdVLwvvGXjiu9jsUWjjxE-ACul9M8HV
+#12 51.98 info: fetching lazy dependency protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv
+#12 51.98 info: fetching lazy dependency N-V-__8AABFlbgB11C3wOoHo9lqDatPMvTuIdHI0vwVxDpTe
+#12 51.98 info: fetching lazy dependency N-V-__8AAPwwCwC-qD60sHS0_NF1XJZ_qtzgIE_XlRCts2kn
+#12 51.98 info: fetching lazy dependency zig_jwt-1.7.6-w3q9SD1JHwCv7Y7wd9cdliyEaGpggJhl1M9QbZm2oNP6
+#12 51.98 info: fetching lazy dependency pg-0.0.0-Wp_7gT8JCAAGQBoEPdK4HJ9dJVRgQPRp2WnblxGwOQhZ
+#12 51.98 info: fetching lazy dependency N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9
+#12 75.68 info: fetching lazy dependency N-V-__8AAMtRpADAGtPCqgS57gPLl02TIK7HbJ1MkIm4Eq8F
+#12 75.68 info: fetching lazy dependency sqlite-3.54.1-F2R_a_YmBADq3G8bA-jCBgWFcQEaVlxVql4mEN2SbliG
+#12 DONE 149.3s
+
+#13 [stage-1 2/2] COPY --from=build /server/zig-out/bin/benchmark /benchmark
+#13 DONE 0.0s
+
+#14 exporting to image
+#14 exporting layers
+#14 exporting layers 0.8s done
+#14 exporting manifest sha256:8bd1e1db9d4674603c39ed4f152a2e732c1eea2359fa9b355a664cd5786d3823 done
+#14 exporting config sha256:1cfde82fcca1082e68b8ee352bf81cee9be4b10f924b27e972160739b111db20 done
+#14 exporting attestation manifest sha256:503f814ec8e9af007a858d36b6f4ae04e5875a3098a83fbb67edccc20eaf8ce9 done
+#14 exporting manifest list sha256:15282edb0f4987540399bfd94f845bc444a410e832c21efe714ec1d4f055ba29 done
+#14 naming to docker.io/library/tmp-benchmark:latest done
+#14 unpacking to docker.io/library/tmp-benchmark:latest
+#14 unpacking to docker.io/library/tmp-benchmark:latest 0.2s done
+#14 DONE 1.0s
+
+#15 resolving provenance for metadata file
+#15 DONE 0.0s
+ Image tmp-benchmark Built 
+ -> Build time: 159512 ms
+ -> Dropping page cache
+ -> Starting container
+ Container benchmark Creating 
+ Container benchmark Created 
+ Container benchmark Starting 
+ Container benchmark Started 
+ -> Waiting for container to be ready
+ -> Ready after 100 ms
+ -> Running benchmark
+ -> [Warmup]: Running...
+ -> [Warmup]: t = 15146 ms, RAM = 20.10 MB, {"rps_median": 32763, "rps_p99": 32319, "latency_median": 633, "latency_p99": 1465, "errors": 0}, {"success": 495548, "time": 15103}
+ -> [Run #1]: Running...
+ -> [Run #1]: t = 15115 ms, RAM = 29.73 MB, {"rps_median": 33155, "rps_p99": 32798, "latency_median": 570, "latency_p99": 1174, "errors": 0}, {"success": 498242, "time": 15092}
+ -> [Run #2]: Running...
+ -> [Run #2]: t = 15130 ms, RAM = 35.21 MB, {"rps_median": 32821, "rps_p99": 32308, "latency_median": 573, "latency_p99": 1227, "errors": 0}, {"success": 492834, "time": 15107}
+ -> [Run #3]: Running...
+ -> [Run #3]: t = 15103 ms, RAM = 36.75 MB, {"rps_median": 33009, "rps_p99": 32566, "latency_median": 545, "latency_p99": 1158, "errors": 0}, {"success": 495220, "time": 15078}
+ -> [Run #4]: Running...
+ -> [Run #4]: t = 15122 ms, RAM = 37.69 MB, {"rps_median": 32829, "rps_p99": 32390, "latency_median": 546, "latency_p99": 1204, "errors": 0}, {"success": 492622, "time": 15099}
+ -> [Run #5]: Running...
+ -> [Run #5]: t = 15120 ms, RAM = 38.80 MB, {"rps_median": 33489, "rps_p99": 33244, "latency_median": 542, "latency_p99": 1106, "errors": 0}, {"success": 503419, "time": 15097}
+ -> Stopping container
+ Container benchmark Stopping 
+ Container benchmark Stopped 
+ Container benchmark Removing 
+ Container benchmark Removed 
+ Dangling images Removing 
+ Image tmp-benchmark:latest Removing 
+ Image tmp-benchmark:latest Removed 
+ Dangling images Removed 
+ -> Writing result:
+    - language: Zig
+    - mode: Default
+    - version: 0.17.0
+    - framework: anole
+    - framework_stdlib: false
+    - framework_website: https://github.com/xuckless/anole
+    - framework_flavor: Default
+    - framework_version: v0.1.0
+    - concurrency: 32
+    - path: zig/anole-0.1
+    - rps_median: 33009
+    - rps_p99: 32566
+    - latency_median: 546
+    - latency_p99: 1174
+    - memory_median: 36920360
+    - memory_p99: 39982202
+    - errors: 0
+    - build_time: 159512
+ -> Keeping old values (rps_median: 33152 > 33009)
+ -> Stopping container
+ Container web_data_source Stopping 
+ Container web_data_source Stopped 
+ Container web_data_source Removing 
+ Container web_data_source Removed 
+ Dangling images Removing 
+ Image data-web-data-source:latest Removing 
+ Image data-web-data-source:latest Removed 
+ Dangling images Removed 
+Docker stats reader thread finished
