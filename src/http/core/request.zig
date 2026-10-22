@@ -73,9 +73,10 @@ pub const Request = struct {
     content_length: ?usize = null,
     /// The route the request matched, null when none did.
     route: ?*const RouteInfo = null,
-    /// The route's path parameters: for "/users/:id",
-    /// `req.params.get("id")` or `req.params.getInt(u64, "id")`; a
-    /// `*wildcard` segment's rest of the path under its name.
+    /// The route's path parameters, raw (percent-encoded, as in the path):
+    /// for "/users/:id", `req.params.get("id")` or
+    /// `req.params.getInt(u64, "id")`; a `*wildcard` segment's rest of the
+    /// path under its name. `paramDecoded` gives the decoded text.
     params: http.Params = .{},
     /// The query string's values, percent-decoded:
     /// `req.query.get("q")`, `req.query.getInt(u32, "page")`. A name
@@ -367,6 +368,17 @@ pub const Request = struct {
         return self.params.get(name);
     }
 
+    /// The route parameter `name`, percent-decoded into the request's arena
+    /// (the slice in `params` itself when it has no '%'). `params` holds the
+    /// raw, percent-encoded text: matching runs on the raw path, so an
+    /// encoded '/' (%2F) never splits a segment, and decodes to '/' here.
+    /// '+' stays '+'. `error.BadRequest` (400) for a '%' not followed by
+    /// two hex digits.
+    pub fn paramDecoded(self: *Request, name: []const u8) error{ BadRequest, OutOfMemory }!?[]const u8 {
+        const raw = self.params.get(name) orelse return null;
+        return try http.percentDecode(self.arena, raw, false);
+    }
+
     /// A query-string value by name, percent-decoded, null when absent:
     /// `req.queryParam("page")` for "?page=2". The same as `req.query.get`;
     /// `req.query.getInt(u32, "page")` parses one.
@@ -586,57 +598,9 @@ pub const Request = struct {
     /// space. Returns `input` itself when there is nothing to decode, else
     /// a copy allocated with `allocator`.
     pub fn urlUnescape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-        var has_plus = false;
-        var unescaped_len = input.len;
-
-        var in_i: usize = 0;
-        while (in_i < input.len) {
-            const b = input[in_i];
-            if (b == '%') {
-                if (in_i + 2 >= input.len or !std.ascii.isHex(input[in_i + 1]) or !std.ascii.isHex(input[in_i + 2])) {
-                    return error.InvalidEscapeSequence;
-                }
-                in_i += 3;
-                unescaped_len -= 2;
-            } else if (b == '+') {
-                has_plus = true;
-                in_i += 1;
-            } else {
-                in_i += 1;
-            }
-        }
-
-        // no encoding, and no plus. nothing to unescape
-        if (unescaped_len == input.len and !has_plus) {
-            return input;
-        }
-
-        const out = try allocator.alloc(u8, unescaped_len);
-
-        in_i = 0;
-        for (0..unescaped_len) |i| {
-            const b = input[in_i];
-            if (b == '%') {
-                out[i] = decodeHex(input[in_i + 1]) << 4 | decodeHex(input[in_i + 2]);
-                in_i += 3;
-            } else if (b == '+') {
-                out[i] = ' ';
-                in_i += 1;
-            } else {
-                out[i] = b;
-                in_i += 1;
-            }
-        }
-
-        return out;
-    }
-
-    fn decodeHex(c: u8) u8 {
-        return switch (c) {
-            '0'...'9' => c - '0',
-            'A'...'F' => c - 'A' + 10,
-            'a'...'f' => c - 'a' + 10,
-            else => 0,
+        return http.percentDecode(allocator, input, true) catch |err| switch (err) {
+            error.BadRequest => error.InvalidEscapeSequence,
+            error.OutOfMemory => error.OutOfMemory,
         };
     }
 };
@@ -1790,4 +1754,28 @@ test "misuse: a second reader is BodyReaderTaken in every build mode" {
     try std.testing.expectError(error.BodyReaderTaken, req.reader(&buf));
     // And `body` after `reader` is the same mistake.
     try std.testing.expectError(error.BodyReaderTaken, req.body());
+}
+
+test "Request.paramDecoded: %C3%BC, %2F, a lone %, no escapes returns the same slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var req: Request = .{
+        .arena = arena.allocator(),
+        ._transport = undefined,
+        ._parser = undefined,
+    };
+    try req.params.map.put(arena.allocator(), "name", "J%C3%BCrgen");
+    try req.params.map.put(arena.allocator(), "path", "a%2Fb+c");
+    try req.params.map.put(arena.allocator(), "bad", "50%");
+    try req.params.map.put(arena.allocator(), "bad2", "%zz");
+    try req.params.map.put(arena.allocator(), "plain", "plain");
+    try std.testing.expectEqualStrings("Jürgen", (try req.paramDecoded("name")).?);
+    try std.testing.expectEqualStrings("a/b+c", (try req.paramDecoded("path")).?);
+    try std.testing.expectError(error.BadRequest, req.paramDecoded("bad"));
+    try std.testing.expectError(error.BadRequest, req.paramDecoded("bad2"));
+    const raw = req.params.get("plain").?;
+    try std.testing.expectEqual(raw.ptr, (try req.paramDecoded("plain")).?.ptr);
+    try std.testing.expect((try req.paramDecoded("missing")) == null);
+    // The raw text is what `params` keeps.
+    try std.testing.expectEqualStrings("J%C3%BCrgen", req.params.get("name").?);
 }

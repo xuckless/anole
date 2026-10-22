@@ -793,6 +793,50 @@ test "validateHeaderName: rejects empty, whitespace, colon, control" {
     try validateHeaderName("X-Custom-Header");
 }
 
+/// Percent-decodes `text` (%XX to a byte; with `plus_is_space`, '+' to a
+/// space, as in a query string or a form). Returns `text` itself when there
+/// is nothing to decode, else a copy in `arena`. `error.BadRequest` for a
+/// '%' not followed by two hex digits.
+pub fn percentDecode(arena: std.mem.Allocator, text: []const u8, plus_is_space: bool) error{ BadRequest, OutOfMemory }![]const u8 {
+    var decoded_len = text.len;
+    var changed = false;
+    var i: usize = 0;
+    while (i < text.len) {
+        const b = text[i];
+        if (b == '%') {
+            if (i + 2 >= text.len or !std.ascii.isHex(text[i + 1]) or !std.ascii.isHex(text[i + 2])) return error.BadRequest;
+            i += 3;
+            decoded_len -= 2;
+            changed = true;
+        } else {
+            if (b == '+' and plus_is_space) changed = true;
+            i += 1;
+        }
+    }
+    if (!changed) return text;
+    const out = try arena.alloc(u8, decoded_len);
+    i = 0;
+    for (out) |*o| {
+        const b = text[i];
+        if (b == '%') {
+            o.* = (hexValue(text[i + 1]) << 4) | hexValue(text[i + 2]);
+            i += 3;
+        } else {
+            o.* = if (b == '+' and plus_is_space) ' ' else b;
+            i += 1;
+        }
+    }
+    return out;
+}
+
+fn hexValue(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'A'...'F' => c - 'A' + 10,
+        else => c - 'a' + 10,
+    };
+}
+
 /// The media types the server knows by name, for `res.content_type` and
 /// `req.content_type`; `.unknown` for anything else (set the
 /// `Content-Type` header yourself for those).
