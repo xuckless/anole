@@ -33,6 +33,10 @@ test "anole.h: every struct as abi.zig lays it out" {
     try expectSameLayout(abi.SentEvent, c.anole_sent_event);
     try expectSameLayout(abi.WsMessageEvent, c.anole_ws_message_event);
     try expectSameLayout(abi.WsCloseEvent, c.anole_ws_close_event);
+    try expectSameLayout(abi.DbValue, c.anole_db_value);
+    try expectSameLayout(abi.DbOptions, c.anole_db_options);
+    try expectSameLayout(abi.DbResultEvent, c.anole_db_result_event);
+    try expectSameLayout(abi.DbCell, c.anole_db_cell);
 }
 
 test "anole.h: every constant as abi.zig has it" {
@@ -52,6 +56,27 @@ test "anole.h: every constant as abi.zig has it" {
     try eq(abi.E_TOOBIG, c.ANOLE_E_TOOBIG);
     try eq(abi.E_SYSTEM, c.ANOLE_E_SYSTEM);
     try eq(abi.E_TIMEOUT, c.ANOLE_E_TIMEOUT);
+    try eq(abi.E_DB, c.ANOLE_E_DB);
+    try eq(abi.DB_NULL, c.ANOLE_DB_NULL);
+    try eq(abi.DB_INT, c.ANOLE_DB_INT);
+    try eq(abi.DB_FLOAT, c.ANOLE_DB_FLOAT);
+    try eq(abi.DB_TEXT, c.ANOLE_DB_TEXT);
+    try eq(abi.DB_BLOB, c.ANOLE_DB_BLOB);
+    try eq(abi.DB_WRITE, c.ANOLE_DB_WRITE);
+    try eq(abi.DB_COALESCE, c.ANOLE_DB_COALESCE);
+    try eq(abi.DB_NO_PREPARE, c.ANOLE_DB_NO_PREPARE);
+    try eq(abi.DB_DROP_EMPTY, c.ANOLE_DB_DROP_EMPTY);
+    try eq(abi.DB_FROM_DATABASE, c.ANOLE_DB_FROM_DATABASE);
+    try eq(abi.DB_FROM_COALESCED, c.ANOLE_DB_FROM_COALESCED);
+    try eq(abi.DB_FROM_CACHE, c.ANOLE_DB_FROM_CACHE);
+    const classes = @typeInfo(abi.DbErrorClass).@"enum";
+    inline for (classes.field_names, classes.field_values) |n, v| {
+        const name = comptime blk: {
+            var buf: [32]u8 = undefined;
+            break :blk "ANOLE_DB_ERR_" ++ std.ascii.upperString(&buf, n);
+        };
+        try eq(v, @field(c, name));
+    }
     try eq(abi.SERVER_SIGNALS, c.ANOLE_SERVER_SIGNALS);
     try eq(abi.LOG_ERROR, c.ANOLE_LOG_ERROR);
     try eq(abi.LOG_WARN, c.ANOLE_LOG_WARN);

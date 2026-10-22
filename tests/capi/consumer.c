@@ -1127,12 +1127,199 @@ static void test_shared_consumer(void) {
   printf("ok shared consumer, max_inflight 503, drain past shutdown_ms (%.0f ms)\n", took);
 }
 
+/* ---- databases (anole_db_*) ----------------------------------------------------------------- */
+
+#define LIT(s) ((anole_str){s, sizeof(s) - 1})
+
+/* The next ANOLE_EV_DB_RESULT, copied into `out` (other events are not
+   expected here). */
+static unsigned char db_buf[1 << 20];
+static const anole_db_result_event *db_next(anole_consumer *c, void *out, size_t cap) {
+  static size_t have = 0, at = 0;
+  for (;;) {
+    if (at < have) {
+      const anole_event *ev = (const anole_event *)(db_buf + at);
+      at += ev->len;
+      if (ev->type != ANOLE_EV_DB_RESULT) continue;
+      CHECK(ev->len <= cap);
+      memcpy(out, ev, ev->len);
+      return (const anole_db_result_event *)out;
+    }
+    int64_t n = anole_poll_wait(c, db_buf, sizeof db_buf, 10000);
+    CHECK(n > 0);
+    have = (size_t)n;
+    at = 0;
+  }
+}
+
+static const anole_db_cell *db_cell(const anole_db_result_event *r, uint32_t row, uint32_t col) {
+  const anole_db_cell *cells = (const anole_db_cell *)((const char *)r + r->cells.off);
+  return &cells[row * r->ncolumns + col];
+}
+
+static anole_str db_column(const anole_db_result_event *r, uint32_t col) {
+  const anole_span *names = (const anole_span *)((const char *)r + r->columns.off);
+  return anole_event_str(r, names[col]);
+}
+
+static void test_db(void) {
+  anole_str sqlite_name = LIT("sqlite");
+  if (!anole_has_feature(sqlite_name)) {
+    printf("ok databases (SQLite not built in)\n");
+    return;
+  }
+  char path[64];
+  snprintf(path, sizeof path, "/tmp/anole-capi-%d.db", (int)getpid());
+  char json[2048];
+  snprintf(json, sizeof json,
+           "{\"executors\": 1, \"listeners\": [{\"port\": 0}],"
+           " \"limits\": {\"db_result_max\": 65536},"
+           " \"databases\": [{\"name\": \"main\", \"sqlite\": {\"path\": \"%s\","
+           "   \"init\": \"CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,"
+           " qty INTEGER, price REAL, data BLOB);\"}}]}",
+           path);
+  anole_server *s = make_server(json);
+  anole_db *db = NULL;
+  anole_str main_name = LIT("main"), nope = LIT("nope");
+  CHECK(anole_db_find(s, nope, &db) == ANOLE_E_INVALID);
+  CHECK(anole_db_find(s, main_name, &db) == ANOLE_OK && db != NULL);
+  anole_consumer *c = NULL;
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+  anole_str sel = LIT("SELECT 1");
+  CHECK(anole_db_query(db, c, sel, NULL, 0, NULL, 1) == ANOLE_E_STATE); /* not started */
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  static unsigned char rec[1 << 20];
+  const anole_db_result_event *r;
+
+  /* exec with every value type */
+  anole_str ins = LIT("INSERT INTO items (name, qty, price, data) VALUES (?, ?, ?, ?)");
+  anole_db_value v[4] = {{ANOLE_DB_TEXT, 0, {.s = LIT("apple")}},
+                         {ANOLE_DB_INT, 0, {.i = 3}},
+                         {ANOLE_DB_FLOAT, 0, {.f = 1.25}},
+                         {ANOLE_DB_BLOB, 0, {.s = LIT("\x00\x01\x02")}}};
+  CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 10) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 10 && r->status == ANOLE_OK && r->changes == 1 && r->last_insert_rowid == 1);
+  CHECK(r->ncolumns == 0 && r->nrows == 0 && r->http_status == 0);
+  v[0].v.s = LIT("pear");
+  v[1].type = ANOLE_DB_NULL;
+  CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 11) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->last_insert_rowid == 2);
+
+  /* a read: names and cells */
+  anole_str q = LIT("SELECT id, name AS label, qty, price, data FROM items ORDER BY id");
+  CHECK(anole_db_query(db, c, q, NULL, 0, NULL, 12) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 12 && r->status == ANOLE_OK && r->ncolumns == 5 && r->nrows == 2);
+  CHECK(str_is(db_column(r, 1), "label"));
+  CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_INT && db_cell(r, 0, 0)->v.i == 1);
+  CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 1)->v.s), "apple"));
+  CHECK(db_cell(r, 0, 3)->type == ANOLE_DB_FLOAT && db_cell(r, 0, 3)->v.f == 1.25);
+  CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_BLOB && db_cell(r, 0, 4)->v.s.len == 3);
+  CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 4)->v.s).ptr, "\x00\x01\x02", 3) == 0);
+  CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_NULL);
+  CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+
+  /* failures: a unique key, a syntax error, a wrong value type */
+  v[0].v.s = LIT("apple");
+  CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 13) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->http_status == 409 && r->error_class == ANOLE_DB_ERR_UNIQUE);
+  CHECK(str_is(anole_event_str(r, r->constraint), "items.name") && r->error.len > 0 && r->error_code.len > 0);
+  anole_str bad = LIT("SELEKT 1");
+  CHECK(anole_db_query(db, c, bad, NULL, 0, NULL, 14) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
+  anole_db_value wrong = {99, 0, {.i = 0}};
+  CHECK(anole_db_query(db, c, sel, &wrong, 1, NULL, 15) == ANOLE_E_INVALID);
+
+  /* several statements without parameters */
+  anole_str script = LIT("CREATE TABLE t2 (x); INSERT INTO t2 VALUES (1); INSERT INTO t2 VALUES (2);");
+  CHECK(anole_db_exec(db, c, script, NULL, 0, NULL, 16) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 2);
+
+  /* the cache: a hit until invalidated */
+  anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
+  anole_str count = LIT("SELECT count(*) AS n FROM items");
+  CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 20) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->source == ANOLE_DB_FROM_DATABASE && db_cell(r, 0, 0)->v.i == 2);
+  v[0].v.s = LIT("plum");
+  CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 21) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 22) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->source == ANOLE_DB_FROM_CACHE && db_cell(r, 0, 0)->v.i == 2);
+  anole_str items = LIT("items");
+  CHECK(anole_db_invalidate(db, items) == ANOLE_OK);
+  CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 23) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->source == ANOLE_DB_FROM_DATABASE && db_cell(r, 0, 0)->v.i == 3);
+
+  /* many at once, coalesced: each answered once */
+  enum { MANY = 200 };
+  static int seen[MANY];
+  memset(seen, 0, sizeof seen);
+  anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_COALESCE, 0, 0, 0, {NULL, 0}};
+  for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
+  int coalesced = 0;
+  for (int i = 0; i < MANY; i++) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->user_data >= 1000 && r->user_data < 1000 + MANY && !seen[r->user_data - 1000]);
+    seen[r->user_data - 1000] = 1;
+    CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 3);
+    if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
+  }
+
+  /* a timeout interrupts the statement */
+  anole_str slow = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n");
+  anole_db_options quick = {sizeof quick, 0, 50, 0, 0, {NULL, 0}};
+  double t0 = now_ms();
+  CHECK(anole_db_query(db, c, slow, NULL, 0, &quick, 30) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
+  CHECK(now_ms() - t0 < 2000);
+
+  /* an answer past limits.db_result_max */
+  anole_str huge = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 10000) SELECT x FROM n");
+  CHECK(anole_db_query(db, c, huge, NULL, 0, NULL, 31) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_TOOBIG && r->nrows == 0);
+
+  /* a poll buffer too small for the next answer: TOOBIG, the record stays */
+  anole_str some = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100) SELECT x FROM n");
+  CHECK(anole_db_query(db, c, some, NULL, 0, NULL, 32) == ANOLE_OK);
+  unsigned char tiny[256];
+  int64_t n;
+  do n = anole_poll_wait(c, tiny, sizeof tiny, 10000);
+  while (n == 0);
+  CHECK(n == ANOLE_E_TOOBIG);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 32 && r->nrows == 100);
+
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, -1) == ANOLE_OK);
+  CHECK(anole_db_query(db, c, sel, NULL, 0, NULL, 40) == ANOLE_E_STATE);
+  anole_server_destroy(s);
+  unlink(path);
+  char side[80];
+  snprintf(side, sizeof side, "%s-wal", path);
+  unlink(side);
+  snprintf(side, sizeof side, "%s-shm", path);
+  unlink(side);
+  printf("ok databases: values both ways, errors, scripts, cache, %d of %d coalesced, timeout, size limit\n", coalesced, MANY);
+}
+
 static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
   test_basics();
   test_main_server();
   test_shared_consumer();
+  test_db();
   printf("PASS\n");
   return 0;
 }

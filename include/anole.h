@@ -93,7 +93,8 @@ enum {
   ANOLE_E_UNSUPPORTED = -7, /* compiled out, or not on this OS */
   ANOLE_E_TOOBIG = -8,      /* anole_poll: the next event does not fit */
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
-  ANOLE_E_TIMEOUT = -10     /* a blocking call's timeout passed */
+  ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
+  ANOLE_E_DB = -11          /* a database refused a statement (anole_db_result_event) */
 };
 
 /* The text of the last error on the calling thread: valid until the next
@@ -230,7 +231,7 @@ enum anole_event_type {
   ANOLE_EV_WS_MESSAGE = 7, /* anole_ws_message_event */
   ANOLE_EV_WS_CLOSE = 8,   /* anole_ws_close_event: the handle is stale from now on */
   ANOLE_EV_WS_DRAIN = 9,   /* anole_event: a WebSocket that took ANOLE_BUSY has room */
-  ANOLE_EV_DB_RESULT = 10, /* reserved for anole_db_* (SQLite, PostgreSQL, Redis, MongoDB) */
+  ANOLE_EV_DB_RESULT = 10, /* anole_db_result_event: a query's answer (anole_db_query, anole_db_exec) */
   ANOLE_EV_STOPPED = 11    /* anole_event: the server stopped; the consumer's last event */
   /* Reserved before ABI 1.0: 12-19 gRPC calls (their own handle kind),
      20-29 WebTransport sessions, streams and datagrams, 30-39 more
@@ -439,6 +440,131 @@ ANOLE_API anole_status anole_ws_unsubscribe(anole_ws w, anole_str topic);
    no event follows, publish again later. */
 ANOLE_API anole_status anole_ws_publish(anole_server *s, anole_str topic, int type, const void *data, size_t len,
                                         anole_ws except);
+
+/* ---- databases ---------------------------------------------------------------- */
+
+/* A database from the configuration's "databases" (SQLite in ABI 0.1;
+   PostgreSQL, Redis and MongoDB follow). Statements run on Anole's threads
+   and never block the caller: each call queues one, and its answer comes
+   back as an ANOLE_EV_DB_RESULT to the consumer named in the call, with the
+   caller's user_data. Reads run beside the writer (WAL); writes take turns
+   on the database's writer thread. Statements may be queued from
+   anole_server_start until the server stops; ones still running when it
+   stops get no answer (ANOLE_EV_STOPPED is the consumer's last event). */
+typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
+
+/* The database named `name` in the configuration (after
+   anole_server_create). ANOLE_E_INVALID when there is none. */
+ANOLE_API anole_status anole_db_find(anole_server *s, anole_str name, anole_db **out);
+
+/* Value and cell types. */
+enum { ANOLE_DB_NULL = 0, ANOLE_DB_INT = 1, ANOLE_DB_FLOAT = 2, ANOLE_DB_TEXT = 3, ANOLE_DB_BLOB = 4 };
+
+/* A parameter: binds `?` (or `?NNN`) in order. Text and blobs are copied
+   by the call. */
+typedef struct anole_db_value {
+  uint32_t type; /* ANOLE_DB_* */
+  uint32_t reserved;
+  union {
+    int64_t i;   /* ANOLE_DB_INT */
+    double f;    /* ANOLE_DB_FLOAT */
+    anole_str s; /* ANOLE_DB_TEXT (UTF-8), ANOLE_DB_BLOB */
+  } v;
+} anole_db_value;
+
+/* Query flags. ANOLE_DB_WRITE: run on the writer, for a statement that
+   writes but does not look like it (a SELECT with side effects).
+   ANOLE_DB_COALESCE: identical reads in flight at once (same statement and
+   parameters) share one run, each caller getting its own answer.
+   ANOLE_DB_NO_PREPARE: do not keep the prepared statement (SQL built at run
+   time). ANOLE_DB_DROP_EMPTY: with a cache_ttl_ms, an answer with no row is
+   served but not kept (cache-aside). */
+#define ANOLE_DB_WRITE 1u
+#define ANOLE_DB_COALESCE 2u
+#define ANOLE_DB_NO_PREPARE 4u
+#define ANOLE_DB_DROP_EMPTY 8u
+
+typedef struct anole_db_options {
+  size_t size;           /* sizeof(anole_db_options): fields past it read as 0 */
+  uint32_t flags;        /* ANOLE_DB_* */
+  uint32_t timeout_ms;   /* 0: none; past it, the statement is interrupted (ANOLE_E_TIMEOUT) */
+  uint32_t cache_ttl_ms; /* reads: keep the answer this long per executor, served
+                            from memory meanwhile; 0: not kept */
+  uint32_t reserved;
+  anole_str cache_tag;   /* a name to drop kept answers by (anole_db_invalidate); copied */
+} anole_db_options;
+
+/* Queues a read (or any statement that returns rows): the answer holds the
+   column names and every row. `params` (copied) bind in order; `opts` may
+   be NULL. `c` receives the answer; it must be fed by at least one
+   executor (ANOLE_E_STATE otherwise, or before start or after the stop).
+   ANOLE_E_INVALID: a bad value type or options size. Returns at once. */
+ANOLE_API anole_status anole_db_query(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
+                                      size_t nparams, const anole_db_options *opts, uint64_t user_data);
+/* Queues a write on the writer: the answer has `changes` and
+   `last_insert_rowid`, and no rows. With no parameters, `sql` may hold
+   several statements (a schema), run in order. */
+ANOLE_API anole_status anole_db_exec(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
+                                     size_t nparams, const anole_db_options *opts, uint64_t user_data);
+/* Drops the answers kept with cache_tag `tag` on every executor ({NULL, 0}:
+   every kept answer), and keeps reads that started before from filling the
+   cache. Call it after a write commits. */
+ANOLE_API anole_status anole_db_invalidate(anole_db *db, anole_str tag);
+
+/* Where an answer came from. */
+enum { ANOLE_DB_FROM_DATABASE = 0, ANOLE_DB_FROM_COALESCED = 1, ANOLE_DB_FROM_CACHE = 2 };
+
+/* What kind of failure (error_class), for every database Anole speaks. */
+enum {
+  ANOLE_DB_ERR_NONE = 0,
+  ANOLE_DB_ERR_UNIQUE = 1,        /* a unique or primary key */
+  ANOLE_DB_ERR_EXCLUSION = 2,
+  ANOLE_DB_ERR_FOREIGN_KEY = 3,
+  ANOLE_DB_ERR_NOT_NULL = 4,
+  ANOLE_DB_ERR_CHECK = 5,
+  ANOLE_DB_ERR_SERIALIZATION = 6, /* lost a race with another transaction */
+  ANOLE_DB_ERR_DEADLOCK = 7,
+  ANOLE_DB_ERR_UNAVAILABLE = 8,   /* no connection, or busy past its timeout */
+  ANOLE_DB_ERR_TIMEOUT = 9,
+  ANOLE_DB_ERR_OTHER = 10         /* syntax, a wrong parameter count, ... */
+};
+
+/* One cell of a row. Text and blobs are spans in the record. */
+typedef struct anole_db_cell {
+  uint32_t type; /* ANOLE_DB_* */
+  uint32_t reserved;
+  union {
+    int64_t i;
+    double f;
+    anole_span s;
+  } v;
+} anole_db_cell;
+
+/* ANOLE_EV_DB_RESULT: ev.handle is 0; user_data as given to the call.
+   Followed by the column names (`columns`: ncolumns anole_span), the cells
+   (`cells`: nrows * ncolumns anole_db_cell, row after row) and their bytes.
+   A large answer makes a large record: anole_poll answers ANOLE_E_TOOBIG
+   until its buffer fits it (limits.db_result_max bounds it). */
+typedef struct anole_db_result_event {
+  anole_event ev;
+  uint64_t user_data;
+  int32_t status;       /* ANOLE_OK; ANOLE_E_DB (error_class says why), ANOLE_E_TIMEOUT
+                           (timeout_ms), ANOLE_E_TOOBIG (past limits.db_result_max),
+                           ANOLE_E_NOMEM */
+  uint16_t http_status; /* the status Anole's own handlers answer for this failure
+                           (409 unique, 503 unavailable, 504 timeout, 500 other); 0 on success */
+  uint8_t error_class;  /* ANOLE_DB_ERR_* */
+  uint8_t source;       /* ANOLE_DB_FROM_* */
+  uint32_t ncolumns;
+  uint32_t nrows;
+  uint64_t changes;          /* anole_db_exec: rows changed */
+  int64_t last_insert_rowid; /* anole_db_exec: the rowid of the last row inserted */
+  anole_span columns;
+  anole_span cells;
+  anole_span error;      /* the database's message (for logs; not for clients) */
+  anole_span error_code; /* the database's own code as text (SQLite's extended code) */
+  anole_span constraint; /* the constraint that failed, when the database names it */
+} anole_db_result_event;
 
 #ifdef __cplusplus
 }
