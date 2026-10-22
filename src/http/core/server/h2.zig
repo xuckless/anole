@@ -231,6 +231,9 @@ pub fn Engine(comptime Ctx: type) type {
             writer_gone: bool = false,
             /// In `Registry`.
             node: std.DoublyLinkedList.Node = .{},
+            /// Streams whose handler is done with their response still
+            /// going out (`Stream.send_pending`).
+            send_pending: usize = 0,
             /// `refusedHead`'s token bucket: what is left, and the second
             /// it was last refilled.
             refused_tokens: u64 = 0,
@@ -437,6 +440,12 @@ pub fn Engine(comptime Ctx: type) type {
 
             handler_done: bool = false,
             protocol_done: bool = false,
+            /// The handler let go with the response not all out: counted in
+            /// `Conn.send_pending`, and given `send_deadline` by the writer.
+            send_pending: bool = false,
+            /// When the rest of the response must be out by, else the
+            /// stream is reset (`sweepSends`).
+            send_deadline: ?std.Io.Clock.Timestamp = null,
             /// Counted in the server's in-flight requests (by `startStream`)
             /// until it is freed.
             counted: bool = false,
@@ -512,12 +521,22 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Drops one side's hold, under the mutex. The second frees it.
             fn release(stream: *Stream, side: Side) void {
+                const conn = stream.conn;
                 switch (side) {
                     .handler => stream.handler_done = true,
                     .protocol => stream.protocol_done = true,
                 }
-                if (!(stream.handler_done and stream.protocol_done)) return;
-                const conn = stream.conn;
+                if (!stream.protocol_done) {
+                    // The response is still going out: from now on it is
+                    // bounded by the writer's send deadline.
+                    if (side == .handler and !stream.send_pending) {
+                        stream.send_pending = true;
+                        conn.send_pending += 1;
+                    }
+                    return;
+                }
+                if (!stream.handler_done) return;
+                if (stream.send_pending) conn.send_pending -= 1;
                 _ = conn.streams.remove(stream.id);
                 if (stream.counted) {
                     conn.open_streams -= 1;
@@ -843,6 +862,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// or the buffer filled up) goes to `spill`, which the writer frees
         /// whenever it runs out of output, so an idle connection holds none.
         fn runWriter(conn: *Conn) !void {
+            const send_timeout = sendTimeout(conn);
             var spill: std.ArrayList(u8) = .empty;
             defer spill.deinit(conn.allocator);
             const writer = conn.connection.writer;
@@ -876,11 +896,17 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 if (writer.end > 0 or spill.items.len > 0) {
                     if (comptime @import("builtin").is_test) if (test_before_flush) |hook| try hook(conn.io);
+                    // A peer that stops reading must not hold the writer,
+                    // and with it every stream of the connection, for good.
+                    var write_timer: Timer = .init(null);
+                    defer write_timer.clear(conn.io);
+                    if (send_timeout) |d| write_timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
                     if (spill.items.len > 0) {
-                        writer.writeAll(spill.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
+                        writer.writeAll(spill.items) catch return writeFailed(conn, &write_timer);
                         spill.clearRetainingCapacity();
                     }
-                    writer.flush() catch return conn.connection.getWriteError() orelse error.Unexpected;
+                    writer.flush() catch return writeFailed(conn, &write_timer);
+                    write_timer.clear(conn.io);
                     conn.settleFinished(settled);
                     // The drain's final GOAWAY is on the wire now.
                     if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
@@ -934,8 +960,64 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.unlock();
                     continue;
                 }
-                try conn.io.futexWait(u32, &conn.write_gen.raw, gen);
+                // Responses whose handlers are done but that the peer is
+                // not taking (no window, or not reading) are bounded: past
+                // their deadline the stream is reset and freed.
+                switch (sweepSends(conn)) {
+                    .reset => continue,
+                    .none => try conn.io.futexWait(u32, &conn.write_gen.raw, gen),
+                    .until => |deadline| try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .deadline = deadline }),
+                }
             }
+        }
+
+        /// Why a write of the writer failed: its own timer firing is a
+        /// timeout, not the connection's cancel.
+        fn writeFailed(conn: *Conn, timer: *Timer) anyerror {
+            const cause = conn.connection.getWriteError() orelse return error.Unexpected;
+            if (cause == error.Canceled and timer.fired()) return error.WriteTimeout;
+            return cause;
+        }
+
+        /// How long a response may take to go out once its handler is
+        /// done: `timeout.request`, else `timeout.keepalive`; null when
+        /// both are off.
+        fn sendTimeout(conn: *const Conn) ?std.Io.Duration {
+            const t = conn.server.config.timeout;
+            return t.request orelse t.keepalive;
+        }
+
+        const Sweep = union(enum) { none, reset, until: std.Io.Clock.Timestamp };
+
+        /// Gives each stream waiting to send the rest of a finished
+        /// response its deadline, and resets those past it. Takes the
+        /// mutex.
+        fn sweepSends(conn: *Conn) Sweep {
+            conn.lock();
+            defer conn.unlock();
+            if (conn.send_pending == 0) return .none;
+            const limit = sendTimeout(conn) orelse return .none;
+            const now = std.Io.Clock.Timestamp.now(conn.io, .awake);
+            var next: ?std.Io.Clock.Timestamp = null;
+            var reset = false;
+            var it = conn.streams.valueIterator();
+            while (it.next()) |entry| {
+                const stream = entry.*;
+                if (!stream.send_pending or stream.reset) continue;
+                const deadline = stream.send_deadline orelse blk: {
+                    const d = now.addDuration(.{ .raw = limit, .clock = .awake });
+                    stream.send_deadline = d;
+                    break :blk d;
+                };
+                if (now.compare(.gte, deadline)) {
+                    log.debug("HTTP/2 stream {d}: response not taken in time, reset", .{stream.id});
+                    stream.reset = true;
+                    _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_CANCEL);
+                    reset = true;
+                } else if (next == null or deadline.compare(.lt, next.?)) next = deadline;
+            }
+            if (reset) return .reset;
+            return if (next) |d| .{ .until = d } else .none;
         }
 
         /// After the writer shut the send side: the peer, seeing the end,

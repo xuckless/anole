@@ -1351,3 +1351,34 @@ test "HTTP/2: a peer whose streams keep being refused is sent GOAWAY(ENHANCE_YOU
     try std.testing.expect(client.goaway_count >= 1);
     try std.testing.expectEqual(@as(u32, c.NGHTTP2_ENHANCE_YOUR_CALM), client.goaway_error);
 }
+
+test "HTTP/2: a finished response the peer never takes is reset at the request timeout" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .timeout = .{ .request = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/whole", struct {
+        const body: [100 * 1024]u8 = @splat('z');
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = &body;
+        }
+    }.handle);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // A stream window of zero: the server may send the head, never the body.
+    const zero = [_]c.nghttp2_settings_entry{.{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = 0 }};
+    if (c.nghttp2_submit_settings(client.session, c.NGHTTP2_FLAG_NONE, &zero, zero.len) != 0) return error.Http2Init;
+    const started: std.Io.Clock.Timestamp = .now(io, .awake);
+    const id = try client.request("GET", "/whole", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_CANCEL), client.get(id).error_code);
+    try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
+    try awaitStreamsFreed(&server, io);
+}

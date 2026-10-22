@@ -452,6 +452,12 @@ pub const ServerConfig = struct {
         /// Defaults to 30 seconds; set to null for long-lived handlers, or
         /// replace it from a handler with `Request.setTimeout`.
         ///
+        /// HTTP/2 also bounds what follows the handler with it (or with
+        /// `keepalive` when this is null): a response not all sent this
+        /// long after its handler returned (a peer that gives no flow
+        /// control window) is reset, and a single write the peer does not
+        /// read for this long closes the connection.
+        ///
         /// Costs a second task per connection on any backend but zio, so on
         /// `std.Io.Threaded` setting either timeout means two threads per
         /// connection.

@@ -506,7 +506,7 @@ Null disables a timeout.
 
 | Field | Default | Covers |
 | --- | --- | --- |
-| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. |
+| `timeout.request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. Over HTTP/2, a response still going out after its handler returned gets this long again (or `timeout.keepalive` when this is off) before the stream is reset, and any one write to a peer that stops reading is cut off after it. |
 | `timeout.read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). |
 | `timeout.keepalive` | 60 s | An idle connection between requests. |
 | `timeout.request_count` | none | Requests per keep-alive connection. |

@@ -13,6 +13,11 @@ breaking changes are listed anyway.
   hold memory without bound. A peer whose streams keep being refused is
   sent GOAWAY(ENHANCE_YOUR_CALM) past `http2.refused_stream_burst` (100,
   refilled at `refused_stream_rate`, 10 a second).
+- HTTP/2: a response whose handler has returned must be sent within
+  `timeout.request` (or `timeout.keepalive` when that is off); a peer that
+  gives it no flow-control window gets the stream reset, and a connection
+  whose peer stops reading is closed after one write blocks that long.
+  Such streams used to be held, and graceful drains to wait, indefinitely.
 - PROXY protocol v2: a header whose TLV length is near 65535 is refused
   instead of crashing the process (or, in ReleaseFast, reading past a
   buffer). Only listeners with `proxy_protocol = true` were affected.
