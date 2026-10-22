@@ -24,6 +24,11 @@ breaking changes are listed anyway.
   messages nested deeper than 100 levels fail the call. Such requests fail
   with INTERNAL (INVALID_ARGUMENT, 400, on transcoded routes) instead of
   stopping the process or allocating up to 2 GiB. No configuration change.
+- JSON transcoding: a query parameter can no longer override a field the
+  path template sets when the template names it by its JSON name
+  (`{bookId}`) and the query by its proto name (`?book_id=`), or the other
+  way around. The path's value stands, as documented. No configuration
+  change.
 
 ### C ABI (ABI 0.1)
 

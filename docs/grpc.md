@@ -451,7 +451,9 @@ A query parameter names a field by its proto or JSON name, nested with dots
 enums by name or number, `true`/`false`, 64-bit integers, `NaN` and
 `Infinity` for floats, base64 for bytes, RFC 3339 for a Timestamp, `1.5s` for
 a Duration. Parameters for no field are ignored (cache-busters, tracking
-tags), and so are those for fields the path or the body set. A message or map
+tags), and so are those for fields the path or the body set, whichever name
+the template and the parameter use (`{bookId}` in the path and `?book_id=` in
+the query are the same field, and the path's value stands). A message or map
 field cannot be set from the query.
 
 A request that does not make a message (a value of the wrong type, a body

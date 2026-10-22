@@ -115,6 +115,31 @@ test "transcoding: requests that do not make a message" {
     }, "", &diag));
 }
 
+test "transcoding: a query parameter never overrides a field the path sets, whichever name either uses" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The template names the field by its JSON name, the query by its proto
+    // name, and the other way around.
+    for ([_][2][]const u8{
+        .{ "bookId", "book_id=456" },
+        .{ "bookId", "bookId=456" },
+        .{ "book_id", "bookId=456" },
+        .{ "book_id", "book_id=456" },
+    }) |case| {
+        const r = try decode(pb.CreateBookRequest, a, "", "", &.{
+            .{ .field = case[0], .raw = "123", .multi = false },
+        }, case[1]);
+        try std.testing.expectEqualStrings("123", r.book_id);
+    }
+    // Nested: a variable at `author.name` binds the field below `author`.
+    const n = try decode(pb.GetBookRequest, a, "", "", &.{
+        .{ .field = "author.name", .raw = "ada", .multi = false },
+    }, "author.name=eve&author.born=1815");
+    try std.testing.expectEqualStrings("ada", n.author.?.name);
+    try std.testing.expectEqual(@as(i32, 1815), n.author.?.born);
+}
+
 test "transcoding: a Timestamp out of range is an invalid argument" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
