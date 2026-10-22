@@ -450,6 +450,51 @@ test "gRPC-Web (binary and text) and Connect (unary JSON, streaming) over HTTP/1
     }
 }
 
+test "gRPC: request messages that nest too deeply or claim more than they hold fail the call" {
+    const gpa = std.testing.allocator;
+    // Stacks as `anole.Server` sizes them by default.
+    const rt = try zio.Runtime.init(gpa, .{ .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 256 * 1024 } });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+    const port = server.address.ip.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Unknown start-group tags, nested far deeper than a task's stack
+    // could recurse.
+    const groups = try arena.alloc(u8, 300_000);
+    @memset(groups, 3 << 3 | 3); // field 3: not one of EchoRequest's
+    // A string field claiming 2^31 - 1 bytes, with none of them.
+    const huge = "\x0a\xff\xff\xff\xff\x07";
+    for ([_][]const u8{ groups, huge }) |message| {
+        const r = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/grpc-web+proto", try frame.encode(arena, message));
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "grpc-status:13\r\n") != null);
+    }
+    // Connect JSON nested past the JSON depth limit.
+    var deep: std.ArrayList(u8) = .empty;
+    try deep.appendSlice(arena, "{\"x\":");
+    try deep.appendNTimes(arena, '[', 200);
+    try deep.appendNTimes(arena, ']', 200);
+    try deep.appendSlice(arena, "}");
+    const j = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/json", deep.items);
+    try std.testing.expectEqual(@as(u16, 500), j.status);
+    // The server still answers.
+    const ok = try http1(gpa, arena, io, port, "/anole.test.Echo/Unary", "application/json", "{\"message\":\"still here\"}");
+    try std.testing.expectEqual(@as(u16, 200), ok.status);
+}
+
 fn decodeChunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;

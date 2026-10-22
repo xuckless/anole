@@ -16,6 +16,14 @@ breaking changes are listed anyway.
   only a type that contains itself can reach, and `YYJSON_READ_INSITU` in
   `ParseOptions.flags` is ignored (the input is read-only). `json.Error`
   gains `NestingTooDeep` (breaking for exhaustive switches).
+- gRPC, gRPC-Web, Connect and transcoded routes: protobuf decoding is
+  hardened (zig-protobuf with Anole's patches): messages and groups nest at
+  most 100 levels, string and bytes lengths are checked against the input
+  before memory is allocated for them, and Timestamps with an out-of-range
+  month, day or time are refused. Connect and gRPC-Web JSON request
+  messages nested deeper than 100 levels fail the call. Such requests fail
+  with INTERNAL (INVALID_ARGUMENT, 400, on transcoded routes) instead of
+  stopping the process or allocating up to 2 GiB. No configuration change.
 
 ### C ABI (ABI 0.1)
 

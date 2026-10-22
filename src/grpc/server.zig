@@ -725,7 +725,7 @@ fn transcodedRequest(comptime Req: type, comptime body: []const u8, call: *Call,
     if (body.len > 0) {
         var in_buf: [16 * 1024]u8 = undefined;
         var reader = try call.req.reader(&in_buf);
-        body_text = reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size + 1)) catch |err| switch (err) {
+        body_text = reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size +| 1)) catch |err| switch (err) {
             error.StreamTooLong => return error.MessageTooLarge,
             else => |e| return e,
         };
@@ -808,7 +808,7 @@ fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader) 
             if (call.impl.unary_read) return null;
             call.impl.unary_read = true;
             if (call.impl.get_message) |message| break :blk message;
-            break :blk body.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size + 1)) catch |err| switch (err) {
+            break :blk body.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size +| 1)) catch |err| switch (err) {
                 error.StreamTooLong => return error.MessageTooLarge,
                 else => |e| return e,
             };
@@ -830,13 +830,30 @@ fn readRequest(comptime Req: type, call: *Call, body: *dusty.RequestBodyReader) 
         },
     };
     if (payload.len > call.impl.max_message_size) return error.MessageTooLarge;
-    switch (call.impl.codec) {
+    return try decodePayload(Req, call.arena, call.impl.codec, payload);
+}
+
+/// One request message's bytes decoded as `Req`, into `arena`, in `codec`:
+/// `error.DecodeFailed` for bytes that are not a `Req`. The result does
+/// not point into `payload`. Protobuf input nests at most zig-protobuf's
+/// `recursion_limit` deep; JSON input, `transcode.max_json_depth`.
+pub fn decodePayload(comptime Req: type, arena: std.mem.Allocator, codec: Codec, payload: []const u8) error{ DecodeFailed, OutOfMemory }!Req {
+    switch (codec) {
         .proto => {
             var reader: std.Io.Reader = .fixed(payload);
-            return Req.decode(&reader, call.arena) catch error.DecodeFailed;
+            return Req.decode(&reader, arena) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.DecodeFailed,
+            };
         },
         .json => {
-            const parsed = Req.jsonDecode(payload, .{ .ignore_unknown_fields = true }, call.arena) catch return error.DecodeFailed;
+            // Parsing into a message type that contains itself recurses
+            // once per level.
+            if (!transcode.jsonDepthWithin(payload, transcode.max_json_depth)) return error.DecodeFailed;
+            const parsed = Req.jsonDecode(payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }, arena) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.DecodeFailed,
+            };
             return parsed.value;
         },
     }

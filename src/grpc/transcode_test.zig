@@ -115,6 +115,17 @@ test "transcoding: requests that do not make a message" {
     }, "", &diag));
 }
 
+test "transcoding: a Timestamp out of range is an invalid argument" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var diag: transcode.Diagnostic = .{};
+    for ([_][]const u8{ "since=2024-03-00T00:00:00Z", "since=2024-02-30T00:00:00Z", "since=2024-13-01T00:00:00Z" }) |query| {
+        try std.testing.expectError(error.InvalidArgument, transcode.decodeRequest(pb.GetBookRequest, a, "", "", &.{}, query, &diag));
+    }
+    try std.testing.expectError(error.InvalidArgument, transcode.decodeRequest(pb.GetBookRequest, a, "*", "{\"since\":\"2024-03-00T00:00:00Z\"}", &.{}, "", &diag));
+}
+
 test "transcoding: the response, whole or one field" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
