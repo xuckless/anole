@@ -963,6 +963,49 @@ const SchemaCheck = struct {
         }
     }
 
+    /// The `default` a property states: its own, or its first `anyOf` branch's.
+    fn defaultOf(prop: std.json.Value) ?std.json.Value {
+        if (prop != .object) return null;
+        if (prop.object.get("default")) |d| return d;
+        if (prop.object.get("anyOf")) |any| return any.array.items[0].object.get("default");
+        return null;
+    }
+
+    /// Whether a type's default is something the schema states as a scalar,
+    /// a string or a list of strings.
+    fn scalarDefault(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .int, .bool, .@"enum" => true,
+            .optional => |o| scalarDefault(o.child),
+            .pointer => |p| p.size == .slice and (p.child == u8 or (@typeInfo(p.child) == .pointer and @typeInfo(p.child).pointer.child == u8)),
+            else => false,
+        };
+    }
+
+    /// Whether the schema's `have` is `value`, the Zig default.
+    fn sameDefault(comptime T: type, value: T, have: std.json.Value) bool {
+        switch (@typeInfo(T)) {
+            .int => return have == .integer and have.integer == value,
+            .bool => return have == .bool and have.bool == value,
+            .@"enum" => return have == .string and std.mem.eql(u8, have.string, @tagName(value)),
+            .optional => |o| return if (value) |v| sameDefault(o.child, v, have) else have == .null,
+            .pointer => |p| {
+                if (p.child == u8) return have == .string and std.mem.eql(u8, have.string, value);
+                if (have != .array or have.array.items.len != value.len) return false;
+                for (value, have.array.items) |a, b| if (b != .string or !std.mem.eql(u8, a, b.string)) return false;
+                return true;
+            },
+            else => return true,
+        }
+    }
+
+    /// The groups whose every key states its default in the schema.
+    fn requiresDefaults(comptime T: type) bool {
+        return T == Config.Timeouts or T == Config.Limits or T == Config.Http3 or
+            T == anole.ServerOptions.Proxy or T == anole.ServerOptions.RequestOptions or
+            T == anole.ServerOptions.ResponseOptions or T == anole.ServerOptions.Http2;
+    }
+
     fn walk(comptime T: type, node_in: std.json.Value, defs: std.json.ObjectMap) error{SchemaOutOfDate}!void {
         if (T == std.json.Value) return;
         const node = resolve(node_in, defs);
@@ -979,10 +1022,21 @@ const SchemaCheck = struct {
                     std.debug.print("schema: {s} has {d} fields, the schema {d}\n", .{ @typeName(T), s.field_names.len, props.object.count() });
                     return error.SchemaOutOfDate;
                 }
-                inline for (s.field_names, s.field_types) |name, FT| {
+                inline for (s.field_names, s.field_types, s.field_attrs) |name, FT, attrs| {
                     const p = props.object.get(name) orelse {
                         std.debug.print("schema: {s}.{s} missing\n", .{ @typeName(T), name });
                         return error.SchemaOutOfDate;
+                    };
+                    if (comptime scalarDefault(FT)) if (comptime attrs.defaultValue(FT)) |dv| {
+                        if (defaultOf(p)) |have| {
+                            if (!sameDefault(FT, dv, have)) {
+                                std.debug.print("schema: {s}.{s}: the schema's default differs from the code's\n", .{ @typeName(T), name });
+                                return error.SchemaOutOfDate;
+                            }
+                        } else if (comptime requiresDefaults(T)) {
+                            std.debug.print("schema: {s}.{s} states no default\n", .{ @typeName(T), name });
+                            return error.SchemaOutOfDate;
+                        }
                     };
                     try walk(FT, p, defs);
                 }
