@@ -463,6 +463,23 @@ pub const Headers = struct {
         self.len = i + 1;
     }
 
+    /// Adds one field of an HTTP/2 or HTTP/3 request, as the HTTP/1.1
+    /// parser does: another entry for a repeated name, except `cookie`,
+    /// whose fields are joined onto the first one with "; " (RFC 9113
+    /// §8.2.3, RFC 9114 §4.2.1), in `allocator` (the request's arena).
+    pub fn addRequestField(self: *Headers, allocator: std.mem.Allocator, name: []const u8, value: []const u8) error{ TooManyHeaders, OutOfMemory }!void {
+        if (std.ascii.eqlIgnoreCase(name, "cookie")) {
+            const h = hashFn(name);
+            for (self.hashes[0..self.len], 0..) |hh, i| {
+                if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) {
+                    self.values[i] = try std.mem.concat(allocator, u8, &.{ self.values[i], "; ", value });
+                    return;
+                }
+            }
+        }
+        try self.add(name, value);
+    }
+
     /// Returns the value of the first matching entry (case-insensitive), or null.
     pub fn get(self: *const Headers, name: []const u8) ?[]const u8 {
         const h = hashFn(name);
@@ -691,6 +708,29 @@ test "Headers: put replaces, add appends" {
     try std.testing.expectEqualStrings("c=3", it.next().?.value);
     try std.testing.expectEqualStrings("b=2", it.next().?.value);
     try std.testing.expectEqual(null, it.next());
+}
+
+test "Headers: addRequestField joins cookie crumbs and adds other repeats" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var headers = try Headers.init(a, 4);
+    try headers.addRequestField(a, "cookie", "a=1");
+    try headers.addRequestField(a, "accept", "text/html");
+    try headers.addRequestField(a, "Cookie", "b=2");
+    try headers.addRequestField(a, "accept", "application/json");
+    try headers.addRequestField(a, "cookie", "c=3");
+    try std.testing.expectEqualStrings("a=1; b=2; c=3", headers.get("cookie").?);
+    try std.testing.expectEqual(3, headers.count());
+    var it = headers.iterator();
+    _ = it.next();
+    try std.testing.expectEqualStrings("text/html", it.next().?.value);
+    try std.testing.expectEqualStrings("application/json", it.next().?.value);
+    try headers.addRequestField(a, "x", "y");
+    try std.testing.expectError(error.TooManyHeaders, headers.addRequestField(a, "z", "y"));
+    // A crumb joins even at capacity: it takes no entry.
+    try headers.addRequestField(a, "cookie", "d=4");
+    try std.testing.expectEqualStrings("a=1; b=2; c=3; d=4", headers.get("cookie").?);
 }
 
 test "Headers: error on overflow" {
