@@ -46,6 +46,7 @@ fn envVar(environ: std.process.Environ, name: []const u8) ?[]const u8 {
 const blocking = @import("blocking.zig");
 const sd_notify = @import("sd_notify.zig");
 const early_data = @import("early_data.zig");
+const ratelimit = @import("ratelimit/root.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
@@ -1371,6 +1372,38 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const listeners = self.server.config.listeners;
             if (index >= listeners.len) return null;
             return listeners[index].name;
+        }
+
+        /// `rateLimit`'s settings.
+        pub const RateLimitOptions = struct {
+            /// Requests allowed per `window`.
+            limit: u32 = 100,
+            window: Duration = .fromSeconds(60),
+            /// How many may come at once; 0 means `limit`.
+            burst: u32 = 0,
+            /// What requests are counted by.
+            key: ratelimit.Key = .ip,
+            /// Keys remembered at most.
+            max_entries: u32 = 10_000,
+        };
+
+        /// Rate limiting for every route after it, with an in-memory limiter
+        /// the server owns: `app.rateLimit(.{ .limit = 100 })` is 100
+        /// requests a minute per client address, over the limit 429 with
+        /// `Retry-After`. Call it with `use`, before the routes.
+        pub fn rateLimit(self: *Self, opts: RateLimitOptions) void {
+            const a = self.arena.allocator();
+            const limiter = self.gpa.create(ratelimit.MemoryLimiter) catch @panic("OOM");
+            limiter.* = .init(self.gpa, self.rt.io(), .{ .max_entries = opts.max_entries });
+            const key: ratelimit.Key = switch (opts.key) {
+                .ip => .ip,
+                .header => |h| .{ .header = a.dupe(u8, h) catch @panic("OOM") },
+            };
+            self.use(ratelimit.OwnedMiddleware{
+                .limiter = limiter,
+                .key = key,
+                .policy = .{ .limit = opts.limit, .window = opts.window, .burst = opts.burst },
+            });
         }
 
         /// A copy of `value`, a middleware (a struct with `execute`, or a

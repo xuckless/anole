@@ -363,6 +363,50 @@ fn addressKey(address: std.Io.net.IpAddress, ipv6_prefix_bits: u8, buf: []u8) []
     return std.fmt.bufPrint(buf, "{s}", .{host}) catch "?";
 }
 
+/// What `Server.rateLimit` counts requests by.
+pub const Key = union(enum) {
+    /// The client's address (`clientAddress`).
+    ip,
+    /// The value of this request header; requests without it share one
+    /// bucket.
+    header: []const u8,
+};
+
+/// A rate limit on a memory limiter of its own, for `Server.rateLimit`:
+/// `Middleware`'s answers, counted by a `Key`.
+pub const OwnedMiddleware = struct {
+    limiter: *MemoryLimiter,
+    key: Key,
+    policy: Policy,
+
+    pub const detach_safe = true;
+
+    pub fn execute(self: *const OwnedMiddleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+        var key_buf: [128]u8 = undefined;
+        const key = switch (self.key) {
+            .ip => clientAddress(req, &key_buf),
+            .header => |h| req.headers.get(h) orelse "",
+        };
+        const r = self.limiter.limiter().take(key, 1, self.policy) catch return next.call();
+        try res.header("RateLimit-Limit", try std.fmt.allocPrint(res.arena, "{d}", .{r.limit}));
+        try res.header("RateLimit-Remaining", try std.fmt.allocPrint(res.arena, "{d}", .{r.remaining}));
+        try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));
+        if (!r.allowed) {
+            try res.header("Retry-After", try std.fmt.allocPrint(res.arena, "{d}", .{r.retry_after_seconds}));
+            res.status = .too_many_requests;
+            res.content_type = .text;
+            res.body = "429 Too Many Requests\n";
+            return;
+        }
+        return next.call();
+    }
+
+    pub fn deinit(self: *OwnedMiddleware) void {
+        self.limiter.deinit();
+        self.limiter.gpa.destroy(self.limiter);
+    }
+};
+
 /// What `Middleware` does when the limiter fails (Redis is down, say).
 pub const OnError = enum {
     /// Let the request through, with a warning in the log: an outage of
