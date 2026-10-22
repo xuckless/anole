@@ -19,6 +19,10 @@ breaking changes are listed anyway.
   handle `ANOLE_E_AGAIN` from publish.
 - C ABI configuration: `limits.inline_body_max` and `limits.ws_max_message`
   are capped at 1 GiB (larger values are a configuration error).
+- C ABI: WebSocket messages waiting for a consumer are bounded per executor
+  in bytes (the larger of 16 x `limits.ws_high_water` and
+  2 x `limits.ws_max_message`), not only in count, so clients cannot make a
+  slow consumer's queue hold `limits.queue` whole messages.
 
 ### C ABI (ABI 0.1)
 

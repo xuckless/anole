@@ -216,6 +216,9 @@ pub const Slot = struct {
 
 pub const no_slot = std.math.maxInt(u32);
 
+/// Records up to this size never wait for `Exec.record_bytes` to fall.
+const small_record = 1024;
+
 fn closeFd(fd: c_int) void {
     if (comptime builtin.os.tag == .windows) return;
     _ = std.c.close(fd);
@@ -328,6 +331,12 @@ pub const Exec = struct {
     done_head: std.atomic.Value(u32) = .init(no_slot),
     /// Commands (WebSocket sends, publishes), likewise.
     inbox: std.atomic.Value(?*Command) = .init(null),
+    /// Bytes of built records (WebSocket messages and the like) in the
+    /// ring: added by the executor, taken off by `poll`. Bounded by
+    /// `record_budget`, so a consumer that falls behind holds back the
+    /// sockets feeding it rather than the ring growing to its length in
+    /// whole messages.
+    record_bytes: std.atomic.Value(usize) = .init(0),
     ws: ws.ExecState = .{},
 
     fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
@@ -417,11 +426,23 @@ pub const Exec = struct {
 
     /// Queues an owned record for the consumer, waiting for room in the
     /// ring if `wait` (else dropping it when full: advisory events only).
+    /// A large record that waits also waits while the records already
+    /// queued pass `record_budget` bytes (one always fits in an empty
+    /// ring); small ones (events, `ANOLE_EV_SENT`) are bounded by the ring.
     pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
         const c = x.consumer orelse return freeRecord(rec.ptr);
-        while (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
-            if (!wait) return freeRecord(rec.ptr);
+        if (wait and rec.len > small_record) while (true) {
+            const queued = x.record_bytes.load(.acquire);
+            if (queued == 0 or queued + rec.len <= x.engine.record_budget) break;
+            // The consumer is behind: make sure it hears there is work.
+            c.wake();
             zio.yield() catch return freeRecord(rec.ptr);
+        };
+        _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
+        while (!x.ring.push(.{ .handle = 0, .rec = rec.ptr })) {
+            if (wait) if (zio.yield()) |_| continue else |_| {};
+            _ = x.record_bytes.fetchSub(rec.len, .monotonic);
+            return freeRecord(rec.ptr);
         }
         c.wake();
     }
@@ -606,6 +627,9 @@ pub const Engine = struct {
     ntimeouts: u8 = 1,
     inline_body_max: u32,
     stream_high_water: usize,
+    /// Bytes of built records each executor's ring may hold (see
+    /// `Exec.record_bytes`).
+    record_budget: usize = 0,
     rewake: i96,
     // Counters.
     requests: std.atomic.Value(u64) = .init(0),
@@ -644,6 +668,7 @@ pub const Engine = struct {
         const cfg = &e.config;
         e.inline_body_max = cfg.limits.inline_body_max;
         e.stream_high_water = cfg.limits.stream_high_water;
+        e.record_budget = @max(16 * @as(usize, cfg.limits.ws_high_water), 2 * @as(usize, cfg.limits.ws_max_message));
         e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
         e.timeouts[0] = @as(i96, cfg.timeouts.request_ms) * std.time.ns_per_ms;
         // One per process: `respond` and the handlers find it here.
@@ -1856,8 +1881,10 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
                     }
                     @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                     pos += ev.len;
+                    const len = ev.len;
                     freeRecord(rec);
                     x.ring.pop();
+                    _ = x.record_bytes.fetchSub(len, .release);
                     progressed = true;
                     continue;
                 }
