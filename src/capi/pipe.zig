@@ -10,12 +10,16 @@
 //! wait.
 const std = @import("std");
 
-pub const gpa = @import("engine.zig").gpa;
+const engine = @import("engine.zig");
+pub const gpa = engine.gpa;
 
 pub const Chunk = struct {
     data: []const u8,
     off: usize = 0,
     owner: Owner,
+    /// For `.consumer` chunks: the `ANOLE_EV_SENT` record the borrowing call
+    /// built, posted when the chunk is no longer read.
+    sent: ?[]align(8) u8 = null,
 
     pub const Owner = enum {
         /// Allocated here (the thread-safe allocator, exactly `data`'s
@@ -154,7 +158,10 @@ pub const Pipe = struct {
 
     /// Frees the pipe's own list (the engine's end).
     pub fn deinit(p: *Pipe) void {
-        for (p.chunks.items[p.head..]) |ch| if (ch.owner == .pipe) gpa.free(ch.data);
+        for (p.chunks.items[p.head..]) |ch| {
+            if (ch.owner == .pipe) gpa.free(ch.data);
+            if (ch.sent) |r| engine.freeRecord(r.ptr);
+        }
         p.chunks.deinit(gpa);
     }
 };
