@@ -17,6 +17,8 @@ breaking changes are listed anyway.
   `ANOLE_E_AGAIN` and sends nothing. A publish larger than
   `limits.ws_max_message` is refused (`ANOLE_E_INVALID`). Bindings should
   handle `ANOLE_E_AGAIN` from publish.
+- C ABI configuration: `limits.inline_body_max` and `limits.ws_max_message`
+  are capped at 1 GiB (larger values are a configuration error).
 
 ### C ABI (ABI 0.1)
 

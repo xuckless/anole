@@ -206,7 +206,7 @@
         "inline_body_max": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 4294967295,
+          "maximum": 1073741824,
           "default": 65536,
           "description": "Bodies up to this come inline in the request record; larger ones are read with anole_req_read."
         },
@@ -241,7 +241,7 @@
         "ws_max_message": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 4294967295,
+          "maximum": 1073741824,
           "default": 1048576,
           "description": "The largest WebSocket message, in or out (after inflating)."
         },
