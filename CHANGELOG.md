@@ -5,6 +5,14 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- Server-Sent Events: a bare CR in event data now ends a `data:` line, as
+  LF and CRLF already did (in `send` and in `startSend`'s writer, also when
+  a CRLF is split across two writes). Before, data relayed from one user
+  could add `event`, `id` or `retry` fields to the events other users got.
+  No configuration change needed.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings

@@ -384,7 +384,7 @@ res.body = "{\"id\":42}"; // must outlive the handler: a literal or res.arena
 | `render(content_type, template, args)` | A body from a template function or type. |
 | `writer()` | A buffered body writer; `end()` it before returning. |
 | `stream(buffer)` | Sends the headers now and streams the body; `end()` it. |
-| `startEventStream(buffer)` | Server-Sent Events: `send(data, .{ .event = ... })`. |
+| `startEventStream(buffer)` | Server-Sent Events: `send(data, .{ .event = ... })`. Every CR, LF or CRLF in `data` starts a new `data:` line, so data cannot add fields of its own; `event` and `id` with a CR or LF are refused. |
 | `sendFile(dir, path, options)` | A file as the body. |
 | `setCookie(name, value, options)` | Adds a `Set-Cookie`. |
 | `trailer(name, value)` | A trailer field after the body. |

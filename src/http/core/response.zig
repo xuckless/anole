@@ -25,6 +25,9 @@ var no_buf: [0]u8 = .{};
 pub const EventWriter = struct {
     body: *StreamingBodyWriter,
     line_in_progress: bool,
+    /// The last write ended in a CR, so an LF that starts the next one
+    /// belongs to it (one CRLF line break, split across the writes).
+    pending_cr: bool = false,
     interface: std.Io.Writer,
     /// The real cause behind the generic `error.WriteFailed` that the
     /// `std.Io.Writer` interface has to return. An event long enough to
@@ -63,16 +66,29 @@ pub const EventWriter = struct {
         return total;
     }
 
+    /// CR, LF and CRLF each end a line, as they do for the peer's parser
+    /// (WHATWG HTML 9.2.6): data that could end one any other way would
+    /// start a line of its own that is not `data:`.
     fn writeLines(self: *EventWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
         const out = &self.body.interface;
         var rest = bytes;
-        while (std.mem.findScalar(u8, rest, '\n')) |idx| {
+        if (self.pending_cr) {
+            self.pending_cr = false;
+            if (rest[0] == '\n') rest = rest[1..];
+        }
+        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
             if (!self.line_in_progress) try out.writeAll("data: ");
-            const line_end = if (idx > 0 and rest[idx - 1] == '\r') idx - 1 else idx;
-            try out.writeAll(rest[0..line_end]);
+            try out.writeAll(rest[0..idx]);
             try out.writeAll("\n");
             self.line_in_progress = false;
-            rest = rest[idx + 1 ..];
+            var next = idx + 1;
+            if (rest[idx] == '\r') {
+                if (next == rest.len) {
+                    self.pending_cr = true;
+                } else if (rest[next] == '\n') next += 1;
+            }
+            rest = rest[next..];
         }
         if (rest.len > 0) {
             if (!self.line_in_progress) {
@@ -155,11 +171,15 @@ pub const EventStream = struct {
 
     fn sendEvent(w: *std.Io.Writer, data: []const u8, opts: Options) std.Io.Writer.Error!void {
         try sendFields(w, opts);
-        var it = std.mem.splitScalar(u8, data, '\n');
-        while (it.next()) |line| {
-            const stripped = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-            try w.print("data: {s}\n", .{stripped});
+        // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
+        var rest = data;
+        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
+            try w.print("data: {s}\n", .{rest[0..idx]});
+            var next = idx + 1;
+            if (rest[idx] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
+            rest = rest[next..];
         }
+        try w.print("data: {s}\n", .{rest});
         try w.writeAll("\n");
         // One event, one write: an event held back is an event the peer
         // has not had, and the next one may be a long way off.
@@ -3243,6 +3263,69 @@ test "EventWriter: splatBytesAll" {
     try ew.end();
 
     try std.testing.expectEqualStrings("data: ababab\n\n", try t.events());
+}
+
+test "EventStream: a bare CR in data is a line break, never the start of a field" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    try t.stream.send("hi\revent: admin\rid: 9\r\rdata: x\r\ny\nz", .{});
+
+    try std.testing.expectEqualStrings(
+        "data: hi\ndata: event: admin\ndata: id: 9\ndata: \ndata: data: x\ndata: y\ndata: z\n\n",
+        try t.events(),
+    );
+}
+
+test "EventWriter: a bare CR is a line break, and a CRLF split across writes is one" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    var ew = try t.stream.startSend(.{});
+    try ew.interface.writeAll("a\revent: x\r");
+    try ew.interface.writeAll("\nb\r");
+    try ew.interface.writeAll("c\r");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: a\ndata: event: x\ndata: b\ndata: c\n\n", try t.events());
+}
+
+test "fuzz: SSE data never adds a line that is not data" {
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var buf: [8192]u8 = undefined;
+            var t: TestEventStream = undefined;
+            try t.init(&buf);
+            defer t.deinit();
+            // What one event can expand to fits the test stream's buffers.
+            const data = input[0..@min(input.len, 64)];
+            const half = data.len / 2;
+            var ew = try t.stream.startSend(.{});
+            try ew.interface.writeAll(data[0..half]);
+            try ew.interface.writeAll(data[half..]);
+            try ew.end();
+            try t.stream.send(data, .{});
+            try expectOnlyData(try t.events());
+        }
+
+        /// Every line the WHATWG parser would see (CR, LF and CRLF end
+        /// one) is a `data:` line or the blank line ending an event.
+        fn expectOnlyData(out: []const u8) !void {
+            var i: usize = 0;
+            var start: usize = 0;
+            while (i < out.len) : (i += 1) {
+                if (out[i] != '\r' and out[i] != '\n') continue;
+                const line = out[start..i];
+                if (line.len > 0 and !std.mem.startsWith(u8, line, "data: ")) return error.InjectedField;
+                if (out[i] == '\r' and i + 1 < out.len and out[i + 1] == '\n') i += 1;
+                start = i + 1;
+            }
+        }
+    }.check, &.{ "", "a\rb", "a\r\nb\n", "\r\r\r", "x\revent: y\rid: 1\r\rdata: z" });
 }
 
 test "Response: resetBody replaces a half written body" {
