@@ -179,6 +179,45 @@ oha with `--latency-correction` (coordinated omission accounted for), 64 connect
 | fastapi | h3 | rate=50%max | fail [16] | | | | | | |
 | fastapi | h3 | rate=75%max | fail [17] | | | | | | |
 
+## WebSockets (HTTP/1.1)
+
+Idle: sockets held open and the memory each costs. Echo: closed-loop 64-byte messages, msgs/s and round trip. Fan-out: subscribers on /ws/feed at the tick rate; delivered msgs/s against expected, and tick lag (receive time minus the server's send stamp). Trading: one bot in ten also sends orders on /ws/trade and waits for each fill; order round trip in the notes and the feed column.
+
+| Server | Case | Count | Rate/s | p50 ms | p99 ms | p99.9 ms | max ms | Memory MB | Cores busy | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| anole | /ws/echo idle=50000 | 50,000 | 0 | 0.00 | 0.00 | 0.00 | 0.0 | 1188 | 0.04 | 24.3 KB per socket (2 MB -> 1188 MB) |
+| anole | /ws/echo echo c=64 | 7,888,006 | 262,931 | 0.24 | 0.28 | 2.43 | 31.6 | 721 | 0.98 |  |
+| anole | /ws/echo echo c=1024 | 6,162,381 | 205,374 | 4.80 | 7.17 | 9.21 | 14.0 | 92 | 1.00 |  |
+| anole | /ws/feed fanout-100x1000hz | 100 | 100,001 | 1.45 | 3.14 | 4.50 | 5.7 | 5 | 0.32 | 100/100 connected, 100001 of 100000 msgs/s expected, 0 gaps |
+| anole | /ws/feed fanout-1000x1000hz | 1,000 | 269,017 | 1.98 | 4.22 | 5.89 | 7.5 | 28 | 1.00 | 1000/1000 connected, 269017 of 1000000 msgs/s expected, 0 gaps |
+| anole | /ws/feed fanout-10000x100hz | 10,000 | 214,451 | 23.69 | 46.51 | 47.95 | 52.7 | 246 | 1.00 | 10000/10000 connected, 214451 of 1000000 msgs/s expected, 0 gaps |
+| anole | /ws/feed trading-500bots | 500 | 99,999 | 0.96 | 2.51 | 3.52 | 4.4 | 18 | 0.39 | 500/500 connected, 99999 of 100000 msgs/s expected, 0 gaps; orders 1000/s, rtt p50 0.26 p99 0.42 p99.9 0.47 ms, 0 errors |
+| anole | /ws/feed trading-2000bots | 2,000 | 245,557 | 10326.69 | 22140.47 | 22349.51 | 22353.0 | 285 | 1.00 | 2000/2000 connected, 245557 of 1000000 msgs/s expected, 0 gaps; orders 2000/s, rtt p50 8.99 p99 11.26 p99.9 18.96 ms, 0 errors |
+| fiber | /ws/echo idle=50000 | 50,000 | 0 | 0.00 | 0.00 | 0.00 | 0.0 | 999 | 0.05 | 20.4 KB per socket (2 MB -> 999 MB) |
+| fiber | /ws/echo echo c=64 | 6,956,555 | 231,883 | 0.26 | 0.54 | 2.55 | 99.8 | 1403 | 0.99 |  |
+| fiber | /ws/echo echo c=1024 | 6,168,534 | 205,578 | 4.91 | 7.44 | 15.17 | 29.8 | 1287 | 1.00 |  |
+| fiber | /ws/feed fanout-100x1000hz | 100 | 99,997 | 1.54 | 4.03 | 5.19 | 14.3 | 12 | 0.33 | 100/100 connected, 99997 of 100000 msgs/s expected, 0 gaps |
+| fiber | /ws/feed fanout-1000x1000hz | 1,000 | 382,691 | 7.71 | 759.26 | 1444.64 | 2973.1 | 60 | 1.00 | 1000/1000 connected, 382691 of 1000000 msgs/s expected, 0 gaps |
+| fiber | /ws/feed fanout-10000x100hz | 10,000 | 488,276 | 11413.47 | 21165.29 | 23096.54 | 27470.6 | 524 | 1.00 | 10000/10000 connected, 488276 of 1000000 msgs/s expected, 0 gaps |
+| fiber | /ws/feed trading-500bots | 500 | 99,997 | 1.65 | 3.64 | 4.88 | 5.8 | 38 | 0.37 | 500/500 connected, 99997 of 100000 msgs/s expected, 0 gaps; orders 1000/s, rtt p50 2.44 p99 3.88 p99.9 4.63 ms, 0 errors |
+| fiber | /ws/feed trading-2000bots | 2,000 | 582,975 | 5104.45 | 11367.22 | 12102.37 | 12947.8 | 122 | 0.99 | 2000/2000 connected, 582975 of 1000000 msgs/s expected, 0 gaps; orders 805/s, rtt p50 157.31 p99 898.17 p99.9 1420.76 ms, 0 errors |
+| axum | /ws/echo idle=50000 | 15,226 | 0 | 0.00 | 0.00 | 0.00 | 0.0 | 2034 | 0.03 | -0.1 KB per socket (1 MB -> 0 MB); server oom-killed |
+| axum | /ws/echo echo c=64 | 0 | 0 | 0.00 | 0.00 | 0.00 | 0.0 | 0 | 0.00 | server oom-killed |
+| axum | /ws/echo echo c=1024 | 0 | 0 | 0.00 | 0.00 | 0.00 | 0.0 | 0 | 0.00 | server oom-killed |
+| axum | /ws/feed fanout-100x1000hz | 100 | 99,999 | 1.01 | 2.38 | 2.75 | 3.5 | 15 | 0.20 | 100/100 connected, 99999 of 100000 msgs/s expected, 0 gaps |
+| axum | /ws/feed fanout-1000x1000hz | 1,000 | 663,871 | 4411.35 | 6504.53 | 7175.16 | 7575.6 | 139 | 0.98 | 1000/1000 connected, 663871 of 1000000 msgs/s expected, 78359 gaps |
+| axum | /ws/feed fanout-10000x100hz | 10,000 | 532,338 | 18320.55 | 30607.35 | 33639.83 | 37018.9 | 1362 | 1.00 | 10000/10000 connected, 532338 of 1000000 msgs/s expected, 0 gaps |
+| axum | /ws/feed trading-500bots | 500 | 100,002 | 3.34 | 7.03 | 7.44 | 8.5 | 76 | 0.67 | 500/500 connected, 100002 of 100000 msgs/s expected, 0 gaps; orders 1000/s, rtt p50 3.17 p99 6.88 p99.9 7.58 ms, 0 errors |
+| axum | /ws/feed trading-2000bots | 2,000 | 599,758 | 6932.22 | 8572.39 | 8684.35 | 9252.5 | 300 | 0.98 | 2000/2000 connected, 599758 of 1000000 msgs/s expected, 31609 gaps; orders 664/s, rtt p50 28.30 p99 611.30 p99.9 616.03 ms, 0 errors |
+| bun | /ws/echo idle=50000 | 50,000 | 0 | 0.00 | 0.00 | 0.00 | 0.0 | 239 | 0.04 | 4.7 KB per socket (7 MB -> 239 MB) |
+| bun | /ws/echo echo c=64 | 8,478,871 | 282,626 | 0.21 | 0.44 | 2.34 | 3.6 | 36 | 0.98 |  |
+| bun | /ws/echo echo c=1024 | 7,611,621 | 253,683 | 4.08 | 6.99 | 9.49 | 15.4 | 37 | 1.00 |  |
+| bun | /ws/feed fanout-100x1000hz | 100 | 100,010 | 0.77 | 1.60 | 3.95 | 5.0 | 8 | 0.06 | 100/100 connected, 100010 of 100000 msgs/s expected, 0 gaps |
+| bun | /ws/feed fanout-1000x1000hz | 1,000 | 703,848 | 5073.07 | 9495.74 | 9962.64 | 10476.4 | 136 | 0.23 | 1000/1000 connected, 703848 of 1000000 msgs/s expected, 0 gaps |
+| bun | /ws/feed fanout-10000x100hz | 10,000 | 230,863 | 21.62 | 42.00 | 43.15 | 44.6 | 58 | 0.98 | 10000/10000 connected, 230863 of 1000000 msgs/s expected, 0 gaps |
+| bun | /ws/feed trading-500bots | 500 | 100,000 | 0.83 | 1.80 | 3.93 | 5.4 | 11 | 0.19 | 500/500 connected, 100000 of 100000 msgs/s expected, 0 gaps; orders 1000/s, rtt p50 0.21 p99 0.95 p99.9 2.41 ms, 0 errors |
+| bun | /ws/feed trading-2000bots | 2,000 | 639,839 | 6139.03 | 11691.74 | 12212.34 | 12773.9 | 69 | 0.48 | 2000/2000 connected, 639839 of 1000000 msgs/s expected, 0 gaps; orders 2003/s, rtt p50 10.86 p99 96.03 p99.9 113.01 ms, 0 errors |
+
 ## Notes
 
 1. latency anole 1cpu h2-tls /json rate=75%max: fell behind: 152612 of 482592 req/s

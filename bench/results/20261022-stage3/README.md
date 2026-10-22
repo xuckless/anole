@@ -280,3 +280,50 @@ Notes:
     rates only.
 - **Errors:** 0–64 per run. These are connections still open when oha stops at
   30 s. They show up for every server.
+
+## WebSockets: idle sockets, echo, fan-out, trading bot (done 16:23)
+
+Setup:
+- 1 CPU / 2 GB, HTTP/1.1 upgrade. Servers: Anole, Bun, Fiber and Axum.
+- Fan-out: the server's ticker sends `TICK_HZ` ticks/s to every subscriber of
+  /ws/feed. "Delivered" is the ticks/s the subscribers received, out of
+  subscribers × Hz. "Lag" is the tick's server send time to its receipt.
+- Trading: the bots subscribe to a 500 Hz feed, and 10% of them send orders
+  on /ws/trade. "Order" is the order's round-trip time.
+- "Gaps" are ticks lost on a connection.
+
+| case | anole | bun | fiber | axum |
+|---|---|---|---|---|
+| 50 000 idle sockets: memory per socket (total) | 24.3 KB (1188 MB) | **4.7 KB** (239 MB) | 20.4 KB (999 MB) | OOM-killed at 2 GB |
+| echo, 64 connections | 263k msg/s, p99 0.28 ms | **283k**, p99 0.44 ms | 232k, p99 0.54 ms | – (OOM above) |
+| echo, 1 024 connections | 205k, p99 7.2 ms | **254k**, p99 7.0 ms | 206k, p99 7.4 ms | – (OOM above) |
+| fan-out 100 × 1000 Hz | 100k/100k, lag p99 3.1 ms | 100k/100k, lag p99 **1.6 ms** | 100k/100k, lag p99 4.0 ms | 100k/100k, lag p99 2.4 ms |
+| fan-out 1 000 × 1000 Hz | 269k/1M, lag p99 **4.2 ms** | **704k/1M**, lag p99 9.5 s | 383k/1M, lag p99 759 ms | 664k/1M, lag p99 6.5 s, 78 359 gaps |
+| fan-out 10 000 × 100 Hz | 214k/1M, lag p99 46 ms | 231k/1M, lag p99 **42 ms** | 488k/1M, lag p99 21 s | **532k/1M**, lag p99 31 s |
+| trading, 500 bots | lag p99 2.5 ms, order p99 2.5 ms | lag p99 **1.8 ms**, order p99 **1.8 ms** | lag p99 3.6 ms, order p99 3.9 ms | lag p99 7.0 ms, order p99 6.9 ms |
+| trading, 2 000 bots | lag p99 22 s, order p99 **11 ms** | lag p99 **12 s**, order p99 96 ms | lag p99 11 s, order p99 898 ms | lag p99 8.6 s, order p99 611 ms, 31 609 gaps |
+
+Notes:
+- **Under fan-out overload, Anole's ticker slows instead of queueing.**
+  - It delivers fewer ticks per second than the others: 27% of the target at
+    1 000 subscribers, against 38–70% for the rest.
+  - But each tick it delivers is fresh: p99 lag is 4 ms at 1 000 subscribers
+    and 46 ms at 10 000.
+  - The others fill their send buffers, and lag grows to seconds: Bun 9.5 s,
+    Fiber 0.8–21 s, Axum 6.5–31 s.
+  - For a market feed, a late tick is worse than a skipped one. Throughput
+    alone would rank Anole last here.
+- **Trading at 2 000 bots overloads every server's feed.** Anole is the only
+  one whose order round trips stay in milliseconds (p99 11 ms, against 96 ms
+  for Bun, 611 ms for Axum and 898 ms for Fiber). Its feed lag is the worst,
+  though (22 s), so orders get priority over ticks there.
+- **Idle sockets:** Bun holds 50 000 for 239 MB (4.7 KB each), 4–5× less than
+  Anole (24.3 KB) and Fiber (20.4 KB). This is Anole's clearest gap in this
+  run.
+- **Axum** was OOM-killed at 50 000 idle sockets within the 2 GB cap. The
+  harness then reported its two echo cases as "server oom-killed" without
+  restarting it, so Axum has no echo numbers. That's a harness gap: those
+  cases should restart the server. Axum is the only server with dropped
+  ticks (gaps), at 1 000 × 1000 Hz and at 2 000 bots.
+- **Bun** leads echo throughput at both connection counts and is the best of
+  the four at 500 bots.
