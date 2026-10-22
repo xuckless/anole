@@ -612,11 +612,11 @@ does not stop the copy, so Anole does what RFC 8470 asks of a server:
   ```
 
 - Behind a proxy that takes early data itself (nginx's `ssl_early_data`),
-  requests arrive marked `Early-Data: 1` on any HTTP version. With HTTP/3
-  on (`http3`, or `listenTls`, which turns it on by default), the server
-  answers 425 to the unsafe ones on every route
+  requests arrive marked `Early-Data: 1` on any HTTP version. The server
+  answers 425 to the unsafe ones on every route, with or without HTTP/3
   (`anole.early_data.Guard`, RFC 8470 §5.1), since waiting cannot make them
-  safe. Without it, add the guard yourself: `app.use(anole.early_data.Guard{})`.
+  safe. The proxy must strip an `Early-Data` header a client sends on its
+  own, or the client can only cause itself 425s.
 
 Tickets are sealed with the same keys as every other ticket (see
 [TLS](#tls)): they rotate every two days and carry over a certificate

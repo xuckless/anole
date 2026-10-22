@@ -702,10 +702,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
-            // get 425 Too Early, on every route. Now, before any route, and
-            // for `listenTls` too, which turns HTTP/3 on later.
+            // get 425 Too Early, on every route, with HTTP/3 or without:
+            // a TLS-terminating proxy can forward the mark to any listener.
+            // Now, before any route.
             const h3_possible = features.http3 and (opts.http3 != null or opts.listen_tls_http3 or anyHttp3(opts.listeners));
-            if (h3_possible) {
+            {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
                 self.router.use(http.Middleware(Ctx).init(guard));

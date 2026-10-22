@@ -78,6 +78,11 @@ breaking changes are listed anyway.
   docs/routing.md now warns up front that an answer depending on anything
   else (an app-specific header, the client's address) must be excluded
   through `credential_headers` or `cacheable`. Check your cached routes.
+- `anole.Server` answers 425 Too Early to unsafe requests marked
+  `Early-Data: 1` on every server, not only when HTTP/3 is on, so a proxy
+  that accepts TLS early data in front of an HTTP/1.1 or HTTP/2 server no
+  longer gets replayable POSTs through. `app.use(anole.early_data.Guard{})`
+  is no longer needed (it is harmless).
 
 ### C ABI (ABI 0.1)
 
