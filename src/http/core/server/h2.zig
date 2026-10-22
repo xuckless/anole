@@ -91,7 +91,7 @@ const out_queue_len = 32 * 1024;
 const body_writer_len = 16 * 1024;
 
 /// The PING sent with a drain's GOAWAY notice.
-const drain_ping: [8]u8 = "dusty-go".*;
+const drain_ping: [8]u8 = "anole-go".*;
 
 /// After the peer's side of the connection ended cleanly, while handlers
 /// still run, how often the writer sends a PING to learn whether the peer
@@ -2063,7 +2063,7 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         /// The response is complete and nobody will read the rest of the
-        /// request body. Like dusty's HTTP/1.x drain, a little more of it is
+        /// request body. Like the core's HTTP/1.x drain, a little more of it is
         /// read and dropped, so a peer still sending a small body sees a
         /// clean end and its later frames are still checked; past one stream
         /// window the stream ends with RST_STREAM(NO_ERROR) (RFC 9113 §8.1).

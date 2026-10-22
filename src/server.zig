@@ -1,4 +1,4 @@
-//! `anole.Server(Ctx)`: one entry point over the zio runtime, dusty's server
+//! `anole.Server(Ctx)`: one entry point over the zio runtime, the core's server
 //! and Anole's TLS. It owns the runtime (pinned scheduling, one executor per
 //! core), builds the listeners (cleartext with h2c, TLS with ALPN), and
 //! `run` serves until SIGINT, SIGTERM or `stop`, then drains.
@@ -188,7 +188,7 @@ pub const Options = struct {
     /// res, err)`: no `Ctx` with `uncaughtError` needed. Replaces
     /// `server.error_handler` when set.
     error_handler: ?http.ErrorHandler = null,
-    /// The rest of dusty's server configuration: timeouts, limits,
+    /// The rest of the core's server configuration: timeouts, limits,
     /// `trusted_proxy_hops` and so on. Its `listeners` and `http2` are
     /// replaced by the fields above.
     server: http.ServerConfig = .{},
@@ -513,7 +513,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         const H3Endpoint = if (features.http3) ?*h3.Endpoint(Ctx) else void;
 
         /// A certificate the TLS listeners serve: the PEM in use, where a
-        /// reload reads it again, and the listener configurations dusty
+        /// reload reads it again, and the listener configurations the core
         /// serves from, whose `pem` a reload points at the new one.
         /// Listeners that name the same source share one.
         const CertState = struct {
@@ -1062,7 +1062,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// The socket for one listener in hand-off mode: inherited if one
         /// was passed in under `name` (or at `index`), else opened here.
-        /// Null outside hand-off mode (dusty binds).
+        /// Null outside hand-off mode (the core binds).
         fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| {

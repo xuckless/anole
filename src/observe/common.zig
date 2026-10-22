@@ -4,7 +4,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 
-/// Serves GET `path` with `handler(state, req, res)`. dusty's handlers carry
+/// Serves GET `path` with `handler(state, req, res)`. the core's handlers carry
 /// no state of their own, so `state` rides in a middleware of the route's
 /// own, which answers and ends the chain; the global middleware still run
 /// first. `state` must outlive the router. With `listener`, only requests
@@ -60,7 +60,7 @@ pub fn excluded(req: *const dusty.Request, list: []const []const u8) bool {
 }
 
 /// The status the client got for this response: the handler's, or for an
-/// error the one dusty answers it with (`errorStatus`: a status-named
+/// error the one the core answers it with (`errorStatus`: a status-named
 /// error's own, 4xx for request-body faults, else 500), unless the head had
 /// already gone out, which the error cannot change. An HTTP/2 extended CONNECT (RFC 8441) answered with a 2xx opened
 /// its tunnel, as an HTTP/1.1 upgrade does with a 101, and is recorded as

@@ -1,4 +1,4 @@
-//! WebSocket over HTTP/2 (RFC 8441), end to end: dusty's HTTP/2 engine with
+//! WebSocket over HTTP/2 (RFC 8441), end to end: the core's HTTP/2 engine with
 //! an `anole.websocket` echo handler, and a minimal nghttp2 client that opens
 //! an extended CONNECT and speaks masked frames through websocket-zig's
 //! client codec. Autobahn has no RFC 8441 mode, so this is the HTTP/2 path's

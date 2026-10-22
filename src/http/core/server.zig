@@ -34,7 +34,7 @@ const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
-/// The HTTP/2 engine, with the `use_http2` build option.
+/// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;

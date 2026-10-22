@@ -1,4 +1,4 @@
-//! The HTTP/2 client against dusty's HTTP/2 server engine: plain requests,
+//! The HTTP/2 client against the core's HTTP/2 server engine: plain requests,
 //! a streamed body both ways larger than the windows, trailers, concurrent
 //! streams on one connection, and TLS.
 const std = @import("std");

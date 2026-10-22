@@ -1,7 +1,7 @@
 //! The HTTP/3 server: a QUIC endpoint on one UDP socket (ngtcp2), HTTP/3
 //! on each connection (nghttp3), and every request handed to the same
 //! router, middleware and `(req, res)` handlers as HTTP/1.1 and HTTP/2,
-//! through dusty's `Server.dispatch` with a sink-backed `Response`. On
+//! through the core's `Server.dispatch` with a sink-backed `Response`. On
 //! Linux a listener has one endpoint per executor, each on a socket of one
 //! SO_REUSEPORT group (`Endpoint`, `steer`).
 //!
@@ -36,7 +36,7 @@
 //!
 //! Ported from ngtcp2's examples/server.cc and
 //! http3_server_proto_codec.cc (MIT, ngtcp2 1.25.0); the request and
-//! response plumbing follows dusty's HTTP/2 engine (src/server/h2.zig in
+//! response plumbing follows the core's HTTP/2 engine (src/server/h2.zig in
 //! the xuckless/dusty fork).
 const std = @import("std");
 const zio = @import("zio");
@@ -62,7 +62,7 @@ const placement = dusty.placement;
 
 const log = std.log.scoped(.anole_h3);
 
-/// What a request body read can fail with, as dusty's engines report it.
+/// What a request body read can fail with, as the core's engines report it.
 const ReadError = @typeInfo(@typeInfo(@typeInfo(@FieldType(dusty.BodySource, "err")).pointer.child).@"fn".return_type.?).optional.child;
 const SendError = dusty.Response.SendError;
 

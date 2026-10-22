@@ -28,7 +28,7 @@ pub const H2Socket = struct {
     /// Sending is over: a close went out.
     closed: bool = false,
     write_mutex: std.Io.Mutex = .init,
-    /// One write per read, as over HTTP/1.1 (dusty's `WebSocket`): what
+    /// One write per read, as over HTTP/1.1 (the core's `WebSocket`): what
     /// the reading task sends while the peer's next message is already
     /// buffered goes out with the batch.
     batch: dusty.WebSocketBatch = .{},

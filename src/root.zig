@@ -60,6 +60,9 @@ const std = @import("std");
 /// `-Dsqlite`, `-Dmongodb`...).
 pub const features = @import("build_options");
 
+/// The version of Anole this build is (`build.zig.zon`).
+pub const version = features.version;
+
 /// The async runtime underneath (lalinsky/zio). `Server` owns one; reach
 /// for this only to run zio code of your own beside it. Anole needs
 /// zio's pinned scheduling, which its build of zio uses by default: a root

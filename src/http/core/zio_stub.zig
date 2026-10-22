@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-/// dusty checks for this to select its watchdog path over `AutoCancel`.
+/// the core checks for this to select its watchdog path over `AutoCancel`.
 pub const is_stub = true;
 
 pub const Timeout = struct {

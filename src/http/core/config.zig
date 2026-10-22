@@ -133,7 +133,7 @@ pub const Address = union(enum) {
 pub const Listener = struct {
     address: Address,
     /// When set, every connection accepted here is TLS. Requires the
-    /// `use_tls` build option (enabled by default); with TLS compiled out,
+    /// `-Dtls` build option (enabled by default); with TLS compiled out,
     /// setting this fails `Server.run`.
     tls: ?ServerConfig.Tls = null,
     /// How many connections the kernel accepts on the server's behalf
@@ -160,7 +160,7 @@ pub const Listener = struct {
     ipv6_only: ?bool = null,
     /// Serve cleartext HTTP/2 to a client that opens with the HTTP/2
     /// connection preface ("prior knowledge", RFC 9113 §3.3), alongside
-    /// HTTP/1.x on the same port. Needs the `use_http2` build option, and
+    /// HTTP/1.x on the same port. Needs the `-Dhttp2` build option, and
     /// is ignored on a TLS listener, which negotiates "h2" through
     /// `Tls.alpn_protocols` instead. The deprecated `Upgrade: h2c` is not
     /// supported.
@@ -279,7 +279,7 @@ pub const ServerConfig = struct {
     /// How responses are written: buffer size, `Date`, the default
     /// content type, header count, Brotli quality.
     response: Response = .{},
-    /// HTTP/2 connections (with the `use_http2` build option): reached
+    /// HTTP/2 connections (with the `-Dhttp2` build option): reached
     /// through ALPN "h2" on a TLS listener or `Listener.http2_prior_knowledge`.
     http2: Http2 = .{},
     /// Where the server accepts connections. `Server.run` serves all of

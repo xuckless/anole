@@ -12,7 +12,7 @@ const std = @import("std");
 const features = @import("build_options");
 
 /// `Compress` (a `std.Io.Writer` that deflates) and `Decompress` (a
-/// `std.Io.Reader` that inflates) over zlib-ng; the same module dusty uses.
+/// `std.Io.Reader` that inflates) over zlib-ng; the same module the core uses.
 pub const zlib = @import("anole_zlib");
 
 /// zstd.h.

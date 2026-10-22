@@ -12,7 +12,7 @@
 //!
 //! `anole.client` finds the server by the runtime of the `std.Io` it is
 //! given (a request's, or `app.io()`), so it works from any handler and any
-//! task of the server, with or without server state. It wraps dusty's
+//! task of the server, with or without server state. It wraps the core's
 //! client (`anole.http.Client`, reachable as `.http`) with inline headers
 //! and JSON decoding of the response. Its settings (the pool, the timeout,
 //! the CAs) come from `ServerOptions.client`.
@@ -23,7 +23,7 @@ const http = @import("http/root.zig");
 /// A request header, as a pair: `.{ "User-Agent", "anole" }`.
 pub const Header = [2][]const u8;
 
-/// Headers a fetch takes inline; more go through `.http` and dusty's
+/// Headers a fetch takes inline; more go through `.http` and the core's
 /// `Headers`.
 pub const max_inline_headers = 32;
 
@@ -50,7 +50,7 @@ pub const FetchOptions = struct {
 /// `observe.trace.Exporter`); a core client of your own fits as
 /// `.{ .http = &my_client }`.
 pub const Client = struct {
-    /// dusty's client, for everything `fetch` does not cover (streamed
+    /// the core's client, for everything `fetch` does not cover (streamed
     /// bodies, WebSocket, Unix sockets).
     http: *http.Client,
 
@@ -77,7 +77,7 @@ pub const Client = struct {
 /// A response from `Client.fetch`: status and headers at once, the body
 /// read on demand. `deinit` it to hand the connection back.
 pub const Response = struct {
-    /// dusty's response, for streaming the body (`reader`) and the rest.
+    /// the core's response, for streaming the body (`reader`) and the rest.
     inner: http.core.ClientResponse,
 
     /// The response's status.

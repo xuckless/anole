@@ -415,7 +415,7 @@ const Https = struct {
     rt: *zio.Runtime,
     io: std.Io,
     pem: Pem,
-    /// Holds cert.pem for the client's CA file (dusty's client reads its
+    /// Holds cert.pem for the client's CA file (the core's client reads its
     /// trust anchors from a file); the key never leaves memory.
     tmp: std.testing.TmpDir,
 
@@ -447,7 +447,7 @@ const Https = struct {
 };
 
 /// A blocking BoringSSL client over a plain socket, for tests that need to
-/// see what dusty's client hides. Run it off the runtime (`onThread`): its
+/// see what the core's client hides. Run it off the runtime (`onThread`): its
 /// I/O blocks.
 const RawClient = struct {
     fd: c_int,

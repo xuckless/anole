@@ -1,10 +1,10 @@
-//! dusty's `tls` module, backed by BoringSSL.
+//! the core's `tls` module, backed by BoringSSL.
 //!
-//! dusty (built with `use_tls = true, use_bundled_tls = false`) imports this
+//! the core (built with `-Dtls = true, use_bundled_tls = false`) imports this
 //! module as `tls` and drives it exactly as it drives lalinsky/tls.zig: the
-//! declarations below are the surface dusty compiles against, and the Reader
+//! declarations below are the surface the core compiles against, and the Reader
 //! and Writer adapters follow tls.zig's `Connection.Reader`/`Writer` (MIT,
-//! 60d0ced), so dusty's buffer swapping and error descent work unchanged.
+//! 60d0ced), so the core's buffer swapping and error descent work unchanged.
 //!
 //! I/O: one reader task and one writer task may use a connection at the same
 //! time, possibly on different executor threads (HTTP/2 does), which is the
@@ -38,12 +38,12 @@ const c = @import("anole_boringssl_c");
 const log = std.log.scoped(.anole_tls);
 const Allocator = std.mem.Allocator;
 
-/// Ciphertext read buffer dusty gives the TCP reader: none. This module
+/// Ciphertext read buffer the core gives the TCP reader: none. This module
 /// points the reader at buffers of its own (`Shared.stash`, pool blocks),
 /// so an idle connection keeps only the stash. A reader that already holds
 /// bytes when the handshake starts is read to the end of them first.
 pub const input_buffer_len: usize = 0;
-/// Ciphertext write buffer dusty gives the TCP writer: none. Records reach
+/// Ciphertext write buffer the core gives the TCP writer: none. Records reach
 /// the socket from `Shared.sending` in one write each flush, so a buffer
 /// here would only copy them once more, and keep pages per connection that
 /// every response dirties.
@@ -138,7 +138,7 @@ pub const config = struct {
             };
         }
 
-        /// A certificate reload (dusty fork, `Server.reloadTls`): this new
+        /// A certificate reload (the core fork, `Server.reloadTls`): this new
         /// pair takes over the session ticket keys of the `old` one it
         /// replaces, so tickets issued before the reload still resume.
         pub fn carryOver(self: *CertKeyPair, old: *const CertKeyPair) void {
@@ -156,7 +156,7 @@ pub const config = struct {
         }
     };
 
-    /// Server handshake options, as dusty builds them (server.zig `initTls`).
+    /// Server handshake options, as the core builds them (server.zig `initTls`).
     pub const Server = struct {
         auth: ?*CertKeyPair,
         client_auth: ?ClientAuth = null,
@@ -174,18 +174,18 @@ pub const config = struct {
     pub const ClientAuth = struct {
         root_ca: std.crypto.Certificate.Bundle,
         auth_type: enum { request, require } = .require,
-        /// `root_ca` loaded once (dusty sets it when the module has
+        /// `root_ca` loaded once (the core sets it when the module has
         /// `TrustStore`); without it each handshake looks `root_ca` up.
         trust: ?*const TrustStore = null,
     };
 
-    /// Client handshake options, as dusty builds them (client.zig `Connection.init`).
+    /// Client handshake options, as the core builds them (client.zig `Connection.init`).
     pub const Client = struct {
         host: []const u8,
         root_ca: std.crypto.Certificate.Bundle,
         /// `root_ca` loaded once, as in `ClientAuth.trust`.
         trust: ?*const TrustStore = null,
-        /// A store from `clientStore`, for clients outside dusty; taken over
+        /// A store from `clientStore`, for clients outside the core; taken over
         /// `trust` and `root_ca`.
         store: ?*c.X509_STORE = null,
         insecure_skip_verify: bool = false,
@@ -202,9 +202,9 @@ pub const config = struct {
 
 const max_pem_len = 1024 * 1024;
 
-/// dusty switches on `ReadFailed`/`WriteFailed` ("the cause is on the TCP
+/// the core switches on `ReadFailed`/`WriteFailed` ("the cause is on the TCP
 /// layer, ask getReadError/getWriteError"), so both are here. A handshake
-/// deadline reaches us as a canceled TCP read, recorded on dusty's reader,
+/// deadline reaches us as a canceled TCP read, recorded on the core's reader,
 /// and comes out as `ReadFailed`, never as `Canceled`.
 pub const HandshakeError = error{
     ReadFailed,
@@ -442,8 +442,8 @@ pub fn client(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Client)
 }
 
 /// One TLS connection: owns its SSL (and through it the BIO and the shared
-/// state). dusty stores it in place after the handshake and frees it with
-/// `deinit` (dusty fork patch: TLS state teardown).
+/// state). the core stores it in place after the handshake and frees it with
+/// `deinit` (the core fork patch: TLS state teardown).
 ///
 /// After the handshake, one task may read while another writes. `close`
 /// is a write: the writing side may call it while the reading side reads
@@ -475,7 +475,7 @@ pub const Connection = struct {
     pub const WriteError = error{ WriteFailed, TlsFailure };
 
     /// On a server connection, the client's certificate (the leaf, DER)
-    /// when the handshake verified one, else null: dusty puts it in
+    /// when the handshake verified one, else null: the core puts it in
     /// `Request.peer_certificate`. On a client connection, the server's
     /// leaf certificate, verified or not as the connection's options said
     /// (PostgreSQL's SCRAM channel binding hashes it). Valid until `deinit`.
@@ -639,7 +639,7 @@ pub const Connection = struct {
         sh.output.flush() catch return error.WriteFailed;
     }
 
-    /// dusty passes an empty buffer and later swaps `interface.buffer`,
+    /// the core passes an empty buffer and later swaps `interface.buffer`,
     /// `seek` and `end` in place, so only `stream` is implemented and the
     /// default `rebase` is kept.
     pub const Reader = struct {
@@ -1068,14 +1068,14 @@ fn clientCtx() HandshakeError!*c.SSL_CTX {
     return ctx;
 }
 
-/// dusty hands over its trust store as a `std.crypto.Certificate.Bundle`
+/// the core hands over its trust store as a `std.crypto.Certificate.Bundle`
 /// by value on every handshake. Converting ~150 system roots per connection
 /// would be far too slow, so each distinct bundle becomes an X509_STORE once.
 /// The key is the bundle's contents (SHA-256 and length), not its address,
 /// because a freed bundle's memory can be reused for a different one, and
 /// a cryptographic digest, because bundles may come from different tenants
 /// and one must never be served another's store.
-/// Planned dusty fork patch P4 (load the trust store once through this
+/// Planned the core fork patch P4 (load the trust store once through this
 /// module) removes the conversion.
 const StoreEntry = struct {
     digest: [32]u8,
@@ -1123,7 +1123,7 @@ fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) Handshake
     return trustFrom(slot.*.?, want_names);
 }
 
-/// A trust store loaded once from a bundle, for dusty to keep beside the
+/// A trust store loaded once from a bundle, for the core to keep beside the
 /// bundle and hand to every handshake (`config.Client.trust`,
 /// `config.ClientAuth.trust`), so none of them converts or looks up the
 /// bundle. Immutable after `init`; any thread may use it.
@@ -1199,10 +1199,10 @@ pub fn clientAuthSessionContext(comptime kind: []const u8, mode: u8, ca_digest: 
     return hash.finalResult();
 }
 
-/// The trust store for a client connection made outside dusty (Anole's
+/// The trust store for a client connection made outside the core (Anole's
 /// HTTP/2 and HTTP/3 clients), from `ca`, a `dusty.TlsCa`. `.system` is
 /// loaded on first use and kept for the process; a file, directory or PEM is
-/// read on every call and its store cached by content, as dusty's bundles
+/// read on every call and its store cached by content, as the core's bundles
 /// are. Null for `.none`. A new reference: `X509_STORE_free` it.
 pub fn clientStore(gpa: Allocator, io: std.Io, ca: anytype) !?*c.X509_STORE {
     switch (ca) {
@@ -1225,7 +1225,7 @@ var system_store: ?*c.X509_STORE = null;
 var system_store_mutex: std.Io.Mutex = .init;
 
 /// The platform's trust store (`std.crypto.Certificate.Bundle.rescan`, what
-/// dusty's `.system` reads), loaded once. A new reference.
+/// the core's `.system` reads), loaded once. A new reference.
 fn systemStore(io: std.Io) !*c.X509_STORE {
     system_store_mutex.lockUncancelable(io);
     defer system_store_mutex.unlock(io);
@@ -1283,12 +1283,12 @@ fn trustFrom(e: StoreEntry, want_names: bool) HandshakeError!Trust {
 /// the BIO's destroy callback when SSL_free releases the BIO.
 const Shared = struct {
     ssl: *c.SSL,
-    /// dusty's ciphertext reader, pointed at `stash` or `block` (see
+    /// the core's ciphertext reader, pointed at `stash` or `block` (see
     /// `prepareInput`). Only the reading side touches it: `fill` with the
     /// lock released and `filling` set, the BIO read callback with the lock
     /// held.
     input: *std.Io.Reader,
-    /// dusty's ciphertext writer. Only the writing side touches it.
+    /// the core's ciphertext writer. Only the writing side touches it.
     output: *std.Io.Writer,
     mutex: std.atomic.Mutex = .unlocked,
 

@@ -1,7 +1,7 @@
 //! OpenID Connect sign-in, as a relying party (never a provider): the
 //! authorization code flow with PKCE (S256), state and nonce, and the ID
 //! token checks of OIDC Core 3.1.3.7. The logic follows liboauth2's
-//! relying-party code (OpenIDC/liboauth2, Apache-2.0), rewritten on dusty's
+//! relying-party code (OpenIDC/liboauth2, Apache-2.0), rewritten on the core's
 //! HTTP client, the JWS verifier and std.crypto.
 //!
 //!     var provider = try oidc.Provider.discover(gpa, app.client(), "https://accounts.google.com");

@@ -50,12 +50,12 @@
 //! to end (the answer to the last buffered message, a read that would
 //! wait, or the handler waiting for anything else), so a client that
 //! pipelines messages gets one write for them, not one each. Sends from
-//! other tasks (`Rooms.broadcast`) go out at once. dusty's
+//! other tasks (`Rooms.broadcast`) go out at once. the core's
 //! `WebSocketBatch` has the rule.
 //!
 //! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
 //! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
-//! upgrades with `upgrade` here, not dusty's HTTP/1.1-only
+//! upgrades with `upgrade` here, not the core's HTTP/1.1-only
 //! `res.upgradeWebSocket`, or turn `http2.enable_connect_protocol` (and
 //! `http3.enable_connect_protocol`) off.
 //!
@@ -98,7 +98,7 @@ pub const CloseCode = WebSocket.CloseCode;
 pub const Client = dusty.WebSocketClient;
 
 /// How `upgrade` (and `app.wsWith`) accepts a socket. The defaults suit
-/// most handlers: dusty's message limit, no timeout, compression when
+/// most handlers: the core's message limit, no timeout, compression when
 /// built in, close 1001 on drain, pages from the same origin only.
 pub const UpgradeOptions = struct {
     /// The pages that may open the socket, by the handshake's `Origin`:
@@ -230,7 +230,7 @@ pub const Socket = struct {
 
     /// Over HTTP/1.1, for a reading task that waits for the peer in its
     /// own way (`callbacks`): the next message once one has begun in the
-    /// read buffer, null when it is empty (dusty's
+    /// read buffer, null when it is empty (the core's
     /// `WebSocket.receiveStarted`).
     fn receiveStarted(self: *Socket) !?Message {
         const msg = (try self.conn.h1.receiveStarted()) orelse return null;

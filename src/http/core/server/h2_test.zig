@@ -2,7 +2,7 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! HTTP/2 engine tests: a dusty server with cleartext HTTP/2 (prior
+//! HTTP/2 engine tests: a the core server with cleartext HTTP/2 (prior
 //! knowledge) on loopback, driven by a minimal nghttp2 client.
 const std = @import("std");
 const dusty = @import("../root.zig");

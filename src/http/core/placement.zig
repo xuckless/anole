@@ -11,7 +11,7 @@
 //! connection and everything it spawns stay on the executor that accepted it:
 //! nothing of one connection crosses threads, and its locks are uncontended.
 //!
-//! Elsewhere -- dusty's zio stub, a zio without placement, `std.Io.Threaded`,
+//! Elsewhere -- the core's zio stub, a zio without placement, `std.Io.Threaded`,
 //! or zio's work-stealing scheduling, where pinning a task is invalid -- this
 //! is plain `concurrent`.
 //!

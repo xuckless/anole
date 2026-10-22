@@ -1388,6 +1388,7 @@ const Core = struct {
             .link_libc = true,
         });
         const opts = b.addOptions();
+        opts.addOption([]const u8, "version", @import("build.zig.zon").version);
         opts.addOption(bool, "use_tls", tls != null);
         opts.addOption(bool, "use_http2", nghttp2 != null);
         opts.addOption(bool, "use_zlib", zlib != null);
@@ -1620,6 +1621,7 @@ const AnoleModuleOptions = struct {
 fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     const f = o.features;
     const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
     options.addOption(Tls, "tls", f.tls);
     options.addOption(bool, "http2", f.http2);
     options.addOption(bool, "http3", f.http3);

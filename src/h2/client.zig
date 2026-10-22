@@ -1,6 +1,6 @@
 //! An HTTP/2 client connection on nghttp2: many concurrent streams over one
 //! TCP connection, cleartext (prior knowledge) or TLS with ALPN "h2". The
-//! shape follows the server engine in the dusty fork: a reader task feeds
+//! shape follows the server engine in the the core fork: a reader task feeds
 //! the session, a writer task drains it, one mutex serializes every
 //! nghttp2 call, and nothing blocks while holding it.
 //!
@@ -18,8 +18,8 @@
 //! `closeSend()`; its response body is read through `reader()`, and the
 //! trailers are in `trailers` once that reports the end.
 //!
-//! Its own module (`anole_h2_client`), because dusty's client takes it as
-//! its `h2_client` import: when a server picks "h2" through ALPN, dusty
+//! Its own module (`anole_h2_client`), because the core's client takes it as
+//! its `h2_client` import: when a server picks "h2" through ALPN, the core
 //! hands the TLS connection over (`adopt`), so `anole.http.Client` speaks
 //! HTTP/2 too.
 const std = @import("std");
@@ -201,7 +201,7 @@ pub const ClientConnection = struct {
     }
 
     /// Takes over a connection on which the TLS handshake picked "h2", as
-    /// dusty's client does (its `h2_client` seam): `reader` and `writer`
+    /// the core's client does (its `h2_client` seam): `reader` and `writer`
     /// carry the cleartext from here on, and only this connection's tasks
     /// use them. `socket` is shut down when the session ends but not
     /// closed; the caller closes it, and frees the TLS state, after

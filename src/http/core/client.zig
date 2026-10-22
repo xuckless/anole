@@ -93,7 +93,7 @@ test "nghttp2 links and reports a version" {
 }
 
 /// Default User-Agent sent with requests unless overridden.
-pub const default_user_agent = "dusty/0.4.0";
+pub const default_user_agent = "anole/" ++ build_options.version;
 
 /// Configuration for the HTTP client.
 pub const ClientConfig = struct {
@@ -130,7 +130,7 @@ pub const ClientConfig = struct {
     /// its connection torn down.
     buffer_size: usize = 16384,
     /// TLS settings for https:// (and wss://) connections. Requires the
-    /// `use_tls` build option; with TLS compiled out any HTTPS request fails
+    /// `-Dtls` build option; with TLS compiled out any HTTPS request fails
     /// with error.TlsNotConfigured. Applies to every connection the client
     /// makes: connections are pooled and reused across requests, so the trust
     /// settings and client identity cannot be varied per request.
