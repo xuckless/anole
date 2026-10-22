@@ -596,10 +596,10 @@ pub const Exec = struct {
 
     /// Any thread.
     fn pushOverflow(x: *Exec, rec: []align(8) u8) void {
-        const link = linkOf(rec.ptr);
+        const lw = linkOf(rec.ptr);
         var old = x.overflow.load(.monotonic);
         while (true) {
-            link.* = old;
+            lw.* = old;
             old = x.overflow.cmpxchgWeak(old, rec.ptr, .seq_cst, .monotonic) orelse break;
         }
     }
@@ -1597,6 +1597,15 @@ pub const Engine = struct {
         return 0;
     }
 
+    /// A handle error as an answer call reports it: over is `Gone`
+    /// (counted).
+    pub fn badHandle(e: *Engine, err: HandleError) AnswerError {
+        return switch (err) {
+            error.WrongKind => error.WrongKind,
+            error.Over => e.gone(),
+        };
+    }
+
     /// Why a client-side end happens: the drain's deadline cut it, or the
     /// client left.
     pub fn clientReason(e: *const Engine) u16 {
@@ -2309,18 +2318,18 @@ fn expireDetached(x: *Exec, si: u32, w: u64) void {
 /// A detached request ended by the sweeper: 504 at its deadline, or 503
 /// when the server is being destroyed (`abandon`: the consumer hears
 /// nothing more).
-fn endDetached(x: *Exec, si: u32, w: u64, abandon: bool) void {
+fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
-    if (!abandon) {
+    if (!abandoning) {
         if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), abi.ABORT_DEADLINE, 504);
         _ = x.engine.expired_count.fetchAdd(1, .monotonic);
     }
     if (s.detached) |d| {
         s.detached = null;
         x.closePipe(&s.in, gen, si);
-        if (abandon)
+        if (abandoning)
             d.response.fail(.service_unavailable, "the server is stopping")
         else
             d.response.fail(.gateway_timeout, "the application did not answer in time");
@@ -2530,8 +2539,8 @@ pub const Head = struct {
         const size_ = out.len;
         const nh = req.headers.len;
         const np = req.params.count();
-        const spans: [*]align(1) abi.Span = @ptrCast(out[spans_off..].ptr);
         const spans_off: usize = @sizeOf(abi.RequestEvent);
+        const spans: [*]align(1) abi.Span = @ptrCast(out[spans_off..].ptr);
         var pos: usize = spans_off + (nh + np) * 2 * @sizeOf(abi.Span);
         const put = struct {
             fn f(buf: []u8, p: *usize, s: []const u8, lower: bool) abi.Span {
@@ -2797,14 +2806,6 @@ pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *
     const s = &x.slots[h.slot];
     if (s.kind.load(.acquire) != @backingInt(kind)) return error.Over;
     return .{ x, s, h };
-}
-
-/// A handle error as an answer call reports it: over is `Gone` (counted).
-pub fn badHandle(e: *Engine, err: HandleError) AnswerError {
-    return switch (err) {
-        error.WrongKind => error.WrongKind,
-        error.Over => e.gone(),
-    };
 }
 
 /// Claims slot `hv` for an answer: `out` to `responding`. `Over` when it is

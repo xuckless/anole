@@ -1071,11 +1071,11 @@ fn expire(x: *Exec, si: u32, w: u64) void {
 /// A detached call ended by the sweeper: DEADLINE_EXCEEDED at its deadline
 /// (the consumer hears ABORT), or UNAVAILABLE when the server is being
 /// destroyed (it hears nothing more).
-fn endDetached(x: *Exec, si: u32, w: u64, abandon: bool) void {
+fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
-    if (!abandon) {
+    if (!abandoning) {
         if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), abi.ABORT_DEADLINE, abi.GRPC_STATUS_DEADLINE_EXCEEDED);
         _ = x.engine.expired_count.fetchAdd(1, .monotonic);
     }
@@ -1085,7 +1085,7 @@ fn endDetached(x: *Exec, si: u32, w: u64, abandon: bool) void {
         s.detached = null;
         var buf: std.ArrayList(u8) = .empty;
         call.impl.buffer = &buf;
-        const result = if (abandon)
+        const result = if (abandoning)
             serving.finish(call, call.fail(.unavailable, "the server is stopping"))
         else
             serving.finish(call, call.fail(.deadline_exceeded, "deadline exceeded"));
