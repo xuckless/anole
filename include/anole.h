@@ -33,7 +33,12 @@
  *    gets 504 from Anole, and a late answer gets ANOLE_E_GONE.
  *
  * Threads. Every function may be called from any thread unless it says
- * otherwise. A request or WebSocket handle is meant to be used by the thread
+ * otherwise, between anole_server_create and anole_server_destroy (never
+ * during or after destroy). That includes anole_server_drain and the
+ * reloads (Node finalizers, Python atexit and signal handlers) while the
+ * server starts, serves or stops: they act on a server that is still
+ * serving, or answer as their text says once it is not, never on one being
+ * freed. A request or WebSocket handle is meant to be used by the thread
  * that polled it; another thread may use it with the binding's own
  * synchronization (calls on one handle must not overlap). anole_poll on one
  * consumer must not overlap with itself (a shared consumer serializes it).
@@ -169,15 +174,18 @@ ANOLE_API anole_status anole_server_start(anole_server *s);
 ANOLE_API anole_status anole_server_port(anole_server *s, uint32_t i, uint16_t *out);
 /* Stops accepting and drains: HTTP/2 and HTTP/3 GOAWAY, WebSockets close
    1001, requests in flight finish within timeouts.shutdown_ms. Returns at
-   once; again is a no-op. Consumers keep polling and answering until they
-   see ANOLE_EV_STOPPED. */
+   once; again, or once the server stops on its own, is a no-op (ANOLE_OK);
+   ANOLE_E_STATE before anole_server_start has succeeded. Consumers keep
+   polling and answering until they see ANOLE_EV_STOPPED. */
 ANOLE_API anole_status anole_server_drain(anole_server *s);
 /* Blocks the calling thread until the server has stopped (after a drain):
    timeout_ms < 0 waits for ever; ANOLE_E_TIMEOUT when it passes. Never on
    a thread that must keep polling a consumer of this server meanwhile. */
 ANOLE_API anole_status anole_server_wait(anole_server *s, int32_t timeout_ms);
 /* Reads every TLS listener's certificate files again and swaps them in;
-   handshakes under way keep the old ones. */
+   handshakes under way keep the old ones. ANOLE_E_STATE when the server is
+   not running (before start, draining, stopped). A stop that begins while
+   a reload runs waits for it to return before the server is freed. */
 ANOLE_API anole_status anole_server_reload_certificates(anole_server *s);
 /* Swaps every TLS listener's certificate and key (the HTTP/3 one too) for
    new ones: file paths, or PEM text with ANOLE_TLS_PEM (copied). Handshakes

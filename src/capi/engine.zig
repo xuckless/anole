@@ -650,6 +650,10 @@ pub const Phase = enum(u8) { created, starting, running, draining, stopped, fail
 
 pub var global: ?*Engine = null;
 
+/// Tests: runs inside a control call (drain, reload) once it holds the
+/// server, before it calls into it.
+pub var test_control_hook: ?*const fn () void = null;
+
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
     config: Config,
@@ -667,7 +671,14 @@ pub const Engine = struct {
     start_why: [400]u8 = undefined,
     start_why_len: usize = 0,
     stopped: std.Io.Event = .unset,
+    /// The server, on the run thread's stack: freed when `run` returns.
+    /// Control calls from other threads (`drain`, the reloads) reach it
+    /// only through `enter`.
     app: ?*anole.App = null,
+    /// `ctl_closed` while there is no server to call into (before it
+    /// serves, once `run` returned), plus the control calls inside it: the
+    /// run thread closes it and waits for those before it frees the server.
+    ctl: std.atomic.Value(u32) = .init(ctl_closed),
     /// The generation its slots start at (`next_first_gen` at create).
     first_gen: u32 = 1,
     /// The runtime's Io, for waking executor tasks from consumer threads
@@ -850,8 +861,11 @@ pub const Engine = struct {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
         };
+        // Control calls may reach the server from here until `run` returns.
+        _ = e.ctl.fetchAnd(~ctl_closed, .release);
         e.phase.store(.running, .release);
         const result = app.run();
+        e.closeControl(app.io());
         watcher.cancel(app.io());
         e.tasks.cancel(app.io());
         if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
@@ -1066,11 +1080,49 @@ pub const Engine = struct {
         }
     }
 
+    const ctl_closed: u32 = 1 << 31;
+
+    /// The server, for a control call from any thread, or null when there
+    /// is none to call into (not serving yet, or `run` returned): then the
+    /// run thread may be freeing it. `leave` after.
+    fn enter(e: *Engine) ?*anole.App {
+        const prev = e.ctl.fetchAdd(1, .acquire);
+        if (prev & ctl_closed != 0) {
+            _ = e.ctl.fetchSub(1, .release);
+            return null;
+        }
+        const app = e.app.?;
+        if (comptime builtin.is_test) if (test_control_hook) |f| f();
+        return app;
+    }
+
+    fn leave(e: *Engine) void {
+        _ = e.ctl.fetchSub(1, .release);
+    }
+
+    /// On the run thread once `run` returned: no control call enters from
+    /// now on, and those inside have left when this returns, so the server
+    /// can be freed. Waits on the runtime (`io`), which a control call
+    /// inside may still need.
+    fn closeControl(e: *Engine, io: std.Io) void {
+        _ = e.ctl.fetchOr(ctl_closed, .acq_rel);
+        while (e.ctl.load(.acquire) & ~ctl_closed != 0) {
+            io.sleep(.fromMilliseconds(1), .awake) catch std.Thread.yield() catch {};
+        }
+    }
+
     pub fn drain(e: *Engine) !void {
-        const p = e.phase.load(.acquire);
-        if (p != .running) return if (p == .draining or p == .stopped) {} else error.State;
-        e.phase.store(.draining, .release);
-        if (e.app) |app| app.stop();
+        switch (e.phase.load(.acquire)) {
+            .running => {},
+            .draining, .stopped => return,
+            .created, .starting, .failed => return error.State,
+        }
+        // None: `run` returned (a signal, an error), and the server stops
+        // on its own.
+        const app = e.enter() orelse return;
+        defer e.leave();
+        _ = e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire);
+        app.stop();
     }
 
     /// Waits for the stop; false when `timeout_ms` passed first.
@@ -1086,7 +1138,8 @@ pub const Engine = struct {
 
     pub fn reloadCertificates(e: *Engine) !void {
         if (e.phase.load(.acquire) != .running) return error.State;
-        const app = e.app orelse return error.State;
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
         try app.reloadCertificates();
     }
 
@@ -1095,7 +1148,8 @@ pub const Engine = struct {
     /// (and SIGHUP) read from it.
     pub fn setCertificate(e: *Engine, cert: anole.Cert) !void {
         if (e.phase.load(.acquire) != .running) return error.State;
-        const app = e.app orelse return error.State;
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
         try app.setCertificate(cert);
     }
 

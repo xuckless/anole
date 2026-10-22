@@ -31,6 +31,16 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- C ABI: `anole_server_drain`, `anole_server_reload_certificates` and
+  `anole_server_reload_tls` called from another thread while the server
+  stopped could reach the server after its run thread had freed it (the
+  server lived on that thread's stack), a use-after-free in the host
+  process. The header promises these calls from any thread; they now
+  either act on a server that is still serving or answer as documented
+  (`ANOLE_OK` for a drain once the server is stopping, `ANOLE_E_STATE`
+  for a reload), and a stop waits for a reload under way before it frees
+  the server. `anole.h` states the rule: any thread, between
+  `anole_server_create` and `anole_server_destroy`.
 - C ABI: two routes of the configuration that the router cannot tell
   apart (the same method and path twice, two parameter names at one
   position, a method route less specific than an any-method one, or a
