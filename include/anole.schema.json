@@ -1,8 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/xuckless/anole/blob/main/include/anole.schema.json",
+  "$id": "https://github.com/xuckless/anole/blob/v0.1.3/include/anole.schema.json",
+  "x-anole-abi": "0.7",
   "title": "Anole C ABI configuration",
-  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error. ABI 0.2.",
+  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error (token UnknownKey).",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -688,6 +689,21 @@
                 },
                 "ready": {
                   "type": "string"
+                },
+                "checks": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "description": "Readiness flags: each starts not ready, so /readyz answers 503 naming it until the consumer calls anole_server_set_ready."
+                },
+                "listener": {
+                  "type": "string",
+                  "description": "Serve both routes only on the listener of this name (404 on the others)."
                 }
               }
             },
