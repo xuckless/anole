@@ -34,6 +34,9 @@ breaking changes are listed anyway.
   (no Content-Length, not chunked) now fails with
   `error.TlsConnectionTruncated` when the TLS connection ends without
   close_notify, instead of being returned as complete.
+- TLS clients: the cache of trust stores built from CA bundles and the
+  HTTP/3 session-ticket cache are keyed by SHA-256 of their contents, so
+  two different CA sets or client identities can never share an entry.
 
 ### C ABI (ABI 0.1)
 

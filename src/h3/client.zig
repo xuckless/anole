@@ -390,18 +390,29 @@ pub const ClientConnection = struct {
 
     /// Where this connection's tickets are filed: the server, and every
     /// TLS setting that decides whether a session may be trusted.
+    /// One field of `cacheKey`'s digest, length first, so fields cannot
+    /// run into each other.
+    fn hashField(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, bytes.len, .little);
+        hash.update(&len);
+        hash.update(bytes);
+    }
+
+    /// The TLS settings by SHA-256: a ticket must never go to a connection
+    /// that trusts other CAs or presents another identity.
     fn cacheKey(gpa: std.mem.Allocator, options: ConnectOptions, identity: ?Identity) ![]u8 {
-        var hash: std.hash.Wyhash = .init(0);
+        var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
         const ca = options.tls.ca;
-        hash.update(@tagName(ca));
+        hashField(&hash, @tagName(ca));
         switch (ca) {
-            .file, .dir => |src| hash.update(src.path),
-            .pem => |text| hash.update(text),
+            .file, .dir => |src| hashField(&hash, src.path),
+            .pem => |text| hashField(&hash, text),
             .system, .none => {},
         }
-        hash.update(&.{@intFromBool(options.tls.insecure_skip_verify)});
-        if (identity) |id| hash.update(id.pem.cert_pem);
-        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, hash.final() });
+        hashField(&hash, &.{@intFromBool(options.tls.insecure_skip_verify)});
+        if (identity) |id| hashField(&hash, id.pem.cert_pem);
+        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, &hash.finalResult() });
     }
 
     /// What became of 0-RTT on this connection.

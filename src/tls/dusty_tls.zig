@@ -1046,12 +1046,14 @@ fn clientCtx() HandshakeError!*c.SSL_CTX {
 /// dusty hands over its trust store as a `std.crypto.Certificate.Bundle`
 /// by value on every handshake. Converting ~150 system roots per connection
 /// would be far too slow, so each distinct bundle becomes an X509_STORE once.
-/// The key is the bundle's contents (hash and length), not its address,
-/// because a freed bundle's memory can be reused for a different one.
+/// The key is the bundle's contents (SHA-256 and length), not its address,
+/// because a freed bundle's memory can be reused for a different one, and
+/// a cryptographic digest, because bundles may come from different tenants
+/// and one must never be served another's store.
 /// Planned dusty fork patch P4 (load the trust store once through this
 /// module) removes the conversion.
 const StoreEntry = struct {
-    hash: u64,
+    digest: [32]u8,
     len: usize,
     store: *c.X509_STORE,
     /// The certificates' subject names (DER), for a server's client CA list.
@@ -1076,12 +1078,13 @@ fn setVerifyStore(ssl: *c.SSL, bundle: std.crypto.Certificate.Bundle) HandshakeE
 /// Returns a new reference to the store; the caller frees it.
 fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) HandshakeError!Trust {
     const der = bundle.bytes.items;
-    const hash = std.hash.Wyhash.hash(0, der);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(der, &digest, .{});
     lockGlobal();
     defer global_lock.unlock();
     for (store_cache) |entry| {
         const e = entry orelse continue;
-        if (e.hash == hash and e.len == der.len) return trustFrom(e, want_names);
+        if (e.len == der.len and std.mem.eql(u8, &e.digest, &digest)) return trustFrom(e, want_names);
     }
 
     const built = try TrustStore.fromDer(der);
@@ -1091,7 +1094,7 @@ fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) Handshake
         var t: TrustStore = .{ .store = old.store, .names = old.names };
         t.deinit();
     }
-    slot.* = .{ .hash = hash, .len = der.len, .store = built.store, .names = built.names };
+    slot.* = .{ .digest = digest, .len = der.len, .store = built.store, .names = built.names };
     return trustFrom(slot.*.?, want_names);
 }
 
@@ -1143,7 +1146,7 @@ pub const TrustStore = struct {
 
     /// New references to the store and, if asked, the names.
     fn share(self: *const TrustStore, want_names: bool) HandshakeError!Trust {
-        return trustFrom(.{ .hash = 0, .len = 0, .store = self.store, .names = self.names }, want_names);
+        return trustFrom(.{ .digest = @splat(0), .len = 0, .store = self.store, .names = self.names }, want_names);
     }
 };
 
