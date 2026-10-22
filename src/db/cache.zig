@@ -23,9 +23,14 @@
 //! executor's own, and copied into the caller's arena on a hit. A miss
 //! coalesces, so a stampede of misses runs the statement once per
 //! executor. Errors are never kept (`one`'s `NotFound` included; an empty
-//! `optional` or `all` is a result and is). Each executor fills its own
-//! cache, so two executors may hold results from different moments, up
-//! to `ttl` apart; `invalidate` reaches all of them at once.
+//! `optional` or `all` is a result and is, unless the call says
+//! `.keep_empty = false`). Each executor fills its own cache, so two
+//! executors may hold results from different moments, up to `ttl` apart;
+//! `invalidate` reaches all of them at once.
+//!
+//! Each shared call records where its answer came from (`db.Source`:
+//! this cache, an identical call in flight, or a round trip of its own),
+//! which `anole.db.lastSource(c)` reads back.
 const std = @import("std");
 const dusty = @import("dusty");
 const db = @import("root.zig");
@@ -40,6 +45,27 @@ const log = std.log.scoped(.anole);
 
 /// What a read fails with: the connectors' error set.
 pub const ReadError = db.Error || error{ Canceled, OutOfMemory };
+
+/// What a read returns, for telling an empty result from another
+/// (`QueryOptions.Cache.keep_empty`). Each runner passed to `Cache.read`
+/// names its own as `pub const shape`.
+pub const Shape = enum {
+    /// One value (`one`, a count): never empty.
+    one,
+    /// An optional (`optional`): empty when null.
+    optional,
+    /// A slice of rows (`all`): empty with none.
+    all,
+};
+
+/// Whether `out`, a read's result of `shape`, is empty.
+fn isEmpty(comptime shape: Shape, out: anytype) bool {
+    return switch (shape) {
+        .one => false,
+        .optional => out == null,
+        .all => out.len == 0,
+    };
+}
 
 /// A connector's cache bounds (`Options.cache` of each connector): totals
 /// over every executor, each executor getting its share.
@@ -145,7 +171,9 @@ pub const Cache = struct {
     /// A read (`one`, `optional`, `all`), shared as `opts` asks:
     /// `runner.run(c, sql, args)` makes the plain call, with `c` the
     /// caller's context, or a `*anole.db.Ctx` of a statement's own task
-    /// when the call is shared. `Out` is what the verb returns.
+    /// when the call is shared; `@TypeOf(runner).shape` is the verb's
+    /// `Shape`. `Out` is what the verb returns. A shared call records its
+    /// `db.Source` for `lastSource`.
     pub fn read(self: *Cache, comptime Out: type, c: anytype, opts: db.QueryOptions, sql: []const u8, args: anytype, runner: anytype) ReadError!Out {
         if (!opts.coalesce and opts.cache == null) return runner.run(c, sql, args);
         return self.shared(Out, c, opts, sql, args, runner);
@@ -155,10 +183,14 @@ pub const Cache = struct {
         const Args = @TypeOf(args);
         if (comptime !copy.copyable(Out) or !copy.encodable(Args)) {
             unsupported(Out, Args);
+            internal.keepSource(c, .database);
             return runner.run(c, sql, args);
         }
         // Off the executors there is nothing to share with.
-        const local = self.locals.get(c.io) orelse return runner.run(c, sql, args);
+        const local = self.locals.get(c.io) orelse {
+            internal.keepSource(c, .database);
+            return runner.run(c, sql, args);
+        };
         const io = c.io;
 
         local.key.clearRetainingCapacity();
@@ -169,6 +201,7 @@ pub const Cache = struct {
         if (opts.cache != null) {
             if (local.store.get(key, store.now(io), &self.gens)) |entry| {
                 local.store.count(.hit);
+                internal.keepSource(c, .cache);
                 return copy.deepCopy(Out, entry.as(Out).*, c.arena);
             }
             local.store.count(.miss);
@@ -186,6 +219,7 @@ pub const Cache = struct {
                 found.unlist();
             }
         }
+        internal.keepSource(c, if (joined != null) .coalesced else .database);
         const f = if (joined) |found| found else (try self.start(Out, local, io, key, stamp, opts, sql, args, runner)) orelse
             return runner.run(c, sql, args);
         const T = Typed(Out, Args, @TypeOf(runner));
@@ -217,6 +251,7 @@ pub const Cache = struct {
                 .arena = .init(self.gpa),
                 .ctx = undefined,
                 .ttl = if (opts.cache) |o| o.ttl else null,
+                .keep_empty = if (opts.cache) |o| o.keep_empty else true,
                 .waiters = 1,
                 .destroy = T.destroy,
             },
@@ -280,6 +315,8 @@ const Flight = struct {
     done: std.Io.Event = .unset,
     /// Kept this long once done; null: not kept.
     ttl: ?std.Io.Duration,
+    /// An empty result is kept too (`QueryOptions.Cache.keep_empty`).
+    keep_empty: bool = true,
     destroy: *const fn (*Flight) void,
 
     fn wait(f: *Flight, io: std.Io) std.Io.Cancelable!void {
@@ -328,7 +365,9 @@ fn Typed(comptime Out: type, comptime Args: type, comptime Runner: type) type {
             }
             f.state = .done;
             f.unlist();
-            if (f.ttl) |ttl| if (self.result) |out| f.cache.keep(Out, f.local, f.key, f.stamp, ttl, out) else |_| {};
+            if (f.ttl) |ttl| if (self.result) |out| {
+                if (f.keep_empty or !isEmpty(Runner.shape, out)) f.cache.keep(Out, f.local, f.key, f.stamp, ttl, out);
+            } else |_| {};
             f.done.set(f.io);
             if (f.waiters == 0) destroy(f);
         }
@@ -390,6 +429,7 @@ const TestCtx = struct {
     io: std.Io,
     arena: std.mem.Allocator,
     last_error: ?db.ErrorDetail = null,
+    last_source: ?db.Source = null,
 };
 
 /// A connector that counts its statements, takes `delay_ms` for each, and
@@ -400,6 +440,10 @@ const Fake = struct {
     plain: *std.atomic.Value(u32),
     delay_ms: i64 = 20,
     fail: bool = false,
+    /// No rows at all: an empty result.
+    empty: bool = false,
+
+    pub const shape: Shape = .all;
 
     pub fn run(self: Fake, ctx: anytype, sql: []const u8, args: anytype) ReadError![]Row {
         _ = self.calls.fetchAdd(1, .monotonic);
@@ -409,6 +453,7 @@ const Fake = struct {
             return error.Canceled;
         };
         if (self.fail) return internal.fail(ctx, .{}, .{ .system = .postgresql, .class = .unique, .code = "23505", .message = "duplicate" });
+        if (self.empty) return &.{};
         const rows = try ctx.arena.alloc(Row, 2);
         const tags = try ctx.arena.alloc([]const u8, 1);
         tags[0] = try ctx.arena.dupe(u8, "tag");
@@ -634,6 +679,112 @@ test "db cache: kept for its ttl, then read again; invalidation by tag, by query
     try group.await(io);
     try once(&cache, io, h.fake(1), opts, 4);
     try testing.expectEqual(@as(u32, 7), h.calls.load(.monotonic));
+}
+
+/// One call on executor 0 with a context of its own: how many rows came
+/// back, and where from (`lastSource`).
+fn sourced(cache: *Cache, io: std.Io, runner: Fake, opts: db.QueryOptions) !struct { rows: usize, source: ?db.Source } {
+    const Out = struct { rows: usize = 0, source: ?db.Source = null, failed: bool = false };
+    const Run = struct {
+        fn one(cache_: *Cache, io_: std.Io, runner_: Fake, opts_: db.QueryOptions, out: *Out) void {
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            var c: TestCtx = .{ .io = io_, .arena = arena.allocator() };
+            const rows = cache_.read([]Row, &c, opts_, "SELECT id FROM t WHERE id = $1", .{1}, runner_) catch {
+                out.failed = true;
+                return;
+            };
+            out.* = .{ .rows = rows.len, .source = internal.lastSource(&c) };
+        }
+    };
+    var out: Out = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, Run.one, .{ cache, io, runner, opts, &out });
+    try group.await(io);
+    if (out.failed) return error.CallFailed;
+    return .{ .rows = out.rows, .source = out.source };
+}
+
+test "db cache: keep_empty = false serves an empty result without keeping it; a full one is kept" {
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var cache: Cache = try .init(gpa, io, .postgresql, "test", .{});
+    defer cache.deinit();
+    var h: Harness = .{};
+    var empty = h.fake(1);
+    empty.empty = true;
+
+    // Kept by default: the second call is a hit.
+    const keeping: db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(60), .tag = "a" } };
+    try testing.expectEqual(@as(usize, 0), (try sourced(&cache, io, empty, keeping)).rows);
+    try testing.expectEqual(@as(usize, 0), (try sourced(&cache, io, empty, keeping)).rows);
+    try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), cache.stats().hits);
+
+    // Not kept: each call asks again, and once the rows exist they are
+    // served at once, not "none" for the rest of the ttl.
+    cache.invalidate(.all);
+    const cache_aside: db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(60), .keep_empty = false } };
+    try testing.expectEqual(@as(usize, 0), (try sourced(&cache, io, empty, cache_aside)).rows);
+    try testing.expectEqual(@as(usize, 0), (try sourced(&cache, io, empty, cache_aside)).rows);
+    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(usize, 2), (try sourced(&cache, io, h.fake(1), cache_aside)).rows);
+    try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
+    // A result with rows is kept as before.
+    try testing.expectEqual(@as(usize, 2), (try sourced(&cache, io, h.fake(1), cache_aside)).rows);
+    try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
+
+    try testing.expect(isEmpty(.optional, @as(?u8, null)));
+    try testing.expect(!isEmpty(.optional, @as(?[]const u8, "")));
+    try testing.expect(!isEmpty(.one, @as([]const u8, "")));
+    try testing.expect(isEmpty(.all, @as([]const Row, &.{})));
+}
+
+test "db cache: lastSource says where each answer came from" {
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var cache: Cache = try .init(gpa, io, .postgresql, "test", .{});
+    defer cache.deinit();
+    var h: Harness = .{};
+    const opts: db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(60) } };
+
+    try testing.expectEqual(@as(?db.Source, .database), (try sourced(&cache, io, h.fake(1), opts)).source);
+    try testing.expectEqual(@as(?db.Source, .cache), (try sourced(&cache, io, h.fake(1), opts)).source);
+    // A plain call records nothing.
+    try testing.expectEqual(@as(?db.Source, null), (try sourced(&cache, io, h.fake(1), .{})).source);
+
+    // Joining an identical call in flight: coalesced.
+    const Join = struct {
+        fn run(cache_: *Cache, io_: std.Io, runner: Fake, source: *?db.Source) void {
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            var c: TestCtx = .{ .io = io_, .arena = arena.allocator() };
+            _ = cache_.read([]Row, &c, .{ .coalesce = true }, "SELECT id FROM t WHERE id = $1", .{9}, runner) catch return;
+            source.* = internal.lastSource(&c);
+        }
+    };
+    var first: ?db.Source = null;
+    var second: ?db.Source = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, Join.run, .{ &cache, io, h.fake(50), &first });
+    try io.sleep(.fromMilliseconds(10), .awake);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, Join.run, .{ &cache, io, h.fake(50), &second });
+    try group.await(io);
+    try testing.expectEqual(@as(?db.Source, .database), first);
+    try testing.expectEqual(@as(?db.Source, .coalesced), second);
+
+    // Off the executors: the plain call, a round trip of its own.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = testing.io, .arena = arena.allocator() };
+    _ = try cache.read([]Row, &c, opts, "SELECT", .{1}, h.fake(0));
+    try testing.expectEqual(@as(?db.Source, .database), db.lastSource(&c));
 }
 
 test "db cache: bounded in bytes, least recently used out first" {

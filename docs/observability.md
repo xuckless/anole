@@ -152,8 +152,8 @@ errors), `access` for `anole.middleware.Logger`, and `anole_h2`,
 subsystems. Each listener logs one line at info as it starts:
 
 ```
-info(anole): listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)
-info(anole): listening on https://0.0.0.0:8443 (HTTP/2, HTTP/1.1, HTTP/3)
+info(anole): listening on http://[::]:8080 (HTTP/1.1, HTTP/2 cleartext; IPv6 and IPv4)
+info(anole): listening on https://[::]:8443 (HTTP/2, HTTP/1.1, HTTP/3; IPv6 and IPv4)
 ```
 
 Nothing is logged per request at `debug`. A Debug build still logs zio's

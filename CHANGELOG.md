@@ -3,6 +3,38 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Server
+
+- Listeners on every interface without a family are dual-stack (#57):
+  `listen(":3000")`, `listenTls(":443", ...)` and `address = ""` in the
+  options bind one socket on `::` with `IPV6_V6ONLY` off, taking IPv6 and
+  IPv4 clients alike, and their HTTP/3 endpoint follows (a QUIC client that
+  resolves `localhost` to `::1` without falling back now connects). So do
+  the per-core `SO_REUSEPORT` sockets, the per-core HTTP/3 sockets and their
+  connection-ID steering, and the sockets a SIGUSR2 restart opens. Where the
+  system has no IPv6 (or on Windows) they bind `0.0.0.0`. An explicit
+  `"0.0.0.0"` stays IPv4 only and `"::"` keeps the system's default.
+  Breaking: `":3000"` meant `0.0.0.0` before.
+- IPv4-mapped client addresses (`::ffff:127.0.0.1`) are reported as plain
+  IPv4 in `req.remote_address`, from the socket, `X-Forwarded-For` and the
+  PROXY protocol alike, so logs and rate-limit keys see one client one way.
+  `anole.http.unmapIpv4` does the same for other addresses.
+- `http.Listener.ipv6_only` and `anole.http.listenIp` set `IPV6_V6ONLY` on
+  a listener of your own; `checkAddressFree` takes it as a second argument.
+
+### Databases
+
+- `.cache = .{ .ttl, .keep_empty = false }` serves an empty result without
+  keeping it (#58): `optional`'s null (a Redis nil) and `all`'s zero rows,
+  so cache-aside sees the value as soon as the store is filled, with no
+  `invalidateQuery` per miss. The default (`true`) keeps them as before.
+- `anole.db.lastSource(req)` says where the last `.cache` or `.coalesce`
+  call made with the request got its answer: `.cache`, `.coalesced` or
+  `.database` (for an `X-Cache: HIT|MISS` header). A `*anole.db.Ctx` keeps
+  it in `last_source`.
+
 ## 0.1.0 (2026-10-21)
 
 The first release: one server core for REST, WebSockets, gRPC and

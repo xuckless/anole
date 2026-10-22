@@ -66,6 +66,30 @@ pub fn lastError(c: anytype) ?ErrorDetail {
     return c.last_error;
 }
 
+/// Where a request keeps its last shared call's source.
+const last_source_key = "anole.db.last_source";
+
+/// Records where a shared call's answer came from, for `lastSource`. A
+/// context without room for it (a test's own) is left alone.
+pub fn keepSource(c: anytype, source: db.Source) void {
+    if (comptime hasLocals(@TypeOf(c))) {
+        // In place after the first: no allocation per call.
+        if (c.locals.getPtr(db.Source, last_source_key)) |p| {
+            p.* = source;
+        } else c.locals.put(c.arena, last_source_key, source) catch {};
+    } else if (comptime @hasField(Pointee(@TypeOf(c)), "last_source")) {
+        c.last_source = source;
+    }
+}
+
+/// `anole.db.lastSource`.
+pub fn lastSource(c: anytype) ?db.Source {
+    comptime checkContext(@TypeOf(c));
+    if (comptime hasLocals(@TypeOf(c))) return c.locals.get(db.Source, last_source_key);
+    if (comptime @hasField(Pointee(@TypeOf(c)), "last_source")) return c.last_source;
+    return null;
+}
+
 fn dupe(detail: ErrorDetail, arena: std.mem.Allocator) !ErrorDetail {
     var out = detail;
     out.code = try arena.dupe(u8, detail.code);

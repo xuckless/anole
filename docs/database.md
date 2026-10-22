@@ -546,7 +546,7 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
 | `db(name).runCommand(req, command)` | any command's reply, as a `bson.Document` |
 | `one(T, req, filter, opts)`, `optional`, `all` | the shared verbs: `findOne`, `findOptional` and `find` under the names the other connectors use |
 | `with(.{ .timeout })` | the same calls with a timeout of their own (`app.db.with(...)`, or on a `db(name)` or a collection) |
-| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
+| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag, .keep_empty } })` | reads shared or kept ([Caching](#caching)) |
 
 There are no transactions yet: each call stands alone, and is retried on
 its own.
@@ -715,7 +715,7 @@ the typed calls, which read it into your type:
 | `acquire(req)` | one connection for several calls, given back with `release()` |
 | `subscribe(req, channels)`, `psubscribe` | a pub/sub connection of its own |
 | `with(.{ .timeout })` | the same calls, bounded |
-| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag } })` | reads shared or kept ([Caching](#caching)) |
+| `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag, .keep_empty } })` | reads shared or kept ([Caching](#caching)) |
 
 The arguments are a tuple: strings as they are (binary-safe), numbers in
 decimal, `bool` as 1 or 0, enums by name, null left out, slices and
@@ -885,7 +885,42 @@ detail in `lastError(req)`.
 executor for `ttl` and copied into the caller's arena on a hit. A miss
 coalesces, so a burst of misses for one key runs the statement once per
 executor. Errors are never kept (`one`'s `NotFound` included); an empty
-result from `optional` or `all` is a result and is kept.
+result is a result and is kept, unless the call sets `.keep_empty = false`.
+
+**Empty results** (`.keep_empty`, true by default): false serves an empty
+result but keeps nothing, so the next call asks the database again. Empty
+means `optional`'s null (a Redis nil from `get` or `hget`, MongoDB's
+`findOne`/`findOptional` with no match) and `all`'s zero rows (MongoDB's
+`find`, `aggregate` and `distinct` with none, an empty Redis list or set).
+`one` and counts are never empty: no row is `error.NotFound`, which is
+never kept. This is what cache-aside wants, where a miss is followed by
+filling the store: with nil kept, the local cache would answer "missing"
+for up to `ttl` after the value exists, or need an `invalidateQuery` on
+every fill.
+
+```zig
+// In-process cache over Redis over PostgreSQL.
+const aside = app.redis.with(.{ .cache = .{ .ttl = .fromSeconds(5), .keep_empty = false } });
+const name = try aside.get(req, key) orelse blk: {
+    const user = try app.db.one(User, req, "SELECT name FROM users WHERE id = $1", .{id});
+    _ = try app.redis.set(req, key, user.name, .{ .ttl = .fromSeconds(60) });
+    break :blk user.name;
+};
+```
+
+**Where an answer came from**: `anole.db.lastSource(req)` says how the
+last call made with `req` through `.cache` or `.coalesce` was answered:
+`.cache` (this executor's result cache, no round trip), `.coalesced`
+(an identical call already in flight, joined) or `.database` (a round trip
+of its own); null when the request made none. Plain calls leave it as it
+was, and a failed call sets it too, as `lastError` holds the failure. It
+lives with the request (a `*anole.db.Ctx` keeps it in `last_source`), like
+`lastError`, so the verbs keep their return types:
+
+```zig
+const top = try app.db.with(.{ .cache = .{ .ttl = .fromSeconds(5) } }).all(Post, req, top_sql, .{});
+try res.header("X-Cache", if (anole.db.lastSource(req) == .cache) "HIT" else "MISS");
+```
 
 **Invalidation**: `app.db.cache.invalidate(.all)`, `.invalidate(.{ .tag =
 "posts" })` for the results cached with that tag, or

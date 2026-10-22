@@ -87,6 +87,10 @@ const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 
 pub const Options = struct {
     /// The UDP address to bind.
     address: std.Io.net.IpAddress,
+    /// IPV6_V6ONLY on an IPv6 `address`: false takes IPv4 clients too on
+    /// the same socket (`::` serving both families), true IPv6 alone,
+    /// null the system's default. Ignored for IPv4 and inherited sockets.
+    ipv6_only: ?bool = null,
     /// PEM: the certificate chain (leaf first) and its key. Read by
     /// `init` only; a reload passes its own (`Endpoint.loadTls`).
     cert_pem: []const u8,
@@ -401,7 +405,9 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // Several sockets share the port: none but ours may be on it
             // already. An inherited group is ours.
-            if (inherited.len == 0 and count > 1) try net.checkUdpAddressFree(options.address);
+            if (inherited.len == 0 and count > 1) try net.checkUdpAddressFree(options.address, options.ipv6_only);
+            // Only an IPv6 socket takes IPV6_V6ONLY (zio refuses it on IPv4).
+            const ipv6_only: ?bool = if (options.address == .ip6) options.ipv6_only else null;
             var made: usize = 0;
             errdefer for (shared.endpoints[0..made]) |ep| ep.deinitOne();
             var bind_to = options.address;
@@ -409,9 +415,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const socket = if (inherited.len > 0)
                     try adoptSocket(io, inherited[i], options.address)
                 else if (count == 1)
-                    try bind_to.bind(io, .{ .mode = .dgram, .protocol = .udp })
+                    try bind_to.bind(io, .{ .mode = .dgram, .protocol = .udp, .ip6_only = ipv6_only })
                 else
-                    try bindMember(io, bind_to);
+                    try bindMember(io, bind_to, ipv6_only);
                 shared.endpoints[i] = initOne(gpa, io, http, options, socket, @intCast(i), shared, secret) catch |err| {
                     socket.close(io);
                     return err;
@@ -430,8 +436,8 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         /// One more socket of the group, SO_REUSEPORT, as zio wants it.
-        fn bindMember(io: std.Io, at: std.Io.net.IpAddress) !std.Io.net.Socket {
-            const fd = try net.bindReusePort(at);
+        fn bindMember(io: std.Io, at: std.Io.net.IpAddress, ipv6_only: ?bool) !std.Io.net.Socket {
+            const fd = try net.bindReusePort(at, ipv6_only);
             return adoptSocket(io, fd, at) catch |err| {
                 _ = std.c.close(fd);
                 return err;
