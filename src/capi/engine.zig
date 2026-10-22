@@ -210,7 +210,7 @@ pub const Slot = struct {
     borrowed_sent: ?[]align(8) u8 = null,
     /// `anole_req_fail`: the detail text is in `bytes` after the headers.
     fail_len: u32 = 0,
-    /// A file to send (`anole_respond_fd`; POSIX only).
+    /// A file to send (`anole_req_respond_fd`; POSIX only).
     fd: c_int = -1,
     fd_offset: u64 = 0,
     fd_len: u64 = 0,

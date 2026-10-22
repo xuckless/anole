@@ -43,7 +43,7 @@ pub const Config = struct {
         /// "127.0.0.1" (this machine), "" (every interface, IPv6 and IPv4),
         /// "0.0.0.0", "::".
         address: []const u8 = "127.0.0.1",
-        /// 0 picks a free port (`anole_server_port`).
+        /// 0 picks a free port (`anole_server_listener`).
         port: u16 = 8080,
         /// A unix domain socket at this path instead of address and port.
         unix: ?[]const u8 = null,
@@ -62,7 +62,7 @@ pub const Config = struct {
     };
 
     pub const Tls = struct {
-        /// PEM files, read at start (and by anole_server_reload_certificates).
+        /// PEM files, read at start (and by anole_server_reload_tls with both arguments empty).
         cert_file: ?[]const u8 = null,
         key_file: ?[]const u8 = null,
         /// Or PEM text.

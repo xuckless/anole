@@ -99,7 +99,7 @@ const Answerer = struct {
                 _ = try engine.streamWrite(e, h, big[0..1000], true);
                 try engine.streamEnd(e, h, &.{.{ .name = .of("x-t"), .value = .of("done") }});
             },
-            // anole_respond_fd is not on Windows (std.c.open does not exist there).
+            // anole_req_respond_fd is not on Windows (std.c.open does not exist there).
             4 => if (comptime builtin.os.tag == .windows) {
                 try engine.respond(e, h, 200, text, "world", false);
             } else {

@@ -36,7 +36,7 @@
       "minimum": 0,
       "maximum": 255,
       "default": 0,
-      "description": "Proxies in front whose X-Forwarded-For (and PROXY protocol) Anole trusts for the client's address."
+      "description": "Proxies in front whose X-Forwarded-For Anole trusts for the client's address (PROXY protocol is per listener)."
     },
     "trust_forwarded_proto": {
       "type": "boolean",
@@ -102,7 +102,7 @@
           "minimum": 0,
           "maximum": 65535,
           "default": 8080,
-          "description": "0 picks a free port (anole_server_port)."
+          "description": "0 picks a free port (anole_server_listener)."
         },
         "unix": {
           "anyOf": [
@@ -137,7 +137,7 @@
         "http3": {
           "type": "boolean",
           "default": false,
-          "description": "HTTP/3 over UDP on a TLS listener (one per server); its port follows the listeners' in anole_server_port."
+          "description": "HTTP/3 over UDP on a TLS listener (one per server); its port follows the listeners' in anole_server_listener (udp_port)."
         },
         "proxy_protocol": {
           "type": "boolean",
@@ -162,7 +162,7 @@
           "anyOf": [
             {
               "type": "string",
-              "description": "PEM file, read at start and by anole_server_reload_certificates."
+              "description": "PEM file, read at start and by anole_server_reload_tls with both arguments empty."
             },
             {
               "type": "null"
@@ -290,7 +290,7 @@
           "minimum": 0,
           "maximum": 4294967295,
           "default": 262144,
-          "description": "Bytes waiting in a streamed response before anole_stream_write answers ANOLE_BUSY."
+          "description": "Bytes waiting in a streamed response before anole_req_stream_write answers ANOLE_BUSY."
         },
         "ws_high_water": {
           "type": "integer",

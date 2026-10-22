@@ -28,6 +28,7 @@ fn expectSameLayout(comptime Zig: type, comptime C: type) !void {
 }
 
 test "anole.h: every struct as abi.zig lays it out" {
+    @setEvalBranchQuota(1_000_000);
     inline for (abi.records) |r| {
         expectSameLayout(r[1], @field(c, r[0])) catch |err| {
             std.debug.print("record {s}\n", .{r[0]});
@@ -37,6 +38,7 @@ test "anole.h: every struct as abi.zig lays it out" {
 }
 
 test "anole.h: every struct the header declares is in abi.records" {
+    @setEvalBranchQuota(1_000_000);
     const decls = @typeInfo(c).@"struct".decl_names;
     inline for (decls) |name| {
         if (comptime std.mem.startsWith(u8, name, "anole_")) {
@@ -103,6 +105,7 @@ fn upperOf(comptime s: []const u8) []const u8 {
 }
 
 test "abi.zig: the allocation table holds" {
+    @setEvalBranchQuota(1_000_000);
     // Every EventType has exactly one entry, named after it.
     const info = @typeInfo(abi.EventType).@"enum";
     inline for (info.field_names, info.field_values) |n, v| {
@@ -157,6 +160,7 @@ test "anole.schema.json: x-anole-abi is the ABI version, $id names this release"
 }
 
 test "docs/c-abi.md names every event type and every anole_* function" {
+    @setEvalBranchQuota(1_000_000);
     for (abi.events) |ev| {
         if (std.mem.indexOf(u8, guide_text, ev.name) == null) {
             std.debug.print("docs/c-abi.md does not mention {s}\n", .{ev.name});

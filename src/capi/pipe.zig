@@ -1,7 +1,7 @@
 //! A body between an executor and a consumer thread, one per direction of
 //! a slot: the request body the executor reads from the client and the
 //! consumer takes with `anole_req_read`, or a streamed response the
-//! consumer writes with `anole_stream_write` and the executor sends.
+//! consumer writes with `anole_req_stream_write` and the executor sends.
 //!
 //! Embedded in its slot and never freed while the engine lives, so a stale
 //! handle can always take the lock and find the pipe serves another
@@ -42,10 +42,10 @@ pub const Pipe = struct {
     head: usize = 0,
     /// Bytes waiting.
     bytes: usize = 0,
-    /// The producer has finished (the body ended, `anole_stream_end`).
+    /// The producer has finished (the body ended, `anole_req_stream_end`).
     ended: bool = false,
     /// The pipe broke: the request body failed (`body_error`), or the
-    /// response stream was given up (`anole_release`).
+    /// response stream was given up (`anole_req_fail`, `anole_req_abort`).
     failed: bool = false,
     /// The consumer was told "nothing now" (`ANOLE_E_AGAIN`) or "full"
     /// (`ANOLE_BUSY`) and waits for an event.

@@ -97,6 +97,11 @@ static atomic_int stop_consumer;
 static atomic_int failures;
 static atomic_ullong held;       /* a call left unanswered ("hold") */
 static atomic_ullong last_abort; /* the handle of the last ANOLE_EV_ABORT */
+static atomic_int last_abort_reason, last_abort_status;
+static atomic_int sent_events;   /* ANOLE_EV_SENT seen */
+static atomic_ullong sent_data;  /* the address and length of the last one */
+static atomic_ullong sent_len;
+static const char borrowed_answer[] = "a borrowed answer";
 static atomic_int writables, busies;
 static atomic_llong held_timeout_us = -2;
 static call_state calls[64];
@@ -156,6 +161,9 @@ static void on_call(const anole_grpc_call_event *ev) {
   anole_str method = anole_event_str(ev, ev->method);
   anole_str msg = anole_event_str(ev, ev->message);
   CHECK(ev->route_id == 1);
+  /* The metadata spans start where metadata_off says (and today that is
+     right after the fixed part). */
+  CHECK(ev->metadata_off == sizeof *ev && ev->ev.len >= ev->metadata_off);
   /* gRPC-Web over HTTP/1.1, but the cancel test's gRPC over HTTP/2. */
   CHECK(ev->version == 11 || ev->version == 20);
   CHECK(ev->protocol == (ev->version == 20 ? ANOLE_GRPC_PROTOCOL_GRPC : ANOLE_GRPC_PROTOCOL_GRPC_WEB));
@@ -169,6 +177,19 @@ static void on_call(const anole_grpc_call_event *ev) {
       if (is(msg, "fail")) {
         anole_header t[2] = {{S("x-why"), S("test")}, {S("x-raw-bin"), {"\x00\x01\xff", 3}}};
         CHECK(anole_grpc_finish(c, ANOLE_GRPC_STATUS_NOT_FOUND, S("no such thing"), t, 2) == ANOLE_OK);
+        return;
+      }
+      if (is(msg, "release-me")) {
+        /* The generic cleanup: UNKNOWN to the client; a second one is OK. */
+        CHECK(anole_handle_release(c) == ANOLE_OK);
+        CHECK(anole_handle_release(c) == ANOLE_OK);
+        CHECK(anole_grpc_send(c, "late", 4, 0) == ANOLE_E_GONE);
+        return;
+      }
+      if (is(msg, "borrow-me") || is(msg, "borrow-empty")) {
+        /* A borrowed answer: one ANOLE_EV_SENT for it, empty ones too. */
+        size_t n = is(msg, "borrow-me") ? sizeof borrowed_answer - 1 : 0;
+        CHECK(anole_grpc_send(c, borrowed_answer, n, ANOLE_BODY_BORROW | ANOLE_GRPC_F_FINISH) == ANOLE_OK);
         return;
       }
       if (is(msg, "hold")) {
@@ -310,10 +331,22 @@ static void *consumer_main(void *arg) {
           if (st && st->busy) pump_busy(st);
           break;
         }
-        case ANOLE_EV_ABORT:
+        case ANOLE_EV_ABORT: {
+          const anole_abort_event *ab = (const anole_abort_event *)ev;
+          CHECK(ab->ev.len == sizeof *ab);
           drop(ev->handle);
+          atomic_store(&last_abort_reason, ab->reason);
+          atomic_store(&last_abort_status, ab->status);
           atomic_store(&last_abort, ev->handle);
           break;
+        }
+        case ANOLE_EV_SENT: {
+          const anole_sent_event *se = (const anole_sent_event *)ev;
+          atomic_store(&sent_data, se->data);
+          atomic_store(&sent_len, se->len);
+          atomic_fetch_add(&sent_events, 1);
+          break;
+        }
         default:
           break;
       }
@@ -646,6 +679,7 @@ int main(void) {
     long long us = atomic_load(&held_timeout_us);
     CHECK(us > 0 && us <= 200000);
     wait_for(&last_abort, h);
+    CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_DEADLINE && atomic_load(&last_abort_status) == ANOLE_GRPC_STATUS_DEADLINE_EXCEEDED);
     CHECK(anole_grpc_send(h, "late", 4, ANOLE_GRPC_F_FINISH) == ANOLE_E_GONE);
     printf("ok deadline\n");
   }
@@ -660,9 +694,35 @@ int main(void) {
     CHECK(atomic_load(&held_timeout_us) == -1);
     h2_frame(fd, 3, 0, 1, "\x00\x00\x00\x08", 4); /* RST_STREAM, CANCEL */
     wait_for(&last_abort, h);
+    CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_CLIENT && atomic_load(&last_abort_status) == 0);
     CHECK(anole_grpc_finish(h, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_E_GONE);
     close(fd);
     printf("ok cancel\n");
+  }
+  /* anole_handle_release on a call: UNKNOWN, "Application error processing RPC". */
+  {
+    const char *m[] = {"release-me"};
+    call("Unary", m, 1, NULL, r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:2"));
+    printf("ok handle_release on a call\n");
+  }
+  /* Borrowed answers: exactly one SENT each, an empty one too. */
+  {
+    int n0 = atomic_load(&sent_events);
+    const char *m[] = {"borrow-me"};
+    call("Unary", m, 1, NULL, r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
+    for (int i = 0; i < 500 && atomic_load(&sent_events) < n0 + 1; i++) sleep_ms(2);
+    CHECK(atomic_load(&sent_events) == n0 + 1);
+    CHECK(atomic_load(&sent_data) == (unsigned long long)(uintptr_t)borrowed_answer && atomic_load(&sent_len) == sizeof borrowed_answer - 1);
+    const char *e[] = {"borrow-empty"};
+    call("Unary", e, 1, NULL, r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
+    for (int i = 0; i < 500 && atomic_load(&sent_events) < n0 + 2; i++) sleep_ms(2);
+    CHECK(atomic_load(&sent_events) == n0 + 2 && atomic_load(&sent_len) == 0);
+    sleep_ms(100);
+    CHECK(atomic_load(&sent_events) == n0 + 2);
+    printf("ok borrowed messages: one SENT each\n");
   }
   /* JSON needs descriptors: none here, so 415. */
   {

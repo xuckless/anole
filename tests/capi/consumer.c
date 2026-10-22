@@ -424,6 +424,13 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
     break;
   }
   case R_USER: {
+    /* The record's layout: the arrays are reached through spans_off, the
+       certificate is empty, the deadline is counting down. */
+    CHECK(r->spans_off == sizeof *r && r->ev.len >= r->spans_off);
+    CHECK(r->nparams == 1 && r->nheaders >= 3);
+    CHECK(r->peer_cert.len == 0 && !(r->flags & ANOLE_REQ_PEER_CERT));
+    CHECK(r->timeout_us > 0 && r->timeout_us <= 400 * 1000);
+    CHECK(r->subprotocol.len == 0);
     anole_str id = param_of(r, "id");
     anole_str xt = header_of(r, "x-test");
     char out[256];
@@ -2592,12 +2599,13 @@ static void test_cleanup_rules(void) {
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 200);
   usleep(50 * 1000);
-  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_E_GONE && name_is("Gone"));
   uint64_t gone = gone_count(s);
+  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(anole_handle_release(h) == ANOLE_OK);
   CHECK(anole_handle_release(h) == ANOLE_OK);
   CHECK(anole_req_abort(h) == ANOLE_OK);
-  CHECK(name_is("Gone"));
+  CHECK(name_is("Gone")); /* cleanup calls left the last error alone */
+  gone += 1;             /* the failed answer counted; the cleanup calls did not */
   CHECK(gone_count(s) == gone);
 
   /* wrong kind and 0 are misuse, never GONE or OK */
