@@ -49,7 +49,7 @@ pub fn isLoopback(ip: std.Io.net.IpAddress) bool {
         .ip4 => |a| return a.bytes[0] == 127,
         .ip6 => |a| {
             const b = a.bytes;
-            const zeros = [_]u8{0} ** 15;
+            const zeros: [15]u8 = @splat(0);
             if (std.mem.eql(u8, b[0..15], &zeros) and b[15] == 1) return true;
             const mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
             return std.mem.eql(u8, b[0..12], &mapped) and b[12] == 127;

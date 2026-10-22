@@ -55,14 +55,15 @@ pub const TlsLoadError = error{
     KeyMismatch,
     SystemResources,
     OutOfMemory,
+    Canceled,
     Unexpected,
 };
 
 /// The names of `ServerError`'s members, for documentation and tests.
 pub const server_error_names: []const []const u8 = blk: {
-    const members = @typeInfo(ServerError).error_set.?;
+    const members = @typeInfo(ServerError).error_set.error_names.?;
     var names: [members.len][]const u8 = undefined;
-    for (members, 0..) |m, i| names[i] = m.name;
+    for (members, 0..) |m, i| names[i] = m;
     const final = names;
     break :blk &final;
 };
@@ -83,10 +84,10 @@ const aliases = [_][2][]const u8{
 
 fn toSet(comptime Set: type, err: anyerror) Set {
     const name = @errorName(err);
-    const members = @typeInfo(Set).error_set.?;
-    inline for (members) |m| if (std.mem.eql(u8, name, m.name)) return @field(Set, m.name);
+    const members = @typeInfo(Set).error_set.error_names.?;
+    inline for (members) |m| if (std.mem.eql(u8, name, m)) return @field(Set, m);
     inline for (aliases) |alias| if (std.mem.eql(u8, name, alias[0])) {
-        inline for (members) |m| if (comptime std.mem.eql(u8, alias[1], m.name)) return @field(Set, m.name);
+        inline for (members) |m| if (comptime std.mem.eql(u8, alias[1], m)) return @field(Set, m);
     };
     // (A test that maps an unknown name on purpose must not fail on the log.)
     if (!@import("builtin").is_test) std.log.scoped(.anole).err("unexpected error while starting: {s}", .{name});
@@ -122,25 +123,25 @@ pub fn posixErrno(name: anyerror) i32 {
 }
 
 test "errors: TlsLoadError is a subset of ServerError" {
-    inline for (@typeInfo(TlsLoadError).error_set.?) |m| {
+    inline for (@typeInfo(TlsLoadError).error_set.error_names.?) |m| {
         comptime var found = false;
-        inline for (@typeInfo(ServerError).error_set.?) |s| {
-            if (comptime std.mem.eql(u8, m.name, s.name)) found = true;
+        inline for (@typeInfo(ServerError).error_set.error_names.?) |s| {
+            if (comptime std.mem.eql(u8, m, s)) found = true;
         }
-        if (!found) @compileError("TlsLoadError." ++ m.name ++ " is not in ServerError");
+        if (!found) @compileError("TlsLoadError." ++ m ++ " is not in ServerError");
     }
 }
 
 test "errors: every member maps to itself; unknown names become Unexpected" {
-    inline for (@typeInfo(ServerError).error_set.?) |m| {
-        try std.testing.expectEqual(@field(ServerError, m.name), toServerError(@field(anyerror, m.name)));
+    inline for (@typeInfo(ServerError).error_set.error_names.?) |m| {
+        try std.testing.expectEqual(@field(ServerError, m), toServerError(@field(anyerror, m)));
     }
     try std.testing.expectEqual(error.AddressNotAvailable, toServerError(error.AddressUnavailable));
     try std.testing.expectEqual(error.KeyMismatch, toServerError(error.TlsKeyMismatch));
     try std.testing.expectEqual(error.Unexpected, toServerError(error.SomethingElseEntirely));
     try std.testing.expectEqual(error.InvalidKey, toTlsLoadError(error.TlsInvalidPrivateKey));
     try std.testing.expectEqual(error.Unexpected, toTlsLoadError(error.AddressInUse));
-    try std.testing.expectEqual(@as(usize, @typeInfo(ServerError).error_set.?.len), server_error_names.len);
+    try std.testing.expectEqual(@as(usize, @typeInfo(ServerError).error_set.error_names.?.len), server_error_names.len);
     try std.testing.expectEqual(@as(i32, @intFromEnum(std.posix.E.ADDRINUSE)), posixErrno(error.AddressInUse));
     try std.testing.expectEqual(@as(i32, 0), posixErrno(error.KeyMismatch));
 }

@@ -690,7 +690,7 @@ test "clientAddress: IPv6 clients share their /64, IPv4 clients are one address 
 test "MemoryLimiter: new keys never push out a throttled bucket" {
     var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .max_entries = 4 });
     defer l.deinit();
-    const policy: Policy = .{ .limit = 2, .window = .fromMilliseconds(3_600)_000 };
+    const policy: Policy = .{ .limit = 2, .window = .fromMilliseconds(3_600_000) };
     _ = try l.takeAt("attacker", 1, policy, 0);
     _ = try l.takeAt("attacker", 1, policy, 0);
     try std.testing.expect(!(try l.takeAt("attacker", 1, policy, 0)).allowed);
@@ -708,7 +708,7 @@ test "MemoryLimiter: an idle bucket is forgotten only once it is full again" {
     var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{ .idle = .fromMilliseconds(1000) });
     defer l.deinit();
     // One an hour: idle for longer than `idle`, still empty.
-    const policy: Policy = .{ .limit = 1, .window = .fromMilliseconds(3_600)_000 };
+    const policy: Policy = .{ .limit = 1, .window = .fromMilliseconds(3_600_000) };
     try std.testing.expect((try l.takeAt("a", 1, policy, 0)).allowed);
     _ = try l.takeAt("b", 1, policy, 10_000);
     try std.testing.expect(!(try l.takeAt("a", 1, policy, 10_000)).allowed);

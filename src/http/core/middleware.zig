@@ -451,7 +451,7 @@ test "Middleware: single middleware executes before handler" {
         .middlewares = &middlewares,
     };
 
-    try next.call();
+    try chain.call();
 
     try std.testing.expectEqual(1, tracker.len);
     try std.testing.expectEqual(1, tracker.items()[0]);
@@ -484,7 +484,7 @@ test "Middleware: multiple middlewares execute in order" {
         .middlewares = &middlewares,
     };
 
-    try next.call();
+    try chain.call();
 
     try std.testing.expectEqual(3, tracker.len);
     try std.testing.expectEqual(1, tracker.items()[0]);
@@ -519,7 +519,7 @@ test "Middleware: short-circuit prevents handler execution" {
         .middlewares = &middlewares,
     };
 
-    try next.call();
+    try chain.call();
 
     // mw1 runs, mw2 short-circuits, mw3 and handler don't run
     try std.testing.expectEqual(2, tracker.len);
@@ -542,7 +542,7 @@ test "Middleware: no middlewares calls handler directly" {
         .middlewares = &.{},
     };
 
-    try next.call();
+    try chain.call();
 
     try std.testing.expectEqualStrings("handler called", res.body);
 }
@@ -590,7 +590,7 @@ test "Middleware: no action returns 404" {
         .middlewares = &middlewares,
     };
 
-    try next.call();
+    try chain.call();
 
     try std.testing.expectEqual(1, tracker.len);
     try std.testing.expectEqual(.not_found, res.status);

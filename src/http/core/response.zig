@@ -1218,7 +1218,7 @@ pub const Response = struct {
     /// cannot become another.
     pub fn fail(self: *Response, status: http.Status, message: []const u8) void {
         if (self.headers_written) return;
-        self.resetBody();
+        self.resetBody() catch return;
         self.status = status;
         if (self.answersJson()) {
             const text = if (message.len > 0) message else status.phrase();
@@ -1348,7 +1348,7 @@ pub const Response = struct {
 
     /// Formats the body, sent as `content_type`, or as whatever the
     /// response already has when it is null.
-    pub fn print(self: *Response, content_type: ?http.ContentType, comptime fmt: []const u8, args: anytype) BodyWriter.Error!void {
+    pub fn print(self: *Response, content_type: ?http.ContentType, comptime fmt: []const u8, args: anytype) (BodyWriter.Error || http.MisuseError)!void {
         var w = try self.writer();
         w.interface.print(fmt, args) catch {
             w.end() catch |err| {

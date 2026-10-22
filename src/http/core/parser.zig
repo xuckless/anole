@@ -641,7 +641,7 @@ pub fn BodyReader(comptime Parser: type) type {
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
             ParseError || @typeInfo(@TypeOf(decodeCause(undefined))).error_union.error_set ||
-            error{ IncompleteBody, InvalidZstd, MalformedBody, BodyTooBig, Unexpected };
+            error{ IncompleteBody, InvalidZstd, MalformedBody, BodyTooBig, WriteTimeout, Unexpected };
 
         /// Stores what actually went wrong and reports the sentinel the
         /// vtable requires. Mirrors `fail` on the buffered body writer.
