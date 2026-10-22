@@ -850,10 +850,34 @@ pub fn build(b: *std.Build) void {
             capi_step.dependOn(&check.step);
         };
 
+        // include/anole.abi.json, generated from src/capi/abi.zig: installed
+        // beside the header, regenerated with `zig build capi-abi-json`, and
+        // checked fresh by capi-test.
+        const abi_mod = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = b.graph.host, .optimize = .Debug });
+        const abi_json = b.addExecutable(.{
+            .name = "capi_abi_json",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/capi_abi_json.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+                .imports = &.{.{ .name = "capi_abi", .module = abi_mod }},
+            }),
+        });
+        const abi_json_gen = b.addRunArtifact(abi_json);
+        const abi_json_out = abi_json_gen.addOutputFileArg("anole.abi.json");
+        capi_step.dependOn(&b.addInstallHeaderFile(abi_json_out, "anole.abi.json").step);
+        const abi_json_update = b.addUpdateSourceFiles();
+        abi_json_update.addCopyFileToSource(abi_json_out, "include/anole.abi.json");
+        b.step("capi-abi-json", "Regenerate include/anole.abi.json from src/capi/abi.zig").dependOn(&abi_json_update.step);
+        const abi_json_check = b.addRunArtifact(abi_json);
+        abi_json_check.addArg("--check");
+        abi_json_check.addFileArg(b.path("include/anole.abi.json"));
+
         // capi-test (also part of `test`): anole.h's layout against
         // src/capi/abi.zig (the header through translate-c), the symbol
         // check, and the C suite (tests/capi/consumer.c) on libanole.a.
         const capi_test_step = b.step("capi-test", "Test the C ABI: anole.h layout, exported symbols, the C suite");
+        capi_test_step.dependOn(&abi_json_check.step);
         if (b.lazyImport(@This(), "translate_c")) |tc| if (b.lazyDependency("translate_c", .{})) |tc_dep| {
             const header: tc.Translator = .init(tc_dep, .{
                 .name = "anole_h",
@@ -861,6 +885,15 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
+            // What the tests compare the header with: the schema, the guide
+            // and the release's version, as text.
+            const embed = b.addWriteFiles();
+            _ = embed.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
+            _ = embed.addCopyFile(b.path("docs/c-abi.md"), "c-abi.md");
+            const schema_mod = b.createModule(.{ .root_source_file = embed.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
+            const guide_mod = b.createModule(.{ .root_source_file = embed.add("guide.zig", "pub const text = @embedFile(\"c-abi.md\");\n") });
+            const version_mod = b.createModule(.{ .root_source_file = embed.add("version.zig", b.fmt("pub const text = \"{s}\";\n", .{@import("build.zig.zon").version})) });
+            const abi_for_test = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize });
             const abi_test = b.addTest(.{
                 .name = "capi-abi-test",
                 .root_module = b.createModule(.{
@@ -868,8 +901,17 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                     .imports = &.{
-                        .{ .name = "capi_abi", .module = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize }) },
+                        .{ .name = "capi_abi", .module = abi_for_test },
+                        .{ .name = "capi_abi_json", .module = b.createModule(.{
+                            .root_source_file = b.path("tools/capi_abi_json.zig"),
+                            .target = target,
+                            .optimize = optimize,
+                            .imports = &.{.{ .name = "capi_abi", .module = abi_for_test }},
+                        }) },
                         .{ .name = "anole_h", .module = header.mod },
+                        .{ .name = "anole_schema", .module = schema_mod },
+                        .{ .name = "anole_guide", .module = guide_mod },
+                        .{ .name = "anole_version", .module = version_mod },
                     },
                 }),
             });
