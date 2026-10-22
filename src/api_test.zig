@@ -226,28 +226,28 @@ test "middleware: every built-in takes init(.{})" {
 test "api: Request and Response expose no engine fields without _" {
     const Allowed = struct {
         const request_fields = [_][]const u8{
-            "method",         "url",         "version_major", "version_minor", "headers", "content_type",
-            "content_encoding", "content_length", "route",       "params",        "query",   "remote_address",
-            "listener",       "secure",      "protocol",      "forwarded_host", "peer_certificate", "id",
-            "trace_id",       "span_id",     "drain",         "arena",         "io",      "session",
+            "method",           "url",            "version_major", "version_minor",  "headers",          "content_type",
+            "content_encoding", "content_length", "route",         "params",         "query",            "remote_address",
+            "listener",         "secure",         "protocol",      "forwarded_host", "peer_certificate", "id",
+            "trace_id",         "span_id",        "drain",         "arena",          "io",               "session",
             "locals",
         };
         const request_decls = [_][]const u8{
-            "host",    "peerCertificate", "setTimeout", "setDeadline", "reader",    "readerLimited", "body",
-            "param",   "queryParam",      "bind",       "bindWith",    "json",      "jsonValue",     "jsonObject",
-            "setLocal", "local",          "cookies",    "formData",    "multiFormData", "urlUnescape",
+            "host",     "peerCertificate", "setTimeout", "setDeadline", "reader",        "readerLimited", "body",
+            "param",    "queryParam",      "bind",       "bindWith",    "json",          "jsonValue",     "jsonObject",
+            "setLocal", "local",           "cookies",    "formData",    "multiFormData", "urlUnescape",
         };
         const response_fields = [_][]const u8{
-            "status",      "body",      "headers",      "content_type", "arena",   "body_buffer", "io",
-            "trailers",    "keepalive", "head",         "http10",       "content_length", "body_sent", "compress",
-            "brotli_encoder", "file",   "detached",
+            "status",         "body",      "headers",  "content_type", "arena",          "body_buffer", "io",
+            "trailers",       "keepalive", "head",     "http10",       "content_length", "body_sent",   "compress",
+            "brotli_encoder", "file",      "detached",
         };
         const response_decls = [_][]const u8{
-            "BodyFile",   "HeaderError", "SendError",   "WriteError",   "trailer",   "abort",   "headersSent",
-            "peerGone",   "deinit",      "SendFileOptions", "SendFileError", "sendFile", "header", "addHeader",
-            "writer",     "stream",      "clearWriter", "resetBody",    "json",      "jsonWith", "fail",
-            "render",     "encode",      "print",       "setCookie",    "startEventStream", "canDetach", "isDetached",
-            "detach",     "onFinish",    "adopt",       "write",        "memoryBodyLen", "copyBody",
+            "BodyFile", "HeaderError", "SendError",       "WriteError",    "trailer",          "abort",     "headersSent",
+            "peerGone", "deinit",      "SendFileOptions", "SendFileError", "sendFile",         "header",    "addHeader",
+            "writer",   "stream",      "clearWriter",     "resetBody",     "json",             "jsonWith",  "fail",
+            "render",   "encode",      "print",           "setCookie",     "startEventStream", "canDetach", "isDetached",
+            "detach",   "onFinish",    "adopt",           "write",         "memoryBodyLen",    "copyBody",
         };
         fn listed(comptime list: []const []const u8, name: []const u8) bool {
             for (list) |n| if (std.mem.eql(u8, n, name)) return true;

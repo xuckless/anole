@@ -1366,7 +1366,7 @@ const TableJob = struct {
 /// numbers and bools converted, bytea as bytes, the rest as text.
 fn textValue(a: std.mem.Allocator, oid: i32, data: []const u8) error{OutOfMemory}!db.Value {
     switch (oid) {
-        Oid.@"bool" => return .{ .bool = std.mem.eql(u8, data, "t") },
+        Oid.bool => return .{ .bool = std.mem.eql(u8, data, "t") },
         Oid.int2, Oid.int4, Oid.int8, Oid.oid_, Oid.xid => if (std.fmt.parseInt(i64, data, 10)) |n| return .{ .int = n } else |_| {},
         Oid.float4, Oid.float8 => if (std.fmt.parseFloat(f64, data)) |f| return .{ .float = f } else |_| {},
         Oid.bytea => if (std.mem.startsWith(u8, data, "\\x") and data.len % 2 == 0) {

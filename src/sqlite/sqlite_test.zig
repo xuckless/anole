@@ -161,10 +161,10 @@ test "sqlite: table and run, with values known only at run time; cached on a pin
         try testing.expectEqual(@as(u64, 1), ins.changes);
         try testing.expectEqual(@as(i64, 1), ins.last_insert_rowid);
         _ = try q.run(ctx, "INSERT INTO kv VALUES (?, ?), (?, ?), (?, ?), (?, ?)", &.{
-            .{ .text = "f" },    .{ .float = 1.5 },
-            .{ .text = "b" },    .{ .blob = "\x00\x01" },
-            .{ .text = "n" },    .null,
-            .{ .text = "i" },    .{ .int = -7 },
+            .{ .text = "f" }, .{ .float = 1.5 },
+            .{ .text = "b" }, .{ .blob = "\x00\x01" },
+            .{ .text = "n" }, .null,
+            .{ .text = "i" }, .{ .int = -7 },
         });
         const t = try q.table(ctx, "SELECT k AS key, v FROM kv ORDER BY rowid", &.{});
         try testing.expectEqual(@as(usize, 2), t.columns.len);

@@ -118,7 +118,7 @@ pub fn posixErrno(name: anyerror) i32 {
         .{ "OutOfMemory", E.NOMEM },
         .{ "SystemResources", E.MFILE },
     };
-    inline for (pairs) |p| if (std.mem.eql(u8, n, p[0])) return @intFromEnum(p[1]);
+    inline for (pairs) |p| if (std.mem.eql(u8, n, p[0])) return @backingInt(p[1]);
     return 0;
 }
 
@@ -142,6 +142,6 @@ test "errors: every member maps to itself; unknown names become Unexpected" {
     try std.testing.expectEqual(error.InvalidKey, toTlsLoadError(error.TlsInvalidPrivateKey));
     try std.testing.expectEqual(error.Unexpected, toTlsLoadError(error.AddressInUse));
     try std.testing.expectEqual(@as(usize, @typeInfo(ServerError).error_set.error_names.?.len), server_error_names.len);
-    try std.testing.expectEqual(@as(i32, @intFromEnum(std.posix.E.ADDRINUSE)), posixErrno(error.AddressInUse));
+    try std.testing.expectEqual(@as(i32, @backingInt(std.posix.E.ADDRINUSE)), posixErrno(error.AddressInUse));
     try std.testing.expectEqual(@as(i32, 0), posixErrno(error.KeyMismatch));
 }
