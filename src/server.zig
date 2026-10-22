@@ -33,6 +33,7 @@ const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
+const errors = @import("errors.zig");
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
@@ -535,6 +536,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     comptime checkZioOptions();
     return struct {
         const Self = @This();
+        const Cert = Options.Cert;
         /// A handler as the router stores it: `fn (*Request, *Response)
         /// anyerror!void`, with `*Ctx` first on a server with state.
         pub const Handler = http.Router(Ctx).Handler;
@@ -761,11 +763,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// or `run` (127.0.0.1:8080).
         pub const init = if (app_init) initApp else initState;
 
-        fn initApp(gpa: std.mem.Allocator, opts: Options) !Self {
+        fn initApp(gpa: std.mem.Allocator, opts: Options) errors.ServerError!Self {
             return initState(gpa, opts, {});
         }
 
-        fn initState(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) !Self {
+        fn initState(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) errors.ServerError!Self {
+            return initStateInner(gpa, opts, ctx) catch |err| errors.toServerError(err);
+        }
+
+        fn initStateInner(gpa: std.mem.Allocator, opts: Options, ctx: if (Ctx == void) void else *Ctx) !Self {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
@@ -1035,6 +1041,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 var config: ?http.ServerConfig.Tls = null;
                 if (l.tls) |t| {
                     if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
+                    if (t.cert == .dev_self_signed) switch (address) {
+                        .ip => |ip| if (!address_mod.isLoopback(ip)) std.log.scoped(.anole).warn(
+                            "listener \"{s}\" serves a development certificate (dev_self_signed) on {f}: browsers will warn and clients cannot verify it. Use Cert.fromFiles(...) outside development.",
+                            .{ spec.name, ip },
+                        ),
+                        .unix => {},
+                    };
                     const cs = for (certs.items) |cs| {
                         if (CertState.sameSource(cs.source, t.cert)) break cs;
                     } else blk: {
@@ -1273,12 +1286,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// clients that open with its preface (h2c). For a server whose
         /// `init` options named neither `http` nor `https`; it serves the
         /// options' `listeners` too.
-        pub fn listen(self: *Self, address: []const u8) !void {
+        pub fn listen(self: *Self, address: []const u8) errors.ServerError!void {
+            return self.listenInner(address) catch |err| self.failWith(err);
+        }
+
+        fn listenInner(self: *Self, address: []const u8) !void {
             var opts = try self.takePending("listen");
-            const at = address_mod.parse(address) catch |err| return self.failStart(err);
+            const at = address_mod.parse(address) catch |err| {
+                std.log.scoped(.anole).err("listen(\"{s}\"): not an address to listen on; use a port (\"3000\", every interface), \":3000\", or \"127.0.0.1:3000\" (this machine only)", .{address});
+                return err;
+            };
             opts.http = .{ .address = at.host, .port = at.port };
             try self.configure(opts);
-            return self.run();
+            return self.runInner();
         }
 
         /// `listen`, over TLS with `cert`: HTTP/2 and HTTP/1.1 by ALPN, and
@@ -1288,20 +1308,27 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///
         ///     try app.listenTls(":443", .fromFiles("cert.pem", "key.pem"));
         ///     try app.listenTls("localhost:8443", .dev_self_signed);
-        pub fn listenTls(self: *Self, address: []const u8, cert: Options.Cert) !void {
+        pub fn listenTls(self: *Self, address: []const u8, cert: Cert) errors.ServerError!void {
+            return self.listenTlsInner(address, cert) catch |err| self.failWith(err);
+        }
+
+        fn listenTlsInner(self: *Self, address: []const u8, cert: Cert) !void {
             var opts = try self.takePending("listenTls");
-            const at = address_mod.parse(address) catch |err| return self.failStart(err);
+            const at = address_mod.parse(address) catch |err| {
+                std.log.scoped(.anole).err("listenTls(\"{s}\"): not an address to listen on; use a port (\"443\", every interface), \":443\", or \"127.0.0.1:8443\" (this machine only)", .{address});
+                return err;
+            };
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
             // Unless a listener in `listeners` serves HTTP/3 already.
             if (features.http3 and opts.listen_tls_http3 and opts.http3 == null and !anyHttp3(opts.listeners)) opts.http3 = .{};
             try self.configure(opts);
-            return self.run();
+            return self.runInner();
         }
 
         fn takePending(self: *Self, comptime what: []const u8) !Options {
             return self.pending orelse {
                 // Not the end of the server: `run` still serves those.
-                std.log.scoped(.anole).info(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
+                std.log.scoped(.anole).err(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
                 return error.ListenersAlreadySet;
             };
         }
@@ -1310,17 +1337,40 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `waitReady`.
         fn configure(self: *Self, opts: Options) !void {
             self.pending = null;
-            self.listenOn(opts) catch |err| return self.failStart(err);
+            self.listenOn(opts) catch |err| return self.failStart(errors.toServerError(err));
         }
 
         /// `err`, also for whoever waits in `waitReady`: the server will
         /// not start.
-        fn failStart(self: *Self, err: anyerror) anyerror {
+        fn failStart(self: *Self, err: errors.ServerError) errors.ServerError {
             if (!self.server.settled.isSet()) {
                 self.server.start_error = err;
                 self.server.settled.set(self.rt.io());
             }
             return err;
+        }
+
+        /// `failStart` for whatever the layers below returned. A second
+        /// `listen` on a server already set up fails alone: the server
+        /// itself is fine.
+        fn failWith(self: *Self, err: anyerror) errors.ServerError {
+            const mapped = errors.toServerError(err);
+            if (mapped == error.ListenersAlreadySet) return mapped;
+            return self.failStart(mapped);
+        }
+
+        /// The listener whose socket could not be bound when `run` failed
+        /// with `AddressInUse`, `AddressNotAvailable` or `AccessDenied`;
+        /// null otherwise.
+        pub fn failedListener(self: *const Self) ?[]const u8 {
+            const err = self.server.start_error orelse return null;
+            const name = @errorName(err);
+            if (!std.mem.eql(u8, name, "AddressInUse") and !std.mem.eql(u8, name, "AddressNotAvailable") and
+                !std.mem.eql(u8, name, "AccessDenied")) return null;
+            const index = self.server.start_error_listener orelse return null;
+            const listeners = self.server.config.listeners;
+            if (index >= listeners.len) return null;
+            return listeners[index].name;
         }
 
         /// A copy of `value`, a middleware (a struct with `execute`, or a
@@ -1849,8 +1899,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `tracing`'s settings.
         pub const TracingOptions = struct {
             /// The collector's OTLP/HTTP base URL. Null: the
-            /// `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (read
-            /// through `Options.process`), else http://localhost:4318.
+            /// `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable, else
+            /// http://localhost:4318.
             endpoint: ?[]const u8 = null,
             /// Null: `OTEL_SERVICE_NAME` (as above), else "anole".
             service_name: ?[]const u8 = null,
@@ -1861,7 +1911,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Spans per export request.
             batch_size: usize = 256,
             /// How often finished spans are sent, at the latest.
-            interval_ms: u32 = 2000,
+            interval: Duration = .fromSeconds(2),
             /// Spans held while waiting to be sent; past it, new ones are
             /// dropped.
             queue_len: usize = 4096,
@@ -1875,15 +1925,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn tracing(self: *Self, opts: TracingOptions) !*observe.trace.Exporter {
             if (self.extras.exporter) |e| return e;
             if (self.router.has_routes) @panic("app.tracing() adds a middleware, so it goes before the routes, with app.use()");
-            const env = if (self.process) |p| p.environ else null;
+            const env: ?std.process.Environ = if (self.process) |p| p.environ else null;
+            const url = @import("db/url.zig");
             const e = try self.arena.allocator().create(observe.trace.Exporter);
             e.* = try observe.trace.Exporter.init(self.gpa, self.rt.io(), self.client(), .{
-                .endpoint = opts.endpoint orelse (if (env) |v| envVar(v, "OTEL_EXPORTER_OTLP_ENDPOINT") else null) orelse "http://localhost:4318",
-                .service_name = opts.service_name orelse (if (env) |v| envVar(v, "OTEL_SERVICE_NAME") else null) orelse "anole",
+                .endpoint = opts.endpoint orelse url.env(env, "OTEL_EXPORTER_OTLP_ENDPOINT") orelse "http://localhost:4318",
+                .service_name = opts.service_name orelse url.env(env, "OTEL_SERVICE_NAME") orelse "anole",
                 .sample_all = opts.sample_all,
                 .exclude = opts.exclude,
                 .batch_size = opts.batch_size,
-                .interval_ms = opts.interval_ms,
+                .interval = opts.interval,
                 .queue_len = opts.queue_len,
             });
             e.start() catch |err| {
@@ -1994,7 +2045,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// match the certificate) nothing changes, on any listener, and the
         /// server goes on with what it had. Call it from a task of the
         /// server's runtime (`io()`); one reload runs at a time.
-        pub fn reloadCertificates(self: *Self) !void {
+        pub fn reloadCertificates(self: *Self) errors.TlsLoadError!void {
+            return self.reloadCertificatesInner() catch |err| errors.toTlsLoadError(err);
+        }
+
+        fn reloadCertificatesInner(self: *Self) !void {
             if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
             try self.extras.cert_mutex.lock(io_);
@@ -2018,7 +2073,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// listener: new PEM in memory, other files, or a fresh development
         /// certificate. On success it becomes the source later reloads (and
         /// SIGHUP) read again.
-        pub fn setCertificate(self: *Self, cert: Options.Cert) !void {
+        pub fn setCertificate(self: *Self, cert: Cert) errors.TlsLoadError!void {
+            return self.setCertificateInner(cert) catch |err| errors.toTlsLoadError(err);
+        }
+
+        fn setCertificateInner(self: *Self, cert: Cert) !void {
             if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
             try self.extras.cert_mutex.lock(io_);
@@ -2104,8 +2163,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Waits until the listeners are bound, or returns `run`'s error if
         /// it stopped before they were (a certificate that will not load,
         /// a port in use) rather than waiting for good.
-        pub fn waitReady(self: *Self) !void {
-            try self.server.waitReady(self.rt.io());
+        pub fn waitReady(self: *Self) errors.ServerError!void {
+            self.server.waitReady(self.rt.io()) catch |err| return errors.toServerError(err);
         }
 
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and
@@ -2114,14 +2173,21 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `listeners`, or 127.0.0.1:8080 when there are none, unless
         /// `listen` or `listenTls` named others). Call it from the
         /// thread that called `init`.
-        pub fn run(self: *Self) !void {
+        pub fn run(self: *Self) errors.ServerError!void {
+            return self.runInner() catch |err| self.failWith(err);
+        }
+
+        fn runInner(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
             logBuildMode();
             self.addHelperRoutes();
             // Only with `router.record_conflicts` (the C ABI): a route the
             // helper routes collided with.
             if (self.router.conflict != null) return self.failStart(error.RouteConflict);
-            self.startConnectors() catch |err| return self.failStart(err);
+            self.startConnectors() catch |err| {
+                std.log.scoped(.anole).err("a database connector could not start: {t}", .{err});
+                return self.failStart(error.DatabaseUnavailable);
+            };
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,

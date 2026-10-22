@@ -88,6 +88,21 @@ pub const ServerOptions = @import("server.zig").Options;
 /// `.fromFiles("cert.pem", "key.pem")`, `.fromPem(cert, key)` or
 /// `.dev_self_signed`.
 pub const Cert = ServerOptions.Cert;
+/// Certificate authorities a peer's certificate must chain to
+/// (`Ca.fromFile("ca.pem")`, `.system`, `.dir`, `.fromPem`).
+pub const Ca = @import("http/root.zig").Ca;
+/// Mutual TLS on a listener: `.{ .ca = .fromFile("clients-ca.pem") }`.
+pub const ClientAuth = ServerOptions.ClientAuth;
+/// A length of time: `.fromSeconds(30)`.
+pub const Duration = @import("server.zig").Duration;
+/// The outbound HTTP client's settings (`ServerOptions.client`).
+pub const ClientOptions = @import("http/root.zig").ClientOptions;
+/// Every way `init`, `listen`, `listenTls`, `run` and `waitReady` fail.
+pub const ServerError = @import("errors.zig").ServerError;
+/// What `reloadCertificates` and `setCertificate` fail with.
+pub const TlsLoadError = @import("errors.zig").TlsLoadError;
+/// Error-name helpers shared with the C ABI.
+pub const errors = @import("errors.zig");
 /// A listener in `ServerOptions.listeners`: address or unix socket, TLS,
 /// protocols, name.
 pub const Listener = ServerOptions.Listener;
