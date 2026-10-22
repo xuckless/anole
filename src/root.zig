@@ -80,9 +80,9 @@ pub const Server = @import("server.zig").Server;
 /// Everything `Server` has, with `(req, res)` handlers.
 pub const App = @import("server.zig").App;
 /// What `App.init` and `Server(Ctx).init` take: listeners (`http`,
-/// `https`, `http3`, `listeners`), executors, limits and timeouts
-/// (`server`), error answers, the blocking pool. `.{}` is a working
-/// default.
+/// `https`, `http3`, `listeners`), `timeouts`, `limits`, `proxy`, `request`,
+/// `response` and `http2` (the C ABI's names), executors, error answers, the
+/// blocking pool. `.{}` is a working default.
 pub const ServerOptions = @import("server.zig").Options;
 /// A TLS certificate for `listenTls` and `ServerOptions.https`:
 /// `.fromFiles("cert.pem", "key.pem")`, `.fromPem(cert, key)` or

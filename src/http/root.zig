@@ -15,8 +15,9 @@ const dusty = @import("dusty");
 /// TLS setup of its own. `anole.Server` builds on it and exposes it as
 /// `app.server`.
 pub const Server = dusty.Server;
-/// The core server's settings: timeouts, limits, listeners, HTTP/2.
-/// `anole.ServerOptions.server` takes it.
+/// The core server's settings: timeouts, limits, listeners, HTTP/2. Anole
+/// builds it from `anole.ServerOptions`; use that unless you drive the core
+/// alone.
 pub const ServerConfig = dusty.ServerConfig;
 /// An IP address and port, or a Unix socket path.
 pub const Address = dusty.Address;
