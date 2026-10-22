@@ -107,6 +107,51 @@ jobs:
       - name: Build every test binary and the full example
         run: zig build test-flags full -Dtarget=${{ matrix.target }} --summary all
 
+  capi:
+    name: capi (${{ matrix.os }})
+    # libanole, the C ABI (include/anole.h): packed with Zig alone, its
+    # exported symbols checked, anole.h's layout against the Zig side, the C
+    # suite plain and under ASan and UBSan; on Linux also the header and the
+    # Zig side of libanole for Windows.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: capi
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then (NameServerFailure,
+      # HttpConnectionClosing), so the fetch is retried before building.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: libanole (static and shared, only anole_* exported)
+        timeout-minutes: 20
+        run: zig build capi --summary all
+      - name: anole.h layout, the C suite, the engine over HTTP/2 and HTTP/3
+        timeout-minutes: 20
+        run: zig build capi-test test-capi-engine --summary all
+      - name: The C suite under ASan and UBSan (system cc)
+        timeout-minutes: 20
+        run: zig build capi-test-asan --summary all
+      - name: The same, against a ReleaseSafe libanole
+        timeout-minutes: 20
+        run: zig build capi-test -Doptimize=ReleaseSafe --summary all
+      - name: anole.h and the Zig side of libanole for Windows
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        run: |
+          for t in x86_64-windows-gnu aarch64-windows-gnu; do
+            zig cc -target $t -std=c99 -Wall -Wextra -Werror -Iinclude -c tests/capi/layout.c -o /tmp/layout-$t.o
+            zig c++ -target $t -std=c++17 -Wall -Werror -Iinclude -x c++ -c tests/capi/layout.c -o /tmp/layout-$t-cxx.o
+          done
+          zig build capi-zig capi -Dtarget=x86_64-windows-gnu --summary all
+
   windows:
     name: windows (development target; default profile)
     runs-on: windows-latest

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The C ABI crossing benchmark (M17 spike). One server, from the C consumer
+# The C ABI crossing benchmark. One server, from the C consumer
 # (tests/capi/consumer.c serve), serves:
 #   /native       a fixed response from the JSON config (never leaves the
 #                 executors; on HTTP/2 it runs inline on the reader, noWait)
@@ -27,12 +27,9 @@ root=$(cd "$here/../.." && pwd)
 zig=${ZIG:-zig}
 out=$root/zig-out/capi-bench
 mkdir -p "$out"
-(cd "$root" && $zig build capi -Doptimize=ReleaseFast)
-# libanole needs no C++ runtime (src/capi/cxx_shim.cpp); threads on Linux.
-cxx_lib=
-[ "$(uname -s)" = Linux ] && cxx_lib=-lpthread
-# shellcheck disable=SC2086
-cc -O2 -std=c11 -I"$root/zig-out/include" "$root/tests/capi/consumer.c" "$root/zig-out/lib/libanole.a" $cxx_lib -o "$out/consumer"
+# The suite's consumer, statically linked against a ReleaseFast libanole.a.
+(cd "$root" && $zig build capi-consumer -Doptimize=ReleaseFast)
+cp "$root/zig-out/bin/capi-consumer" "$out/consumer"
 
 median() { sort -n | sed -n 2p; }
 wrk_case() { # url [wrk args] -> "rps p99ms"
