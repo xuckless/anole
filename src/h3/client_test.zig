@@ -931,6 +931,8 @@ pub const Relay = struct {
     front: net.Udp,
     /// Toward the server.
     back: net.Udp,
+    /// Toward the server after a NAT rebinding (`rebind_after_up`).
+    back2: net.Udp,
     server: std.Io.net.IpAddress,
     mutex: std.Io.Mutex = .init,
     client: ?std.Io.net.IpAddress = null,
@@ -943,6 +945,11 @@ pub const Relay = struct {
     /// The server's next datagram, and so all after it, waits this long,
     /// once.
     hold_down_ms: u32 = 0,
+    /// After this many of the client's datagrams (0: never), the NAT
+    /// rebinds: the client's datagrams leave from another port, and the
+    /// server's to the old one are lost.
+    rebind_after_up: u32 = 0,
+    rebound: bool = false,
     recording: bool = false,
     recorded: std.ArrayList([]u8) = .empty,
     group: std.Io.Group = .init,
@@ -956,10 +963,12 @@ pub const Relay = struct {
             .io = io,
             .front = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
             .back = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
+            .back2 = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
             .server = server,
         };
         try r.group.concurrent(io, up, .{r});
-        try r.group.concurrent(io, down, .{r});
+        try r.group.concurrent(io, down, .{ r, false });
+        try r.group.concurrent(io, down, .{ r, true });
         return r;
     }
 
@@ -967,6 +976,7 @@ pub const Relay = struct {
         r.group.cancel(r.io);
         r.front.socket.close(r.io);
         r.back.socket.close(r.io);
+        r.back2.socket.close(r.io);
         r.forget();
         r.recorded.deinit(r.gpa);
         r.gpa.destroy(r);
@@ -1026,22 +1036,33 @@ pub const Relay = struct {
                 const copy = r.gpa.dupe(u8, dg.data) catch null;
                 if (copy) |d| r.recorded.append(r.gpa, d) catch r.gpa.free(d);
             }
+            const via = if (r.rebound) &r.back2 else &r.back;
+            if (r.rebind_after_up > 0) {
+                r.rebind_after_up -= 1;
+                if (r.rebind_after_up == 0) r.rebound = true;
+            }
             r.mutex.unlock(r.io);
             if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
-            while (dg.next()) |d| r.back.send(r.io, r.server, null, 0, d, d.len);
+            while (dg.next()) |d| via.send(r.io, r.server, null, 0, d, d.len);
         }
     }
 
-    fn down(r: *Relay) std.Io.Cancelable!void {
+    fn down(r: *Relay, second: bool) std.Io.Cancelable!void {
         const buf = r.gpa.alloc(u8, 65536) catch return;
         defer r.gpa.free(buf);
         var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+        const from = if (second) &r.back2 else &r.back;
         while (true) {
-            var dg = r.back.receive(r.io, buf, &control, .none) catch |err| switch (err) {
+            var dg = from.receive(r.io, buf, &control, .none) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => continue,
             };
             r.mutex.lockUncancelable(r.io);
+            if (r.rebound != second) {
+                // To a binding the NAT no longer has: lost.
+                r.mutex.unlock(r.io);
+                continue;
+            }
             r.answered = true;
             const to = r.client;
             const hold = r.hold_down_ms;
@@ -1366,6 +1387,41 @@ test "h3 server: a ClientHello resent before the client acted on our Retry gets 
     // connection, the one the client's token led to.
     try std.testing.expect(f.ep.stats.retries.load(.monotonic) >= 2);
     try std.testing.expectEqual(@as(u64, 1), f.ep.stats.accepted.load(.monotonic));
+}
+
+test "h3 server: a NAT rebinding during the handshake: the server follows the client to its new port" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    // The client's first flight (its ClientHello spans two Initials)
+    // leaves from one port; the NAT then rebinds, so the server's answer
+    // to that port is lost and the client's retransmission comes from
+    // another: the interop runner's rebind-port case when the first
+    // rebind falls inside the handshake. Before the xuckless/ngtcp2 patch
+    // the server ignored the new port until the handshake timed out.
+    relay.mutex.lockUncancelable(io);
+    relay.rebind_after_up = 2;
+    relay.mutex.unlock(io);
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = relay.front.socket.address,
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+    });
+    defer conn.close();
+    const body = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+    try std.testing.expectEqual(@as(u64, 1), f.ep.stats.accepted.load(.monotonic));
+    const p = try finish(try request(conn, "GET", "/port", .{}), gpa);
+    defer gpa.free(p);
+    var port_text: [8]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&port_text, "{d}", .{relay.back2.socket.address.getPort()}), p);
 }
 
 test "h3: a client that moves to a new port keeps its connection, and the server follows" {

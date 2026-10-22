@@ -88,6 +88,14 @@ Fixes from the QUIC interop runner's matrix (Anole's server against all
   picoquic, s2n-quic) answered the second probe only; validation still
   succeeded, but observers that check the first challenge (the interop
   runner's rebind-port and rebind-addr cases) did not see it answered.
+- A NAT rebinding during the handshake: the server now follows the
+  client to its new address once a packet from there authenticates and is
+  new (xuckless/ngtcp2 patch), instead of sending to the old address while
+  ignoring the new one until the handshake timed out. On Linux, with one
+  UDP socket per core, a client's Initial and 0-RTT packets are now
+  steered by the first byte of the connection ID the client chose, not by
+  its address and port, so its packets from a new port reach the
+  endpoint that holds its connection rather than starting a second one.
 - A client whose first Initial reached the server without the start of
   its ClientHello got a Retry, and if it resent its whole ClientHello
   before that Retry arrived, the resent copy started a second connection

@@ -21,7 +21,7 @@ import urllib.request
 # by git URL); nghttp3 too: v1.18.0 plus nghttp3_conn_add_extra_setting.
 VERSIONED = {
     "nghttp2": ("nghttp2/nghttp2", "1.70.0", r"xuckless/nghttp2/archive/0f8bc1c4271f4380409071eade31830e6e436bd6"),
-    "ngtcp2": ("ngtcp2/ngtcp2", "1.25.0", r"xuckless/ngtcp2#dc43211c02690f9239a4601db84db2dd7d2b9b06"),
+    "ngtcp2": ("ngtcp2/ngtcp2", "1.25.0", r"xuckless/ngtcp2#ac08ecbc6db570a7895e1888d6b23d95e3d1b6b8"),
     "nghttp3": ("ngtcp2/nghttp3", "1.18.0", r"xuckless/nghttp3/archive/de4bcb905eca28cdfe0e6ef4280b355e1c29660d"),
     "zlib-ng": ("zlib-ng/zlib-ng", "2.3.3", r"zlib-ng/archive/refs/tags/2\.3\.3\.tar"),
     "zstd": ("facebook/zstd", "1.5.7", r"zstd/archive/refs/tags/v1\.5\.7\.tar"),

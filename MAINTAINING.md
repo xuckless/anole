@@ -81,7 +81,14 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      `test_ngtcp2_conn_server_path_challenge_round_data` and an addition to
      `test_ngtcp2_pv_validate`; without it quinn, picoquic and s2n-quic,
      which answer only the latest challenge on a path, fail the interop
-     runner's rebind-port and rebind-addr checks).
+     runner's rebind-port and rebind-addr checks), and one that makes a
+     server follow a client whose address changes during the handshake: a
+     long-header datagram from a new remote address is read on the current
+     path, and moves it there only if one of its packets authenticates and
+     is new in its space (`conn_server_read_handshake_rebound`, with
+     `test_ngtcp2_conn_server_handshake_nat_rebinding`; without it a NAT
+     rebinding inside the handshake stalls it, as in the interop runner's
+     rebind-port case when kwik's slow start puts the first rebind there).
      On a new tag: drop a patch if upstream fixed its bug (run its test
      against the new tag), otherwise rebase it on a new branch, run ngtcp2's
      unit tests, commit the new `version.h`, merge into `anole`, and pin the

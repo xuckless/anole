@@ -689,9 +689,11 @@ So each of the server's connection IDs carries its endpoint's number in its
 second byte, and a classic BPF program on the socket group
 (`SO_ATTACH_REUSEPORT_CBPF`, Linux 4.5 or later) reads that byte from every
 datagram's destination connection ID and picks the socket by it. A client's
-first Initial carries a connection ID of its own choosing, so the kernel's
-hash places it, and the endpoint that takes it hands out IDs with its own
-number from then on.
+first Initials (and its 0-RTT packets) carry a connection ID of its own
+choosing; the program places those by that ID's first byte, modulo the
+number of sockets, not by the client's address, so a client whose NAT
+rebinds during the handshake still reaches the same endpoint. The endpoint
+that takes it hands out IDs with its own number from then on.
 
 What lands on another endpoint's socket all the same is passed on to the
 owner's queue and handled there, never where it landed: another

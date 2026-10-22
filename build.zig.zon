@@ -57,15 +57,17 @@
         // server PTO in the Initial space retransmit two packets, not one (a
         // post-quantum ServerHello spans two), and one that gives both
         // PATH_CHALLENGE probes of a validation round the same data (peers
-        // that answer only the latest challenge then answer the first).
+        // that answer only the latest challenge then answer the first), and
+        // one that makes a server follow a client whose address changes
+        // during the handshake (a NAT rebinding) instead of stalling.
         // Pinned by git URL and commit. nghttp3 1.18.0 from
         // Anole's fork xuckless/nghttp3, branch `anole`: the v1.18.0 tag plus
         // the release's generated version.h and bundled sfparse, and
         // nghttp3_conn_add_extra_setting, which sends the SETTINGS
         // WebTransport needs (0x2b603742 for Chrome and Firefox).
         .ngtcp2 = .{
-            .url = "git+https://github.com/xuckless/ngtcp2#dc43211c02690f9239a4601db84db2dd7d2b9b06",
-            .hash = "N-V-__8AALWLQwA-NsyUqJNxg7L4F2PxcNMrYTWEDMUJPLZv",
+            .url = "git+https://github.com/xuckless/ngtcp2#ac08ecbc6db570a7895e1888d6b23d95e3d1b6b8",
+            .hash = "N-V-__8AANqlQwCMQKrgBILlhBjUQSUP72qz9uNclA0jK_DM",
             .lazy = true,
         },
         // -Dcompression: zlib-ng 2.3.3 (zlib-compat, runtime SIMD dispatch) and
