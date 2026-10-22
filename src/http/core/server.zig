@@ -79,28 +79,31 @@ const ForwardedForIterator = struct {
 
 /// Returns the address `trusted_proxy_hops` hops away from this server. The
 /// socket peer is hop zero, so hop one is the rightmost forwarded address.
-/// Rejecting the whole chain on malformed input fails closed to the peer.
+/// Only that entry is parsed: those left of it are whatever the client
+/// sent, and a malformed one there must not change the answer. A selected
+/// entry that is not an address names no client, and gives the unspecified
+/// address (0.0.0.0) rather than the proxy's. Null when the chain is
+/// shorter than the trusted hops: the peer stands.
 fn forwardedRemoteAddress(headers: *const Headers, trusted_proxy_hops: usize) ?std.Io.net.IpAddress {
     if (trusted_proxy_hops == 0) return null;
 
     var count: usize = 0;
     var counting = ForwardedForIterator.init(headers);
-    while (counting.next()) |text| {
-        if (text.len == 0) return null;
-        count += 1;
-    }
+    while (counting.next()) |_| count += 1;
     if (count < trusted_proxy_hops) return null;
 
     const wanted = count - trusted_proxy_hops;
     var index: usize = 0;
-    var selected: ?std.Io.net.IpAddress = null;
     var parsing = ForwardedForIterator.init(headers);
     while (parsing.next()) |text| : (index += 1) {
-        const address = std.Io.net.IpAddress.parse(text, 0) catch return null;
-        if (index == wanted) selected = address;
+        if (index != wanted) continue;
+        return std.Io.net.IpAddress.parse(text, 0) catch unknown_client;
     }
-    return selected;
+    unreachable;
 }
+
+/// What `remote_address` is when a trusted proxy's entry names no address.
+const unknown_client: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
 
 /// IPv4-mapped addresses, from a dual-stack socket or a forwarding
 /// header, are reported as IPv4 (`unmapIpv4`).
@@ -122,26 +125,39 @@ fn lastForwardedValue(headers: *const Headers, name: []const u8) ?[]const u8 {
     return if (value.len == 0) null else value;
 }
 
+/// What the server takes from forwarding headers: `ServerConfig`'s
+/// `trusted_proxy_hops`, `trust_forwarded_proto` and `trust_forwarded_host`.
+const Forwarding = struct {
+    hops: usize = 0,
+    proto: bool = true,
+    host: bool = false,
+
+    fn of(config: *const ServerConfig) Forwarding {
+        return .{ .hops = config.trusted_proxy_hops, .proto = config.trust_forwarded_proto, .host = config.trust_forwarded_host };
+    }
+};
+
 /// Applies what trusted proxies say about a request: its client address
 /// (`X-Forwarded-For`), whether the client's connection is TLS
-/// (`X-Forwarded-Proto`) and the host it asked for (`X-Forwarded-Host`).
-/// With no trusted hops, only the peer address applies.
-fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, trusted_proxy_hops: usize) void {
-    request.remote_address = remoteAddress(peer, &request.headers, trusted_proxy_hops);
+/// (`X-Forwarded-Proto`, unless turned off) and the host it asked for
+/// (`X-Forwarded-Host`, only when turned on). With no trusted hops, only
+/// the peer address applies.
+fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, forwarding: Forwarding) void {
+    request.remote_address = remoteAddress(peer, &request.headers, forwarding.hops);
     request.forwarded_host = null;
-    if (trusted_proxy_hops == 0) return;
-    if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
+    if (forwarding.hops == 0) return;
+    if (forwarding.proto) if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
         if (std.ascii.eqlIgnoreCase(proto, "https")) request.secure = true;
         if (std.ascii.eqlIgnoreCase(proto, "http")) request.secure = false;
-    }
-    if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
+    };
+    if (forwarding.host) if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
         // A host name or address with an optional port: nothing that could
         // break a URL or a log line built from it.
         const ok = host.len <= 255 and for (host) |ch| {
             if (!(std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, ".-:[]_", ch) != null)) break false;
         } else true;
         if (ok) request.forwarded_host = host;
-    }
+    };
 }
 
 /// Borrowed view of the client-certificate settings, handed to each accepted
@@ -2354,13 +2370,13 @@ pub fn Server(comptime Ctx: type) type {
         /// from `connection`, through the trusted proxies, for an engine
         /// other than the HTTP/1.x loop.
         pub fn applyForwarded(self: *const Self, request: *Request, connection: *const Connection) void {
-            applyForwardedFn(request, connection.peerAddress(), self.config.trusted_proxy_hops);
+            applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
         }
 
         /// `applyForwarded` for an engine with no `Connection` (HTTP/3 over
         /// UDP): the peer address is given directly.
         pub fn applyForwardedFrom(self: *const Self, request: *Request, peer: std.Io.net.IpAddress) void {
-            applyForwardedFn(request, peer, self.config.trusted_proxy_hops);
+            applyForwardedFn(request, peer, .of(&self.config));
         }
 
         /// Routes `req` and runs its handler, with the middleware, writing to
@@ -2655,7 +2671,7 @@ pub fn Server(comptime Ctx: type) type {
                 // or invalid chain fail closed instead of retaining the last
                 // request's forwarded address.
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
-                applyForwardedFn(&request, connection.peerAddress(), self.config.trusted_proxy_hops);
+                applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
 
                 var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
@@ -2853,11 +2869,20 @@ test "trusted proxy hops select X-Forwarded-For from the right" {
     const too_short = remoteAddress(peer, &headers, 4);
     try std.testing.expect(too_short.ip4.eql(peer.ip4));
 
-    // A malformed address anywhere in the chain makes its ordering
-    // ambiguous/untrustworthy and likewise falls back to the peer.
-    try headers.put("X-Forwarded-For", "not-an-address, 203.0.113.10");
-    const malformed = remoteAddress(peer, &headers, 2);
-    try std.testing.expect(malformed.ip4.eql(peer.ip4));
+    // Entries left of the selected one are the client's own; a malformed
+    // one there changes nothing.
+    _ = headers.remove("X-Forwarded-For");
+    try headers.add("X-Forwarded-For", "not-an-address, , 203.0.113.10");
+    try headers.add("X-Forwarded-For", "198.51.100.7");
+    const ignored = remoteAddress(peer, &headers, 2);
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 10 }, ignored.ip4.bytes);
+
+    // A malformed or empty selected entry names no client: the unspecified
+    // address, never the proxy's.
+    const bad = remoteAddress(peer, &headers, 3);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, bad.ip4.bytes);
+    const empty = remoteAddress(peer, &headers, 4);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, empty.ip4.bytes);
 }
 
 test "IPv4-mapped peers and forwarded addresses are reported as IPv4" {

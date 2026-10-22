@@ -3748,7 +3748,7 @@ test "Server: a PROXY protocol listener with proxy_protocol_from serves only tho
 
 test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
     const io = std.testing.io;
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1, .trust_forwarded_host = true }, {});
     defer server.deinit();
     server.router.get("/who", WhoHandler.handle);
     var future = try io.concurrent(struct {
@@ -3766,6 +3766,29 @@ test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
     // A host with characters no host has is ignored.
     const bad = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-Host: evil.com/x y\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.endsWith(u8, bad, "secure=false host=internal:8080"));
+}
+
+test "Server: X-Forwarded-Host is ignored unless trusted, X-Forwarded-Proto when turned off" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    const request = "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\nConnection: close\r\n\r\n";
+    const resp = try rawAll(io, &server, request, &out);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "203.0.113.9:0 secure=true host=internal:8080"));
+
+    server.config.trust_forwarded_proto = false;
+    const no_proto = try rawAll(io, &server, request, &out);
+    try std.testing.expect(std.mem.endsWith(u8, no_proto, "203.0.113.9:0 secure=false host=internal:8080"));
 }
 
 test "Server: forwarding headers are ignored without trusted hops" {

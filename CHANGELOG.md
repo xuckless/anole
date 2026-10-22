@@ -14,6 +14,13 @@ breaking changes are listed anyway.
   in CIDR notation allowed to send the header; connections from other
   peers are closed. Optional; recommended when the port is reachable by
   more than the load balancer.
+- `trusted_proxy_hops`: only the selected `X-Forwarded-For` entry is parsed,
+  so a malformed entry the client added no longer makes the proxy's address
+  the client's; a selected entry that is not an address reports `0.0.0.0`.
+- **Breaking:** `X-Forwarded-Host` is honoured only with the new
+  `server.trust_forwarded_host = true`. `X-Forwarded-Proto` stays on with
+  `trusted_proxy_hops` and can be turned off with
+  `trust_forwarded_proto = false`. Make sure the proxy overwrites both.
 
 ### C ABI (ABI 0.1)
 

@@ -893,9 +893,17 @@ client that reaches the port directly cannot claim another address.
 
 **`X-Forwarded-*`**, with `.server = .{ .trusted_proxy_hops = 1 }`. With `n`
 hops, `req.remote_address` is the `n`-th address from the right of
-`X-Forwarded-For` (with port 0), the nearest proxy's `X-Forwarded-Proto` sets
-`req.secure`, and its `X-Forwarded-Host` is what `req.host()` returns. The
-`Forwarded` header (RFC 7239) is not read.
+`X-Forwarded-For` (with port 0); entries left of it are the client's own and
+are not read, and a selected entry that is not an address gives `0.0.0.0`,
+never the proxy's address. The nearest proxy's `X-Forwarded-Proto` sets
+`req.secure` (`.trust_forwarded_proto = false` turns that off). Its
+`X-Forwarded-Host` is what `req.host()` returns only with
+`.trust_forwarded_host = true`: a proxy that passes the client's header
+through (nginx does unless told `proxy_set_header X-Forwarded-Host $host`)
+would let a client choose the host your links and redirects are built from.
+The proxy must set (overwrite) both headers on every request; append-only
+proxies are not enough for them. The `Forwarded` header (RFC 7239) is not
+read.
 
 Enable either only on a listener that nothing but the proxy can reach;
 otherwise clients write the header themselves and choose the address your

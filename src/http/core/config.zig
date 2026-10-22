@@ -296,7 +296,23 @@ pub const ServerConfig = struct {
     /// Only enable this when the server is unreachable except through that
     /// many trusted proxies. Otherwise a client can supply the header itself
     /// and choose the address reported to handlers.
+    ///
+    /// Only the selected entry is read; the ones left of it are the
+    /// client's own. One that is not an address gives `remote_address`
+    /// 0.0.0.0, never the proxy's address.
     trusted_proxy_hops: usize = 0,
+    /// With `trusted_proxy_hops`: the last `X-Forwarded-Proto` value sets
+    /// `Request.secure`. The nearest proxy must set (overwrite) the header
+    /// on every request, as nginx does only with `proxy_set_header
+    /// X-Forwarded-Proto $scheme`; otherwise the client's own value passes
+    /// through.
+    trust_forwarded_proto: bool = true,
+    /// With `trusted_proxy_hops`: the last `X-Forwarded-Host` value is what
+    /// `Request.host` returns. Off by default: a proxy that does not
+    /// overwrite the header lets a client choose the host that links,
+    /// redirects and cache keys are built from. Turn it on only when the
+    /// nearest proxy sets the header on every request.
+    trust_forwarded_host: bool = false,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
