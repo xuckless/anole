@@ -1259,6 +1259,12 @@ test "HTTP/2: :authority is the host; a host field that differs from it is refus
 const LiveAllocator = struct {
     inner: std.mem.Allocator,
     live: std.atomic.Value(isize) = .init(0),
+    peak: std.atomic.Value(isize) = .init(0),
+
+    fn grew(self: *LiveAllocator, by: isize) void {
+        const now = self.live.fetchAdd(by, .monotonic) + by;
+        _ = self.peak.fetchMax(now, .monotonic);
+    }
 
     fn allocator(self: *LiveAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -1266,19 +1272,19 @@ const LiveAllocator = struct {
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
         const p = self.inner.rawAlloc(len, alignment, ra) orelse return null;
-        _ = self.live.fetchAdd(@intCast(len), .monotonic);
+        self.grew(@intCast(len));
         return p;
     }
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
         if (!self.inner.rawResize(memory, alignment, new_len, ra)) return false;
-        _ = self.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        self.grew(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)));
         return true;
     }
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
         const p = self.inner.rawRemap(memory, alignment, new_len, ra) orelse return null;
-        _ = self.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        self.grew(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)));
         return p;
     }
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
@@ -1381,4 +1387,34 @@ test "HTTP/2: a finished response the peer never takes is reset at the request t
     try std.testing.expectEqual(@as(u32, c.NGHTTP2_CANCEL), client.get(id).error_code);
     try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
     try awaitStreamsFreed(&server, io);
+}
+
+test "HTTP/2: the raised body windows of a connection share one budget" {
+    const io = std.testing.io;
+    var live: LiveAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(live.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .http2 = .{ .reading_window_budget = 1024 * 1024 },
+    }, {});
+    defer server.deinit();
+    server.router.post("/late", Handlers.late);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    const body = try std.testing.allocator.alloc(u8, 300 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var ids: [8]i32 = undefined;
+    for (&ids) |*id| id.* = try client.request("POST", "/late", body);
+    try client.run();
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(std.testing.allocator);
+    try want.print(std.testing.allocator, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) });
+    for (ids) |id| try std.testing.expectEqualStrings(want.items, client.get(id).body.items);
+    // Eight streams reading at once would raise eight 1 MiB windows.
+    try std.testing.expect(live.peak.load(.monotonic) < 4 * 1024 * 1024);
 }

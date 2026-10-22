@@ -234,6 +234,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// Streams whose handler is done with their response still
             /// going out (`Stream.send_pending`).
             send_pending: usize = 0,
+            /// What the streams' raised body buffers take
+            /// (`Http2.reading_window_budget`).
+            raised_bytes: usize = 0,
             /// `refusedHead`'s token bucket: what is left, and the second
             /// it was last refilled.
             refused_tokens: u64 = 0,
@@ -446,6 +449,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// When the rest of the response must be out by, else the
             /// stream is reset (`sweepSends`).
             send_deadline: ?std.Io.Clock.Timestamp = null,
+            /// The body buffer `raiseWindow` took from the connection's
+            /// `reading_window_budget`, given back when the stream is freed.
+            raised_bytes: usize = 0,
             /// Counted in the server's in-flight requests (by `startStream`)
             /// until it is freed.
             counted: bool = false,
@@ -476,7 +482,11 @@ pub fn Engine(comptime Ctx: type) type {
                 // Until the peer's ACK of SETTINGS, what is queued may be up
                 // to the default window, and the ACK still moves this one.
                 const acked = conn.ackedStreamWindow();
-                const buf = stream.arena.allocator().alloc(u8, @max(want, acked)) catch return;
+                const size: usize = @max(want, acked);
+                // The connection's raised windows share one budget; a stream
+                // past it reads at `stream_window`.
+                if (size > conn.config.reading_window_budget -| conn.raised_bytes) return;
+                const buf = stream.arena.allocator().alloc(u8, size) catch return;
                 var bigger: std.Io.Queue(u8) = .init(buf);
                 if (stream.body) |*q| {
                     // What is queued moves over, in order; nobody else gets
@@ -495,6 +505,8 @@ pub fn Engine(comptime Ctx: type) type {
                 if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want - pending) != 0) return;
                 stream.body = bigger;
                 stream.recv_window = want;
+                stream.raised_bytes = size;
+                conn.raised_bytes += size;
                 conn.kickWriter();
             }
 
@@ -537,6 +549,7 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 if (!stream.handler_done) return;
                 if (stream.send_pending) conn.send_pending -= 1;
+                conn.raised_bytes -= stream.raised_bytes;
                 _ = conn.streams.remove(stream.id);
                 if (stream.counted) {
                     conn.open_streams -= 1;

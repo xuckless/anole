@@ -557,10 +557,19 @@ handlers as HTTP/1.1.
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
 (64 KiB, also each stream's body buffer), `stream_window_reading` (1 MiB:
 the window and buffer from the handler's first read of the body),
-`connection_window` (16 MiB),
-`max_header_list_size` (64 KiB), `stream_reset_burst` and
-`stream_reset_rate` (rapid-reset protection), `max_continuations` (8) and
+`reading_window_budget` (16 MiB: what those raised buffers take at most per
+connection; past it a stream keeps `stream_window`), `connection_window`
+(16 MiB), `max_header_list_size` (64 KiB), `stream_reset_burst` and
+`stream_reset_rate` (rapid-reset protection), `refused_stream_burst` (100)
+and `refused_stream_rate` (10 a second: streams refused before a handler,
+past which the connection is closed), `max_continuations` (8) and
 `enable_connect_protocol` (on, for RFC 8441 WebSockets).
+
+Memory per HTTP/2 connection is per stream, too: besides the raised
+windows, each of up to `max_concurrent_streams` streams may hold a
+`stream_window` body buffer and, when its handler reads the whole body,
+up to `request.max_body_size`. Size memory for `max_connections` times
+that, or lower `max_concurrent_streams` or `max_body_size`.
 
 ## HTTP/3
 

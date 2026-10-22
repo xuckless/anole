@@ -408,6 +408,18 @@ pub const ServerConfig = struct {
         /// 6.5 MB/s at 10 ms), while one that never reads holds only
         /// `stream_window`. No larger than `stream_window`: stays as is.
         stream_window_reading: u31 = 1024 * 1024,
+        /// The most memory the raised windows (`stream_window_reading`) of
+        /// one connection's streams take at once: 16 streams reading at
+        /// the default. A stream whose handler reads past it keeps
+        /// `stream_window`, and reads at that pace.
+        ///
+        /// What else a connection's streams can hold: up to
+        /// `max_concurrent_streams` body buffers of `stream_window`, and
+        /// for each handler that reads its whole body (`Request.body`) up
+        /// to `Request.max_body_size`. Size memory for `max_connections`
+        /// times that, or lower `max_concurrent_streams` and
+        /// `max_body_size`.
+        reading_window_budget: usize = 16 * 1024 * 1024,
         /// Request body bytes in flight across all streams of a
         /// connection. It holds no memory of its own (the streams' body
         /// buffers do), so it is generous: several uploads at once share

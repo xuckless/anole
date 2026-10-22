@@ -18,6 +18,10 @@ breaking changes are listed anyway.
   gives it no flow-control window gets the stream reset, and a connection
   whose peer stops reading is closed after one write blocks that long.
   Such streams used to be held, and graceful drains to wait, indefinitely.
+- HTTP/2: the raised body windows of one connection's streams share
+  `http2.reading_window_budget` (16 MiB), so a connection with many uploads
+  at once no longer takes 1 MiB per stream without bound. docs/server.md
+  now sizes HTTP/2 memory per stream.
 - PROXY protocol v2: a header whose TLV length is near 65535 is refused
   instead of crashing the process (or, in ReleaseFast, reading past a
   buffer). Only listeners with `proxy_protocol = true` were affected.
