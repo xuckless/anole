@@ -427,6 +427,10 @@ Breaking below.
 - C ABI configuration: a `jwt` middleware with `jwks_url` needs `audience`
   (or `allow_any_audience: true` for keys that sign for this application
   alone); without it the configuration is refused.
+- C ABI configuration: a fixed (`respond`) route's headers are checked when
+  the configuration is read: `Connection` and `Transfer-Encoding` (the
+  server's own) and invalid names or values are refused there, instead of
+  failing every request to the route.
 - C ABI: WebSocket messages waiting for a consumer are bounded per executor
   in bytes (the larger of 16 x `limits.ws_high_water` and
   2 x `limits.ws_max_message`), not only in count, so clients cannot make a

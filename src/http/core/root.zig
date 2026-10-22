@@ -67,6 +67,9 @@ pub const validateCookieValue = @import("cookie.zig").validateCookieValue;
 /// replies with them before they reach a `Response`).
 pub const validateHeaderName = @import("http.zig").validateHeaderName;
 pub const validateHeaderValue = @import("http.zig").validateHeaderValue;
+/// Response header names only the server writes (`Connection`,
+/// `Transfer-Encoding`), which `Response.header` refuses.
+pub const isReservedHeader = @import("response.zig").isReservedHeader;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
 /// `Request.locals`: per-request values a middleware hands to the handler.
 pub const Locals = @import("locals.zig").Locals;

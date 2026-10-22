@@ -772,7 +772,14 @@
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "propertyNames": {
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+            "not": {
+              "pattern": "^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg])$"
+            }
+          },
+          "description": "Not Connection or Transfer-Encoding: the server writes those."
         }
       }
     },

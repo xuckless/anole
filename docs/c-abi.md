@@ -223,6 +223,9 @@ here and runs on Anole's threads:
 
 - A route has exactly one of `handler` (a consumer's route id), `respond` (a
   fixed answer), `static` (files under a directory) or `websocket`.
+  A `respond` answer's `headers` may not name `Connection` or
+  `Transfer-Encoding`, which the server writes itself, and must be valid
+  field names and values; the configuration is refused otherwise.
 - `middleware` at the top runs for every route, a route's own after it.
   `jwt` with `jwks_url` fetches keys, so its requests keep a task; with
   `jwks` inline (or no `jwt`), HTTP/2 and HTTP/3 requests detach.

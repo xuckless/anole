@@ -672,8 +672,9 @@ const StreamCompressor = struct {
     }
 };
 
-/// Framing fields the server writes itself (`Response.header`).
-fn isReservedHeader(name: []const u8) bool {
+/// Framing fields the server writes itself (`Response.header` refuses
+/// them).
+pub fn isReservedHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or std.ascii.eqlIgnoreCase(name, "Connection");
 }
 

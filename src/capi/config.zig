@@ -319,7 +319,16 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (kinds != 1) return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket", .{i});
         if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
         if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
-        if (r.respond) |f| _ = http.Status.fromCode(f.status) catch return fail(why, "routes[{d}].respond.status {d} is not a status Anole knows", .{ i, f.status });
+        if (r.respond) |f| {
+            _ = http.Status.fromCode(f.status) catch return fail(why, "routes[{d}].respond.status {d} is not a status Anole knows", .{ i, f.status });
+            var it = f.headers.map.iterator();
+            while (it.next()) |h| {
+                const name = h.key_ptr.*;
+                http.core.validateHeaderName(name) catch return fail(why, "routes[{d}].respond.headers: \"{f}\" is not a header name", .{ i, std.zig.fmtString(name) });
+                if (http.core.isReservedHeader(name)) return fail(why, "routes[{d}].respond.headers: {s} is the server's to set", .{ i, name });
+                http.core.validateHeaderValue(h.value_ptr.*) catch return fail(why, "routes[{d}].respond.headers.{s}: the value holds CR, LF or NUL", .{ i, name });
+            }
+        }
         if (r.websocket != null) {
             if (comptime !features.websocket) return fail(why, "routes[{d}].websocket: WebSocket is not built in (-Dwebsocket)", .{i});
             if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: a websocket route is GET", .{i});
@@ -527,6 +536,11 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"routes\": [{\"method\": \"FETCH\", \"path\": \"/x\", \"handler\": 1}]}",
         "{\"listeners\": []}",
         "{\"middleware\": [{\"rate_limit\": {\"key\": \"cookie\"}}]}",
+        // Framing fields are the server's; names and values must go on the wire.
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"Connection\": \"close\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"transfer-encoding\": \"chunked\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"x bad\": \"1\"}}}]}",
+        "{\"routes\": [{\"path\": \"/x\", \"respond\": {\"headers\": {\"x-ok\": \"a\\r\\nb\"}}}]}",
         // A provider's keys sign for its other clients too.
         "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\"}}]}",
         "{\"limits\": {\"inline_body_max\": 10, \"body_max\": 5}}",
