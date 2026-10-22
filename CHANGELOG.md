@@ -29,6 +29,13 @@ breaking changes are listed anyway.
   (RFC 9112). `server.request.require_host = false` accepts them again.
 - Static files: a file modified after the year 9999 no longer crashes the
   server while formatting `Last-Modified`; the date is capped at 9999.
+- A streamed response with a `Content-Length` no longer writes past that
+  length: the write fails with `ContentLengthMismatch` (now part of
+  `StreamingBodyWriter.Error`) and the connection is closed after the
+  response. **Breaking:** `res.header`/`res.addHeader` refuse
+  `Transfer-Encoding` and `Connection` (`error.InvalidHeaderName`); use
+  `res.keepalive = false` to close the connection. A second
+  `Content-Length` from `addHeader` replaces the first.
 
 ### C ABI (ABI 0.1)
 
