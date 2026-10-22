@@ -3843,6 +3843,67 @@ test "Server: a request body with broken framing is a 400, and the connection cl
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "HTTP/1.1 "));
 }
 
+/// Sends `request` and reads until the server closes. False when it has
+/// not within `limit_ms` (the socket is then shut down to end the read).
+fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, limit_ms: u64) !bool {
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var done: std.atomic.Value(bool) = .init(false);
+    var reader = try io.concurrent(struct {
+        fn run(s: std.Io.net.Stream, _io: std.Io, flag: *std.atomic.Value(bool)) void {
+            var rbuf: [1024]u8 = undefined;
+            var r = s.reader(_io, &rbuf);
+            _ = r.interface.discardRemaining() catch {};
+            flag.store(true, .release);
+        }
+    }.run, .{ stream, io, &done });
+    var waited: u64 = 0;
+    while (!done.load(.acquire) and waited < limit_ms) : (waited += 10) try io.sleep(.fromMilliseconds(10), .awake);
+    const closed = done.load(.acquire);
+    if (!closed) stream.shutdown(io, .both) catch {};
+    reader.await(io);
+    return closed;
+}
+
+test "Server: an unread body left after the request timed out or lifted its timeout is not drained without bound" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromMilliseconds(300), .keepalive = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    const H = struct {
+        /// Reads the body, and answers anyway when that fails (the
+        /// request timer firing).
+        fn swallow(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req.body() catch {};
+            res.body = "ok";
+        }
+        /// Lifts the request timeout and never reads the body.
+        fn unbounded(req: *dusty.Request, res: *dusty.Response) !void {
+            req.setTimeout(.none);
+            res.body = "ok";
+        }
+    };
+    server.router.post("/swallow", H.swallow);
+    server.router.post("/unbounded", H.unbounded);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // A body declared at 1000 bytes of which 10 come, then nothing.
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /unbounded HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
+}
+
 test "Server: forwarding headers are ignored without trusted hops" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});

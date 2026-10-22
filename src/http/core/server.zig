@@ -695,6 +695,9 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// within a round trip, and the request deadline may be off.
 pub const linger_limit: usize = 64 * 1024;
 pub const linger_timeout: std.Io.Duration = .fromSeconds(1);
+/// How long an unread request body is drained for when `timeout.keepalive`
+/// is off.
+const drain_timeout_fallback: std.Io.Duration = .fromSeconds(10);
 
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
@@ -2427,6 +2430,29 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
+        /// `discardBody` under a deadline of its own: the request's, or
+        /// `drainTimeout` from now if sooner. A handler may have lifted its
+        /// timeout (`Request.setTimeout`), or caught the cancel of one that
+        /// fired and returned, and the drain must not then wait on the peer
+        /// for good. A request already past its deadline is not drained:
+        /// the connection closes instead. Whether the connection can carry
+        /// on.
+        fn boundedDiscard(self: *Self, parser: *RequestParser, connection: *Connection, max: usize, timer: *Timer, request_deadline: ?std.Io.Clock.Timestamp) error{Canceled}!bool {
+            const now = std.Io.Clock.Timestamp.now(self.io, .awake);
+            if (request_deadline) |d| if (now.compare(.gte, d)) return false;
+            const own = now.addDuration(.{ .raw = drainTimeout(&self.config), .clock = .awake });
+            self.armDeadline(timer, earlier(request_deadline, own));
+            defer timer.clear(self.io);
+            return discardBody(parser, connection, max) catch |err| switch (err) {
+                error.Canceled => if (timer.fired()) false else error.Canceled,
+            };
+        }
+
+        /// The longest a left-over request body is drained for.
+        fn drainTimeout(config: *const ServerConfig) std.Io.Duration {
+            return config.timeout.keepalive orelse drain_timeout_fallback;
+        }
+
         /// Runs the HTTP request loop over a connection: each request is
         /// parsed, served and answered before the next is looked at, so
         /// pipelined requests are answered in order without any more
@@ -2789,7 +2815,7 @@ pub fn Server(comptime Ctx: type) type {
                         break :blk n <= max;
                     };
                     if (drainable) {
-                        if (!try discardBody(&parser, connection, max)) response.keepalive = false;
+                        if (!try self.boundedDiscard(&parser, connection, max, timer, request_deadline)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
                     }

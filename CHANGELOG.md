@@ -53,6 +53,12 @@ breaking changes are listed anyway.
   `Content-Length` from `addHeader` replaces the first.
 - A request body with broken framing (chunked) or a corrupt gzip/deflate
   coding is answered 400 and logged at `debug`, instead of 500 at `err`.
+- HTTP/1.1: the rest of a request body a handler left unread is drained
+  only until the request's deadline, and at most `timeout.keepalive` (10 s
+  when that is off); a request already past its deadline is not drained
+  and its connection closes. A handler that lifted its timeout, or caught
+  the timeout's error and returned, let a slow client hold the connection
+  indefinitely.
   Reading it fails with the new `error.MalformedBody` (was the parser's
   `InvalidChunkSize`/`ParseFailed`/... or zlib's `CorruptInput`).
 
