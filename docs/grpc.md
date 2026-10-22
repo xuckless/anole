@@ -257,7 +257,7 @@ lives until the call ends.
 | `call.addTrailer(name, value)` | Trailing metadata, sent with the status. The name is lower-case (letters, digits, `-`, `_`, `.`), the value printable ASCII; a `-bin` name takes base64 text, as `call.metadata` returns it. `error.InvalidMetadata` otherwise. |
 | `call.addBinaryTrailer(name, bytes)` | Binary trailing metadata under a `-bin` name, base64-encoded for you. |
 | `call.fail(code, message)` | Sets the status; return what it returns. |
-| `call.deadline` | The client's deadline, if it sent one. |
+| `call.deadline` | The call's deadline: the client's, capped at `max_call_duration`, or that alone; null without either. |
 | `call.deadlineExceeded()` | True once the deadline has passed. |
 | `call.cancelled()` | The client went away, or the deadline passed. |
 | `call.state(T)` | The `Server(T)` application state. |

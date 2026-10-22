@@ -131,7 +131,9 @@ pub const Call = struct {
     ctx: ?*anyopaque,
     /// `RegisterOptions.data` of the registration that routed the call.
     data: ?*anyopaque = null,
-    /// When the client's grpc-timeout runs out, if it sent one.
+    /// When the call's deadline passes: the client's grpc-timeout (or
+    /// connect-timeout-ms), capped at the registration's
+    /// `max_call_duration`, or that alone; null without either.
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Set by `fail`, or left at OK.
     status: Code = .ok,
@@ -257,7 +259,7 @@ pub const Call = struct {
         return self.impl.codec;
     }
 
-    /// Whether the client's grpc-timeout has run out. False without one.
+    /// Whether the call's deadline has passed. False without one.
     pub fn deadlineExceeded(self: *const Call) bool {
         const d = self.deadline orelse return false;
         return std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d);
