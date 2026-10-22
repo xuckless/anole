@@ -427,7 +427,7 @@ const WtAnswerer = struct {
     }
 
     fn write(self: *WtAnswerer, h: u64, data: []const u8, fin: bool) !void {
-        if (try engine.wt.write(self.e, h, data, fin)) {
+        if (try engine.wt.write(self.e, h, data, fin, false)) {
             _ = self.busies.fetchAdd(1, .monotonic);
             if (self.streams.getPtr(h)) |ent| ent.busy = true;
         }
@@ -501,7 +501,7 @@ const WtAnswerer = struct {
                 if (engine.wt.sendDatagram(e, h, "x")) |_| return error.NotStale else |err| if (err != error.Gone) return err;
                 var it = self.streams.iterator();
                 while (it.next()) |kv| if (kv.value_ptr.session == h) {
-                    if (engine.wt.write(e, kv.key_ptr.*, "x", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                    if (engine.wt.write(e, kv.key_ptr.*, "x", false, false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
                     _ = self.stale_ok.fetchAdd(1, .monotonic);
                 };
                 _ = self.closes.fetchAdd(1, .monotonic);
@@ -619,7 +619,7 @@ fn wtCheck(a: *WtAnswerer, port: u16, io: std.Io, keep: *?*anole.webtransport.Se
         const forged_stream: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 5) << 28) | 1;
         try std.testing.expectError(error.Gone, engine.wt.openStream(a.e, forged_session, false));
         try std.testing.expectError(error.Gone, engine.wt.close(a.e, forged_session, 0, ""));
-        try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false));
+        try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false, false));
         try std.testing.expectError(error.Gone, engine.wt.streamOp(a.e, forged_stream, .release, 0));
         // A request handle is not a session.
         try std.testing.expectError(error.Gone, engine.wt.sendDatagram(a.e, 1, "x"));

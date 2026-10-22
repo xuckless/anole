@@ -56,7 +56,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 5 /* additions */
+#define ANOLE_ABI_VERSION_MINOR 6 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 
 #if defined(_WIN32) && defined(ANOLE_SHARED)
@@ -434,7 +434,7 @@ typedef struct anole_grpc_message_event {
 
 /* WebTransport (draft-02 over HTTP/3, what Chrome and Firefox speak). */
 #define ANOLE_WT_UNI 1u /* anole_wt_open_stream's flag, and ANOLE_EV_WT_STREAM's: one-way */
-#define ANOLE_WT_FIN 1u /* anole_wt_stream_write's flag, and ANOLE_EV_WT_DATA's: the end */
+#define ANOLE_WT_FIN 2u /* anole_wt_stream_write's flag, and ANOLE_EV_WT_DATA's: the end (1 before ABI 0.6) */
 enum { ANOLE_WT_CLOSED_LOCAL = 0, ANOLE_WT_CLOSED_PEER = 1, ANOLE_WT_CLOSED_CONNECTION = 2 };
 
 /* ANOLE_EV_WT_STREAM: a stream the peer opened, both ways or (ANOLE_WT_UNI)
@@ -540,7 +540,10 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
    instead of copying them; they must stay valid and unchanged until
    ANOLE_EV_SENT for them (which arrives even when the client is gone or
    the call fails with ANOLE_E_GONE after taking them). Bindings borrow
-   large bodies (above 64 KiB, say) and copy small ones. */
+   large bodies (above 64 KiB, say) and copy small ones. Bit 0 of every
+   send-type call's flags (anole_respond, anole_stream_write, anole_ws_send,
+   anole_grpc_send, anole_wt_stream_write) is ANOLE_BODY_BORROW; flags of
+   one call start at bit 1, and unknown bits are ANOLE_E_INVALID. */
 #define ANOLE_BODY_BORROW 1u
 
 /* The whole response: status (a code in the IANA registry, or one of the
@@ -697,7 +700,9 @@ ANOLE_API anole_status anole_grpc_health_set(anole_server *s, anole_str service,
    stream limit may hold it). */
 ANOLE_API anole_status anole_wt_open_stream(anole_wt w, uint32_t flags, anole_wt_stream *out);
 /* Queues bytes to send on a stream (copied), and with ANOLE_WT_FIN its end
-   after them. ANOLE_BUSY: queued, but past limits.stream_high_water bytes
+   after them. ANOLE_BODY_BORROW is taken too: the bytes are copied all the
+   same, and ANOLE_EV_SENT follows (ev.handle s), as for every borrowing
+   call. ANOLE_BUSY: queued, but past limits.stream_high_water bytes
    waiting: wait for ANOLE_EV_WRITABLE (ev.handle the stream). ANOLE_E_INVALID
    for a read-only stream or after its end; ANOLE_E_GONE once its sending
    side is over (reset, or stopped by the peer: ANOLE_EV_WT_STREAM_STOP). */

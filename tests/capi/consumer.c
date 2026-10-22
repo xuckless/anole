@@ -2062,7 +2062,7 @@ typedef struct {
   wt_ent ents[32];
   anole_wt session;
   anole_wt_stream first_stream; /* for the stale check after the close */
-  int opened, closed, released, drains;
+  int opened, closed, released, drains, borrow_sent;
   uint32_t close_code, close_by;
   char reason[64];
 } wt_state;
@@ -2094,8 +2094,17 @@ static void wt_forget(wt_state *st, wt_ent *e) {
   st->released++;
 }
 
+/* Borrowed by a WebTransport write: static, as it must stay until
+   ANOLE_EV_SENT. */
+static const char wt_borrowed[] = "hello ";
+
 static void wt_event(wt_state *st, const anole_event *ev) {
   switch (ev->type) {
+  case ANOLE_EV_SENT: {
+    const anole_sent_event *se = (const anole_sent_event *)ev;
+    if (se->data == (uint64_t)(uintptr_t)wt_borrowed && se->len == 6) st->borrow_sent++;
+    break;
+  }
   case ANOLE_EV_WT_OPEN: {
     const anole_request_event *r = (const anole_request_event *)ev;
     CHECK(r->route_id == 5);
@@ -2105,7 +2114,12 @@ static void wt_event(wt_state *st, const anole_event *ev) {
     CHECK(anole_wt_max_datagram(ev->handle) > 0);
     anole_wt_stream u = 0;
     CHECK(anole_wt_open_stream(ev->handle, ANOLE_WT_UNI, &u) == ANOLE_OK && u != 0);
-    CHECK(anole_wt_stream_write(u, "hello from C", 12, ANOLE_WT_FIN) == ANOLE_OK);
+    /* Bit 0 is ANOLE_BODY_BORROW on every send-type call: a borrowed
+       write does not end the stream (ANOLE_EV_SENT follows); unknown flag
+       bits are refused. */
+    CHECK(anole_wt_stream_write(u, wt_borrowed, 6, ANOLE_BODY_BORROW) == ANOLE_OK);
+    CHECK(anole_wt_stream_write(u, "x", 1, 0x80) == ANOLE_E_INVALID);
+    CHECK(anole_wt_stream_write(u, "from C", 6, ANOLE_WT_FIN) == ANOLE_OK);
     /* Written with its end: still goes out whole after the release. */
     CHECK(anole_wt_stream_write(u, "more", 4, 0) == ANOLE_E_INVALID);
     CHECK(anole_wt_stream_release(u) == ANOLE_OK);
@@ -2230,6 +2244,7 @@ static void test_webtransport(void) {
   CHECK(st.opened == 1 && st.closed == 1);
   CHECK(st.close_code == 7 && st.close_by == ANOLE_WT_CLOSED_PEER && strcmp(st.reason, "done") == 0);
   CHECK(st.released >= 3);
+  CHECK(st.borrow_sent == 1);
   /* The session and its streams are stale after the close. */
   CHECK(anole_wt_close(st.session, 0, LIT("")) == ANOLE_E_GONE);
   CHECK(anole_wt_send_datagram(st.session, "x", 1) == ANOLE_E_GONE);

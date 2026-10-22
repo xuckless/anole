@@ -384,7 +384,9 @@ anole_wt_close(w, 0, (anole_str){"bye", 3});
 - Streams in either direction, opened by either side. The peer's stream
   data comes in `ANOLE_EV_WT_DATA` records of at most 32 KiB, in order;
   a consumer that falls behind holds back the reading (the record budget,
-  then QUIC flow control). Writes are copied and queued:
+  then QUIC flow control). Writes are copied and queued (a write with
+  `ANOLE_BODY_BORROW` is copied too, and gets its `ANOLE_EV_SENT`, so a
+  binding's one borrowing helper works here as everywhere):
   `limits.stream_high_water` bytes waiting answers `ANOLE_BUSY`, then
   `ANOLE_EV_WRITABLE` comes for the stream.
 - Every stream must be released (`anole_wt_stream_release`) or go with
@@ -793,7 +795,10 @@ routes with native ones.
 ABI 0.1 was the request/response and WebSocket core, plus `anole_db_*` with
 SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server, 0.3 MongoDB through
 `anole_db_*`, 0.4 WebTransport, and 0.5 the TLS extras (mutual TLS, the
-client certificate in requests, certificate reload). Next is the freeze, ABI
+client certificate in requests, certificate reload). 0.6 makes bit 0 of every
+send-type call's flags `ANOLE_BODY_BORROW`, so `ANOLE_WT_FIN` moved from 1 to
+2 (a binding built against 0.5 that passes 1 to end a WebTransport stream now
+borrows instead; rebuild against the new header). Next is the freeze, ABI
 1.0, before the bindings ship.
 
 Auth beyond the configured `jwt` middleware comes later.

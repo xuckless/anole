@@ -16,6 +16,19 @@ breaking changes are listed anyway.
   past every generation an earlier server handed out, so such a handle is
   `ANOLE_E_GONE`.
 
+### Breaking
+
+- C ABI 0.6: bit 0 of every send-type call's flags is `ANOLE_BODY_BORROW`,
+  and a call's own flags start at bit 1. `ANOLE_WT_FIN` was 1, the same
+  bit as `ANOLE_BODY_BORROW`, so a borrowing `anole_wt_stream_write` (a
+  binding's usual "borrow above 64 KiB" helper) silently ended the
+  WebTransport stream after its bytes. `ANOLE_WT_FIN` is now 2, in
+  `anole_wt_stream_write`'s flags and in `ANOLE_EV_WT_DATA`'s; a borrowed
+  write is copied as before and gets its `ANOLE_EV_SENT`; unknown flag
+  bits are `ANOLE_E_INVALID`. Action: rebuild against the new `anole.h`
+  (a binding built against ABI 0.5 that passes 1 to end a stream now
+  borrows instead, and its streams do not end).
+
 ### Fixed
 
 - C ABI: two routes of the configuration that the router cannot tell
