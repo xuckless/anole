@@ -44,17 +44,17 @@ pub const Options = struct {
     /// The database `collection(name)` uses. Null: the URL's path, else
     /// "test" (as the official drivers do).
     database: ?[]const u8 = null,
-    /// The name in metrics (`db` label), spans and `/readyz`.
-    name: []const u8 = "mongodb",
+    /// The name in metrics (`db` label), spans and `/readyz`. Null: "mongodb".
+    name: ?[]const u8 = null,
     /// TLS beyond what the URL says: a CA or a client certificate in
-    /// memory. Setting it turns TLS on, and then a URL that turns TLS off
-    /// (`tls=false`) or stops checking the certificate (`tlsInsecure`,
-    /// `tlsAllowInvalidCertificates`, `tlsAllowInvalidHostnames`) is
-    /// refused rather than obeyed.
-    tls: ?net.ConnectOptions.Tls = null,
-    /// Connections at most, split between the executors (`maxPoolSize`;
-    /// 0 for no limit).
-    max_connections: usize = 100,
+    /// memory. Giving `ca` or `client_certificate` turns TLS on, and then a
+    /// URL that turns TLS off (`tls=false`) or stops checking the
+    /// certificate (`tlsInsecure`, `tlsAllowInvalidCertificates`,
+    /// `tlsAllowInvalidHostnames`) is refused rather than obeyed.
+    tls: shared.Tls = .{},
+    /// Connections at most, split between the executors (`maxPoolSize`).
+    /// Null: 100. 0 is refused.
+    max_connections: ?u32 = null,
     /// How long a call waits for a pooled connection before
     /// `error.ServiceUnavailable` (`waitQueueTimeoutMS`).
     acquire_timeout: std.Io.Duration = .fromSeconds(10),
@@ -62,14 +62,22 @@ pub const Options = struct {
     /// `error.ServiceUnavailable` (`serverSelectionTimeoutMS`).
     server_selection_timeout: std.Io.Duration = .fromSeconds(30),
     /// TCP connect and TLS handshake (`connectTimeoutMS`).
-    connect_timeout: std.Io.Duration = .fromSeconds(10),
+    /// Null: no limit.
+    connect_timeout: ?std.Io.Duration = .fromSeconds(10),
     /// Between two checks of a server (`heartbeatFrequencyMS`).
     heartbeat: std.Io.Duration = .fromSeconds(10),
-    /// A bound on every call, also sent as `maxTimeMS` (`timeoutMS`).
-    /// Null: only the request's deadline and `with(.{ .timeout })`.
-    timeout: ?std.Io.Duration = null,
+    /// A bound on every call that has no `QueryOptions.timeout` of its own,
+    /// also sent as `maxTimeMS` (`timeoutMS`). A request's deadline applies
+    /// too, whichever comes first. Null: none.
+    timeout: ?std.Io.Duration = .fromSeconds(30),
     /// Idle connections older than this are closed (`maxIdleTimeMS`).
-    max_idle: ?std.Io.Duration = null,
+    idle_timeout: ?std.Io.Duration = null,
+    /// Select a server and open one connection per executor's pool before
+    /// serving, and fail the start if that fails. Off: connections open as
+    /// calls need them.
+    connect_at_start: bool = false,
+    /// What `/readyz` waits for the ping.
+    ping_timeout: std.Io.Duration = .fromSeconds(2),
     /// Retry a read once after a network error or a primary change
     /// (`retryReads`).
     retry_reads: bool = true,
@@ -167,6 +175,10 @@ pub const Client = struct {
     settings: conn_mod.Settings,
     default_database: []const u8,
     options: Options,
+    /// `Options.name`, resolved.
+    name: []const u8,
+    /// `Options.max_connections`, resolved.
+    max_connections: u32,
     errors: shared.ErrorMap,
     /// Write and read concerns from the URL, as BSON (empty when unset).
     write_concern: ?[]const u8 = null,
@@ -197,21 +209,36 @@ pub const Client = struct {
     /// honour (a read preference other than primary, `mongodb+srv://`,
     /// a load balancer).
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
+        if (opts.max_connections) |n| if (n == 0) {
+            log.err("mongodb: max_connections is 0; set at least 1, or leave it null for 100", .{});
+            return error.InvalidOptions;
+        };
+        if (opts.tls.insecure_skip_verify and opts.tls.ca != null) {
+            log.err("mongodb: tls.insecure_skip_verify cannot be set with tls.ca: one checks the server's certificate and the other does not", .{});
+            return error.InvalidOptions;
+        }
+        if (opts.tls.client_certificate) |cc| if (cc == .dev_self_signed) {
+            log.err("mongodb: tls.client_certificate cannot be .dev_self_signed", .{});
+            return error.InvalidOptions;
+        };
+        const name = opts.name orelse "mongodb";
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .arena_state = .init(gpa),
+            .name = name,
+            .max_connections = opts.max_connections orelse 100,
             .settings = undefined,
             .default_database = undefined,
             .options = opts,
             .errors = opts.errors,
             .direct = false,
-            .observer = .{ .system = .mongodb, .name = opts.name },
+            .observer = .{ .system = .mongodb, .name = name },
             .topology = undefined,
             .sessions = undefined,
-            .cache = try .init(gpa, io, .mongodb, opts.name, opts.cache),
+            .cache = try .init(gpa, io, .mongodb, name, opts.cache),
         };
         errdefer self.cache.deinit();
         errdefer self.arena_state.deinit();
@@ -273,13 +300,19 @@ pub const Client = struct {
         };
 
         var o = opts;
-        if (cs.int("maxPoolSize")) |n| o.max_connections = @intCast(n);
+        if (cs.int("maxPoolSize")) |n| {
+            if (n == 0) {
+                log.err("mongodb: maxPoolSize=0 (no limit) is not supported; set a number", .{});
+                return error.InvalidOptions;
+            }
+            self.max_connections = @intCast(n);
+        }
         if (cs.int("waitQueueTimeoutMS")) |n| o.acquire_timeout = .fromMilliseconds(n);
         if (cs.int("serverSelectionTimeoutMS")) |n| o.server_selection_timeout = .fromMilliseconds(n);
-        if (cs.int("connectTimeoutMS")) |n| o.connect_timeout = .fromMilliseconds(n);
+        if (cs.int("connectTimeoutMS")) |n| o.connect_timeout = if (n == 0) null else .fromMilliseconds(n);
         if (cs.int("heartbeatFrequencyMS")) |n| o.heartbeat = .fromMilliseconds(n);
         if (cs.int("timeoutMS")) |n| o.timeout = if (n == 0) null else .fromMilliseconds(n);
-        if (cs.int("maxIdleTimeMS")) |n| o.max_idle = if (n == 0) null else .fromMilliseconds(n);
+        if (cs.int("maxIdleTimeMS")) |n| o.idle_timeout = if (n == 0) null else .fromMilliseconds(n);
         if (cs.boolean("retryReads")) |v| o.retry_reads = v;
         if (cs.boolean("retryWrites")) |v| o.retry_writes = v;
         self.options = o;
@@ -287,7 +320,8 @@ pub const Client = struct {
         // The URL often comes from the environment; it may not weaken TLS
         // that the code asks for, and weakening it otherwise is logged.
         const weakening = [_][]const u8{ "tlsInsecure", "tlsAllowInvalidCertificates", "tlsAllowInvalidHostnames" };
-        if (opts.tls != null) {
+        const tls_given = opts.tls.ca != null or opts.tls.client_certificate != null or opts.tls.insecure_skip_verify;
+        if (tls_given) {
             if (cs.boolean("tls") == false) {
                 log.warn("mongodb: the URL turns TLS off (tls=false), but Options.tls asks for it; take it out of the URL", .{});
                 return error.InvalidUri;
@@ -301,7 +335,11 @@ pub const Client = struct {
         };
 
         // TLS: on with tls=true, with any tls* option, or with `opts.tls`.
-        var tls: ?net.ConnectOptions.Tls = opts.tls;
+        var tls: ?net.ConnectOptions.Tls = if (tls_given) .{
+            .ca = opts.tls.ca orelse .system,
+            .client_certificate = opts.tls.client_certificate,
+            .insecure_skip_verify = opts.tls.insecure_skip_verify,
+        } else null;
         const tls_on = cs.boolean("tls") orelse (tls != null or cs.string("tlsCAFile") != null or
             cs.string("tlsCertificateKeyFile") != null or cs.get("tlsInsecure") != null or
             cs.get("tlsAllowInvalidCertificates") != null or cs.get("tlsAllowInvalidHostnames") != null);
@@ -317,7 +355,7 @@ pub const Client = struct {
 
         self.settings = .{
             .tls = tls,
-            .connect_timeout = if (o.connect_timeout.nanoseconds == 0) null else o.connect_timeout,
+            .connect_timeout = o.connect_timeout,
             .credential = credential,
             .metadata = try conn_mod.clientMetadata(arena, cs.string("appname")),
             .scram_cache = &self.scram_cache,
@@ -378,21 +416,49 @@ pub const Client = struct {
     /// What the server hands over when serving starts (`app.mongodb`): the
     /// app's metrics registry, tracer and health checks, when it has them.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        self.observer = try .init(.mongodb, self.options.name, registry, tracer);
+        self.observer = try .init(.mongodb, self.name, registry, tracer);
         try self.cache.observe(registry);
         if (health) |h| {
             self.readiness = .{ .io = self.io, .context = self, .ping = readyPing };
-            try self.readiness.register(h, self.options.name);
+            try self.readiness.register(h, self.name);
+        }
+        if (self.options.connect_at_start) self.warm() catch |err| {
+            log.err("mongodb \"{s}\": not serving, no server is reachable ({t})", .{ self.name, err });
+            return switch (err) {
+                error.Canceled => error.Canceled,
+                else => error.ServiceUnavailable,
+            };
+        };
+    }
+
+    /// `connect_at_start`: selects a server (within the server selection
+    /// timeout) and opens one connection in each executor's pool.
+    fn warm(self: *Client) !void {
+        const io = self.io;
+        const s = try self.select(io, null);
+        for (s.pools.pools) |*p| {
+            const generation = s.generation.load(.acquire);
+            const c = try Connection.open(self.gpa, io, s.address, self.settings, true);
+            c.generation = generation;
+            c.server = s;
+            try p.mutex.lock(io);
+            defer p.mutex.unlock(io);
+            p.idle.append(self.gpa, c) catch {
+                c.close();
+                return error.OutOfMemory;
+            };
+            p.total += 1;
+            self.observer.connections(1, 0);
         }
     }
 
-    /// The readiness check: a ping, two seconds at most.
+    /// The readiness check: a ping within `ping_timeout`.
     fn readyPing(context: *anyopaque, io: std.Io) bool {
         const self: *Client = @ptrCast(@alignCast(context));
         var buf: [2048]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var c: shared.Ctx = .{ .io = io, .arena = fba.allocator() };
-        _ = self.db("admin").with(.{ .timeout = .fromSeconds(2) }).runCommand(&c, .{ .ping = 1 }) catch return false;
+        _ = self.db("admin").with(.{ .timeout = self.options.ping_timeout }).runCommand(&c, .{ .ping = 1 }) catch return false;
         return true;
     }
 
@@ -481,7 +547,7 @@ pub const Client = struct {
         var parsed = conn_mod.Address.parse(text);
         parsed.text = text;
         s.* = .{ .client = self, .address = parsed, .pools = try .init(self.gpa, self.io) };
-        for (s.pools.pools, 0..) |*p, i| p.* = .{ .max = if (self.options.max_connections == 0) 0 else s.pools.share(self.options.max_connections, i) };
+        for (s.pools.pools, 0..) |*p, i| p.* = .{ .max = s.pools.share(self.max_connections, i) };
         try self.servers.append(self.gpa, s);
         return s;
     }
@@ -693,7 +759,7 @@ pub const Client = struct {
 
     fn stale(self: *Client, s: *Server, c: *Connection, io: std.Io) bool {
         if (c.generation != s.generation.load(.acquire) or s.retired.load(.acquire)) return true;
-        if (self.options.max_idle) |max| {
+        if (self.options.idle_timeout) |max| {
             if (c.last_used.durationTo(.now(io, .awake)).raw.nanoseconds > max.nanoseconds) return true;
         }
         return false;
@@ -822,7 +888,7 @@ pub const Client = struct {
     ///     fn sequences(ctx, m: *wire.Message, x: *Exchange) !void  kind-1 sections
     fn execute(self: *Client, c: *const Context, op: Operation, ctx: anytype) Error!@typeInfo(@TypeOf(ctx)).pointer.child.Result {
         const Ctx = @typeInfo(@TypeOf(ctx)).pointer.child;
-        const timeout = op.options.timeout orelse self.options.timeout;
+        const timeout = internal.callTimeout(op.options.timeout, self.options.timeout);
         const deadline: ?std.Io.Clock.Timestamp = if (timeout) |t| .fromNow(c.io, .{ .raw = t, .clock = .awake }) else null;
         const call = self.observer.start(c);
         const result = if (timeout) |t| bounded: {

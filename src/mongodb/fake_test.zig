@@ -290,8 +290,29 @@ test "fake mongod: no server, a timeout and a bad connection string" {
         "mongodb://host/?tlsAllowInvalidCertificates=true",
         "mongodb://host/?tlsAllowInvalidHostnames=true",
     }) |url| {
-        try testing.expectError(error.InvalidUri, mongodb.Client.init(gpa, io, .{ .url = url, .tls = .{} }));
+        try testing.expectError(error.InvalidUri, mongodb.Client.init(gpa, io, .{ .url = url, .tls = .{ .ca = .system } }));
     }
+}
+
+test "mongodb: max_connections = 0 and a URL's maxPoolSize=0 are InvalidOptions" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    try testing.expectError(error.InvalidOptions, mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/", .max_connections = 0 }));
+    try testing.expectError(error.InvalidOptions, mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?maxPoolSize=0" }));
+}
+
+test "mongodb: connect_at_start fails start when nothing listens" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const client = try mongodb.Client.init(gpa, io, .{
+        .url = "mongodb://127.0.0.1:1/?connectTimeoutMS=200",
+        .server_selection_timeout = .fromMilliseconds(200),
+        .connect_at_start = true,
+    });
+    defer client.deinit();
+    try testing.expectError(error.ServiceUnavailable, client.start(null, null, null));
 }
 
 test "fake mongod: coalesced and cached reads, invalidation" {
