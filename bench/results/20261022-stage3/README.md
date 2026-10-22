@@ -21,9 +21,16 @@ cases.jsonl have every number.
 - The server order rotates by one per scenario.
 - Drivers: stage3.sh, then stage3b.sh (nginx-fronted raw, then $12).
 
-Part 1: raw → conns → latency → ws → mem → gc → video → wt.
-Part 2: raw behind nginx (HTTP/1.1 only), then $12 at both tiers for all 12
-servers: the quick ladder, then each bracket bisected with 5-minute holds.
+Scope (revised 2026-10-22, 15:00, at the user's call: "drop useless
+comparisons"):
+- raw, conns and latency ran for all six servers.
+- After latency, the contenders are Anole, Bun, Fiber and Axum only. They run
+  ws, then $12 at both tiers: the quick ladder, then each bracket bisected
+  with 5-minute holds. The driver is stage3c.sh.
+- Dropped: mem, gc, video, wt and the nginx-fronted runs. servers/front stays
+  committed but unused.
+- Bun was added with /ws/feed, /ws/trade and the $12 routes (e2de24c). It
+  has no raw, conns or latency in this run.
 
 ## Raw throughput (done 13:08)
 
@@ -206,3 +213,65 @@ Notes:
 - **Express, Fastify and FastAPI** start failing connections at 1,024–4,096.
   From there their p99 drops back to tens of ms, because it only counts the
   requests that succeed. Read their latency together with the error row.
+
+## Latency at fixed rates (done 15:58)
+
+Setup:
+- 1 CPU, GET /json, oha with 64 connections, open loop, coordinated omission
+  corrected (`--latency-correction`), 30 s × 3, median run.
+- Rates: 1k, 5k and 20k req/s, plus 50% and 75% of each server's own raw
+  /json max.
+- Latencies are in ms.
+
+h1: p50 / p99 / p99.9 (achieved req/s)
+
+| server | 1000 | 5000 | 20000 | 50%max | 75%max |
+|---|---|---|---|---|---|
+| anole | 0.02 / 0.11 / 0.20 (1k) | 0.06 / 0.17 / 0.22 (5k) | 0.11 / 0.23 / 0.43 (20k) | 0.44 / 4.49 / 33 (120k) | 0.80 / 47 / 96 (179k) |
+| fiber | 0.02 / 0.10 / 0.16 (1k) | 0.05 / 0.16 / 0.20 (5k) | 0.11 / 0.26 / 0.50 (20k) | 0.46 / 2.53 / 38 (110k) | 0.76 / 53 / 105 (165k) |
+| axum | 0.02 / 0.10 / 0.17 (1k) | 0.06 / 0.17 / 0.23 (5k) | 0.11 / 0.25 / 0.53 (20k) | 0.48 / 1.16 / 32 (109k) | 0.81 / 52 / 103 (164k) |
+| express | 0.04 / 0.15 / 0.28 (1k) | 0.09 / 0.21 / 0.28 (5k) | 0.22 / 0.58 / 2.77 (20k) | 0.63 / 1.33 / 15 (39k) | 0.88 / 5.14 / 37 (59k) |
+| fastify | 0.03 / 0.11 / 0.18 (1k) | 0.07 / 0.18 / 0.28 (5k) | 0.17 / 0.43 / 1.48 (20k) | 0.55 / 1.24 / 13 (60k) | 0.87 / 20 / 53 (90k) |
+| fastapi | 0.08 / 0.19 / 0.26 (1k) | 0.27 / 0.54 / 0.61 (5k) | – | 0.47 / 1.01 / 1.15 (10k) | 0.87 / 1.70 / 7.26 (14k) |
+
+h1-tls: p50 / p99 / p99.9 (achieved req/s)
+
+| server | 1000 | 5000 | 20000 | 50%max | 75%max |
+|---|---|---|---|---|---|
+| fiber | 0.02 / 0.11 / 1.61 (1k) | 0.05 / 0.17 / 1.54 (5k) | 0.12 / 0.31 / 4.15 (20k) | 0.42 / 3.51 / 26 (98k) | 0.72 / 91 / 145 (147k) |
+| express | 0.04 / 0.15 / 2.83 (1k) | 0.09 / 0.26 / 2.54 (5k) | 0.26 / 0.64 / 8.50 (20k) | 0.51 / 1.23 / 17 (31k) | 0.92 / 7.10 / 25 (47k) |
+| fastapi | 0.09 / 0.20 / 4.32 (1k) | 0.28 / 0.61 / 2.46 (5k) | – | 0.49 / 1.05 / 8.75 (9k) | 0.88 / 1.82 / 22 (13k) |
+
+h2-tls: p50 / p99 / p99.9 (achieved req/s)
+
+| server | 1000 | 5000 | 20000 | 50%max | 75%max |
+|---|---|---|---|---|---|
+| anole | 0.04 / 0.13 / 0.28 (1k) | 0.08 / 0.20 / 0.71 (5k) | 0.16 / 0.33 / 2.29 (20k) | 6989 / 14.9 s / 15.0 s (160k) ⚠ | 9809 / 20.3 s / 20.5 s (153k) ⚠ |
+| axum | 0.04 / 0.13 / 0.28 (1k) | 0.08 / 0.21 / 42 (5k) | 0.18 / 0.42 / 44 (20k) | 1.29 / 346 / 358 (124k) | 5120 / 10.5 s / 10.5 s (122k) ⚠ |
+| fastify | 0.06 / 0.16 / 16 (1k) | 0.17 / 0.41 / 16 (5k) | 0.76 / 13 / 34 (20k) | 1.50 / 40 / 54 (31k) | 2423 / 4906 / 4956 (39k) ⚠ |
+
+⚠ means the server fell behind the target rate (its latency is then queueing).
+
+Notes:
+- **HTTP/1.1:** at the fixed rates of 1k, 5k and 20k, Anole, Fiber and Axum
+  are within a few µs at p50 and p99. At 20k req/s, Anole has the lowest p99
+  (0.23 ms) with Fiber at 0.26 and Axum at 0.25.
+  - At 50% and 75% of their own max, each runs at a different rate, because
+    Anole's max is the highest.
+  - 50%: Anole serves 120k req/s with p99 4.5 ms, Fiber 110k with 2.5 ms, and
+    Axum 109k with 1.2 ms.
+  - 75%: Anole serves 179k with p99 47 ms, against Fiber's 165k with 53 ms and
+    Axum's 164k with 52 ms.
+- **The h2 % of max rows aren't valid.** The max comes from raw's h2load
+  run, with 64 connections × 10 streams. oha keeps one request in flight per
+  connection, so 64 at a time, and can't reach those rates against anyone.
+  - Anole (targets of 322k and 483k) and Axum at 75% (188k) fell behind, and
+    their latency there is the queue.
+  - The fixed rates are valid. At 20k req/s over h2+TLS, the p99s were Anole
+    0.33 ms, Axum 0.42 ms and Fastify 13.2 ms.
+- **HTTP/3 didn't run.** The loadgen's oha was built without HTTP/3
+  support ("Your Oha instance has not been built with HTTP/3 support"), so
+  every h3 latency case is an error. That's a loadgen image bug: oha needs its
+  `http3` feature. It isn't rerun here, since the scope was cut.
+- **Errors:** 0–64 per run. These are connections still open when oha stops at
+  30 s. They show up for every server.
