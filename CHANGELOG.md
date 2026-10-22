@@ -29,6 +29,21 @@ breaking changes are listed anyway.
   (`{bookId}`) and the query by its proto name (`?book_id=`), or the other
   way around. The path's value stands, as documented. No configuration
   change.
+- gRPC: new per-registration limits (`RegisterOptions`). `read_timeout`
+  (default 30 s) bounds how long a request message may take to arrive,
+  which a call without `grpc-timeout` used not to bound at all;
+  `max_received_bytes` (default 64 MiB) bounds what one call receives in
+  all, since decoded messages stay in the call's arena; `max_call_duration`
+  (default none) caps every call. A message frame's memory now grows with the
+  bytes that arrive instead of being allocated in full from its 5-byte
+  header, and frames are freed once decoded. Transcoded routes read the body
+  under the server's request timeout before the call's deadline applies.
+  Behaviour change: a client-streaming call that receives more than 64 MiB
+  in all now fails with RESOURCE_EXHAUSTED; raise `max_received_bytes` for
+  such services.
+- JSON transcoding: a binding with a `body` answers 415 to a non-empty body
+  whose `Content-Type` is not `application/json` (or `+json`). Breaking for
+  clients that post JSON with another content type.
 
 ### C ABI (ABI 0.1)
 

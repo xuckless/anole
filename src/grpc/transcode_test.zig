@@ -574,6 +574,87 @@ test "transcoding: REST routes over HTTP/1.1 and HTTP/2" {
     }
 }
 
+test "transcoding: the body is read under the request timeout, and must be JSON" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+        .timeout = .{ .request = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Library, impl);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    const port = server.address.ip.getPort();
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+
+    const book = "{\"title\":\"T\"}";
+    {
+        // A body that never arrives in full: the request timeout still
+        // ends the request.
+        const answer = try slowExchange(gpa, io, port, &.{
+            "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"title\"",
+        }, .zero, "\r\n\r\n", .fromSeconds(5));
+        gpa.free(answer);
+    }
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "Content-Type: text/plain\r\n", "415" },
+        .{ "Content-Type: application/x-www-form-urlencoded\r\n", "415" },
+        .{ "", "415" },
+        .{ "Content-Type: application/json; charset=utf-8\r\n", "200" },
+        .{ "Content-Type: Application/JSON\r\n", "200" },
+    }) |case| {
+        var buf: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(&buf, "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ case[0], book.len, book });
+        const answer = try slowExchange(gpa, io, port, &.{request}, .zero, "\r\n\r\n", .fromSeconds(5));
+        defer gpa.free(answer);
+        if (!std.mem.startsWith(u8, answer, "HTTP/1.1 ") or !std.mem.startsWith(u8, answer[9..], case[1])) {
+            std.debug.print("{s}: {s}\n", .{ case[0], answer });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+/// Sends `parts` over a new connection, waiting `pause` before each one
+/// after the first, then reads until `needle` arrives or the peer closes.
+/// Fails with `error.Timeout` when neither happens within `wait`.
+pub fn slowExchange(gpa: std.mem.Allocator, io: std.Io, port: u16, parts: []const []const u8, pause: std.Io.Duration, needle: []const u8, wait: std.Io.Duration) ![]u8 {
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    for (parts, 0..) |part, i| {
+        if (i > 0) try io.sleep(pause, .awake);
+        try writer.interface.writeAll(part);
+        try writer.interface.flush();
+    }
+    var read_buf: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const read = struct {
+        fn until(r: *std.Io.Reader, text: []const u8) !void {
+            while (std.mem.indexOf(u8, r.buffered(), text) == null) {
+                r.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    else => |e| return e,
+                };
+            }
+        }
+    }.until;
+    const bound: dusty.Deadline = .init(io, .{ .duration = .{ .raw = wait, .clock = .awake } });
+    try bound.run(read, .{ &reader.interface, needle });
+    return gpa.dupe(u8, reader.interface.buffered());
+}
+
 test "transcoding: off for a registration" {
     const gpa = std.testing.allocator;
     var router = dusty.Router(void).init(gpa);

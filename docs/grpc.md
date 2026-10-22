@@ -149,6 +149,9 @@ app.grpcWith(pb.Greeter, .{ .SayHello = sayHello }, .{
     .transcode = false, // gRPC routes only
     .response_compression = .accepted, // default .mirror; see Compression
     .no_wait = true, // the unary handlers never wait; see below
+    .max_received_bytes = 16 * 1024 * 1024, // default 64 MiB per call
+    .read_timeout = .fromSeconds(10), // default 30 s per request message
+    .max_call_duration = .fromSeconds(600), // default none
 });
 ```
 
@@ -158,6 +161,39 @@ anyerror), impl)` (and `registerWith`), which work on any `anole.http` router.
 `max_message_size` bounds each request message after decompression; a larger
 one fails the call with RESOURCE_EXHAUSTED. `data` is for handlers that serve
 more than one registration, such as the same service on two servers.
+
+The other limits bound what one client can hold on the server:
+
+- `max_received_bytes` (64 MiB) is what one call may receive in all, each
+  message counted at its size plus 64 bytes. Decoded request messages live in
+  the call's arena until the call ends, so this is what bounds a long
+  client-streaming or bidirectional call; past it the call fails with
+  RESOURCE_EXHAUSTED. An upload of a large file in chunks needs it raised, or
+  the upload split over several calls.
+- `read_timeout` (30 s) is how long a request message may take to arrive:
+  from the start of a unary or server-streaming call, and from a message's
+  first byte in a client-streaming or bidirectional call, whose client may
+  pause between messages as long as the call lasts. Past it the call fails
+  with DEADLINE_EXCEEDED. It also bounds what the server does for the request
+  once the handler is done (sending the response, reading what is left of
+  the body). Null leaves reads to the call's deadline alone.
+- `max_call_duration` (none) caps every call: the client's deadline, and the
+  deadline of a call that sent none. Without it, a call whose client sent no
+  deadline runs as long as its handler does, as on other gRPC servers, so a
+  long-lived stream ends only when the client or the handler ends it. Set it
+  to bound those.
+
+A decoded message can take much more memory than its bytes on the wire (a
+repeated field of empty messages costs a whole struct per two bytes, a packed
+field eight bytes per byte), so a registration whose messages carry large
+repeated fields is worth a `max_message_size` well below the 4 MiB default.
+
+`app.grpc` registers on the root router, so the middleware of a
+`router.group(prefix, ...)` does not run for gRPC calls or for the REST
+routes of transcoded methods, even when their paths start with the group's
+prefix: an auth middleware on a `/v1` group does not cover a transcoded
+`/v1/...` route. Middleware added with `app.use` (or `router.use`) runs for
+them like for any route; check authorization there, or in the handler.
 
 `no_wait` is `anole.noWait` ([routing.md](routing.md)) for the
 registration's unary methods: their handlers answer from the request and
@@ -261,7 +297,9 @@ A client sets a deadline with `grpc-timeout` (Connect: `connect-timeout-ms`).
 When it passes, Anole cancels the handler: any wait on `call.io` returns
 `error.Canceled`, and the client gets DEADLINE_EXCEEDED. You do not need to
 check the deadline yourself while you wait on `call.io`. A call without a
-deadline is not bound by the server's request timeout.
+deadline is not bound by the server's request timeout, only by
+`max_call_duration` when the registration sets one; its request messages
+must still arrive within `read_timeout`.
 
 When the client resets the stream (RST_STREAM), or the connection is lost,
 the handler is canceled the same way: its next wait on `call.io` returns
@@ -360,6 +398,11 @@ curl 'http://localhost:8083/greeter.Greeter/GetGreeting?connect=v1&encoding=json
 ```
 
 A GET on any other method is `405 Method Not Allowed`.
+
+Anole sends no caching headers of its own. If a handler adds them
+(`call.addHeader("cache-control", ...)`) to a method whose answer depends on
+who asks (a cookie, a token, the caller's address), mark it `private`, or a
+shared cache may hand one user's answer to another.
 
 ## JSON transcoding
 
@@ -472,9 +515,17 @@ repeated field, its default (`[]`, `""`, `0`) when unset. Responses are
 compressed by the request's `Accept-Encoding`.
 
 `call.addHeader` sets response headers, and `call.addTrailer` sends
-`grpc-trailer-<name>` headers, as grpc-gateway does. A client's
-`grpc-timeout` header sets the deadline; without one, the call is not bound
-by the server's request timeout, as with gRPC.
+`grpc-trailer-<name>` headers, as grpc-gateway does. The request body is read
+under the server's request timeout, like any route's; once it is in, a
+client's `grpc-timeout` header sets the deadline, and without one the call is
+not bound by the server's request timeout, as with gRPC
+(`max_call_duration` caps both).
+
+A binding with a `body` takes it only as JSON: a request whose body is not
+empty and whose `Content-Type` is not `application/json` (or a `+json` type)
+is answered 415. Browsers send `text/plain` and form posts to other sites
+without asking first, so this keeps such requests from reaching a handler
+that trusts cookies.
 
 A failed call answers the gRPC code's HTTP status (the same table as
 Connect: NOT_FOUND 404, INVALID_ARGUMENT 400, UNAUTHENTICATED 401,

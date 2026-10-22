@@ -495,6 +495,75 @@ test "gRPC: request messages that nest too deeply or claim more than they hold f
     try std.testing.expectEqual(@as(u16, 200), ok.status);
 }
 
+const slowExchange = @import("transcode_test.zig").slowExchange;
+
+/// An HTTP/1.1 gRPC-Web request head for `path` with a body of `len` bytes.
+fn webHead(buf: []u8, path: []const u8, len: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "POST {s} HTTP/1.1\r\nHost: x\r\nContent-Type: application/grpc-web+proto\r\nContent-Length: {d}\r\n\r\n", .{ path, len });
+}
+
+test "gRPC: per-call limits on what a client sends and how slowly" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.registerWith(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    }, .{ .max_received_bytes = 1000, .read_timeout = .fromMilliseconds(200) });
+    var server_future = try startServer(&server, io);
+    defer server_future.cancel(io) catch {};
+    const addr = server.address.ip;
+    const port = addr.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        // A few messages fit the call's 1000 bytes; twenty of 100 do not.
+        const few = try Client.call(gpa, io, addr, "/anole.test.Echo/ClientStream", &.{ .{ .message = "a" }, .{ .message = "b" } }, &.{});
+        defer few.deinit();
+        try std.testing.expectEqual(@as(?u32, 0), few.grpc_status);
+        const many: [20]pb.EchoRequest = @splat(.{ .message = &x100 });
+        const cl = try Client.call(gpa, io, addr, "/anole.test.Echo/ClientStream", &many, &.{});
+        defer cl.deinit();
+        try std.testing.expectEqual(@as(?u32, 8), cl.grpc_status);
+    }
+
+    const message = try encodeReq(arena, .{ .message = "hi" });
+    var head_buf: [256]u8 = undefined;
+    {
+        // A unary request that declares 100 bytes and sends 2 is cut off
+        // after the read timeout, and the connection then closes rather
+        // than wait for the rest of the body.
+        const head = try webHead(&head_buf, "/anole.test.Echo/Unary", 105);
+        const answer = try slowExchange(gpa, io, port, &.{ head, "\x00\x00\x00\x00\x64ab" }, .zero, "(until the server closes)", .fromSeconds(5));
+        defer gpa.free(answer);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:4\r\n") != null);
+    }
+    {
+        // A client stream may pause between messages longer than the read
+        // timeout...
+        const head = try webHead(&head_buf, "/anole.test.Echo/ClientStream", 2 * message.len);
+        const answer = try slowExchange(gpa, io, port, &.{ head, message, message }, .fromMilliseconds(400), "grpc-status:", .fromSeconds(5));
+        defer gpa.free(answer);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:0\r\n") != null);
+    }
+    {
+        // ...but not within one.
+        const head = try webHead(&head_buf, "/anole.test.Echo/ClientStream", 2 * message.len);
+        const answer = try slowExchange(gpa, io, port, &.{ head, message, message[0..3], message[3..] }, .fromMilliseconds(400), "grpc-status:", .fromSeconds(5));
+        defer gpa.free(answer);
+        try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:4\r\n") != null);
+    }
+}
+
 fn decodeChunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
