@@ -52,6 +52,14 @@ breaking changes are listed anyway.
   `idle_ms` on a long window, reset a client's limit. docs/auth.md's API key
   example now keys on the verified owner, not the raw header. Rate-limit
   keys of IPv6 clients change; no configuration change needed.
+- JWT: `Keyring.verify` (and so `RequireJwt` with a keyring) refuses a
+  policy without an `audience` (`error.AudienceRequired`, 500 from
+  `RequireJwt` with the fix in the log), since a provider's keys also sign
+  tokens for its other clients. Action needed if you verify keyring tokens
+  without an audience: set `.audience`, or `.allow_any_audience = true` for
+  keys that sign for your application alone. New `Policy.typ` (e.g.
+  `"at+jwt"`) checks the header's `typ`, and `Policy.require_iat` makes
+  `iat` mandatory.
 
 ### C ABI (ABI 0.1)
 

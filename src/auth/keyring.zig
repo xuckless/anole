@@ -65,11 +65,15 @@ pub const Keyring = struct {
     }
 
     /// Verifies `token` with the provider's keys and checks it against
-    /// `policy`. Fetches the set on first use, on expiry, and once more
+    /// `policy`, which must name an `audience` (`error.AudienceRequired`
+    /// otherwise, unless `allow_any_audience`). Fetches the set on first use, on expiry, and once more
     /// when the token's key is unknown. A request that finds a fetch
     /// running waits for it only when the current keys cannot serve it;
     /// if that fetch fails, it gets `error.JwksFetchFailed`.
     pub fn verify(self: *Keyring, arena: std.mem.Allocator, token: []const u8, policy: jws.Policy) !jws.Verified {
+        // A provider's keys sign for every one of its clients: without an
+        // audience, their tokens for other applications would pass here.
+        if (policy.audience == null and !policy.allow_any_audience) return error.AudienceRequired;
         const set = (try self.obtain(null)).?;
         defer self.release(set);
         return jws.verify(arena, token, set.keys, policy, self.now()) catch |err| switch (err) {

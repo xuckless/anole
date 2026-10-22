@@ -34,7 +34,8 @@ A `Key` has an optional `kid`, exactly one `alg`, and its `material`
 (`.hmac`, `.rsa` with big-endian `n` and `e`, `.p256`, `.p384` or `.ed25519`).
 It supports HS256/384/512, RS256/384/512, PS256/384/512, ES256, ES384 and
 EdDSA, all on Zig's `std.crypto`. `Policy` holds `issuer`, `audience`,
-`leeway_seconds` (60), `require_exp` (true) and `max_age_seconds`. `now` is
+`typ`, `leeway_seconds` (60), `require_exp` (true), `require_iat` (false),
+`max_age_seconds` and `allow_any_audience` (false). `now` is
 in Unix seconds, for example `std.Io.Clock.real.now(req.io).toSeconds()`.
 
 Each key verifies only its own algorithm. A token whose `alg` differs from
@@ -47,8 +48,18 @@ These defaults are enforced, not optional:
   and so does any `crit` header.
 - `exp` is required (`error.MissingExpiry`). Turn off `require_exp` only for
   tokens that really have no expiry.
-- `nbf` and `iat` are checked when present. `iss`, `aud` (a string or an
-  array) and `max_age_seconds` are checked when you set them in the policy.
+- `nbf` and `iat` are checked when present (`require_iat` makes `iat`
+  mandatory). `iss`, `aud` (a string or an array), the header's `typ` and
+  `max_age_seconds` are checked when you set them in the policy.
+- Set `issuer` and `audience` whenever the keys also sign tokens for
+  others, as an identity provider's do: without `audience`, a token the
+  provider issued to another application verifies too. A `Keyring` refuses
+  a policy without `audience` (`error.AudienceRequired`; `RequireJwt`
+  answers 500 and logs the fix) unless you set `allow_any_audience = true`
+  for keys that sign for this application alone.
+- `typ = "at+jwt"` accepts only RFC 9068 access tokens (case and an
+  `application/` prefix aside), so an ID token from the same provider is
+  not taken for one; use it when your provider marks its access tokens.
 - An HMAC comparison runs in constant time.
 - An HMAC secret shorter than its hash (32 bytes for HS256, 48 for HS384,
   64 for HS512, as RFC 7518 requires) verifies nothing: `verify` fails with
@@ -72,7 +83,7 @@ go there), and refuses the request as RFC 6750 says:
 | A token that does not verify, or misses a required claim | 401, `error="invalid_token"` (expired ones also get an `error_description`) |
 | A token without the required scopes | 403, `error="insufficient_scope"` |
 | The keyring could not fetch the keys | 503, so the client keeps its token |
-| The HMAC key is shorter than its hash (`error.WeakKey`) | 500, and an error in the log |
+| The HMAC key is shorter than its hash (`error.WeakKey`), or a keyring policy has no `audience` (`error.AudienceRequired`) | 500, and an error in the log |
 
 ```zig
 const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
