@@ -1,0 +1,156 @@
+2026-10-22 07:16:19,826 Generated random file: thick-black-hdmi of size: 10485760
+2026-10-22 07:16:19,826 Requests: ['https://server4:443/thick-black-hdmi']
+2026-10-22 07:16:19,852 
+2026-10-22 07:16:19,852 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_hiicfszw/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=transfer CLIENT_WWW=/tmp/client_www_oxruw1vd/ CLIENT_DOWNLOADS=/tmp/client_download_mk494yqq/ SERVER_WWW=/tmp/server_www_726ofxj4/ SERVER_DOWNLOADS=/tmp/server_download_ul0eew1h/ SERVER_LOGS=/tmp/logs_server_80hsb8z_ CLIENT_LOGS=/tmp/logs_client_olwkilnz SCENARIO="rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s" CLIENT=peterdoornbosch/kwik_n_flupke-interop SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/thick-black-hdmi" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 07:16:32,485  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container server Recreated 
+ Container client Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container server Starting 
+ Container client Starting 
+sim  | waiting 10s for server:443
+server  | Setting up routes...
+ Container server Started 
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+ Container client Started 
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | Certificate was added to keystore
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+sim     | server:443 is available after 500.490391ms
+sim     | Using scenario: rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+sim     | 0s: first rebind in 1s, frequency 5s
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Writing keys to /logs/keys.log
+sim     | Packets: 1 Packets: 1 Packets: 4 Packets: 5 Packets: 9 Packets: 10 Packets: 14 Packets: 14 1s:  rebinding: 193.167.0.100:49965 -> 193.167.0.100:57607
+sim     | 1.01525s: unknown binding for destination 193.167.0.100:49965, dropping packet
+sim     | Packets: 16 Packets: 31 Packets: 23 Packets: 36 Packets: 51 Packets: 64 Packets: 123 Packets: 108 Packets: 231 Packets: 218 Packets: 418 Packets: 433 Packets: 715 Packets: 724 Packets: 1064 Packets: 1067 Packets: 1413 Packets: 1410 Packets: 1758 Packets: 1753 Packets: 2098 Packets: 2107 Packets: 2434 Packets: 2432 Packets: 2770 Packets: 2776 Packets: 3111 Packets: 3107 Packets: 3453 Packets: 3443 Packets: 3799 Packets: 3785 Packets: 4142 Packets: 4124 Packets: 4461 Packets: 4472 Packets: 4806 Packets: 4793 Packets: 5148 Packets: 5131 6s:  rebinding: 193.167.0.100:57607 -> 193.167.0.100:59022
+sim     | 6.00115s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00233s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00351s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00468s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00586s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00704s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00822s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.0094s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01058s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01176s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01294s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01412s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.0153s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01648s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01766s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01771s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01889s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02007s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02125s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02243s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02361s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02479s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02597s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02715s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02832s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.0295s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.03068s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.03186s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.03304s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.03422s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.0354s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.03658s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.10912s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.11011s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | Packets: 5489 Packets: 5471 Packets: 5755 Packets: 5715 Packets: 6089 Packets: 6047 Packets: 6427 Packets: 6382 Packets: 6764 Packets: 6715 7.14687s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 7.14786s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | Packets: 7102 Packets: 7048 Packets: 7440 Packets: 7380 Packets: 7756 Packets: 7709 Packets: 8098 Packets: 8048 Packets: 8450 Packets: 8395 Packets: 8797 Packets: 8739 Packets: 9139 Packets: 9080 Packets: 9424 Packets: 9486 Packets: 9813 Packets: 9763 Packets: 10155 Packets: 10104 Packets: 10496 Packets: 10442 Packets: 10840 Packets: 10782 Packets: 11184 Packets: 11123 Packets: 11462 Packets: 11524 Packets: 11849 Packets: 11798 11s:  rebinding: 193.167.0.100:59022 -> 193.167.0.100:18108
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 12022 Packets: 11989 Received signal: 15
+sim     | msg="15", +11.000000000s -1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 11989
+sim     | Packets received/dropped on interface 'eth0': 11989/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# Packets captured: 12022
+sim     | Packets received/dropped on interface 'eth1': 12022/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 07:16:32,680 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 07:16:32,681 Using the client's key log file.
+2026-10-22 07:16:32,699 
+2026-10-22 07:16:32,703 Using the client's key log file.
+2026-10-22 07:16:32,703 Using the client's key log file.
+2026-10-22 07:16:32,716 
+2026-10-22 07:16:32,719 Using the client's key log file.
+2026-10-22 07:16:32,719 Using selector: EpollSelector
+2026-10-22 07:16:33,305 Check of downloaded files succeeded.
+2026-10-22 07:16:33,305 Using the client's key log file.
+2026-10-22 07:16:33,919 Check of downloaded files succeeded.
+2026-10-22 07:16:47,774 First server packet on new path (('193.167.100.100', 443), ('193.167.0.100', 57607)) did not contain a PATH_CHALLENGE frame
+2026-10-22 07:16:47,774 Layer QUIC
+:	QUIC Connection information
+	Connection Number: 0
+	Packet Length: 190
+	1... .... = Header Form: Long Header (1)
+	.1.. .... = Fixed Bit: True
+	..00 .... = Packet Type: Initial (0)
+	.... 00.. = Reserved: 0
+	.... ..11 = Packet Number Length: 4 bytes (3)
+	Version: 1 (0x00000001)
+	Destination Connection ID Length: 8
+	Destination Connection ID: 892b99bd377ab1e6
+	Source Connection ID Length: 18
+	Source Connection ID: d41888ba8ef5a1fcd06baea3869e56c3d668
+	Token Length: 0
+	Length: 152
+	Packet Number: 113291426
+	Payload […]: bae8b119a333806ca93ca02801b78399ae6e0d08e798cbb56c873914437154b4df5dcd4ddffda3313dbedb479127de17cda40c8950e35fcbb49917219088311ef815b5973fe926ee16bedfc1862216c6182187423a966d8e9a0b60b2a5e9055da27525c80661de93569478f535fc588c
+	ACK
+	Frame Type: ACK (0x0000000000000002)
+	Largest Acknowledged: 1
+	ACK Delay: 0
+	ACK Range Count: 0
+	First ACK Range: 1
+	Offset: 0
+	Length: 123
+	Crypto Data
+	Expert Info (Note/Sequence): This QUIC frame has a reused stream offset (retransmission?)
+	This QUIC frame has a reused stream offset (retransmission?)
+	Severity level: Note
+	Group: Sequence
+	This QUIC frame has a reused stream offset (retransmission?)
+	CRYPTO
+	Frame Type: CRYPTO (0x0000000000000006)
+
