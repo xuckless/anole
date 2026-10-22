@@ -61,9 +61,10 @@ ngtcp2 1.25.0 (QUIC), including its BoringSSL crypto helper
   Source:   https://github.com/ngtcp2/ngtcp2, used through Anole's fork
             https://github.com/xuckless/ngtcp2 (branch anole: tag v1.25.0,
             its generated version.h, and Anole's patches keeping a server's
-            fallback connection ID across a migration after a NAT rebinding
-            and retransmitting two Initial packets on a server PTO)
-  Pinned:   commit f47d1322abb7d65e48920f3e539f113866824478 of the fork
+            fallback connection ID across a migration after a NAT rebinding,
+            retransmitting two Initial packets on a server PTO, and giving
+            both PATH_CHALLENGE probes of a validation round the same data)
+  Pinned:   commit dc43211c02690f9239a4601db84db2dd7d2b9b06 of the fork
   Includes: lib/ngtcp2_pcg.c (PCG random number generator,
             Copyright 2014-2019 Melissa O'Neill and the PCG Project
             contributors, Apache-2.0 OR MIT, used under MIT), compiled in

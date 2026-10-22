@@ -30,7 +30,7 @@ export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
 # The URL build.zig.zon pins for a library (matched on a fragment of it).
 url_of() {
-  grep -o "\"https://[^\"]*$1[^\"]*\"" "$root/build.zig.zon" | head -1 | tr -d '"'
+  grep -oE "\"(git\+)?https://[^\"]*$1[^\"]*\"" "$root/build.zig.zon" | head -1 | tr -d '"'
 }
 
 # The SHA-256 of every file this script downloads, by URL. build.zig.zon
@@ -73,10 +73,10 @@ fetch() {
 for lib in "${libs[@]}"; do
   case $lib in
     ngtcp2)
-      url=$(url_of "xuckless/ngtcp2/archive")
-      [ -n "$url" ] || { echo "no pinned URL matching xuckless/ngtcp2/archive" >&2; exit 1; }
-      commit=${url##*/}
-      commit=${commit%.tar.gz}
+      # Pinned by git URL: git+https://github.com/xuckless/ngtcp2#<commit>.
+      url=$(url_of "xuckless/ngtcp2#")
+      [ -n "$url" ] || { echo "no pinned URL matching xuckless/ngtcp2#" >&2; exit 1; }
+      commit=${url##*#}
       echo "== ngtcp2: xuckless/ngtcp2 at $commit"
       rm -rf "$work/ngtcp2" && git init -q "$work/ngtcp2" && cd "$work/ngtcp2"
       git fetch -q --depth 1 https://github.com/xuckless/ngtcp2 "$commit"

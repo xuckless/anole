@@ -13,7 +13,7 @@ that happens promptly.
 | HTTP core (from dusty) | src/http/core | Anole code since 2026-10-20; see "The HTTP core" below |
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
-| ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (tarball) |
+| ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (git URL) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
 | zlib-ng, zstd, Brotli, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
 | zig-protobuf | build.zig.zon | commit of the xuckless/zig-protobuf fork, branch `anole`; it pins protoc per platform |
@@ -74,12 +74,22 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      and one that makes a server PTO in the Initial space reclaim two
      packets as the client's does (`conn_write_pkt`, with
      `test_ngtcp2_conn_server_initial_pto_reclaim`; without it a ServerHello
-     split over two packets stalls quic-go's lossy handshakes).
+     split over two packets stalls quic-go's lossy handshakes), and one that
+     gives the two PATH_CHALLENGE probes of a path validation round the
+     same data, with `ngtcp2_pv_validate` combining the flags of every
+     entry that has it (`conn_write_path_challenge`, with
+     `test_ngtcp2_conn_server_path_challenge_round_data` and an addition to
+     `test_ngtcp2_pv_validate`; without it quinn, picoquic and s2n-quic,
+     which answer only the latest challenge on a path, fail the interop
+     runner's rebind-port and rebind-addr checks).
      On a new tag: drop a patch if upstream fixed its bug (run its test
      against the new tag), otherwise rebase it on a new branch, run ngtcp2's
      unit tests, commit the new `version.h`, merge into `anole`, and pin the
-     merge commit. Then run Anole's migration test ("a client that moves to
-     a new port"), `tests/h3/run.sh` and the interop runner.
+     merge commit by git URL (`zig fetch --save=ngtcp2
+     git+https://github.com/xuckless/ngtcp2#<commit>`). Then run Anole's
+     migration test ("a client that moves to a new port"), `tests/h3/run.sh`
+     and the interop runner (rebind-port and rebind-addr with quinn and
+     picoquic among the clients).
    - **nghttp3** comes from the fork as well: the tag, the release's
      generated `lib/includes/nghttp3/version.h` and its bundled
      `lib/sfparse` (a submodule in the repository, plain files in the fork,
