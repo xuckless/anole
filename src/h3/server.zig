@@ -79,6 +79,18 @@ const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 const hold_ns = std.time.ns_per_ms;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
+/// Retries an endpoint remembers (`Endpoint.retried`), and for how long:
+/// as long as a Retry's token is good.
+const retried_len = 64;
+const retried_ttl = 10 * std.time.ns_per_s;
+
+/// A Retry sent for a client's first flight (`Endpoint.retried`).
+const Retried = struct {
+    /// The client's original destination ID; `at` 0 for an empty slot.
+    dcid: net.CidKey = .{ .len = 0, .bytes = @splat(0) },
+    remote: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
+    at: u64 = 0,
+};
 /// The versions a connection may end up on, in order of preference
 /// (`Options.prefer_v2`): RFC 9368's compatible version negotiation moves
 /// a client that started in one to the first of these it also lists.
@@ -281,6 +293,10 @@ pub const Stats = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Connections accepted.
     accepted: std.atomic.Value(u64) = .init(0),
+    /// Retry packets sent: to validate an address (`validate_address`),
+    /// for a ClientHello whose start was missing, and again to a client
+    /// that has not yet acted on one (`Endpoint.retried`).
+    retries: std.atomic.Value(u64) = .init(0),
     /// Packets handled on another thread than the endpoint's own: always
     /// zero; counted in test builds only.
     foreign: std.atomic.Value(u64) = .init(0),
@@ -357,6 +373,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
+        /// The latest Retries sent because a client's first Initial
+        /// arrived without the start of its ClientHello (ngtcp2 then wants
+        /// a Retry rather than keep the rest unvalidated): until the client
+        /// acts on the Retry, it may resend its whole ClientHello without a
+        /// token, which would otherwise start a second connection beside
+        /// the one the Retry leads to (neqo, whose ClientHello leads with
+        /// a later piece, in the runner's handshakecorruption case). Such
+        /// an Initial gets a Retry again. A ring: under a flood, older
+        /// entries are overwritten, and their clients merely get the
+        /// second connection. Only the endpoint task touches it.
+        retried: [retried_len]Retried = @splat(.{}),
+        retried_next: usize = 0,
         /// The listener requests report (address, `secure`).
         listener: dusty.Listener,
         /// Requests that came in 0-RTT: run before the handshake completed
@@ -1167,6 +1195,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
+            if (hd.tokenlen == 0 and self.wasRetried(&hd.dcid, remote.ip())) {
+                // Its ClientHello again, sent before our Retry reached it.
+                return self.sendRetry(&hd, remote, local, data.len * 3);
+            }
+
             const conn = Conn.create(self, remote, local, &hd, pocid, token_type) catch |err| {
                 log.debug("new connection: {t}", .{err});
                 return;
@@ -1178,7 +1211,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), &pi, data, now(self.io));
             if (rv != 0) {
                 conn.unlock();
-                if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, local, data.len * 3);
+                if (rv == c.NGTCP2_ERR_RETRY) {
+                    self.rememberRetry(&hd.dcid, remote.ip());
+                    self.sendRetry(&hd, remote, local, data.len * 3);
+                }
                 self.giveUp(conn);
                 return;
             }
@@ -1224,6 +1260,22 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (n > 0) self.send(to, from, buf[0..@intCast(n)]);
         }
 
+        fn rememberRetry(self: *Self, dcid: *const c.ngtcp2_cid, remote: std.Io.net.IpAddress) void {
+            self.retried[self.retried_next] = .{ .dcid = .ofCid(dcid), .remote = remote, .at = @max(now(self.io), 1) };
+            self.retried_next = (self.retried_next + 1) % retried_len;
+        }
+
+        /// Whether `rememberRetry` saw this client's first flight lately.
+        fn wasRetried(self: *Self, dcid: *const c.ngtcp2_cid, remote: std.Io.net.IpAddress) bool {
+            const key: net.CidKey = .ofCid(dcid);
+            const t = now(self.io);
+            for (&self.retried) |*r| {
+                if (r.at == 0 or t -| r.at > retried_ttl) continue;
+                if (r.dcid.len == key.len and std.mem.eql(u8, r.dcid.bytes[0..r.dcid.len], key.bytes[0..key.len]) and r.remote.eql(&remote)) return true;
+            }
+            return false;
+        }
+
         fn sendRetry(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote_in: Addr, from: ?std.Io.net.IpAddress, max_len: usize) void {
             var remote = remote_in;
             var scid: c.ngtcp2_cid = undefined;
@@ -1235,7 +1287,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (token_len < 0) return;
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             const n = c.ngtcp2_crypto_write_retry(&buf, @min(buf.len, max_len), chd.version, &chd.scid, &scid, &chd.dcid, &token, @intCast(token_len));
-            if (n > 0) self.send(remote.ip(), from, buf[0..@intCast(n)]);
+            if (n <= 0) return;
+            _ = self.stats.retries.fetchAdd(1, .monotonic);
+            self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
         fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr, from: ?std.Io.net.IpAddress) void {

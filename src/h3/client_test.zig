@@ -938,6 +938,11 @@ pub const Relay = struct {
     /// after it) waits this long, once.
     hold_ms: u32 = 0,
     answered: bool = false,
+    /// The client's next this many datagrams are lost.
+    drop_up: u32 = 0,
+    /// The server's next datagram, and so all after it, waits this long,
+    /// once.
+    hold_down_ms: u32 = 0,
     recording: bool = false,
     recorded: std.ArrayList([]u8) = .empty,
     group: std.Io.Group = .init,
@@ -1010,6 +1015,11 @@ pub const Relay = struct {
             };
             r.mutex.lockUncancelable(r.io);
             r.client = dg.from;
+            if (r.drop_up > 0) {
+                r.drop_up -= 1;
+                r.mutex.unlock(r.io);
+                continue;
+            }
             const hold = if (r.answered) r.hold_ms else 0;
             if (hold > 0) r.hold_ms = 0;
             if (r.recording) {
@@ -1034,7 +1044,10 @@ pub const Relay = struct {
             r.mutex.lockUncancelable(r.io);
             r.answered = true;
             const to = r.client;
+            const hold = r.hold_down_ms;
+            r.hold_down_ms = 0;
             r.mutex.unlock(r.io);
+            if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
             if (to) |a| while (dg.next()) |d| r.front.send(r.io, a, null, 0, d, d.len);
         }
     }
@@ -1318,6 +1331,41 @@ test "h3: a client offering QUIC v2 moves to it only when the server prefers v2"
             try std.testing.expectEqual(if (prefer_v2 and offer_v2) v2 else v1, conn.quicVersion());
         }
     }
+}
+
+test "h3 server: a ClientHello resent before the client acted on our Retry gets a Retry again, not a second connection" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    // The ClientHello (with its post-quantum key share) spans two
+    // Initials; the first is lost, so the server sees a later piece first
+    // and answers with a Retry. That Retry is held up past the client's
+    // PTO, so the client resends its whole ClientHello, still without a
+    // token, before it acts on the Retry: the runner's handshakecorruption
+    // case with neqo, whose first Initial leads with a later piece.
+    relay.mutex.lockUncancelable(io);
+    relay.drop_up = 1;
+    relay.hold_down_ms = 1500;
+    relay.mutex.unlock(io);
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = relay.front.socket.address,
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+    });
+    defer conn.close();
+    const body = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+    // A Retry for the piece and one for the resent ClientHello; one
+    // connection, the one the client's token led to.
+    try std.testing.expect(f.ep.stats.retries.load(.monotonic) >= 2);
+    try std.testing.expectEqual(@as(u64, 1), f.ep.stats.accepted.load(.monotonic));
 }
 
 test "h3: a client that moves to a new port keeps its connection, and the server follows" {
