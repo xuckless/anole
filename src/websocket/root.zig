@@ -1419,3 +1419,46 @@ test "WebSocket accept key matches RFC 6455 section 1.3" {
     WebSocket.computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==", &out);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &out);
 }
+
+test "isUpgrade and offeredSubprotocols: header lines, commas, spaces, HTTP/2 :protocol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req: dusty.Request = .{ .arena = a, ._transport = undefined, ._parser = undefined };
+    req.headers = try dusty.Headers.init(a, 16);
+    // Not a handshake yet.
+    try std.testing.expect(!isUpgrade(&req));
+    req.method = .get;
+    try req.headers.add("Upgrade", "WebSocket");
+    try req.headers.add("Connection", "keep-alive, Upgrade");
+    try req.headers.add("Sec-WebSocket-Version", "13");
+    try req.headers.add("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try req.headers.add("Sec-WebSocket-Protocol", "b ,  a,,\tc");
+    try req.headers.add("sec-websocket-protocol", "d");
+    try std.testing.expect(isUpgrade(&req));
+    var it = offeredSubprotocols(&req);
+    const want = [_][]const u8{ "b", "a", "c", "d" };
+    for (want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expectEqualStrings("a", selectSubprotocol(&req, &.{ "x", "a", "b" }).?);
+    try std.testing.expectEqualStrings("d", selectSubprotocol(&req, &.{ "d", "a" }).?);
+    try std.testing.expect(selectSubprotocol(&req, &.{"x"}) == null);
+    try std.testing.expect(selectSubprotocol(&req, &.{}) == null);
+    // Wrong version.
+    try req.headers.put("Sec-WebSocket-Version", "8");
+    try std.testing.expect(!isUpgrade(&req));
+    // HTTP/2 extended CONNECT.
+    if (features.http2 or features.http3) {
+        req.protocol = "websocket";
+        try req.headers.put("Sec-WebSocket-Version", "13");
+        try std.testing.expect(isUpgrade(&req));
+        req.protocol = "connect-udp";
+        try std.testing.expect(!isUpgrade(&req));
+    }
+    try std.testing.expect(isToken("graphql-transport-ws"));
+    try std.testing.expect(!isToken("a b"));
+    try std.testing.expect(!isToken(""));
+    try std.testing.expect(!handshakeHeaderAllowed("sec-websocket-accept"));
+    try std.testing.expect(!handshakeHeaderAllowed("Content-Length"));
+    try std.testing.expect(handshakeHeaderAllowed("Set-Cookie"));
+}
