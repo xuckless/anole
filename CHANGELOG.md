@@ -289,6 +289,107 @@ breaking changes are listed anyway.
   ping or pong over 125 bytes from the handler fails with
   `error.LargeControlFrame`; a close goes out once even when two tasks
   close at the same time, and a frame cut short ends sending.
+- Server-Sent Events: a bare CR in event data now ends a `data:` line, as
+  LF and CRLF already did (in `send` and in `startSend`'s writer, also when
+  a CRLF is split across two writes). Before, data relayed from one user
+  could add `event`, `id` or `retry` fields to the events other users got.
+  No configuration change needed.
+- `setCookie` refuses a `path` or `domain` containing `;` or a control
+  character (`error.InvalidCookiePath`, `error.InvalidCookieDomain`), so a
+  value taken from a request cannot add cookie attributes.
+- Session cookies: `cookie_opts` of `anole.session.Config` and of
+  `anole.http.middleware.Session.Config` is now `SessionCookieOpts`, whose
+  every field defaults to the safe value. Setting one field (say
+  `.{ .same_site = .none }`) used to reset the others to plain cookie
+  defaults: no `HttpOnly`, no `Secure`, no `Path`. Breaking: the type
+  changed and has no `max_age` (the middleware sets it); struct literals
+  keep compiling.
+- `anole.http.middleware.Session` (the HMAC-signed cookie): every cookie
+  now carries a signed expiry (`max_age`, else the new `lifetime`, 24 h,
+  renewed while the session is in use), and the signature covers the
+  cookie's name. Cookies signed before this release are no longer accepted
+  (users sign in again); no configuration change needed.
+- Server-side sessions: a request that loaded a session before it was
+  destroyed (a logout, `regenerate` from another request) no longer writes
+  it back when it ends. The middleware now writes a session only when the
+  request changed it, and only if it still exists (`Store.update`, Redis
+  `SET ... XX`), and renews an unchanged one with `Store.touch` (Redis
+  `EXPIRE`). `Store.VTable` has the two new optional entries; a custom store
+  without them falls back to `load` + `save`, so implement them.
+- `MemoryStore` sweeps expired sessions as new ones are written, and holds
+  at most `max_entries` (100,000 by default, `MemoryStore.initOptions`);
+  before, sessions created and never seen again (anonymous visitors, CSRF
+  tokens on a login form) stayed in memory for good.
+- `anole.session.regenerate` also drops the session's CSRF token, so a
+  token from before a sign-in is not valid after it. Both session
+  middlewares refuse a `__Host-`/`__Secure-` cookie name that their
+  `cookie_opts` do not satisfy (`error.CookiePrefixMismatch`); docs/auth.md
+  recommends `__Host-anole_session` in production.
+- Rate limiting: `ratelimit.clientAddress` groups IPv6 clients by their /64
+  (`clientAddressPrefix(bits)` for another prefix), so a client with a
+  /64 no longer gets a bucket per address. `MemoryLimiter` never evicts a
+  throttled bucket to make room for a new key (a full table sends new keys
+  to a shared overflow bucket instead), and forgets an idle key only once
+  its bucket has refilled; before, a stream of fresh keys, or waiting
+  `idle_ms` on a long window, reset a client's limit. docs/auth.md's API key
+  example now keys on the verified owner, not the raw header. Rate-limit
+  keys of IPv6 clients change; no configuration change needed.
+- JWT: `Keyring.verify` (and so `RequireJwt` with a keyring) refuses a
+  policy without an `audience` (`error.AudienceRequired`, 500 from
+  `RequireJwt` with the fix in the log), since a provider's keys also sign
+  tokens for its other clients. Action needed if you verify keyring tokens
+  without an audience: set `.audience`, or `.allow_any_audience = true` for
+  keys that sign for your application alone. New `Policy.typ` (e.g.
+  `"at+jwt"`) checks the header's `typ`, and `Policy.require_iat` makes
+  `iat` mandatory.
+- JWKS `Keyring`: while the provider can't be reached, keys past their TTL
+  stay in use for `stale_seconds` (24 h), and failed fetches back off
+  (`retry_seconds` 5, doubling up to `max_retry_seconds` 300). Before, an
+  outage failed every request with 503 and turned each one into another
+  fetch. No configuration change needed.
+- OIDC: ID tokens must carry `iat`; `azp`, when present, must be the
+  `client_id` (before, it was checked only with several audiences); the
+  token request no longer follows redirects (a 307/308 would have carried
+  the code and client secret on); `Provider.discover` refuses non-`https`
+  issuers and endpoints (`error.InsecureEndpoint`, loopback `http` aside).
+  `Identity` gains `issuer`: key accounts on `(issuer, subject)`, as
+  docs/auth.md now says.
+- Response cache: requests with a TLS client certificate bypass it like
+  those with `Authorization`/`Cookie`/`X-API-Key`, and the new
+  `ResponseCache.Options.cacheable` predicate refuses others per route.
+  docs/routing.md now warns up front that an answer depending on anything
+  else (an app-specific header, the client's address) must be excluded
+  through `credential_headers` or `cacheable`. Check your cached routes.
+- `anole.Server` answers 425 Too Early to unsafe requests marked
+  `Early-Data: 1` on every server, not only when HTTP/3 is on, so a proxy
+  that accepts TLS early data in front of an HTTP/1.1 or HTTP/2 server no
+  longer gets replayable POSTs through. `app.use(anole.early_data.Guard{})`
+  is no longer needed (it is harmless).
+- `RequestId` with `trust_incoming` keeps an incoming ID only if it is 1 to
+  128 of `[A-Za-z0-9._:-]` (before: any visible ASCII), and the JSON access
+  log escapes `request_id`, `trace_id` and `span_id`: a client-chosen ID
+  could add or override fields in the JSON line.
+- Access logs (`observe.AccessLog`, `middleware.Logger`) leave the query
+  string out by default (`log_query = true` keeps it), since queries carry
+  sign-in codes, reset tokens and API keys. `access_log.format` drops it
+  too; `formatLine` takes the option. Log consumers that parsed the query
+  out of `path` need `log_query`.
+- `app.metrics(.{ .listener = "admin" })`, `app.health(.{ .listener = ... })`
+  (and `Registry.serveOnListener`, `Health.Options.listener`) serve
+  `/metrics`, `/healthz` and `/readyz` on one named listener only, 404
+  elsewhere. Without it they are on every listener, as before;
+  docs/observability.md now says how to keep them off the public port,
+  since they name routes, errors, databases and failing checks.
+- `auth.apikey.generate` and `session.devKey` take their bytes from the
+  operating system (`std.Io.randomSecure`) and fail rather than fall back
+  to a weaker source; `apikey.generate` can now return
+  `error.EntropyUnavailable`.
+- Examples model the safe patterns: `examples/rest` (and the
+  getting-started guide) read the API key from `API_KEY`, keep its SHA-256
+  and compare in constant time instead of a hard-coded key compared with
+  `std.mem.eql`; `examples/observe` serves `/metrics`, the health routes and
+  its `/maintenance` switch on a loopback-only admin listener (the next
+  port) instead of the public one.
 
 ### C ABI (ABI 0.1)
 

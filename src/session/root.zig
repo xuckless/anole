@@ -25,6 +25,10 @@ const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;
 const log = std.log.scoped(.anole_session);
 
+/// The session cookie's attributes (`Config.cookie_opts`), with secure
+/// defaults for every field.
+pub const CookieOpts = dusty.SessionCookieOpts;
+
 /// The cookie encryption key's length in bytes (32), for `Config.key`.
 pub const key_length = Cipher.key_length;
 
@@ -33,7 +37,11 @@ pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    /// What a store implements.
+    /// What a store implements. `update` and `touch` must not bring back a
+    /// session that is gone: a request still running when the session was
+    /// destroyed (a logout, `regenerate`) ends with one of them. A store
+    /// without them gets `load` followed by `save`, which leaves a short
+    /// window for that.
     pub const VTable = struct {
         /// The session's serialized data, copied into `arena`; null when
         /// there is none (or it expired).
@@ -42,6 +50,12 @@ pub const Store = struct {
         save: *const fn (ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!void,
         /// Removes the session `id`; one that is not there is no error.
         destroy: *const fn (ptr: *anyopaque, id: []const u8) anyerror!void,
+        /// Replaces the data under `id`, for `ttl_seconds`, only if it is
+        /// still there (Redis `SET ... XX`); false when it is not.
+        update: ?*const fn (ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!bool = null,
+        /// Renews `id` for `ttl_seconds` without rewriting it, only if it
+        /// is still there (Redis `EXPIRE`); false when it is not.
+        touch: ?*const fn (ptr: *anyopaque, id: []const u8, ttl_seconds: u32) anyerror!bool = null,
     };
 
     /// The data stored under `id`, copied into `arena`, or null.
@@ -56,51 +70,130 @@ pub const Store = struct {
     pub fn destroy(s: Store, id: []const u8) !void {
         return s.vtable.destroy(s.ptr, id);
     }
+    /// Replaces the data under `id` if it is still there; false when it is
+    /// not. `arena` is for a store without `update`.
+    pub fn update(s: Store, arena: std.mem.Allocator, id: []const u8, data: []const u8, ttl_seconds: u32) !bool {
+        if (s.vtable.update) |f| return f(s.ptr, id, data, ttl_seconds);
+        if ((try s.load(arena, id)) == null) return false;
+        try s.save(id, data, ttl_seconds);
+        return true;
+    }
+    /// Renews `id` if it is still there; false when it is not. `arena` is
+    /// for a store without `touch`.
+    pub fn touch(s: Store, arena: std.mem.Allocator, id: []const u8, ttl_seconds: u32) !bool {
+        if (s.vtable.touch) |f| return f(s.ptr, id, ttl_seconds);
+        const data = (try s.load(arena, id)) orelse return false;
+        try s.save(id, data, ttl_seconds);
+        return true;
+    }
 };
 
 /// Sessions in this process's memory: for a single node, and tests.
+/// Bounded: expired sessions are swept as new ones are written, and past
+/// `max_entries` the one written longest ago goes.
 pub const MemoryStore = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
-    entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    entries: std.StringHashMapUnmanaged(*Entry) = .empty,
+    /// Most recently written first. The middleware gives every session the
+    /// same TTL, so the far end is where they expire first.
+    order: std.DoublyLinkedList = .{},
+    max_entries: usize,
+    /// Whether the "store full" warning was logged already.
+    warned_full: bool = false,
 
-    const Entry = struct { data: []u8, expires: i64 };
+    const Entry = struct {
+        key: []u8,
+        data: []u8,
+        expires: i64,
+        node: std.DoublyLinkedList.Node = .{},
+    };
 
-    /// An empty store. Expired sessions are dropped when next looked up.
+    /// `initOptions`' settings.
+    pub const Options = struct {
+        /// Sessions kept at most; past it, the one written longest ago is
+        /// dropped (its user is signed out), with a warning in the log.
+        max_entries: usize = 100_000,
+    };
+
+    /// An empty store with the default `Options`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) MemoryStore {
-        return .{ .gpa = gpa, .io = io };
+        return initOptions(gpa, io, .{});
+    }
+
+    /// An empty store.
+    pub fn initOptions(gpa: std.mem.Allocator, io: std.Io, options: Options) MemoryStore {
+        return .{ .gpa = gpa, .io = io, .max_entries = @max(1, options.max_entries) };
     }
 
     /// Frees every session.
     pub fn deinit(self: *MemoryStore) void {
-        var it = self.entries.iterator();
-        while (it.next()) |e| {
-            self.gpa.free(e.key_ptr.*);
-            self.gpa.free(e.value_ptr.data);
-        }
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| self.freeEntry(e.*);
         self.entries.deinit(self.gpa);
     }
 
     /// The store interface for `Config.store`; `self` must outlive the
     /// middleware.
     pub fn store(self: *MemoryStore) Store {
-        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy } };
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch } };
+    }
+
+    /// How many sessions are kept now, expired ones not yet swept included.
+    pub fn count(self: *MemoryStore) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.entries.count();
     }
 
     fn now(self: *MemoryStore) i64 {
         return std.Io.Clock.real.now(self.io).toSeconds();
     }
 
+    fn freeEntry(self: *MemoryStore, e: *Entry) void {
+        self.gpa.free(e.key);
+        self.gpa.free(e.data);
+        self.gpa.destroy(e);
+    }
+
+    fn removeLocked(self: *MemoryStore, e: *Entry) void {
+        self.order.remove(&e.node);
+        _ = self.entries.remove(e.key);
+        self.freeEntry(e);
+    }
+
+    /// The live entry for `id`; an expired one is removed.
+    fn liveLocked(self: *MemoryStore, id: []const u8, t: i64) ?*Entry {
+        const e = self.entries.get(id) orelse return null;
+        if (e.expires <= t) {
+            self.removeLocked(e);
+            return null;
+        }
+        return e;
+    }
+
+    /// Drops expired entries from the far end of `order`.
+    fn sweepLocked(self: *MemoryStore, t: i64) void {
+        while (self.order.last) |n| {
+            const e: *Entry = @fieldParentPtr("node", n);
+            if (e.expires > t) break;
+            self.removeLocked(e);
+        }
+    }
+
+    /// `e` was just written: to the front, with its new expiry.
+    fn renewLocked(self: *MemoryStore, e: *Entry, t: i64, ttl_seconds: u32) void {
+        e.expires = t + ttl_seconds;
+        self.order.remove(&e.node);
+        self.order.prepend(&e.node);
+    }
+
     fn load(ptr: *anyopaque, arena: std.mem.Allocator, id: []const u8) anyerror!?[]const u8 {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const e = self.entries.get(id) orelse return null;
-        if (e.expires <= self.now()) {
-            removeLocked(self, id);
-            return null;
-        }
+        const e = self.liveLocked(id, self.now()) orelse return null;
         return try arena.dupe(u8, e.data);
     }
 
@@ -108,31 +201,61 @@ pub const MemoryStore = struct {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const t = self.now();
+        self.sweepLocked(t);
         const copy = try self.gpa.dupe(u8, data);
         errdefer self.gpa.free(copy);
-        const gop = try self.entries.getOrPut(self.gpa, id);
-        if (gop.found_existing) {
-            self.gpa.free(gop.value_ptr.data);
-        } else {
-            gop.key_ptr.* = self.gpa.dupe(u8, id) catch |err| {
-                self.entries.removeByPtr(gop.key_ptr);
-                return err;
-            };
+        if (self.entries.get(id)) |e| {
+            self.gpa.free(e.data);
+            e.data = copy;
+            self.renewLocked(e, t, ttl_seconds);
+            return;
         }
-        gop.value_ptr.* = .{ .data = copy, .expires = self.now() + ttl_seconds };
+        if (self.entries.count() >= self.max_entries) {
+            if (!self.warned_full) {
+                self.warned_full = true;
+                log.warn("anole.session: MemoryStore holds max_entries ({d}) sessions; the oldest are being dropped", .{self.max_entries});
+            }
+            self.removeLocked(@fieldParentPtr("node", self.order.last.?));
+        }
+        const e = try self.gpa.create(Entry);
+        errdefer self.gpa.destroy(e);
+        const key = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(key);
+        e.* = .{ .key = key, .data = copy, .expires = t + ttl_seconds };
+        try self.entries.put(self.gpa, key, e);
+        self.order.prepend(&e.node);
+    }
+
+    fn update(ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!bool {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const t = self.now();
+        const e = self.liveLocked(id, t) orelse return false;
+        const copy = try self.gpa.dupe(u8, data);
+        self.gpa.free(e.data);
+        e.data = copy;
+        self.renewLocked(e, t, ttl_seconds);
+        return true;
+    }
+
+    fn touch(ptr: *anyopaque, id: []const u8, ttl_seconds: u32) anyerror!bool {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const t = self.now();
+        const e = self.liveLocked(id, t) orelse return false;
+        self.renewLocked(e, t, ttl_seconds);
+        return true;
     }
 
     fn destroy(ptr: *anyopaque, id: []const u8) anyerror!void {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        removeLocked(self, id);
-    }
-
-    fn removeLocked(self: *MemoryStore, id: []const u8) void {
-        const kv = self.entries.fetchRemove(id) orelse return;
-        self.gpa.free(kv.key);
-        self.gpa.free(kv.value.data);
+        const e = self.entries.get(id) orelse return;
+        self.removeLocked(e);
     }
 };
 
@@ -149,7 +272,7 @@ pub const RedisStore = if (features.redis) struct {
     /// The store interface for `Config.store`; `self` must outlive the
     /// middleware.
     pub fn store(self: *@This()) Store {
-        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy } };
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch } };
     }
 
     fn key(self: *@This(), buf: []u8, id: []const u8) ![]const u8 {
@@ -170,6 +293,26 @@ pub const RedisStore = if (features.redis) struct {
         var buf: [256]u8 = undefined;
         var c: db.Ctx = .{ .io = self.client.io, .arena = arena.allocator() };
         _ = try self.client.set(&c, try self.key(&buf, id), data, .{ .ttl = .fromSeconds(ttl_seconds) });
+    }
+
+    /// SET ... XX: only while the key exists.
+    fn update(ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        var buf: [256]u8 = undefined;
+        var c: db.Ctx = .{ .io = self.client.io, .arena = arena.allocator() };
+        return self.client.set(&c, try self.key(&buf, id), data, .{ .ttl = .fromSeconds(ttl_seconds), .xx = true });
+    }
+
+    /// EXPIRE: false when the key is gone.
+    fn touch(ptr: *anyopaque, id: []const u8, ttl_seconds: u32) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        var buf: [256]u8 = undefined;
+        var c: db.Ctx = .{ .io = self.client.io, .arena = arena.allocator() };
+        return self.client.expire(&c, try self.key(&buf, id), .fromSeconds(ttl_seconds));
     }
 
     fn destroy(ptr: *anyopaque, id: []const u8) anyerror!void {
@@ -195,19 +338,27 @@ pub const Config = struct {
     /// development only, `devKey(io)` makes a random one.
     key: ?[key_length]u8 = null,
     /// The cookie's name; also bound into the sealed cookie, so renaming
-    /// it ends every cookie-mode session.
+    /// it ends every cookie-mode session. Over HTTPS, a `__Host-` name
+    /// (`__Host-anole_session`) keeps the cookie to this host and path `/`,
+    /// so a sibling subdomain cannot set or shadow it; `init` checks that
+    /// `cookie_opts` allows it.
     cookie_name: []const u8 = "anole_session",
     /// How long a session lives without being touched; each response that
     /// carries it renews it.
     ttl_seconds: u32 = 24 * 3600,
     /// The cookie's attributes: path `/`, `HttpOnly`, `Secure` and
-    /// `SameSite=Lax` by default. `max_age` is set from `ttl_seconds`.
-    cookie_opts: dusty.CookieOpts = .{ .path = "/", .http_only = true, .secure = true, .same_site = .lax },
+    /// `SameSite=Lax` by default, each kept unless set here (`.{ .same_site =
+    /// .none }` changes only that one). `Max-Age` comes from `ttl_seconds`.
+    cookie_opts: CookieOpts = .{},
 };
 
 /// The session entry `regenerate` leaves for the middleware. Never stored:
 /// the save path takes it out first.
 pub const regenerate_key = "_anole_regenerate";
+
+/// Where `anole.auth.csrf` keeps the session's token; `regenerate` drops
+/// it, so a token handed out before a sign-in is not valid after.
+pub const csrf_key = "_csrf";
 
 /// Asks the session middleware to issue a new session id when it saves
 /// this response: call it when someone signs in (or their privileges
@@ -217,16 +368,24 @@ pub const regenerate_key = "_anole_regenerate";
 /// every save; an earlier copy of it stays valid until it expires, but
 /// holds only what the session held before.
 ///
+/// It also drops the session's CSRF token (`anole.auth.csrf`): the next
+/// `csrf.token(req)`, in this request or a later one, makes a new one.
+///
 /// It takes one of the session's 16 entries until the response is saved.
 pub fn regenerate(req: *dusty.Request) error{ SessionFull, InvalidSessionData }!void {
+    req.session.remove(csrf_key);
     try req.session.set(regenerate_key, "1");
 }
 
-/// What `Middleware.init` refuses: cookie mode without a usable key.
+/// What `Middleware.init` refuses: cookie mode without a usable key, and
+/// a cookie name whose prefix `cookie_opts` does not satisfy.
 pub const ConfigError = error{
     /// Cookie mode (no `Config.store`) with `Config.key` null or all
     /// zeros: such cookies could be forged and read by anyone.
     SessionKeyMissing,
+    /// A `__Host-` name without `Secure`, `Path=/` and no `Domain`, or a
+    /// `__Secure-` one without `Secure`: browsers would drop the cookie.
+    CookiePrefixMismatch,
 };
 
 /// The session middleware: `app.use(try anole.session.Middleware.init(config))`.
@@ -237,12 +396,20 @@ pub const Middleware = struct {
 
     /// The middleware for `config`. Before the handler it loads
     /// `req.session` from the cookie (a missing, expired or forged one
-    /// leaves it empty); after, it saves the session when it changed or
-    /// holds anything, and clears the cookie when it was emptied.
+    /// leaves it empty); after, it saves the session when it changed,
+    /// renews it when it holds anything, and clears the cookie when it was
+    /// emptied. With a store, a session destroyed while the request ran
+    /// (a logout elsewhere) stays destroyed.
     ///
     /// In cookie mode it fails with `error.SessionKeyMissing` (and logs
-    /// how to fix it) when `config.key` is null or all zeros.
+    /// how to fix it) when `config.key` is null or all zeros. It fails with
+    /// `error.CookiePrefixMismatch` for a `__Host-`/`__Secure-` name that
+    /// `cookie_opts` does not allow.
     pub fn init(config: Config) ConfigError!Middleware {
+        config.cookie_opts.checkPrefix(config.cookie_name) catch |err| {
+            log.err("anole.session: a __Host- cookie needs Secure, Path=/ and no Domain; a __Secure- one needs Secure", .{});
+            return err;
+        };
         if (config.store != null) return .{ .config = config, .key = @splat(0) };
         const key = cookieKey(config.key) orelse {
             log.err("anole.session: cookie sessions need Config.key, 32 random bytes (not all zeros) from your secret store and the same on every node " ++
@@ -297,19 +464,32 @@ pub const Middleware = struct {
         if (req.session.len == 0) {
             // Cleared: forget it, here and in the browser.
             if (self.config.store) |store| if (id) |i| try store.destroy(i);
-            var opts = self.config.cookie_opts;
-            opts.max_age = .zero;
-            return res.setCookie(self.config.cookie_name, "", opts);
+            return res.setCookie(self.config.cookie_name, "", self.config.cookie_opts.withMaxAge(.zero));
         }
-        const data = try serialize(req.arena, &req.session);
-        var opts = self.config.cookie_opts;
-        opts.max_age = .fromSeconds(self.config.ttl_seconds);
+        const opts = self.config.cookie_opts.withMaxAge(.fromSeconds(self.config.ttl_seconds));
+        const ttl = self.config.ttl_seconds;
         if (self.config.store) |store| {
             if (fresh) if (id) |old| try store.destroy(old);
-            const session_id = if (fresh) try newId(req.arena, req.io) else id orelse try newId(req.arena, req.io);
-            try store.save(session_id, data, self.config.ttl_seconds);
+            if (id != null and !fresh) {
+                // The session this request loaded, written or renewed only
+                // if it still exists: one destroyed meanwhile (a logout, a
+                // `regenerate` by another request) stays destroyed, and
+                // the browser gets no cookie for it.
+                const alive = if (req.session.modified)
+                    try store.update(req.arena, id.?, try serialize(req.arena, &req.session), ttl)
+                else
+                    try store.touch(req.arena, id.?, ttl);
+                if (!alive) return;
+                return res.setCookie(self.config.cookie_name, id.?, opts);
+            }
+            // A new id, which only a cookie can hand out: none is stored
+            // once the response has started.
+            if (res.headers_written) return error.HeadersAlreadySent;
+            const session_id = try newId(req.arena, req.io);
+            try store.save(session_id, try serialize(req.arena, &req.session), ttl);
             return res.setCookie(self.config.cookie_name, session_id, opts);
         }
+        const data = try serialize(req.arena, &req.session);
         const plain = try req.arena.alloc(u8, 8 + data.len);
         std.mem.writeInt(i64, plain[0..8], std.Io.Clock.real.now(req.io).toSeconds() + self.config.ttl_seconds, .little);
         @memcpy(plain[8..], data);
@@ -333,7 +513,9 @@ fn cookieKey(key: ?[key_length]u8) ?[key_length]u8 {
 pub fn devKey(io: std.Io) [key_length]u8 {
     log.warn("anole.session: using a random development key; sessions end on restart and differ between nodes. Set Config.key from your secret store in production", .{});
     var key: [key_length]u8 = undefined;
-    io.random(&key);
+    // From the operating system, or not at all: a key from a weaker
+    // source would make every cookie forgeable.
+    io.randomSecure(&key) catch |err| std.debug.panic("anole.session.devKey: no secure randomness from the system: {t}", .{err});
     return key;
 }
 
@@ -485,4 +667,65 @@ test "fuzz: forged session cookies never open" {
             if (open(arena, key, "sid", raw)) |_| return error.ForgedCookieOpened else |_| {}
         }
     }.check, &.{ "", "AAAA", &@as([80]u8, @splat('A')), &@as([40]u8, @splat(0)) });
+}
+
+test "MemoryStore: capped at max_entries, and update/touch never bring a session back" {
+    const level = std.testing.log_level;
+    std.testing.log_level = .err; // the "store full" warning is expected
+    defer std.testing.log_level = level;
+    var mem = MemoryStore.initOptions(std.testing.allocator, std.testing.io, .{ .max_entries = 3 });
+    defer mem.deinit();
+    const s = mem.store();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try s.save("a", "1", 3600);
+    try s.save("b", "1", 3600);
+    try s.save("c", "1", 3600);
+    try std.testing.expect(try s.touch(arena, "a", 3600)); // a is the most recent now
+    try s.save("d", "1", 3600); // b goes
+    try std.testing.expectEqual(@as(usize, 3), mem.count());
+    try std.testing.expect((try s.load(arena, "b")) == null);
+    try std.testing.expect((try s.load(arena, "a")) != null);
+    try std.testing.expect(try s.update(arena, "a", "2", 3600));
+    try std.testing.expectEqualStrings("2", (try s.load(arena, "a")).?);
+    try s.destroy("a");
+    try std.testing.expect(!try s.update(arena, "a", "3", 3600));
+    try std.testing.expect(!try s.touch(arena, "a", 3600));
+    try std.testing.expect((try s.load(arena, "a")) == null);
+}
+
+test "regenerate drops the CSRF token, and __Host- names are checked" {
+    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    try req.session.set(csrf_key, "old-token");
+    try req.session.set("user", "alice");
+    try regenerate(&req);
+    try std.testing.expect(req.session.get(csrf_key) == null);
+    try std.testing.expectEqualStrings("alice", req.session.get("user").?);
+    // The defaults allow a __Host- name (the refusals are in cookie.zig's
+    // tests, without the error this would log).
+    _ = try Middleware.init(.{ .key = @splat(1), .cookie_name = "__Host-anole_session" });
+    const opts: CookieOpts = .{ .path = "/app" };
+    try std.testing.expectError(error.CookiePrefixMismatch, opts.checkPrefix("__Host-s"));
+}
+
+test "Config: setting one cookie_opts field keeps the secure defaults of the others" {
+    const mw = try Middleware.init(.{ .key = @splat(1), .cookie_opts = .{ .same_site = .strict } });
+    try std.testing.expect(mw.config.cookie_opts.http_only);
+    try std.testing.expect(mw.config.cookie_opts.secure);
+    try std.testing.expectEqualStrings("/", mw.config.cookie_opts.path);
+}
+
+test "MemoryStore: expired sessions are swept as new ones come in" {
+    var mem = MemoryStore.init(std.testing.allocator, std.testing.io);
+    defer mem.deinit();
+    const s = mem.store();
+    var buf: [16]u8 = undefined;
+    // Each expires at once (a TTL of 0), and none is ever looked up again.
+    for (0..500) |i| try s.save(try std.fmt.bufPrint(&buf, "dead{d}", .{i}), "x", 0);
+    try s.save("live", "x", 3600);
+    try std.testing.expect(mem.entries.count() < 100);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings("x", (try s.load(arena_state.allocator(), "live")).?);
 }

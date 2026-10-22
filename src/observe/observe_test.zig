@@ -127,6 +127,20 @@ test "access log: text and JSON lines" {
     try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
 }
 
+test "access log: a request ID cannot add JSON fields" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/x";
+    req.id = "x\",\"status\":200,\"y\":\"\\";
+    const json = try observe.access_log.format(arena, .json, &req, 403, 1, 0, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqual(@as(i64, 403), parsed.object.get("status").?.integer);
+    try std.testing.expectEqualStrings(req.id, parsed.object.get("request_id").?.string);
+}
+
 fn relay(req: *dusty.Request, res: *dusty.Response) !void {
     var buf: [55]u8 = undefined;
     res.body = try res.arena.dupe(u8, observe.trace.outgoing(req, &buf) orelse "none");
@@ -351,4 +365,21 @@ test "observe: exclude keeps probes out of metrics and traces" {
     var spans: [8]observe.trace.Span = undefined;
     try std.testing.expectEqual(@as(usize, 1), try exporter.queue.get(io, &spans, 0));
     try std.testing.expectEqualStrings("/users/:id", spans[0].route[0..spans[0].route_len]);
+}
+
+test "access log: the query is left out unless log_query" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/callback?code=secret-code&state=s";
+    const json = try observe.access_log.format(arena, .json, &req, 200, 1, 0, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqualStrings("/callback", parsed.object.get("path").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, json, "secret-code") == null);
+    const text = try observe.access_log.format(arena, .text, &req, 200, 1, 0, null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret-code") == null);
+    const kept = try observe.access_log.formatLine(arena, .{ .format = .text, .log_query = true }, &req, 200, 1, 0, null);
+    try std.testing.expect(std.mem.startsWith(u8, kept, "GET /callback?code=secret-code&state=s 200 "));
 }

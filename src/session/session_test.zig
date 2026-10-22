@@ -161,3 +161,96 @@ test "session: memory store" {
 test "redis: live session store (RedisStore)" {
     try run(.redis);
 }
+
+/// Lets a test hold a request inside its handler, after the session was
+/// loaded, while other requests run.
+const Gate = struct {
+    var entered: std.Io.Event = .unset;
+    var release: std.Io.Event = .unset;
+
+    fn reset() void {
+        entered = .unset;
+        release = .unset;
+    }
+
+    /// Reads the session, then waits for the test.
+    fn slowRead(req: *dusty.Request, res: *dusty.Response) !void {
+        res.body = req.session.get("user") orelse "none";
+        entered.set(req.io);
+        try release.wait(req.io);
+    }
+
+    /// Writes to the session, then waits for the test.
+    fn slowWrite(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.session.set("seen", "1");
+        res.body = "wrote";
+        entered.set(req.io);
+        try release.wait(req.io);
+    }
+};
+
+/// A request that loaded the session before another one logged out must not
+/// bring the session back when it ends, whether it changed the session or
+/// not.
+fn runInFlight(slow_path: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var mem = session.MemoryStore.init(gpa, io);
+    defer mem.deinit();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var mw = try session.Middleware.init(.{ .store = mem.store() });
+    server.router.use(dusty.Middleware(void).init(&mw));
+    server.router.get("/set", setUser);
+    server.router.get("/get", getUser);
+    server.router.get("/logout", logout);
+    server.router.get("/slow-read", Gate.slowRead);
+    server.router.get("/slow-write", Gate.slowWrite);
+    var future = try io.concurrent(struct {
+        fn r(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.r, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+    const port = server.address.ip.getPort();
+    Gate.reset();
+
+    var out: [4096]u8 = undefined;
+    var cookie_buf: [512]u8 = undefined;
+    const cookie = cookieOf(try exchange(io, port, "GET /set HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out), &cookie_buf).?;
+
+    var slow_buf: [1024]u8 = undefined;
+    const slow_req = try std.fmt.bufPrint(&slow_buf, "GET {s} HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{ slow_path, cookie });
+    var slow_out: [4096]u8 = undefined;
+    var slow = try io.concurrent(exchange, .{ io, port, slow_req, &slow_out });
+    defer _ = slow.cancel(io) catch {};
+    try Gate.entered.wait(io);
+
+    // Logged out while the slow request is still in its handler.
+    var lo_buf: [1024]u8 = undefined;
+    const lo_req = try std.fmt.bufPrint(&lo_buf, "GET /logout HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{cookie});
+    var lo_out: [4096]u8 = undefined;
+    _ = try exchange(io, port, lo_req, &lo_out);
+
+    Gate.release.set(io);
+    const slow_resp = try slow.await(io);
+    // It got no cookie for the session it can no longer have.
+    var slow_cookie: [512]u8 = undefined;
+    try std.testing.expect(cookieOf(slow_resp, &slow_cookie) == null);
+
+    var get_buf: [1024]u8 = undefined;
+    const get_req = try std.fmt.bufPrint(&get_buf, "GET /get HTTP/1.1\r\nHost: x\r\nCookie: anole_session={s}\r\nConnection: close\r\n\r\n", .{cookie});
+    var get_out: [4096]u8 = undefined;
+    try std.testing.expect(std.mem.endsWith(u8, try exchange(io, port, get_req, &get_out), "none"));
+}
+
+test "session: a request in flight does not restore a logged-out session (read)" {
+    try runInFlight("/slow-read");
+}
+
+test "session: a request in flight does not restore a logged-out session (write)" {
+    try runInFlight("/slow-write");
+}

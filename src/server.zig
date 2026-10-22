@@ -458,6 +458,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             client_registered: bool,
             metrics: ?*observe.metrics.Registry = null,
             metrics_path: []const u8 = "",
+            metrics_listener: ?[]const u8 = null,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -717,10 +718,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
-            // get 425 Too Early, on every route. Now, before any route, and
-            // for `listenTls` too, which turns HTTP/3 on later.
+            // get 425 Too Early, on every route, with HTTP/3 or without:
+            // a TLS-terminating proxy can forward the mark to any listener.
+            // Now, before any route.
             const h3_possible = features.http3 and (opts.http3 != null or opts.listen_tls_http3 or anyHttp3(opts.listeners));
-            if (h3_possible) {
+            {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
                 self.router.use(http.Middleware(Ctx).init(guard));
@@ -1653,7 +1655,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const extras = self.extras;
             if (extras.routes_added) return;
             extras.routes_added = true;
-            if (extras.metrics) |r| r.serveOn(Ctx, self.router, extras.metrics_path);
+            if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
             if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
         }
 
@@ -1680,6 +1682,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             http: bool = true,
             /// Paths the HTTP metrics leave out.
             exclude: []const []const u8 = &observe.probe_paths,
+            /// Serve `path` only on the listener of this name
+            /// (`Options.Listener.name`, an internal port the scraper
+            /// reaches), 404 on the others. Null: on every listener,
+            /// public ones included, and the metrics name routes, errors
+            /// and databases; then keep the port private or put auth
+            /// middleware in front (global `use` middleware runs first).
+            listener: ?[]const u8 = null,
         };
 
         /// Prometheus metrics at `/metrics`, with the HTTP request counts,
@@ -1694,6 +1703,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             r.* = .init(self.gpa, self.rt.io());
             self.extras.metrics = r;
             self.extras.metrics_path = opts.path;
+            self.extras.metrics_listener = opts.listener;
             if (opts.http) self.use(observe.metrics.HttpMetrics.init(r, .{ .exclude = opts.exclude }) catch @panic("OOM"));
             return r;
         }

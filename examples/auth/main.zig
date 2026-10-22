@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
 
     // A demo HS256 key, pinned to that algorithm, and a token signed with it.
     var jwt_secret: [32]u8 = undefined;
-    io.random(&jwt_secret);
+    try io.randomSecure(&jwt_secret); // a long-lived secret: from the OS, never a fallback
     const jwt_keys = [_]auth.Key{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = &jwt_secret } }};
     const now = std.Io.Clock.real.now(io).toSeconds();
     var signer = auth.jwt.SigningMethodHS256.init(arena);

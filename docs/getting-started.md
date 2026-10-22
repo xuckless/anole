@@ -86,6 +86,8 @@ const NewTodo = struct { title: []const u8 };
 
 const App = struct {
     gpa: std.mem.Allocator,
+    /// SHA-256 of the API key; the key itself is not kept.
+    api_key_digest: [32]u8,
     mutex: std.Io.Mutex = .init,
     todos: std.ArrayList(Todo) = .empty,
 
@@ -123,14 +125,22 @@ fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
     try res.json(todo);
 }
 
-fn requireKey(req: *anole.Request, _: *anole.Response, next: anole.Next) !void {
+fn sha256(text: []const u8) [32]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &d, .{});
+    return d;
+}
+
+fn requireKey(app: *App, req: *anole.Request, _: *anole.Response, next: anole.Next) !void {
     const key = req.headers.get("X-Api-Key") orelse return error.Unauthorized;
-    if (!std.mem.eql(u8, key, "secret")) return error.Forbidden;
+    // Constant time: how long the check takes says nothing about the key.
+    if (!std.crypto.timing_safe.eql([32]u8, sha256(key), app.api_key_digest)) return error.Forbidden;
     return next.call();
 }
 
 pub fn main(init: std.process.Init) !void {
-    var state: App = .{ .gpa = init.gpa };
+    const api_key = init.environ_map.get("API_KEY") orelse return error.NoApiKey;
+    var state: App = .{ .gpa = init.gpa, .api_key_digest = sha256(api_key) };
     defer state.deinit();
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
@@ -148,9 +158,10 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 ```sh
-curl -H 'X-Api-Key: secret' -d '{"title":"write docs"}' localhost:3000/api/todos
+export API_KEY=$(openssl rand -base64 32)   # zig build run reads it
+curl -H "X-Api-Key: $API_KEY" -d '{"title":"write docs"}' localhost:3000/api/todos
 # {"id":1,"title":"write docs","done":false}
-curl -H 'X-Api-Key: secret' 'localhost:3000/api/todos?limit=10'
+curl -H "X-Api-Key: $API_KEY" 'localhost:3000/api/todos?limit=10'
 # [{"id":1,"title":"write docs","done":false}]
 curl localhost:3000/api/todos/1
 # {"error":"Unauthorized"}
@@ -184,7 +195,12 @@ What each piece does:
   `{"error":"..."}`; by default a request that sent or accepts JSON gets JSON
   and others get text.
 - **Middleware.** A function that takes `next` and calls `next.call()` to
-  go on, or returns an error or a `res.fail` answer to stop. `app.use` adds
+  go on, or returns an error or a `res.fail` answer to stop. Like a
+  handler, it may take the state first. Secrets such as the API key come
+  from the environment or a secret store, never from source, and are
+  compared in constant time (`std.crypto.timing_safe.eql`);
+  `anole.auth.apikey` issues and checks per-user keys
+  ([auth.md](auth.md#api-keys)). `app.use` adds
   middleware for every request (before the routes), and `app.group(prefix,
   .{...})` for the routes under a prefix. `app.with(.{...})` does the same
   without a prefix, for single routes.
