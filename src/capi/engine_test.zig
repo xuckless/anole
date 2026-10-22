@@ -495,7 +495,7 @@ const WtAnswerer = struct {
                     try ent.got.appendSlice(alloc, data);
                     if (fin) {
                         var out: [64]u8 = undefined;
-                        try engine.wt.sendDatagram(e, ent.session, try std.fmt.bufPrint(&out, "uni:{d}", .{ent.got.items.len}));
+                        try engine.wt.sendDatagram(e, ent.session, try std.fmt.bufPrint(&out, "uni:{d}", .{ent.got.items.len}), false);
                         try self.forget(h);
                     }
                 } else {
@@ -509,7 +509,7 @@ const WtAnswerer = struct {
             .wt_datagram => {
                 const de: *const abi.WtDatagramEvent = @ptrCast(@alignCast(rec.ptr));
                 var out: [256]u8 = undefined;
-                try engine.wt.sendDatagram(e, h, try std.fmt.bufPrint(&out, "echo:{s}", .{str(rec, de.data)}));
+                try engine.wt.sendDatagram(e, h, try std.fmt.bufPrint(&out, "echo:{s}", .{str(rec, de.data)}), false);
             },
             .wt_stream_reset => {
                 const ce: *const abi.WtCodeEvent = @ptrCast(@alignCast(rec.ptr));
@@ -532,7 +532,7 @@ const WtAnswerer = struct {
                 self.close_by.store(ce.by, .release);
                 // The session and its streams are gone for every call.
                 if (engine.wt.openStream(e, h, false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
-                if (engine.wt.sendDatagram(e, h, "x")) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                if (engine.wt.sendDatagram(e, h, "x", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
                 var it = self.streams.iterator();
                 while (it.next()) |kv| if (kv.value_ptr.session == h) {
                     if (engine.wt.write(e, kv.key_ptr.*, "x", false, false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
@@ -652,11 +652,12 @@ fn wtCheck(a: *WtAnswerer, port: u16, io: std.Io, keep: *?*anole.webtransport.Se
         const forged_session: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 4) << 28) | 1;
         const forged_stream: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 5) << 28) | 1;
         try std.testing.expectError(error.Gone, engine.wt.openStream(a.e, forged_session, false));
-        try std.testing.expectError(error.Gone, engine.wt.close(a.e, forged_session, 0, ""));
+        try std.testing.expectError(error.Over, engine.wt.close(a.e, forged_session, 0, ""));
         try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false, false));
-        try std.testing.expectError(error.Gone, engine.wt.streamOp(a.e, forged_stream, .release, 0));
-        // A request handle is not a session.
-        try std.testing.expectError(error.Gone, engine.wt.sendDatagram(a.e, 1, "x"));
+        try std.testing.expectError(error.Over, engine.wt.streamOp(a.e, forged_stream, .release, 0));
+        // A request handle is not a session, and 0 is no handle: misuse.
+        try std.testing.expectError(error.WrongKind, engine.wt.sendDatagram(a.e, 1, "x", false));
+        try std.testing.expectError(error.WrongKind, engine.wt.sendDatagram(a.e, 0, "x", false));
     }
 
     step = "a session left open for the drain";
@@ -1090,9 +1091,6 @@ test "capi engine: drain and reloads from other threads race the stop, many time
 // ---------------------------------------------------------------------------
 // Rings, rooms and records (C ABI 0.7)
 
-const dusty = @import("dusty");
-const placement = dusty.placement;
-
 /// An engine with one executor, a consumer and a ring of `queue` entries,
 /// started, for the tests that post records straight onto its ring.
 fn ringEngine(comptime queue: u32) !struct { *engine.Engine, *engine.Consumer } {
@@ -1151,9 +1149,8 @@ test "capi engine: a full ring parks the executor on the room futex" {
     defer e.destroy();
     const x = &e.execs[0];
     var posted: std.atomic.Value(u32) = .init(0);
-    var group: std.Io.Group = .init;
-    try placement.concurrent(&group, e.io, .{ .executor = 0 }, postMany, .{ x, 8, &posted });
-    defer group.cancel(e.io);
+    // One executor: the task runs on it.
+    var f = try e.io.concurrent(postMany, .{ x, 8, &posted });
     // The consumer does not poll: two fit the ring, the task waits.
     const tio = engine.threadedIo();
     try std.Io.sleep(tio, .fromMilliseconds(300), .awake);
@@ -1163,6 +1160,7 @@ test "capi engine: a full ring parks the executor on the room futex" {
     // Polling makes room, and all eight arrive.
     var counts: [64]u32 = @splat(0);
     try drainCounts(c, &counts, 8, 3000);
+    try f.await(e.io);
     try std.testing.expectEqual(@as(u32, 8), counts[@backingInt(abi.EventType.writable)]);
 }
 
@@ -1178,13 +1176,12 @@ test "capi engine: advisory events are never dropped" {
     const e, const c = try ringEngine(2);
     defer e.destroy();
     const x = &e.execs[0];
-    var group: std.Io.Group = .init;
-    try placement.concurrent(&group, e.io, .{ .executor = 0 }, postAdvisory, .{x});
-    defer group.cancel(e.io);
+    var f = try e.io.concurrent(postAdvisory, .{x});
     // From another thread too: the overflow list takes it.
     x.postEvent(.writable, 300);
     var counts: [64]u32 = @splat(0);
     try drainCounts(c, &counts, 9, 3000);
+    try f.await(e.io);
     try std.testing.expectEqual(@as(u32, 2), counts[@backingInt(abi.EventType.body)]);
     try std.testing.expectEqual(@as(u32, 4), counts[@backingInt(abi.EventType.abort)]);
     try std.testing.expectEqual(@as(u32, 3), counts[@backingInt(abi.EventType.writable)]);
@@ -1201,11 +1198,10 @@ test "capi engine: SENT is never lost to a full ring" {
     const e, const c = try ringEngine(8);
     defer e.destroy();
     const x = &e.execs[0];
-    var group: std.Io.Group = .init;
-    try placement.concurrent(&group, e.io, .{ .executor = 0 }, postSentMany, .{ x, 64 });
-    defer group.cancel(e.io);
+    var f = try e.io.concurrent(postSentMany, .{ x, 64 });
     // The consumer does not poll while all 64 are posted.
     try std.Io.sleep(engine.threadedIo(), .fromMilliseconds(200), .awake);
+    try f.await(e.io);
     var counts: [64]u32 = @splat(0);
     try drainCounts(c, &counts, 64, 3000);
     try std.testing.expectEqual(@as(u32, 64), counts[@backingInt(abi.EventType.sent)]);
