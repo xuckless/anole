@@ -37,6 +37,10 @@ pub fn cpuLimit(io: std.Io) std.Io.Cancelable!?u32 {
 /// Round a quota/period ratio up to a whole CPU count, with a floor of 2 (see
 /// `cpuLimit`). Split out from `cpuLimit` so it can be tested without a cgroup.
 fn roundRatio(ratio: f64) u32 {
+    // A quota far above the period (a misconfigured or hostile cgroup file)
+    // means no real limit: clamp before the cast, which would not fit.
+    const max: f64 = @floatFromInt(std.math.maxInt(u32));
+    if (!(ratio <= max)) return std.math.maxInt(u32);
     const rounded: u32 = @intFromFloat(@ceil(ratio));
     return @max(rounded, 2);
 }
@@ -163,4 +167,7 @@ test "roundRatio: ceil with floor of 2" {
     try std.testing.expectEqual(2, roundRatio(2.0));
     try std.testing.expectEqual(3, roundRatio(2.1));
     try std.testing.expectEqual(4, roundRatio(4.0));
+    // A quota far above the period does not fit a u32: no real limit.
+    try std.testing.expectEqual(std.math.maxInt(u32), roundRatio(9.2e18));
+    try std.testing.expectEqual(std.math.maxInt(u32), roundRatio(parseV2("9223372036854775807 1").?));
 }
