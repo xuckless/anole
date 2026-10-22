@@ -239,19 +239,19 @@ pub fn submit(d: *Db, c: *Consumer, verb: Verb, sql: []const u8, params: []const
     }
     if (!d.open.load(.acquire)) return error.State;
     if (c.execs.items.len == 0) return error.State;
-    for (params) |p| if (p.type > abi.DB_BOOL) return error.Invalid;
+    for (params) |p| if (p.type > abi.DB_TYPE_BOOL) return error.Invalid;
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     const values = try a.alloc(db.Value, params.len);
     for (params, values) |p, *v| v.* = switch (p.type) {
-        abi.DB_NULL => .null,
-        abi.DB_INT => .{ .int = p.v.i },
-        abi.DB_FLOAT => .{ .float = p.v.f },
-        abi.DB_TEXT => .{ .text = try a.dupe(u8, p.v.s.slice()) },
-        abi.DB_BLOB => .{ .blob = try a.dupe(u8, p.v.s.slice()) },
-        abi.DB_BOOL => .{ .bool = p.v.i != 0 },
+        abi.DB_TYPE_NULL => .null,
+        abi.DB_TYPE_INT => .{ .int = p.v.i },
+        abi.DB_TYPE_FLOAT => .{ .float = p.v.f },
+        abi.DB_TYPE_TEXT => .{ .text = try a.dupe(u8, p.v.s.slice()) },
+        abi.DB_TYPE_BLOB => .{ .blob = try a.dupe(u8, p.v.s.slice()) },
+        abi.DB_TYPE_BOOL => .{ .bool = p.v.i != 0 },
         else => unreachable,
     };
     const q = try a.create(Query);
@@ -294,15 +294,15 @@ fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
     defer arena.deinit();
     var ctx: db.Ctx = .{ .io = e.io, .arena = arena.allocator() };
     var options: db.QueryOptions = .{
-        .write = q.flags & abi.DB_WRITE != 0,
-        .prepare = q.flags & abi.DB_NO_PREPARE == 0,
-        .coalesce = q.flags & abi.DB_COALESCE != 0,
+        .write = q.flags & abi.DB_F_WRITE != 0,
+        .prepare = q.flags & abi.DB_F_NO_PREPARE == 0,
+        .coalesce = q.flags & abi.DB_F_COALESCE != 0,
     };
     if (q.timeout_ms > 0) options.timeout = .fromMilliseconds(q.timeout_ms);
     if (q.cache_ttl_ms > 0) options.cache = .{
         .ttl = .fromMilliseconds(q.cache_ttl_ms),
         .tag = q.tag,
-        .keep_empty = q.flags & abi.DB_DROP_EMPTY == 0,
+        .keep_empty = q.flags & abi.DB_F_DROP_EMPTY == 0,
     };
     var answer: Answer = .{ .user_data = q.user_data };
     switch (q.d.client) {
@@ -473,10 +473,10 @@ const Answer = struct {
             const cells: [*]abi.DbCell = @ptrCast(@alignCast(rec.ptr + cells_off));
             switch (m) {
                 .documents => |docs| for (docs, 0..) |doc, i| {
-                    cells[i] = .{ .type = abi.DB_BSON, .v = .{ .s = w.put(doc.bytes) } };
+                    cells[i] = .{ .type = abi.DB_TYPE_BSON, .v = .{ .s = w.put(doc.bytes) } };
                 },
-                .count => |n| cells[0] = .{ .type = abi.DB_INT, .v = .{ .i = @intCast(@min(n, std.math.maxInt(i64))) } },
-                .write => |wr| cells[0] = .{ .type = abi.DB_BSON, .v = .{ .s = w.put(wr.summary.bytes) } },
+                .count => |n| cells[0] = .{ .type = abi.DB_TYPE_INT, .v = .{ .i = @intCast(@min(n, std.math.maxInt(i64))) } },
+                .write => |wr| cells[0] = .{ .type = abi.DB_TYPE_BSON, .v = .{ .s = w.put(wr.summary.bytes) } },
             }
         };
         if (a.table) |t| {
@@ -486,12 +486,12 @@ const Answer = struct {
             var k: usize = 0;
             for (t.rows) |row| for (row, 0..) |v, col| {
                 cells[k] = switch (v) {
-                    .null => .{ .type = abi.DB_NULL, .v = .{ .i = 0 } },
-                    .int => |n| .{ .type = abi.DB_INT, .v = .{ .i = n } },
-                    .float => |f| .{ .type = abi.DB_FLOAT, .v = .{ .f = f } },
-                    .bool => |b| .{ .type = abi.DB_BOOL, .v = .{ .i = @intFromBool(b) } },
-                    .text => |s| .{ .type = abi.DB_TEXT, .v = .{ .s = w.put(s) } },
-                    .blob => |s| .{ .type = abi.DB_BLOB, .v = .{ .s = w.put(s) } },
+                    .null => .{ .type = abi.DB_TYPE_NULL, .v = .{ .i = 0 } },
+                    .int => |n| .{ .type = abi.DB_TYPE_INT, .v = .{ .i = n } },
+                    .float => |f| .{ .type = abi.DB_TYPE_FLOAT, .v = .{ .f = f } },
+                    .bool => |b| .{ .type = abi.DB_TYPE_BOOL, .v = .{ .i = @intFromBool(b) } },
+                    .text => |s| .{ .type = abi.DB_TYPE_TEXT, .v = .{ .s = w.put(s) } },
+                    .blob => |s| .{ .type = abi.DB_TYPE_BLOB, .v = .{ .s = w.put(s) } },
                 };
                 if (col < t.types.len) cells[k].db_type = t.types[col];
                 k += 1;
@@ -521,16 +521,16 @@ fn putReply(r: redis.Reply, cells: [*]abi.DbCell, k: *usize, w: *Writer) void {
     const at = k.*;
     k.* += 1;
     cells[at] = switch (r) {
-        .nil => .{ .type = abi.DB_NULL, .v = .{ .i = 0 } },
-        .int => |n| .{ .type = abi.DB_INT, .v = .{ .i = n } },
-        .double => |f| .{ .type = abi.DB_FLOAT, .v = .{ .f = f } },
-        .boolean => |b| .{ .type = abi.DB_BOOL, .v = .{ .i = @intFromBool(b) } },
-        .status => |str| .{ .type = abi.DB_TEXT, .v = .{ .s = w.put(str) } },
-        .string => |str| .{ .type = abi.DB_BLOB, .v = .{ .s = w.put(str) } },
-        .err => |str| .{ .type = abi.DB_ERROR, .v = .{ .s = w.put(str) } },
-        .array => |items| .{ .type = abi.DB_ARRAY, .v = .{ .i = @intCast(items.len) } },
+        .nil => .{ .type = abi.DB_TYPE_NULL, .v = .{ .i = 0 } },
+        .int => |n| .{ .type = abi.DB_TYPE_INT, .v = .{ .i = n } },
+        .double => |f| .{ .type = abi.DB_TYPE_FLOAT, .v = .{ .f = f } },
+        .boolean => |b| .{ .type = abi.DB_TYPE_BOOL, .v = .{ .i = @intFromBool(b) } },
+        .status => |str| .{ .type = abi.DB_TYPE_TEXT, .v = .{ .s = w.put(str) } },
+        .string => |str| .{ .type = abi.DB_TYPE_BLOB, .v = .{ .s = w.put(str) } },
+        .err => |str| .{ .type = abi.DB_TYPE_ERROR, .v = .{ .s = w.put(str) } },
+        .array => |items| .{ .type = abi.DB_TYPE_ARRAY, .v = .{ .i = @intCast(items.len) } },
         // RESP3 maps hold key, value, key, value...
-        .map => |items| .{ .type = abi.DB_MAP, .v = .{ .i = @intCast(items.len / 2) } },
+        .map => |items| .{ .type = abi.DB_TYPE_MAP, .v = .{ .i = @intCast(items.len / 2) } },
     };
     switch (r) {
         .array, .map => |items| for (items) |item| putReply(item, cells, k, w),

@@ -123,7 +123,7 @@ const Consumer = struct {
             // anole.test.Echo: Unary 0, ServerStream 1, ClientStream 2, Bidi 3.
             10 => switch (call.method_id) {
                 0 => {
-                    if (!std.mem.eql(u8, method, "/anole.test.Echo/Unary") or call.kind != abi.GRPC_UNARY) return error.WrongCall;
+                    if (!std.mem.eql(u8, method, "/anole.test.Echo/Unary") or call.kind != abi.GRPC_KIND_UNARY) return error.WrongCall;
                     if (call.flags & abi.GRPC_CALL_MESSAGE == 0) return error.NoMessage;
                     const req = try decode(pb.EchoRequest, arena, str(rec, call.message));
                     if (std.mem.eql(u8, req.message, "fail")) {

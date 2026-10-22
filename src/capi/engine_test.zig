@@ -450,13 +450,13 @@ const WtAnswerer = struct {
             },
             .wt_stream => {
                 const se: *const abi.WtStreamEvent = @ptrCast(@alignCast(rec.ptr));
-                try self.streams.put(alloc, h, .{ .uni = se.flags & abi.WT_UNI != 0, .session = se.session });
+                try self.streams.put(alloc, h, .{ .uni = se.flags & abi.WT_F_UNI != 0, .session = se.session });
             },
             .wt_data => {
                 const de: *const abi.WtDataEvent = @ptrCast(@alignCast(rec.ptr));
                 const ent = self.streams.getPtr(h) orelse return error.UnknownStream;
                 const data = str(rec, de.data);
-                const fin = de.flags & abi.WT_FIN != 0;
+                const fin = de.flags & abi.WT_F_FIN != 0;
                 if (ent.uni) {
                     try ent.got.appendSlice(alloc, data);
                     if (fin) {

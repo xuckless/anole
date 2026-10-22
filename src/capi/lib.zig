@@ -202,7 +202,7 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
         setError("log_level: 0 or ANOLE_LOG_ERROR..ANOLE_LOG_DEBUG", .{});
         return abi.E_INVALID;
     }
-    if (o.flags & ~abi.SERVER_SIGNALS != 0) return failCode(abi.E_INVALID);
+    if (o.flags & ~abi.SERVER_F_SIGNALS != 0) return failCode(abi.E_INVALID);
     log_max.store(if (o.log_level == 0) abi.LOG_INFO else o.log_level, .monotonic);
     if (o.log) |f| {
         log_fn = f;
@@ -211,7 +211,7 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
     const json = o.config_json.slice();
     var why_buf: [400]u8 = undefined;
     var why: std.Io.Writer = .fixed(&why_buf);
-    const e = Engine.create(if (json.len == 0) "{}" else json, o.flags & abi.SERVER_SIGNALS != 0, &why) catch |err| switch (err) {
+    const e = Engine.create(if (json.len == 0) "{}" else json, o.flags & abi.SERVER_F_SIGNALS != 0, &why) catch |err| switch (err) {
         error.Config => {
             setError("{s}", .{why.buffered()});
             return abi.E_CONFIG;
@@ -274,7 +274,7 @@ export fn anole_server_reload_certificates(s: ?*anyopaque) i32 {
 export fn anole_server_reload_tls(s: ?*anyopaque, flags: u32, cert: ?[*]const u8, cert_len: usize, key: ?[*]const u8, key_len: usize) i32 {
     clearError();
     const e = engineOf(s) orelse return failCode(abi.E_INVALID);
-    if (flags & ~abi.TLS_PEM != 0) return failCode(abi.E_INVALID);
+    if (flags & ~abi.TLS_F_PEM != 0) return failCode(abi.E_INVALID);
     const c = cert orelse {
         if (key != null) return failCode(abi.E_INVALID);
         return anole_server_reload_certificates(s);
@@ -283,7 +283,7 @@ export fn anole_server_reload_tls(s: ?*anyopaque, flags: u32, cert: ?[*]const u8
     if (cert_len == 0 or key_len == 0) return failCode(abi.E_INVALID);
     const cs = c[0..cert_len];
     const ks = k[0..key_len];
-    const source: anole.Cert = if (flags & abi.TLS_PEM != 0)
+    const source: anole.Cert = if (flags & abi.TLS_F_PEM != 0)
         .{ .pem = .{ .cert = cs, .key = ks } }
     else
         .{ .files = .{ .cert_path = cs, .key_path = ks } };
@@ -319,8 +319,8 @@ export fn anole_consumer_attach(s: ?*anyopaque, options: ?*const abi.ConsumerOpt
     const e = engineOf(s) orelse return failCode(abi.E_INVALID);
     const o = readSized(abi.ConsumerOptions, options orelse return failCode(abi.E_INVALID)) orelse return failCode(abi.E_INVALID);
     const dst = out orelse return failCode(abi.E_INVALID);
-    if (o.flags & ~abi.CONSUMER_SHARED != 0) return failCode(abi.E_INVALID);
-    const shared = o.flags & abi.CONSUMER_SHARED != 0;
+    if (o.flags & ~abi.CONSUMER_F_SHARED != 0) return failCode(abi.E_INVALID);
+    const shared = o.flags & abi.CONSUMER_F_SHARED != 0;
     if (o.wake == null and !shared and builtin.os.tag == .windows) {
         setError("Windows has no doorbell fd: pass a wake callback, or use anole_poll_wait", .{});
         return abi.E_UNSUPPORTED;
@@ -351,8 +351,8 @@ fn pollBuf(buf: ?*anyopaque, cap: usize) ?[]u8 {
 export fn anole_poll(c: ?*anyopaque, buf: ?*anyopaque, cap: usize, flags: u32) i64 {
     const consumer = consumerOf(c) orelse return failCode(abi.E_INVALID);
     const out = pollBuf(buf, cap) orelse return failCode(abi.E_INVALID);
-    if (flags & ~abi.POLL_NOARM != 0) return failCode(abi.E_INVALID);
-    const n = engine.poll(consumer, out, flags & abi.POLL_NOARM == 0) catch return failCode(abi.E_TOOBIG);
+    if (flags & ~abi.POLL_F_NOARM != 0) return failCode(abi.E_INVALID);
+    const n = engine.poll(consumer, out, flags & abi.POLL_F_NOARM == 0) catch return failCode(abi.E_TOOBIG);
     return @intCast(n);
 }
 
@@ -481,9 +481,9 @@ export fn anole_grpc_send_headers(c: u64, metadata: ?[*]const Header, n: usize) 
 export fn anole_grpc_send(c: u64, msg: ?*const anyopaque, len: usize, flags: u32) i32 {
     if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
     const e = live() orelse return failCode(abi.E_GONE);
-    if (flags & ~(abi.BODY_BORROW | abi.GRPC_SEND_FINISH) != 0) return failCode(abi.E_INVALID);
+    if (flags & ~(abi.BODY_BORROW | abi.GRPC_F_FINISH) != 0) return failCode(abi.E_INVALID);
     const b = bytes(msg, len) orelse return failCode(abi.E_INVALID);
-    const busy = engine.grpc.send(e, c, b, flags & abi.BODY_BORROW != 0, flags & abi.GRPC_SEND_FINISH != 0) catch |err| return answer(err);
+    const busy = engine.grpc.send(e, c, b, flags & abi.BODY_BORROW != 0, flags & abi.GRPC_F_FINISH != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 
@@ -533,17 +533,17 @@ export fn anole_wt_open_stream(w: u64, flags: u32, out: ?*u64) i32 {
     if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
     const e = live() orelse return failCode(abi.E_GONE);
     const o = out orelse return failCode(abi.E_INVALID);
-    if (flags & ~abi.WT_UNI != 0) return failCode(abi.E_INVALID);
-    o.* = engine.wt.openStream(e, w, flags & abi.WT_UNI != 0) catch |err| return answer(err);
+    if (flags & ~abi.WT_F_UNI != 0) return failCode(abi.E_INVALID);
+    o.* = engine.wt.openStream(e, w, flags & abi.WT_F_UNI != 0) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_wt_stream_write(st: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
     if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
     const e = live() orelse return failCode(abi.E_GONE);
-    if (flags & ~(abi.BODY_BORROW | abi.WT_FIN) != 0) return failCode(abi.E_INVALID);
+    if (flags & ~(abi.BODY_BORROW | abi.WT_F_FIN) != 0) return failCode(abi.E_INVALID);
     const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
-    const busy = engine.wt.write(e, st, b, flags & abi.WT_FIN != 0, flags & abi.BODY_BORROW != 0) catch |err| return answer(err);
+    const busy = engine.wt.write(e, st, b, flags & abi.WT_F_FIN != 0, flags & abi.BODY_BORROW != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 

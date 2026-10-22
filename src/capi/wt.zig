@@ -496,7 +496,7 @@ fn adopt(s: *SessionSlot, g: u32, stream: *Stream, dir: @FieldType(StreamSlot, "
     const rec = newRecord(@sizeOf(abi.WtStreamEvent), .wt_stream, st.handle(sg)) catch return;
     const ev: *abi.WtStreamEvent = @ptrCast(rec.ptr);
     ev.route_id = s.route.id;
-    ev.flags = if (dir == .uni_in) abi.WT_UNI else 0;
+    ev.flags = if (dir == .uni_in) abi.WT_F_UNI else 0;
     ev.session = s.handle(g);
     x.postRecord(rec, true);
 }
@@ -624,7 +624,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
             const size = @sizeOf(abi.WtDataEvent) + r.n;
             if (newRecord(size, .wt_data, h)) |rec| {
                 const ev: *abi.WtDataEvent = @ptrCast(rec.ptr);
-                ev.flags = if (r.fin) abi.WT_FIN else 0;
+                ev.flags = if (r.fin) abi.WT_F_FIN else 0;
                 ev.data = .{ .off = @sizeOf(abi.WtDataEvent), .len = @intCast(r.n) };
                 @memcpy(rec[@sizeOf(abi.WtDataEvent)..][0..r.n], buf[0..r.n]);
                 x.postRecord(rec, true);
