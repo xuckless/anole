@@ -1,0 +1,420 @@
+2026-10-22 04:16:29,557 Generated random file: giant-slow-spaceship of size: 1024
+2026-10-22 04:16:29,557 Generated random file: indigo-salty-armadillo of size: 1024
+2026-10-22 04:16:29,557 Generated random file: aquamarine-maroon-wizard of size: 1024
+2026-10-22 04:16:29,557 Generated random file: zestful-tired-backpack of size: 1024
+2026-10-22 04:16:29,557 Generated random file: dry-delighted-porcupine of size: 1024
+2026-10-22 04:16:29,557 Generated random file: euphoric-exhilarated-scooter of size: 1024
+2026-10-22 04:16:29,557 Generated random file: excessive-heavy-celebi of size: 1024
+2026-10-22 04:16:29,557 Generated random file: ecstatic-brutal-doctor of size: 1024
+2026-10-22 04:16:29,558 Generated random file: microscopic-sour-earbuds of size: 1024
+2026-10-22 04:16:29,558 Generated random file: arctic-frightened-glasses of size: 1024
+2026-10-22 04:16:29,558 Generated random file: noisy-wet-scissors of size: 1024
+2026-10-22 04:16:29,558 Generated random file: excited-fast-zapdos of size: 1024
+2026-10-22 04:16:29,558 Generated random file: brutal-soft-celebi of size: 1024
+2026-10-22 04:16:29,558 Generated random file: hard-zesty-ring of size: 1024
+2026-10-22 04:16:29,558 Generated random file: large-anxious-astronaut of size: 1024
+2026-10-22 04:16:29,558 Generated random file: bored-anxious-porcupine of size: 1024
+2026-10-22 04:16:29,558 Generated random file: chilly-frosty-camel of size: 1024
+2026-10-22 04:16:29,558 Generated random file: pleased-numerous-princess of size: 1024
+2026-10-22 04:16:29,558 Generated random file: cyan-overjoyed-monk of size: 1024
+2026-10-22 04:16:29,558 Generated random file: sharp-excessive-belt of size: 1024
+2026-10-22 04:16:29,558 Generated random file: upbeat-huge-bowtie of size: 1024
+2026-10-22 04:16:29,559 Generated random file: purple-dull-uxie of size: 1024
+2026-10-22 04:16:29,559 Generated random file: happy-dull-shogun of size: 1024
+2026-10-22 04:16:29,559 Generated random file: few-titanic-ram of size: 1024
+2026-10-22 04:16:29,559 Generated random file: lime-savory-professor of size: 1024
+2026-10-22 04:16:29,559 Generated random file: frosty-intense-blacksmith of size: 1024
+2026-10-22 04:16:29,559 Generated random file: massive-glad-shogun of size: 1024
+2026-10-22 04:16:29,559 Generated random file: tart-anxious-bus of size: 1024
+2026-10-22 04:16:29,559 Generated random file: pink-bitter-speaker of size: 1024
+2026-10-22 04:16:29,559 Generated random file: tan-medium-folder of size: 1024
+2026-10-22 04:16:29,559 Generated random file: confused-blue-bag of size: 1024
+2026-10-22 04:16:29,559 Generated random file: intense-icy-vhs of size: 1024
+2026-10-22 04:16:29,559 Generated random file: harsh-confused-ninja of size: 1024
+2026-10-22 04:16:29,559 Generated random file: sour-frigid-diary of size: 1024
+2026-10-22 04:16:29,559 Generated random file: tropical-anxious-singer of size: 1024
+2026-10-22 04:16:29,560 Generated random file: exhilarated-wet-ranger of size: 1024
+2026-10-22 04:16:29,560 Generated random file: pleased-frightened-vhs of size: 1024
+2026-10-22 04:16:29,560 Generated random file: yellow-unlimited-bracelet of size: 1024
+2026-10-22 04:16:29,560 Generated random file: red-boiling-necklace of size: 1024
+2026-10-22 04:16:29,560 Generated random file: hard-shy-gpu of size: 1024
+2026-10-22 04:16:29,560 Generated random file: roasting-merciless-snorlax of size: 1024
+2026-10-22 04:16:29,560 Generated random file: disgusted-giant-plane of size: 1024
+2026-10-22 04:16:29,560 Generated random file: minuscule-fast-computer of size: 1024
+2026-10-22 04:16:29,560 Generated random file: zesty-envious-mittens of size: 1024
+2026-10-22 04:16:29,560 Generated random file: hot-tan-rayquaza of size: 1024
+2026-10-22 04:16:29,560 Generated random file: angry-icy-officer of size: 1024
+2026-10-22 04:16:29,560 Generated random file: guilty-jubilant-tyrant of size: 1024
+2026-10-22 04:16:29,560 Generated random file: endless-merciless-envelope of size: 1024
+2026-10-22 04:16:29,561 Generated random file: heavy-ashamed-scooter of size: 1024
+2026-10-22 04:16:29,561 Generated random file: vibrant-excessive-ethernet of size: 1024
+2026-10-22 04:16:29,561 Requests: ['https://server4:443/giant-slow-spaceship', 'https://server4:443/indigo-salty-armadillo', 'https://server4:443/aquamarine-maroon-wizard', 'https://server4:443/zestful-tired-backpack', 'https://server4:443/dry-delighted-porcupine', 'https://server4:443/euphoric-exhilarated-scooter', 'https://server4:443/excessive-heavy-celebi', 'https://server4:443/ecstatic-brutal-doctor', 'https://server4:443/microscopic-sour-earbuds', 'https://server4:443/arctic-frightened-glasses', 'https://server4:443/noisy-wet-scissors', 'https://server4:443/excited-fast-zapdos', 'https://server4:443/brutal-soft-celebi', 'https://server4:443/hard-zesty-ring', 'https://server4:443/large-anxious-astronaut', 'https://server4:443/bored-anxious-porcupine', 'https://server4:443/chilly-frosty-camel', 'https://server4:443/pleased-numerous-princess', 'https://server4:443/cyan-overjoyed-monk', 'https://server4:443/sharp-excessive-belt', 'https://server4:443/upbeat-huge-bowtie', 'https://server4:443/purple-dull-uxie', 'https://server4:443/happy-dull-shogun', 'https://server4:443/few-titanic-ram', 'https://server4:443/lime-savory-professor', 'https://server4:443/frosty-intense-blacksmith', 'https://server4:443/massive-glad-shogun', 'https://server4:443/tart-anxious-bus', 'https://server4:443/pink-bitter-speaker', 'https://server4:443/tan-medium-folder', 'https://server4:443/confused-blue-bag', 'https://server4:443/intense-icy-vhs', 'https://server4:443/harsh-confused-ninja', 'https://server4:443/sour-frigid-diary', 'https://server4:443/tropical-anxious-singer', 'https://server4:443/exhilarated-wet-ranger', 'https://server4:443/pleased-frightened-vhs', 'https://server4:443/yellow-unlimited-bracelet', 'https://server4:443/red-boiling-necklace', 'https://server4:443/hard-shy-gpu', 'https://server4:443/roasting-merciless-snorlax', 'https://server4:443/disgusted-giant-plane', 'https://server4:443/minuscule-fast-computer', 'https://server4:443/zesty-envious-mittens', 'https://server4:443/hot-tan-rayquaza', 'https://server4:443/angry-icy-officer', 'https://server4:443/guilty-jubilant-tyrant', 'https://server4:443/endless-merciless-envelope', 'https://server4:443/heavy-ashamed-scooter', 'https://server4:443/vibrant-excessive-ethernet']
+2026-10-22 04:16:29,584 
+2026-10-22 04:16:29,584 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_3504ky7i/ TESTCASE_SERVER=multiconnect TESTCASE_CLIENT=multiconnect CLIENT_WWW=/tmp/client_www_1wcp5q5d/ CLIENT_DOWNLOADS=/tmp/client_download_l7clbpd3/ SERVER_WWW=/tmp/server_www_1wyox2_j/ SERVER_DOWNLOADS=/tmp/server_download_dq1cmv6e/ SERVER_LOGS=/tmp/logs_server_dhwn56jc CLIENT_LOGS=/tmp/logs_client_pv9wz2l6 SCENARIO="drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3" CLIENT=ghcr.io/facebook/proxygen/mvfst-interop:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/giant-slow-spaceship https://server4:443/indigo-salty-armadillo https://server4:443/aquamarine-maroon-wizard https://server4:443/zestful-tired-backpack https://server4:443/dry-delighted-porcupine https://server4:443/euphoric-exhilarated-scooter https://server4:443/excessive-heavy-celebi https://server4:443/ecstatic-brutal-doctor https://server4:443/microscopic-sour-earbuds https://server4:443/arctic-frightened-glasses https://server4:443/noisy-wet-scissors https://server4:443/excited-fast-zapdos https://server4:443/brutal-soft-celebi https://server4:443/hard-zesty-ring https://server4:443/large-anxious-astronaut https://server4:443/bored-anxious-porcupine https://server4:443/chilly-frosty-camel https://server4:443/pleased-numerous-princess https://server4:443/cyan-overjoyed-monk https://server4:443/sharp-excessive-belt https://server4:443/upbeat-huge-bowtie https://server4:443/purple-dull-uxie https://server4:443/happy-dull-shogun https://server4:443/few-titanic-ram https://server4:443/lime-savory-professor https://server4:443/frosty-intense-blacksmith https://server4:443/massive-glad-shogun https://server4:443/tart-anxious-bus https://server4:443/pink-bitter-speaker https://server4:443/tan-medium-folder https://server4:443/confused-blue-bag https://server4:443/intense-icy-vhs https://server4:443/harsh-confused-ninja https://server4:443/sour-frigid-diary https://server4:443/tropical-anxious-singer https://server4:443/exhilarated-wet-ranger https://server4:443/pleased-frightened-vhs https://server4:443/yellow-unlimited-bracelet https://server4:443/red-boiling-necklace https://server4:443/hard-shy-gpu https://server4:443/roasting-merciless-snorlax https://server4:443/disgusted-giant-plane https://server4:443/minuscule-fast-computer https://server4:443/zesty-envious-mittens https://server4:443/hot-tan-rayquaza https://server4:443/angry-icy-officer https://server4:443/guilty-jubilant-tyrant https://server4:443/endless-merciless-envelope https://server4:443/heavy-ashamed-scooter https://server4:443/vibrant-excessive-ethernet" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 04:16:32,867  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container server Recreated 
+ Container client Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | + set -o nounset
+client  | + VERSION=1
+client  | + HQ_CLI=/proxygen/_build/proxygen/bin/hq
+client  | + PORT=443
+client  | + LOGLEVEL=2
+client  | + /setup.sh
+ Container client Started 
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | + PROTOCOL=hq-interop
+client  | + HTTPVERSION=0.9
+client  | + CONN_FLOW_CONTROL=107374182
+client  | + STREAM_FLOW_CONTROL=107374182
+client  | ++ echo 'https://server4:443/giant-slow-spaceship https://server4:443/indigo-salty-armadillo https://server4:443/aquamarine-maroon-wizard https://server4:443/zestful-tired-backpack https://server4:443/dry-delighted-porcupine https://server4:443/euphoric-exhilarated-scooter https://server4:443/excessive-heavy-celebi https://server4:443/ecstatic-brutal-doctor https://server4:443/microscopic-sour-earbuds https://server4:443/arctic-frightened-glasses https://server4:443/noisy-wet-scissors https://server4:443/excited-fast-zapdos https://server4:443/brutal-soft-celebi https://server4:443/hard-zesty-ring https://server4:443/large-anxious-astronaut https://server4:443/bored-anxious-porcupine https://server4:443/chilly-frosty-camel https://server4:443/pleased-numerous-princess https://server4:443/cyan-overjoyed-monk https://server4:443/sharp-excessive-belt https://server4:443/upbeat-huge-bowtie https://server4:443/purple-dull-uxie https://server4:443/happy-dull-shogun https://server4:443/few-titanic-ram https://server4:443/lime-savory-professor https://server4:443/frosty-intense-blacksmith https://server4:443/massive-glad-shogun https://server4:443/tart-anxious-bus https://server4:443/pink-bitter-speaker https://server4:443/tan-medium-folder https://server4:443/confused-blue-bag https://server4:443/intense-icy-vhs https://server4:443/harsh-confused-ninja https://server4:443/sour-frigid-diary https://server4:443/tropical-anxious-singer https://server4:443/exhilarated-wet-ranger https://server4:443/pleased-frightened-vhs https://server4:443/yellow-unlimited-bracelet https://server4:443/red-boiling-necklace https://server4:443/hard-shy-gpu https://server4:443/roasting-merciless-snorlax https://server4:443/disgusted-giant-plane https://server4:443/minuscule-fast-computer https://server4:443/zesty-envious-mittens https://server4:443/hot-tan-rayquaza https://server4:443/angry-icy-officer https://server4:443/guilty-jubilant-tyrant https://server4:443/endless-merciless-envelope https://server4:443/heavy-ashamed-scooter https://server4:443/vibrant-excessive-ethernet'
+client  | ++ tr ' ' '\n'
+client  | ++ awk -F / '{ print "/" $4 }'
+client  | ++ paste -sd,
+client  | + INVOCATIONS=/giant-slow-spaceship,/indigo-salty-armadillo,/aquamarine-maroon-wizard,/zestful-tired-backpack,/dry-delighted-porcupine,/euphoric-exhilarated-scooter,/excessive-heavy-celebi,/ecstatic-brutal-doctor,/microscopic-sour-earbuds,/arctic-frightened-glasses,/noisy-wet-scissors,/excited-fast-zapdos,/brutal-soft-celebi,/hard-zesty-ring,/large-anxious-astronaut,/bored-anxious-porcupine,/chilly-frosty-camel,/pleased-numerous-princess,/cyan-overjoyed-monk,/sharp-excessive-belt,/upbeat-huge-bowtie,/purple-dull-uxie,/happy-dull-shogun,/few-titanic-ram,/lime-savory-professor,/frosty-intense-blacksmith,/massive-glad-shogun,/tart-anxious-bus,/pink-bitter-speaker,/tan-medium-folder,/confused-blue-bag,/intense-icy-vhs,/harsh-confused-ninja,/sour-frigid-diary,/tropical-anxious-singer,/exhilarated-wet-ranger,/pleased-frightened-vhs,/yellow-unlimited-bracelet,/red-boiling-necklace,/hard-shy-gpu,/roasting-merciless-snorlax,/disgusted-giant-plane,/minuscule-fast-computer,/zesty-envious-mittens,/hot-tan-rayquaza,/angry-icy-officer,/guilty-jubilant-tyrant,/endless-merciless-envelope,/heavy-ashamed-scooter,/vibrant-excessive-ethernet
+client  | + EARLYDATA=false
+client  | + PSK_FILE=
+client  | + '[' -n multiconnect ']'
+client  | + case "${TESTCASE}" in
+client  | + '[' client == client ']'
+client  | + /wait-for-it.sh sim:57832 -s -t 10
+client  | wait-for-it.sh: waiting 10 seconds for sim:57832
+ Container server Started 
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 501.033884ms
+sim     | Using scenario: drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | + echo 'Starting QUIC client...'
+client  | Starting QUIC client...
+client  | + '[' -n 'https://server4:443/giant-slow-spaceship https://server4:443/indigo-salty-armadillo https://server4:443/aquamarine-maroon-wizard https://server4:443/zestful-tired-backpack https://server4:443/dry-delighted-porcupine https://server4:443/euphoric-exhilarated-scooter https://server4:443/excessive-heavy-celebi https://server4:443/ecstatic-brutal-doctor https://server4:443/microscopic-sour-earbuds https://server4:443/arctic-frightened-glasses https://server4:443/noisy-wet-scissors https://server4:443/excited-fast-zapdos https://server4:443/brutal-soft-celebi https://server4:443/hard-zesty-ring https://server4:443/large-anxious-astronaut https://server4:443/bored-anxious-porcupine https://server4:443/chilly-frosty-camel https://server4:443/pleased-numerous-princess https://server4:443/cyan-overjoyed-monk https://server4:443/sharp-excessive-belt https://server4:443/upbeat-huge-bowtie https://server4:443/purple-dull-uxie https://server4:443/happy-dull-shogun https://server4:443/few-titanic-ram https://server4:443/lime-savory-professor https://server4:443/frosty-intense-blacksmith https://server4:443/massive-glad-shogun https://server4:443/tart-anxious-bus https://server4:443/pink-bitter-speaker https://server4:443/tan-medium-folder https://server4:443/confused-blue-bag https://server4:443/intense-icy-vhs https://server4:443/harsh-confused-ninja https://server4:443/sour-frigid-diary https://server4:443/tropical-anxious-singer https://server4:443/exhilarated-wet-ranger https://server4:443/pleased-frightened-vhs https://server4:443/yellow-unlimited-bracelet https://server4:443/red-boiling-necklace https://server4:443/hard-shy-gpu https://server4:443/roasting-merciless-snorlax https://server4:443/disgusted-giant-plane https://server4:443/minuscule-fast-computer https://server4:443/zesty-envious-mittens https://server4:443/hot-tan-rayquaza https://server4:443/angry-icy-officer https://server4:443/guilty-jubilant-tyrant https://server4:443/endless-merciless-envelope https://server4:443/heavy-ashamed-scooter https://server4:443/vibrant-excessive-ethernet' ']'
+client  | + REQS=("${REQUESTS}")
+client  | + REQ='https://server4:443/giant-slow-spaceship https://server4:443/indigo-salty-armadillo https://server4:443/aquamarine-maroon-wizard https://server4:443/zestful-tired-backpack https://server4:443/dry-delighted-porcupine https://server4:443/euphoric-exhilarated-scooter https://server4:443/excessive-heavy-celebi https://server4:443/ecstatic-brutal-doctor https://server4:443/microscopic-sour-earbuds https://server4:443/arctic-frightened-glasses https://server4:443/noisy-wet-scissors https://server4:443/excited-fast-zapdos https://server4:443/brutal-soft-celebi https://server4:443/hard-zesty-ring https://server4:443/large-anxious-astronaut https://server4:443/bored-anxious-porcupine https://server4:443/chilly-frosty-camel https://server4:443/pleased-numerous-princess https://server4:443/cyan-overjoyed-monk https://server4:443/sharp-excessive-belt https://server4:443/upbeat-huge-bowtie https://server4:443/purple-dull-uxie https://server4:443/happy-dull-shogun https://server4:443/few-titanic-ram https://server4:443/lime-savory-professor https://server4:443/frosty-intense-blacksmith https://server4:443/massive-glad-shogun https://server4:443/tart-anxious-bus https://server4:443/pink-bitter-speaker https://server4:443/tan-medium-folder https://server4:443/confused-blue-bag https://server4:443/intense-icy-vhs https://server4:443/harsh-confused-ninja https://server4:443/sour-frigid-diary https://server4:443/tropical-anxious-singer https://server4:443/exhilarated-wet-ranger https://server4:443/pleased-frightened-vhs https://server4:443/yellow-unlimited-bracelet https://server4:443/red-boiling-necklace https://server4:443/hard-shy-gpu https://server4:443/roasting-merciless-snorlax https://server4:443/disgusted-giant-plane https://server4:443/minuscule-fast-computer https://server4:443/zesty-envious-mittens https://server4:443/hot-tan-rayquaza https://server4:443/angry-icy-officer https://server4:443/guilty-jubilant-tyrant https://server4:443/endless-merciless-envelope https://server4:443/heavy-ashamed-scooter https://server4:443/vibrant-excessive-ethernet'
+client  | ++ echo 'https://server4:443/giant-slow-spaceship https://server4:443/indigo-salty-armadillo https://server4:443/aquamarine-maroon-wizard https://server4:443/zestful-tired-backpack https://server4:443/dry-delighted-porcupine https://server4:443/euphoric-exhilarated-scooter https://server4:443/excessive-heavy-celebi https://server4:443/ecstatic-brutal-doctor https://server4:443/microscopic-sour-earbuds https://server4:443/arctic-frightened-glasses https://server4:443/noisy-wet-scissors https://server4:443/excited-fast-zapdos https://server4:443/brutal-soft-celebi https://server4:443/hard-zesty-ring https://server4:443/large-anxious-astronaut https://server4:443/bored-anxious-porcupine https://server4:443/chilly-frosty-camel https://server4:443/pleased-numerous-princess https://server4:443/cyan-overjoyed-monk https://server4:443/sharp-excessive-belt https://server4:443/upbeat-huge-bowtie https://server4:443/purple-dull-uxie https://server4:443/happy-dull-shogun https://server4:443/few-titanic-ram https://server4:443/lime-savory-professor https://server4:443/frosty-intense-blacksmith https://server4:443/massive-glad-shogun https://server4:443/tart-anxious-bus https://server4:443/pink-bitter-speaker https://server4:443/tan-medium-folder https://server4:443/confused-blue-bag https://server4:443/intense-icy-vhs https://server4:443/harsh-confused-ninja https://server4:443/sour-frigid-diary https://server4:443/tropical-anxious-singer https://server4:443/exhilarated-wet-ranger https://server4:443/pleased-frightened-vhs https://server4:443/yellow-unlimited-bracelet https://server4:443/red-boiling-necklace https://server4:443/hard-shy-gpu https://server4:443/roasting-merciless-snorlax https://server4:443/disgusted-giant-plane https://server4:443/minuscule-fast-computer https://server4:443/zesty-envious-mittens https://server4:443/hot-tan-rayquaza https://server4:443/angry-icy-officer https://server4:443/guilty-jubilant-tyrant https://server4:443/endless-merciless-envelope https://server4:443/heavy-ashamed-scooter https://server4:443/vibrant-excessive-ethernet'
+client  | ++ cut -d/ -f3
+client  | ++ cut -d: -f1
+client  | + SERVER=server4
+client  | + for INVOCATION in ${INVOCATIONS}
+client  | + echo 'requesting files '\''/giant-slow-spaceship,/indigo-salty-armadillo,/aquamarine-maroon-wizard,/zestful-tired-backpack,/dry-delighted-porcupine,/euphoric-exhilarated-scooter,/excessive-heavy-celebi,/ecstatic-brutal-doctor,/microscopic-sour-earbuds,/arctic-frightened-glasses,/noisy-wet-scissors,/excited-fast-zapdos,/brutal-soft-celebi,/hard-zesty-ring,/large-anxious-astronaut,/bored-anxious-porcupine,/chilly-frosty-camel,/pleased-numerous-princess,/cyan-overjoyed-monk,/sharp-excessive-belt,/upbeat-huge-bowtie,/purple-dull-uxie,/happy-dull-shogun,/few-titanic-ram,/lime-savory-professor,/frosty-intense-blacksmith,/massive-glad-shogun,/tart-anxious-bus,/pink-bitter-speaker,/tan-medium-folder,/confused-blue-bag,/intense-icy-vhs,/harsh-confused-ninja,/sour-frigid-diary,/tropical-anxious-singer,/exhilarated-wet-ranger,/pleased-frightened-vhs,/yellow-unlimited-bracelet,/red-boiling-necklace,/hard-shy-gpu,/roasting-merciless-snorlax,/disgusted-giant-plane,/minuscule-fast-computer,/zesty-envious-mittens,/hot-tan-rayquaza,/angry-icy-officer,/guilty-jubilant-tyrant,/endless-merciless-envelope,/heavy-ashamed-scooter,/vibrant-excessive-ethernet'\'''
+client  | requesting files '/giant-slow-spaceship,/indigo-salty-armadillo,/aquamarine-maroon-wizard,/zestful-tired-backpack,/dry-delighted-porcupine,/euphoric-exhilarated-scooter,/excessive-heavy-celebi,/ecstatic-brutal-doctor,/microscopic-sour-earbuds,/arctic-frightened-glasses,/noisy-wet-scissors,/excited-fast-zapdos,/brutal-soft-celebi,/hard-zesty-ring,/large-anxious-astronaut,/bored-anxious-porcupine,/chilly-frosty-camel,/pleased-numerous-princess,/cyan-overjoyed-monk,/sharp-excessive-belt,/upbeat-huge-bowtie,/purple-dull-uxie,/happy-dull-shogun,/few-titanic-ram,/lime-savory-professor,/frosty-intense-blacksmith,/massive-glad-shogun,/tart-anxious-bus,/pink-bitter-speaker,/tan-medium-folder,/confused-blue-bag,/intense-icy-vhs,/harsh-confused-ninja,/sour-frigid-diary,/tropical-anxious-singer,/exhilarated-wet-ranger,/pleased-frightened-vhs,/yellow-unlimited-bracelet,/red-boiling-necklace,/hard-shy-gpu,/roasting-merciless-snorlax,/disgusted-giant-plane,/minuscule-fast-computer,/zesty-envious-mittens,/hot-tan-rayquaza,/angry-icy-officer,/guilty-jubilant-tyrant,/endless-merciless-envelope,/heavy-ashamed-scooter,/vibrant-excessive-ethernet'
+client  | + /proxygen/_build/proxygen/bin/hq --mode=client --host=server4 --port=443 --protocol=hq-interop --httpversion=0.9 --use_version=true --quic-version=1 --path=/giant-slow-spaceship,/indigo-salty-armadillo,/aquamarine-maroon-wizard,/zestful-tired-backpack,/dry-delighted-porcupine,/euphoric-exhilarated-scooter,/excessive-heavy-celebi,/ecstatic-brutal-doctor,/microscopic-sour-earbuds,/arctic-frightened-glasses,/noisy-wet-scissors,/excited-fast-zapdos,/brutal-soft-celebi,/hard-zesty-ring,/large-anxious-astronaut,/bored-anxious-porcupine,/chilly-frosty-camel,/pleased-numerous-princess,/cyan-overjoyed-monk,/sharp-excessive-belt,/upbeat-huge-bowtie,/purple-dull-uxie,/happy-dull-shogun,/few-titanic-ram,/lime-savory-professor,/frosty-intense-blacksmith,/massive-glad-shogun,/tart-anxious-bus,/pink-bitter-speaker,/tan-medium-folder,/confused-blue-bag,/intense-icy-vhs,/harsh-confused-ninja,/sour-frigid-diary,/tropical-anxious-singer,/exhilarated-wet-ranger,/pleased-frightened-vhs,/yellow-unlimited-bracelet,/red-boiling-necklace,/hard-shy-gpu,/roasting-merciless-snorlax,/disgusted-giant-plane,/minuscule-fast-computer,/zesty-envious-mittens,/hot-tan-rayquaza,/angry-icy-officer,/guilty-jubilant-tyrant,/endless-merciless-envelope,/heavy-ashamed-scooter,/vibrant-excessive-ethernet --early_data=false --psk_file= --conn_flow_control=107374182 --stream_flow_control=107374182 --outdir=/downloads --logdir=/logs --qlogger_path=/logs --v=2
+client  | + tee /logs/client.log
+client  | I20261022 08:16:31.066967    43 HQClient.cpp:47] HQClient connecting to 193.167.100.100:443
+sim     | Packets: 1 Packets: 1 Packets: 4 Packets: 5 Dropping 1252 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/1 (100.0%)
+sim     | Forwarding 1252 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/2 (50.0%)
+sim     | Packets: 8 Packets: 13 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 0/1 (0.0%)
+client  | I20261022 08:16:31.215590    43 CurlClient.cpp:184] Sending request for /giant-slow-spaceship
+client  | I20261022 08:16:31.215633    43 CurlClient.cpp:184] Sending request for /indigo-salty-armadillo
+client  | I20261022 08:16:31.215647    43 CurlClient.cpp:184] Sending request for /aquamarine-maroon-wizard
+client  | I20261022 08:16:31.215659    43 CurlClient.cpp:184] Sending request for /zestful-tired-backpack
+client  | I20261022 08:16:31.215669    43 CurlClient.cpp:184] Sending request for /dry-delighted-porcupine
+client  | I20261022 08:16:31.215679    43 CurlClient.cpp:184] Sending request for /euphoric-exhilarated-scooter
+client  | I20261022 08:16:31.215692    43 CurlClient.cpp:184] Sending request for /excessive-heavy-celebi
+client  | I20261022 08:16:31.215705    43 CurlClient.cpp:184] Sending request for /ecstatic-brutal-doctor
+client  | I20261022 08:16:31.215716    43 CurlClient.cpp:184] Sending request for /microscopic-sour-earbuds
+client  | I20261022 08:16:31.215751    43 CurlClient.cpp:184] Sending request for /arctic-frightened-glasses
+client  | I20261022 08:16:31.215761    43 CurlClient.cpp:184] Sending request for /noisy-wet-scissors
+client  | I20261022 08:16:31.215771    43 CurlClient.cpp:184] Sending request for /excited-fast-zapdos
+client  | I20261022 08:16:31.215783    43 CurlClient.cpp:184] Sending request for /brutal-soft-celebi
+client  | I20261022 08:16:31.215794    43 CurlClient.cpp:184] Sending request for /hard-zesty-ring
+client  | I20261022 08:16:31.215811    43 CurlClient.cpp:184] Sending request for /large-anxious-astronaut
+client  | I20261022 08:16:31.215824    43 CurlClient.cpp:184] Sending request for /bored-anxious-porcupine
+client  | I20261022 08:16:31.215834    43 CurlClient.cpp:184] Sending request for /chilly-frosty-camel
+client  | I20261022 08:16:31.215845    43 CurlClient.cpp:184] Sending request for /pleased-numerous-princess
+client  | I20261022 08:16:31.215855    43 CurlClient.cpp:184] Sending request for /cyan-overjoyed-monk
+client  | I20261022 08:16:31.215866    43 CurlClient.cpp:184] Sending request for /sharp-excessive-belt
+client  | I20261022 08:16:31.215880    43 CurlClient.cpp:184] Sending request for /upbeat-huge-bowtie
+client  | I20261022 08:16:31.215891    43 CurlClient.cpp:184] Sending request for /purple-dull-uxie
+client  | I20261022 08:16:31.215902    43 CurlClient.cpp:184] Sending request for /happy-dull-shogun
+client  | I20261022 08:16:31.215915    43 CurlClient.cpp:184] Sending request for /few-titanic-ram
+client  | I20261022 08:16:31.215926    43 CurlClient.cpp:184] Sending request for /lime-savory-professor
+client  | I20261022 08:16:31.215936    43 CurlClient.cpp:184] Sending request for /frosty-intense-blacksmith
+client  | I20261022 08:16:31.215960    43 CurlClient.cpp:184] Sending request for /massive-glad-shogun
+client  | I20261022 08:16:31.215972    43 CurlClient.cpp:184] Sending request for /tart-anxious-bus
+client  | I20261022 08:16:31.215982    43 CurlClient.cpp:184] Sending request for /pink-bitter-speaker
+client  | I20261022 08:16:31.215996    43 CurlClient.cpp:184] Sending request for /tan-medium-folder
+client  | I20261022 08:16:31.216006    43 CurlClient.cpp:184] Sending request for /confused-blue-bag
+client  | I20261022 08:16:31.216018    43 CurlClient.cpp:184] Sending request for /intense-icy-vhs
+client  | I20261022 08:16:31.216028    43 CurlClient.cpp:184] Sending request for /harsh-confused-ninja
+client  | I20261022 08:16:31.216039    43 CurlClient.cpp:184] Sending request for /sour-frigid-diary
+client  | I20261022 08:16:31.216054    43 CurlClient.cpp:184] Sending request for /tropical-anxious-singer
+client  | I20261022 08:16:31.216064    43 CurlClient.cpp:184] Sending request for /exhilarated-wet-ranger
+client  | I20261022 08:16:31.216075    43 CurlClient.cpp:184] Sending request for /pleased-frightened-vhs
+client  | I20261022 08:16:31.216110    43 CurlClient.cpp:184] Sending request for /yellow-unlimited-bracelet
+client  | I20261022 08:16:31.216120    43 CurlClient.cpp:184] Sending request for /red-boiling-necklace
+client  | I20261022 08:16:31.216133    43 CurlClient.cpp:184] Sending request for /hard-shy-gpu
+client  | I20261022 08:16:31.216157    43 CurlClient.cpp:184] Sending request for /roasting-merciless-snorlax
+client  | I20261022 08:16:31.216166    43 CurlClient.cpp:184] Sending request for /disgusted-giant-plane
+client  | I20261022 08:16:31.216176    43 CurlClient.cpp:184] Sending request for /minuscule-fast-computer
+client  | I20261022 08:16:31.216187    43 CurlClient.cpp:184] Sending request for /zesty-envious-mittens
+client  | I20261022 08:16:31.216198    43 CurlClient.cpp:184] Sending request for /hot-tan-rayquaza
+client  | I20261022 08:16:31.216213    43 CurlClient.cpp:184] Sending request for /angry-icy-officer
+client  | I20261022 08:16:31.216225    43 CurlClient.cpp:184] Sending request for /guilty-jubilant-tyrant
+client  | I20261022 08:16:31.216240    43 CurlClient.cpp:184] Sending request for /endless-merciless-envelope
+client  | I20261022 08:16:31.216250    43 CurlClient.cpp:184] Sending request for /heavy-ashamed-scooter
+client  | I20261022 08:16:31.216261    43 CurlClient.cpp:184] Sending request for /vibrant-excessive-ethernet
+sim     | Forwarding 98 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/3 (33.3%)
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/4 (25.0%)
+sim     | Forwarding 1252 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/5 (20.0%)
+sim     | Forwarding 388 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/6 (16.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 1/2 (50.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 1/3 (33.3%)
+client  | I20261022 08:16:31.251655    43 CurlClient.cpp:277] Got EOM for /giant-slow-spaceship. Txn Time= 36 ms
+client  | I20261022 08:16:31.251689    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 1/4 (25.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 2/5 (40.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 2/6 (33.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 2/7 (28.6%)
+client  | I20261022 08:16:31.254592    43 CurlClient.cpp:277] Got EOM for /dry-delighted-porcupine. Txn Time= 38 ms
+client  | I20261022 08:16:31.254597    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.254602    43 CurlClient.cpp:277] Got EOM for /zestful-tired-backpack. Txn Time= 38 ms
+client  | I20261022 08:16:31.254606    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 3/8 (37.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 3/9 (33.3%)
+client  | I20261022 08:16:31.256609    43 CurlClient.cpp:277] Got EOM for /excessive-heavy-celebi. Txn Time= 40 ms
+client  | I20261022 08:16:31.256613    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 3/10 (30.0%)
+client  | I20261022 08:16:31.257542    43 CurlClient.cpp:277] Got EOM for /ecstatic-brutal-doctor. Txn Time= 41 ms
+client  | I20261022 08:16:31.257545    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 3/11 (27.3%)
+client  | I20261022 08:16:31.258531    43 CurlClient.cpp:277] Got EOM for /microscopic-sour-earbuds. Txn Time= 42 ms
+client  | I20261022 08:16:31.258534    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 4/12 (33.3%)
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 1/7 (14.3%)
+sim     | Dropping 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 2/8 (25.0%)
+sim     | Dropping 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 3/9 (33.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 5/13 (38.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 5/14 (35.7%)
+client  | I20261022 08:16:31.283372    43 CurlClient.cpp:277] Got EOM for /excited-fast-zapdos. Txn Time= 67 ms
+client  | I20261022 08:16:31.283386    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 5/15 (33.3%)
+client  | I20261022 08:16:31.286782    43 CurlClient.cpp:277] Got EOM for /brutal-soft-celebi. Txn Time= 70 ms
+client  | I20261022 08:16:31.286785    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 3/10 (30.0%)
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 3/11 (27.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 6/16 (37.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 6/17 (35.3%)
+client  | I20261022 08:16:31.314108    43 CurlClient.cpp:277] Got EOM for /euphoric-exhilarated-scooter. Txn Time= 98 ms
+client  | I20261022 08:16:31.314119    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 6/18 (33.3%)
+client  | I20261022 08:16:31.315066    43 CurlClient.cpp:277] Got EOM for /vibrant-excessive-ethernet. Txn Time= 98 ms
+client  | I20261022 08:16:31.315069    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 6/19 (31.6%)
+client  | I20261022 08:16:31.316056    43 CurlClient.cpp:277] Got EOM for /heavy-ashamed-scooter. Txn Time= 99 ms
+client  | I20261022 08:16:31.316057    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 6/20 (30.0%)
+client  | I20261022 08:16:31.317065    43 CurlClient.cpp:277] Got EOM for /endless-merciless-envelope. Txn Time= 100 ms
+client  | I20261022 08:16:31.317080    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 3/12 (25.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 6/21 (28.6%)
+client  | I20261022 08:16:31.329352    43 CurlClient.cpp:277] Got EOM for /arctic-frightened-glasses. Txn Time= 113 ms
+client  | I20261022 08:16:31.329368    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 3/13 (23.1%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 7/22 (31.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 7/23 (30.4%)
+client  | I20261022 08:16:31.331264    43 CurlClient.cpp:277] Got EOM for /guilty-jubilant-tyrant. Txn Time= 115 ms
+client  | I20261022 08:16:31.331267    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 7/24 (29.2%)
+client  | I20261022 08:16:31.339026    43 CurlClient.cpp:277] Got EOM for /angry-icy-officer. Txn Time= 122 ms
+client  | I20261022 08:16:31.339032    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 7/25 (28.0%)
+client  | I20261022 08:16:31.345662    43 CurlClient.cpp:277] Got EOM for /disgusted-giant-plane. Txn Time= 129 ms
+client  | I20261022 08:16:31.345670    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 4/14 (28.6%)
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 4/15 (26.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 7/26 (26.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 8/27 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 8/28 (28.6%)
+client  | I20261022 08:16:31.396984    43 CurlClient.cpp:277] Got EOM for /noisy-wet-scissors. Txn Time= 181 ms
+client  | I20261022 08:16:31.396994    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 9/29 (31.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 9/30 (30.0%)
+client  | I20261022 08:16:31.398940    43 CurlClient.cpp:277] Got EOM for /hard-shy-gpu. Txn Time= 182 ms
+client  | I20261022 08:16:31.398944    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 10/31 (32.3%)
+sim     | Dropping 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/16 (31.2%)
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/17 (29.4%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 11/32 (34.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 12/33 (36.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 12/34 (35.3%)
+client  | I20261022 08:16:31.440289    43 CurlClient.cpp:277] Got EOM for /roasting-merciless-snorlax. Txn Time= 224 ms
+client  | I20261022 08:16:31.440297    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/18 (27.8%)
+sim     | Packets: 17 Packets: 34 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 13/35 (37.1%)
+client  | I20261022 08:16:31.486346    43 CurlClient.cpp:277] Got EOM for /aquamarine-maroon-wizard. Txn Time= 270 ms
+client  | I20261022 08:16:31.486352    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.486358    43 CurlClient.cpp:277] Got EOM for /indigo-salty-armadillo. Txn Time= 270 ms
+client  | I20261022 08:16:31.486361    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 13/36 (36.1%)
+sim     | Forwarding 68 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/19 (26.3%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 14/37 (37.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 15/38 (39.5%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 16/39 (41.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 16/40 (40.0%)
+client  | I20261022 08:16:31.614900    43 CurlClient.cpp:277] Got EOM for /tan-medium-folder. Txn Time= 398 ms
+client  | I20261022 08:16:31.614920    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 17/41 (41.5%)
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/20 (25.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 17/42 (40.5%)
+client  | I20261022 08:16:31.646802    43 CurlClient.cpp:277] Got EOM for /confused-blue-bag. Txn Time= 430 ms
+client  | I20261022 08:16:31.646836    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/21 (23.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 18/43 (41.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 18/44 (40.9%)
+client  | I20261022 08:16:31.679874    43 CurlClient.cpp:277] Got EOM for /intense-icy-vhs. Txn Time= 463 ms
+client  | I20261022 08:16:31.679898    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.679925    43 CurlClient.cpp:277] Got EOM for /red-boiling-necklace. Txn Time= 463 ms
+client  | I20261022 08:16:31.679929    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 18/45 (40.0%)
+client  | I20261022 08:16:31.681008    43 CurlClient.cpp:277] Got EOM for /tart-anxious-bus. Txn Time= 465 ms
+client  | I20261022 08:16:31.681021    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/22 (22.7%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 19/46 (41.3%)
+sim     | Packets: 72 Packets: 69 Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/23 (21.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/47 (42.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/48 (41.7%)
+client  | I20261022 08:16:31.734952    43 CurlClient.cpp:277] Got EOM for /frosty-intense-blacksmith. Txn Time= 519 ms
+client  | I20261022 08:16:31.734964    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/24 (20.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/49 (40.8%)
+client  | I20261022 08:16:31.766912    43 CurlClient.cpp:277] Got EOM for /harsh-confused-ninja. Txn Time= 550 ms
+client  | I20261022 08:16:31.766927    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/50 (40.0%)
+client  | I20261022 08:16:31.767946    43 CurlClient.cpp:277] Got EOM for /few-titanic-ram. Txn Time= 552 ms
+client  | I20261022 08:16:31.767958    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/25 (20.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/51 (39.2%)
+client  | I20261022 08:16:31.819867    43 CurlClient.cpp:277] Got EOM for /lime-savory-professor. Txn Time= 603 ms
+client  | I20261022 08:16:31.819880    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.819898    43 CurlClient.cpp:277] Got EOM for /purple-dull-uxie. Txn Time= 604 ms
+client  | I20261022 08:16:31.819900    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/52 (38.5%)
+client  | I20261022 08:16:31.821048    43 CurlClient.cpp:277] Got EOM for /pink-bitter-speaker. Txn Time= 605 ms
+client  | I20261022 08:16:31.821059    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 20/53 (37.7%)
+client  | I20261022 08:16:31.822172    43 CurlClient.cpp:277] Got EOM for /massive-glad-shogun. Txn Time= 606 ms
+client  | I20261022 08:16:31.822184    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.822192    43 CurlClient.cpp:277] Got EOM for /happy-dull-shogun. Txn Time= 606 ms
+client  | I20261022 08:16:31.822196    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 5/26 (19.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 21/54 (38.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 21/55 (38.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 21/56 (37.5%)
+client  | I20261022 08:16:31.873243    43 CurlClient.cpp:277] Got EOM for /pleased-numerous-princess. Txn Time= 657 ms
+client  | I20261022 08:16:31.873256    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.873265    43 CurlClient.cpp:277] Got EOM for /cyan-overjoyed-monk. Txn Time= 657 ms
+client  | I20261022 08:16:31.873267    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 22/57 (38.6%)
+sim     | Dropping 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 6/27 (22.2%)
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 6/28 (21.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 22/58 (37.9%)
+client  | I20261022 08:16:31.925127    43 CurlClient.cpp:277] Got EOM for /bored-anxious-porcupine. Txn Time= 709 ms
+client  | I20261022 08:16:31.925138    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 23/59 (39.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 23/60 (38.3%)
+client  | I20261022 08:16:31.927321    43 CurlClient.cpp:277] Got EOM for /exhilarated-wet-ranger. Txn Time= 711 ms
+client  | I20261022 08:16:31.927332    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 6/29 (20.7%)
+sim     | Dropping 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 7/30 (23.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 23/61 (37.7%)
+client  | I20261022 08:16:31.956759    43 CurlClient.cpp:277] Got EOM for /sharp-excessive-belt. Txn Time= 740 ms
+client  | I20261022 08:16:31.956772    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:31.956787    43 CurlClient.cpp:277] Got EOM for /chilly-frosty-camel. Txn Time= 740 ms
+client  | I20261022 08:16:31.956790    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Packets: 90 Packets: 84 Dropping 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 8/31 (25.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 24/62 (38.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 24/63 (38.1%)
+client  | I20261022 08:16:32.022863    43 CurlClient.cpp:277] Got EOM for /hard-zesty-ring. Txn Time= 807 ms
+client  | I20261022 08:16:32.022876    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 8/32 (25.0%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 25/64 (39.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 25/65 (38.5%)
+client  | I20261022 08:16:32.055768    43 CurlClient.cpp:277] Got EOM for /sour-frigid-diary. Txn Time= 839 ms
+client  | I20261022 08:16:32.055775    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 25/66 (37.9%)
+client  | I20261022 08:16:32.056843    43 CurlClient.cpp:277] Got EOM for /yellow-unlimited-bracelet. Txn Time= 840 ms
+client  | I20261022 08:16:32.056855    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 8/33 (24.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 25/67 (37.3%)
+client  | I20261022 08:16:32.087416    43 CurlClient.cpp:277] Got EOM for /tropical-anxious-singer. Txn Time= 871 ms
+client  | I20261022 08:16:32.087422    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:32.087432    43 CurlClient.cpp:277] Got EOM for /upbeat-huge-bowtie. Txn Time= 871 ms
+client  | I20261022 08:16:32.087435    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 9/34 (26.5%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 26/68 (38.2%)
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 9/35 (25.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 26/69 (37.7%)
+client  | I20261022 08:16:32.139484    43 CurlClient.cpp:277] Got EOM for /hot-tan-rayquaza. Txn Time= 923 ms
+client  | I20261022 08:16:32.139504    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 27/70 (38.6%)
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 9/36 (25.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 27/71 (38.0%)
+client  | I20261022 08:16:32.171121    43 CurlClient.cpp:277] Got EOM for /pleased-frightened-vhs. Txn Time= 955 ms
+client  | I20261022 08:16:32.171132    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:32.171144    43 CurlClient.cpp:277] Got EOM for /large-anxious-astronaut. Txn Time= 955 ms
+client  | I20261022 08:16:32.171147    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 9/37 (24.3%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 28/72 (38.9%)
+sim     | Packets: 115 Packets: 110 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 28/73 (38.4%)
+client  | I20261022 08:16:32.266269    43 CurlClient.cpp:277] Got EOM for /zesty-envious-mittens. Txn Time= 1050 ms
+client  | I20261022 08:16:32.266281    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+client  | I20261022 08:16:32.266294    43 CurlClient.cpp:277] Got EOM for /minuscule-fast-computer. Txn Time= 1050 ms
+client  | I20261022 08:16:32.266296    43 QuicStreamAsyncTransport.cpp:563] Failed to unregister write callback during cleanup: Invalid operation
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 29/74 (39.2%)
+sim     | Forwarding 100 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 9/38 (23.7%)
+sim     | Forwarding 47 bytes 193.167.0.100:39905 -> 193.167.100.100:443, dropped 9/39 (23.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39905, dropped 29/75 (38.7%)
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 135 Packets: 127 Received signal: 15
+sim     | msg="15", Packets: 140 +2.039010314s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 140
+sim     | Packets: 134 Packets received/dropped on interface 'eth1': 140/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# Packets captured: 134
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 04:16:33,038 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 04:16:33,039 No key log file found.
+2026-10-22 04:16:33,039 No key log file found.
+2026-10-22 04:16:33,039 No key log file found.
+2026-10-22 04:16:33,039 No key log file found.
+2026-10-22 04:16:33,162 Expected 50 handshakes. Got: 1

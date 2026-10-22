@@ -1,0 +1,117 @@
+2026-10-22 04:32:05,778 Generated random file: ample-frigid-singer of size: 10485760
+2026-10-22 04:32:05,778 Requests: ['https://server4:443/ample-frigid-singer']
+2026-10-22 04:32:05,803 
+2026-10-22 04:32:05,803 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_8_0t45gw/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=transfer CLIENT_WWW=/tmp/client_www_yx123hv8/ CLIENT_DOWNLOADS=/tmp/client_download_dtszhhae/ SERVER_WWW=/tmp/server_www_0uqriemc/ SERVER_DOWNLOADS=/tmp/server_download__ywry_lk/ SERVER_LOGS=/tmp/logs_server_2ayo_n43 CLIENT_LOGS=/tmp/logs_client_cyfepme5 SCENARIO="rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s" CLIENT=peterdoornbosch/kwik_n_flupke-interop SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/ample-frigid-singer" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 04:32:39,178  Container sim Recreate 
+ Container sim Recreated 
+ Container server Recreate 
+ Container client Recreate 
+ Container server Recreated 
+ Container client Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | Setting up routes...
+ Container client Started 
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | Certificate was added to keystore
+server  | Setting up routes...
+ Container server Started 
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+sim     | server:443 is available after 500.74534ms
+sim     | Using scenario: rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+sim     | 0s: first rebind in 1s, frequency 5s
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Writing keys to /logs/keys.log
+sim     | Packets: 1 Packets: 1 Packets: 8 Packets: 3 Packets: 13 Packets: 10 Packets: 15 Packets: 34 1s:  rebinding: 193.167.0.100:33379 -> 193.167.0.100:57607
+sim     | 1.00658s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01042s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01157s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01272s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01387s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01502s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01617s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.01732s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.03712s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.03826s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.03941s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.04056s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.04171s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.04286s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.04401s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.1662s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.16735s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 24 Packets: 44 1.42389s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.42655s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.4277s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 61 Packets: 61 Packets: 69 Packets: 70 1.9417s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.94425s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 1.9454s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 75 Packets: 74 Packets: 80 Packets: 75 Packets: 82 Packets: 84 Packets: 76 Packets: 85 2.97405s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 2.9752s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 86 Packets: 88 Packets: 77 Packets: 78 Packets: 89 Packets: 79 Packets: 93 Packets: 82 5.03296s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 5.03411s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 95 Packets: 84 Packets: 98 Packets: 99 Packets: 101 6s:  rebinding: 193.167.0.100:57607 -> 193.167.0.100:59022
+sim     | Packets: 85 Packets: 102 Packets: 86 Packets: 106 Packets: 89 Packets: 109 Packets: 92 Packets: 111 Packets: 94 9.15071s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 9.15186s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 113 Packets: 95 Packets: 116 Packets: 97 11s:  rebinding: 193.167.0.100:59022 -> 193.167.0.100:18108
+sim     | Packets: 98 Packets: 99 Packets: 117 Packets: 118 Packets: 100 16s:  rebinding: 193.167.0.100:18108 -> 193.167.0.100:39968
+sim     | Packets: 119 17.386s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | 17.3872s: unknown binding for destination 193.167.0.100:33379, dropping packet
+sim     | Packets: 120 Packets: 121 Packets: 122 Packets: 101 Packets: 124 Packets: 103 21s:  rebinding: 193.167.0.100:39968 -> 193.167.0.100:745
+sim     | Packets: 104 26s:  rebinding: 193.167.0.100:745 -> 193.167.0.100:38910
+sim     | Packets: 125 Packets: 105 31s:  rebinding: 193.167.0.100:38910 -> 193.167.0.100:64331
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 106 Packets: 126 Received signal: 15
+sim     | msg="15Packets captured: 106
+sim     | ", Packets received/dropped on interface 'eth0': 106/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | +32.031694597s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | Packets captured: 126
+sim     | NS_FATAL, terminating
+sim     | Packets received/dropped on interface 'eth1': 126/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 04:32:39,355 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 04:32:39,355 Using the client's key log file.
+2026-10-22 04:32:39,359 
+2026-10-22 04:32:39,359 Using the client's key log file.
+2026-10-22 04:32:39,359 Using the client's key log file.
+2026-10-22 04:32:39,363 
+2026-10-22 04:32:39,363 Using the client's key log file.
+2026-10-22 04:32:39,610 File size of /tmp/client_download_dtszhhae/ample-frigid-singer doesn't match. Original: 10485760 bytes, downloaded: 9322 bytes.
+2026-10-22 04:32:39,610 Using the client's key log file.
+2026-10-22 04:32:39,854 File size of /tmp/client_download_dtszhhae/ample-frigid-singer doesn't match. Original: 10485760 bytes, downloaded: 9322 bytes.

@@ -1,0 +1,5 @@
+info: interop server on port 443, serving /www
+info(anole): ReleaseSafe build
+info(anole): listening on https://0.0.0.0:443 (HTTP/2, HTTP/1.1, HTTP/3)
+info(anole): Graceful shutdown requested
+info(anole): signal received (term); drained and stopped
