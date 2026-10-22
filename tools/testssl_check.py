@@ -34,8 +34,6 @@ def main(path):
             problems.append(f"{id_}: {finding}")
         elif id_ not in SKIP_VULN and "VULNERABLE" in finding and "not vulnerable" not in low:
             problems.append(f"{id_} vulnerable: {finding}")
-        elif id_.startswith("cert_") and False:
-            pass
     fs = by_id.get("FS")
     if fs is None:
         problems.append("no forward secrecy result in the report")
