@@ -156,6 +156,30 @@ pub const EventStream = struct {
         };
     }
 
+    /// A comment line (": text\n\n"): a heartbeat that keeps proxies from
+    /// closing an idle stream; browsers ignore it.
+    pub fn comment(self: *EventStream, text: []const u8) Error!void {
+        if (std.mem.indexOfAny(u8, text, "\r\n") != null) return error.InvalidEventField;
+        return self.body.res.resolve(sendComment(&self.body.interface, text));
+    }
+
+    fn sendComment(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+        try w.print(": {s}\n\n", .{text});
+        return w.flush();
+    }
+
+    /// Ends the stream (the body's last chunk). Call before returning.
+    pub fn end(self: *EventStream) StreamingBodyWriter.Error!void {
+        return self.body.end();
+    }
+
+    /// Whether the server is draining: send a last event and `end`.
+    pub fn draining(self: *const EventStream) bool {
+        const req = self.body.res.request orelse return false;
+        const event = req.drain orelse return false;
+        return event.isSet();
+    }
+
     /// Sends one complete event.
     pub fn send(self: *EventStream, data: []const u8, opts: Options) Error!void {
         try opts.validate();
@@ -505,6 +529,8 @@ pub const StreamingBodyWriter = struct {
             return w.consume(total);
         }
 
+        self.res.armWrite();
+        defer self.res.disarmWrite();
         if (self.compressor) |compressor| {
             // Charged by the compressor for what it sends instead.
             try self.record(compressor.write(pending, data, splat));
@@ -530,6 +556,8 @@ pub const StreamingBodyWriter = struct {
     /// otherwise hold on to what it was given until it had more.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *StreamingBodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        self.res.armWrite();
+        defer self.res.disarmWrite();
         const compressor = self.compressor orelse return std.Io.Writer.defaultFlush(w);
         try self.record(compressor.flush(w.buffered()));
         w.end = 0;
@@ -551,6 +579,8 @@ pub const StreamingBodyWriter = struct {
         // its headers promised, and the connection cannot carry another
         // response.
         errdefer res.keepalive = false;
+        res.armWrite();
+        defer res.disarmWrite();
 
         if (self.compressor) |compressor| {
             try res.resolve(compressor.finish(self.interface.buffered()));
@@ -772,7 +802,15 @@ pub const Response = struct {
     body_sent: usize = 0,
     /// The request this answers, when the server built the pair. Set by the
     /// server.
-    request: ?*const Request = null,
+    request: ?*Request = null,
+    /// From the engine: `timeouts.write`. Once a stream or file body has
+    /// started, each write the peer does not take within it ends the
+    /// response (`error.WriteTimeout`).
+    _write_timeout: ?std.Io.Duration = null,
+    /// When the write in progress times out, if one is being timed.
+    _write_deadline: ?std.Io.Clock.Timestamp = null,
+    /// The request deadline was lifted for a stream or file body.
+    _stream_mode: bool = false,
     /// Send the body compressed (zstd, Brotli or gzip, as the build has
     /// them) if the request's `Accept-Encoding` allows it.
     /// Settled with the headers: by `stream`, or by `write` for a buffered
@@ -835,7 +873,7 @@ pub const Response = struct {
     /// vtable's sentinel and says nothing a caller can act on, so it does
     /// not appear here; a writer that failed without recording a cause --
     /// a fixed buffer running out, say -- comes back as `Unexpected`.
-    pub const SendError = Connection.WriteError || error{Unexpected};
+    pub const SendError = Connection.WriteError || error{ Unexpected, WriteTimeout };
 
     /// What `write` can fail with. `ContentLengthMismatch` is a body of
     /// another length than a handler-set Content-Length promises;
@@ -1097,6 +1135,7 @@ pub const Response = struct {
             self.chunked = true;
         }
         try self.resolve(self.sendHeaderAlone(self.bodyOut()));
+        self.liftDeadline();
         return .init(self, buf, compressor);
     }
 
@@ -1495,10 +1534,50 @@ pub const Response = struct {
     fn resolve(self: *Response, result: std.Io.Writer.Error!void) SendError!void {
         result catch |err| switch (err) {
             error.WriteFailed => {
-                if (self.sink) |sink| return sink.writeError() orelse error.Unexpected;
-                return self.conn.getWriteError() orelse error.Unexpected;
+                const cause: SendError = if (self.sink) |sink|
+                    (sink.writeError() orelse error.Unexpected)
+                else
+                    (self.conn.getWriteError() orelse error.Unexpected);
+                // A write that was canceled after its own deadline passed
+                // was the write timeout's doing (the cancel stays pending
+                // for the engine, which closes the connection or the stream).
+                if (cause == error.Canceled) if (self._write_deadline) |d| {
+                    if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d)) {
+                        self.keepalive = false;
+                        return error.WriteTimeout;
+                    }
+                };
+                return cause;
             },
         };
+    }
+
+    /// Ends the request deadline for a body that may take long to go out
+    /// (a stream, a file): from now each write has `timeouts.write` instead.
+    /// A deadline the handler set itself is kept.
+    fn liftDeadline(self: *Response) void {
+        const req = self.request orelse return;
+        if (req._deadline_from_handler or self._stream_mode) return;
+        req._applyDeadline(.none);
+        self._stream_mode = true;
+    }
+
+    /// Starts timing one hand-off of bytes to the connection.
+    fn armWrite(self: *Response) void {
+        if (!self._stream_mode) return;
+        const d = self._write_timeout orelse return;
+        const req = self.request orelse return;
+        self._write_deadline = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake });
+        req._applyDeadline(.{ .duration = .{ .raw = d, .clock = .awake } });
+    }
+
+    /// Stops timing it.
+    fn disarmWrite(self: *Response) void {
+        if (!self._stream_mode) return;
+        const req = self.request orelse return;
+        if (self._write_deadline == null) return;
+        self._write_deadline = null;
+        req._applyDeadline(.none);
     }
 
     /// Puts `content_type` into the headers. Before `headers_written` is
@@ -1869,7 +1948,10 @@ pub const Response = struct {
         }
         if (self.file) |body| {
             if (send_header) try self.resolve(self.sendHeader(self.bodyOut()));
+            self.liftDeadline();
             if (self.sendsBody()) try self.sendFileBody(body);
+            self.armWrite();
+            defer self.disarmWrite();
             return self.resolve(self.finish(self.bodyOut()));
         }
         // A whole body in memory goes to a sink that takes it in one call.
@@ -1914,28 +1996,40 @@ pub const Response = struct {
         }
     }
 
+    /// How much of a file is handed to the connection at a time.
+    const file_piece: usize = 1 << 20;
+
     fn sendFileBody(self: *Response, body: BodyFile) WriteError!void {
         if (body.size == 0) return;
         // Unbuffered: without a sendfile of its own, the `Io` reads the
         // file straight into the connection's write buffer.
         var reader = body.handle.reader(self.io, &.{});
         reader.seekTo(body.offset) catch unreachable; // a new reader is positional
-        const sent = self.bodyOut().sendFileAll(&reader, .limited(body.size)) catch |err| switch (err) {
-            error.WriteFailed => {
+        // In pieces, so that `timeouts.write` bounds each hand-off to the
+        // peer rather than the whole download.
+        var left = body.size;
+        while (left > 0) {
+            const piece = @min(left, file_piece);
+            self.armWrite();
+            defer self.disarmWrite();
+            const sent = self.bodyOut().sendFileAll(&reader, .limited(piece)) catch |err| switch (err) {
+                error.WriteFailed => {
+                    self.keepalive = false;
+                    return self.resolve(error.WriteFailed);
+                },
+                error.ReadFailed => {
+                    self.keepalive = false;
+                    if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                    return error.ContentLengthMismatch;
+                },
+            };
+            // The file shrank since it was opened, and the length already
+            // went out with the headers.
+            if (sent != piece) {
                 self.keepalive = false;
-                return self.resolve(error.WriteFailed);
-            },
-            error.ReadFailed => {
-                self.keepalive = false;
-                if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
                 return error.ContentLengthMismatch;
-            },
-        };
-        // The file shrank since it was opened, and the length already went
-        // out with the headers.
-        if (sent != body.size) {
-            self.keepalive = false;
-            return error.ContentLengthMismatch;
+            }
+            left -= piece;
         }
     }
 

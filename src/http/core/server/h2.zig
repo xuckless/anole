@@ -886,7 +886,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// or the buffer filled up) goes to `spill`, which the writer frees
         /// whenever it runs out of output, so an idle connection holds none.
         fn runWriter(conn: *Conn) !void {
-            const send_timeout = sendTimeout(conn);
+            // A write the peer does not take, however many streams wait behind it.
+            const send_timeout = conn.server.config.timeout.write;
             var spill: std.ArrayList(u8) = .empty;
             defer spill.deinit(conn.allocator);
             const writer = conn.connection.writer;

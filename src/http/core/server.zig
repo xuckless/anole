@@ -2381,6 +2381,7 @@ pub fn Server(comptime Ctx: type) type {
             res.default_content_type = self.config.response.default_content_type;
             res.brotli_quality = self.config.response.brotli_quality;
             res.error_format = self.config.errors;
+            res._write_timeout = self.config.timeout.write;
         }
 
         /// The client address for a request from `peer` with `headers`,
