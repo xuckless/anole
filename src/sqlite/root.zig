@@ -328,7 +328,7 @@ pub const Client = struct {
         };
         var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader };
         errdefer tx.release();
-        _ = try tx.run(cx, .exec, void, if (reader) "BEGIN" else "BEGIN IMMEDIATE", .{}, .{ .prepare = false });
+        _ = try tx.runOp(cx, .exec, void, if (reader) "BEGIN" else "BEGIN IMMEDIATE", .{}, .{ .prepare = false });
         return tx;
     }
 
@@ -652,50 +652,64 @@ pub const Tx = struct {
     /// Committed or rolled back.
     finished: bool = false,
 
+    /// The verbs with per-call options: `timeout` and `prepare` apply; a
+    /// `coalesce` or `cache` fails the call (`error.Database`, `lastError`:
+    /// "coalesce and cache are not for calls inside a transaction").
+    pub fn with(tx: *Tx, opts: db.QueryOptions) TxQuery {
+        return .{ .tx = tx, .opts = opts };
+    }
+
     /// `Client.exec` inside the transaction.
     pub fn exec(tx: *Tx, cx: anytype, sql: []const u8, args: anytype) Error!u64 {
-        return tx.run(cx, .exec, void, sql, args, .{});
+        return tx.with(.{}).exec(cx, sql, args);
     }
 
     /// `Client.one` inside the transaction.
     pub fn one(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!T {
-        return tx.run(cx, .one, T, sql, args, .{});
+        return tx.with(.{}).one(T, cx, sql, args);
     }
 
     /// `Client.optional` inside the transaction.
     pub fn optional(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!?T {
-        return tx.run(cx, .optional, T, sql, args, .{});
+        return tx.with(.{}).optional(T, cx, sql, args);
     }
 
     /// `Client.all` inside the transaction.
     pub fn all(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error![]T {
-        return tx.run(cx, .all, T, sql, args, .{});
+        return tx.with(.{}).all(T, cx, sql, args);
     }
 
     /// `Client.iterate` inside the transaction; `deinit` the rows before the
     /// next call on `tx`.
     pub fn iterate(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
-        // Not probed (`owns` is false): never NeedsWriter.
-        return Rows(T).startOn(tx.db, cx, tx.conn, tx.on_writer, false, sql, args) catch |err| switch (err) {
-            error.NeedsWriter => unreachable,
-            else => |e| e,
-        };
+        return tx.with(.{}).iterate(T, cx, sql, args);
+    }
+
+    /// `Query.table` inside the transaction: rows whose columns are known
+    /// at run time (the C ABI's `anole_db_tx_query`).
+    pub fn table(tx: *Tx, cx: anytype, sql: []const u8, values: []const Value) Error!Table {
+        return tx.with(.{}).table(cx, sql, values);
+    }
+
+    /// `Query.run` inside the transaction.
+    pub fn run(tx: *Tx, cx: anytype, sql: []const u8, values: []const Value) Error!Changes {
+        return tx.with(.{}).run(cx, sql, values);
     }
 
     /// Commits and gives the connection back; `deinit` after it does
     /// nothing. When it fails, `deinit` rolls back.
     pub fn commit(tx: *Tx, cx: anytype) Error!void {
-        std.debug.assert(!tx.finished);
-        _ = try tx.run(cx, .exec, void, "COMMIT", .{}, .{ .prepare = false });
+        try tx.usable(cx);
+        _ = try tx.runOp(cx, .exec, void, "COMMIT", .{}, .{ .prepare = false });
         tx.release();
     }
 
     /// Rolls back and gives the connection back, failed or not. `deinit`
     /// does it too when neither this nor `commit` ran.
     pub fn rollback(tx: *Tx, cx: anytype) Error!void {
-        std.debug.assert(!tx.finished);
+        try tx.usable(cx);
         defer tx.release();
-        _ = try tx.run(cx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false });
+        _ = try tx.runOp(cx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false });
     }
 
     /// Rolls back unless committed, and gives the connection back. Not
@@ -708,7 +722,7 @@ pub const Tx = struct {
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var ctx: db.Ctx = .{ .io = tx.io, .arena = fba.allocator() };
         // Fails when SQLite already rolled back (an interrupted write).
-        _ = tx.run(&ctx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false, .quiet = true }) catch {};
+        _ = tx.runOp(&ctx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false, .quiet = true }) catch {};
         tx.release();
     }
 
@@ -717,8 +731,13 @@ pub const Tx = struct {
         if (tx.on_writer) tx.db.unlockWriter(tx.io) else tx.db.releaseReader(tx.io, tx.conn);
     }
 
-    fn run(tx: *Tx, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) Error!Out(op, T) {
-        std.debug.assert(!tx.finished);
+    fn usable(tx: *const Tx, cx: anytype) Error!void {
+        if (!tx.finished) return;
+        return failedWith(tx.db, cx, "the transaction is over (committed or rolled back); begin another");
+    }
+
+    fn runOp(tx: *Tx, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype, flags: Flags) Error!Out(op, T) {
+        try tx.usable(cx);
         const call_ = tx.db.observer.start(cx);
         const result = if (tx.on_writer)
             runOnWriter(tx.db, cx, op, T, sql, args, flags)
@@ -729,6 +748,72 @@ pub const Tx = struct {
         return result;
     }
 };
+
+/// `Tx.with`: the transaction's verbs with options.
+pub const TxQuery = struct {
+    tx: *Tx,
+    opts: db.QueryOptions,
+
+    fn ready(q: TxQuery, cx: anytype) Error!void {
+        try q.tx.usable(cx);
+        if (q.opts.coalesce or q.opts.cache != null) return failedWith(q.tx.db, cx, "coalesce and cache are not for calls inside a transaction");
+    }
+
+    fn flags(q: TxQuery) Flags {
+        return .{ .prepare = q.opts.prepare };
+    }
+
+    fn go(q: TxQuery, cx: anytype, comptime op: Op, comptime T: type, sql: []const u8, args: anytype) Error!Out(op, T) {
+        try q.ready(cx);
+        const Run = struct {
+            fn run(tx: *Tx, c_: @TypeOf(cx), s: []const u8, a: @TypeOf(args), f: Flags) Error!Out(op, T) {
+                return tx.runOp(c_, op, T, s, a, f);
+            }
+        };
+        return unbound(Error!Out(op, T), internal.bounded(cx, .sqlite, internal.callTimeout(q.opts.timeout, null), Run.run, .{ q.tx, cx, sql, args, q.flags() }));
+    }
+
+    pub fn exec(q: TxQuery, cx: anytype, sql: []const u8, args: anytype) Error!u64 {
+        return q.go(cx, .exec, void, sql, args);
+    }
+
+    pub fn one(q: TxQuery, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!T {
+        return q.go(cx, .one, T, sql, args);
+    }
+
+    pub fn optional(q: TxQuery, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!?T {
+        return q.go(cx, .optional, T, sql, args);
+    }
+
+    pub fn all(q: TxQuery, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error![]T {
+        return q.go(cx, .all, T, sql, args);
+    }
+
+    pub fn table(q: TxQuery, cx: anytype, sql: []const u8, values: []const Value) Error!Table {
+        return q.go(cx, .table, void, sql, values);
+    }
+
+    pub fn run(q: TxQuery, cx: anytype, sql: []const u8, values: []const Value) Error!Changes {
+        return q.go(cx, .run, void, sql, values);
+    }
+
+    pub fn iterate(q: TxQuery, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
+        try q.ready(cx);
+        // Not probed (`owns` is false): never NeedsWriter.
+        return Rows(T).startOn(q.tx.db, cx, q.tx.conn, q.tx.on_writer, false, sql, args) catch |err| switch (err) {
+            error.NeedsWriter => unreachable,
+            else => |e| e,
+        };
+    }
+};
+
+/// A call's failure that is Anole's own (not SQLite's): recorded for
+/// `lastError`, as `error.Database`.
+fn failedWith(d: *Client, cx: anytype, comptime message: []const u8) Error {
+    var f: Failure = .{};
+    _ = f.ours(.other, message, .{}) catch {};
+    return failed(d, cx, &f);
+}
 
 /// The writer connection, held (`Client.acquire`) for the driver's own calls.
 pub const Conn = struct {
@@ -749,6 +834,12 @@ pub const Conn = struct {
 
     /// Gives the writer back, for the next call or transaction.
     pub fn release(self: *const Conn) void {
+        {
+            const was = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(was);
+            if (self.db.onWriter(self.io, rollbackIfOpen, .{&self.db.writer.conn}) catch false)
+                log.err("acquire(): the writer was given back inside a transaction; rolled back", .{});
+        }
         self.db.unlockWriter(self.io);
     }
 };
@@ -845,7 +936,7 @@ pub fn Rows(comptime T: type) type {
         pub fn next(self: *Self) Error!?T {
             std.debug.assert(!self.finished);
             if (self.pos == self.batch.len) {
-                if (self.done) return null;
+                if (self.done) return self.leftOpen();
                 var failure: Failure = .{};
                 const fetched = if (self.on_writer)
                     self.db.onWriter(self.io, fetchJob, .{ self, &failure })
@@ -856,10 +947,28 @@ pub fn Rows(comptime T: type) type {
                     error.NeedsWriter => unreachable,
                     else => |e| return e,
                 };
-                if (self.batch.len == 0) return null;
+                if (self.batch.len == 0) return self.leftOpen();
             }
             defer self.pos += 1;
             return self.batch[self.pos];
+        }
+
+        /// After the last row of a call that owns its connection: one that
+        /// left a transaction open (a bare BEGIN) is rolled back, and the
+        /// call fails.
+        fn leftOpen(self: *Self) Error!?T {
+            if (!self.owns) return null;
+            var failure: Failure = .{};
+            const checked = if (self.on_writer)
+                self.db.onWriter(self.io, leftOpenJob, .{ self.conn, &failure })
+            else
+                Client.onReader(self.io, self.conn, leftOpenJob, .{ self.conn, &failure });
+            checked catch |err| switch (err) {
+                error.Failed => return self.fail_fn(self.fail_ctx, self.db, &failure),
+                error.NeedsWriter => unreachable,
+                else => |e| return e,
+            };
+            return null;
         }
 
         /// Ends the statement and gives the connection back.
@@ -869,6 +978,15 @@ pub fn Rows(comptime T: type) type {
             // Resetting ends the read; no I/O to speak of.
             self.stmt.done();
             if (!self.owns) return;
+            {
+                const was = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(was);
+                const rolled = if (self.on_writer)
+                    self.db.onWriter(self.io, rollbackIfOpen, .{self.conn})
+                else
+                    Client.onReader(self.io, self.conn, rollbackIfOpen, .{self.conn});
+                if (rolled catch false) log.err("the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back", .{});
+            }
             if (self.on_writer) self.db.unlockWriter(self.io) else self.db.releaseReader(self.io, self.conn);
         }
 
@@ -1107,7 +1225,23 @@ const Flags = struct {
 /// Why a plain call that left a transaction open failed.
 const left_open = "the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: " ++
     "separate calls do not keep a connection, and the writer is shared by every request; " ++
-    "use begin() or transaction() (C ABI: one call with the whole transaction, until the transaction API)";
+    "use begin() or transaction() (C ABI: anole_db_begin)";
+
+/// On the connection's own thread: a transaction left open is rolled back,
+/// and the call fails with `left_open`.
+fn leftOpenJob(conn: *Connection, f: *Failure) JobError!void {
+    if (c.sqlite3_get_autocommit(conn.handle.db) != 0) return;
+    _ = c.sqlite3_exec(conn.handle.db, "ROLLBACK", null, null, null);
+    return f.ours(.other, left_open, .{});
+}
+
+/// On the connection's own thread: rolls back a transaction left open;
+/// whether there was one.
+fn rollbackIfOpen(conn: *Connection) bool {
+    if (c.sqlite3_get_autocommit(conn.handle.db) != 0) return false;
+    _ = c.sqlite3_exec(conn.handle.db, "ROLLBACK", null, null, null);
+    return true;
+}
 
 /// What a job fails with. `Failed` carries a `Failure`, which the caller
 /// turns into `anole.db`'s error on its own task.
