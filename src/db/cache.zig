@@ -56,6 +56,9 @@ pub const Shape = enum {
     optional,
     /// A slice of rows (`all`): empty with none.
     all,
+    /// Rows under run-time column names (`anole.sqlite.Table`): empty with
+    /// no row.
+    table,
 };
 
 /// Whether `out`, a read's result of `shape`, is empty.
@@ -64,6 +67,7 @@ fn isEmpty(comptime shape: Shape, out: anytype) bool {
         .one => false,
         .optional => out == null,
         .all => out.len == 0,
+        .table => out.rows.len == 0,
     };
 }
 

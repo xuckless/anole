@@ -25,6 +25,8 @@ pub const Config = struct {
     middleware: []const Middleware = &.{},
     routes: []const Route = &.{},
     observe: Observe = .{},
+    /// Databases for `anole_db_*`, opened at start.
+    databases: []const Database = &.{},
 
     pub const Listener = struct {
         /// Unique; "http-<port>" / "https-<port>" when left out. Requests
@@ -82,6 +84,39 @@ pub const Config = struct {
         ws_max_message: u32 = 1 << 20,
         /// Open connections at most; 0 follows the open-file limit.
         max_connections: u32 = 0,
+        /// The largest database answer, in bytes of its record: past it,
+        /// the answer is ANOLE_E_TOOBIG.
+        db_result_max: u32 = 16 << 20,
+    };
+
+    pub const Database = struct {
+        /// What `anole_db_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        sqlite: ?Sqlite = null,
+        /// The bounds of the answers kept for queries with cache_ttl_ms,
+        /// over every executor.
+        cache: CacheBounds = .{},
+    };
+
+    pub const Sqlite = struct {
+        /// A file (created when missing), or ":memory:".
+        path: []const u8,
+        /// Read-only connections beside the writer; null: one per executor,
+        /// at most 8; 0: everything on the writer.
+        readers: ?u32 = null,
+        /// How long a statement waits for a lock another process holds.
+        busy_timeout_ms: u32 = 5000,
+        /// Prepared statements kept per connection.
+        statement_cache: u32 = 64,
+        /// Run on every connection as it opens: "PRAGMA cache_size = -20000".
+        pragmas: []const []const u8 = &.{},
+        /// SQL run once at start, before the listeners open: a schema.
+        init: ?[]const u8 = null,
+    };
+
+    pub const CacheBounds = struct {
+        max_entries: u32 = 4096,
+        max_bytes: u64 = 32 << 20,
     };
 
     pub const Timeouts = struct {
@@ -309,6 +344,14 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             return fail(why, "listeners[{d}].name \"{s}\" is taken", .{ i, l.name.? });
     }
     if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
+    for (cfg.databases, 0..) |d, i| {
+        if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
+        for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
+            return fail(why, "databases[{d}].name \"{s}\" is taken", .{ i, d.name });
+        const sq = d.sqlite orelse return fail(why, "databases[{d}]: sqlite (the one kind in ABI 0.1)", .{i});
+        if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
+        if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
+    }
     try checkMiddleware(cfg.middleware, "middleware", why);
     var timeouts: [max_timeouts]u32 = undefined;
     var ntimeouts: usize = 1;

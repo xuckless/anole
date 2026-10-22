@@ -133,9 +133,10 @@ are `anole_span`s (offset from the record's start, length).
 | `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` |
 | `ANOLE_EV_WS_CLOSE` | `anole_ws_close_event`: the socket is done | `anole_ws` |
 | `ANOLE_EV_WS_DRAIN` | `anole_event`: a socket that took `ANOLE_BUSY` has room | `anole_ws` |
+| `ANOLE_EV_DB_RESULT` | `anole_db_result_event`, then column names, cells, bytes | 0 (`user_data`) |
 | `ANOLE_EV_STOPPED` | `anole_event`: the server stopped; the consumer's last event | 0 |
 
-Types 10 and 12-39 are reserved (database results, gRPC calls, WebTransport).
+Types 12-39 are reserved (gRPC calls, WebTransport, more database events).
 
 A request record carries the route's `handler` id, the method (an enum and
 the name as sent), the HTTP version (11, 20, 30), the raw path and query, the
@@ -185,7 +186,8 @@ Negative codes mean nothing was done unless the function says otherwise:
 | `ANOLE_E_UNSUPPORTED` | compiled out, or not on this OS |
 | `ANOLE_E_TOOBIG` | the next event does not fit the poll buffer (it stays queued) |
 | `ANOLE_E_SYSTEM` | the OS refused (a port in use, a certificate that will not load) |
-| `ANOLE_E_TIMEOUT` | a blocking call's timeout passed |
+| `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
+| `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
 
 ## Configuration
 
@@ -289,6 +291,61 @@ per executor, and the larger of 16 x `limits.ws_high_water` and
 2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
 `ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
+## Databases
+
+`anole_db_*` runs SQL without blocking the caller, for event-loop consumers
+(Node, asyncio). A database is configured with the server and opened at
+start, before the listeners, with its `init` script:
+
+```json
+"databases": [
+  { "name": "main",
+    "sqlite": { "path": "app.db", "init": "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT UNIQUE NOT NULL);" },
+    "cache": { "max_entries": 4096, "max_bytes": 33554432 } }
+]
+```
+
+```c
+anole_db *db;
+anole_db_find(s, (anole_str){"main", 4}, &db);
+anole_db_value p[] = {{ANOLE_DB_TEXT, 0, {.s = {"milk", 4}}}};
+anole_db_exec(db, consumer, sql_insert, p, 1, NULL, /*user_data*/ 7);
+anole_db_options o = {sizeof o, ANOLE_DB_COALESCE, 0, /*cache_ttl_ms*/ 5000, 0, {"notes", 5}};
+anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
+/* later, from anole_poll: ANOLE_EV_DB_RESULT with user_data 7, then 8 */
+```
+
+- Each call copies the statement and its parameters and returns at once.
+  The answer is one `ANOLE_EV_DB_RESULT` record for the consumer named in
+  the call, carrying the call's `user_data` (a binding's promise ID).
+  Answers to different calls may arrive in any order.
+- SQLite runs as in Zig ([database.md](database.md)): reads on read-only
+  connections on Anole's blocking pool beside the writer (WAL), writes in
+  turn on the database's writer thread, `:memory:` all on the writer.
+- `anole_db_query` returns rows: the column names (`columns`), then
+  `nrows * ncolumns` cells (`anole_db_cell`: null, integer, float, text or
+  blob), row after row, all in the record. `anole_db_exec` returns
+  `changes` and `last_insert_rowid`; with no parameters its SQL may hold
+  several statements.
+- Options (`anole_db_options`, or NULL):
+  - `timeout_ms` interrupts the statement (`ANOLE_E_TIMEOUT`, 504).
+  - `ANOLE_DB_COALESCE`: identical reads in flight at once on one executor
+    share one run.
+  - `cache_ttl_ms`: the answer is kept per executor and served from memory
+    (`source` says whether it was). `cache_tag` names a group of kept
+    answers to drop by, with `anole_db_invalidate` after a write.
+  - Nothing is coalesced or cached unless the call asks.
+- Failures come back in the record, never as a call's return:
+  - `status` is `ANOLE_E_DB`, `ANOLE_E_TIMEOUT`, `ANOLE_E_TOOBIG` (an answer
+    past `limits.db_result_max`) or `ANOLE_E_NOMEM`.
+  - `error_class` gives the kind of failure (`ANOLE_DB_ERR_UNIQUE`, ...).
+  - `http_status` is what Anole's own handlers would answer for it (409, 503,
+    504, 500).
+  - The database's message, its code and the constraint are in the record,
+    for logs. Don't send them to clients.
+- Queries can be queued from `anole_server_start` until the server stops.
+  Queries still running at the stop get no answer.
+
 ## Lifecycle
 
 ```c
@@ -328,19 +385,17 @@ routes with native ones.
 
 ## What comes next
 
-ABI 0.1 is the request/response and WebSocket core. Before the ABI freezes
-(1.0) and the bindings ship, these come as their own pull requests, in this
-order; their event types and handle kinds are reserved already:
+ABI 0.1 is the request/response and WebSocket core, plus `anole_db_*` with
+SQLite. Before the ABI freezes (1.0) and the bindings ship, these come as
+their own pull requests; their event types and handle kinds are reserved
+already:
 
-1. `anole_db_*` with SQLite: non-blocking queries for event-loop consumers,
-   with per-query request coalescing and a TTL result cache.
-2. gRPC: server, with service methods implemented in the language.
-3. WebTransport: sessions, streams and datagrams.
-4. PostgreSQL through `anole_db_*`.
-5. Redis.
-6. MongoDB.
-7. TLS extras: mutual TLS and the client certificate in the request,
-   certificate reload per listener.
-8. The freeze: ABI 1.0.
+- The other databases through `anole_db_*`, in this order: PostgreSQL
+  (the same calls and answers), Redis, MongoDB.
+- gRPC: server, with service methods implemented in the language.
+- WebTransport: sessions, streams and datagrams.
+- TLS extras: mutual TLS and the client certificate in the request,
+  certificate reload per listener.
+- Then the freeze: ABI 1.0.
 
 Auth beyond the configured `jwt` middleware comes later.

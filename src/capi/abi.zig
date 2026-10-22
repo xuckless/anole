@@ -20,6 +20,7 @@ pub const E_UNSUPPORTED: Status = -7;
 pub const E_TOOBIG: Status = -8;
 pub const E_SYSTEM: Status = -9;
 pub const E_TIMEOUT: Status = -10;
+pub const E_DB: Status = -11;
 
 pub const Str = extern struct {
     ptr: ?[*]const u8 = null,
@@ -156,6 +157,75 @@ pub const WsCloseEvent = extern struct {
     reason: Span,
 };
 
+pub const DB_NULL: u32 = 0;
+pub const DB_INT: u32 = 1;
+pub const DB_FLOAT: u32 = 2;
+pub const DB_TEXT: u32 = 3;
+pub const DB_BLOB: u32 = 4;
+
+pub const DbValue = extern struct {
+    type: u32,
+    reserved: u32 = 0,
+    v: extern union { i: i64, f: f64, s: Str },
+};
+
+pub const DB_WRITE: u32 = 1;
+pub const DB_COALESCE: u32 = 2;
+pub const DB_NO_PREPARE: u32 = 4;
+pub const DB_DROP_EMPTY: u32 = 8;
+
+pub const DbOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    cache_ttl_ms: u32 = 0,
+    reserved: u32 = 0,
+    cache_tag: Str = .{},
+};
+
+pub const DB_FROM_DATABASE: u8 = 0;
+pub const DB_FROM_COALESCED: u8 = 1;
+pub const DB_FROM_CACHE: u8 = 2;
+
+/// `anole.db.Class`, plus 0 for none, in its order.
+pub const DbErrorClass = enum(u8) {
+    none = 0,
+    unique = 1,
+    exclusion = 2,
+    foreign_key = 3,
+    not_null = 4,
+    check = 5,
+    serialization = 6,
+    deadlock = 7,
+    unavailable = 8,
+    timeout = 9,
+    other = 10,
+};
+
+pub const DbResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    source: u8,
+    ncolumns: u32,
+    nrows: u32,
+    changes: u64,
+    last_insert_rowid: i64,
+    columns: Span,
+    cells: Span,
+    @"error": Span,
+    error_code: Span,
+    constraint: Span,
+};
+
+pub const DbCell = extern struct {
+    type: u32,
+    reserved: u32 = 0,
+    v: extern union { i: i64, f: f64, s: Span },
+};
+
 pub const POLL_NOARM: u32 = 1;
 pub const BODY_BORROW: u32 = 1;
 
@@ -166,6 +236,10 @@ comptime {
     std.debug.assert(@sizeOf(SentEvent) == 32);
     std.debug.assert(@sizeOf(WsMessageEvent) == 32);
     std.debug.assert(@sizeOf(WsCloseEvent) == 32);
+    std.debug.assert(@sizeOf(DbValue) == 24);
+    std.debug.assert(@sizeOf(DbOptions) == 40);
+    std.debug.assert(@sizeOf(DbResultEvent) == 96);
+    std.debug.assert(@sizeOf(DbCell) == 16);
 }
 
 /// Records are padded to this.

@@ -3,6 +3,21 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### C ABI
+
+- `anole_db_*` with SQLite (additions to ABI 0.1): databases from the
+  configuration (opened at start with an `init` script), queried without
+  blocking the caller;
+  each answer is an `ANOLE_EV_DB_RESULT` record (column names and typed
+  cells, or changes and the last rowid) with the caller's `user_data`.
+  Per-query timeout, coalescing and the TTL result cache with tags and
+  `anole_db_invalidate`; failures carry their class, the status Anole would
+  answer and the database's detail. `anole.sqlite`'s `table` and `run`
+  are the Zig side: rows and parameters known only at run time
+  (`anole.sqlite.Value`).
+
 ## 0.1.1 (2026-10-22)
 
 ### Security

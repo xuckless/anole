@@ -145,6 +145,82 @@ test "sqlite: a file: URI only with Options.uri" {
     defer db.deinit();
 }
 
+test "sqlite: table and run, with values known only at run time; cached on a pinned runtime" {
+    {
+        const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+        defer db.deinit();
+        var s: Scratch = undefined;
+        s.init(testing.io);
+        defer s.deinit();
+        const ctx = &s.ctx;
+        const q = db.with(.{});
+        // Several statements with no parameters.
+        const made = try q.run(ctx, schema ++ "CREATE TABLE kv (k TEXT, v);", &.{});
+        try testing.expectEqual(@as(u64, 0), made.changes);
+        const ins = try q.run(ctx, "INSERT INTO notes (title, done) VALUES (?, ?)", &.{ .{ .text = "first" }, .{ .int = 1 } });
+        try testing.expectEqual(@as(u64, 1), ins.changes);
+        try testing.expectEqual(@as(i64, 1), ins.last_insert_rowid);
+        _ = try q.run(ctx, "INSERT INTO kv VALUES (?, ?), (?, ?), (?, ?), (?, ?)", &.{
+            .{ .text = "f" },    .{ .float = 1.5 },
+            .{ .text = "b" },    .{ .blob = "\x00\x01" },
+            .{ .text = "n" },    .null,
+            .{ .text = "i" },    .{ .int = -7 },
+        });
+        const t = try q.table(ctx, "SELECT k AS key, v FROM kv ORDER BY rowid", &.{});
+        try testing.expectEqual(@as(usize, 2), t.columns.len);
+        try testing.expectEqualStrings("key", t.columns[0]);
+        try testing.expectEqual(@as(usize, 4), t.rows.len);
+        try testing.expectEqual(@as(f64, 1.5), t.rows[0][1].float);
+        try testing.expectEqualStrings("\x00\x01", t.rows[1][1].blob);
+        try testing.expect(t.rows[2][1] == .null);
+        try testing.expectEqual(@as(i64, -7), t.rows[3][1].int);
+        // No row: the columns still.
+        const none = try q.table(ctx, "SELECT id, title FROM notes WHERE id = ?", &.{.{ .int = 99 }});
+        try testing.expectEqual(@as(usize, 2), none.columns.len);
+        try testing.expectEqual(@as(usize, 0), none.rows.len);
+        // A wrong parameter count and a constraint are errors as usual.
+        const level = quiet();
+        defer testing.log_level = level;
+        try testing.expectError(error.Database, q.table(ctx, "SELECT ?", &.{}));
+        try testing.expectError(error.Conflict, q.run(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "first" }}));
+        try testing.expect(anole_db.lastError(ctx) != null);
+    }
+
+    // Coalesced and cached on a pinned runtime with readers.
+    var r: Runtime = undefined;
+    try r.init(2, 4);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("table.db") });
+    defer db.deinit();
+    const Check = struct {
+        fn run(d: *sqlite.Client, io_: std.Io) !void {
+            var sc: Scratch = undefined;
+            sc.init(io_);
+            defer sc.deinit();
+            const ctx = &sc.ctx;
+            _ = try d.with(.{}).run(ctx, schema, &.{});
+            _ = try d.with(.{}).run(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "a" }});
+            const cached: anole_db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(60), .tag = "notes" } };
+            const sql = "SELECT title FROM notes WHERE id > ?";
+            const one = try d.with(cached).table(ctx, sql, &.{.{ .int = 0 }});
+            try testing.expectEqualStrings("a", one.rows[0][0].text);
+            _ = try d.with(.{}).run(ctx, "INSERT INTO notes (title) VALUES ('b')", &.{});
+            // From the cache: the write does not show until invalidated.
+            try testing.expectEqual(@as(usize, 1), (try d.with(cached).table(ctx, sql, &.{.{ .int = 0 }})).rows.len);
+            try testing.expectEqual(anole_db.Source.cache, anole_db.lastSource(ctx).?);
+            // Other parameters are another entry.
+            try testing.expectEqual(@as(usize, 1), (try d.with(cached).table(ctx, sql, &.{.{ .int = 1 }})).rows.len);
+            d.cache.invalidate(.{ .tag = "notes" });
+            try testing.expectEqual(@as(usize, 2), (try d.with(cached).table(ctx, sql, &.{.{ .int = 0 }})).rows.len);
+        }
+    };
+    var f = try io.concurrent(Check.run, .{ db, io });
+    try f.await(io);
+}
+
 test "sqlite: values both ways: times, enums, optionals, JSON, blobs, defaults" {
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
