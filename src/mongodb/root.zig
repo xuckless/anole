@@ -57,6 +57,7 @@ pub const ObjectId = @import("bson").ObjectId;
 
 test {
     _ = @import("uri.zig");
+    _ = @import("uri_fuzz_test.zig");
     _ = @import("scram.zig");
     _ = @import("wire.zig");
     _ = @import("sdam.zig");

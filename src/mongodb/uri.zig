@@ -744,29 +744,3 @@ test "parse: warnings for what is left out, errors for what is wrong" {
         try testing.expect(std.mem.indexOf(u8, diag.message, "hunter2") == null);
     }
 }
-
-test "fuzz: connection strings: parsed or refused, never the password in the message" {
-    try @import("../fuzz.zig").bytes(struct {
-        fn check(input: []const u8) !void {
-            var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var diag: Diagnostic = .{};
-            // As a whole connection string.
-            if (parse(arena, input, &diag)) |cs| {
-                _ = credential(arena, cs, &diag) catch {};
-            } else |_| {}
-            // As the password.
-            if (input.len < 6) return;
-            const scaffold = "mongodb://app:***@h1:27017,h2/shop?authSource=admin&replicaSet=rs0";
-            if (std.mem.indexOf(u8, scaffold, input) != null) return;
-            const text = try std.fmt.allocPrint(arena, "mongodb://app:{s}@h1:27017,h2/shop?authSource=admin&replicaSet=rs0", .{input});
-            diag = .{};
-            if (parse(arena, text, &diag)) |cs| {
-                diag = .{};
-                _ = credential(arena, cs, &diag) catch {};
-            } else |_| {}
-            if (std.mem.indexOf(u8, diag.message, input) != null) return error.PasswordShown;
-        }
-    }.check, &.{ "mongodb://u:p@h/db", "hunter2", "pa/ss?x", "a@b?c", "p:ss/w?rd", "x]y[z", "%zz%41", "mongodb://h/?tls=true&ssl=false" });
-}
