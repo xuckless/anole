@@ -88,6 +88,10 @@ Fixes from the QUIC interop runner's matrix (Anole's server against all
   picoquic, s2n-quic) answered the second probe only; validation still
   succeeded, but observers that check the first challenge (the interop
   runner's rebind-port and rebind-addr cases) did not see it answered.
+- After a NAT rebinding, the first packet to the client's new address is
+  now always the PATH_CHALLENGE (xuckless/ngtcp2 patch): while pacing held
+  data back, an ACK the client's packets called for went out to the new
+  address first.
 - A NAT rebinding during the handshake: the server now follows the
   client to its new address once a packet from there authenticates and is
   new (xuckless/ngtcp2 patch), instead of sending to the old address while

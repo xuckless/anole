@@ -88,7 +88,14 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      is new in its space (`conn_server_read_handshake_rebound`, with
      `test_ngtcp2_conn_server_handshake_nat_rebinding`; without it a NAT
      rebinding inside the handshake stalls it, as in the interop runner's
-     rebind-port case when kwik's slow start puts the first rebind there).
+     rebind-port case when kwik's slow start puts the first rebind there),
+     and one that writes a pending PATH_RESPONSE or PATH_CHALLENGE before
+     the ACK-only packet ngtcp2 sends while pacing holds data back
+     (`ngtcp2_conn_write_vmsg`, with
+     `test_ngtcp2_conn_server_path_challenge_while_paced`; without it the
+     first packet to a client's new port after a NAT rebinding can be an
+     ACK, and the interop runner's rebind-port case, which wants the
+     challenge first, fails with go-x-net and aioquic).
      On a new tag: drop a patch if upstream fixed its bug (run its test
      against the new tag), otherwise rebase it on a new branch, run ngtcp2's
      unit tests, commit the new `version.h`, merge into `anole`, and pin the

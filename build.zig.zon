@@ -59,15 +59,17 @@
         // PATH_CHALLENGE probes of a validation round the same data (peers
         // that answer only the latest challenge then answer the first), and
         // one that makes a server follow a client whose address changes
-        // during the handshake (a NAT rebinding) instead of stalling.
+        // during the handshake (a NAT rebinding) instead of stalling, and
+        // one that keeps pacing from sending an ACK to a new path before its
+        // PATH_CHALLENGE.
         // Pinned by git URL and commit. nghttp3 1.18.0 from
         // Anole's fork xuckless/nghttp3, branch `anole`: the v1.18.0 tag plus
         // the release's generated version.h and bundled sfparse, and
         // nghttp3_conn_add_extra_setting, which sends the SETTINGS
         // WebTransport needs (0x2b603742 for Chrome and Firefox).
         .ngtcp2 = .{
-            .url = "git+https://github.com/xuckless/ngtcp2#ac08ecbc6db570a7895e1888d6b23d95e3d1b6b8",
-            .hash = "N-V-__8AANqlQwCMQKrgBILlhBjUQSUP72qz9uNclA0jK_DM",
+            .url = "git+https://github.com/xuckless/ngtcp2#b70d6d98d90be1af793af704bdf66b97df8dd7f1",
+            .hash = "N-V-__8AAMCuQwCjsxFJ5ddtVQcmqA7wQVrluqzivC1f7D72",
             .lazy = true,
         },
         // -Dcompression: zlib-ng 2.3.3 (zlib-compat, runtime SIMD dispatch) and
