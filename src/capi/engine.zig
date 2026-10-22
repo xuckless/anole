@@ -2999,6 +2999,11 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     _ = try checkHeaders(headers);
     // A regular file, and how much of it.
     if (fd < 0) return error.Invalid;
+    // A descriptor that is none (std treats EBADF from fstat as a bug).
+    if (std.c.fcntl(fd, std.c.F.GETFD) < 0) {
+        engine_errno = std.c._errno().*;
+        return error.Invalid;
+    }
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     const st = file.stat(threadedIo()) catch {
         engine_errno = @intFromEnum(std.posix.E.BADF);
