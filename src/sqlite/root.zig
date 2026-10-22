@@ -80,8 +80,14 @@ const log = std.log.scoped(.anole);
 pub const Options = struct {
     /// A file (created when missing), `":memory:"` for one in-memory
     /// database shared by the whole app, or a `sqlite:` URL of either
-    /// (`sqlite:data/app.db`, `sqlite::memory:`).
+    /// (`sqlite:data/app.db`, `sqlite::memory:`). A path starting with
+    /// `file:` is a SQLite URI only with `uri = true`.
     path: []const u8,
+    /// Take a path starting with `file:` as a SQLite URI
+    /// (https://sqlite.org/uri.html), whose parameters choose the VFS, the
+    /// open mode, `immutable` and `nolock`. Off by default, since the path
+    /// often comes from the environment: such a path is refused unless set.
+    uri: bool = false,
     /// The `db` label of its metrics and spans. Null: the file's name
     /// (`app.db`), or `memory`.
     name: ?[]const u8 = null,
@@ -147,6 +153,10 @@ pub const Client = struct {
     /// calls will come from. Close it with `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
         const path = stripScheme(options.path);
+        if (!options.uri and std.ascii.startsWithIgnoreCase(path, "file:")) {
+            log.warn("sqlite: \"{s}\" is a SQLite URI, taken only with Options.uri = true", .{path});
+            return error.InvalidDatabaseUrl;
+        }
         const memory = std.mem.eql(u8, path, ":memory:");
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);

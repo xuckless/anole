@@ -121,6 +121,28 @@ test "sqlite: :memory: on std.Io.Threaded, the verbs" {
     try testing.expectEqualStrings("first", r.name);
     try testing.expectEqual(@as(i64, 1), r.ID);
     try testing.expectEqual(@as(usize, 0), (try db.all(Note, ctx, "SELECT * FROM notes WHERE id > ?", .{100})).len);
+
+    // An expression nested deeper than SQLite's default limit (1000): an
+    // error, not a deep recursion.
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(gpa);
+    try deep.appendSlice(gpa, "SELECT ");
+    for (0..200_000) |_| try deep.appendSlice(gpa, "1+");
+    try deep.appendSlice(gpa, "1");
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    try testing.expectError(error.Database, db.one(i64, ctx, deep.items, .{}));
+}
+
+test "sqlite: a file: URI only with Options.uri" {
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    try testing.expectError(error.InvalidDatabaseUrl, sqlite.Client.init(gpa, testing.io, .{ .path = "file::memory:" }));
+    try testing.expectError(error.InvalidDatabaseUrl, sqlite.Client.init(gpa, testing.io, .{ .path = "sqlite:FILE:app.db?mode=ro" }));
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = "file:anole_uri_test?mode=memory", .uri = true });
+    defer db.deinit();
 }
 
 test "sqlite: values both ways: times, enums, optionals, JSON, blobs, defaults" {

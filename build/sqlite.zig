@@ -18,12 +18,15 @@ pub const config_name = "anole_sqlite_config.h";
 /// With OMIT_AUTOINIT, sqlite3_initialize() must run before anything else
 /// (zig-sqlite's `Db.init` calls it). Per-connection settings (WAL,
 /// synchronous=NORMAL, busy_timeout, foreign_keys) are pragmas, not here.
+/// SQLITE_MAX_EXPR_DEPTH stays at SQLite's default of 1000 (compile.html
+/// suggests 0, no limit): the parser recurses per level, on a thread or a
+/// coroutine stack of limited size.
 pub const config =
     \\#define SQLITE_DQS 0
     \\#define SQLITE_DEFAULT_MEMSTATUS 0
     \\#define SQLITE_DEFAULT_WAL_SYNCHRONOUS 1
     \\#define SQLITE_LIKE_DOESNT_MATCH_BLOBS 1
-    \\#define SQLITE_MAX_EXPR_DEPTH 0
+    \\#define SQLITE_MAX_EXPR_DEPTH 1000
     \\#define SQLITE_OMIT_DEPRECATED 1
     \\#define SQLITE_OMIT_SHARED_CACHE 1
     \\#define SQLITE_OMIT_AUTOINIT 1
