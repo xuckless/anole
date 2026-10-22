@@ -22,6 +22,8 @@ RUN git clone -q https://github.com/MDA2AV/gcannon /gcannon && cd /gcannon \
 # need it.
 FROM rust:1.99.1-slim-trixie@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS oha
 ARG OHA=1.16.0
+# make for jemalloc's build, cmake for aws-lc's.
+RUN apt-get update && apt-get install -y --no-install-recommends make cmake && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo install --locked oha@$OHA --features http3 --root /out
 
@@ -35,6 +37,9 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 # wtload: its own module (it pins the last draft-02 webtransport-go).
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     cd wtload && CGO_ENABLED=0 go build -o /out/wtload .
+# vcload: the video-call driver (bench/videocall), its own module for the same reason.
+RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    cd vcload && CGO_ENABLED=0 go build -o /out/vcload .
 
 FROM fedora:44
 RUN dnf -q install -y nghttp2 curl jq openssl procps-ng iproute bash findutils ffmpeg-free liburing \
@@ -50,7 +55,7 @@ RUN curl -fsSL https://github.com/grafana/k6/releases/download/v$K6/k6-v$K6-linu
     | tar -xz -C /usr/local/bin --strip-components=1 docker/docker
 COPY --from=wrk /usr/local/bin/wrk /usr/local/bin/wrk
 COPY --from=gcannon /usr/local/bin/gcannon /usr/local/bin/gcannon
-COPY --from=tools /out/benchctl /out/wtload /usr/local/bin/
+COPY --from=tools /out/benchctl /out/wtload /out/vcload /usr/local/bin/
 COPY --from=oha /out/bin/oha /usr/local/bin/oha
 WORKDIR /bench
 ENTRYPOINT ["benchctl"]
