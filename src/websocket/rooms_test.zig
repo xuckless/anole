@@ -434,8 +434,11 @@ test "Rooms: a member closed for not keeping up is shut down, so its handler end
     const msg = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(msg);
     @memset(msg, 'm');
+    // By the clock, not a count of sleeps: a 1 ms sleep takes about 10 ms on
+    // Windows.
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
     var left = false;
-    for (0..5000) |_| {
+    while (start.untilNow(io).raw.toMilliseconds() < 10_000) {
         _ = auto_rooms.broadcast("lobby", .binary, msg, null);
         try io.sleep(.fromMilliseconds(1), .awake);
         if (auto_rooms.count("lobby") == 0) {

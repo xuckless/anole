@@ -67,6 +67,7 @@
 //! answer arrives through `receive` as a `.close` message, and
 //! `Socket.draining` says why.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const placement = dusty.placement;
 const features = @import("build_options");
@@ -190,7 +191,9 @@ pub const Socket = struct {
     /// `Rooms`' own lock.
     memberships_lock: std.atomic.Mutex = .unlocked,
     /// The task that serves the socket over HTTP/2 or HTTP/3 (its stream's),
-    /// which `abortConnection` cancels; null over HTTP/1.1 and off zio.
+    /// and over HTTP/1.1 on Windows (its connection's, see
+    /// `abort_cancels_h1_reader`), which `abortConnection` cancels; null
+    /// over HTTP/1.1 elsewhere and off zio.
     task: ?placement.Task = null,
 
     /// Which protocol a socket runs on. The sockets it points at are
@@ -340,12 +343,23 @@ pub const Socket = struct {
     }
 };
 
+/// On Windows a TCP shutdown does not end a receive already waiting on the
+/// socket: an overlapped WSARecv stays pending until data or the peer's FIN
+/// arrives, or the socket is closed, and a peer that stopped reading sends
+/// neither. So there `abortConnection` also cancels the task reading an
+/// HTTP/1.1 socket, which completes that receive. Connections never park on
+/// Windows, so that task is the connection's, which opened the socket and
+/// serves it (and releases it) for its whole life.
+const abort_cancels_h1_reader = builtin.os.tag == .windows;
+
 /// Ends the connection under `socket` without a close frame, for a socket
 /// whose sending side is stuck (a `Rooms` member that did not keep up), so
-/// its reading side sees the end: over HTTP/1.1 a TCP shutdown both ways,
-/// over HTTP/2 and HTTP/3 a cancel of the stream's task, which resets the
-/// stream. Nothing more is sent on it either way. From a task that knows
-/// the socket is still alive (a `Rooms` sender, which `leave` waits for).
+/// its reading side sees the end: over HTTP/1.1 a TCP shutdown both ways
+/// (on Windows also a cancel of the task reading it), over HTTP/2 and
+/// HTTP/3 a cancel of the stream's task, which resets the stream. Nothing
+/// more is sent on it either way. From a task that knows the socket is
+/// still alive (a `Rooms` sender, which `leave` waits for), so the task
+/// serving it has not returned.
 fn abortConnection(socket: *Socket) void {
     socket.closed.store(true, .release);
     switch (socket.conn) {
@@ -358,6 +372,7 @@ fn abortConnection(socket: *Socket) void {
             const protection = socket.io.swapCancelProtection(.blocked);
             defer _ = socket.io.swapCancelProtection(protection);
             if (ws.transport.tcp_reader) |r| r.stream.shutdown(socket.io, .both) catch {};
+            if (comptime abort_cancels_h1_reader) if (socket.task) |t| placement.cancelTask(t);
         },
         .h2 => |ws| {
             ws.write_mutex.lockUncancelable(socket.io);
@@ -466,8 +481,8 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         .executor = placement.currentExecutor(req.io),
         // The stream's task serves the socket for its whole life over
         // HTTP/2 and HTTP/3; over HTTP/1.1 a callback socket outlives the
-        // task that opened it.
-        .task = if (h2) placement.currentTask(req.io) else null,
+        // task that opened it where connections park (not on Windows).
+        .task = if (h2 or abort_cancels_h1_reader) placement.currentTask(req.io) else null,
     };
     if (h2) {
         socket.conn = .{ .h2 = try H2Socket.accept(req, res, options.max_message_size, negotiated) };
