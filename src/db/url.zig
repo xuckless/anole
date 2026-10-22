@@ -154,24 +154,29 @@ pub const Redacted = struct {
     /// Writes `text` with its password and password parameters as `***`.
     pub fn format(self: Redacted, w: *std.Io.Writer) std.Io.Writer.Error!void {
         var text = self.text;
-        var query: ?[]const u8 = null;
-        if (std.mem.indexOfScalar(u8, text, '?')) |i| {
-            query = text[i + 1 ..];
-            text = text[0..i];
-        }
-        // The userinfo's password: between the first ':' after "//" and
-        // the authority's last '@'.
+        // The userinfo's password: from the first ':' after "//" to the
+        // authority's last '@'. The password may hold a '/' or a '?' (a URL
+        // that does not parse, logged as such), so the '@' is the last one
+        // before the query when there is one there, else the last one of
+        // all: at worst more is hidden than the password, never less.
         if (std.mem.indexOf(u8, text, "//")) |slashes| {
             const start = slashes + 2;
-            const end = if (std.mem.indexOfScalarPos(u8, text, start, '/')) |i| i else text.len;
-            if (std.mem.lastIndexOfScalar(u8, text[start..end], '@')) |at_rel| {
-                const at = start + at_rel;
+            const first_q = std.mem.indexOfScalarPos(u8, text, start, '?') orelse text.len;
+            const at_rel = std.mem.lastIndexOfScalar(u8, text[start..first_q], '@') orelse
+                std.mem.lastIndexOfScalar(u8, text[start..], '@');
+            if (at_rel) |r| {
+                const at = start + r;
                 if (std.mem.indexOfScalarPos(u8, text[0..at], start, ':')) |c| {
                     try w.writeAll(text[0 .. c + 1]);
                     try w.writeAll("***");
                     text = text[at..];
                 }
             }
+        }
+        var query: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, text, '?')) |i| {
+            query = text[i + 1 ..];
+            text = text[0..i];
         }
         try w.writeAll(text);
         const q = query orelse return;
@@ -298,11 +303,19 @@ test "redacted: no password in what is printed" {
         .{ "postgres://app:p@ss@word@db/main", "postgres://app:***@db/main" },
         .{ "postgres://app@db/main?password=s3cret&sslpassword=x&x=1", "postgres://app@db/main?password=***&sslpassword=***&x=1" },
         .{ "mongodb://db1,db2/?tlsCertificateKeyFilePassword=k", "mongodb://db1,db2/?tlsCertificateKeyFilePassword=***" },
+        // a '/' or '?' in the password: the URL does not parse, and the
+        // password stays hidden all the same
+        .{ "postgres://app:pa/ss@db/main", "postgres://app:***@db/main" },
+        .{ "postgres://app:pa?ss@db/main?sslmode=require", "postgres://app:***@db/main?sslmode=require" },
+        .{ "postgres://app:pa/s?s@db/main?x=1", "postgres://app:***@db/main?x=1" },
+        .{ "postgres://app:pa/ss@db/main?email=a@b", "postgres://app:***@db/main?email=a@b" },
         .{ "sqlite:data/app.db", "sqlite:data/app.db" },
         .{ "not a url at all", "not a url at all" },
     }) |case| {
         try testing.expectEqualStrings(case[1], try std.fmt.bufPrint(&buf, "{f}", .{redacted(case[0])}));
     }
+    // Even when the password holds a '?', and the query an '@'.
+    try testing.expect(std.mem.indexOf(u8, try std.fmt.bufPrint(&buf, "{f}", .{redacted("postgres://app:hunter2?x@db/main?email=a@b")}), "hunter2") == null);
     const url = try Url.parse(arena_state.allocator(), "redis://default:hunter2@cache:6379/0");
     try testing.expectEqualStrings("redis://default:***@cache:6379/0", try std.fmt.bufPrint(&buf, "{f}", .{url}));
 }

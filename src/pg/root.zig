@@ -1685,6 +1685,8 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         .{ "postgres://h/d?require_auth=plain", "require_auth \"plain\"" },
         .{ "postgres://h/d?channel_binding=maybe", "channel_binding \"maybe\"" },
         .{ "postgres://h:99999/d", "InvalidPort" },
+        .{ "postgres://u:hunter2/x@h/d", "InvalidPort" },
+        .{ "postgres://u:hunter2?x@h/d", "InvalidPort" },
         .{ "host=localhost dbname=app", "InvalidUrl" },
     }) |bad| {
         var why: Settings.Why = .{ .arena = arena };
