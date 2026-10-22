@@ -1295,7 +1295,7 @@ pub const Engine = struct {
             }
             const group = app.with(chain.items);
             if (rc.respond) |f| {
-                group.inner.addRouteWith(method, rc.path, config_mod.FixedRoute.handler, .{ .data = try config_mod.fixed(a, f), .no_wait = rc.no_wait });
+                group.inner.addRouteWith(method, rc.path, config_mod.FixedRoute.handler, .{ .data = try config_mod.fixed(a, f), .no_wait = rc.no_wait and global_ok and config_mod.neverWaits(rc.middleware) });
             } else if (rc.static) |st| {
                 try group.staticDir(rc.path, st.dir, .{
                     .index = st.index,

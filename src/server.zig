@@ -525,6 +525,9 @@ pub const OnlyOn = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *const OnlyOn, req: *http.Request, _: *http.Response, next: anytype) !void {
         if (!std.mem.eql(u8, req.listener.name, self.name)) return error.NotFound;
         return next.call();
@@ -767,6 +770,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
             /// Does nothing after `next()`: requests behind it can detach.
             pub const detach_safe = true;
+
+            /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+            pub const no_wait = true;
 
             pub fn execute(self: *const AltSvc, req: *http.Request, res: *http.Response, next: anytype) !void {
                 if (self.value) |v| if (req.version_major != 3 and self.listener != null and req.listener == self.listener.?) try res.header("Alt-Svc", v);
@@ -1437,6 +1443,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 @typeInfo(@typeInfo(T).pointer.child) == .@"struct" and @hasDecl(@typeInfo(T).pointer.child, "execute"))
                 return http.Middleware(Ctx).init(value);
             if (comptime handlers.isFn(T)) return self.middleware(handlers.func(value));
+            if (comptime handlers.isNoWait(T)) {
+                if (comptime !handlers.isMiddlewareFn(T.no_wait_handler))
+                    @compileError("anole.noWait wraps a handler for a route, or a middleware function (taking anole.Next last) for use/group/with");
+                return self.middleware(handlers.FuncNoWait(T.no_wait_handler){});
+            }
             const copy = self.arena.allocator().create(T) catch @panic("OOM");
             copy.* = value;
             const handle = http.Middleware(Ctx).init(copy);

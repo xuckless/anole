@@ -116,7 +116,10 @@ pub const func = @import("handlers.zig").func;
 pub const Next = @import("handlers.zig").Next;
 /// Marks a handler that never waits on I/O, so HTTP/2 and HTTP/3 run it
 /// without a task of its own: `app.get("/ping", anole.noWait(ping))`.
-/// Not for handlers that query a database or call another service.
+/// Not for handlers that query a database or call another service. The
+/// middleware in front of such a route must say it never waits
+/// (`pub const no_wait = true;`), or registering the route is a startup
+/// error; around a middleware function, `app.use(anole.noWait(f))` says it.
 pub const noWait = @import("handlers.zig").noWait;
 /// A route whose answers are kept per executor and served from memory:
 /// `app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed))`.

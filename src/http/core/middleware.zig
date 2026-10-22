@@ -40,6 +40,13 @@ pub fn Middleware(comptime Ctx: type) type {
         /// `Response.onFinish` when the response is detached (see
         /// `Detached`). A request that passes one that is not cannot detach.
         detach_safe: bool = false,
+        /// The middleware never waits: no I/O, no sleep, no lock or event
+        /// another task releases. From `pub const no_wait = true`, or
+        /// `pub fn noWait(self) bool` when it depends on the value. Routes
+        /// registered `no_wait` take only such middleware.
+        no_wait: bool = false,
+        /// `@typeName` of the middleware, for messages.
+        name: []const u8 = "",
 
         /// A handle on `impl`, a pointer to a middleware value that must
         /// outlive the router.
@@ -64,6 +71,8 @@ pub fn Middleware(comptime Ctx: type) type {
                 .executeFn = gen.execute,
                 .deinitFn = if (@hasDecl(Impl, "deinit")) gen.deinit else null,
                 .detach_safe = comptime @hasDecl(Impl, "detach_safe") and Impl.detach_safe,
+                .no_wait = if (comptime @hasDecl(Impl, "noWait")) impl.noWait() else comptime (@hasDecl(Impl, "no_wait") and Impl.no_wait),
+                .name = @typeName(Impl),
             };
         }
 

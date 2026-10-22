@@ -355,6 +355,9 @@ pub const HttpMetrics = struct {
     /// finished.
     pub const detach_safe = true;
 
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *const HttpMetrics, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         if (common.excluded(req, self.options.exclude)) return next.call();
         const gauge = self.in_flight.with(&.{});

@@ -48,6 +48,9 @@ pub const Middleware = struct {
         return .{ .config = config };
     }
 
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         switch (req.method) {
             .post, .put, .patch, .delete => {},

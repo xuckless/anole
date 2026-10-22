@@ -59,6 +59,9 @@ pub const Result = struct {
 pub const Limiter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// `take` never waits (memory only): routes registered `no_wait` may sit
+    /// behind a middleware that uses it.
+    never_waits: bool = false,
 
     /// What a limiter implements: refill `key`'s bucket, then take `cost`.
     pub const VTable = struct {
@@ -162,7 +165,7 @@ pub const MemoryLimiter = struct {
 
     /// The `Limiter` interface for `Middleware.init`; `self` must outlive it.
     pub fn limiter(self: *MemoryLimiter) Limiter {
-        return .{ .ptr = self, .vtable = &.{ .take = takeFn } };
+        return .{ .ptr = self, .vtable = &.{ .take = takeFn }, .never_waits = true };
     }
 
     /// How many keys have a bucket now.
@@ -380,6 +383,8 @@ pub const OwnedMiddleware = struct {
     policy: Policy,
 
     pub const detach_safe = true;
+    /// Counts in memory: it never waits.
+    pub const no_wait = true;
 
     pub fn execute(self: *const OwnedMiddleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         var key_buf: [128]u8 = undefined;
@@ -459,6 +464,12 @@ pub const Middleware = struct {
 
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
+
+    /// Whether the limiter never waits (the memory limiter), asked once at
+    /// registration: only then may a `no_wait` route sit behind it.
+    pub fn noWait(self: *const Middleware) bool {
+        return self.limiter.never_waits;
+    }
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         var key_buf: [128]u8 = undefined;

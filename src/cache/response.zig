@@ -180,6 +180,9 @@ pub const ResponseCache = struct {
     /// The middleware: a GET or HEAD with a fresh kept response gets it
     /// without going further; any other request runs on, and a GET's
     /// answer is kept when it may be.
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *ResponseCache, req: *Request, res: *Response, next: anytype) !void {
         if (req.method != .get and req.method != .head) return next.call();
         if (!self.options.authenticated and self.credentials(req)) return next.call();

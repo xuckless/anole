@@ -83,6 +83,12 @@ pub const RequireJwt = struct {
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
 
+    /// Static keys and no hook: verification is CPU only. A keyring may
+    /// fetch the provider's key set, and a hook may do anything.
+    pub fn noWait(self: *const RequireJwt) bool {
+        return self.keys == .static and self.options.hook == null;
+    }
+
     pub fn execute(self: *const RequireJwt, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         const header = req.headers.get("Authorization") orelse return self.refuse(res, .missing);
         const space = std.mem.indexOfScalar(u8, header, ' ') orelse return self.refuse(res, .missing);

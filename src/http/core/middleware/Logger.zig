@@ -32,6 +32,9 @@ pub fn init(options: Options) Logger {
     return .{ .log_query = options.log_query };
 }
 
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
 pub fn execute(self: *const Logger, req: *Request, res: *Response, next: anytype) !void {
     const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
     next.call() catch |err| {

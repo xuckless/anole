@@ -37,6 +37,9 @@ pub fn digest(key: []const u8) Digest {
 pub const Lookup = struct {
     ptr: ?*anyopaque,
     lookup: *const fn (ptr: ?*anyopaque, arena: std.mem.Allocator, digest: Digest) anyerror!?[]const u8,
+    /// The lookup never waits (a table in memory): routes registered
+    /// `no_wait` may sit behind the middleware.
+    never_waits: bool = false,
 };
 
 /// The key a request carries, if any:
@@ -83,6 +86,11 @@ pub const Middleware = struct {
 
     /// Does nothing after `next()`: requests behind it can detach.
     pub const detach_safe = true;
+
+    /// Whether the lookup never waits (`Lookup.never_waits`).
+    pub fn noWait(self: *const Middleware) bool {
+        return self.lookup.never_waits;
+    }
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         const key = fromRequest(req) orelse return unauthorized(res);

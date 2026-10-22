@@ -39,6 +39,9 @@ pub const AccessLog = struct {
     /// finished.
     pub const detach_safe = true;
 
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         if (common.excluded(req, self.options.exclude)) return next.call();
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);

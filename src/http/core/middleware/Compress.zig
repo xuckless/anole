@@ -31,6 +31,9 @@ pub fn init(options: Options) Compress {
 /// (`Detached`).
 pub const detach_safe = true;
 
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
 pub fn execute(self: *const Compress, req: *Request, res: *Response, next: anytype) !void {
     _ = req;
     res.compress = true;

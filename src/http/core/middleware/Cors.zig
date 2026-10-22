@@ -97,6 +97,9 @@ pub fn init(config: Options) Cors {
 /// (`Detached`).
 pub const detach_safe = true;
 
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
 pub fn execute(self: *const Cors, req: *Request, res: *Response, next: anytype) !void {
     const origin = req.headers.get("Origin");
     const preflight = req.method == .options and origin != null and

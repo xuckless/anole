@@ -769,6 +769,9 @@ pub const RateLimitMw = struct {
 
     pub const detach_safe = true;
 
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *const RateLimitMw, req: *http.Request, res: *http.Response, next: anytype) !void {
         var key_buf: [128]u8 = undefined;
         const key = if (self.header) |h| req.headers.get(h) orelse "" else anole.ratelimit.clientAddress(req, &key_buf);

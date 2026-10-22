@@ -36,6 +36,9 @@ pub const key_length = Cipher.key_length;
 pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Its calls never wait (memory only): routes registered `no_wait` may
+    /// sit behind a session middleware that uses it.
+    never_waits: bool = false,
 
     /// What a store implements. `update` and `touch` must not bring back a
     /// session that is gone: a request still running when the session was
@@ -132,7 +135,7 @@ pub const MemoryStore = struct {
     /// The store interface for `Options.store`; `self` must outlive the
     /// middleware.
     pub fn store(self: *MemoryStore) Store {
-        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch } };
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch }, .never_waits = true };
     }
 
     /// How many sessions are kept now, expired ones not yet swept included.
@@ -412,6 +415,12 @@ pub const Middleware = struct {
             return error.SessionKeyMissing;
         };
         return .{ .config = config, .key = key };
+    }
+
+    /// Cookie sessions and a memory store never wait; another store may.
+    pub fn noWait(self: *const Middleware) bool {
+        const store = self.config.store orelse return true;
+        return store.never_waits;
     }
 
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {

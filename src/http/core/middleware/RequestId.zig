@@ -36,6 +36,9 @@ pub fn init(config: Options) RequestId {
 /// (`Detached`).
 pub const detach_safe = true;
 
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
 pub fn execute(self: *const RequestId, req: *Request, res: *Response, next: anytype) !void {
     req.id = if (self.trust_incoming) incoming(req, self.header) orelse try generate(req) else try generate(req);
     try res.header(self.header, req.id);

@@ -56,14 +56,17 @@ pub fn noWait(comptime handler: anytype) NoWait(handler) {
 }
 
 /// The type `noWait` returns: a marker the route methods recognise.
+/// Given a middleware function it marks the middleware instead (`use`,
+/// `group` and `with` take it).
 pub fn NoWait(comptime handler: anytype) type {
-    if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function, not " ++ @typeName(@TypeOf(handler)));
+    if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function or a middleware function, not " ++ @typeName(@TypeOf(handler)));
     return struct {
         pub const no_wait_handler = handler;
     };
 }
 
-fn isNoWait(comptime T: type) bool {
+/// Whether `T` is the type `noWait` returns.
+pub fn isNoWait(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "no_wait_handler");
 }
 
@@ -124,12 +127,31 @@ pub fn func(comptime f: anytype) Func(f) {
 /// The middleware type `func` returns for `f`. A compile error when `f`
 /// does not take `anole.Next` last.
 pub fn Func(comptime f: anytype) type {
+    return FuncMarked(f, false);
+}
+
+/// `Func(f)` that says it never waits (`pub const no_wait = true`), for
+/// routes registered `no_wait`: what `app.use(anole.noWait(f))` makes.
+pub fn FuncNoWait(comptime f: anytype) type {
+    return FuncMarked(f, true);
+}
+
+/// Whether `f` takes `anole.Next` last: a middleware function, not a
+/// handler.
+pub fn isMiddlewareFn(comptime f: anytype) bool {
+    const params = @typeInfo(@TypeOf(f)).@"fn".param_types;
+    return (params.len == 3 or params.len == 4) and params[params.len - 1] == Next;
+}
+
+fn FuncMarked(comptime f: anytype, comptime never_waits: bool) type {
     const params = @typeInfo(@TypeOf(f)).@"fn".param_types;
     if (params.len != 3 and params.len != 4 or params[params.len - 1] != Next)
         @compileError("a middleware function takes (*anole.Request, *anole.Response, anole.Next), or the server's state first; got " ++ @typeName(@TypeOf(f)));
     return struct {
         // Not zero-sized: the server keeps a pointer to its copy.
         _: u8 = 0,
+
+        pub const no_wait = never_waits;
 
         pub fn execute(_: *const @This(), req: *dusty.Request, res: *dusty.Response, chain: anytype) anyerror!void {
             const E = @TypeOf(chain);

@@ -323,6 +323,9 @@ pub const Middleware = struct {
         return .{ .exporter = exporter };
     }
 
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
     pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         if (common.excluded(req, self.exporter.options.exclude)) return next.call();
         const parent = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;

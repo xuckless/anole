@@ -70,7 +70,9 @@ pub const RouteOptions = struct {
     /// that completed its head). A handler that waits anyway still works,
     /// but holds up every other request on its connection meanwhile, and
     /// gets no request timeout. Leave it off for anything that talks to a
-    /// database, a cache, another service or the file system.
+    /// database, a cache, another service or the file system. Checked at
+    /// registration: every middleware in front of the route must say it
+    /// never waits (`pub const no_wait = true`), or the route is a conflict.
     no_wait: bool = false,
 };
 
@@ -219,6 +221,10 @@ pub fn Router(comptime Ctx: type) type {
             if (self.findConflict(path, method)) |c| {
                 return self.conflicted("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
             }
+
+            if (opts.no_wait) for (middlewares) |m| if (!m.no_wait) {
+                return self.conflicted("route {s} {s} is marked noWait, but middleware {s} may wait (I/O, a lock, a sleep): drop noWait from the route, or mark the middleware if it never waits (pub const no_wait = true; anole.noWait(f) for a function middleware)", .{ if (method) |mm| mm.name() else "ANY", path, m.name });
+            };
 
             const slot = if (method) |m| &self.trees[@backingInt(m)] else &self.any_tree;
 

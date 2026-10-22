@@ -147,6 +147,9 @@ test "init: a key shorter than 32 bytes, or of zeros, is refused" {
     _ = try init(.{ .secret_key = "test-secret-key-that-is-long-enough" });
 }
 
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
 pub fn execute(self: *const Session, req: *Request, res: *Response, next: anytype) !void {
     const cookie_value = req.cookies().get(self.config.cookie_name);
     // When the loaded cookie stops being honoured; 0 for none loaded.
