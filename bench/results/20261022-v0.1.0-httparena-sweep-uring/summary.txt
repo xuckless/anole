@@ -1,0 +1,29 @@
+HttpArena sweep of the anole entry (v0.1.0 c6d41b9; HttpArena clone anole-entry 752c33570), io_uring (seccomp=unconfined, as HttpArena runs).
+scripts/benchmark-local.sh (benchmark.sh without the prune lines), SKIP_TUNE=true LOADGEN_DOCKER=true; best of 3. 28-CPU box (i7-14700F); load generator on CPUs 14-27; single-container profiles get the whole box (the harness's fallback for cpusets past nproc).
+Gateway cpusets: gateway-64/-h3 proxy 0-5 server 6-13; production-stack edge 0-5 cache 6-9 authsvc 10-11 server 12-13.
+
+8gbit: 512c 49601 req/s (CPU 86.2%, mem 46MiB);
+async: 32000c 614474 req/s (CPU 1194.0%, mem 789MiB);
+baseline-h2c: 256c 4141952 req/s (CPU 1915.8%, mem 333MiB);1024c 3609116 req/s (CPU 1821.4%, mem 506MiB);4096c 3231260 req/s (CPU 1691.5%, mem 1.8GiB);
+baseline-h2: 256c 3927529 req/s (CPU 1876.9%, mem 361MiB);1024c 3214852 req/s (CPU 1823.4%, mem 628MiB);
+baseline-h3: 64c 143971 req/s (CPU 427.3%, mem 154MiB);
+baseline: 4096c 1430765 req/s (CPU 864.1%, mem 114MiB);
+echo-ws-limited: 512c 904049 req/s (CPU 665.9%, mem 47MiB);4096c 783961 req/s (CPU 713.8%, mem 155MiB);
+echo-ws: 512c 1758886 req/s (CPU 776.3%, mem 27MiB);4096c 1340798 req/s (CPU 732.4%, mem 129MiB);16384c 1095447 req/s (CPU 709.6%, mem 435MiB);
+echo-ws-pipeline: 512c 21726486 req/s (CPU 860.4%, mem 27MiB);4096c 19407926 req/s (CPU 843.9%, mem 134MiB);16384c 16002447 req/s (CPU 796.8%, mem 466MiB);
+gateway-64: 512c 140287 req/s (CPU 1132.4%, mem 1019MiB);1024c 127305 req/s (CPU 1125.8%, mem 1.6GiB);
+gateway-h3: 64c 147041 req/s (CPU 780.8%, mem 459MiB);256c 138887 req/s (CPU 870.1%, mem 945MiB);
+json-comp: 4096c 105137 req/s (CPU 1801.2%, mem 453MiB);16384c 98958 req/s (CPU 1678.2%, mem 1.1GiB);
+json-h2c: 1024c 987025 req/s (CPU 1731.2%, mem 807MiB);4096c 797989 req/s (CPU 1477.7%, mem 2.8GiB);
+json-tls: 4096c 444755 req/s (CPU 1208.6%, mem 452MiB);
+latency-10k: 1024c 9984 req/s (CPU 11.3%, mem 31MiB);
+latency-1m: 1024c 826337 req/s (CPU 792.3%, mem 40MiB);
+latency-500k-8cpu: 1024c 499205 req/s (CPU 319.7%, mem 40MiB);
+limited-conn: 4096c 747683 req/s (CPU 709.7%, mem 144MiB);
+pipelined: 4096c 1662765 req/s (CPU 878.1%, mem 126MiB);
+production-stack: 256c 134247 req/s (CPU 589.4%, mem 452MiB);1024c 116556 req/s (CPU 612.1%, mem 1.1GiB);
+static-h2: 256c 250344 req/s (CPU 1461.4%, mem 672MiB);1024c 158555 req/s (CPU 1376.8%, mem 2.5GiB);
+static-h3: 64c 61684 req/s (CPU 602.7%, mem 298MiB);
+static-tls: 1024c 392283 req/s (CPU 1241.7%, mem 187MiB);
+unary-grpc: 256c 154468 req/s (CPU 381.1%, mem 289MiB);1024c 138255 req/s (CPU 382.8%, mem 1.2GiB);
+unary-grpc-tls: 256c 119599 req/s (CPU 407.6%, mem 676MiB);1024c 112807 req/s (CPU 463.8%, mem 1.9GiB);

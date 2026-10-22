@@ -1,0 +1,155 @@
+[info] available CPUs: 28
+[info] load generators: docker mode
+[info] framework: anole (anole, Zig)
+[info] subscribed tests: baseline,pipelined,limited-conn,async,latency-1m,latency-10k,latency-500k-8cpu,json-comp,json-tls,8gbit,static-tls,baseline-h2,static-h2,baseline-h2c,json-h2c,baseline-h3,static-h3,unary-grpc,unary-grpc-tls,echo-ws,echo-ws-pipeline,echo-ws-limited,gateway-64,gateway-h3,production-stack
+[info] building image: httparena-anole
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.22kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 0.2s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 126B done
+#3 DONE 0.0s
+
+#4 [build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#4 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 539B done
+#5 DONE 0.0s
+
+#6 [build 7/8] COPY proto ./proto
+#6 CACHED
+
+#7 [build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#7 CACHED
+
+#8 [build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#8 CACHED
+
+#9 [build 5/8] COPY build.zig build.zig.zon ./
+#9 CACHED
+
+#10 [build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#10 CACHED
+
+#11 [build 6/8] COPY src ./src
+#11 CACHED
+
+#12 [build 3/8] WORKDIR /server
+#12 CACHED
+
+#13 [stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#13 CACHED
+
+#14 exporting to image
+#14 exporting layers done
+#14 exporting manifest sha256:b728c8a0c14c61a63c3db04d1584b173e476507c3e386bfc348083105096e9c5 done
+#14 exporting config sha256:04679976930dd6476d718bbb353609d50b7a1ccb14dbf489a8265d237236c7af done
+#14 exporting attestation manifest sha256:bad839391bd01a9a3474e8bc042d1c1469bb1700514ed24b8340e4173f4673a1 0.0s done
+#14 exporting manifest list sha256:5b4079c6edafb3bd6211cb8413772675abed537020362011a292bb35bef6aa3c 0.0s done
+#14 naming to docker.io/library/httparena-anole:latest
+#14 naming to docker.io/library/httparena-anole:latest done
+#14 unpacking to docker.io/library/httparena-anole:latest done
+#14 DONE 0.1s
+[info] skipping system tuning as requested (SKIP_TUNE=true)
+[info] starting postgres sidecar
+[info] postgres ready (seeded)
+
+==============================================
+=== anole / latency-10k / 1024c (tool=zrk) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+{
+  "zrk_version": "2.3.0",
+  "target": { "url": "http://localhost:8080/baseline11?a=1&b=2", "method": "GET" },
+  "config": { "connections": 1024, "launched": 1024, "duration_s": 20.000, "closed": false, "target_rate": 10000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
+  "duration_s": 20.003,
+  "requests": 199709,
+  "bytes": 23365953,
+  "achieved_rate": 9984.15,
+  "target_rate": 10000,
+  "target_rate_end": 10000,
+  "rate_ratio": 0.9984,
+  "bytes_per_sec": 1168145.34,
+  "error_rate": 0.000000,
+  "max_schedule_lag_us": 0,
+  "latency_us": {
+    "min": 13, "mean": 58.3, "stdev": 735.7, "max": 43903,
+    "p50": 34, "p75": 38, "p90": 52, "p99": 143, "p99_9": 3703, "p99_99": 37040
+  },
+  "status_codes": { "1xx": 0, "2xx": 199709, "3xx": 0, "4xx": 0, "5xx": 0 },
+  "errors": { "connect": 0, "read": 0, "write": 0, "timeout": 0, "deadline": 0, "non_2xx_3xx": 0 },
+  "latency_histogram": "HISTFAAAAv94nC1RXUgUYRSde2ac/XX/3H+3abVtrbVMbctMSkstehCl8MGih8iKKJR+KCmEiK2spJYMiaAlZB8kRLYiEomIHuyXCAmfIqqHCp8keogg6MzazNz55t4559x7vi+WGSlTFHVSWbzU/6sUk5FLSvPCYiECz1OZsEw7s44r1vfaS/2ZZyg+um5+z/nBz1dl+pwMH7q399rpqUfy/LuM/pXZBcm+k8K43L0gw72fts2nPydzRj6U8T4pzToLjj+uX/4nkcnyr9G3wa++565fzry9YH1t+VEyVvJT+6C9Vz+qc+qkmlNH1aya5/oNF5lPqfP4gQJmMYybmJE5+S3P5IGMy5gMy4QMSV9eBgaO9/YevyG9ZzJy9Jxk5JZclGvSl5OcZCUvk3IyJ7flptxgYUYK5N+V83Kq7+DBk7t3dnVtbWnZ0FbbUtOWrK+J16+Kbt4cW1+bjKdra9MpY0XC74xHjcpE1Ah7wuGYMxj0xY1oLFmfSiWSG9OpVH06URkPVxpGPBxbkYj6nZ5o0Ij5fC4/P/2+oBF0efyusM8atdr9um53QrdaFbuu61YNGqwKFF2BHZquazqgKxoUTdH4WGABGEzNN+8yePlWeStwMBAqpgoCBHixEktQgSNYjip8EaJVVKOc6QmMCGsqOlGCEWAQHYwQ9uOywI1+/AUO4DReCRrxUCiyidD7pkQnunFdmNdhO9rRirVowBuhcAS7GOvY9Sw17ggRISxjk71YSiJnCvB/NQul2EJSP5rYvRSk7KNsgJo24qqYmbAd/G6lCXO1cL4QVWzU3MQqfQVoBAR2U0XBYdq3MVajWmso7oBCeBNJjezhJV0ltYKIHZpKZDPWmFtQzm6W4lhlHKSDBrYTRJ+PgR68kOI+9ph7p7C+Bo4iuZpY00Q7x2ik1QBnLGHrbpgnVEY1N6dsYsM6jcBdLC5j0Yui+dXEujmYjQPybJeAPwJgqYqxeJTlhNiKR2UKqvRpuiHfNEmqgyw3MRFWeZoWVs3NdZu4Y8A/qy2cQA=="
+}
+[info] CPU 11.9% | Mem 30MiB
+
+[run 2/3]
+{
+  "zrk_version": "2.3.0",
+  "target": { "url": "http://localhost:8080/baseline11?a=1&b=2", "method": "GET" },
+  "config": { "connections": 1024, "launched": 1024, "duration_s": 20.000, "closed": false, "target_rate": 10000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
+  "duration_s": 20.003,
+  "requests": 199702,
+  "bytes": 23365134,
+  "achieved_rate": 9983.83,
+  "target_rate": 10000,
+  "target_rate_end": 10000,
+  "rate_ratio": 0.9984,
+  "bytes_per_sec": 1168107.94,
+  "error_rate": 0.000000,
+  "max_schedule_lag_us": 0,
+  "latency_us": {
+    "min": 14, "mean": 52.5, "stdev": 603.6, "max": 46143,
+    "p50": 33, "p75": 37, "p90": 50, "p99": 146, "p99_9": 2861, "p99_99": 31944
+  },
+  "status_codes": { "1xx": 0, "2xx": 199702, "3xx": 0, "4xx": 0, "5xx": 0 },
+  "errors": { "connect": 0, "read": 0, "write": 0, "timeout": 0, "deadline": 0, "non_2xx_3xx": 0 },
+  "latency_histogram": "HISTFAAAAwB4nC1RW0gUYRSe882/615md9udXde9aKV5SVs1c7OLmWwZ2IUojeihAruZSImZXeghYjEzseiuhIQP0YNEQRn0ID108SHE3qInCQmfRHyIiLC+2Zx/Zv5zvnO+73z/TDx919Q0/bX2/9KXdskkd69rW+f/A7GcRZl2PDFGnRO2ftXjvh17n5hv+HNN/gzL74fCoLf1VevHQembkdtpzP2VnmlZfMlYBlqGdvRWLRT2xqaCP31fjUnjmWvMPe4dCX4LT+TMhIYC877nxrjzRdaAfcg2rabUPTWsj+uj+i/06Au4o3/GBK7qi4we6POYwTt8xqz0I40pmZUfMilz8kKey4g8lkdyR4ak43LXxeOptJzsPH6l83JXc1tX61WhR+mTZ/JUxth+T97Kd0nLMLHu7n5pbWnvOHLmSHt3W2rn7u37U6kNVXV5zRtSdSV1qVR9bXV1SVFVMFpeWh4t8Ubz8gOBaCAezV61Ii9/VWll5ZrKovravPVFRZtKS3PiJdHs/LgjGggYwWDAm23EA96gy2Vk59gNw+VwLeNbeZXLYXcZdpdywG5odth5KQU4GAJKgwY3oFu3m7HO5eGjgVsEfuyDDU6ulaiAiU+CbSxoSKCRaQgxvBQUEriEAmyEDxeQ5P5BSMxixxb2r0QZwRj2sDFJyRPqLHc3boqV4ItgHc5bOpvJj3BehI0VFE+CwVp2LqeCCZsqIMHkMB+fRljGQ0RoTDUS8dNCI8FDVuGW0OdqWrkhbAplRDy0tI9GQmiisElCkierYa6xFiY9wsjGXh27mJdxuMUoILKWlWLiZchlf5hDl9OGycyHY8iYjhF08u3kVKrGWC1TPiSVnwyTyOrMR/bjNE7RpJaJw6SaJIc4yZpi4/JQ07NU1SgXznxyk7tOjRD1PBgUTjuM+wYO8vhN1HTCo2LsccOnGug5wdNFkDmaprIoW2ylHm5hujZxjgwff1ANDpBXQ9yaFQKJTnZaRT8NWVEujtJeAm8Ee/mX3HTRRGCjSrD8DzP9mrY="
+}
+[info] CPU 11.3% | Mem 31MiB
+
+[run 3/3]
+{
+  "zrk_version": "2.3.0",
+  "target": { "url": "http://localhost:8080/baseline11?a=1&b=2", "method": "GET" },
+  "config": { "connections": 1024, "launched": 1024, "duration_s": 20.000, "closed": false, "target_rate": 10000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
+  "duration_s": 20.003,
+  "requests": 199703,
+  "bytes": 23365251,
+  "achieved_rate": 9983.80,
+  "target_rate": 10000,
+  "target_rate_end": 10000,
+  "rate_ratio": 0.9984,
+  "bytes_per_sec": 1168104.99,
+  "error_rate": 0.000000,
+  "max_schedule_lag_us": 0,
+  "latency_us": {
+    "min": 13, "mean": 55.7, "stdev": 654.7, "max": 45663,
+    "p50": 34, "p75": 39, "p90": 52, "p99": 141, "p99_9": 3403, "p99_99": 35984
+  },
+  "status_codes": { "1xx": 0, "2xx": 199703, "3xx": 0, "4xx": 0, "5xx": 0 },
+  "errors": { "connect": 0, "read": 0, "write": 0, "timeout": 0, "deadline": 0, "non_2xx_3xx": 0 },
+  "latency_histogram": "HISTFAAAAxJ4nC1RXUgUURSec+buOjP7M+vu7Mzuus6qq9uWa1r2g0XZH5lRQj8URg9FEUUEZiEmJSKbGf0gFCKLhPUQW0SF9VA+SUVB+RQ9hfnYg1REVEiE9c3UXO6953z3O9/5DpPMX4tIkvxB+vfJ/29yk2sXpOav/4C42DomT2jD+uPAVW1Q/RYoJm5nR1cXDgzkaXyEpq/QxOmPJ+730egtGpuge29o/hVNPqK7BXp2bubw27bZNXMNheq58kKsaMyEvoTGIx+jQ4lfibvx1+Z85Lc+HRjzzakzymzJtHfK81t8Ey/FPfFOfiYX5WHs7/xC/sl98iyP8xQX+QmP8Ff6RO9pkor0kMbpBg1Sd556+mmAOnp6O/Z03aB+6jzblacR6izSdco7jD7qQ3hgiLqG3MLbyHovU/eR/Uc7tu3e0rZv3Ya1m3dmG7Krctll2VyuIbkiZ67IZZKL7GymIlkdNoOxqoqEYduGbZoVYduftGN2ZtPSTKZhcaYql7BzVaYZNqvDoWozYSSNmG3EFNMIa6YRMvxKLBQKa8FgMKZpZlAENb8mvF5FUTTFy4L9fkUICQF7sYVQFBwuIrPMkpARliDysYRT5Y0Ch489vIub2OIa7GY+T6xzHS/gAIA0eDridqwyPgk8Bfw5QaAOQZpb+Q5xnNfzH+bPhFsC8ww/IBT/IC6HpMwrsXzcgp1CFMep4yUOLyoiC7njKSrQXYWihDMFq1BLcZRrwW2BySi4pfDSyPW8hJ1JFgBJATuG+xTvQMtjqLGAS8BbYfAQJBeCaWGloVPGjFEj4PuQ69CywCrlSm4UTRjJUU0js+Auji4RPg7Htei+Buw4jEWg55y10GpEXIMOFuo8fBA7DrWASLk900AjyFX3tlDhY1X4XIVSoUOvkp3/Uoe6RnBgQ8ejzNtR8pT5koLoIrlTO70cRzIIUcRNLDyueAlEUOoUqvCrwqfFQCR3lBooeACU42khBknj56QZKk5xBHrliHQQo+4k0Kvnm8x1IurOFMBMzmTt7JrwgV6Du56Xu/oq7wX+FwITmno="
+}
+[info] CPU 11.3% | Mem 31MiB
+[info] run 2 wins on score
+
+=== Best: 9984 req/s (CPU: 11.3%, Mem: 31MiB) ===
+[info] exact CPU: 2.36 core-seconds | 11.830 us/req
+=== Fixed-rate: cpu/req 11.83us | p99 146.0us | p99.9 2861.0us | rate_ratio 0.9984 ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole
+httparena-bench-anole
+[info] done
+httparena-postgres
