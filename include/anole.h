@@ -379,7 +379,8 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
    unless borrowed, the body are copied before this returns. Compression,
    the response cache and the access log run on Anole's side afterwards.
    Finishes the request. ANOLE_E_INVALID: a bad status, flag, header name
-   or value (nothing taken, the request is still owed); ANOLE_E_GONE. */
+   or value, or Connection / Transfer-Encoding, which the server writes
+   itself (nothing taken, the request is still owed); ANOLE_E_GONE. */
 ANOLE_API anole_status anole_respond(anole_req r, uint16_t status, const anole_header *headers, size_t nheaders,
                                      const void *body, size_t len, uint32_t flags);
 /* Sends `len` bytes of the open regular file `fd` from `offset` (len 0: to

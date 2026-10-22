@@ -176,7 +176,7 @@ Negative codes mean nothing was done unless the function says otherwise:
 
 | Code | Meaning |
 | --- | --- |
-| `ANOLE_E_INVALID` | a bad argument: status, header name or value, flag, size (a request is still owed) |
+| `ANOLE_E_INVALID` | a bad argument: status, header name or value (`Connection` and `Transfer-Encoding` included: the server writes those), flag, size (a request is still owed) |
 | `ANOLE_E_GONE` | the handle was answered, expired, aborted, is stale or of another kind |
 | `ANOLE_E_AGAIN` | nothing now; an event follows (`anole_req_read` with timeout 0) |
 | `ANOLE_E_NOMEM` | out of memory |

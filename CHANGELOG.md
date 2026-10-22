@@ -433,6 +433,9 @@ Breaking below.
   the configuration is read: `Connection` and `Transfer-Encoding` (the
   server's own) and invalid names or values are refused there, instead of
   failing every request to the route.
+- C ABI: replies and trailers naming `Connection` or `Transfer-Encoding`
+  are refused with `ANOLE_E_INVALID` (the request is still owed), instead
+  of those headers being dropped without a word.
 - C ABI: WebSocket messages waiting for a consumer are bounded per executor
   in bytes (the larger of 16 x `limits.ws_high_water` and
   2 x `limits.ws_max_message`), not only in count, so clients cannot make a

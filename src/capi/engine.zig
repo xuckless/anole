@@ -2011,6 +2011,9 @@ fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
     for (headers) |hd| {
         total += hd.name.len + hd.value.len;
         dusty.validateHeaderName(hd.name.slice()) catch return error.Invalid;
+        // Framing fields are the server's to write (`Response.header`
+        // refuses them): refused here rather than dropped later.
+        if (dusty.isReservedHeader(hd.name.slice())) return error.Invalid;
         dusty.validateHeaderValue(hd.value.slice()) catch return error.Invalid;
     }
     return total;

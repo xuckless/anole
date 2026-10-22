@@ -858,6 +858,9 @@ static void test_main_server(void) {
       CHECK(anole_respond(h2, 200, &bad, 1, NULL, 0, 0) == ANOLE_E_INVALID);
       anole_header bad_value = {{"x-ok", 4}, {"a\r\nb", 4}};
       CHECK(anole_respond(h2, 200, &bad_value, 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      anole_header framing[] = {{{"Connection", 10}, {"close", 5}}, {{"transfer-encoding", 17}, {"chunked", 7}}};
+      CHECK(anole_respond(h2, 200, &framing[0], 1, NULL, 0, 0) == ANOLE_E_INVALID);
+      CHECK(anole_respond(h2, 200, &framing[1], 1, NULL, 0, 0) == ANOLE_E_INVALID);
       CHECK(anole_respond(h2, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
       pthread_join(t, NULL);
       CHECK(b.r.status == 200);
