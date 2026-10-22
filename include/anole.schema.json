@@ -52,6 +52,13 @@
     },
     "observe": {
       "$ref": "#/$defs/Observe"
+    },
+    "databases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Database"
+      },
+      "description": "Databases for anole_db_*, opened at start."
     }
   },
   "$defs": {
@@ -251,6 +258,13 @@
           "maximum": 4294967295,
           "default": 0,
           "description": "Open connections at most; 0 follows the open-file limit."
+        },
+        "db_result_max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 16777216,
+          "description": "The largest database answer (its record's bytes); past it, ANOLE_E_TOOBIG."
         }
       }
     },
@@ -861,6 +875,345 @@
       "required": [
         "handler"
       ]
+    },
+    "Database": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "What anole_db_find looks it up by: unique, 1-255 bytes."
+        },
+        "sqlite": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sqlite"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "postgres": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Postgres"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "redis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Redis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_entries": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 4096
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 33554432
+            }
+          },
+          "description": "Bounds of the answers kept for queries with cache_ttl_ms, over every executor."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "description": "A database for anole_db_*: exactly one of sqlite, postgres and redis."
+    },
+    "Sqlite": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "A file (created when missing), or \":memory:\"."
+        },
+        "readers": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "Read-only connections beside the writer; left out: one per executor, at most 8; 0: everything on the writer."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "busy_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a statement waits for a lock another process holds."
+        },
+        "statement_cache": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 64,
+          "description": "Prepared statements kept per connection."
+        },
+        "pragmas": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Run on every connection as it opens."
+        },
+        "init": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "SQL run once at start, before the listeners open: a schema."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "Postgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "postgres://user:password@host:port/database?params. Null: DATABASE_URL, else libpq's variables (PGHOST, PGUSER...)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sslmode": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "disable",
+                "allow",
+                "prefer",
+                "require",
+                "verify-ca",
+                "verify-full"
+              ],
+              "description": "libpq's sslmode. Null: the URL's, else PGSSLMODE, else verify-full for a server on another host and prefer on this machine."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file of the CA certificates the server's certificate is checked against; with one, the certificate is always checked."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections in all, split between the executors. Null: the URL's pool_max_conns, else twice the executors, at least 4."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a query waits for a connection when all are busy."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long opening a connection may take; 0: no limit."
+        },
+        "statement_cache_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 256,
+          "description": "Statements each connection keeps prepared."
+        },
+        "max_lifetime_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 3600000,
+          "description": "Connections older than this are closed; 0: no limit."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 1800000,
+          "description": "Connections idle this long are closed; 0: no limit."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open a connection per executor at start, and fail the start if that fails."
+        },
+        "application_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reset_session": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reset each connection's session when a query gives it back."
+        },
+        "init": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "SQL run once at start, before the listeners open: a schema."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "A PostgreSQL database (anole.pg; docs/database.md)."
+    },
+    "Redis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "redis://user:password@host:6379/0, rediss:// for TLS, or unix:///path?db=0. Null: REDIS_URL, else redis://127.0.0.1:6379."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "rediss://: a PEM file of the CA certificates the server's certificate is checked against. Null: the URL's ssl_ca_certs, else the system's store."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections in all, split between the executors. Null: ten per executor."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acquire_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "How long a command waits for a connection when all are busy."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long opening a connection may take; 0: no limit."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 300000,
+          "description": "Connections idle this long are closed; 0: no limit."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Open a connection per executor at start, and fail the start if that fails."
+        }
+      },
+      "description": "A Redis or Valkey server (anole.redis; docs/database.md)."
     },
     "Cache": {
       "type": "object",

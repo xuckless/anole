@@ -115,7 +115,11 @@ pub const Options = struct {
     idle_timeout: ?Duration = .fromSeconds(30 * 60),
     /// What each class of server error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
-    /// Certificates for TLS; whether TLS is used is the URL's `sslmode`.
+    /// libpq's `sslmode`, unless the URL names one; it wins over
+    /// `PGSSLMODE`. Null: the URL's, else `PGSSLMODE`, else `verify_full`
+    /// for a server on another host and `prefer` on this machine.
+    sslmode: ?SslMode = null,
+    /// Certificates for TLS; whether TLS is used is the `sslmode`.
     /// With `tls.ca` set, the server's certificate is always checked:
     /// `verify-full` when no sslmode is given, and an sslmode that does not
     /// check it (`disable`, `allow`, `prefer`) is refused.
@@ -157,7 +161,7 @@ pub const Options = struct {
 
 /// libpq's `sslmode`. Without one: `verify_full` for a remote host,
 /// `prefer` for this machine (`Settings.finish`).
-const SslMode = enum {
+pub const SslMode = enum {
     disable,
     /// As `prefer` here (libpq tries plain text first).
     allow,
@@ -268,6 +272,10 @@ const Settings = struct {
         if (db.env(env, "PGSSLNEGOTIATION")) |v| s.direct_tls = parseNegotiation(v) catch return why.set("PGSSLNEGOTIATION \"{s}\" is not postgres or direct", .{v});
         if (db.env(env, "PGAPPNAME")) |v| s.application_name = v;
         if (db.env(env, "PGCONNECT_TIMEOUT")) |v| s.connect_timeout = parseSeconds(v) catch return why.set("PGCONNECT_TIMEOUT \"{s}\" is not a number of seconds", .{v});
+        if (opts.sslmode) |m| {
+            s.sslmode = m;
+            s.sslmode_set = true;
+        }
         var parameters: std.ArrayList(db.Url.Param) = .empty;
         if (db.env(env, "PGOPTIONS")) |v| try parameters.append(arena, .{ .name = "options", .value = v });
 
@@ -1007,6 +1015,36 @@ pub const Query = struct {
     pub fn iterate(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
+
+    /// Every row, with columns and parameters known only at run time
+    /// (`anole.db.Value`; what the C ABI and the language bindings pass).
+    /// Each value comes in PostgreSQL's text format, as psql prints it,
+    /// under its column's type OID (`Table.types`): bool, the integer types
+    /// (int2, int4, int8, oid, xid) and float4/float8 are converted, bytea
+    /// becomes a blob, everything else (numeric, dates and times, json,
+    /// uuid, arrays...) stays text for the caller to parse by its type.
+    /// `coalesce` and `cache` apply.
+    pub fn table(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
+        return self.db.cache.read(db.Table, c, self.opts, sql, values, TableRead{ .query = self });
+    }
+
+    /// Runs `sql` with parameters known only at run time; the rows it
+    /// changed (`last_insert_rowid` is 0: use `RETURNING` with `table`).
+    /// Without parameters, several statements may go in one call.
+    pub fn run(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        return self.db.call(c, self.opts.timeout, null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+    }
+};
+
+const TableRead = struct {
+    query: Query,
+
+    pub const shape: db.ReadShape = .table;
+
+    pub fn run(r: TableRead, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
+        const q = r.query;
+        return q.db.call(c, q.opts.timeout, null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
+    }
 };
 
 /// A read as `anole.db.QueryCache` makes it: the plain call, with the
@@ -1211,6 +1249,80 @@ fn Exec(comptime Args: type) type {
             return @intCast(@max(n orelse 0, 0));
         }
     };
+}
+
+const RunJob = struct {
+    values: []const db.Value,
+    prepare: bool,
+
+    const Out = db.Changes;
+
+    fn run(job: *@This(), d: *Client, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!db.Changes {
+        const lease = if (tx) |t| t.lease else try d.take(ctx);
+        defer if (tx == null) d.give(lease);
+        const n = lease.conn.execOpts(sql, job.values, .{ .statement_cache = job.prepare }) catch |err| return d.failed(ctx, lease, err, tx);
+        return .{ .changes = @intCast(@max(n orelse 0, 0)) };
+    }
+};
+
+const TableJob = struct {
+    values: []const db.Value,
+    prepare: bool,
+
+    const Out = db.Table;
+
+    fn run(job: *@This(), d: *Client, ctx: *Ctx, tx: ?*Tx, sql: []const u8) Error!db.Table {
+        const lease = if (tx) |t| t.lease else try d.take(ctx);
+        defer if (tx == null) d.give(lease);
+        var result = lease.conn.queryOpts(sql, job.values, .{
+            .statement_cache = job.prepare,
+            .column_names = true,
+            .text_results = true,
+        }) catch |err| return d.failed(ctx, lease, err, tx);
+        defer result.deinit();
+        return readTable(d, ctx, lease, tx, result) catch |err| {
+            // The rest of the rows are still to come: read past them, so
+            // the connection can be used again.
+            if (lease.conn._state == .query) result.drain() catch |e| {
+                if (e == error.Canceled) stopBackend(ctx.io, lease.conn);
+                lease.conn._state = .fail;
+            };
+            return err;
+        };
+    }
+
+    fn readTable(d: *Client, ctx: *Ctx, lease: Lease, tx: ?*Tx, result: *pg.Result) Error!db.Table {
+        const a = ctx.arena;
+        const ncol = result.number_of_columns;
+        const names = try a.alloc([]const u8, ncol);
+        for (names, result.column_names) |*n, src| n.* = try a.dupe(u8, src);
+        const types = try a.alloc(u32, ncol);
+        for (types, result._oids) |*t, oid| t.* = @bitCast(oid);
+        var rows: std.ArrayList([]const db.Value) = .empty;
+        while (true) {
+            const row = (result.next() catch |err| return d.failed(ctx, lease, err, tx)) orelse break;
+            const cells = try a.alloc(db.Value, ncol);
+            for (cells, row.values, result._oids) |*cell, v, oid| cell.* = if (v.is_null) .null else try textValue(a, oid, v.data);
+            try rows.append(a, cells);
+        }
+        return .{ .columns = names, .types = types, .rows = rows.items };
+    }
+};
+
+/// A value in PostgreSQL's text format as `anole.db.Value`, by its type:
+/// numbers and bools converted, bytea as bytes, the rest as text.
+fn textValue(a: std.mem.Allocator, oid: i32, data: []const u8) error{OutOfMemory}!db.Value {
+    switch (oid) {
+        Oid.@"bool" => return .{ .bool = std.mem.eql(u8, data, "t") },
+        Oid.int2, Oid.int4, Oid.int8, Oid.oid_, Oid.xid => if (std.fmt.parseInt(i64, data, 10)) |n| return .{ .int = n } else |_| {},
+        Oid.float4, Oid.float8 => if (std.fmt.parseFloat(f64, data)) |f| return .{ .float = f } else |_| {},
+        Oid.bytea => if (std.mem.startsWith(u8, data, "\\x") and data.len % 2 == 0) {
+            const out = try a.alloc(u8, (data.len - 2) / 2);
+            if (std.fmt.hexToBytes(out, data[2..])) |bytes| return .{ .blob = bytes } else |_| a.free(out);
+        },
+        else => {},
+    }
+    return .{ .text = try a.dupe(u8, data) };
 }
 
 const Mode = enum { one, optional, all, iterate };
@@ -1664,6 +1776,10 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         try testing.expect(m.scram_sha_256 and m.none);
     }
     try testing.expectEqual(SslMode.disable, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d" })).sslmode);
+    // Options.sslmode: over PGSSLMODE, under the URL's.
+    try testing.expectEqual(SslMode.require, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d", .sslmode = .require })).sslmode);
+    try testing.expectEqual(SslMode.verify_ca, (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d?sslmode=verify-ca", .sslmode = .disable })).sslmode);
+    try testing.expectEqual(SslMode.disable, (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d", .sslmode = .disable })).sslmode);
 
     // require_auth and channel_binding, from the URL or the variables
     const strict = try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d?sslmode=prefer&require_auth=scram-sha-256&channel_binding=require" });

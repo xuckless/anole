@@ -14,29 +14,34 @@ const Allocator = std.mem.Allocator;
 
 /// Whether `deepCopy` can copy a `T`.
 pub fn copyable(comptime T: type) bool {
-    return comptime copyableDepth(T, 0);
+    return comptime copyableIn(T, &.{});
 }
 
-fn copyableDepth(comptime T: type, comptime depth: u32) bool {
-    // A type that holds itself (through a slice) is not followed far.
-    if (depth > 12) return false;
+/// `seen`: the types being checked further up. A type that holds itself
+/// through a slice (a tree, such as a Redis reply) is copied like any
+/// other: its values are finite.
+fn copyableIn(comptime T: type, comptime seen: []const type) bool {
+    // Wide unions (a BSON value) take many steps.
+    @setEvalBranchQuota(100_000);
+    for (seen) |S| if (S == T) return true;
+    const inner = seen ++ [_]type{T};
     return switch (@typeInfo(T)) {
         .bool, .int, .float, .@"enum", .void, .null, .comptime_int, .comptime_float, .enum_literal => true,
-        .optional => |o| copyableDepth(o.child, depth + 1),
-        .array => |a| copyableDepth(a.child, depth + 1),
-        .@"struct" => |s| {
-            for (s.field_types) |F| if (!copyableDepth(F, depth + 1)) return false;
+        .optional => |o| copyableIn(o.child, inner),
+        .array => |a| copyableIn(a.child, inner),
+        .@"struct" => |st| {
+            for (st.field_types) |F| if (!copyableIn(F, inner)) return false;
             return true;
         },
         .@"union" => |u| {
             if (u.tag_type == null) return false;
-            for (u.field_types) |F| if (!copyableDepth(F, depth + 1)) return false;
+            for (u.field_types) |F| if (!copyableIn(F, inner)) return false;
             return true;
         },
         .pointer => |p| switch (p.size) {
-            .slice => copyableDepth(p.child, depth + 1),
+            .slice => copyableIn(p.child, inner),
             // A string literal (`*const [N:0]u8`), say.
-            .one => @typeInfo(p.child) == .array and copyableDepth(p.child, depth + 1),
+            .one => @typeInfo(p.child) == .array and copyableIn(p.child, inner),
             else => false,
         },
         else => false,
@@ -270,6 +275,16 @@ test "deepCopy: every slice in new memory, and deepSize enough for it" {
     try testing.expectEqualStrings("text", copy[0].either.s);
     try testing.expectEqual(Kind.link, copy[1].kind);
     try testing.expect(@intFromPtr(copy.ptr) >= @intFromPtr(buf.ptr) and @intFromPtr(copy.ptr) < @intFromPtr(buf.ptr) + buf.len);
+
+    // A type that holds itself through a slice: a tree.
+    const Tree = union(enum) { leaf: []const u8, node: []const @This() };
+    try testing.expect(copyable(Tree));
+    const tree: Tree = .{ .node = &.{ .{ .leaf = "a" }, .{ .node = &.{.{ .leaf = "bc" }} } } };
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const tree_copy = try deepCopy(Tree, tree, arena_state.allocator());
+    try testing.expectEqualStrings("bc", tree_copy.node[1].node[0].leaf);
+    try testing.expect(tree_copy.node[1].node[0].leaf.ptr != tree.node[1].node[0].leaf.ptr);
 
     // Types with pointers of other kinds are not copyable.
     try testing.expect(!copyable(std.json.Value));

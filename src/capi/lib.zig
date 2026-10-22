@@ -155,8 +155,9 @@ export fn anole_has_feature(name: Str) c_int {
         .{ "compression", f.compression },
         .{ "brotli", f.brotli },
         .{ "auth", f.auth },
-        // anole_db_* is not in ABI 0.1 yet.
-        .{ "sqlite", false },
+        .{ "sqlite", f.sqlite },
+        .{ "postgres", f.postgres },
+        .{ "redis", f.redis },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;
@@ -406,5 +407,60 @@ export fn anole_ws_publish(s: ?*anyopaque, topic: Str, typ: c_int, data: ?*const
     const e = engineOf(s) orelse return abi.E_INVALID;
     const b = bytes(data, len) orelse return abi.E_INVALID;
     engine.ws.publish(e, topic.slice(), typ, b, except) catch |err| return answer(err);
+    return abi.OK;
+}
+
+// ---- databases ---------------------------------------------------------------------
+
+const db_mod = engine.db;
+
+fn dbOf(d: ?*anyopaque) ?*db_mod.Db {
+    return @ptrCast(@alignCast(d orelse return null));
+}
+
+export fn anole_db_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return abi.E_INVALID;
+    const dst = out orelse return abi.E_INVALID;
+    const d = db_mod.find(e, name.slice()) orelse {
+        setError("no database \"{s}\" in the configuration", .{name.slice()});
+        return abi.E_INVALID;
+    };
+    dst.* = d;
+    return abi.OK;
+}
+
+fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
+    clearError();
+    const d = dbOf(d_) orelse return abi.E_INVALID;
+    const c = consumerOf(c_) orelse return abi.E_INVALID;
+    const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return abi.E_INVALID)[0..nparams];
+    const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) orelse return abi.E_INVALID else .{ .size = @sizeOf(abi.DbOptions) };
+    db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return switch (err) {
+        error.Invalid => blk: {
+            setError("invalid argument (a value type, or a consumer of another server)", .{});
+            break :blk abi.E_INVALID;
+        },
+        error.State => blk: {
+            setError("the server is not running, or no executor feeds this consumer", .{});
+            break :blk abi.E_STATE;
+        },
+        error.OutOfMemory => abi.E_NOMEM,
+        error.Unsupported => abi.E_UNSUPPORTED,
+    };
+    return abi.OK;
+}
+
+export fn anole_db_query(d: ?*anyopaque, c: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
+    return dbSubmit(.query, d, c, sql, params, nparams, opts, user_data);
+}
+
+export fn anole_db_exec(d: ?*anyopaque, c: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
+    return dbSubmit(.exec, d, c, sql, params, nparams, opts, user_data);
+}
+
+export fn anole_db_invalidate(d_: ?*anyopaque, tag: Str) i32 {
+    const d = dbOf(d_) orelse return abi.E_INVALID;
+    db_mod.invalidate(d, tag.slice()) catch return abi.E_STATE;
     return abi.OK;
 }

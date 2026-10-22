@@ -50,6 +50,7 @@ pub const ws = if (features.websocket) @import("ws.zig") else struct {
     };
 };
 pub const pipe = pipe_mod;
+pub const db = @import("db.zig");
 pub const config = config_mod;
 
 const log = std.log.scoped(.anole_capi);
@@ -283,7 +284,7 @@ fn freeRecord(rec: [*]align(8) u8) void {
 }
 
 /// A record of `size` bytes (rounded up), its header filled in.
-fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
+pub fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
     const n = abi.alignUp(size);
     const rec = try gpa.alignedAlloc(u8, .@"8", n);
     @memset(rec[@sizeOf(abi.Event)..], 0);
@@ -338,6 +339,7 @@ pub const Exec = struct {
     /// whole messages.
     record_bytes: std.atomic.Value(usize) = .init(0),
     ws: ws.ExecState = .{},
+    db: db.ExecState = .{},
 
     fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
         if (x.idle) {
@@ -502,6 +504,8 @@ pub const Consumer = struct {
     /// The executors this consumer is fed by (set at start).
     execs: std.ArrayList(*Exec) = .empty,
     next_exec: usize = 0,
+    /// Spreads `anole_db_*` queries over `execs`.
+    next_db: std.atomic.Value(usize) = .init(0),
     stopped_sent: bool = false,
     /// When `poll` last ran (awake clock, ns), for the lost-wake check.
     last_poll: std.atomic.Value(i64) = .init(0),
@@ -647,6 +651,8 @@ pub const Engine = struct {
     publishing: std.atomic.Value(usize) = .init(0),
     publish_bytes: std.atomic.Value(usize) = .init(0),
     publish_dropped: std.atomic.Value(u64) = .init(0),
+    /// The configuration's databases (`anole_db *`).
+    dbs: []db.Db = &.{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa) else {},
 
@@ -675,6 +681,8 @@ pub const Engine = struct {
         if (comptime features.websocket) e.rooms.options.max_queued_bytes = cfg.limits.ws_high_water;
         e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
         e.timeouts[0] = @as(i96, cfg.timeouts.request_ms) * std.time.ns_per_ms;
+        e.dbs = try a.alloc(db.Db, cfg.databases.len);
+        for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
         // One per process: `respond` and the handlers find it here.
         global = e;
         return e;
@@ -759,6 +767,7 @@ pub const Engine = struct {
         if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
         e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
         e.buildRoutes(&app) catch |err| return e.failStartDeinit(&app, err);
+        db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
@@ -772,6 +781,8 @@ pub const Engine = struct {
         watcher.cancel(app.io());
         e.tasks.cancel(app.io());
         if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
+        for (e.execs) |*x| x.db.cancel(app.io());
+        db.close(e);
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
                 e.start_error = err;

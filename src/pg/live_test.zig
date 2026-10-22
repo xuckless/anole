@@ -175,6 +175,71 @@ test "pg: live verbs, rows into structs, and errors as statuses" {
     try testing.expectEqual(@as(usize, 1), d.pools.pools[0].pool.stats().in_use);
 }
 
+test "pg: live table and run: values known only at run time, in PostgreSQL's text format" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const d = try open(io, .{ .max_connections = 1 });
+    defer d.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const q = d.with(.{});
+
+    // Several statements, no parameters.
+    const ch = try q.run(&c,
+        \\DROP TABLE IF EXISTS anole_pg_dyn;
+        \\CREATE TABLE anole_pg_dyn (id int8 PRIMARY KEY, name text UNIQUE NOT NULL, ok bool, score float8,
+        \\  price numeric(8, 2), data bytea, at timestamptz, tags text[]);
+    , &.{});
+    try testing.expectEqual(@as(u64, 0), ch.changes);
+
+    // Every kind of value as a parameter; numbers into numeric and text go
+    // as text.
+    const row: []const db.Value = &.{ .{ .int = 1 }, .{ .text = "ada" }, .{ .bool = true }, .{ .float = 2.5 }, .{ .int = 12 }, .{ .blob = "\x00\xff" }, .{ .text = "2026-10-22T10:00:00Z" }, .{ .text = "{a,b}" } };
+    try testing.expectEqual(@as(u64, 1), (try q.run(&c, "INSERT INTO anole_pg_dyn VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", row)).changes);
+    try testing.expectEqual(@as(u64, 1), (try q.run(&c, "INSERT INTO anole_pg_dyn (id, name) VALUES ($1, $2)", &.{ .{ .int = 2 }, .{ .text = "bob" } })).changes);
+
+    const t = try q.table(&c, "SELECT id, name, ok, score, price, data, at, tags, NULL::int4 AS nothing, 'Infinity'::float8 AS inf FROM anole_pg_dyn WHERE id >= $1 ORDER BY id", &.{.{ .int = 1 }});
+    try testing.expectEqual(@as(usize, 10), t.columns.len);
+    try testing.expectEqualStrings("nothing", t.columns[8]);
+    // Type OIDs: int8, text, bool, float8, numeric, bytea, timestamptz, text[].
+    try testing.expectEqualSlices(u32, &.{ 20, 25, 16, 701, 1700, 17, 1184, 1009, 23, 701 }, t.types);
+    try testing.expectEqual(@as(usize, 2), t.rows.len);
+    const r = t.rows[0];
+    try testing.expectEqual(@as(i64, 1), r[0].int);
+    try testing.expectEqualStrings("ada", r[1].text);
+    try testing.expect(r[2].bool);
+    try testing.expectEqual(@as(f64, 2.5), r[3].float);
+    try testing.expectEqualStrings("12.00", r[4].text);
+    try testing.expectEqualStrings("\x00\xff", r[5].blob);
+    try testing.expect(std.mem.startsWith(u8, r[6].text, "2026-10-22 "));
+    try testing.expectEqualStrings("{a,b}", r[7].text);
+    try testing.expect(r[8] == .null);
+    try testing.expect(std.math.isInf(r[9].float));
+    try testing.expect(t.rows[1][2] == .null);
+
+    // Cached by the parameters' values.
+    const cached = d.with(.{ .cache = .{ .ttl = .fromSeconds(60), .tag = "dyn" } });
+    _ = try cached.table(&c, "SELECT name FROM anole_pg_dyn WHERE id = $1", &.{.{ .int = 2 }});
+    try testing.expectEqual(db.Source.database, db.lastSource(&c).?);
+    const again = try cached.table(&c, "SELECT name FROM anole_pg_dyn WHERE id = $1", &.{.{ .int = 2 }});
+    try testing.expectEqual(db.Source.cache, db.lastSource(&c).?);
+    try testing.expectEqualStrings("bob", again.rows[0][0].text);
+
+    const level = quiet();
+    defer testing.log_level = level;
+    try testing.expectError(error.Conflict, q.run(&c, "INSERT INTO anole_pg_dyn (id, name) VALUES ($1, $2)", &.{ .{ .int = 3 }, .{ .text = "ada" } }));
+    try testing.expectEqualStrings("anole_pg_dyn_name_key", db.lastError(&c).?.constraint.?);
+    // An error in the middle of the rows; the connection carries on.
+    try testing.expectError(error.Database, q.table(&c, "SELECT 10 / (x - 2) FROM generate_series(1, 3) x", &.{}));
+    try testing.expectEqualStrings("22012", db.lastError(&c).?.code);
+    try testing.expectError(error.Database, q.table(&c, "SELECT $1::int4", &.{.{ .float = 1.5 }}));
+    try testing.expectEqual(@as(i64, 2), (try q.table(&c, "SELECT count(*) FROM anole_pg_dyn", &.{})).rows[0][0].int);
+    _ = try q.run(&c, "DROP TABLE anole_pg_dyn", &.{});
+}
+
 test "pg: live transactions: commit, roll back, retry a serialization failure" {
     _ = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });

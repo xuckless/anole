@@ -5,6 +5,41 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### C ABI
+
+- `anole_db_*` with SQLite (additions to ABI 0.1): databases from the
+  configuration (opened at start with an `init` script), queried without
+  blocking the caller;
+  each answer is an `ANOLE_EV_DB_RESULT` record (column names and typed
+  cells, or changes and the last rowid) with the caller's `user_data`.
+  Per-query timeout, coalescing and the TTL result cache with tags and
+  `anole_db_invalidate`; failures carry their class, the status Anole would
+  answer and the database's detail. `anole.sqlite`'s `table` and `run`
+  are the Zig side: rows and parameters known only at run time
+  (`anole.sqlite.Value`).
+- `anole_db_*` with PostgreSQL: a `"postgres"` database (`url`, `sslmode`,
+  `ca_file`/`ca_pem`, pool bounds and timeouts, `init`), the same calls,
+  options, answers and error classes. TLS is checked by default
+  (verify-full for a server on another host); a CA given in the
+  configuration can't be turned off by the URL. Cells come in PostgreSQL's
+  text format but for bool, integers, floats and bytea, each with its
+  column's type OID (`anole_db_cell.db_type`, formerly `reserved`) for a
+  binding's own type parsers; `ANOLE_DB_BOOL` is a new value and cell type.
+  `timeout_ms` cancels the statement on the server.
+- `anole.db.Value`, `Table` and `Changes` are shared by the SQL connectors
+  (`anole.sqlite`'s are now these); `anole.pg` gains `table` and `run` for
+  rows and parameters known only at run time, and `Options.sslmode`.
+- `anole_db_*` with Redis and Valkey: a `"redis"` database (`url`,
+  `ca_file`/`ca_pem`, pool bounds and timeouts). A command is `sql` (its
+  name and fixed words) plus parameters as binary-safe arguments;
+  `anole_db_query` answers with the reply as a tree of cells in preorder
+  (`ANOLE_DB_ARRAY`, `ANOLE_DB_MAP` and `ANOLE_DB_ERROR` are new cell
+  types), `anole_db_exec` with an integer reply as `changes`. Coalescing
+  and the result cache apply to read commands.
+- `anole.redis`'s `Query.reply` sends a command known only at run time
+  (`[]const []const u8`), through the cache for read commands; the result
+  caches copy types that hold themselves (a reply tree).
+
 ### Fixed
 
 - C ABI: a program linked against `libanole.a` with dead-stripping
