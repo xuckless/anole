@@ -98,6 +98,41 @@ defer response.deinit();
 Other `FetchOptions`: `max_redirects`, `timeout`, `decompress`, `stream`, and
 `unix_socket_path` (for a server on a Unix socket, such as Docker's).
 
+The URL's path and query go into the request as they are, so they must be
+percent-encoded: a space, a control character (CR and LF among them) or a
+byte past 0x7f in either fails the request with `error.InvalidUrl`, and so
+does a redirect to such a URL. Build query strings from data with
+`std.Uri.Component.percentEncode` or an equivalent, never by pasting it in.
+
+### Redirects
+
+`fetch` follows up to `max_redirects` (10) redirects: 301, 302, 303, 307 and
+308. 301, 302 and 303 turn a request other than GET and HEAD into a GET
+without a body (QUERY keeps both on 301 and 302); 307 and 308 keep the
+method and body. Along the way:
+
+- `Authorization`, `Cookie` and the proxy credentials are dropped once a
+  redirect leaves the first host and its subdomains, or goes from https to
+  http.
+- The `Referer` is the previous URL within one origin, only its origin
+  (`https://host/`) across origins, and none from https to http, as
+  browsers do by default. One you set yourself is sent as it is.
+- A body follows a 307 or 308 only to the same host (or from http to https
+  on it). A redirect that would take it elsewhere is not followed: `fetch`
+  returns the 307 or 308 response.
+
+`ClientConfig.check_redirect` replaces that last rule with your own: a
+function that sees each redirect (`status`, `from`, `to`, `method`,
+`has_body`, `hops`, `cross_origin`) and returns `.follow`, `.stop` (return
+the redirect response) or `.fail` (`error.RedirectRefused`).
+
+For a client that fetches URLs from untrusted input (webhooks, link
+previews), set `ClientConfig.deny_private_addresses = true`. It refuses
+loopback, private, link-local (cloud metadata included), shared, multicast
+and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
+The check is on the address the connection reached, after DNS, on every
+hop, before any byte of the request is sent.
+
 `ClientConfig.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
 ALPN on HTTPS connections. A server that picks it gets the request over
 HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
@@ -145,10 +180,17 @@ defer gpa.free(body);
 - `release` every stream you open, before `close`. Releasing an unfinished
   stream resets it (RST_STREAM CANCEL); `cancel` does that without releasing.
 - `waitHead` fails with `error.StreamReset`, `error.ConnectionClosed`,
-  `error.Timeout` (see [Timeouts](#timeouts)) or `error.Canceled`. A read or
+  `error.Timeout` (see [Timeouts](#timeouts)), `error.Canceled`,
+  `error.HeadersTooLarge` or `error.TooManyInterimResponses`. A read or
   write on a stream that ended early fails with `error.ReadFailed` or
   `error.WriteFailed`, the only errors a reader and a writer can return;
-  `s.readError()` and `s.writeError()` say which of those four it was.
+  `s.readError()` and `s.writeError()` say which it was.
+- `max_header_list_size` (64 KiB) bounds a response's header fields,
+  decoded, informational responses and trailers included, and is sent to
+  the server as SETTINGS_MAX_HEADER_LIST_SIZE. Up to five informational
+  (1xx) responses may come before the final one, as over HTTP/1.1.
+- After the server's GOAWAY, `request` fails with `error.ConnectionClosed`
+  and `isOpen()` is false, while the streams the GOAWAY covers finish.
 - A stream's `status`, `headers` and `trailers` live until `release`; copy
   what you keep.
 - `stream_window` (64 KiB) is what the server may send on a stream before
@@ -178,7 +220,9 @@ trust among other causes), `error.Timeout` (past `connect_timeout`, 10 s by
 default) or `error.NoH3`. `timeout` is each request's budget, as for
 HTTP/2. `stream_window` (256 KiB) and `max_data` (16 MiB) mean what they
 do for HTTP/2, with the same types; the stream window's default is larger
-because an HTTP/3 stream's buffer grows as data arrives. Only HTTP/3 has
+because an HTTP/3 stream's buffer grows as data arrives.
+`max_header_list_size` (64 KiB) and the limit of five informational
+responses are the same too (SETTINGS_MAX_FIELD_SECTION_SIZE over HTTP/3). Only HTTP/3 has
 `idle_timeout` (30 s, QUIC's idle timeout), `session_cache`, `early_data`
 and `webtransport` (below), and `RequestOptions.early`; `tls` is not
 optional. `anole.h3` exports the names `anole.h2` does:
@@ -262,6 +306,13 @@ When it is read:
   store is cached by its contents), so connect once and share the
   connection. PEM need only live through `connect`.
 
+A response body with neither `Content-Length` nor chunked framing ends
+where the connection does. Over TLS that end must be the server's
+close_notify; a connection that just closes could have been cut by anyone
+on the path, so reading such a body then fails with
+`error.TlsConnectionTruncated`. Framed bodies are not affected: their
+framing already shows a cut.
+
 Paths are relative to the current directory, or to `dir` when you set one
 (`.{ .path = "ca.pem", .dir = some_dir }`). A client key must be PKCS#8 or
 SEC1 PEM without a passphrase.
@@ -269,7 +320,10 @@ SEC1 PEM without a passphrase.
 To trust a development certificate from `anole.tls.selfSigned`, pass its
 `cert` (not the key) as `.ca = .{ .pem = pem.cert }`, as `examples/clients`
 does. The certificate is its own CA and names `localhost`, `127.0.0.1` and
-`::1`. An IP literal as the host is checked against the IP names, and no
+`::1`. Being a CA, it could vouch for any name, so trust it only in
+development and tests.
+
+The clients do not check revocation (no CRLs, no OCSP). An IP literal as the host is checked against the IP names, and no
 SNI is sent for it.
 
 ## Timeouts

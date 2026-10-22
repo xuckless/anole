@@ -604,13 +604,14 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// A certificate reload, second step: connections that start from
         /// now on, on every endpoint of the listener, handshake with `tls`,
         /// which takes over the session ticket keys, so tickets issued
-        /// before still resume. Connections already open keep the context
+        /// before still resume, unless the client CAs or mode changed:
+        /// those sessions must not outlive the policy that verified them. Connections already open keep the context
         /// they started with (each `SSL` holds a reference to it). Safe from
         /// any task or thread.
         pub fn useTls(self: *Self, tls: quic_tls.Context) void {
             const shared = self.shared;
             lockTls(shared);
-            dusty_tls.carryTicketKeys(tls.ctx, shared.tls.ctx);
+            if (tls.sameClientAuth(&shared.tls)) dusty_tls.carryTicketKeys(tls.ctx, shared.tls.ctx);
             var old = shared.tls;
             shared.tls = tls;
             shared.tls_lock.unlock();

@@ -87,6 +87,11 @@ pub const ConnectOptions = struct {
     /// body, unless its `RequestOptions.timeout` says otherwise. Null for
     /// no limit, which a long-lived stream wants.
     timeout: ?std.Io.Duration = .fromSeconds(30),
+    /// The most a response's header fields may take, decoded (name, value
+    /// and 32 bytes per field), informational responses and trailers
+    /// included; advertised as SETTINGS_MAX_FIELD_SECTION_SIZE. Past it the
+    /// stream fails with `error.HeadersTooLarge`.
+    max_header_list_size: u32 = 64 * 1024,
     /// HTTP/3 only: where tickets are kept, to resume sessions (one round
     /// trip less, no certificate) and for `early_data`. Shared by any
     /// connections.
@@ -101,12 +106,6 @@ pub const ConnectOptions = struct {
     /// HTTP/3 only: speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
     /// HTTP datagrams, and streams the server may open.
     webtransport: bool = false,
-    /// HTTP/3 only: the largest response head the client takes (decoded
-    /// names and values plus 32 bytes a field, sent to the server as
-    /// SETTINGS_MAX_FIELD_SECTION_SIZE). The trailers get as much again;
-    /// 1xx heads count against the response head's. A server that sends
-    /// more fails the connection.
-    max_field_section_size: u32 = 64 * 1024,
 
     /// The fields of `anole.h2.ConnectOptions.Tls`, with the same defaults.
     pub const Tls = struct {
@@ -168,7 +167,16 @@ pub const StreamError = error{
     Timeout,
     /// The stream was canceled (`cancel`, or the task waiting on it).
     Canceled,
+    /// The response's header fields passed `max_header_list_size`.
+    HeadersTooLarge,
+    /// More informational (1xx) responses than the client takes before a
+    /// final one.
+    TooManyInterimResponses,
 };
+
+/// How many informational (1xx) responses may come before the final one,
+/// as in the HTTP/1.1 and HTTP/2 clients.
+const max_interim_responses = 5;
 
 fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     const d = duration orelse return .none;
@@ -246,8 +254,8 @@ pub const ClientConnection = struct {
     wt: ?*webtransport.Core = null,
     /// The server's SETTINGS, once they arrived.
     peer_settings: ?PeerSettings = null,
-    /// `ConnectOptions.max_field_section_size`.
-    max_field_section_size: u32 = 64 * 1024,
+    /// `ConnectOptions.max_header_list_size`.
+    max_header_list_size: u32 = 64 * 1024,
 
     /// What the server's SETTINGS allow (`waitSettings`).
     pub const PeerSettings = struct {
@@ -292,7 +300,7 @@ pub const ClientConnection = struct {
             .tx = tx,
             .rx = rx,
             .timeout = timeoutFrom(options.timeout),
-            .max_field_section_size = options.max_field_section_size,
+            .max_header_list_size = options.max_header_list_size,
         };
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
@@ -382,18 +390,29 @@ pub const ClientConnection = struct {
 
     /// Where this connection's tickets are filed: the server, and every
     /// TLS setting that decides whether a session may be trusted.
+    /// One field of `cacheKey`'s digest, length first, so fields cannot
+    /// run into each other.
+    fn hashField(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, bytes.len, .little);
+        hash.update(&len);
+        hash.update(bytes);
+    }
+
+    /// The TLS settings by SHA-256: a ticket must never go to a connection
+    /// that trusts other CAs or presents another identity.
     fn cacheKey(gpa: std.mem.Allocator, options: ConnectOptions, identity: ?Identity) ![]u8 {
-        var hash: std.hash.Wyhash = .init(0);
+        var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
         const ca = options.tls.ca;
-        hash.update(@tagName(ca));
+        hashField(&hash, @tagName(ca));
         switch (ca) {
-            .file, .dir => |src| hash.update(src.path),
-            .pem => |text| hash.update(text),
+            .file, .dir => |src| hashField(&hash, src.path),
+            .pem => |text| hashField(&hash, text),
             .system, .none => {},
         }
-        hash.update(&.{@intFromBool(options.tls.insecure_skip_verify)});
-        if (identity) |id| hash.update(id.pem.cert_pem);
-        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, hash.final() });
+        hashField(&hash, &.{@intFromBool(options.tls.insecure_skip_verify)});
+        if (identity) |id| hashField(&hash, id.pem.cert_pem);
+        return std.fmt.allocPrint(gpa, "{s}|{d}|{x}", .{ options.host, options.port, &hash.finalResult() });
     }
 
     /// What became of 0-RTT on this connection.
@@ -1009,8 +1028,8 @@ pub const ClientConnection = struct {
         nghttp3.settingsDefault(&settings);
         settings.qpack_max_dtable_capacity = 4096;
         settings.qpack_blocked_streams = 100;
-        settings.max_field_section_size = self.max_field_section_size;
         settings.h3_datagram = @intFromBool(self.wt != null);
+        settings.max_field_section_size = self.max_header_list_size;
         var hc: ?*h.nghttp3_conn = null;
         if (nghttp3.connClientNew(&hc, &h3_callbacks, &settings, h.nghttp3_mem_default(), self) != 0) return error.Http3SetupFailed;
         errdefer h.nghttp3_conn_del(hc);
@@ -1264,10 +1283,21 @@ pub const ClientConnection = struct {
         return 0;
     }
 
+    /// Counts a field against `max_header_list_size`; false once the
+    /// stream is past it (or ended), when the field is not kept.
+    fn countField(s: *Stream, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf) bool {
+        if (s.cause != null) return false;
+        s.header_list_size +|= h.nghttp3_rcbuf_get_buf(name).len + h.nghttp3_rcbuf_get_buf(value).len + 32;
+        if (s.header_list_size <= s.conn.max_header_list_size) return true;
+        // The rest of the block is dropped; `release` resets the stream.
+        s.endEarly(error.HeadersTooLarge);
+        return false;
+    }
+
     fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
+        if (!countField(s, name, value)) return 0;
         const v = h.nghttp3_rcbuf_get_buf(value);
-        if (!s.countField(&s.head_bytes, name, v.len)) return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         if (token == h.NGHTTP3_QPACK_TOKEN__STATUS) {
             s.status = std.fmt.parseInt(u16, v.base[0..v.len], 10) catch 0;
             return 0;
@@ -1281,12 +1311,16 @@ pub const ClientConnection = struct {
     fn onH3EndHeaders(_: ?*h.nghttp3_conn, _: i64, fin: c_int, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         const s = streamOfUser(sud) orelse return 0;
-        if (s.status >= 200) {
+        if (s.cause != null) {
+            // Failed (`countField`): no head.
+        } else if (s.status >= 200) {
             s.head_ready = true;
         } else {
             // 1xx: its fields are not the response's.
             s.headers.clearRetainingCapacity();
             s.status = 0;
+            s.interim += 1;
+            if (s.interim > max_interim_responses) s.endEarly(error.TooManyInterimResponses);
         }
         if (fin != 0) s.body_done = true;
         self.kick();
@@ -1295,9 +1329,9 @@ pub const ClientConnection = struct {
 
     fn onH3RecvTrailer(_: ?*h.nghttp3_conn, _: i64, _: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
+        if (!countField(s, name, value)) return 0;
         const n = h.nghttp3_rcbuf_get_buf(name);
         const v = h.nghttp3_rcbuf_get_buf(value);
-        if (!s.countField(&s.trailer_bytes, name, v.len)) return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         s.addField(&s.trailers, n.base[0..n.len], v.base[0..v.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         return 0;
     }
@@ -1367,12 +1401,13 @@ pub const Stream = struct {
     deadline: Deadline,
 
     status: u16 = 0,
+    /// Informational responses so far.
+    interim: u8 = 0,
+    /// What the response's header fields have taken, as
+    /// `max_header_list_size` counts it.
+    header_list_size: usize = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
-    /// Decoded bytes of the heads (1xx ones too) and of the trailers, as
-    /// `max_field_section_size` counts them.
-    head_bytes: u64 = 0,
-    trailer_bytes: u64 = 0,
     head_ready: bool = false,
     /// Why the stream ended early (reset, the connection went, the time
     /// ran out).
@@ -1469,13 +1504,6 @@ pub const Stream = struct {
             nv.* = .{ .name = name.ptr, .namelen = name.len, .value = value.ptr, .valuelen = value.len, .flags = h.NGHTTP3_NV_FLAG_NONE };
         }
         return nva;
-    }
-
-    /// Counts a field the server sent; false past what the client allows
-    /// (nghttp3 only advertises the limit).
-    fn countField(self: *Stream, total: *u64, name: ?*h.nghttp3_rcbuf, value_len: usize) bool {
-        total.* += @as(u64, h.nghttp3_rcbuf_get_buf(name).len) + value_len + 32;
-        return total.* <= self.conn.max_field_section_size;
     }
 
     fn addField(self: *Stream, list: *std.ArrayList(Header), name: []const u8, value: []const u8) !void {

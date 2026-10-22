@@ -328,7 +328,7 @@ test "anole.h2 and anole.h3 export the same client names" {
     inline for (.{ "ca", "insecure_skip_verify" }) |field| {
         try std.testing.expect(@FieldType(h2.ConnectOptions.Tls, field) == @FieldType(h3.ConnectOptions.Tls, field));
     }
-    inline for (.{ "connect_timeout", "timeout", "address", "host", "port", "stream_window", "max_data" }) |field| {
+    inline for (.{ "connect_timeout", "timeout", "address", "host", "port", "stream_window", "max_data", "max_header_list_size" }) |field| {
         try std.testing.expect(@FieldType(h2.ConnectOptions, field) == @FieldType(h3.ConnectOptions, field));
     }
     inline for (.{ "body", "timeout" }) |field| {

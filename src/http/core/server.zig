@@ -214,6 +214,14 @@ const TlsMaterial = struct {
         };
     }
 
+    /// Whether `a` and `b` verify client certificates the same way: both
+    /// not at all, or the same mode against the same CAs.
+    fn sameClientAuth(a: *const TlsMaterial, b: *const TlsMaterial) bool {
+        const a_ca = if (a.client_ca) |*bundle| bundle else return b.client_ca == null;
+        const b_ca = if (b.client_ca) |*bundle| bundle else return false;
+        return a.client_auth_mode == b.client_auth_mode and std.mem.eql(u8, a_ca.bytes.items, b_ca.bytes.items);
+    }
+
     fn release(m: *TlsMaterial, allocator: std.mem.Allocator) void {
         if (m.refs.fetchSub(1, .acq_rel) != 1) return;
         m.auth.deinit(allocator);
@@ -1466,7 +1474,10 @@ pub fn Server(comptime Ctx: type) type {
         /// What the TLS module must carry from a listener's old certificate
         /// to its new one, it does in `CertKeyPair.carryOver(new, old)`, if
         /// it declares that: BoringSSL's adapter keeps the session ticket
-        /// keys, so tickets issued before a reload still resume.
+        /// keys, so tickets issued before a reload still resume. Not when
+        /// the reload changes how client certificates are verified: a
+        /// resumed session's certificate is not verified again, so those
+        /// sessions must not outlive the policy that let them in.
         pub fn reloadTls(self: *Self) !void {
             if (!build_options.use_tls) return;
             const listeners = self.configuredListeners();
@@ -1488,7 +1499,9 @@ pub fn Server(comptime Ctx: type) type {
             for (self.active_listeners, loaded) |*l, *slot| {
                 const new = slot.* orelse continue;
                 const old = l.tls_material orelse continue;
-                if (comptime @hasDecl(tls.config.CertKeyPair, "carryOver")) new.auth.carryOver(&old.auth);
+                if (comptime @hasDecl(tls.config.CertKeyPair, "carryOver")) {
+                    if (TlsMaterial.sameClientAuth(new, old)) new.auth.carryOver(&old.auth);
+                }
                 l.tls_material = new;
                 slot.* = old;
             }

@@ -91,7 +91,8 @@ pub const SelfSignedOptions = struct {
 
 /// A fresh key and a self-signed certificate for it, for development
 /// and tests: nothing touches the disk. The certificate is its own CA
-/// (`CA:TRUE`), so a client can trust it directly. Free it with
+/// (`CA:TRUE`), so a client can trust it directly; never trust it outside
+/// development, since a CA certificate can vouch for any name. Free it with
 /// `Pem.deinit`. A listener that only needs one can name
 /// `.dev_self_signed` instead.
 ///
@@ -905,5 +906,204 @@ test "TLS hello: a certificate reload serves the new certificate, and tickets fr
         var returning: Client = .{ .ctx = ctx };
         try RawClient.onThread(io, Client.visit, .{ &returning, port, sealed_before });
         try std.testing.expect(returning.reused);
+    }
+}
+
+/// A blocking BoringSSL server on a thread of its own: one connection,
+/// answered with `response`, then ended with close_notify or with a bare
+/// close of the socket.
+const RawServer = struct {
+    fd: c_int,
+    port: u16,
+
+    fn listen() !RawServer {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = std.c.close(fd);
+        var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Bind;
+        if (std.c.listen(fd, 1) != 0) return error.Listen;
+        var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        if (std.c.getsockname(fd, @ptrCast(&addr), &len) != 0) return error.Bind;
+        return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+    }
+
+    fn serveOnce(self: RawServer, ctx: *c.SSL_CTX, response: []const u8, close_notify: bool) void {
+        defer _ = std.c.close(self.fd);
+        const conn = std.c.accept(self.fd, null, null);
+        if (conn < 0) return;
+        defer _ = std.c.close(conn);
+        const ssl = c.SSL_new(ctx) orelse return;
+        defer c.SSL_free(ssl);
+        _ = c.SSL_set_fd(ssl, conn);
+        if (c.SSL_accept(ssl) != 1) return;
+        var buf: [4096]u8 = undefined;
+        var got: usize = 0;
+        while (std.mem.indexOf(u8, buf[0..got], "\r\n\r\n") == null) {
+            const n = c.SSL_read(ssl, buf[got..].ptr, @intCast(buf.len - got));
+            if (n <= 0) return;
+            got += @intCast(n);
+        }
+        _ = c.SSL_write(ssl, response.ptr, @intCast(response.len));
+        if (close_notify) _ = c.SSL_shutdown(ssl);
+    }
+};
+
+test "TLS hello: a response body that runs to the end of the connection needs close_notify" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawServer: BoringSSL over a blocking BSD socket
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    const gpa = std.testing.allocator;
+    var pair = try dusty_tls.config.CertKeyPair.fromSlice(gpa, io, h.pem.cert, h.pem.key);
+    defer pair.deinit(gpa);
+    // No Content-Length, no chunking: the body ends where the connection does.
+    const response = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nall of it";
+
+    for ([_]bool{ true, false }) |close_notify| {
+        const server = try RawServer.listen();
+        const thread = try std.Thread.spawn(.{}, RawServer.serveOnce, .{ server, pair.server_ctx, response, close_notify });
+        defer thread.join();
+        var client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = h.caFile() } });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{server.port});
+        if (close_notify) {
+            var resp = try client.fetch(url, .{});
+            defer resp.deinit();
+            try std.testing.expectEqualStrings("all of it", (try resp.body()).?);
+        } else {
+            try std.testing.expectError(error.TlsConnectionTruncated, client.fetch(url, .{}));
+        }
+    }
+}
+
+test "TLS hello: a reload that changes the client CAs stops earlier sessions from resuming" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    const gpa = std.testing.allocator;
+    var other = try selfSigned(gpa, .{});
+    defer other.deinit(gpa);
+    // The self-signed certificate is the server's, the client's and, at
+    // first, the CA that verifies the client.
+    var listeners = [_]dusty.Listener{.{ .address = loopback, .tls = .{
+        .pem = .{ .cert = h.pem.cert, .key = h.pem.key },
+        .client_auth = .{ .ca = .{ .pem = h.pem.cert } },
+    } }};
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &listeners }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    var identity = try dusty_tls.config.CertKeyPair.fromSlice(gpa, io, h.pem.cert, h.pem.key);
+    defer identity.deinit(gpa);
+
+    const Visit = struct {
+        var latest: ?*c.SSL_SESSION = null;
+        reused: bool = false,
+        hello: bool = false,
+
+        fn onNewSession(_: ?*c.SSL, session: ?*c.SSL_SESSION) callconv(.c) c_int {
+            if (latest) |old| c.SSL_SESSION_free(old);
+            latest = session;
+            return 1;
+        }
+
+        fn run(v: *@This(), ctx: *c.SSL_CTX, port: u16, session: ?*c.SSL_SESSION) !void {
+            const conn = RawClient.connect(ctx, port, session) catch |err| switch (err) {
+                error.Handshake => return,
+                else => return err,
+            };
+            defer conn.close();
+            v.reused = c.SSL_session_reused(conn.ssl) == 1;
+            v.hello = (conn.get() catch return).hello;
+        }
+    };
+
+    for ([_]u16{ c.TLS1_3_VERSION, c.TLS1_2_VERSION }) |tls_version| {
+        const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+        defer c.SSL_CTX_free(ctx);
+        _ = c.SSL_CTX_set_min_proto_version(ctx, tls_version);
+        _ = c.SSL_CTX_set_max_proto_version(ctx, tls_version);
+        _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
+        c.SSL_CTX_sess_set_new_cb(ctx, Visit.onNewSession);
+        try std.testing.expectEqual(1, c.SSL_CTX_use_certificate(ctx, identity.cert));
+        try std.testing.expectEqual(1, c.SSL_CTX_use_PrivateKey(ctx, identity.key));
+        defer if (Visit.latest) |sess| {
+            c.SSL_SESSION_free(sess);
+            Visit.latest = null;
+        };
+        const port = server.address.ip.getPort();
+
+        listeners[0].tls.?.client_auth = .{ .ca = .{ .pem = h.pem.cert } };
+        try server.reloadTls();
+        var first: Visit = .{};
+        try RawClient.onThread(io, Visit.run, .{ &first, ctx, port, null });
+        try std.testing.expect(first.hello);
+
+        // The same client CAs again: the session still resumes.
+        try server.reloadTls();
+        var same: Visit = .{};
+        try RawClient.onThread(io, Visit.run, .{ &same, ctx, port, Visit.latest orelse return error.NoSession });
+        try std.testing.expect(same.reused and same.hello);
+
+        // Other client CAs, which do not cover the client's certificate:
+        // a session from before must not stand in for verifying it.
+        listeners[0].tls.?.client_auth = .{ .ca = .{ .pem = other.cert } };
+        try server.reloadTls();
+        var after: Visit = .{};
+        try RawClient.onThread(io, Visit.run, .{ &after, ctx, port, Visit.latest orelse return error.NoSession });
+        try std.testing.expect(!after.reused);
+        try std.testing.expect(!after.hello);
+    }
+}
+
+test "TLS hello: TLS 1.2 offers only forward-secret AEAD cipher suites" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
+    // An RSA key, which RSA key exchange would also work with.
+    var h = try Https.initWith(.{ .key = .rsa4096 });
+    defer h.deinit();
+    const io = h.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback, .tls = .{ .pem = .{ .cert = h.pem.cert, .key = h.pem.key } } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const Offer = struct {
+        /// Whether a TLS 1.2 handshake offering only `ciphers` succeeds.
+        fn run(port: u16, ciphers: [:0]const u8, ok: *bool) !void {
+            const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+            defer c.SSL_CTX_free(ctx);
+            _ = c.SSL_CTX_set_max_proto_version(ctx, c.TLS1_2_VERSION);
+            if (c.SSL_CTX_set_strict_cipher_list(ctx, ciphers.ptr) != 1) return error.BadCipherList;
+            const conn = RawClient.connect(ctx, port, null) catch |err| switch (err) {
+                error.Handshake => {
+                    ok.* = false;
+                    return;
+                },
+                else => return err,
+            };
+            defer conn.close();
+            ok.* = (try conn.get()).hello;
+        }
+    };
+    const port = server.address.ip.getPort();
+    for ([_][:0]const u8{ "ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384", "ECDHE-RSA-CHACHA20-POLY1305" }) |good| {
+        var ok = false;
+        try RawClient.onThread(io, Offer.run, .{ port, good, &ok });
+        try std.testing.expect(ok);
+    }
+    // No forward secrecy (RSA key exchange), or CBC with SHA-1.
+    for ([_][:0]const u8{ "AES128-GCM-SHA256", "AES256-GCM-SHA384", "AES128-SHA", "ECDHE-RSA-AES128-SHA", "ECDHE-RSA-AES256-SHA" }) |weak| {
+        var ok = true;
+        try RawClient.onThread(io, Offer.run, .{ port, weak, &ok });
+        try std.testing.expect(!ok);
     }
 }

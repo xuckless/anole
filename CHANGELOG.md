@@ -16,9 +16,6 @@ breaking changes are listed anyway.
   SETTINGS) and field count (`request.max_header_count`) are enforced as
   the fields arrive; a larger head is answered 431. Before, the whole head
   was kept in memory however large it was.
-- HTTP/3 client: response heads and trailers are limited to the new
-  `ConnectOptions.max_field_section_size` (64 KiB by default, also sent to
-  the server); a server that sends more fails the connection.
 - HTTP/3 server: cookie fields sent separately are joined with "; " and
   other repeated request fields are all kept, as over HTTP/1.1. Before,
   only the last of each was kept, which could drop or shadow a session
@@ -42,6 +39,47 @@ breaking changes are listed anyway.
   `error.HqInteropNotAllowed` unless the program's root file declares
   `pub const anole_hq_interop = true;`. Breaking only for programs that
   set it.
+- HTTP/2 client: a graceful GOAWAY from the server no longer ends the
+  connection at once; the streams it covers finish. A stream released
+  after a GOAWAY is reset and freed once the session has closed it, never
+  while the session can still reach it.
+- HTTP/2 and HTTP/3 clients: a response's header fields are bounded by the
+  new `ConnectOptions.max_header_list_size` (64 KiB, advertised to the
+  server), and at most five informational (1xx) responses may precede the
+  final one. Past either the stream fails with `error.HeadersTooLarge` or
+  `error.TooManyInterimResponses` (new members of `StreamError`). The HTTP/2
+  client also reads a final response that follows a 1xx correctly now.
+- HTTP client: a URL whose path or query holds a space, a control
+  character or a byte past 0x7f is refused with `error.InvalidUrl`, for
+  `fetch`, redirects, WebSocket upgrades and HTTP/2 alike, instead of being
+  written into the request line. Percent-encode such bytes; URLs that
+  carried raw UTF-8 now fail (breaking).
+- HTTP client redirects: across origins the `Referer` is only the origin
+  (browsers' default policy); a 307 or 308 that would carry the body to
+  another host is not followed, and its response is returned (breaking for
+  callers that relied on it; `ClientConfig.check_redirect` can allow it).
+  New: `ClientConfig.check_redirect` (follow, stop or fail each redirect)
+  and `ClientConfig.deny_private_addresses` (refuse loopback, private,
+  link-local and similar addresses, after DNS, on every hop). Redirects are
+  followed in a loop, so the stack no longer grows with `max_redirects`.
+- HTTPS client: a response body delimited by the end of the connection
+  (no Content-Length, not chunked) now fails with
+  `error.TlsConnectionTruncated` when the TLS connection ends without
+  close_notify, instead of being returned as complete.
+- TLS clients: the cache of trust stores built from CA bundles and the
+  HTTP/3 session-ticket cache are keyed by SHA-256 of their contents, so
+  two different CA sets or client identities can never share an entry.
+- Mutual TLS: a TLS session resumes only under the client-auth settings
+  (CAs and mode) it was verified under, on TCP and QUIC listeners, and a
+  certificate reload that changes them no longer carries the ticket keys
+  over. Removing a client CA and reloading now stops clients whose
+  certificates it vouched for from resuming with older sessions.
+- TLS listeners offer only ECDHE key exchange with AES-GCM or
+  ChaCha20-Poly1305 over TLS 1.2 (BoringSSL's default also allowed RSA key
+  exchange and CBC with SHA-1). TLS 1.2 clients that support none of these
+  can no longer connect. Docs now state that revocation (CRL, OCSP) is not
+  checked and that `.dev_self_signed` certificates are CAs for development
+  only.
 
 ### C ABI (ABI 0.1)
 

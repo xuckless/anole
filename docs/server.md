@@ -205,7 +205,10 @@ var app = try anole.Server(void).init(init.gpa, .{
   (`cannot read the TLS certificate "cert.pem": FileNotFound`).
 - `.dev_self_signed`: a fresh P-256 key and certificate for `localhost`,
   `127.0.0.1` and `::1`, held only in memory. For development; clients need
-  `curl -k`.
+  `curl -k`. The certificate is its own CA (`CA:TRUE`), so a client can
+  trust it directly; never add it, or anything from `anole.tls.selfSigned`,
+  to a trust store outside development, since a CA certificate can vouch
+  for any name.
 
 `anole.Cert.fromFiles(cert_path, key_path)` and `.fromPem(cert, key)` build
 the first two: `.cert = .fromFiles("cert.pem", "key.pem")`.
@@ -683,7 +686,10 @@ so HTTP/3 keeps one socket and one endpoint there, whatever `sockets` says.
 TLS is BoringSSL, built into your binary (`-Dtls=boringssl`, the default
 outside `minimal`).
 
-- TLS 1.2 and 1.3; nothing older.
+- TLS 1.2 and 1.3; nothing older. TLS 1.2 offers only suites with ECDHE key
+  exchange (forward secrecy) and an AEAD cipher: AES-GCM and
+  ChaCha20-Poly1305, no RSA key exchange and no CBC. TLS 1.3's suites are
+  all of that kind.
 - ALPN: the server picks by its own order (`alpn_protocols`). A client whose
   offer shares nothing with it gets no ALPN answer and HTTP/1.1, rather than
   a refusal.
@@ -693,6 +699,11 @@ outside `minimal`).
   restart, and do not carry over to another machine.
 - A handshake has the same deadline as a request (`timeout.request`). Failed
   handshakes are logged at `info`, since any client can cause them.
+- No revocation checking: neither the server (for client certificates under
+  `client_auth`) nor the clients consult CRLs or OCSP, and the server does
+  not staple OCSP responses. To revoke client certificates, issue them from
+  a CA you can drop and reload (see below), keep them short-lived, or check
+  `req.peerCertificate()` against your own list in a middleware.
 
 **Certificate reload.** `app.reloadCertificates()` loads every TLS
 listener's certificate and key again (from their files, for `.files`) and
@@ -705,6 +716,12 @@ systemd hears `RELOADING=1` and then `READY=1`.
   handshakes in progress included, keep the one they started with, which is
   freed when the last of them closes.
 - Session tickets issued before still resume: the ticket keys carry over.
+  Not when the reload changes `client_auth` (its CAs or its mode): a
+  resumed session's client certificate is not verified again, so sessions
+  from before such a reload never resume, on TCP or QUIC, and every client
+  goes through a full handshake and certificate check under the new CAs.
+  Removing a compromised CA and reloading takes effect for new connections
+  at once; connections already open stay until they close.
 - A reload that fails (a file missing, a key that does not match the
   certificate) returns the error, or logs it on SIGHUP, and the server goes
   on with the certificate it had.

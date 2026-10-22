@@ -335,6 +335,13 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     c.SSL_set_shed_handshake_config(ssl, 1);
 
     if (opt.client_auth) |ca| {
+        // A session resumes only under the client-auth policy it was
+        // verified under: a resumed session's client certificate is not
+        // verified again, so one from before the client CAs changed (a
+        // reload) must not resume.
+        const ca_digest = if (ca.trust) |t| t.digest else digestOf(ca.root_ca.bytes.items);
+        const sid_ctx = clientAuthSessionContext("anole tcp", @intFromEnum(ca.auth_type), ca_digest);
+        if (c.SSL_set_session_id_context(ssl, &sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
         // The CertificateRequest also names the acceptable CAs, so a client
         // holding several certificates can pick the right one.
         const trust = if (ca.trust) |t| try t.share(true) else try trustStore(ca.root_ca, true);
@@ -519,15 +526,24 @@ pub const Connection = struct {
         sh.output.flush() catch {};
     }
 
+    /// Whether the stream ended with a transport EOF and no close_notify:
+    /// anyone on the path can end it so. HTTP checks it where nothing else
+    /// marks the end of a message (a response body that runs to the end of
+    /// the connection). False while the stream has not ended.
+    pub fn endedWithoutCloseNotify(self: *const Connection) bool {
+        const sh = self.shared orelse return false;
+        return sh.eof_without_close_notify;
+    }
+
     /// Cleartext into `buf`; 0 means the peer ended the stream, with
     /// close_notify or by closing the transport between records. Belongs to
     /// the reading side.
     ///
-    /// A transport EOF without close_notify is taken as a clean end, as
+    /// A transport EOF without close_notify is taken as an end here, as
     /// tls.zig does by default: many peers skip close_notify, and HTTP's own
-    /// framing (Content-Length, chunked) detects a truncated message.
-    /// BoringSSL does not say whether the EOF fell inside a record, so
-    /// `TlsConnectionTruncated` is never reported.
+    /// framing (Content-Length, chunked) detects a truncated message. It is
+    /// recorded (`endedWithoutCloseNotify`) for a message HTTP does not
+    /// frame, whose reader reports `TlsConnectionTruncated`.
     fn read(self: *Connection, buf: []u8) ReadError!usize {
         const sh = self.shared.?;
         const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
@@ -561,7 +577,11 @@ pub const Connection = struct {
                     error.ReadFailed => return error.ReadFailed,
                 },
                 c.SSL_ERROR_ZERO_RETURN => return 0,
-                c.SSL_ERROR_SYSCALL => return if (eof) 0 else error.TlsFailure,
+                c.SSL_ERROR_SYSCALL => {
+                    if (!eof) return error.TlsFailure;
+                    sh.eof_without_close_notify = true;
+                    return 0;
+                },
                 else => {
                     const f = failure orelse return error.TlsFailure;
                     if (asAlert(f)) |alert| return alert;
@@ -798,16 +818,32 @@ fn alpnSelect(
     return c.SSL_TLSEXT_ERR_NOACK;
 }
 
+/// What a server offers over TLS 1.2: Mozilla's "intermediate" list less
+/// finite-field Diffie-Hellman, which BoringSSL does not do. ChaCha20 ranks
+/// with AES-128-GCM, so a client without AES hardware can pick it.
+const server_tls12_ciphers =
+    "[ECDHE-ECDSA-AES128-GCM-SHA256|ECDHE-ECDSA-CHACHA20-POLY1305]:" ++
+    "[ECDHE-RSA-AES128-GCM-SHA256|ECDHE-RSA-CHACHA20-POLY1305]:" ++
+    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384";
+
 fn newServerCtx() !*c.SSL_CTX {
     const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
     errdefer c.SSL_CTX_free(ctx);
     if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1) return error.TlsFailure;
+    // TLS 1.2 suites: ECDHE key exchange (forward secrecy) with an AEAD
+    // only. BoringSSL's default also has RSA key exchange and CBC with
+    // SHA-1. TLS 1.3 suites are all of that kind and are not set here.
+    if (c.SSL_CTX_set_strict_cipher_list(ctx, server_tls12_ciphers) != 1) return error.TlsFailure;
     // Idle keep-alive connections give their record buffers back.
     _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
     // Resumption through stateless session tickets only. The stateful cache
     // holds up to 20k sessions per listener behind one lock that every
     // executor thread would share.
     _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_OFF);
+    // Sessions of a listener without client certificates; one that asks for
+    // them sets a context of its own per connection (`server`).
+    const sid_ctx = "anole tcp";
+    if (c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
     c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, null);
     try installTicketKeys(ctx);
     return ctx;
@@ -1033,12 +1069,14 @@ fn clientCtx() HandshakeError!*c.SSL_CTX {
 /// dusty hands over its trust store as a `std.crypto.Certificate.Bundle`
 /// by value on every handshake. Converting ~150 system roots per connection
 /// would be far too slow, so each distinct bundle becomes an X509_STORE once.
-/// The key is the bundle's contents (hash and length), not its address,
-/// because a freed bundle's memory can be reused for a different one.
+/// The key is the bundle's contents (SHA-256 and length), not its address,
+/// because a freed bundle's memory can be reused for a different one, and
+/// a cryptographic digest, because bundles may come from different tenants
+/// and one must never be served another's store.
 /// Planned dusty fork patch P4 (load the trust store once through this
 /// module) removes the conversion.
 const StoreEntry = struct {
-    hash: u64,
+    digest: [32]u8,
     len: usize,
     store: *c.X509_STORE,
     /// The certificates' subject names (DER), for a server's client CA list.
@@ -1063,22 +1101,23 @@ fn setVerifyStore(ssl: *c.SSL, bundle: std.crypto.Certificate.Bundle) HandshakeE
 /// Returns a new reference to the store; the caller frees it.
 fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) HandshakeError!Trust {
     const der = bundle.bytes.items;
-    const hash = std.hash.Wyhash.hash(0, der);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(der, &digest, .{});
     lockGlobal();
     defer global_lock.unlock();
     for (store_cache) |entry| {
         const e = entry orelse continue;
-        if (e.hash == hash and e.len == der.len) return trustFrom(e, want_names);
+        if (e.len == der.len and std.mem.eql(u8, &e.digest, &digest)) return trustFrom(e, want_names);
     }
 
     const built = try TrustStore.fromDer(der);
     const slot = &store_cache[store_cache_next];
     store_cache_next = (store_cache_next + 1) % store_cache.len;
     if (slot.*) |old| {
-        var t: TrustStore = .{ .store = old.store, .names = old.names };
+        var t: TrustStore = .{ .store = old.store, .names = old.names, .digest = old.digest };
         t.deinit();
     }
-    slot.* = .{ .hash = hash, .len = der.len, .store = built.store, .names = built.names };
+    slot.* = .{ .digest = digest, .len = der.len, .store = built.store, .names = built.names };
     return trustFrom(slot.*.?, want_names);
 }
 
@@ -1090,6 +1129,9 @@ pub const TrustStore = struct {
     store: *c.X509_STORE,
     /// The certificates' subject names (DER), for a server's client CA list.
     names: *c.struct_stack_st_CRYPTO_BUFFER,
+    /// SHA-256 of the bundle, for the session context of a listener that
+    /// verifies clients with it.
+    digest: [32]u8,
 
     /// A store holding every certificate in `bundle`.
     pub fn init(bundle: std.crypto.Certificate.Bundle) error{OutOfMemory}!TrustStore {
@@ -1125,14 +1167,35 @@ pub const TrustStore = struct {
             }
         }
         c.ERR_clear_error();
-        return .{ .store = store, .names = names };
+        return .{ .store = store, .names = names, .digest = digestOf(der) };
     }
 
     /// New references to the store and, if asked, the names.
     fn share(self: *const TrustStore, want_names: bool) HandshakeError!Trust {
-        return trustFrom(.{ .hash = 0, .len = 0, .store = self.store, .names = self.names }, want_names);
+        return trustFrom(.{ .digest = @splat(0), .len = 0, .store = self.store, .names = self.names }, want_names);
     }
 };
+
+fn digestOf(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+/// A TLS session context (`SSL_set_session_id_context`, at most 32 bytes)
+/// for a listener that verifies client certificates: the listener kind,
+/// whether a certificate is required, and the CAs (`ca_digest`, SHA-256 of
+/// their DER). BoringSSL resumes a session only under the context it was
+/// made in, so a change to any of them sends clients through a full
+/// handshake, and their certificates through verification, again. HTTP/3's
+/// listener (src/h3/quic_tls.zig) uses it too.
+pub fn clientAuthSessionContext(comptime kind: []const u8, mode: u8, ca_digest: [32]u8) [32]u8 {
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    hash.update(kind ++ " client auth\x00");
+    hash.update(&.{mode});
+    hash.update(&ca_digest);
+    return hash.finalResult();
+}
 
 /// The trust store for a client connection made outside dusty (Anole's
 /// HTTP/2 and HTTP/3 clients), from `ca`, a `dusty.TlsCa`. `.system` is
@@ -1231,6 +1294,9 @@ const Shared = struct {
     /// The socket reached end of stream; the BIO reports EOF once `input`
     /// is drained.
     input_eof: bool = false,
+    /// The reading side's: the stream ended at that EOF with no
+    /// close_notify (`Connection.endedWithoutCloseNotify`).
+    eof_without_close_notify: bool = false,
     /// Set while `fill` reads into `input`, so the BIO leaves it alone.
     filling: bool = false,
     /// Records BoringSSL produced, not yet handed to `output`.

@@ -124,8 +124,8 @@ fn bigBody(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = body;
 }
 
-/// GET /bighead: a response head of 90 KiB, in three fields.
-fn bigHead(_: *dusty.Request, res: *dusty.Response) !void {
+/// GET /huge-head: a response head of 90 KiB, in three fields.
+fn hugeHead(_: *dusty.Request, res: *dusty.Response) !void {
     const value = try res.arena.alloc(u8, 30 * 1024);
     @memset(value, 'h');
     try res.header("x-big-1", value);
@@ -161,6 +161,15 @@ fn holdHandler(req: *dusty.Request, res: *dusty.Response) !void {
 fn slowNoWait(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromMilliseconds(20), .awake);
     res.body = "slow but whole";
+}
+
+/// Three 2000-byte header fields.
+fn bigHead(_: *dusty.Request, res: *dusty.Response) !void {
+    const value: [2000]u8 = @splat('v');
+    try res.header("x-a", &value);
+    try res.header("x-b", &value);
+    try res.header("x-c", &value);
+    res.body = "big head";
 }
 
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
@@ -221,9 +230,10 @@ const Fixture = struct {
         http.router.post("/early-post", earlyPost);
         http.router.get("/port", port);
         http.router.get("/download", download);
-        http.router.get("/bighead", bigHead);
+        http.router.get("/huge-head", hugeHead);
         http.router.get("/fields", fields);
         http.router.get("/hold", holdHandler);
+        http.router.get("/big-head", bigHead);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -560,7 +570,7 @@ test "h3 server: a request head past max_field_section_size or max_header_count 
     try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, many[0..30]));
 }
 
-test "h3 client: a response head past max_field_section_size fails the connection" {
+test "h3 client: a 90 KiB response head fails under the default max_header_list_size, and passes when it is raised" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -571,11 +581,11 @@ test "h3 client: a response head past max_field_section_size fails the connectio
         const conn = try f.connect(gpa, io);
         defer conn.close();
         const s = try conn.request(&.{
-            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/bighead" },
+            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/huge-head" },
             .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
         }, .{});
         defer s.release();
-        try std.testing.expect(std.meta.isError(s.waitHead()));
+        try std.testing.expectError(error.HeadersTooLarge, s.waitHead());
     }
     // A client that allows it takes the head.
     const conn = try client.ClientConnection.connect(gpa, io, .{
@@ -583,10 +593,10 @@ test "h3 client: a response head past max_field_section_size fails the connectio
         .address = f.ep.address(),
         .port = f.ep.address().getPort(),
         .tls = .{ .ca = .{ .pem = f.pem.cert } },
-        .max_field_section_size = 128 * 1024,
+        .max_header_list_size = 128 * 1024,
     });
     defer conn.close();
-    const body = try get(conn, "/bighead", gpa);
+    const body = try get(conn, "/huge-head", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("big head", body);
 }
@@ -1311,4 +1321,84 @@ test "h3: a client that moves to a new port keeps its connection, and the server
         defer gpa.free(p);
         try std.testing.expectEqual(after, try std.fmt.parseInt(u16, p, 10));
     }
+}
+
+test "h3 client: a response head past max_header_list_size fails the stream, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .max_header_list_size = 4096,
+    });
+    defer conn.close();
+    {
+        const s = try request(conn, "GET", "/big-head", .{});
+        defer s.release();
+        try std.testing.expectError(error.HeadersTooLarge, s.waitHead());
+    }
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+test "h3 server: a reload that changes the client CAs stops earlier sessions from resuming" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .client_auth = .request });
+    defer f.stop(gpa, io);
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    var other = try anole_tls.selfSigned(gpa, .{});
+    defer other.deinit(gpa);
+    var other_bundle = try @import("../tls/testing.zig").bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), other.cert);
+    defer other_bundle.deinit(gpa);
+
+    const Connect = struct {
+        fn run(fx: *Fixture, gpa_: std.mem.Allocator, io_: std.Io, cache_: *client.SessionCache) !*client.ClientConnection {
+            return client.ClientConnection.connect(gpa_, io_, .{
+                .host = "localhost",
+                .address = fx.ep.address(),
+                .port = fx.ep.address().getPort(),
+                .tls = .{ .ca = .{ .pem = fx.pem.cert }, .client_certificate = .{ .pem = .{ .cert = fx.pem.cert, .key = fx.pem.key } } },
+                .session_cache = cache_,
+                .connect_timeout = .fromSeconds(3),
+            });
+        }
+    };
+    {
+        const conn = try Connect.run(&f, gpa, io, &cache);
+        defer conn.close();
+        const body = try get(conn, "/peer", gpa);
+        gpa.free(body);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+    // The same client CAs: the session resumes.
+    f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, .{ .ca_der = f.bundle.bytes.items, .mode = .request }));
+    {
+        const conn = try Connect.run(&f, gpa, io, &cache);
+        defer conn.close();
+        try std.testing.expect(conn.resumed());
+        const body = try get(conn, "/peer", gpa);
+        gpa.free(body);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+    // Other client CAs, which do not cover the client's certificate.
+    f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, .{ .ca_der = other_bundle.bytes.items, .mode = .request }));
+    if (Connect.run(&f, gpa, io, &cache)) |conn| {
+        defer conn.close();
+        try std.testing.expect(!conn.resumed());
+        if (get(conn, "/peer", gpa)) |body| {
+            gpa.free(body);
+            return error.ServedAfterTheClientCasChanged;
+        } else |_| {}
+    } else |_| {}
 }
