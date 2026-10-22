@@ -3,6 +3,20 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Fixed
+
+- C ABI: a program linked against `libanole.a` with dead-stripping
+  (`-Wl,-dead_strip`, or `zig cc -O1` and Zig's release links) crashed on
+  macOS when its first TLS listener started: the packed object lost the
+  symbol flags that keep BoringSSL's assembly together, so the linker cut
+  it apart. The flags are restored when libanole is packed.
+- C ABI: on x86_64 Linux, a program or extension linked against
+  `libanole.a` with GNU ld got an executable stack (the packed object had
+  no `.note.GNU-stack`); glibc 2.41 refuses to load such an extension.
+  The note is added when libanole is packed.
+
 ## 0.1.1 (2026-10-22)
 
 ### Security
