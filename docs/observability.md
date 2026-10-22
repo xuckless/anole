@@ -90,7 +90,8 @@ stores them in `req.id` and sends them back in `X-Request-Id`. Set
 `.header` to use another header name. Set `.trust_incoming = true` to keep
 an ID that arrives with the request; do this only behind a proxy that sets
 or strips the header, or clients choose their own IDs. An incoming ID is
-kept only if it is 1 to 128 visible ASCII characters.
+kept only if it is 1 to 128 letters, digits, `.`, `_`, `:` or `-`;
+anything else gets a fresh ID. The JSON access log escapes IDs either way.
 
 ## Access log
 

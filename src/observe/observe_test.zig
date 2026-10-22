@@ -127,6 +127,20 @@ test "access log: text and JSON lines" {
     try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
 }
 
+test "access log: a request ID cannot add JSON fields" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    req.method = .get;
+    req.url = "/x";
+    req.id = "x\",\"status\":200,\"y\":\"\\";
+    const json = try observe.access_log.format(arena, .json, &req, 403, 1, 0, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqual(@as(i64, 403), parsed.object.get("status").?.integer);
+    try std.testing.expectEqualStrings(req.id, parsed.object.get("request_id").?.string);
+}
+
 fn relay(req: *dusty.Request, res: *dusty.Response) !void {
     var buf: [55]u8 = undefined;
     res.body = try res.arena.dupe(u8, observe.trace.outgoing(req, &buf) orelse "none");

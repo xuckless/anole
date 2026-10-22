@@ -100,8 +100,10 @@ pub fn format(arena: std.mem.Allocator, fmt: Format, req: *const dusty.Request, 
         .json => {
             try w.print("{{\"ts\":{d},\"method\":\"{s}\",\"path\":{f},\"status\":{d},\"duration_us\":{d},\"client\":\"{s}\"", .{ now_ms, method, std.json.fmt(req.url, .{}), status, micros, addr });
             if (req.route) |r| try w.print(",\"route\":{f}", .{std.json.fmt(r.path, .{})});
-            if (req.id.len > 0) try w.print(",\"request_id\":\"{s}\"", .{req.id});
-            if (req.trace_id.len > 0) try w.print(",\"trace_id\":\"{s}\",\"span_id\":\"{s}\"", .{ req.trace_id, req.span_id });
+            // Escaped: an ID may come from the client (RequestId's
+            // `trust_incoming`, or one set by the app).
+            if (req.id.len > 0) try w.print(",\"request_id\":{f}", .{std.json.fmt(req.id, .{})});
+            if (req.trace_id.len > 0) try w.print(",\"trace_id\":{f},\"span_id\":{f}", .{ std.json.fmt(req.trace_id, .{}), std.json.fmt(req.span_id, .{}) });
             if (err) |e| try w.print(",\"error\":\"{t}\"", .{e});
             try w.writeByte('}');
         },

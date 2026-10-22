@@ -83,6 +83,10 @@ breaking changes are listed anyway.
   that accepts TLS early data in front of an HTTP/1.1 or HTTP/2 server no
   longer gets replayable POSTs through. `app.use(anole.early_data.Guard{})`
   is no longer needed (it is harmless).
+- `RequestId` with `trust_incoming` keeps an incoming ID only if it is 1 to
+  128 of `[A-Za-z0-9._:-]` (before: any visible ASCII), and the JSON access
+  log escapes `request_id`, `trace_id` and `span_id`: a client-chosen ID
+  could add or override fields in the JSON line.
 
 ### C ABI (ABI 0.1)
 
