@@ -32,7 +32,8 @@ pub const ServerOptions = struct {
     cert_pem: []const u8,
     /// The private key, PEM.
     key_pem: []const u8,
-    /// Also accept ALPN "hq-interop" (after "h3").
+    /// Also accept ALPN "hq-interop", and then take whichever of the two
+    /// the client lists first (`accept_h3_hq`).
     hq_interop: bool = false,
     /// Ask clients for a certificate (mutual TLS).
     client_auth: ?ClientAuth = null,
@@ -126,13 +127,24 @@ pub fn earlyDataReason(ssl: *const c.SSL) []const u8 {
     return if (text) |t| std.mem.span(t) else "unknown";
 }
 
-/// What a listener accepts, in its order of preference.
-const Accept = struct { protocols: []const []const u8 };
+/// What a listener accepts.
+const Accept = struct {
+    protocols: []const []const u8,
+    /// Take the first protocol the client lists that is among
+    /// `protocols`, rather than the first of `protocols` the client lists.
+    client_order: bool = false,
+};
 const accept_h3: Accept = .{ .protocols = &.{alpn_h3} };
-const accept_h3_hq: Accept = .{ .protocols = &.{ alpn_h3, alpn_hq } };
+/// The interop runner's clients say what a test case wants by the order
+/// they list protocols in: msquic's offers "hq-interop" first, "h3" after,
+/// and speaks HTTP/0.9 whatever comes back, so by our order it got "h3"
+/// and failed every hq case. A client that wants HTTP/3 lists "h3" first
+/// (or alone).
+const accept_h3_hq: Accept = .{ .protocols = &.{ alpn_h3, alpn_hq }, .client_order = true };
 
-/// Picks the first protocol of ours (`arg`) the client offers, or refuses
-/// the handshake: an HTTP/3 endpoint speaks nothing else.
+/// Picks a protocol of ours (`arg`) the client offers, by `Accept`'s
+/// order, or refuses the handshake: an HTTP/3 endpoint speaks nothing
+/// else.
 fn selectAlpn(
     _: ?*c.SSL,
     out: [*c][*c]const u8,
@@ -142,21 +154,58 @@ fn selectAlpn(
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
     const accept: *const Accept = @ptrCast(@alignCast(arg.?));
-    for (accept.protocols) |want| {
-        var offer = in[0..in_len];
-        while (offer.len > 0) {
-            const n = offer[0];
-            if (1 + @as(usize, n) > offer.len) break;
-            if (std.mem.eql(u8, offer[0 .. 1 + n], want)) {
-                out.* = offer[1..].ptr;
-                out_len.* = n;
-                return c.SSL_TLSEXT_ERR_OK;
-            }
-            offer = offer[1 + n ..];
-        }
+    if (pickAlpn(accept, in[0..in_len])) |p| {
+        out.* = p.ptr;
+        out_len.* = @intCast(p.len);
+        return c.SSL_TLSEXT_ERR_OK;
     }
     log.debug("client offered no ALPN we speak", .{});
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+/// The protocol name (without its length byte) `selectAlpn` picks from
+/// the client's list `offer` (ALPN wire format), or null.
+fn pickAlpn(accept: *const Accept, offer: []const u8) ?[]const u8 {
+    if (accept.client_order) {
+        var rest = offer;
+        while (rest.len > 0) {
+            const n = rest[0];
+            if (1 + @as(usize, n) > rest.len) return null;
+            for (accept.protocols) |want| if (std.mem.eql(u8, rest[0 .. 1 + n], want)) return rest[1 .. 1 + n];
+            rest = rest[1 + n ..];
+        }
+        return null;
+    }
+    for (accept.protocols) |want| {
+        var rest = offer;
+        while (rest.len > 0) {
+            const n = rest[0];
+            if (1 + @as(usize, n) > rest.len) break;
+            if (std.mem.eql(u8, rest[0 .. 1 + n], want)) return rest[1 .. 1 + n];
+            rest = rest[1 + n ..];
+        }
+    }
+    return null;
+}
+
+test "h3 ALPN: h3 alone normally; with hq-interop, the client's order decides" {
+    const msquic = "\x0ahq-interop\x02h3\x05hq-29\x05h3-29";
+    const h3_first = "\x02h3\x0ahq-interop";
+    const neither = "\x05h3-29\x08http/1.1";
+    const truncated = "\x02h3\x0ahq-int";
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3, msquic).?);
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3, h3_first).?);
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3, "\x0ahq-interop"));
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3, neither));
+    // msquic's interop client lists hq-interop first and speaks HTTP/0.9.
+    try std.testing.expectEqualStrings("hq-interop", pickAlpn(&accept_h3_hq, msquic).?);
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3_hq, h3_first).?);
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3_hq, "\x05h3-29\x02h3").?);
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3_hq, neither));
+    // A malformed list: what precedes the bad entry still counts.
+    try std.testing.expectEqualStrings("h3", pickAlpn(&accept_h3_hq, truncated).?);
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3_hq, "\x0ahq-int"));
+    try std.testing.expectEqual(null, pickAlpn(&accept_h3_hq, ""));
 }
 
 /// The listener's policy, as the TCP listener's (src/tls/dusty_tls.zig)
