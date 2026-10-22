@@ -86,14 +86,44 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
+const ms = std.Io.Duration.fromMilliseconds;
+
+/// Zero is none.
+fn optMs(n: u32) ?std.Io.Duration {
+    return if (n > 0) ms(n) else null;
+}
+
+/// The connector's bound on a call without its own: `databases[].timeout_ms`.
+fn callBound(d: *Db) ?std.Io.Duration {
+    return optMs(d.config.timeout_ms);
+}
+
+/// `anole.db.Tls` from a connector's TLS keys.
+fn tlsOf(c: anytype) db.Tls {
+    return .{
+        .ca = if (c.ca_file) |f| .{ .file = f } else if (c.ca_pem) |pem| .{ .pem = pem } else null,
+        .client_certificate = if (c.client_cert_file) |f|
+            dusty.Cert.fromFiles(f, c.client_key_file.?)
+        else if (c.client_cert_pem) |pem|
+            dusty.Cert.fromPem(pem, c.client_key_pem.?)
+        else
+            null,
+        .insecure_skip_verify = c.insecure_skip_verify,
+    };
+}
+
 fn openSqlite(d: *Db, app: *anole.App, sq: config_mod.Config.Sqlite) !void {
     {
         const client = try app.sqlite(anole.sqlite.Options{
             .path = sq.path,
             .name = d.config.name,
-            .readers = if (sq.readers) |n| n else null,
-            .busy_timeout_ms = sq.busy_timeout_ms,
-            .statement_cache = sq.statement_cache,
+            .uri = sq.uri,
+            .readers = sq.readers,
+            .busy_timeout = ms(sq.busy_timeout_ms),
+            .statement_cache_size = sq.statement_cache_size,
+            .ping_timeout = ms(sq.ping_timeout_ms),
+            .timeout = callBound(d),
+            .errors = d.config.errors,
             .pragmas = sq.pragmas,
             .cache = .{
                 .max_entries = d.config.cache.max_entries,
@@ -112,7 +142,6 @@ fn openSqlite(d: *Db, app: *anole.App, sq: config_mod.Config.Sqlite) !void {
 }
 
 fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
-    const ms = std.Io.Duration.fromMilliseconds;
     const client = try app.postgres(anole.pg.Options{
         .url = p.url,
         .name = d.config.name,
@@ -125,7 +154,10 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
         .sslmode = if (p.sslmode) |m| switch (config_mod.sslMode(m).?) {
             inline else => |t| @field(anole.pg.SslMode, @tagName(t)),
         } else null,
-        .tls = .{ .ca = if (p.ca_file) |f| .{ .file = f } else if (p.ca_pem) |pem| .{ .pem = pem } else null },
+        .tls = tlsOf(p),
+        .ping_timeout = ms(p.ping_timeout_ms),
+        .timeout = callBound(d),
+        .errors = d.config.errors,
         .connect_at_start = p.connect_at_start,
         .application_name = p.application_name,
         .reset_session = switch (p.reset_session) {
@@ -141,7 +173,7 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var ctx: db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
-    _ = client.exec(&ctx, script, .{}) catch |err| {
+    client.execScript(&ctx, script) catch |err| {
         if (db.lastError(&ctx)) |detail| {
             log.err("databases \"{s}\": init failed: {f}", .{ d.config.name, detail });
         } else log.err("databases \"{s}\": init failed: {t}", .{ d.config.name, err });
@@ -150,7 +182,6 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
 }
 
 fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
-    const ms = std.Io.Duration.fromMilliseconds;
     const client = try app.redis(anole.redis.Options{
         .url = r.url,
         .name = d.config.name,
@@ -158,7 +189,10 @@ fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
         .acquire_timeout = ms(r.acquire_timeout_ms),
         .connect_timeout = if (r.connect_timeout_ms > 0) ms(r.connect_timeout_ms) else null,
         .idle_timeout = if (r.idle_timeout_ms > 0) ms(r.idle_timeout_ms) else null,
-        .tls = .{ .ca = if (r.ca_file) |f| .{ .file = f } else if (r.ca_pem) |pem| .{ .pem = pem } else null },
+        .tls = tlsOf(r),
+        .ping_timeout = ms(r.ping_timeout_ms),
+        .timeout = callBound(d),
+        .errors = d.config.errors,
         .connect_at_start = r.connect_at_start,
         .cache = .{
             .max_entries = d.config.cache.max_entries,
@@ -169,18 +203,23 @@ fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
 }
 
 fn openMongodb(d: *Db, app: *anole.App, m: config_mod.Config.Mongodb) !void {
-    const ms = std.Io.Duration.fromMilliseconds;
-    const Tls = @typeInfo(@FieldType(anole.mongodb.Options, "tls")).optional.child;
-    const ca: ?Tls = if (m.ca_file) |f| .{ .ca = .{ .file = f } } else if (m.ca_pem) |pem| .{ .ca = .{ .pem = pem } } else null;
     const client = try app.mongodb(anole.mongodb.Options{
         .url = m.url,
         .database = m.database,
         .name = d.config.name,
-        .tls = ca,
+        .tls = tlsOf(m),
         .max_connections = m.max_connections,
         .acquire_timeout = ms(m.acquire_timeout_ms),
         .server_selection_timeout = ms(m.server_selection_timeout_ms),
-        .connect_timeout = ms(m.connect_timeout_ms),
+        .connect_timeout = optMs(m.connect_timeout_ms),
+        .idle_timeout = optMs(m.idle_timeout_ms),
+        .heartbeat = ms(m.heartbeat_ms),
+        .retry_reads = m.retry_reads,
+        .retry_writes = m.retry_writes,
+        .connect_at_start = m.connect_at_start,
+        .ping_timeout = ms(m.ping_timeout_ms),
+        .timeout = callBound(d),
+        .errors = d.config.errors,
         .cache = .{
             .max_entries = d.config.cache.max_entries,
             .max_bytes = std.math.cast(usize, d.config.cache.max_bytes) orelse std.math.maxInt(usize),
