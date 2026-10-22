@@ -427,7 +427,7 @@ const AppRoutes = struct {
     /// Messages as Server-Sent Events, until the drain ends the
     /// subscription.
     fn events(app: *AppState, req: *http.Request, res: *http.Response) !void {
-        req.setTimeout(.none);
+        req.setTimeout(null);
         const sub = try app.redis.subscribe(req, "anole:test:events");
         defer sub.close();
         var buf: [256]u8 = undefined;

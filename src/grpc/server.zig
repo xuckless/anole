@@ -1114,7 +1114,7 @@ fn readWhole(call: *Call, reader: *std.Io.Reader, limit: usize, streaming: bool)
 /// `read_timeout` rather than by the call's deadline, or by none.
 pub fn boundTheRest(call: *Call) void {
     const timeout = call.impl.read_timeout orelse return;
-    call.req.setTimeout(.{ .duration = .{ .raw = timeout, .clock = .awake } });
+    call.req.setTimeout(timeout);
 }
 
 /// Sets the call's deadline: the client's (`client_ns`), capped at
@@ -1122,7 +1122,7 @@ pub fn boundTheRest(call: *Call) void {
 /// timeout is lifted: the call runs as long as its handler does.
 pub fn setDeadline(call: *Call, client_ns: ?u64, max_call_duration: ?std.Io.Duration) void {
     call.deadline = deadlineOf(call.io, client_ns, max_call_duration);
-    call.req.setTimeout(if (call.deadline) |d| .{ .deadline = d } else .none);
+    call.req.setDeadline(if (call.deadline) |d| .{ .deadline = d } else .none);
 }
 
 /// A call's deadline from now: the client's timeout (`client_ns`), capped

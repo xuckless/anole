@@ -501,7 +501,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         ws.rsv1_allowed = negotiated;
         socket.conn = .{ .h1 = ws };
     }
-    req.setTimeout(options.timeout);
+    req.setDeadline(options.timeout);
     if (options.close_on_drain) if (req.drain_hooks) |hooks| {
         const watch = try alloc.create(DrainWatch);
         watch.* = .{

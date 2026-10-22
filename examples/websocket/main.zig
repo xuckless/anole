@@ -62,7 +62,7 @@ fn chat(app: *App, ws: *websocket.Socket, req: *anole.Request) !void {
     while (true) {
         // An idle limit: the timer restarts before every wait. When it
         // runs out the connection is closed and `next` returns null.
-        req.setTimeout(.{ .duration = .{ .raw = chat_idle, .clock = .awake } });
+        req.setTimeout(chat_idle);
         const msg = try ws.next() orelse return;
         _ = app.rooms.broadcast(room, msg.type, msg.data, null);
     }

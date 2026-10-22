@@ -3890,7 +3890,7 @@ test "Server: an unread body left after the request timed out or lifted its time
         }
         /// Lifts the request timeout and never reads the body.
         fn unbounded(req: *dusty.Request, res: *dusty.Response) !void {
-            req.setTimeout(.none);
+            req.setTimeout(null);
             res.body = "ok";
         }
     };

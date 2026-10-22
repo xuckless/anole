@@ -120,7 +120,7 @@ pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions)
     errdefer self.session.deinit();
     // The 200 out now: the client opens streams once it has it.
     try self.out.interface.flush();
-    req.setTimeout(options.timeout);
+    req.setDeadline(options.timeout);
     return &self.session;
 }
 

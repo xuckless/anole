@@ -138,6 +138,9 @@ pub const Request = struct {
     /// clock; null for none (or `.none`). The rest of an unread body is
     /// drained no later than this.
     _handler_deadline: ?std.Io.Clock.Timestamp = null,
+    /// A handler called `setTimeout` or `setDeadline`: a stream or file body
+    /// then leaves its deadline alone (`Response.liftDeadline`).
+    _deadline_from_handler: bool = false,
 
     // Body reading support
     parser: *RequestParser,
@@ -236,13 +239,28 @@ pub const Request = struct {
         }
     }
 
-    /// Replaces the deadline for this request. A duration starts now, a
-    /// deadline is absolute, and `.none` disables the deadline. The server
-    /// installs its normal keepalive deadline after the handler returns.
+    /// Replaces this request's deadline with one `timeout` from now; null
+    /// for none. The server installs its normal keepalive deadline after the
+    /// handler returns. A response that streams (`res.stream`,
+    /// `res.startEventStream`) or sends a file lifts the request deadline
+    /// itself, once its head is out (`timeouts.write` then bounds each
+    /// write); a deadline set here before that is kept.
     ///
     /// Call from the connection's handler task, not concurrently from a task
     /// spawned by the handler.
-    pub fn setTimeout(self: *Request, timeout: std.Io.Timeout) void {
+    pub fn setTimeout(self: *Request, timeout: ?std.Io.Duration) void {
+        self.setDeadline(if (timeout) |d| .{ .duration = .{ .raw = d, .clock = .awake } } else .none);
+    }
+
+    /// As `setTimeout`, with a `std.Io.Timeout`: a duration starts now, a
+    /// deadline is absolute, and `.none` disables the deadline.
+    pub fn setDeadline(self: *Request, deadline: std.Io.Timeout) void {
+        self._deadline_from_handler = true;
+        self._applyDeadline(deadline);
+    }
+
+    /// The deadline in place, without marking it the handler's.
+    pub fn _applyDeadline(self: *Request, timeout: std.Io.Timeout) void {
         const set = self._set_timeout orelse return;
         self._handler_deadline = if (timeout.toDurationFromNow(self.io)) |d|
             std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d.raw, .clock = .awake })
@@ -890,17 +908,18 @@ test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
         ._set_timeout = Probe.set,
     };
 
-    req.setTimeout(.{ .duration = .{ .raw = .fromSeconds(7), .clock = .awake } });
+    req.setTimeout(.fromSeconds(7));
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(7), probe.last.duration.raw);
+    try std.testing.expect(req._deadline_from_handler);
 
     const deadline = std.Io.Clock.Timestamp.now(std.testing.io, .real).addDuration(.{
         .raw = .fromSeconds(11),
         .clock = .real,
     });
-    req.setTimeout(.{ .deadline = deadline });
+    req.setDeadline(.{ .deadline = deadline });
     try std.testing.expectEqual(deadline, probe.last.deadline);
 
-    req.setTimeout(.none);
+    req.setTimeout(null);
     try std.testing.expect(probe.last == .none);
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
 }
