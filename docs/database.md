@@ -381,7 +381,10 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(App).init(init.gpa, .{ .errors = .json }, &state);
     defer app.deinit();
     state.db = try app.sqlite("app.db"); // created when missing; ":memory:" for one in memory
-    try state.db.execScript(
+    var arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer arena.deinit();
+    var c: anole.db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
+    try state.db.execScript(&c,
         \\CREATE TABLE IF NOT EXISTS notes (
         \\    id INTEGER PRIMARY KEY,
         \\    title TEXT NOT NULL UNIQUE,
@@ -459,7 +462,7 @@ A transaction holds the writer (`BEGIN IMMEDIATE`) until it commits or
 rolls back, so make it short, and inside it use the `Tx`, not the `Client`: a
 write on the `Client` would wait for the transaction's own writer. `transaction`
 runs again after `SQLITE_BUSY` (another process held the file past
-`busy_timeout_ms`, as during a restart), up to `retries` more times.
+`busy_timeout`, as during a restart), up to `retries` more times.
 `begin(req, .{ .read_only = true })` is a snapshot on a reader that writes
 do not disturb. By hand, as with PostgreSQL:
 
@@ -477,8 +480,8 @@ state.db = try app.sqlite(.{
     .path = "data/app.db",       // or "sqlite:data/app.db", ":memory:"
     .uri = false,                // true: a "file:..." path is a SQLite URI
     .readers = 4,                // read-only connections; 0: everything on the writer
-    .busy_timeout_ms = 5000,     // waiting for a lock another process holds
-    .statement_cache = 64,       // per connection
+    .busy_timeout = .fromSeconds(5), // waiting for a lock another process holds
+    .statement_cache_size = 64,     // per connection
     .pragmas = &.{"PRAGMA cache_size = -20000"}, // run on every connection
 });
 ```
@@ -506,7 +509,7 @@ unless `.uri = true`.
 | SQLite | Error | Status |
 | --- | --- | --- |
 | `CONSTRAINT_UNIQUE`, `CONSTRAINT_PRIMARYKEY` | `error.Conflict` | 409 |
-| `BUSY` past `busy_timeout_ms`, `LOCKED` | `error.ServiceUnavailable` | 503 |
+| `BUSY` past `busy_timeout`, `LOCKED` | `error.ServiceUnavailable` | 503 |
 | interrupted by `with(.{ .timeout })` | `error.GatewayTimeout` | 504 |
 | `CONSTRAINT_FOREIGNKEY`, `_NOTNULL`, `_CHECK`, the rest | `error.Database` | 500 |
 

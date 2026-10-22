@@ -91,7 +91,10 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
     app.use(anole.observe.AccessLog.init(.{}));
     state.db = try app.sqlite(path);
-    try state.db.execScript(schema);
+    var setup_arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer setup_arena.deinit();
+    var setup: anole.db.Ctx = .{ .io = app.io(), .arena = setup_arena.allocator() };
+    try state.db.execScript(&setup, schema);
     routes(&app);
     try app.listen(address);
 }

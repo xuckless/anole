@@ -2026,7 +2026,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// app has, and it is closed with the server, after the drain.
         ///
         ///     state.db = try app.sqlite("app.db");
-        ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout_ms = 10_000 });
+        ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout = .fromSeconds(10) });
         pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
             if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
             const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {

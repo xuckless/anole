@@ -166,8 +166,9 @@ pub const Changes = struct {
 /// prepared statement, nothing cached.
 pub const QueryOptions = struct {
     /// A bound of the call's own, on top of the request's deadline: past
-    /// it the call is canceled and fails with `error.GatewayTimeout`. For
-    /// work outside a request, which has no deadline otherwise.
+    /// it the call is canceled and fails with `error.GatewayTimeout`.
+    /// Null: the connector's `Options.timeout` (30 s by default).
+    /// `.max` (`std.Io.Duration.max`): no bound for this call.
     timeout: ?std.Io.Duration = null,
     /// SQL connectors: prepare the statement and keep it for the next call
     /// (per connection). Off for SQL that is built at run time and seldom
@@ -249,8 +250,31 @@ pub const TxOptions = struct {
     /// `transaction` only: runs again after a serialization failure or a
     /// deadlock (`retryable`), up to this many more times.
     retries: u8 = 0,
-    /// As `QueryOptions.timeout`, for the whole transaction.
+    /// Bounds the whole transaction. Null: the connector's `Options.timeout`
+    /// (30 s by default); `.max`: none.
     timeout: ?std.Io.Duration = null,
+};
+
+/// TLS to a database server (`anole.pg`, `anole.redis`, `anole.mongodb`).
+/// Whether TLS is used is the URL's (`sslmode`, `rediss://`, `tls=true`,
+/// `mongodb+srv://`); giving `ca` or `client_certificate` asks for it with
+/// the certificate checked: PostgreSQL without an sslmode then uses
+/// verify-full, MongoDB turns TLS on; a URL that turns TLS off or stops
+/// checking (`sslmode=disable|allow|prefer`, `redis://`, `tls=false`,
+/// `tlsInsecure`) is refused at init, never silently obeyed.
+pub const Tls = struct {
+    /// What the server's certificate must chain to. Null: the URL's
+    /// (`sslrootcert`, `ssl_ca_certs`, `tlsCAFile`), else the system's store.
+    ca: ?dusty.Ca = null,
+    /// A client certificate for servers that ask. Null: the URL's
+    /// (`sslcert`/`sslkey`, `ssl_certfile`/`ssl_keyfile`, `tlsCertificateKeyFile`).
+    /// `.dev_self_signed` is refused.
+    client_certificate: ?dusty.Cert = null,
+    /// TLS without checking the certificate (PostgreSQL `sslmode=require`,
+    /// Redis `ssl_cert_reqs=none`, MongoDB `tlsInsecure`): a managed server
+    /// with a self-signed certificate on a network you trust. Refused with
+    /// `ca`, and with an sslmode that verifies.
+    insecure_skip_verify: bool = false,
 };
 
 /// SQL isolation levels (`TxOptions.isolation`).

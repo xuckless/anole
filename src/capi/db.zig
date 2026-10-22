@@ -100,7 +100,10 @@ fn openSqlite(d: *Db, app: *anole.App, sq: config_mod.Config.Sqlite) !void {
                 .max_bytes = std.math.cast(usize, d.config.cache.max_bytes) orelse std.math.maxInt(usize),
             },
         });
-        if (sq.init) |script| client.execScript(script) catch |err| {
+        var script_arena: std.heap.ArenaAllocator = .init(gpa);
+        defer script_arena.deinit();
+        var script_ctx: db.Ctx = .{ .io = app.io(), .arena = script_arena.allocator() };
+        if (sq.init) |script| client.execScript(&script_ctx, script) catch |err| {
             log.err("databases \"{s}\": init failed: {t}", .{ d.config.name, err });
             return err;
         };

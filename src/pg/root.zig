@@ -94,8 +94,8 @@ pub const Options = struct {
     /// `PGDATABASE`, `PGSSLMODE`...), else `postgres://postgres@127.0.0.1:5432/postgres`.
     url: ?[]const u8 = null,
     /// The database's name in metrics (`db` label), spans, `/readyz` and
-    /// logs. Must outlive the connector.
-    name: []const u8 = "postgres",
+    /// logs. Must outlive the connector. Null: "postgres".
+    name: ?[]const u8 = null,
     /// Connections in all, split between the executors (at least one
     /// each). Null: the URL's `pool_max_conns`, else twice the number of
     /// executors, at least 4. A URL's `pool_max_conns` wins over this.
@@ -124,7 +124,7 @@ pub const Options = struct {
     /// With `tls.ca` set, the server's certificate is always checked:
     /// `verify-full` when no sslmode is given, and an sslmode that does not
     /// check it (`disable`, `allow`, `prefer`) is refused.
-    tls: Tls = .{},
+    tls: db.Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
     /// a database that is down shows in `/readyz` and as 503s.
@@ -133,6 +133,12 @@ pub const Options = struct {
     application_name: ?[]const u8 = null,
     /// What `/readyz` waits for the database's answer.
     ping_timeout: Duration = .fromSeconds(2),
+    /// A bound on every call that has no `QueryOptions.timeout` of its own,
+    /// in a request or not; past it the call is canceled and fails with
+    /// `error.GatewayTimeout`. A request's deadline applies too, whichever
+    /// comes first. Null: none (a call outside a request then waits as long
+    /// as the database does).
+    timeout: ?Duration = .fromSeconds(30),
     /// The bounds of the results kept for calls with `.cache`
     /// (`anole.db.QueryOptions`).
     cache: db.CacheOptions = .{},
@@ -176,14 +182,7 @@ pub const Options = struct {
     };
 
     /// Certificates beyond what the URL names (`Options.tls`).
-    pub const Tls = struct {
-        /// What `sslmode=verify-ca`/`verify-full` trust; null: the URL's
-        /// `sslrootcert`, else the system's store.
-        ca: ?dusty.Ca = null,
-        /// A client certificate for servers that ask (`clientcert` in
-        /// pg_hba.conf); null: the URL's `sslcert` and `sslkey`.
-        client_certificate: ?dusty.Cert = null,
-    };
+    pub const Tls = db.Tls;
 };
 
 /// libpq's `sslmode`. Without one: `verify_full` for a remote host,
@@ -378,11 +377,14 @@ const Settings = struct {
             s.unix_path = try std.fmt.allocPrint(arena, "{s}/.s.PGSQL.{d}", .{ std.mem.trimEnd(u8, s.host, "/"), s.port });
         }
         const code_ca = opts.tls.ca != null;
+        const insecure = opts.tls.insecure_skip_verify;
+        if (insecure and code_ca) return why.set("Options.tls.insecure_skip_verify cannot be set with Options.tls.ca: one checks the server's certificate and the other does not", .{});
+        if (insecure and s.sslmode_set and (s.sslmode == .disable or s.sslmode.verifies())) return why.set("Options.tls.insecure_skip_verify asks for TLS without checking the certificate, but sslmode={t} does not; take sslmode out of the URL and PGSSLMODE, or set require", .{s.sslmode});
         // No sslmode given: the server's certificate is checked unless the
         // server is on this machine and the code gives no CA.
-        if (!s.sslmode_set) s.sslmode = if (s.local() and !code_ca) .prefer else .verify_full;
+        if (!s.sslmode_set) s.sslmode = if (insecure) .require else if (s.local() and !code_ca) .prefer else .verify_full;
         // libpq: `require` with a root certificate checks the chain.
-        if (s.sslmode == .require and (s.sslrootcert != null or code_ca)) s.sslmode = .verify_ca;
+        if (s.sslmode == .require and !insecure and (s.sslrootcert != null or code_ca)) s.sslmode = .verify_ca;
         // The URL and the environment may not turn off the checks the code
         // asks for by giving a CA.
         if (code_ca and !s.sslmode.verifies()) {
@@ -454,6 +456,8 @@ pub const Client = struct {
     /// The settings' strings and the startup parameters.
     arena: std.heap.ArenaAllocator,
     name: []const u8,
+    /// `Options.timeout`: the bound of a call without its own.
+    timeout: ?Duration,
     settings: Settings,
     pools: internal.PerExecutor(Shard),
     errors: db.ErrorMap,
@@ -474,23 +478,33 @@ pub const Client = struct {
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
+        if (opts.max_connections) |n| if (n == 0) {
+            log.err("postgres: max_connections is 0; set at least 1, or leave it null for the default", .{});
+            return error.InvalidOptions;
+        };
+        if (opts.tls.client_certificate) |cc| if (cc == .dev_self_signed) {
+            log.err("postgres: tls.client_certificate cannot be .dev_self_signed", .{});
+            return error.InvalidOptions;
+        };
+        const name = opts.name orelse "postgres";
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .arena = .init(gpa),
-            .name = opts.name,
+            .timeout = opts.timeout,
+            .name = name,
             .settings = undefined,
             .pools = undefined,
             .errors = opts.errors,
-            .observer = .{ .system = .postgresql, .name = opts.name },
+            .observer = .{ .system = .postgresql, .name = name },
             .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = undefined,
             .ping_timeout = opts.ping_timeout,
             .connect_at_start = opts.connect_at_start,
-            .cache = try .init(gpa, io, .postgresql, opts.name, opts.cache),
+            .cache = try .init(gpa, io, .postgresql, name, opts.cache),
         };
         errdefer self.cache.deinit();
         errdefer self.arena.deinit();
@@ -667,6 +681,12 @@ pub const Client = struct {
         return self.with(.{}).exec(c, sql, args);
     }
 
+    /// Runs `sql` (several statements allowed) with no bound on its time:
+    /// a schema or a migration at startup, outside any request.
+    pub fn execScript(self: *Client, c: anytype, sql: []const u8) Error!void {
+        _ = try self.with(.{ .timeout = .max }).exec(c, sql, .{});
+    }
+
     /// The first row as a `T`; none: `error.NotFound` (a 404).
     pub fn one(self: *Client, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         return self.with(.{}).one(T, c, sql, args);
@@ -691,7 +711,7 @@ pub const Client = struct {
     /// A transaction on one connection: `defer tx.deinit()` (it rolls
     /// back unless committed), the verbs on `tx`, then `tx.commit(c)`.
     pub fn begin(self: *Client, c: anytype, opts: db.TxOptions) Error!Tx {
-        return self.beginWith(c, opts, if (opts.timeout) |t| dusty.Deadline.init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } }) else null);
+        return self.beginWith(c, opts, if (internal.callTimeout(opts.timeout, self.timeout)) |t| dusty.Deadline.init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } }) else null);
     }
 
     fn beginWith(self: *Client, c: anytype, opts: db.TxOptions, deadline: ?dusty.Deadline) Error!Tx {
@@ -728,7 +748,7 @@ pub const Client = struct {
     ///         _ = try tx.exec(req, "UPDATE accounts SET cents = cents + $1 WHERE id = $2", .{ cents, to });
     ///     }
     pub fn transaction(self: *Client, c: anytype, opts: db.TxOptions, comptime func: anytype, args: anytype) internal.Bounded(Retry(func, @TypeOf(c), @TypeOf(args)).run) {
-        return internal.bounded(c, .postgresql, opts.timeout, Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
+        return internal.bounded(c, .postgresql, internal.callTimeout(opts.timeout, self.timeout), Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
     }
 
     fn Retry(comptime func: anytype, comptime C: type, comptime Args: type) type {
@@ -1040,7 +1060,7 @@ pub const Query = struct {
 
     /// `Client.exec`, with the options' `timeout` and `prepare`.
     pub fn exec(self: Query, c: anytype, sql: []const u8, args: anytype) Error!u64 {
-        return self.db.call(c, self.opts.timeout, null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     // The reads go through the cache, which shares them when `opts`
@@ -1064,7 +1084,7 @@ pub const Query = struct {
     /// The timeout bounds the statement until its first rows; reading the
     /// rest is the caller's.
     pub fn iterate(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
-        return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     /// Every row, with columns and parameters known only at run time
@@ -1083,7 +1103,7 @@ pub const Query = struct {
     /// changed (`last_insert_rowid` is 0: use `RETURNING` with `table`).
     /// Without parameters, several statements may go in one call.
     pub fn run(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
-        return self.db.call(c, self.opts.timeout, null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
     }
 };
 
@@ -1094,7 +1114,7 @@ const TableRead = struct {
 
     pub fn run(r: TableRead, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
         const q = r.query;
-        return q.db.call(c, q.opts.timeout, null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
+        return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
     }
 };
 
@@ -1108,7 +1128,7 @@ fn Read(comptime T: type, comptime mode: Mode) type {
 
         pub fn run(r: @This(), c: anytype, sql: []const u8, args: anytype) Error!Fetch(T, mode, @TypeOf(args)).Out {
             const q = r.query;
-            return q.db.call(c, q.opts.timeout, null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
+            return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
         }
     };
 }

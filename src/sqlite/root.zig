@@ -47,7 +47,7 @@
 //! returns `error.Canceled` (`error.GatewayTimeout` for a timeout).
 //!
 //! A unique or primary-key violation is `error.Conflict` (409), `SQLITE_BUSY`
-//! past `busy_timeout_ms` (another process holding the write lock) is
+//! past `busy_timeout` (another process holding the write lock) is
 //! `error.ServiceUnavailable` (503), and the rest `error.Database` (500);
 //! `lastError(req)` has SQLite's extended code and message.
 //!
@@ -74,6 +74,7 @@ pub const c = sqlite.c;
 pub const driver = sqlite;
 
 const log = std.log.scoped(.anole);
+const Duration = std.Io.Duration;
 
 /// `app.sqlite(options)` and `Client.init`: the file, its connections and
 /// statement cache. `app.sqlite("app.db")` is `.{ .path = "app.db" }`.
@@ -94,13 +95,21 @@ pub const Options = struct {
     /// Read-only connections for reads, used at once from the blocking
     /// pool. Null: one per executor, at most 8. Zero: everything on the
     /// writer. None for `:memory:`.
-    readers: ?usize = null,
+    readers: ?u32 = null,
     /// How long a statement waits for a lock another process holds (a
     /// migration tool, the old process during a restart) before
     /// `error.ServiceUnavailable`.
-    busy_timeout_ms: u32 = 5000,
+    busy_timeout: Duration = .fromSeconds(5),
     /// Prepared statements kept per connection, by SQL text.
-    statement_cache: usize = 64,
+    statement_cache_size: u16 = 64,
+    /// What `/readyz` waits for the database's answer.
+    ping_timeout: Duration = .fromSeconds(2),
+    /// A bound on every call that has no `QueryOptions.timeout` of its own,
+    /// in a request or not; past it the call is interrupted and fails with
+    /// `error.GatewayTimeout`. A request's deadline applies too, whichever
+    /// comes first. Null: none (a call outside a request then waits as long
+    /// as the database does).
+    timeout: ?Duration = .fromSeconds(30),
     /// Statements run on every connection as it opens, after Anole's own
     /// (`journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout`,
     /// `foreign_keys=ON`): `"PRAGMA cache_size = -20000"`.
@@ -149,6 +158,9 @@ pub const Client = struct {
     memory: bool,
     errors: db.ErrorMap,
     cache_size: usize,
+    /// `Options.timeout`: the bound of a call without its own.
+    timeout: ?Duration,
+    ping_timeout: Duration,
     writer: Writer,
     readers: Readers,
     /// Metrics and spans; `start` fills them in.
@@ -184,7 +196,9 @@ pub const Client = struct {
             .path = path_z,
             .memory = memory,
             .errors = options.errors,
-            .cache_size = options.statement_cache,
+            .cache_size = options.statement_cache_size,
+            .timeout = options.timeout,
+            .ping_timeout = options.ping_timeout,
             .writer = .{ .conn = undefined, .thread = undefined },
             .readers = .{},
             .observer = .{ .system = .sqlite, .name = name },
@@ -254,15 +268,12 @@ pub const Client = struct {
     /// Runs `sql`, one or more statements with no parameters, on the
     /// writer, outside any request: a schema at startup.
     ///
-    ///     try db.execScript(
+    ///     try db.execScript(&ctx,
     ///         \\CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
     ///         \\CREATE INDEX IF NOT EXISTS notes_title ON notes (title);
     ///     );
-    pub fn execScript(self: *Client, sql: []const u8) Error!void {
-        var arena: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena.deinit();
-        var ctx: db.Ctx = .{ .io = self.io, .arena = arena.allocator() };
-        _ = try self.exec(&ctx, sql, .{});
+    pub fn execScript(self: *Client, cx: anytype, sql: []const u8) Error!void {
+        _ = try self.with(.{ .timeout = .max }).exec(cx, sql, .{});
     }
 
     /// The calls below, with `options` (a timeout, `.write`, `.prepare`).
@@ -324,7 +335,7 @@ pub const Client = struct {
     /// Runs `func(tx, args...)` in a transaction (see `begin`) and commits
     /// it, or rolls it back if `func` fails. When `func` or the commit
     /// fails with `SQLITE_BUSY` (another process held the database past
-    /// `busy_timeout_ms`, or a snapshot went stale), the whole of it runs
+    /// `busy_timeout`, or a snapshot went stale), the whole of it runs
     /// again, up to `options.retries` more times. `options.timeout` bounds
     /// all of it.
     ///
@@ -352,7 +363,7 @@ pub const Client = struct {
                 }
             }
         };
-        return unbound(TxResult(func), internal.bounded(cx, .sqlite, options.timeout, Run.run, .{ self, cx, options, args }));
+        return unbound(TxResult(func), internal.bounded(cx, .sqlite, internal.callTimeout(options.timeout, self.timeout), Run.run, .{ self, cx, options, args }));
     }
 
     /// The writer connection for the driver's own calls (`Conn.run`), held
@@ -462,13 +473,13 @@ pub const Client = struct {
         return t.result;
     }
 
-    /// The readiness check: a `SELECT 1` within a second.
+    /// The readiness check: a `SELECT 1` within `ping_timeout`.
     fn ping(context: *anyopaque, io: std.Io) bool {
         const self: *Client = @ptrCast(@alignCast(context));
         var buf: [1024]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var ctx: db.Ctx = .{ .io = io, .arena = fba.allocator() };
-        const v = self.with(.{ .timeout = .fromSeconds(1) }).one(i64, &ctx, "SELECT 1", .{}) catch return false;
+        const v = self.with(.{ .timeout = self.ping_timeout }).one(i64, &ctx, "SELECT 1", .{}) catch return false;
         return v == 1;
     }
 };
@@ -567,7 +578,7 @@ pub const Query = struct {
             }
         };
         const call_ = q.db.observer.start(cx);
-        const result = unbound(Error!Rows(T), internal.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
+        const result = unbound(Error!Rows(T), internal.bounded(cx, .sqlite, internal.callTimeout(q.options.timeout, q.db.timeout), Run.run, .{ q, cx, sql, args }));
         const kw = operation(sql);
         call_.end(cx, kw.text(), null, if (result) |_| null else |e| e);
         return result;
@@ -580,7 +591,7 @@ pub const Query = struct {
             }
         };
         const call_ = q.db.observer.start(cx);
-        const result = unbound(Error!Out(op, T), internal.bounded(cx, .sqlite, q.options.timeout, Run.run, .{ q, cx, sql, args }));
+        const result = unbound(Error!Out(op, T), internal.bounded(cx, .sqlite, internal.callTimeout(q.options.timeout, q.db.timeout), Run.run, .{ q, cx, sql, args }));
         const kw = operation(sql);
         call_.end(cx, kw.text(), null, if (result) |_| null else |e| e);
         return result;
@@ -968,7 +979,7 @@ const Connection = struct {
         errdefer handle.deinit();
         var conn: Connection = .{ .handle = handle };
         var buf: [64]u8 = undefined;
-        const busy = std.mem.printSentinel(&buf, "PRAGMA busy_timeout = {d}", .{options.busy_timeout_ms}, 0) catch unreachable;
+        const busy = std.mem.printSentinel(&buf, "PRAGMA busy_timeout = {d}", .{@divTrunc(options.busy_timeout.nanoseconds, std.time.ns_per_ms)}, 0) catch unreachable;
         try conn.setup(busy);
         if (!d.memory) {
             // Persistent in the file: the writer sets it once.

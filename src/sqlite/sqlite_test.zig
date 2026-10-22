@@ -666,7 +666,7 @@ test "sqlite: transactions: commit, rollback, deinit, and transaction() retried 
     var tmp: TmpFile = .init();
     defer tmp.deinit();
     const path = tmp.file("app.db");
-    const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout_ms = 20 });
+    const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout = .fromMilliseconds(20) });
     defer db.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -718,7 +718,7 @@ test "sqlite: transactions: commit, rollback, deinit, and transaction() retried 
     try testing.expectEqual(@as(u32, 2), attempts);
 
     // Another process (a raw connection here) holds the write lock: past
-    // busy_timeout_ms a call is ServiceUnavailable; transaction() runs
+    // busy_timeout a call is ServiceUnavailable; transaction() runs
     // again until the lock is gone.
     var other = try sqlite.driver.Db.init(.{ .mode = .{ .File = try arena_state.allocator().dupeSentinel(u8, path, 0) }, .open_flags = .{ .write = true }, .threading_mode = .MultiThread });
     defer other.deinit();
@@ -806,7 +806,7 @@ test "sqlite: iterate in batches, on a reader and on :memory:'s writer; RETURNIN
 }
 
 test "sqlite: the statement cache keeps the newest; prepare = false keeps none" {
-    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:", .statement_cache = 2 });
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:", .statement_cache_size = 2 });
     defer db.deinit();
     var s: Scratch = undefined;
     s.init(testing.io);
