@@ -76,6 +76,17 @@ breaking changes are listed anyway.
   `anole_wt_send_datagram` (a bounded queue that drops the oldest),
   `anole_wt_max_datagram`, `anole_wt_close`; `anole_stats` gains
   `wt_sessions` and `wt_datagrams_dropped`; `anole_has_feature("webtransport")`.
+- C ABI 0.5: TLS extras, mutual TLS per listener (`tls.client_auth`
+  `"none"`/`"request"`/`"require"` with `client_ca_file` or
+  `client_ca_pem`, HTTP/3 included); the client's certificate (DER) in
+  request records (`ANOLE_REQ_PEER_CERT`, `peer_cert`, which replaces the
+  reserved word, and `anole_request_peer_cert`), also on WebSocket and
+  WebTransport opens; `anole_server_reload_tls` swaps in new certificate
+  files or PEM (`ANOLE_TLS_PEM`) for every TLS listener and HTTP/3, and
+  SIGHUP reloads with `ANOLE_SERVER_SIGNALS`; the configuration gains
+  `trust_forwarded_proto`, `trust_forwarded_host` and a listener's
+  `proxy_protocol_from`. `anole_server_reload_certificates` answers
+  `ANOLE_E_STATE` (was `ANOLE_E_SYSTEM`) when no listener has TLS.
 - `anole.webtransport.Session` and `Stream` gain calls that never wait
   (`tryAccept`, `tryOpen`, `takeDatagram`, `trySendDatagram`, `tryRead`,
   `tryWrite`, `sendError`, with `generation`/`waitChange`), for code that

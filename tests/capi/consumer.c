@@ -432,6 +432,8 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
               ln = anole_event_str(r, r->listener), id = anole_event_str(r, r->id);
     int n = snprintf(out, sizeof out, "%d %.*s %d %d %.*s %.*s %zu", r->method, (int)m.len, m.ptr, r->version,
                      (r->flags & ANOLE_REQ_SECURE) != 0, (int)ln.len, ln.ptr, (int)ra.len, ra.ptr, id.len);
+    /* No TLS here, so no client certificate. */
+    CHECK((r->flags & ANOLE_REQ_PEER_CERT) == 0 && r->peer_cert == 0 && anole_request_peer_cert(r).len == 0);
     CHECK(anole_respond(h, 200, text_plain, 1, out, (size_t)n, 0) == ANOLE_OK);
     break;
   }
@@ -2111,6 +2113,58 @@ static void test_webtransport(void) {
   printf("ok webtransport: a session from a Zig client, streams both ways, datagrams, the client's close\n");
 }
 
+static void test_tls(void) {
+  anole_str name = LIT("tls");
+  if (!anole_has_feature(name)) {
+    printf("ok tls (not built in)\n");
+    return;
+  }
+  /* Mutual TLS settings the configuration refuses. */
+  const char *bad[] = {
+      "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
+      "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
+      "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_file\": \"ca.pem\"}}]}",
+      "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+  };
+  for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    anole_server_options o = {sizeof o, {bad[i], strlen(bad[i])}, 0, 0, on_log, NULL};
+    anole_server *x = NULL;
+    CHECK(anole_server_create(&o, &x) == ANOLE_E_CONFIG && x == NULL);
+    CHECK(anole_last_error().len > 0);
+  }
+  /* Settings it takes. */
+  anole_server *p = make_server("{\"trusted_proxy_hops\": 1, \"trust_forwarded_proto\": false,"
+                                " \"trust_forwarded_host\": true, \"listeners\": [{\"port\": 0,"
+                                " \"proxy_protocol\": true, \"proxy_protocol_from\": [\"127.0.0.1\", \"10.0.0.0/8\"]}]}");
+  CHECK(anole_server_start(p) == ANOLE_OK);
+  /* No TLS listener: nothing to reload. */
+  CHECK(anole_server_reload_tls(p, 0, NULL, 0, NULL, 0) == ANOLE_E_STATE);
+  CHECK(anole_server_reload_certificates(p) == ANOLE_E_STATE);
+  CHECK(anole_server_drain(p) == ANOLE_OK);
+  CHECK(anole_server_wait(p, -1) == ANOLE_OK);
+  anole_server_destroy(p);
+
+  anole_server *s = make_server("{\"listeners\": [{\"port\": 0, \"tls\": {\"self_signed\": true}}]}");
+  /* Not running yet. */
+  CHECK(anole_server_reload_tls(s, 0, NULL, 0, NULL, 0) == ANOLE_E_STATE);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  CHECK(anole_server_reload_tls(s, 0, NULL, 0, NULL, 0) == ANOLE_OK);
+  CHECK(anole_server_reload_tls(s, 2, NULL, 0, NULL, 0) == ANOLE_E_INVALID);
+  CHECK(anole_server_reload_tls(s, 0, NULL, 0, "k", 1) == ANOLE_E_INVALID);
+  CHECK(anole_server_reload_tls(s, ANOLE_TLS_PEM, "c", 0, "k", 1) == ANOLE_E_INVALID);
+  const char junk[] = "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n";
+  CHECK(anole_server_reload_tls(s, ANOLE_TLS_PEM, junk, strlen(junk), junk, strlen(junk)) == ANOLE_E_INVALID);
+  CHECK(anole_last_error().len > 0);
+  const char *missing = "/nonexistent/anole-cert.pem";
+  CHECK(anole_server_reload_tls(s, 0, missing, strlen(missing), missing, strlen(missing)) == ANOLE_E_SYSTEM);
+  /* Still serving the certificate it had: a reload from it works. */
+  CHECK(anole_server_reload_certificates(s) == ANOLE_OK);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, -1) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok tls: mutual TLS and proxy settings in the configuration, anole_server_reload_tls's refusals\n");
+}
+
 static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
@@ -2122,6 +2176,7 @@ static int run_tests(void) {
   test_db_redis();
   test_db_mongodb();
   test_webtransport();
+  test_tls();
   printf("PASS\n");
   return 0;
 }

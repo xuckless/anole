@@ -256,6 +256,51 @@ here and runs on Anole's threads:
   hits without reaching the consumer.
 - `no_wait: false` gives each request a task (for comparisons).
 
+## TLS
+
+A listener's `tls` takes the certificate and key as files (`cert_file`,
+`key_file`), as PEM text (`cert_pem`, `key_pem`) or `self_signed` for
+development, plus `alpn`.
+
+Mutual TLS is `client_auth`: `"none"` (the default), `"request"` (a
+certificate is asked for and checked when the client sends one) or
+`"require"` (a client without one is refused at the handshake), with the CAs
+that client certificates must chain to as `client_ca_file` or
+`client_ca_pem`:
+
+```json
+{ "port": 8443, "http3": true,
+  "tls": { "cert_file": "cert.pem", "key_file": "key.pem",
+           "client_auth": "require", "client_ca_file": "clients-ca.pem" } }
+```
+
+The HTTP/3 endpoint follows the settings of the listener with `http3`.
+A request whose client presented a certificate has `ANOLE_REQ_PEER_CERT`
+in its flags; `anole_request_peer_cert(r)` returns it (DER, verified,
+the leaf only) from the record, which holds it at `r->peer_cert` as a
+little-endian `uint32_t` length followed by the bytes. The same goes for
+`ANOLE_EV_WS_OPEN` and `ANOLE_EV_WT_OPEN`.
+
+Certificates change without a restart:
+`anole_server_reload_certificates(s)` reads every TLS listener's sources
+again; `anole_server_reload_tls(s, flags, cert, cert_len, key, key_len)`
+swaps in new ones for every TLS listener (and HTTP/3), as file paths or, with
+`ANOLE_TLS_PEM`, as PEM text, and they become what later reloads read.
+Handshakes under way finish on the old certificate, and session tickets
+issued before still resume. A certificate that does not load leaves the old
+one in place (`ANOLE_E_INVALID`, or `ANOLE_E_SYSTEM` for a file that cannot
+be read). With `ANOLE_SERVER_SIGNALS`, SIGHUP does the same as
+`anole_server_reload_certificates`. A reload changes the server's own
+certificate only; the client CAs stay those of the configuration.
+
+Behind a proxy, `trusted_proxy_hops` says how many proxies in front to
+trust for `X-Forwarded-For` (the client's address in `remote_addr`), with
+`trust_forwarded_proto` (default true: `X-Forwarded-Proto` decides
+`ANOLE_REQ_SECURE`) and `trust_forwarded_host` (default false). A
+listener's `proxy_protocol` expects a PROXY protocol (v1 or v2) header on
+every connection; `proxy_protocol_from` limits who may send one
+(addresses or CIDR networks).
+
 `anole_server_port(s, i)` reports listener *i*'s bound port (port 0 picks a
 free one); *i* = the number of listeners gives the HTTP/3 UDP port.
 
@@ -707,7 +752,8 @@ anole_server_destroy(s);
 One server per process. By default Anole installs no signal handlers (the
 host process owns its signals); `ANOLE_SERVER_SIGNALS` asks for SIGINT and
 SIGTERM (drain) and SIGHUP (reload certificates), for a standalone C program.
-`anole_server_reload_certificates` reloads TLS certificates on demand.
+`anole_server_reload_certificates` and `anole_server_reload_tls` reload TLS
+certificates on demand (see TLS).
 `anole_server_stats` reports counters (requests, detached, in flight,
 expired, aborted, refused, wakes and re-wakes, WebSockets); options structs
 and the stats struct start with their `size`, so an older header keeps
@@ -728,23 +774,20 @@ zig-out/bin/capi-grpc-interop` runs grpc-go's interop client against.
 `zig build capi-test-asan` builds the suite with the system C compiler under
 ASan and UBSan (it runs with `ASAN_OPTIONS=use_sigaltstack=0`: Zig's threads
 install their own signal stack). `zig build test-capi-engine` runs the
-engine's HTTP/2, HTTP/3 and WebTransport tests; `zig build test-grpc` the gRPC
-ones (native, transcoding, and the ABI's, with descriptors, JSON and
-transcoding). The C suite's WebTransport part has its server in C and its
-client in Zig (`tests/capi/wt_client.zig`, built with the suite and passed
-to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
+engine's HTTP/2, HTTP/3, WebTransport and TLS tests (mutual TLS over HTTP/2
+and HTTP/3, certificate reload from PEM, files and SIGHUP); `zig build
+test-grpc` the gRPC ones (native, transcoding, and the ABI's, with
+descriptors, JSON and transcoding). The C suite's WebTransport part has its
+server in C and its client in Zig (`tests/capi/wt_client.zig`, built with
+the suite and passed to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
 
 ## What comes next
 
 ABI 0.1 was the request/response and WebSocket core, plus `anole_db_*` with
 SQLite, PostgreSQL and Redis; 0.2 adds the gRPC server, 0.3 MongoDB through
-`anole_db_*`, and 0.4 WebTransport. Before the ABI freezes (1.0) and the
-bindings ship, these come as their own pull requests; their event types and
-handle kinds are reserved already:
-
-- TLS extras: mutual TLS and the client certificate in the request,
-  certificate reload per listener.
-- Then the freeze: ABI 1.0.
+`anole_db_*`, 0.4 WebTransport, and 0.5 the TLS extras (mutual TLS, the
+client certificate in requests, certificate reload). Next is the freeze, ABI
+1.0, before the bindings ship.
 
 Auth beyond the configured `jwt` middleware comes later.

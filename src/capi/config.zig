@@ -21,6 +21,12 @@ pub const Config = struct {
     /// Proxies in front whose `X-Forwarded-For` (and PROXY protocol)
     /// Anole trusts for the client's address: 0 trusts none.
     trusted_proxy_hops: u8 = 0,
+    /// With trusted_proxy_hops: the last X-Forwarded-Proto value says
+    /// whether the request is secure.
+    trust_forwarded_proto: bool = true,
+    /// With trusted_proxy_hops: the last X-Forwarded-Host value is the
+    /// request's host (only when every proxy in front sets it).
+    trust_forwarded_host: bool = false,
     /// Middleware for every route, in order, before the route's own.
     middleware: []const Middleware = &.{},
     routes: []const Route = &.{},
@@ -50,6 +56,9 @@ pub const Config = struct {
         http3: bool = false,
         /// Connections start with a PROXY protocol header.
         proxy_protocol: bool = false,
+        /// With proxy_protocol: the proxies allowed to send one (addresses
+        /// or CIDR networks, "10.0.0.0/8"); empty: any peer.
+        proxy_protocol_from: []const []const u8 = &.{},
     };
 
     pub const Tls = struct {
@@ -63,6 +72,15 @@ pub const Config = struct {
         self_signed: bool = false,
         /// ALPN protocols in order; default "h2", "http/1.1".
         alpn: ?[]const []const u8 = null,
+        /// Mutual TLS: "none", "request" (a certificate is asked for, and
+        /// checked when sent) or "require" (a client without one is
+        /// refused). Also over HTTP/3. Requests carry the certificate
+        /// (ANOLE_REQ_PEER_CERT).
+        client_auth: []const u8 = "none",
+        /// The CAs (PEM) client certificates must chain to, as a file or as
+        /// the PEM text: one of them with "request" and "require".
+        client_ca_file: ?[]const u8 = null,
+        client_ca_pem: ?[]const u8 = null,
     };
 
     pub const Limits = struct {
@@ -446,6 +464,13 @@ pub const Config = struct {
     };
 };
 
+pub const ClientAuth = enum { none, request, require };
+
+/// A listener's `tls.client_auth`, or null when it is none of the three.
+pub fn clientAuth(text: []const u8) ?ClientAuth {
+    return std.meta.stringToEnum(ClientAuth, text);
+}
+
 pub const max_timeouts = 16;
 
 /// The most an inline body or a WebSocket message may be (one event each).
@@ -509,7 +534,12 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (n != 1) return fail(why, "listeners[{d}].tls: exactly one of cert_file/key_file, cert_pem/key_pem, self_signed", .{i});
             if (files and (t.cert_file == null or t.key_file == null)) return fail(why, "listeners[{d}].tls: cert_file and key_file go together", .{i});
             if (pem and (t.cert_pem == null or t.key_pem == null)) return fail(why, "listeners[{d}].tls: cert_pem and key_pem go together", .{i});
+            const mode = clientAuth(t.client_auth) orelse return fail(why, "listeners[{d}].tls.client_auth: \"none\", \"request\" or \"require\"", .{i});
+            const cas = @as(u8, @intFromBool(t.client_ca_file != null)) + @intFromBool(t.client_ca_pem != null);
+            if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs one of client_ca_file, client_ca_pem", .{ i, t.client_auth });
+            if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: client_ca_file and client_ca_pem go with client_auth \"request\" or \"require\"", .{i});
         }
+        if (l.proxy_protocol_from.len > 0 and !l.proxy_protocol) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
         if (l.http3) {
             if (comptime !features.http3) return fail(why, "listeners[{d}].http3: HTTP/3 is not built in (-Dhttp3)", .{i});
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
@@ -831,6 +861,11 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"method\": \"GET\", \"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 0}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_pem\": \"b\"}}]}",
+        "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
     };
     for (bad) |doc| {
         why.end = 0;

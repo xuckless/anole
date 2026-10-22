@@ -54,7 +54,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 4 /* additions */
+#define ANOLE_ABI_VERSION_MINOR 5 /* additions */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 
 #if defined(_WIN32) && defined(ANOLE_SHARED)
@@ -172,6 +172,16 @@ ANOLE_API anole_status anole_server_wait(anole_server *s, int32_t timeout_ms);
 /* Reads every TLS listener's certificate files again and swaps them in;
    handshakes under way keep the old ones. */
 ANOLE_API anole_status anole_server_reload_certificates(anole_server *s);
+/* Swaps every TLS listener's certificate and key (the HTTP/3 one too) for
+   new ones: file paths, or PEM text with ANOLE_TLS_PEM (copied). Handshakes
+   under way keep the old ones; later reloads (anole_server_reload_certificates,
+   SIGHUP with ANOLE_SERVER_SIGNALS) read the new source. cert and key NULL:
+   as anole_server_reload_certificates. ANOLE_E_STATE when the server has no
+   TLS listener or is not running, ANOLE_E_INVALID when they do not load
+   (anole_last_error says why); the old certificate stays then. */
+#define ANOLE_TLS_PEM 1u
+ANOLE_API anole_status anole_server_reload_tls(anole_server *s, uint32_t flags, const char *cert,
+                                               size_t cert_len, const char *key, size_t key_len);
 /* Drains if still running, waits for the stop, joins Anole's threads and
    frees everything, consumers included. No handle, consumer or pointer
    from this server may be used afterwards. NULL is a no-op. */
@@ -293,6 +303,7 @@ enum anole_method {
 #define ANOLE_REQ_BODY_STREAM 2u /* there is a body to read with anole_req_read */
 #define ANOLE_REQ_SECURE 4u      /* arrived over TLS (or QUIC) */
 #define ANOLE_REQ_EARLY_DATA 8u  /* arrived in TLS 1.3 / QUIC 0-RTT (replayable) */
+#define ANOLE_REQ_PEER_CERT 16u  /* the client presented a certificate (mutual TLS): see peer_cert */
 
 /* ANOLE_EV_REQUEST and ANOLE_EV_WS_OPEN. Followed by
    `anole_span headers[2 * nheaders]` (name, value: names lower-cased, order
@@ -314,7 +325,9 @@ typedef struct anole_request_event {
   anole_span claims;       /* a verified JWT's claims as JSON (jwt middleware), else empty */
   uint16_t nheaders;
   uint16_t nparams;
-  uint32_t reserved;
+  uint32_t peer_cert;      /* mutual TLS: the offset of the client's certificate (verified
+                              against the listener's client CAs): a little-endian uint32_t
+                              length, then the DER; 0 when none (anole_request_peer_cert) */
   uint64_t content_length; /* UINT64_MAX when unknown */
 } anole_request_event;
 
@@ -473,6 +486,16 @@ static inline anole_str anole_event_str(const void *record, anole_span s) {
 }
 static inline const anole_span *anole_request_spans(const anole_request_event *r) {
   return (const anole_span *)(r + 1);
+}
+/* The client's certificate (DER) in a request record (ANOLE_EV_REQUEST,
+   ANOLE_EV_WS_OPEN, ANOLE_EV_WT_OPEN); empty when it sent none. */
+static inline anole_str anole_request_peer_cert(const anole_request_event *r) {
+  anole_str s = {0, 0};
+  if (r->peer_cert == 0) return s;
+  const unsigned char *p = (const unsigned char *)r + r->peer_cert;
+  s.len = (size_t)p[0] | (size_t)p[1] << 8 | (size_t)p[2] << 16 | (size_t)p[3] << 24;
+  s.ptr = (const char *)(p + 4);
+  return s;
 }
 
 /* Drains events into buf (caller-owned, 8-byte aligned; the caller owns the

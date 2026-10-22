@@ -100,6 +100,8 @@ test "anole.h: every constant as abi.zig has it" {
     try eq(abi.REQ_BODY_STREAM, c.ANOLE_REQ_BODY_STREAM);
     try eq(abi.REQ_SECURE, c.ANOLE_REQ_SECURE);
     try eq(abi.REQ_EARLY_DATA, c.ANOLE_REQ_EARLY_DATA);
+    try eq(abi.REQ_PEER_CERT, c.ANOLE_REQ_PEER_CERT);
+    try eq(abi.TLS_PEM, c.ANOLE_TLS_PEM);
     try eq(abi.WS_TEXT, c.ANOLE_WS_TEXT);
     try eq(abi.WS_BINARY, c.ANOLE_WS_BINARY);
     try eq(abi.POLL_NOARM, c.ANOLE_POLL_NOARM);

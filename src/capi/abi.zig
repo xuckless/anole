@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 4;
+pub const version_minor: u32 = 5;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -125,6 +125,10 @@ pub const REQ_BODY_INLINE: u16 = 1;
 pub const REQ_BODY_STREAM: u16 = 2;
 pub const REQ_SECURE: u16 = 4;
 pub const REQ_EARLY_DATA: u16 = 8;
+/// The client presented a certificate (mutual TLS): `peer_cert` is set.
+pub const REQ_PEER_CERT: u16 = 16;
+/// anole_server_reload_tls: the two arguments are PEM text, not paths.
+pub const TLS_PEM: u32 = 1;
 
 pub const RequestEvent = extern struct {
     ev: Event,
@@ -142,7 +146,9 @@ pub const RequestEvent = extern struct {
     claims: Span,
     nheaders: u16,
     nparams: u16,
-    reserved: u32 = 0,
+    /// Mutual TLS: the offset of the client's certificate in the record, a
+    /// little-endian u32 length then the DER; 0 when there is none.
+    peer_cert: u32 = 0,
     content_length: u64,
 };
 
