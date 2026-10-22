@@ -796,6 +796,11 @@ test "validateHeaderName: rejects empty, whitespace, colon, control" {
 /// The media types the server knows by name, for `res.content_type` and
 /// `req.content_type`; `.unknown` for anything else (set the
 /// `Content-Type` header yourself for those).
+/// Using a request or response out of order: a second `req.reader()`,
+/// `res.stream` after `res.body` was set, writing after the head went out.
+/// Answered 500.
+pub const MisuseError = error{ BodyReaderTaken, BodyAlreadySet, BodyWriterOpen, HeadersAlreadySent };
+
 pub const ContentType = enum(u32) {
     text,
     html,

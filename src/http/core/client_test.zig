@@ -2243,7 +2243,7 @@ test "Server: res.compress gzips buffered and streamed bodies for a client that 
 
         fn buffered(_: *dusty.Request, res: *dusty.Response) !void {
             res.compress = true;
-            var w = res.writer();
+            var w = try res.writer();
             for (0..100) |_| try w.interface.writeAll(line);
             try w.end();
         }

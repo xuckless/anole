@@ -598,6 +598,10 @@ pub fn BodyReader(comptime Parser: type) type {
         /// read just as surely and the connection has nothing to say about
         /// it.
         err: ?Error = null,
+        /// The most bytes the reader hands out (after decoding); past it
+        /// reading fails with `error.BodyTooBig`. Null: no limit.
+        body_limit: ?usize = null,
+        body_count: usize = 0,
 
         const Self = @This();
 
@@ -637,7 +641,7 @@ pub fn BodyReader(comptime Parser: type) type {
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
             ParseError || @typeInfo(@TypeOf(decodeCause(undefined))).error_union.error_set ||
-            error{ IncompleteBody, InvalidZstd, MalformedBody, Unexpected };
+            error{ IncompleteBody, InvalidZstd, MalformedBody, BodyTooBig, Unexpected };
 
         /// Stores what actually went wrong and reports the sentinel the
         /// vtable requires. Mirrors `fail` on the buffered body writer.
@@ -788,8 +792,12 @@ pub fn BodyReader(comptime Parser: type) type {
 
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
-            if (self.decode) |decode| return self.streamDecoded(decode, w, limit);
-            return self.streamFramed(w, limit);
+            const n = if (self.decode) |decode| try self.streamDecoded(decode, w, limit) else try self.streamFramed(w, limit);
+            if (self.body_limit) |max| {
+                self.body_count +|= n;
+                if (self.body_count > max) return self.fail(error.BodyTooBig);
+            }
+            return n;
         }
 
         fn streamFramed(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {

@@ -61,7 +61,7 @@ fn port(req: *dusty.Request, res: *dusty.Response) !void {
 /// GET /download?n=BYTES: that many bytes, streamed.
 fn download(req: *dusty.Request, res: *dusty.Response) !void {
     const n = std.fmt.parseInt(usize, req.query.get("n") orelse "0", 10) catch 0;
-    var w = res.writer();
+    var w = try res.writer();
     var chunk: [16 * 1024]u8 = undefined;
     for (&chunk, 0..) |*b, i| b.* = @truncate(i);
     var left = n;

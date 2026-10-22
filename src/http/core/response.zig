@@ -984,7 +984,7 @@ pub const Response = struct {
         resolve_beneath: bool = false,
     };
 
-    pub const SendFileError = std.Io.File.OpenError || std.Io.File.StatError || error{ FileTooBig, NotFile };
+    pub const SendFileError = std.Io.File.OpenError || std.Io.File.StatError || http.MisuseError || error{ FileTooBig, NotFile };
 
     /// Makes the file at `sub_path` in `dir` the body. The file is opened
     /// and checked now, so a missing one is reported here, where it can
@@ -1002,9 +1002,7 @@ pub const Response = struct {
     /// A directory is `error.IsDir`, and anything else that is not a
     /// regular file, such as a device, is `error.NotFile`. Never compressed.
     pub fn sendFile(self: *Response, dir: std.Io.Dir, sub_path: []const u8, options: SendFileOptions) SendFileError!std.Io.File.Stat {
-        std.debug.assert(!self.body_writer_open); // body writer already open
-        std.debug.assert(!self.headers_written); // body cannot start after the headers
-        std.debug.assert(self.body.len == 0 and self.body_buffer.len() == 0); // body already set
+        try self.checkBodyNotStarted();
         if (!staysInside(sub_path)) return error.BadPathName;
         const io = self.io;
         const handle = try dir.openFile(io, sub_path, .{ .resolve_beneath = options.resolve_beneath });
@@ -1079,8 +1077,8 @@ pub const Response = struct {
     /// running after the handler can still change them.
     ///
     /// Call `end` on the result before returning from the handler.
-    pub fn writer(self: *Response) BodyWriter {
-        self.startBody();
+    pub fn writer(self: *Response) http.MisuseError!BodyWriter {
+        try self.startBody();
         self.body_writer_buffering = true;
         // Without the memory, the first write fails the same way.
         self.body_buffer.reserveFirst(self.arena) catch {};
@@ -1096,7 +1094,7 @@ pub const Response = struct {
     /// The headers are on the wire when this returns, so nothing can change
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
-        self.startBody();
+        try self.startBody();
         // Everything that can fail comes before anything is committed: a
         // handler that gets an error from here still has open headers,
         // and the error response written in their place must not inherit
@@ -1139,17 +1137,23 @@ pub const Response = struct {
         return .init(self, buf, compressor);
     }
 
-    fn startBody(self: *Response) void {
-        std.debug.assert(!self.body_writer_open); // one body writer per response
-        std.debug.assert(!self.headers_written); // body cannot start after the headers
-        std.debug.assert(self.body.len == 0 and self.body_buffer.len() == 0); // body already set
+    /// A body can be started: no writer open, no head sent, no body set.
+    fn checkBodyNotStarted(self: *const Response) http.MisuseError!void {
+        if (self.body_writer_open) return error.BodyWriterOpen;
+        if (self.headers_written) return error.HeadersAlreadySent;
+        if (self.body.len != 0 or self.body_buffer.len() != 0) return error.BodyAlreadySet;
+    }
+
+    fn startBody(self: *Response) http.MisuseError!void {
+        try self.checkBodyNotStarted();
         self.body_writer_open = true;
     }
 
     /// Throws away the body written so far. Not while a body writer is
     /// open: its unflushed bytes are its own, and it would put them back.
     pub fn clearWriter(self: *Response) void {
-        std.debug.assert(!self.body_writer_buffering);
+        // A buffering writer is open: its bytes are its own.
+        if (self.body_writer_buffering) return;
         self.body_buffer.clear();
     }
 
@@ -1161,8 +1165,8 @@ pub const Response = struct {
     /// Only usable while the headers are still open; once they are on the
     /// wire the framing is already promised and the body cannot be
     /// swapped.
-    pub fn resetBody(self: *Response) void {
-        std.debug.assert(!self.headers_written);
+    pub fn resetBody(self: *Response) error{HeadersAlreadySent}!void {
+        if (self.headers_written) return error.HeadersAlreadySent;
         // An open writer is abandoned with the body: `end` on it does
         // nothing once it is no longer the open one.
         self.body_writer_open = false;
@@ -2349,7 +2353,7 @@ test "BodyWriter: sends nothing until the response is written" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
 
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("Hello, ");
     try body.interface.writeAll("World!");
     try body.end();
@@ -2379,7 +2383,7 @@ test "BodyWriter: a body larger than one write still arrives whole" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
 
-    var body = response.writer();
+    var body = try response.writer();
     for (0..100) |i| try body.interface.print("{d},", .{i});
     try body.end();
     try response.write();
@@ -2734,7 +2738,7 @@ test "BodyWriter: end is idempotent" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
 
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("hello");
     try body.end();
     // The `defer body.end() catch {}` that pairs with the line above.
@@ -2783,7 +2787,7 @@ test "Response: an abandoned buffered body goes out as far as it was flushed" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
 
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("hello");
     try body.interface.flush();
     try body.interface.writeAll(" world");
@@ -3536,7 +3540,7 @@ test "Response: resetBody replaces a half written body" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     response.content_type = .json;
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("{\"half\":");
     // The handler fails here, without ever calling `end`.
 
@@ -3571,7 +3575,7 @@ test "Response: resetBody drops the headers that described the old body" {
     try response.header("Content-Type", "application/json");
     try response.header("Content-Length", "8");
     try response.header("X-Request-Id", "abc");
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("{\"half\":");
 
     response.resetBody();
@@ -3692,7 +3696,7 @@ test "BodyWriter: a body over many segments goes out whole, with its length" {
     for (&expected, 0..) |*b, i| b.* = @intCast('a' + i % 26);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     // Short writes, as an encoder makes, crossing every segment boundary.
     var i: usize = 0;
     while (i < expected.len) : (i += 7) {
@@ -3719,7 +3723,7 @@ test "BodyWriter: a body of more segments than one vectored write takes goes out
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     var chunk: [1000]u8 = undefined;
     for (0..total / chunk.len) |i| {
         @memset(&chunk, @intCast('a' + i % 26));
@@ -3750,7 +3754,7 @@ test "BodyWriter: a write bigger than any segment, and a long splat" {
 
     const big: [100 * 1024]u8 = @splat('x');
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("<");
     try body.interface.writeAll(&big);
     try body.interface.splatByteAll('y', 70 * 1024);
@@ -3779,7 +3783,7 @@ test "BodyWriter: rebase keeps the bytes it was asked to preserve" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     const head: [500]u8 = @splat('h');
     try body.interface.writeAll(&head);
     // Asks for more room than the first segment has left, keeping the last
@@ -3817,7 +3821,7 @@ test "BodyWriter: a file streamed into the body arrives whole" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     const file = try tmp.dir.openFile(io, "body.txt", .{});
     defer file.close(io);
     var read_buf: [256]u8 = undefined;
@@ -3842,7 +3846,7 @@ test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("abc");
     const slice = try body.interface.writableSliceGreedyPreserve(100, 1000);
     try std.testing.expect(slice.len >= 1000);
@@ -3865,7 +3869,7 @@ test "Response: json is refused while a body writer is open" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("[");
     try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }));
     try body.interface.writeAll("]");
@@ -3885,14 +3889,14 @@ test "BodyWriter: resetBody after several segments leaves only the replacement" 
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.splatByteAll('y', 300);
     try body.interface.splatByteAll('z', 5000);
     try body.interface.flush();
     try std.testing.expect(response.body_buffer.segments.len() > 1);
     try std.testing.expectEqual(5300, response.body_buffer.len());
     response.resetBody();
-    var again = response.writer();
+    var again = try response.writer();
     try again.interface.writeAll("fresh");
     try again.end();
     try response.write();
@@ -4036,7 +4040,7 @@ test "Response: a HEAD sends no body written through the writer" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     response.head = true;
-    var body = response.writer();
+    var body = try response.writer();
     try body.interface.writeAll("hello");
     try body.end();
     try response.write();

@@ -282,7 +282,16 @@ pub const Request = struct {
     /// One per body. `body` takes it if you have not, so a handler that
     /// streams cannot then ask for the body whole.
     pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
+        return self.readerLimited(buffer, self.config.max_body_size);
+    }
+
+    /// `reader` with a limit of your own: the most bytes the body may bring
+    /// (decoded), `null` for any amount (an upload to a file, say). Past the
+    /// limit reading fails with `error.BodyTooBig` (a 413). `reader` stops
+    /// at `limits.body_max`, chunked bodies too.
+    pub fn readerLimited(self: *Request, buffer: []u8, limit: ?usize) !RequestBodyReader {
         var r = RequestBodyReader.init(self.parser, self.transport, buffer);
+        r.body_limit = limit;
         r.raw = self.body_source;
 
         // Once the body is in memory there is nothing left on the wire, and
@@ -295,7 +304,7 @@ pub const Request = struct {
         // The buffer belongs to the caller, so a second reader starts empty
         // and whatever the first one had buffered is unreachable -- bytes off
         // the body, with nothing to say they went missing.
-        std.debug.assert(!self._body_reader_taken); // one body reader per request
+        if (self._body_reader_taken) return error.BodyReaderTaken;
 
         r.request = self;
         if (self._decode) |decode| {

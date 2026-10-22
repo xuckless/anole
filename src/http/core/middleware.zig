@@ -175,7 +175,7 @@ pub fn Chain(comptime Ctx: type) type {
         }
 
         fn handleMethodNotAllowed(self: *Self, allow: []const u8) !void {
-            if (!self.res.headers_written) self.res.resetBody();
+            if (!self.res.headers_written) self.res.resetBody() catch {};
             try self.res.header("Allow", allow);
             if (comptime Ctx != void and @hasDecl(Ctx, "methodNotAllowed")) {
                 try self.ctx.methodNotAllowed(self.req, self.res);
@@ -190,7 +190,7 @@ pub fn Chain(comptime Ctx: type) type {
             // of the 404. Unlike the error path, nothing has checked the
             // headers yet: a middleware that started streaming has already
             // committed the framing, so there is nothing to replace.
-            if (!self.res.headers_written) self.res.resetBody();
+            if (!self.res.headers_written) self.res.resetBody() catch {};
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
                 try self.ctx.notFound(self.req, self.res);
             } else {
@@ -203,7 +203,7 @@ pub fn Chain(comptime Ctx: type) type {
             // it did not finish, and `write` would send it in place of the
             // error response. The caller has already checked that the
             // headers are still open.
-            self.res.resetBody();
+            self.res.resetBody() catch {};
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(self.req, self.res, err);
             } else if (self.error_handler) |handler| {
@@ -845,7 +845,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
         .action = struct {
             fn handle(_: *Request, r: *Response) !void {
                 r.content_type = .json;
-                var body = r.writer();
+                var body = try r.writer();
                 try body.interface.writeAll("{\"half\":");
                 // Flushed, so the response holds the fragment the error
                 // path has to throw away.
@@ -869,7 +869,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
 const WritingMiddleware = struct {
     pub fn execute(_: *const WritingMiddleware, _: *Request, res: *Response, next: *Chain(void)) !void {
         res.content_type = .json;
-        var body = res.writer();
+        var body = try res.writer();
         try body.interface.writeAll("{\"half\":");
         try body.interface.flush();
         return next.call();

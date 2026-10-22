@@ -67,6 +67,10 @@ pub const Ca = dusty.Ca;
 /// Mutual TLS on a listener (`anole.ClientAuth`).
 pub const ClientAuth = dusty.ClientAuth;
 
+/// Using a request or response out of order (a second `req.reader()`,
+/// `res.stream` after `res.body` was set): a named error, answered 500.
+pub const MisuseError = dusty.MisuseError;
+
 /// How the server writes its own error answers (`ServerConfig.errors`).
 pub const ErrorFormat = dusty.ErrorFormat;
 /// `ServerConfig.error_handler`: a function that answers handler errors.
