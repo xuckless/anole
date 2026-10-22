@@ -1405,4 +1405,5 @@ const HealthCmd = struct {
 
 test {
     _ = schema;
+    _ = @import("grpc_test.zig");
 }

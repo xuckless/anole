@@ -1,0 +1,476 @@
+//! The C ABI's gRPC server, end to end: a consumer thread implements
+//! anole.test.Echo, anole.test.Lookup and part of transcode.Library through
+//! the engine's functions (what libanole's exports call), and Anole's own
+//! gRPC client, HTTP/1.1 client and h2 client check what goes out. The C
+//! suite (tests/capi/grpc.c) covers the exported API over gRPC-Web.
+const std = @import("std");
+const anole = @import("../root.zig");
+const dusty = @import("dusty");
+const engine = @import("engine.zig");
+const grpc_capi = @import("grpc.zig");
+const abi = engine.abi;
+const features = anole.features;
+const zio = anole.zio;
+const grpc = anole.grpc;
+const pb = @import("anole_test_pb");
+const tpb = @import("anole_transcode_pb");
+
+const alloc = std.testing.allocator;
+const Echo = pb.Echo(grpc.Call, anyerror);
+
+const Consumer = struct {
+    e: *engine.Engine,
+    c: *engine.Consumer,
+    stop: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+    /// The call the consumer holds unanswered ("hold"), and the last ABORT.
+    held: std.atomic.Value(u64) = .init(0),
+    last_abort: std.atomic.Value(u64) = .init(0),
+    calls: std.atomic.Value(u32) = .init(0),
+    /// Client-streaming calls: what came so far.
+    pending: std.AutoHashMapUnmanaged(u64, std.ArrayList(u8)) = .empty,
+    bidi_index: std.AutoHashMapUnmanaged(u64, i32) = .empty,
+
+    fn run(self: *Consumer) void {
+        var buf: [256 * 1024]u8 align(8) = undefined;
+        while (!self.stop.load(.acquire)) {
+            const n = engine.pollWait(self.c, &buf, 50) catch unreachable;
+            var off: usize = 0;
+            while (off < n) {
+                const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+                self.handle(buf[off..][0..ev.len]) catch |err| {
+                    std.debug.print("consumer failed: {t}\n", .{err});
+                    _ = self.failures.fetchAdd(1, .monotonic);
+                };
+                off += ev.len;
+            }
+        }
+        var it = self.pending.valueIterator();
+        while (it.next()) |v| v.deinit(alloc);
+        self.pending.deinit(alloc);
+        self.bidi_index.deinit(alloc);
+    }
+
+    fn str(rec: []const u8, s: abi.Span) []const u8 {
+        return rec[s.off..][0..s.len];
+    }
+
+    fn metadata(rec: []const u8, name: []const u8) ?[]const u8 {
+        const call: *const abi.GrpcCallEvent = @ptrCast(@alignCast(rec.ptr));
+        const spans: [*]align(1) const abi.Span = @ptrCast(rec[@sizeOf(abi.GrpcCallEvent)..].ptr);
+        for (0..call.nmetadata) |k| if (std.mem.eql(u8, str(rec, spans[2 * k]), name)) return str(rec, spans[2 * k + 1]);
+        return null;
+    }
+
+    fn encode(arena: std.mem.Allocator, msg: anytype) ![]const u8 {
+        var w: std.Io.Writer.Allocating = .init(arena);
+        try msg.encode(&w.writer, arena);
+        return w.written();
+    }
+
+    fn decode(comptime T: type, arena: std.mem.Allocator, bytes: []const u8) !T {
+        var r: std.Io.Reader = .fixed(bytes);
+        return T.decode(&r, arena);
+    }
+
+    fn handle(self: *Consumer, rec: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
+        const e = self.e;
+        const h = ev.handle;
+        const g = grpc_capi;
+        switch (@as(abi.EventType, @fromBackingInt(@intCast(ev.type)))) {
+            .abort => {
+                self.last_abort.store(h, .release);
+                if (self.pending.fetchRemove(h)) |kv| {
+                    var list = kv.value;
+                    list.deinit(alloc);
+                }
+                _ = self.bidi_index.remove(h);
+                return;
+            },
+            .grpc_message => {
+                const m: *const abi.GrpcMessageEvent = @ptrCast(@alignCast(rec.ptr));
+                const req = try decode(pb.EchoRequest, arena, str(rec, m.data));
+                if (self.pending.getPtr(h)) |list| {
+                    try list.appendSlice(alloc, req.message);
+                } else if (self.bidi_index.getPtr(h)) |i| {
+                    _ = try g.send(e, h, try encode(arena, pb.EchoResponse{ .message = req.message, .index = i.* }), false, false);
+                    i.* += 1;
+                }
+                try g.read(e, h, 1);
+                return;
+            },
+            .grpc_half_close => {
+                if (self.pending.fetchRemove(h)) |kv| {
+                    var list = kv.value;
+                    defer list.deinit(alloc);
+                    _ = try g.send(e, h, try encode(arena, pb.EchoResponse{ .message = list.items }), false, true);
+                } else if (self.bidi_index.remove(h)) {
+                    try g.finish(e, h, 0, "", &.{});
+                }
+                return;
+            },
+            .grpc_call => {},
+            else => return,
+        }
+        _ = self.calls.fetchAdd(1, .monotonic);
+        const call: *const abi.GrpcCallEvent = @ptrCast(@alignCast(rec.ptr));
+        const method = str(rec, call.method);
+        switch (call.route_id) {
+            // anole.test.Echo: Unary 0, ServerStream 1, ClientStream 2, Bidi 3.
+            10 => switch (call.method_id) {
+                0 => {
+                    if (!std.mem.eql(u8, method, "/anole.test.Echo/Unary") or call.kind != abi.GRPC_UNARY) return error.WrongCall;
+                    if (call.flags & abi.GRPC_CALL_MESSAGE == 0) return error.NoMessage;
+                    const req = try decode(pb.EchoRequest, arena, str(rec, call.message));
+                    if (std.mem.eql(u8, req.message, "fail")) {
+                        return g.finish(e, h, @intFromEnum(grpc.Code.not_found), "no such thing: fail", &.{
+                            .{ .name = .of("x-why"), .value = .of("test") },
+                            .{ .name = .of("x-raw-bin"), .value = .of("\x00\x01\xff") },
+                        });
+                    }
+                    if (std.mem.eql(u8, req.message, "hold")) {
+                        if (call.timeout_us < 0 and metadata(rec, "x-expect-deadline") != null) return error.NoDeadline;
+                        self.held.store(h, .release);
+                        return;
+                    }
+                    if (std.mem.eql(u8, req.message, "headers")) {
+                        try g.sendHeaders(e, h, &.{.{ .name = .of("x-initial"), .value = .of("yes") }});
+                        // Twice: refused.
+                        if (g.sendHeaders(e, h, &.{})) |_| return error.SecondHeaders else |err| if (err != error.State) return err;
+                    }
+                    const echoed = metadata(rec, "x-trace") orelse "none";
+                    _ = try g.send(e, h, try encode(arena, pb.EchoResponse{ .message = req.message }), false, false);
+                    // A second message for a unary call: refused.
+                    if (g.send(e, h, "", false, false)) |_| return error.SecondMessage else |err| if (err != error.State) return err;
+                    try g.finish(e, h, 0, "", &.{.{ .name = .of("x-echoed"), .value = .of(echoed) }});
+                    // Finished: the handle is stale.
+                    if (g.finish(e, h, 0, "", &.{})) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                },
+                1 => {
+                    const req = try decode(pb.EchoRequest, arena, str(rec, call.message));
+                    var i: i32 = 0;
+                    while (i < req.repeat) : (i += 1) {
+                        _ = try g.send(e, h, try encode(arena, pb.EchoResponse{ .message = req.message, .index = i }), false, false);
+                    }
+                    try g.finish(e, h, 0, "", &.{});
+                },
+                2 => try self.pending.put(alloc, h, .empty),
+                3 => try self.bidi_index.put(alloc, h, 0),
+                else => return error.WrongMethod,
+            },
+            // anole.test.Lookup: Find 0, Store 1.
+            11 => {
+                const req = try decode(pb.EchoRequest, arena, str(rec, call.message));
+                _ = try g.send(e, h, try encode(arena, pb.EchoResponse{ .message = req.message }), false, true);
+            },
+            // transcode.Library, three methods listed: GetBook 0, WatchBooks 1, UploadBooks 2.
+            12 => switch (call.method_id) {
+                0 => {
+                    const req = try decode(tpb.GetBookRequest, arena, str(rec, call.message));
+                    _ = try g.send(e, h, try encode(arena, tpb.Book{ .name = req.name, .title = "T", .pages = 7 }), false, true);
+                },
+                1 => {
+                    for ([_][]const u8{ "a", "b" }) |n| _ = try g.send(e, h, try encode(arena, tpb.Book{ .name = n }), false, false);
+                    try g.finish(e, h, 0, "", &.{});
+                },
+                else => try g.finish(e, h, @intFromEnum(grpc.Code.unimplemented), "", &.{}),
+            },
+            else => return error.WrongService,
+        }
+    }
+};
+
+fn waitUntil(io: std.Io, v: *std.atomic.Value(u64), want: ?u64) !u64 {
+    for (0..2500) |_| {
+        const got = v.load(.acquire);
+        if (if (want) |w| got == w else got != 0) return got;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TimedOut;
+}
+
+const Http1 = struct { status: u16, body: []const u8 };
+
+fn http1(io: std.Io, arena: std.mem.Allocator, port: u16, method: dusty.Method, path: []const u8, content_type: ?[]const u8, body: ?[]const u8) !Http1 {
+    var client = dusty.Client.init(alloc, io, .{});
+    defer client.deinit();
+    var headers = try dusty.Headers.init(alloc, 8);
+    defer headers.deinit(alloc);
+    if (content_type) |ct| try headers.put("Content-Type", ct);
+    var url_buf: [256]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+    var resp = try client.fetch(url, .{ .method = method, .headers = &headers, .body = body });
+    defer resp.deinit();
+    return .{ .status = @intCast(@backingInt(resp.status())), .body = try arena.dupe(u8, (try resp.body()) orelse "") };
+}
+
+fn check(a: *Consumer, port: u16, io: std.Io) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    var step: []const u8 = "unary";
+    errdefer std.debug.print("capi grpc check failed at {s}\n", .{step});
+
+    // Unary, detached: the answer, trailing metadata from the request's.
+    const d0 = a.e.stats().detached;
+    {
+        const r = try client.unary("Unary", arena, .{ .message = "hello" }, .{ .metadata = &.{.{ .name = "x-trace", .value = "t1" }} });
+        try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+        try std.testing.expectEqualStrings("hello", r.message.?.message);
+        var echoed: []const u8 = "";
+        for (r.trailers) |t| if (std.mem.eql(u8, t.name, "x-echoed")) {
+            echoed = t.value;
+        };
+        try std.testing.expectEqualStrings("t1", echoed);
+    }
+    try std.testing.expect(a.e.stats().detached > d0);
+
+    step = "error status";
+    {
+        const r = try client.unary("Unary", arena, .{ .message = "fail" }, .{});
+        try std.testing.expectEqual(grpc.Code.not_found, r.status.code);
+        try std.testing.expectEqualStrings("no such thing: fail", r.status.message);
+        var why: []const u8 = "";
+        var raw: []const u8 = "";
+        for (r.trailers) |t| {
+            if (std.mem.eql(u8, t.name, "x-why")) why = t.value;
+            if (std.mem.eql(u8, t.name, "x-raw-bin")) raw = t.value;
+        }
+        try std.testing.expectEqualStrings("test", why);
+        try std.testing.expectEqualStrings("AAH/", raw);
+    }
+
+    step = "initial metadata";
+    {
+        var s = try client.stream("Unary", arena, .{});
+        defer s.deinit();
+        try s.send(.{ .message = "headers" });
+        try s.closeSend();
+        const reply = (try s.receive()).?;
+        try std.testing.expectEqualStrings("headers", reply.message);
+        try std.testing.expectEqualStrings("yes", s.stream.header("x-initial") orelse "");
+        try std.testing.expect(try s.receive() == null);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+
+    step = "server streaming";
+    {
+        var s = try client.stream("ServerStream", arena, .{});
+        defer s.deinit();
+        try s.send(.{ .message = "tick", .repeat = 5 });
+        try s.closeSend();
+        var n: i32 = 0;
+        while (try s.receive()) |m| : (n += 1) {
+            try std.testing.expectEqual(n, m.index);
+            try std.testing.expectEqualStrings("tick", m.message);
+        }
+        try std.testing.expectEqual(@as(i32, 5), n);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+
+    step = "client streaming";
+    {
+        // More messages than read_ahead (8): the consumer's credit lets
+        // the rest in.
+        var s = try client.stream("ClientStream", arena, .{ .compression = if (features.compression) .gzip else .identity });
+        defer s.deinit();
+        var want: std.ArrayList(u8) = .empty;
+        for (0..20) |i| {
+            const m = try std.fmt.allocPrint(arena, "{c}", .{@as(u8, 'a') + @as(u8, @intCast(i))});
+            try want.appendSlice(arena, m);
+            try s.send(.{ .message = m });
+        }
+        try s.closeSend();
+        const reply = (try s.receive()).?;
+        try std.testing.expectEqualStrings(want.items, reply.message);
+        try std.testing.expect(try s.receive() == null);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+
+    step = "bidi";
+    {
+        var s = try client.stream("Bidi", arena, .{});
+        defer s.deinit();
+        for ([_][]const u8{ "ping", "pong", "again" }, 0..) |m, i| {
+            try s.send(.{ .message = m });
+            const reply = (try s.receive()).?;
+            try std.testing.expectEqualStrings(m, reply.message);
+            try std.testing.expectEqual(@as(i32, @intCast(i)), reply.index);
+        }
+        try s.closeSend();
+        try std.testing.expect(try s.receive() == null);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+
+    step = "deadline";
+    {
+        a.held.store(0, .release);
+        const r = try client.unary("Unary", arena, .{ .message = "hold" }, .{ .timeout = .fromMilliseconds(150), .metadata = &.{.{ .name = "x-expect-deadline", .value = "1" }} });
+        try std.testing.expectEqual(grpc.Code.deadline_exceeded, r.status.code);
+        const held = try waitUntil(io, &a.held, null);
+        _ = try waitUntil(io, &a.last_abort, held);
+        try std.testing.expectError(error.Gone, grpc_capi.finish(a.e, held, 0, "", &.{}));
+    }
+
+    step = "cancel";
+    {
+        a.held.store(0, .release);
+        var s = try client.stream("Unary", arena, .{});
+        try s.send(.{ .message = "hold" });
+        try s.closeSend();
+        const held = try waitUntil(io, &a.held, null);
+        s.cancel();
+        s.deinit();
+        _ = try waitUntil(io, &a.last_abort, held);
+        try std.testing.expectError(error.Gone, grpc_capi.send(a.e, held, "", false, true));
+    }
+
+    step = "connect json";
+    {
+        const r = try http1(io, arena, port, .post, "/anole.test.Echo/Unary", "application/json", "{\"message\":\"json\"}");
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("{\"message\":\"json\"}", r.body);
+        const bad = try http1(io, arena, port, .post, "/anole.test.Echo/Unary", "application/json", "{\"message\":7}");
+        try std.testing.expectEqual(@as(u16, 400), bad.status);
+    }
+
+    step = "connect get";
+    {
+        // Lookup.Find has no side effects: GET with the message in the query.
+        const r = try http1(io, arena, port, .get, "/anole.test.Lookup/Find?encoding=json&message=%7B%22message%22%3A%22got%22%7D", null, null);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("{\"message\":\"got\"}", r.body);
+        const store = try http1(io, arena, port, .get, "/anole.test.Lookup/Store?encoding=json&message=%7B%7D", null, null);
+        try std.testing.expect(store.status == 404 or store.status == 405);
+    }
+
+    step = "transcoding";
+    {
+        const r = try http1(io, arena, port, .get, "/v1/books/abc", null, null);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expectEqualStrings("{\"name\":\"abc\",\"title\":\"T\",\"pages\":\"7\"}", r.body);
+        const w = try http1(io, arena, port, .get, "/v1/shelves/s1/books:watch", null, null);
+        try std.testing.expectEqual(@as(u16, 200), w.status);
+        try std.testing.expectEqualStrings("[{\"name\":\"a\"},{\"name\":\"b\"}]", w.body);
+        const up = try http1(io, arena, port, .post, "/v1/books:upload", "application/json", "{}");
+        try std.testing.expectEqual(@as(u16, 501), up.status);
+    }
+
+    step = "health";
+    {
+        const Health = grpc.health.pb.Health(grpc.Call, anyerror);
+        const hc: grpc.Client(Health) = .{ .channel = &channel };
+        const r = try hc.unary("Check", arena, .{ .service = "anole.test.Echo" }, .{});
+        try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+        try std.testing.expectEqual(grpc.health.ServingStatus.SERVING, r.message.?.status);
+        try grpc_capi.healthSet(a.e, "anole.test.Echo", abi.GRPC_HEALTH_NOT_SERVING);
+        for (0..500) |_| {
+            const again = try hc.unary("Check", arena, .{ .service = "anole.test.Echo" }, .{});
+            if (again.message.?.status == .NOT_SERVING) break;
+            try io.sleep(.fromMilliseconds(2), .awake);
+        } else return error.TimedOut;
+    }
+}
+
+test "capi grpc: every call mode over h2c, status and metadata, deadlines, cancel, Connect, transcoding, health" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 2, "timeouts": {{"request_ms": 3000, "shutdown_ms": 1000}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "grpc": {{"descriptor_set": "{s}", "health": true, "services": [
+        \\   {{"name": "anole.test.Echo", "handler": 10}},
+        \\   {{"name": "anole.test.Lookup", "handler": 11}},
+        \\   {{"name": "transcode.Library", "handler": 12, "methods": [{{"name": "GetBook"}}, {{"name": "WatchBooks"}}, {{"name": "UploadBooks"}}]}}
+        \\ ]}}}}
+    , .{b64});
+    defer alloc.free(json);
+    var why_buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    // Before start: kept until the health service exists.
+    try grpc_capi.healthSet(e, "later.Service", abi.GRPC_HEALTH_NOT_SERVING);
+    try e.start();
+
+    var a: Consumer = .{ .e = e, .c = c };
+    const t = try std.Thread.spawn(.{}, Consumer.run, .{&a});
+    defer {
+        a.stop.store(true, .release);
+        t.join();
+    }
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(check, .{ &a, e.ports.items[0], io });
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+    try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
+}
+
+test "capi grpc: configurations refused" {
+    const cases = [_][]const u8{
+        // No descriptors and no methods.
+        \\{"grpc": {"services": [{"name": "a.B", "handler": 1}]}}
+        ,
+        // No descriptors and a method without its kind.
+        \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M"}]}]}}
+        ,
+        // A service twice.
+        \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}]}, {"name": "a.B", "handler": 2, "methods": [{"name": "M", "kind": "unary"}]}]}}
+        ,
+        // Not base64.
+        \\{"grpc": {"descriptor_set": "!!", "services": [{"name": "a.B", "handler": 1}]}}
+        ,
+        // Bytes that are not a FileDescriptorSet.
+        \\{"grpc": {"descriptor_set": "AAAA", "services": [{"name": "a.B", "handler": 1}]}}
+        ,
+    };
+    for (cases) |json| {
+        var why_buf: [400]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        if (engine.Engine.create(json, false, &why)) |e| {
+            e.destroy();
+            std.debug.print("accepted: {s}\n", .{json});
+            return error.Accepted;
+        } else |err| try std.testing.expectEqual(error.Config, err);
+    }
+    // A service the descriptors do not have, and a kind they contradict.
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    inline for (.{
+        \\{{"grpc": {{"descriptor_set": "{s}", "services": [{{"name": "no.Such", "handler": 1}}]}}}}
+        ,
+        \\{{"grpc": {{"descriptor_set": "{s}", "services": [{{"name": "anole.test.Echo", "handler": 1, "methods": [{{"name": "Unary", "kind": "bidi_streaming"}}]}}]}}}}
+        ,
+        \\{{"grpc": {{"descriptor_set": "{s}", "services": [{{"name": "anole.test.Echo", "handler": 1, "methods": [{{"name": "Nope"}}]}}]}}}}
+    }) |fmt| {
+        const json = try std.fmt.allocPrint(alloc, fmt, .{b64});
+        defer alloc.free(json);
+        var why_buf: [400]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        if (engine.Engine.create(json, false, &why)) |e| {
+            e.destroy();
+            return error.Accepted;
+        } else |err| try std.testing.expectEqual(error.Config, err);
+    }
+}

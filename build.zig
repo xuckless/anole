@@ -1598,6 +1598,24 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         .optimize = o.optimize,
         .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
     }));
+    // The test services' descriptors (a FileDescriptorSet with imports,
+    // made by the pinned protoc), for the C ABI's gRPC tests: what a
+    // consumer passes as grpc.descriptor_set.
+    if (f.grpc and o.for_test) if (b.lazyDependency("protobuf", .{ .target = b.graph.host })) |pb_dep| if (protocBinary(pb_dep.builder)) |protoc| {
+        const run = b.addRunFile(protoc);
+        run.setName("protoc test descriptors");
+        run.addArg("--include_imports");
+        const set = run.addPrefixedOutputFileArg("--descriptor_set_out=", "test.binpb");
+        run.addArg("-I");
+        run.addDirectoryArg(b.path("tests/grpc/proto"));
+        run.addArg("-I");
+        run.addDirectoryArg(b.path("src/grpc/proto"));
+        run.addFileArg(b.path("tests/grpc/proto/echo.proto"));
+        run.addFileArg(b.path("tests/grpc/proto/transcode.proto"));
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(set, "test.binpb");
+        mod.addAnonymousImport("anole_test_descriptors", .{ .root_source_file = wf.add("descriptors.zig", "pub const set = @embedFile(\"test.binpb\");\n") });
+    };
     if (f.compression) {
         mod.addImport("anole_zlib", o.c.zlib.?);
         mod.addImport("anole_zlib_c", o.c.zlib_c.?);
