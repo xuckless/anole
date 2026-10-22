@@ -332,6 +332,13 @@ static anole_str param_of(const anole_request_event *r, const char *name) {
 
 static int str_is(anole_str s, const char *want) { return s.len == strlen(want) && memcmp(s.ptr, want, s.len) == 0; }
 
+static int str_has(anole_str s, const char *want) {
+  size_t n = strlen(want);
+  for (size_t i = 0; i + n <= s.len; i++)
+    if (memcmp(s.ptr + i, want, n) == 0) return 1;
+  return 0;
+}
+
 static const anole_header text_plain[] = {{{"content-type", 12}, {"text/plain", 10}}};
 
 #define BIG_LEN (200 * 1024)
@@ -848,6 +855,10 @@ static void test_main_server(void) {
     CHECK(anole_respond(h ^ (1ull << 60), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
+    /* Every error answer sets its own text: none is left over from an earlier call. */
+    CHECK(str_has(anole_last_error(), "invalid"));
+    CHECK(anole_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(str_has(anole_last_error(), "stale"));
     CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (have_websocket ? ANOLE_E_GONE : ANOLE_E_UNSUPPORTED));
 
     /* slot reuse: same executor and slot, newer generation, old one stays GONE */
@@ -2000,14 +2011,18 @@ static void wt_event(wt_state *st, const anole_event *ev) {
       e->len += d.len;
       if (!fin) break;
       char out[32];
+      int n;
       if (e->uni) {
-        int n = snprintf(out, sizeof out, "uni:%zu", e->len);
-        CHECK(anole_wt_send_datagram(e->session, out, (size_t)n) == ANOLE_OK);
+        n = snprintf(out, sizeof out, "uni:%zu", e->len);
       } else {
         CHECK(e->len == 6 && memcmp(e->got, "thanks", 6) == 0);
-        CHECK(anole_wt_send_datagram(e->session, "thanked", 7) == ANOLE_OK);
+        n = snprintf(out, sizeof out, "thanked");
       }
+      /* Released before the answer: the client closes the session once it
+         has "thanked", and a stream is stale from its session's close on. */
+      anole_wt session = e->session;
       wt_forget(st, e);
+      CHECK(anole_wt_send_datagram(session, out, (size_t)n) == ANOLE_OK);
     } else {
       anole_status rc = anole_wt_stream_write(ev->handle, d.ptr, d.len, fin ? ANOLE_WT_FIN : 0);
       CHECK(rc == ANOLE_OK || rc == ANOLE_BUSY);
@@ -2165,7 +2180,24 @@ static void test_tls(void) {
   printf("ok tls: mutual TLS and proxy settings in the configuration, anole_server_reload_tls's refusals\n");
 }
 
+/* A hang fails the run instead of holding CI until the job's timeout: the
+   last "ok" line printed (stdout is line-buffered) names the last step that
+   passed. abort() leaves a core where cores are kept. */
+static void on_watchdog(int sig) {
+  (void)sig;
+  const char *msg = "FAIL: still running after the watchdog's limit (hung); the step after the last \"ok\" line hangs\n";
+  (void)!write(2, msg, strlen(msg));
+  abort();
+}
+
+static void start_watchdog(unsigned seconds) {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  signal(SIGALRM, on_watchdog);
+  alarm(seconds);
+}
+
 static int run_tests(void) {
+  start_watchdog(600);
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
   test_basics();
