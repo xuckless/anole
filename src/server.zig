@@ -1956,6 +1956,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// thread that called `init`.
         pub fn run(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
+            logBuildMode();
             self.addHelperRoutes();
             self.startConnectors() catch |err| return self.failStart(err);
             const rt_io = self.rt.io();
@@ -2069,6 +2070,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     else => log.err("SIGHUP: certificate reload failed, keeping the current one: {t}", .{err}),
                 }
                 if (self.process) |p| sd_notify.ready(p.environ, null);
+            }
+        }
+
+        /// Which build this is; a loud word for ReleaseFast, which has none
+        /// of Zig's safety checks (docs/server.md recommends ReleaseSafe).
+        fn logBuildMode() void {
+            const log = std.log.scoped(.anole);
+            const name = switch (builtin.mode) {
+                .debug => "Debug",
+                .safe => "ReleaseSafe",
+                .fast => "ReleaseFast",
+                .small => "ReleaseSmall",
+            };
+            switch (builtin.mode) {
+                .fast, .small => log.warn("built with {s}: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production", .{name}),
+                .debug, .safe => log.info("{s} build", .{name}),
             }
         }
 

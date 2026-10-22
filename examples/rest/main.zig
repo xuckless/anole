@@ -15,6 +15,8 @@ const anole = @import("anole");
 
 /// Keeps the runtime's per-thread lines out of a Debug build.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const User = struct { id: u64, name: []const u8, email: []const u8 };
 const NewUser = struct { name: []const u8, email: []const u8 };

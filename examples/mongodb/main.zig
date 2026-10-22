@@ -17,6 +17,8 @@ const std = @import("std");
 const anole = @import("anole");
 
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const App = struct { db: *anole.mongodb.Client };
 

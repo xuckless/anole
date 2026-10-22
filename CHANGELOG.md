@@ -30,6 +30,17 @@ breaking changes are listed anyway.
   for `h3`, UDP) sockets; anything else stops the start with
   `error.InheritedSocketMismatch`. A CPU quota that does not fit 32 bits no
   longer stops the start.
+- `anole.panic` (`pub const panic = anole.panic;` in the root file; the
+  examples and libanole use it): a panic is written as one error line with
+  its stack trace through the log function, then the process aborts. The
+  server logs its build mode at start and warns when it is ReleaseFast or
+  ReleaseSmall; `addApp` warns at build time for those modes (the build is
+  not refused).
+- CI: a Release checks workflow runs h2spec, Autobahn, the HTTP/3 checks,
+  the QUIC interop runner, gRPC interop and the C ABI suite against
+  ReleaseFast builds, and the bundled C libraries under sanitizers, at every
+  release tag. Actions are pinned by commit; downloads in the sanitizer
+  script and the Python test packages are checked by hash.
 
 ### C ABI (ABI 0.1)
 

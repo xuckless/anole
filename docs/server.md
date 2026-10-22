@@ -106,6 +106,22 @@ pub const std_options: std.Options = .{
 `anole.logFn` is still there for programs that set it; it only renames the
 scopes older builds used.
 
+A panic (a bug: an index out of bounds, an integer overflow, `unreachable`)
+stops the process. Zig's default handler prints it to standard error;
+`anole.panic` writes the message and the stack trace as one error line
+through the log function instead, so it lands wherever the logs go (a JSON
+collector, journald), then aborts. The examples declare it; leave the line
+out to keep Zig's default:
+
+```zig
+pub const panic = anole.panic;
+```
+
+At start the server logs which build it is. A `ReleaseFast` build gets a
+warning: Zig's safety checks are off there, so a bug that `ReleaseSafe` would
+stop at the faulty line can corrupt memory instead. `ReleaseSafe` is the
+recommended build for production.
+
 Do not set `std_options_debug_io = zio.debug_io`, as zio's own examples do.
 std.debug unwinds stack traces through that `Io`, and Debug builds capture
 traces inside allocator and task-pool locks, so a coroutine can be suspended

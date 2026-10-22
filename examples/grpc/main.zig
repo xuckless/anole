@@ -37,6 +37,8 @@ const pb = @import("greeter_pb");
 /// Keeps the runtime's per-thread lines and the connection loops' debug
 /// lines out of a Debug build; info (startup lines, access log) stays.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 const Call = anole.grpc.Call;
 

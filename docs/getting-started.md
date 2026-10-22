@@ -79,6 +79,7 @@ const std = @import("std");
 const anole = @import("anole");
 
 pub const std_options = anole.std_options;
+pub const panic = anole.panic;
 
 const Todo = struct { id: usize, title: []const u8, done: bool = false };
 const NewTodo = struct { title: []const u8 };

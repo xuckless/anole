@@ -16,6 +16,8 @@ const anole = @import("anole");
 
 /// Keeps the runtime's per-thread lines out of a Debug build.
 pub const std_options = anole.std_options;
+// A panic is logged (message and stack trace) before the process aborts.
+pub const panic = anole.panic;
 
 pub const App = struct {
     db: *anole.sqlite.Client = undefined,
