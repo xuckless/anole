@@ -1541,10 +1541,13 @@ fn finishDetached(x: *Exec, si: u32) void {
     const gen = genOf(w);
     x.unlink(si);
     if (stateOf(w) == .streaming or (stateOf(w) == .done and s.reply == .fd)) {
-        const group = d.attach();
-        placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) catch {
+        const spawned = if (d.attach()) |group| placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) else error.ConnectionClosed;
+        spawned catch {
+            // The connection is going (or no task could start): a stream
+            // the consumer is writing hears it is over.
+            if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, gen));
             x.closePipe(&s.in, gen, si);
-            d.finish(error.SystemResources);
+            d.finish(error.ConnectionResetByPeer);
             x.release(si);
         };
         return;

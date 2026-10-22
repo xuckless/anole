@@ -602,6 +602,9 @@ pub fn Engine(comptime Ctx: type) type {
                     // stream; the loop looks again.
                     if (stream.detached != null) {
                         abortDetached(stream);
+                        // Never attached by now (`conn.tasks` is null, and
+                        // attached tasks were joined): the abort let go.
+                        std.debug.assert(stream.detached == null);
                         continue;
                     }
                     // No handler task is left (a stream whose head never
@@ -617,7 +620,13 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             var group: std.Io.Group = .init;
-            defer group.cancel(conn.io);
+            defer {
+                group.cancel(conn.io);
+                // A canceled group takes tasks again: nothing may join it
+                // from here on (a detached response finished during the
+                // teardown would outlive the connection).
+                conn.tasks = null;
+            }
             conn.tasks = &group;
             // The writer and the streams stay on the connection's executor.
             try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
@@ -1248,14 +1257,15 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// The response goes on from a task: its body writes may now wait
         /// for the peer, as a handler task's do.
-        fn detachedAttach(d: *Detached) *std.Io.Group {
+        fn detachedAttach(d: *Detached) ?*std.Io.Group {
             const ex = exchangeOf(d);
             const stream = ex.sink_state.stream;
             const conn = stream.conn;
             conn.lock();
             defer conn.unlock();
+            const tasks = conn.tasks orelse return null;
             stream.inline_mode = false;
-            return conn.tasks.?;
+            return tasks;
         }
 
         fn detachedEnter(d: *Detached) void {
