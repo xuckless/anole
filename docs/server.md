@@ -480,8 +480,12 @@ Every connection is a file descriptor, and the process's soft open-file
 limit is often 1024 (256 on macOS), kept low for old programs that use
 `select`. So `init` raises the soft limit to the hard one, as Go does at
 startup: 524,288 under systemd by default, 1,048,576 in Docker, and on macOS
-`kern.maxfilesperproc` at most. (`raise_fd_limit = false` leaves it alone;
-processes the server starts inherit the raised limit.)
+`kern.maxfilesperproc` at most. (`raise_fd_limit = false` leaves it alone.)
+Processes your handlers start inherit the raised limit, as with Go; a
+program that still uses `select` (which cannot watch descriptors past 1023)
+can misbehave with it, so start such a program through a wrapper that lowers
+it again (`sh -c 'ulimit -n 1024; exec prog'`), or turn `raise_fd_limit` off
+and raise the limit in the service manager instead (`LimitNOFILE=`).
 
 `server.max_connections` follows the limit by default. When serving starts
 it is the soft limit less what other descriptors need:
@@ -797,7 +801,11 @@ protocol itself (no libsystemd): `READY=1` once the listeners are bound,
 `READY=1` from the new process once it serves, so systemd follows the main
 process to it, `READY=1` from the old one if the new one fails, and
 `STOPPING=1` when a drain to exit starts. The process that hands over never
-sends `STOPPING=1`, which would stop the service. A path starting with `@` is
+sends `STOPPING=1`, which would stop the service. The server keeps the socket
+for itself and takes `NOTIFY_SOCKET` out of the process's environment at
+`init` (its entry becomes `ANOLE_NOTIFY_SOCKET_TAKEN=1`), so programs your
+handlers start cannot report to systemd for the service; a restart hands it
+to the new process itself. A path starting with `@` is
 in Linux's abstract namespace.
 
 A service with every listener passed in, restarted with `systemctl reload`:

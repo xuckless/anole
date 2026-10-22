@@ -23,6 +23,13 @@ breaking changes are listed anyway.
   in bytes (the larger of 16 x `limits.ws_high_water` and
   2 x `limits.ws_max_message`), not only in count, so clients cannot make a
   slow consumer's queue hold `limits.queue` whole messages.
+- With `ServerOptions.process` set, the server keeps systemd's `NOTIFY_SOCKET`
+  for itself and takes it out of the environment that programs started by
+  handlers inherit (a restart passes it to the new process). Sockets
+  inherited through `LISTEN_FDS` are checked to be listening TCP/unix (or,
+  for `h3`, UDP) sockets; anything else stops the start with
+  `error.InheritedSocketMismatch`. A CPU quota that does not fit 32 bits no
+  longer stops the start.
 
 ### C ABI (ABI 0.1)
 
