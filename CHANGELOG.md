@@ -5,6 +5,14 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- HTTP/3: long-header packets whose connection ID is longer than QUIC
+  allows (20 bytes), and Version Negotiation packets sent to the server,
+  are dropped before any lookup. Previously one such datagram could crash
+  the process. Every deployment with HTTP/3 on should upgrade; no
+  configuration change is needed.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings

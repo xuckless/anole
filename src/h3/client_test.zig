@@ -442,6 +442,43 @@ test "h3 server: no_wait routes run inline, past the ring, beside tasks; one tha
     try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= 23);
 }
 
+test "h3 server: long-header packets with a connection ID over 20 bytes are dropped, and the endpoint carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var raw: net.Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    defer raw.socket.close(io);
+    var pkt: [1300]u8 = undefined;
+    // Version 0 (Version Negotiation), version 1 and an unknown version,
+    // each with a 200-byte destination ID; short and padded to 1200+.
+    for ([_]u32{ 0, 1, 0x1a2a3a4a }) |version| for ([_]usize{ 208, 1300 }) |len| {
+        @memset(&pkt, 0xab);
+        pkt[0] = 0xc0;
+        std.mem.writeInt(u32, pkt[1..5], version, .big);
+        pkt[5] = 200;
+        pkt[6 + 200] = 0;
+        raw.send(io, f.ep.address(), null, 0, pkt[0..len], len);
+    };
+    // A destination ID of 21 bytes, one past the limit.
+    pkt[0] = 0xc0;
+    std.mem.writeInt(u32, pkt[1..5], 0, .big);
+    pkt[5] = 21;
+    pkt[6 + 21] = 0;
+    raw.send(io, f.ep.address(), null, 0, pkt[0..28], 28);
+    try io.sleep(.fromMilliseconds(50), .awake);
+
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+}
+
 test "h3 server: Response.abort resets the stream, and the connection carries on" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });

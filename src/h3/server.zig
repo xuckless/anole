@@ -1070,22 +1070,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// endpoint task and its inbox task both call it, on one executor,
         /// so it keeps nothing in the endpoint across a yield.
         fn onPacket(self: *Self, from: std.Io.net.IpAddress, local: ?std.Io.net.IpAddress, ecn: u8, data: []u8, ts: u64) void {
-            var vc: c.ngtcp2_version_cid = undefined;
-            switch (c.ngtcp2_pkt_decode_version_cid(&vc, data.ptr, data.len, scid_len)) {
-                0 => {},
-                c.NGTCP2_ERR_VERSION_NEGOTIATION => {
-                    self.sendVersionNegotiation(from, local, &vc);
-                    return;
-                },
-                else => return,
-            }
+            const vc, const dcid = switch (net.classify(data, scid_len)) {
+                .drop => return,
+                .version_negotiation => |vc| return self.sendVersionNegotiation(from, local, &vc),
+                .packet => |p| .{ p.vc, p.dcid },
+            };
             if (self.owner(data)) |ep| return self.forward(ep, from, local, ecn, data);
             _ = self.stats.packets.fetchAdd(1, .monotonic);
             if (builtin.is_test) if (self.thread) |t| if (t != std.Thread.getCurrentId()) {
                 _ = self.stats.foreign.fetchAdd(1, .monotonic);
             };
             const remote: Addr = .from(from);
-            if (self.lookup(.of(vc.dcid[0..vc.dcidlen]))) |conn| {
+            if (self.lookup(dcid)) |conn| {
                 defer conn.unref();
                 conn.onPacket(remote, local, ecn, data, ts);
                 return;
