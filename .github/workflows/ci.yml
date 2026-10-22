@@ -143,14 +143,20 @@ jobs:
         run: zig build hello rest websocket grpc auth clients observe postgres sqlite mongodb redis io full --summary all
       # Two examples serve requests: hello over HTTP/1.1, and full (every
       # listener, `process` set, so the Unix-only hand-off is skipped)
-      # over HTTP/1.1, h2c and HTTPS with HTTP/2. Ctrl-C would drain them,
-      # but a runner has no console to send one to, so they are killed.
+      # over HTTP/1.1, HTTPS, and h2c and HTTP/2 over TLS when a curl with
+      # HTTP/2 is on the runner (Git for Windows' is built without it; the
+      # h2 client tests above cover HTTP/2 either way). Ctrl-C would drain
+      # them, but a runner has no console to send one to, so they are killed.
       - name: examples/hello and examples/full answer requests
         timeout-minutes: 5
         run: |
+          h2curl=
+          for c in curl /c/Windows/System32/curl.exe; do
+            if "$c" -V 2>/dev/null | grep -q '^Features:.* HTTP2'; then h2curl=$c; break; fi
+          done
           get() {
             for i in $(seq 1 50); do
-              if curl -fsS "$@"; then echo; return 0; fi
+              if "$@"; then echo; return 0; fi
               sleep 0.2
             done
             return 1
@@ -158,13 +164,18 @@ jobs:
           ok=0
           ./zig-out/bin/hello.exe > hello.log 2>&1 &
           hello=$!
-          get http://127.0.0.1:3000/ || ok=1
+          get curl -fsS http://127.0.0.1:3000/ || ok=1
           kill $hello || true
           ./zig-out/bin/full.exe > full.log 2>&1 &
           full=$!
-          get http://127.0.0.1:8080/ || ok=1
-          get --http2-prior-knowledge http://127.0.0.1:8080/ || ok=1
-          get -k --http2 https://127.0.0.1:8443/ -w '%{http_version}\n' || ok=1
+          get curl -fsS http://127.0.0.1:8080/ || ok=1
+          get curl -fsSk https://127.0.0.1:8443/ || ok=1
+          if [ -n "$h2curl" ]; then
+            get "$h2curl" -fsS --http2-prior-knowledge http://127.0.0.1:8080/ -w ' (HTTP/%{http_version})' || ok=1
+            get "$h2curl" -fsSk --http2 https://127.0.0.1:8443/ -w ' (HTTP/%{http_version})' || ok=1
+          else
+            echo "no curl with HTTP/2 here: h2c and h2 over TLS not checked from outside"
+          fi
           kill $full || true
           echo "--- hello.log"; cat hello.log
           echo "--- full.log"; cat full.log
