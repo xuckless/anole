@@ -1,0 +1,155 @@
+[info] available CPUs: 28
+[info] load generators: docker mode
+[info] framework: anole-ma (anole, Zig)
+[info] subscribed tests: baseline,baseline-h2,baseline-h2c,json-h2c,unary-grpc,unary-grpc-tls,async-db,echo-ws
+[info] building image: httparena-anole-ma
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.22kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 0.2s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 126B done
+#3 DONE 0.0s
+
+#4 [build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#4 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 539B done
+#5 DONE 0.0s
+
+#6 [build 5/8] COPY build.zig build.zig.zon ./
+#6 CACHED
+
+#7 [build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#7 CACHED
+
+#8 [build 3/8] WORKDIR /server
+#8 CACHED
+
+#9 [build 7/8] COPY proto ./proto
+#9 CACHED
+
+#10 [build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#10 CACHED
+
+#11 [build 6/8] COPY src ./src
+#11 CACHED
+
+#12 [build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#12 CACHED
+
+#13 [stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#13 CACHED
+
+#14 exporting to image
+#14 exporting layers done
+#14 exporting manifest sha256:671c4873b3d0623e5b761d9e2f094412a681c33de92b0efd5231ec37c51de1b7 done
+#14 exporting config sha256:d9781f1f0cab0846a302f661a12bea9845d09445550b3a605b09594370067db4 done
+#14 exporting attestation manifest sha256:ddd30337e6002b001798b1f25ad74ee85ad81dc4f0f9f8d2233533d736dcc56d done
+#14 exporting manifest list sha256:f1dc4f753940cde51b027a5033d8119f81af62a7d7750c117dc7298d351bb76d done
+#14 naming to docker.io/library/httparena-anole-ma:latest done
+#14 unpacking to docker.io/library/httparena-anole-ma:latest done
+#14 DONE 0.0s
+[info] skipping system tuning as requested (SKIP_TUNE=true)
+[info] starting postgres sidecar
+[info] postgres ready (seeded)
+
+==============================================
+=== anole-ma / async-db / 1024c (tool=gcannon) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] server ready
+
+[run 1/3]
+gcannon v0.6.1
+  Target:    localhost:8080/
+  Threads:   64
+  Conns:     1024 (16/thread)
+  Pipeline:  1
+  Req/conn:  25
+  Templates: 5
+  Expected:  200
+  Duration:  10s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   8.15ms   3.23ms   21.30ms   68.40ms   134.20ms
+
+  1257370 requests in 10.00s, 1257247 responses
+  Throughput: 125.69K req/s
+  Bandwidth:  480.80MB/s
+  Status codes: 2xx=1257247, 3xx=0, 4xx=0, 5xx=0
+  Latency samples: 1257247 / 1257247 responses (100.0%)
+  Reconnects: 50042
+  Errors: connect 0, read 125, timeout 0
+  Per-template: 251796,251827,251845,251123,250656
+  Per-template-ok: 251796,251827,251845,251123,250656
+[info] CPU 745.3% | Mem 213MiB
+
+[run 2/3]
+gcannon v0.6.1
+  Target:    localhost:8080/
+  Threads:   64
+  Conns:     1024 (16/thread)
+  Pipeline:  1
+  Req/conn:  25
+  Templates: 5
+  Expected:  200
+  Duration:  10s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   8.72ms   4.59ms   21.40ms   57.20ms   108.80ms
+
+  1171246 requests in 10.00s, 1171122 responses
+  Throughput: 117.08K req/s
+  Bandwidth:  447.93MB/s
+  Status codes: 2xx=1171122, 3xx=0, 4xx=0, 5xx=0
+  Latency samples: 1171122 / 1171122 responses (100.0%)
+  Reconnects: 46812
+  Errors: connect 0, read 126, timeout 0
+  Per-template: 234650,234529,234427,233724,233792
+  Per-template-ok: 234650,234529,234427,233724,233792
+[info] CPU 737.4% | Mem 283MiB
+
+[run 3/3]
+gcannon v0.6.1
+  Target:    localhost:8080/
+  Threads:   64
+  Conns:     1024 (16/thread)
+  Pipeline:  1
+  Req/conn:  25
+  Templates: 5
+  Expected:  200
+  Duration:  10s
+
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   12.47ms   6.88ms   30.60ms   80.10ms   150.00ms
+
+  819417 requests in 10.00s, 819338 responses
+  Throughput: 81.92K req/s
+  Bandwidth:  313.59MB/s
+  Status codes: 2xx=819338, 3xx=0, 4xx=0, 5xx=0
+  Latency samples: 819338 / 819338 responses (100.0%)
+  Reconnects: 32627
+  Errors: connect 0, read 81, timeout 0
+  Per-template: 163601,163998,164424,163774,163541
+  Per-template-ok: 163601,163998,164424,163774,163541
+[info] CPU 655.9% | Mem 312MiB
+
+=== Best: 125724 req/s (CPU: 745.3%, Mem: 213MiB) ===
+[info] input BW: 8.39MB/s (avg template: 70 bytes)
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-ma
+httparena-bench-anole-ma
+[info] done
+httparena-postgres

@@ -1,0 +1,288 @@
+[info] available CPUs: 28
+[info] load generators: docker mode
+[info] framework: anole-ma (anole, Zig)
+[info] subscribed tests: baseline,baseline-h2,baseline-h2c,json-h2c,unary-grpc,unary-grpc-tls,async-db,echo-ws
+[info] building image: httparena-anole-ma
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.22kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 0.3s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 126B done
+#3 DONE 0.0s
+
+#4 [build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#4 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 539B done
+#5 DONE 0.0s
+
+#6 [build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#6 CACHED
+
+#7 [build 3/8] WORKDIR /server
+#7 CACHED
+
+#8 [build 6/8] COPY src ./src
+#8 CACHED
+
+#9 [build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#9 CACHED
+
+#10 [build 5/8] COPY build.zig build.zig.zon ./
+#10 CACHED
+
+#11 [build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#11 CACHED
+
+#12 [build 7/8] COPY proto ./proto
+#12 CACHED
+
+#13 [stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#13 CACHED
+
+#14 exporting to image
+#14 exporting layers done
+#14 exporting manifest sha256:671c4873b3d0623e5b761d9e2f094412a681c33de92b0efd5231ec37c51de1b7 done
+#14 exporting config sha256:d9781f1f0cab0846a302f661a12bea9845d09445550b3a605b09594370067db4 done
+#14 exporting attestation manifest sha256:9ff397312d4808da560aa2c4fcd6de22e4af02114c3748ae6e85e00f44c21c46 done
+#14 exporting manifest list sha256:021452886a4119d0b481570546dee1502c1c7ee753e39b0084c67321f6c4cb38 done
+#14 naming to docker.io/library/httparena-anole-ma:latest done
+#14 unpacking to docker.io/library/httparena-anole-ma:latest done
+#14 DONE 0.0s
+[info] skipping system tuning as requested (SKIP_TUNE=true)
+[info] starting postgres sidecar
+[info] postgres ready (seeded)
+
+==============================================
+=== anole-ma / unary-grpc-tls / 256c (tool=h2load) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] gRPC server ready
+
+[run 1/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+.
+progress: 100Warm-up phase is over for thread #Warm-up phase is over for thread #Warm-up phase is over for thread #Warm-up phase is over for thread #Warm-up phase is over for thread #51.
+53.Warm-up phase is over for thread #54
+.Warm-up phase is over for thread #20
+32Main benchmark duration is started for thread #54.
+.
+40.
+56.
+% of clients started
+.Warm-up phase is over for thread #
+0.
+30.
+50.31.Warm-up phase is over for thread #Main benchmark duration is started for thread #25.
+.
+
+16Warm-up phase is over for thread #.
+47.
+
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+30. Stopping all clients.
+14
+13. Stopping all clients.
+37. Stopping all clients.
+
+44
+34Stopped all clients for thread #2
+
+
+finished in 5.03s, 120768.20 req/s, 4.62MB/s
+requests: 603841 total, 629441 started, 603841 done, 603841 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 603841 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 23.10MB (24220744) total, 3.51MB (3676070) headers (space savings 95.74%), 4.03MB (4226887) data
+                     min         max         mean         sd        +/- sd
+time for request:     2.06ms       4.62s    188.89ms    353.64ms    93.06%
+time for connect:     2.62ms    124.16ms     40.96ms     29.37ms    64.45%
+time to 1st byte:     8.19ms    354.05ms    167.48ms    100.29ms    56.25%
+req/s           :     128.38      974.63      471.69      187.55    64.84%
+[info] CPU 434.8% | Mem 665MiB
+
+[run 2/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+...
+27.Main benchmark duration is started for thread #
+36.
+29.
+.
+
+
+.
+37.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+35
+
+36. Stopping all clients.
+28
+42. Stopping all clients.
+
+finished in 5.03s, 118369.60 req/s, 4.53MB/s
+requests: 591848 total, 617448 started, 591848 done, 591848 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 591848 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 22.64MB (23739184) total, 3.44MB (3602272) headers (space savings 95.74%), 3.95MB (4142936) data
+                     min         max         mean         sd        +/- sd
+time for request:     2.32ms       4.31s    194.63ms    351.56ms    92.92%
+time for connect:     1.35ms    182.05ms     36.47ms     31.78ms    76.95%
+time to 1st byte:     9.98ms    454.55ms    183.41ms    112.34ms    68.75%
+req/s           :     202.37     1344.25      462.32      185.34    71.88%
+[info] CPU 457.6% | Mem 681MiB
+
+[run 3/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+9Main benchmark duration is started for thread #57.
+.
+62Warm-up started for thread #48.
+.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+
+23.
+.Main benchmark duration is started for thread #10.
+
+26.
+50.
+25Warm-up phase is over for thread #
+1.
+16.
+27Main benchmark duration is started for thread #16.
+.
+.
+14.
+. Stopping all clients.
+. Stopping all clients.
+
+
+27. Stopping all clients.
+
+
+finished in 5.03s, 118578.60 req/s, 4.54MB/s
+requests: 592893 total, 618493 started, 592893 done, 592893 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 592893 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 22.68MB (23782226) total, 3.44MB (3609784) headers (space savings 95.74%), 3.96MB (4150251) data
+                     min         max         mean         sd        +/- sd
+time for request:     1.33ms       4.31s    195.24ms    349.51ms    92.99%
+time for connect:     2.17ms    150.34ms     35.91ms     31.64ms    78.52%
+time to 1st byte:     7.58ms    444.21ms    175.79ms    113.27ms    60.55%
+req/s           :     170.77     1271.96      463.15      175.80    75.00%
+[info] CPU 413.7% | Mem 684MiB
+
+=== Best: 120047 req/s (CPU: 434.8%, Mem: 665MiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-ma
+httparena-bench-anole-ma
+
+==============================================
+=== anole-ma / unary-grpc-tls / 1024c (tool=h2load) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] gRPC server ready
+
+[run 1/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+
+2847Main benchmark duration is started for thread #9.
+20.
+
+.
+.
+
+
+
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+63. Stopping all clients.
+6
+
+finished in 5.05s, 116990.40 req/s, 4.51MB/s
+requests: 584952 total, 687352 started, 584952 done, 584952 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 584952 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 22.55MB (23643289) total, 3.53MB (3698601) headers (space savings 95.58%), 3.90MB (4094664) data
+                     min         max         mean         sd        +/- sd
+time for request:     7.69ms       4.83s    476.10ms    519.30ms    91.25%
+time for connect:    11.15ms    233.22ms    124.40ms     61.05ms    58.01%
+time to 1st byte:    90.21ms       2.01s    660.73ms    329.09ms    63.57%
+req/s           :      65.57      263.72      114.22       32.22    73.34%
+[info] CPU 484.0% | Mem 1.9GiB
+
+[run 2/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+49.
+.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+
+finished in 5.08s, 112046.20 req/s, 4.32MB/s
+requests: 560231 total, 662631 started, 560231 done, 560231 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 560231 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 21.62MB (22669698) total, 3.40MB (3565524) headers (space savings 95.55%), 3.74MB (3921617) data
+                     min         max         mean         sd        +/- sd
+time for request:     2.85ms       4.88s    517.06ms    487.25ms    92.36%
+time for connect:     4.78ms    228.74ms    105.57ms     62.63ms    55.96%
+time to 1st byte:    90.50ms       1.25s    706.21ms    325.46ms    58.69%
+req/s           :      59.20      286.16      109.39       32.05    69.92%
+[info] CPU 472.6% | Mem 1.9GiB
+
+[run 3/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+2.
+
+
+50.Warm-up phase is over for thread #62.
+
+.
+21.
+33.
+30.
+.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+
+finished in 5.08s, 112470.60 req/s, 4.34MB/s
+requests: 562353 total, 664753 started, 562353 done, 562353 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 562353 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 21.69MB (22743883) total, 3.40MB (3567561) headers (space savings 95.56%), 3.75MB (3936471) data
+                     min         max         mean         sd        +/- sd
+time for request:     2.03ms       4.81s    515.02ms    485.14ms    92.46%
+time for connect:     5.10ms    234.43ms    103.37ms     63.41ms    54.88%
+time to 1st byte:     9.09ms       1.78s    712.29ms    322.24ms    62.40%
+req/s           :      59.22      222.74      109.83       31.17    68.07%
+[info] CPU 452.3% | Mem 2.0GiB
+
+=== Best: 115832 req/s (CPU: 484.0%, Mem: 1.9GiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-ma
+httparena-bench-anole-ma
+[info] done
+httparena-postgres

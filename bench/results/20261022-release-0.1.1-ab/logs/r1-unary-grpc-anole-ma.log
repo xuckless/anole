@@ -1,0 +1,307 @@
+[info] available CPUs: 28
+[info] load generators: docker mode
+[info] framework: anole-ma (anole, Zig)
+[info] subscribed tests: baseline,baseline-h2,baseline-h2c,json-h2c,unary-grpc,unary-grpc-tls,async-db,echo-ws
+[info] building image: httparena-anole-ma
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.22kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 0.2s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 126B done
+#3 DONE 0.0s
+
+#4 [build 1/8] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#4 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 539B done
+#5 DONE 0.0s
+
+#6 [build 2/8] RUN apk add --no-cache ca-certificates curl git tar xz
+#6 CACHED
+
+#7 [build 3/8] WORKDIR /server
+#7 CACHED
+
+#8 [build 6/8] COPY src ./src
+#8 CACHED
+
+#9 [build 7/8] COPY proto ./proto
+#9 CACHED
+
+#10 [build 4/8] RUN set -eu;     case "amd64" in         amd64) ZIG_ARCH=x86_64 ;;         arm64) ZIG_ARCH=aarch64 ;;         *) echo "unsupported arch: amd64" >&2; exit 1 ;;     esac;     curl -fSL "https://ziglang.org/download/0.17.0/zig-${ZIG_ARCH}-linux-0.17.0.tar.xz"         | tar -xJ -C /opt;     mv "/opt/zig-${ZIG_ARCH}-linux-0.17.0" /opt/zig
+#10 CACHED
+
+#11 [build 5/8] COPY build.zig build.zig.zon ./
+#11 CACHED
+
+#12 [build 8/8] RUN set -eu;     case "amd64" in         amd64) ZIG_TARGET=x86_64-linux-musl; ZIG_CPU="x86_64_v3+aes+pclmul+adx" ;;         arm64) ZIG_TARGET=aarch64-linux-musl; ZIG_CPU=baseline ;;     esac;     zig build         -Dtarget="${ZIG_TARGET}"         -Dcpu="${ZIG_CPU}"         -Doptimize=ReleaseFast --summary failures
+#12 CACHED
+
+#13 [stage-1 2/2] COPY --from=build /server/zig-out/bin/anole-arena /anole-arena
+#13 CACHED
+
+#14 exporting to image
+#14 exporting layers done
+#14 exporting manifest sha256:671c4873b3d0623e5b761d9e2f094412a681c33de92b0efd5231ec37c51de1b7 done
+#14 exporting config sha256:d9781f1f0cab0846a302f661a12bea9845d09445550b3a605b09594370067db4 done
+#14 exporting attestation manifest sha256:67bddb10e8bfa7cc8888c0c23e41287089cc5ddda2ef1efb8272d28390abe2b3 done
+#14 exporting manifest list sha256:150f31bf86e937f86827aa98a4115d15301d787cc3dba1830776efe1b64c4b45 done
+#14 naming to docker.io/library/httparena-anole-ma:latest done
+#14 unpacking to docker.io/library/httparena-anole-ma:latest done
+#14 DONE 0.0s
+[info] skipping system tuning as requested (SKIP_TUNE=true)
+[info] starting postgres sidecar
+[info] postgres ready (seeded)
+
+==============================================
+=== anole-ma / unary-grpc / 256c (tool=h2load) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] gRPC server ready
+
+[run 1/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+25% of clients started
+Application protocol: h2c
+55.Main benchmark duration is started for thread #56.
+.Warm-up phase is over for thread #45.
+
+
+20.
+1.
+6.
+46.
+34Warm-up phase is over for thread #Warm-up phase is over for thread #Warm-up phase is over for thread #Main benchmark duration is started for thread #44.23.
+
+49Warm-up phase is over for thread #Main benchmark duration is started for thread #.447.
+.35Main benchmark duration is started for thread #Warm-up phase is over for thread #49.
+.Warm-up phase is over for thread #60.
+3.
+
+
+
+.
+.
+
+
+53
+
+58. Stopping all clients.Stopped all clients for thread #41
+
+
+
+
+
+
+finished in 5.03s, 158709.60 req/s, 5.93MB/s
+requests: 793548 total, 819148 started, 793548 done, 793548 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 793548 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 29.63MB (31065111) total, 3.83MB (4012783) headers (space savings 95.64%), 5.30MB (5554836) data
+                     min         max         mean         sd        +/- sd
+time for request:     1.43ms       2.51s    159.20ms     68.24ms    69.71%
+time for connect:       48us       667us       274us       149us    55.08%
+time to 1st byte:     4.33ms    678.38ms    180.60ms    134.20ms    66.80%
+req/s           :     331.74     1299.83      619.91      235.45    71.88%
+[info] CPU 348.1% | Mem 252MiB
+
+[run 2/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+
+5660.Warm-up phase is over for thread #Warm-up phase is over for thread #Main benchmark duration is started for thread #50.
+52.
+
+
+55.
+29.
+.
+59.
+.
+32Warm-up phase is over for thread #Warm-up phase is over for thread #Main benchmark duration is started for thread #43.21
+.Warm-up phase is over for thread #20.
+
+34.
+.
+
+.
+Application protocol: h2c
+3.
+48.
+2. Stopping all clients.
+60Stopped all clients for thread #. Stopping all clients.49
+
+51
+41. Stopping all clients.
+3
+
+finished in 5.03s, 155347.20 req/s, 5.80MB/s
+requests: 776736 total, 802336 started, 776736 done, 776736 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 776736 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 29.00MB (30411864) total, 3.75MB (3931092) headers (space savings 95.64%), 5.19MB (5437152) data
+                     min         max         mean         sd        +/- sd
+time for request:     5.12ms       2.69s    162.07ms     68.94ms    72.09%
+time for connect:       38us     15.52ms       507us      1.88ms    98.44%
+time to 1st byte:     5.46ms    711.06ms    184.51ms    140.17ms    67.58%
+req/s           :     290.47     1479.73      606.79      221.34    74.61%
+[info] CPU 381.5% | Mem 295MiB
+
+[run 3/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+
+10.Main benchmark duration is started for thread #
+
+60Main benchmark duration is started for thread #4.
+.
+Application protocol: h2c
+.
+47.Main benchmark duration is started for thread #57.
+
+
+1Warm-up phase is over for thread #.
+58.
+
+.
+20.
+35Stopped all clients for thread #. Stopping all clients.
+6
+60
+62
+
+
+61. Stopping all clients.Stopped all clients for thread #24
+
+
+finished in 5.03s, 154756.20 req/s, 5.78MB/s
+requests: 773781 total, 799381 started, 773781 done, 773781 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 773781 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 28.89MB (30294293) total, 3.74MB (3916708) headers (space savings 95.64%), 5.17MB (5416467) data
+                     min         max         mean         sd        +/- sd
+time for request:     5.79ms       3.41s    165.37ms     83.11ms    73.60%
+time for connect:       35us       657us       284us       156us    56.64%
+time to 1st byte:     6.49ms    781.61ms    206.29ms    152.73ms    62.89%
+req/s           :     235.99     2539.60      604.47      359.58    90.23%
+[info] CPU 359.1% | Mem 318MiB
+
+=== Best: 157763 req/s (CPU: 348.1%, Mem: 252MiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-ma
+httparena-bench-anole-ma
+
+==============================================
+=== anole-ma / unary-grpc / 1024c (tool=h2load) ===
+==============================================
+[warn] profile cpuset 0-31,64-95 exceeds available CPUs (max 27) — using all cores
+[info] waiting for server...
+[info] gRPC server ready
+
+[run 1/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+
+5358Main benchmark duration is started for thread #51.
+.
+
+.
+.
+55.
+Application protocol: h2c
+31.
+15. Stopping all clients.
+5Main benchmark duration is over for thread #. Stopping all clients.42
+. Stopping all clients.
+
+finished in 5.07s, 140627.20 req/s, 5.32MB/s
+requests: 703136 total, 805536 started, 703136 done, 703136 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 703136 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 26.59MB (27879641) total, 3.52MB (3686077) headers (space savings 95.48%), 4.69MB (4921952) data
+                     min         max         mean         sd        +/- sd
+time for request:    35.20ms       4.98s    676.84ms    233.33ms    79.25%
+time for connect:       39us     34.96ms      2.09ms      5.09ms    94.92%
+time to 1st byte:    37.86ms       2.47s    680.36ms    412.45ms    63.77%
+req/s           :      50.99      219.97      137.31       36.83    52.25%
+[info] CPU 354.6% | Mem 1.2GiB
+
+[run 2/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+35.
+.
+43.
+.Warm-up phase is over for thread #Warm-up phase is over for thread #26.Main benchmark duration is started for thread #Warm-up phase is over for thread #31.
+
+47Main benchmark duration is started for thread #31.
+.
+
+37.
+44Main benchmark duration is started for thread #47.
+.
+
+33progress: 56.% of clients started
+44.
+32.
+62.
+.Main benchmark duration is started for thread #11.
+
+Application protocol: h2c
+47
+19
+. Stopping all clients.
+
+
+
+finished in 5.07s, 143826.40 req/s, 5.44MB/s
+requests: 719132 total, 821532 started, 719132 done, 719132 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 719132 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 27.19MB (28509135) total, 3.60MB (3772097) headers (space savings 95.48%), 4.80MB (5033924) data
+                     min         max         mean         sd        +/- sd
+time for request:     2.52ms       4.98s    659.07ms    256.21ms    84.61%
+time for connect:       47us     53.96ms      2.00ms      4.73ms    95.02%
+time to 1st byte:     3.33ms       4.32s    645.86ms    506.56ms    80.90%
+req/s           :       0.00      316.11      140.44       34.70    69.04%
+[info] CPU 385.1% | Mem 1.3GiB
+
+[run 3/3]
+-t: warning: the number of threads is greater than hardware cores.
+starting benchmark...
+6Warm-up started for thread #4.
+.
+6.Warm-up phase is over for thread #23.
+26.
+
+6Main benchmark duration is started for thread #Main benchmark duration is started for thread #5341..
+
+.
+.
+.
+28.
+Application protocol: h2c
+.
+
+finished in 5.07s, 140118.20 req/s, 5.30MB/s
+requests: 700591 total, 802991 started, 700591 done, 700591 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 700591 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 26.49MB (27774804) total, 3.50MB (3669005) headers (space savings 95.49%), 4.68MB (4904137) data
+                     min         max         mean         sd        +/- sd
+time for request:     4.72ms       4.99s    675.75ms    261.93ms    82.81%
+time for connect:       48us     61.58ms      2.99ms      5.23ms    88.67%
+time to 1st byte:     6.06ms       2.71s    685.63ms    473.13ms    70.51%
+req/s           :      50.39      279.94      136.81       36.32    63.96%
+[info] CPU 361.6% | Mem 1.3GiB
+
+=== Best: 141840 req/s (CPU: 385.1%, Mem: 1.3GiB) ===
+[info] dry-run — not saving (use --save to persist)
+httparena-bench-anole-ma
+httparena-bench-anole-ma
+[info] done
+httparena-postgres
