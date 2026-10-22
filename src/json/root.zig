@@ -112,8 +112,7 @@ fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, opti
             // A real with no fraction is still a whole number.
             const f = c.yyjson_get_real(v);
             if (@floor(f) != f or !std.math.isFinite(f)) return error.UnexpectedType;
-            if (f < @as(f64, @floatFromInt(std.math.minInt(T))) or f > @as(f64, @floatFromInt(std.math.maxInt(T)))) return error.Overflow;
-            return @intFromFloat(f);
+            return intFromWholeFloat(T, f) orelse error.Overflow;
         },
         .float => {
             if (t != c.YYJSON_TYPE_NUM) return error.UnexpectedType;
@@ -181,6 +180,18 @@ fn fromValue(comptime T: type, arena: std.mem.Allocator, v: ?*c.yyjson_val, opti
         },
         else => @compileError("anole.json: unsupported type " ++ @typeName(T)),
     }
+}
+
+/// A whole, finite `f` as a `T`, or null when it is out of `T`'s range.
+/// The bounds are compared as powers of two, which f64 holds exactly:
+/// maxInt(T) itself rounds up to the next power of two for 64-bit types.
+fn intFromWholeFloat(comptime T: type, f: f64) ?T {
+    const info = @typeInfo(T).int;
+    const value_bits = info.bits - @intFromBool(info.signedness == .signed);
+    const upper = std.math.ldexp(@as(f64, 1), value_bits); // exclusive
+    const lower = if (info.signedness == .signed) -upper else 0; // inclusive
+    if (f < lower or f >= upper) return null;
+    return @intFromFloat(f);
 }
 
 /// `value` as JSON text, allocated from `arena`.
@@ -286,6 +297,28 @@ test "parse: structs, defaults, optionals, slices, enums and numbers" {
     try std.testing.expectError(error.Overflow, parse(u8, arena, "300", .{}));
     try std.testing.expectError(error.UnexpectedType, parse(u8, arena, "\"7\"", .{}));
     try std.testing.expectError(error.SyntaxError, parse(u8, arena, "{", .{}));
+}
+
+test "parse: a whole float at the edge of an integer type's range" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 2^63 and 2^64: maxInt(i64) and maxInt(u64) round up to them as f64.
+    try std.testing.expectError(error.Overflow, parse(i64, arena, "9223372036854775808.0", .{}));
+    try std.testing.expectError(error.Overflow, parse(i64, arena, "9.223372036854775807e18", .{}));
+    try std.testing.expectError(error.Overflow, parse(u64, arena, "18446744073709551616.0", .{}));
+    try std.testing.expectError(error.Overflow, parse(usize, arena, "1.8446744073709552e19", .{}));
+    try std.testing.expectError(error.Overflow, parse(i64, arena, "-9223372036854777856.0", .{}));
+    try std.testing.expectError(error.Overflow, parse(u8, arena, "256.0", .{}));
+    try std.testing.expectError(error.Overflow, parse(u8, arena, "-1.0", .{}));
+    const T = struct { id: i64 };
+    try std.testing.expectError(error.Overflow, parse(T, arena, "{\"id\": 9223372036854775808.0}", .{}));
+    // The largest and smallest that fit still do.
+    try std.testing.expectEqual(@as(i64, 9223372036854774784), try parse(i64, arena, "9223372036854774784.0", .{}));
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), try parse(i64, arena, "-9223372036854775808.0", .{}));
+    try std.testing.expectEqual(@as(u64, 18446744073709549568), try parse(u64, arena, "18446744073709549568.0", .{}));
+    try std.testing.expectEqual(@as(u8, 255), try parse(u8, arena, "255.0", .{}));
+    try std.testing.expectEqual(@as(i8, -128), try parse(i8, arena, "-128.0", .{}));
 }
 
 test "readBody: bind's contract, answered 400 by the server" {

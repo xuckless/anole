@@ -5,6 +5,13 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- `anole.json.parse` / `readBody`: a whole-number float just past the range
+  of an integer field (such as `9223372036854775808.0` for an `i64`) is
+  refused as `error.Overflow` (400 from `readBody`) instead of stopping the
+  process. No configuration change.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings
