@@ -15,6 +15,18 @@ breaking changes are listed anyway.
   response meant for someone else. The slots of each new server now start
   past every generation an earlier server handed out, so such a handle is
   `ANOLE_E_GONE`.
+- Databases (`anole_db_*` in the C ABI, and plain calls on `anole.sqlite`
+  and `anole.pg`): a call that left a transaction open, such as a bare
+  `BEGIN` or a script that failed before its `COMMIT`, was taken as
+  done. On SQLite the shared writer connection stayed inside that
+  transaction, so every later write from any request joined it, unseen by
+  readers and lost by a later `ROLLBACK` from anyone. On PostgreSQL the
+  connection was closed on its way back to the pool and the statements
+  meant for the transaction each committed on their own. Such a call is
+  now rolled back and fails (class `other`, a 500 by default) with a
+  message pointing to `begin`/`transaction`; a whole transaction in one
+  call without parameters still works. A transaction API for the C ABI
+  comes later.
 
 ### Breaking
 

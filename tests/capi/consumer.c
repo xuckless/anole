@@ -1375,6 +1375,44 @@ static void test_db(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->changes == 2);
 
+  /* A call that leaves a transaction open (a bare BEGIN, a script that
+     fails before its COMMIT) is rolled back and refused: separate calls
+     share no connection, and SQLite's writer is every request's, so later
+     writes would join it. A whole transaction in one call still works. */
+  anole_str t2count = LIT("SELECT count(*) FROM t2");
+  static const struct {
+    const char *sql;
+    int ok;
+    int64_t count; /* rows in t2 after it, as a reader sees them */
+  } txs[] = {
+      {"BEGIN", 0, 2},
+      {"INSERT INTO t2 VALUES (3)", 1, 3},
+      {"BEGIN IMMEDIATE; INSERT INTO t2 VALUES (4); INSERT INTO nope VALUES (1); COMMIT;", 0, 3},
+      {"INSERT INTO t2 VALUES (4)", 1, 4},
+      {"BEGIN; INSERT INTO t2 VALUES (5); INSERT INTO t2 VALUES (6); COMMIT;", 1, 6},
+      {"SAVEPOINT a", 0, 6},
+      {"INSERT INTO t2 VALUES (7)", 1, 7},
+  };
+  for (size_t i = 0; i < sizeof txs / sizeof *txs; i++) {
+    anole_str sql = {txs[i].sql, strlen(txs[i].sql)};
+    CHECK(anole_db_exec(db, c, sql, NULL, 0, NULL, 50 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    if (txs[i].ok) {
+      CHECK(r->status == ANOLE_OK);
+    } else {
+      CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
+    }
+    if (i == 0) {
+      anole_str why = anole_event_str(r, r->error);
+      CHECK(memmem(why.ptr, why.len, "transaction", 11) != NULL);
+    }
+    CHECK(anole_db_query(db, c, t2count, NULL, 0, NULL, 60 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    if (r->status != ANOLE_OK || db_cell(r, 0, 0)->v.i != txs[i].count)
+      fprintf(stderr, "after \"%s\": %lld rows\n", txs[i].sql, (long long)db_cell(r, 0, 0)->v.i);
+    CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == txs[i].count);
+  }
+
   /* the cache: a hit until invalidated */
   anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
   anole_str count = LIT("SELECT count(*) AS n FROM items");
@@ -1462,7 +1500,8 @@ static void test_db_postgres(void) {
            " \"limits\": {\"db_result_max\": 65536},"
            " \"databases\": [{\"name\": \"pg\", \"postgres\": {\"url\": \"%s\", \"max_connections\": 4,"
            "   \"init\": \"DROP TABLE IF EXISTS anole_capi_items; CREATE TABLE anole_capi_items (id bigserial PRIMARY KEY,"
-           " name text UNIQUE NOT NULL, qty int4, price numeric(8, 2), ok bool, data bytea, at timestamptz)\"}}]}",
+           " name text UNIQUE NOT NULL, qty int4, price numeric(8, 2), ok bool, data bytea, at timestamptz);"
+           " DROP TABLE IF EXISTS anole_capi_tx; CREATE TABLE anole_capi_tx (x int4)\"}}]}",
            url);
   anole_server *s = make_server(json);
   anole_db *db = NULL;
@@ -1521,6 +1560,43 @@ static void test_db_postgres(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
   CHECK(str_is(anole_event_str(r, r->error_code), "42601"));
+
+  /* A call that leaves a transaction open (a bare BEGIN) is rolled back and
+     refused: the connection went back to the pool closed, and the
+     statements meant for the transaction each committed on their own. A
+     whole transaction in one call (no parameters) still works. */
+  {
+    anole_str txcount = LIT("SELECT count(*) FROM anole_capi_tx");
+    static const struct {
+      const char *sql;
+      int ok;
+      int64_t count;
+    } txs[] = {
+        {"BEGIN", 0, 0},
+        {"INSERT INTO anole_capi_tx VALUES (1)", 1, 1},
+        {"START TRANSACTION ISOLATION LEVEL SERIALIZABLE", 0, 1},
+        {"BEGIN; INSERT INTO anole_capi_tx VALUES (2); INSERT INTO nope VALUES (1); COMMIT", 0, 1},
+        {"BEGIN; INSERT INTO anole_capi_tx VALUES (2); INSERT INTO anole_capi_tx VALUES (3); COMMIT", 1, 3},
+        {"INSERT INTO anole_capi_tx VALUES (4)", 1, 4},
+    };
+    for (size_t i = 0; i < sizeof txs / sizeof *txs; i++) {
+      anole_str sql = {txs[i].sql, strlen(txs[i].sql)};
+      CHECK(anole_db_exec(db, c, sql, NULL, 0, NULL, 50 + i) == ANOLE_OK);
+      r = db_next(c, rec, sizeof rec);
+      if (txs[i].ok != (r->status == ANOLE_OK)) {
+        anole_str why = anole_event_str(r, r->error);
+        fprintf(stderr, "\"%s\": status %d: %.*s\n", txs[i].sql, r->status, (int)why.len, why.ptr);
+      }
+      CHECK(txs[i].ok ? r->status == ANOLE_OK : r->status == ANOLE_E_DB);
+      if (i == 0) {
+        anole_str why = anole_event_str(r, r->error);
+        CHECK(r->error_class == ANOLE_DB_ERR_OTHER && memmem(why.ptr, why.len, "transaction", 11) != NULL);
+      }
+      CHECK(anole_db_query(db, c, txcount, NULL, 0, NULL, 60 + i) == ANOLE_OK);
+      r = db_next(c, rec, sizeof rec);
+      CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == txs[i].count);
+    }
+  }
   anole_str as_int = LIT("SELECT $1::int4");
   anole_db_value half = {ANOLE_DB_FLOAT, 0, {.f = 1.5}};
   CHECK(anole_db_query(db, c, as_int, &half, 1, NULL, 15) == ANOLE_OK);
