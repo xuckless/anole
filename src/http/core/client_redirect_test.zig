@@ -18,6 +18,9 @@ const Peer = struct {
     last: [4096]u8 = undefined,
     last_len: usize = 0,
     requests: usize = 0,
+    /// Set before the cancel: a cancel lands only once, so a read it
+    /// interrupts must not lead back into `accept`.
+    stopping: std.atomic.Value(bool) = .init(false),
 
     fn start(io: std.Io, answer: *const fn (*Peer, []const u8, *std.Io.Writer) anyerror!void) !*Peer {
         const self = try std.testing.allocator.create(Peer);
@@ -29,6 +32,7 @@ const Peer = struct {
     }
 
     fn stop(self: *Peer, io: std.Io) void {
+        self.stopping.store(true, .release);
         self.future.cancel(io);
         self.listener.deinit(io);
         std.testing.allocator.destroy(self);
@@ -43,7 +47,7 @@ const Peer = struct {
     }
 
     fn run(self: *Peer, io: std.Io) void {
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             const s = self.listener.accept(io) catch return;
             defer s.close(io);
             var rbuf: [8192]u8 = undefined;

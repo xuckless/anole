@@ -247,6 +247,7 @@ struct consumer_state {
   atomic_int sent, aborts, ws_open, ws_msgs, ws_closes, last_close_code;
   atomic_uintptr_t last_sent;
   atomic_ullong ws_handle;
+  atomic_ullong last_abort; /* the handle of the latest ANOLE_EV_ABORT */
   uint64_t batches, events;
   int spin_us; /* serve: CAPI_SPIN_US */
 };
@@ -385,9 +386,10 @@ static void on_request(consumer_state *cs, const anole_request_event *r) {
   }
   case R_HOLD:
   case R_SHORT: {
-    int i = atomic_fetch_add(&cs->nheld, 1);
+    int i = atomic_load(&cs->nheld);
     CHECK(i < 64);
     cs->held[i] = h;
+    atomic_store(&cs->nheld, i + 1); /* after the handle: wait_for(nheld) then reads it */
     break;
   }
   case R_USER: {
@@ -449,6 +451,7 @@ static void on_event(consumer_state *cs, const anole_event *ev) {
     break;
   }
   case ANOLE_EV_ABORT:
+    atomic_store(&cs->last_abort, ev->handle);
     atomic_fetch_add(&cs->aborts, 1);
     break;
   case ANOLE_EV_WS_OPEN: {
@@ -902,13 +905,15 @@ static void test_main_server(void) {
 
   /* a client that leaves: ANOLE_EV_ABORT, and the handle is GONE */
   {
-    int ab0 = atomic_load(&cs.aborts);
     atomic_store(&cs.nheld, 0);
     int fd = dial(port);
     send_request(fd, "GET", "/hold", NULL, 0);
     CHECK(wait_for(&cs.nheld, 1));
     close(fd);
-    CHECK(wait_for(&cs.aborts, ab0 + 1));
+    /* This request's own ABORT: the deadline checks above may still have
+       theirs in flight. */
+    for (int i = 0; i < 1000 && atomic_load(&cs.last_abort) != cs.held[0]; i++) usleep(2000);
+    CHECK(atomic_load(&cs.last_abort) == cs.held[0]);
     CHECK(anole_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
   }
   printf("ok client gone\n");
