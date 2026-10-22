@@ -22,12 +22,22 @@
 //!   reads it, the `PG*` variables filling in what it leaves out:
 //!   `postgres://user:password@host:5432/db?sslmode=verify-full`. A host
 //!   that is a directory is a Unix socket's (`postgres://%2Fvar%2Frun%2Fpostgresql/app`).
-//!   Parameters libpq has: `sslmode` (disable, allow, prefer (the default),
-//!   require, verify-ca, verify-full), `sslrootcert`, `sslcert`, `sslkey`,
-//!   `sslnegotiation=direct` (PostgreSQL 17), `application_name`,
-//!   `connect_timeout` (seconds), `options`, `host`, `port`; pgx's
-//!   `pool_max_conns`; any other is a run-time parameter the server sets
-//!   for each connection (`?search_path=app&timezone=UTC`).
+//!   Parameters libpq has: `sslmode` (disable, allow, prefer, require,
+//!   verify-ca, verify-full), `sslrootcert`, `sslcert`, `sslkey`,
+//!   `sslnegotiation=direct` (PostgreSQL 17), `require_auth`,
+//!   `channel_binding`, `application_name`, `connect_timeout` (seconds),
+//!   `options`, `host`, `port`; pgx's `pool_max_conns`; any other is a
+//!   run-time parameter the server sets for each connection
+//!   (`?search_path=app&timezone=UTC`).
+//! - TLS and logging in: without an `sslmode`, a server on a remote host
+//!   is reached with `verify-full` (TLS, its certificate checked against
+//!   the system's store or `sslrootcert`), and one on this machine
+//!   (localhost, 127.0.0.0/8, ::1, a Unix socket) with `prefer`. Unless
+//!   the server's certificate is verified or the server is on this machine,
+//!   a server asking for the password in clear text or as MD5 is refused
+//!   (`require_auth=md5` allows it). SCRAM binds the login to the TLS
+//!   connection when the server offers it (`channel_binding=prefer`;
+//!   `require` insists).
 //! - Pools: `max_connections` split between the executors; a connection
 //!   opens when a call first needs one.
 //! - Statements: each connection prepares a statement the first time it
@@ -130,7 +140,8 @@ pub const Options = struct {
     };
 };
 
-/// libpq's `sslmode`.
+/// libpq's `sslmode`. Without one: `verify_full` for a remote host,
+/// `prefer` for this machine (`Settings.finish`).
 const SslMode = enum {
     disable,
     /// As `prefer` here (libpq tries plain text first).
@@ -150,7 +161,23 @@ const SslMode = enum {
             .require, .verify_ca, .verify_full => true,
         };
     }
+
+    /// Whether the mode checks the server's certificate.
+    pub fn verifies(mode: SslMode) bool {
+        return mode == .verify_ca or mode == .verify_full;
+    }
 };
+
+/// Whether `host` is this machine: localhost, 127.0.0.0/8 or ::1 (a Unix
+/// socket's directory is checked apart).
+fn isLoopback(host: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.eqlIgnoreCase(host, "localhost.")) return true;
+    const addr = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    return switch (addr) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})),
+    };
+}
 
 /// A connection's settings: the URL, the environment and `Options`,
 /// resolved. Strings point into the arena `resolve` was given.
@@ -164,6 +191,12 @@ const Settings = struct {
     password: ?[]const u8 = null,
     database: []const u8 = "postgres",
     sslmode: SslMode = .prefer,
+    /// Whether `sslmode` came from the URL or `PGSSLMODE`; else `finish`
+    /// picks it by the host.
+    sslmode_set: bool = false,
+    /// `require_auth`; null: by the connection (`authMethods`).
+    require_auth: ?pg.Conn.AuthMethods = null,
+    channel_binding: pg.Conn.ChannelBinding = .prefer,
     sslrootcert: ?[]const u8 = null,
     sslcert: ?[]const u8 = null,
     sslkey: ?[]const u8 = null,
@@ -208,7 +241,12 @@ const Settings = struct {
         if (db.env(env, "PGUSER")) |v| s.user = v;
         if (db.env(env, "PGPASSWORD")) |v| s.password = v;
         if (db.env(env, "PGDATABASE")) |v| s.database = v else s.database = s.user;
-        if (db.env(env, "PGSSLMODE")) |v| s.sslmode = parseSslMode(v) catch return why.set("PGSSLMODE \"{s}\" is not one of disable, allow, prefer, require, verify-ca, verify-full", .{v});
+        if (db.env(env, "PGSSLMODE")) |v| {
+            s.sslmode = parseSslMode(v) catch return why.set("PGSSLMODE \"{s}\" is not one of disable, allow, prefer, require, verify-ca, verify-full", .{v});
+            s.sslmode_set = true;
+        }
+        if (db.env(env, "PGREQUIREAUTH")) |v| s.require_auth = pg.Conn.AuthMethods.parse(v) catch return why.set("PGREQUIREAUTH \"{s}\" is not a list of none, password, md5 and scram-sha-256 (or all of them with !)", .{v});
+        if (db.env(env, "PGCHANNELBINDING")) |v| s.channel_binding = std.meta.stringToEnum(pg.Conn.ChannelBinding, v) orelse return why.set("PGCHANNELBINDING \"{s}\" is not disable, prefer or require", .{v});
         if (db.env(env, "PGSSLROOTCERT")) |v| s.sslrootcert = v;
         if (db.env(env, "PGSSLCERT")) |v| s.sslcert = v;
         if (db.env(env, "PGSSLKEY")) |v| s.sslkey = v;
@@ -242,6 +280,11 @@ const Settings = struct {
             const name = p.name;
             if (std.mem.eql(u8, name, "sslmode")) {
                 s.sslmode = parseSslMode(p.value) catch return why.url(text, "sslmode \"{s}\" is not one of disable, allow, prefer, require, verify-ca, verify-full", .{p.value});
+                s.sslmode_set = true;
+            } else if (std.mem.eql(u8, name, "require_auth")) {
+                s.require_auth = pg.Conn.AuthMethods.parse(p.value) catch return why.url(text, "require_auth \"{s}\" is not a list of none, password, md5 and scram-sha-256 (or all of them with !)", .{p.value});
+            } else if (std.mem.eql(u8, name, "channel_binding")) {
+                s.channel_binding = std.meta.stringToEnum(pg.Conn.ChannelBinding, p.value) orelse return why.url(text, "channel_binding \"{s}\" is not disable, prefer or require", .{p.value});
             } else if (std.mem.eql(u8, name, "sslrootcert")) {
                 s.sslrootcert = p.value;
             } else if (std.mem.eql(u8, name, "sslcert")) {
@@ -268,7 +311,7 @@ const Settings = struct {
             } else if (std.mem.eql(u8, name, "dbname")) {
                 s.database = p.value;
             } else if (std.mem.startsWith(u8, name, "ssl") or std.mem.eql(u8, name, "target_session_attrs") or
-                std.mem.eql(u8, name, "gssencmode") or std.mem.eql(u8, name, "channel_binding"))
+                std.mem.eql(u8, name, "gssencmode"))
             {
                 return why.url(text, "the parameter {s} is not supported", .{name});
             } else {
@@ -284,8 +327,27 @@ const Settings = struct {
         if (s.host.len > 0 and s.host[0] == '/') {
             s.unix_path = try std.fmt.allocPrint(arena, "{s}/.s.PGSQL.{d}", .{ std.mem.trimEnd(u8, s.host, "/"), s.port });
         }
+        // No sslmode given: the server's certificate is checked unless the
+        // server is on this machine.
+        if (!s.sslmode_set) s.sslmode = if (s.local()) .prefer else .verify_full;
         // libpq: `require` with a root certificate checks the chain.
         if (s.sslmode == .require and s.sslrootcert != null) s.sslmode = .verify_ca;
+    }
+
+    /// Whether the server is on this machine: a Unix socket, or a loopback
+    /// host.
+    fn local(s: *const Settings) bool {
+        return s.unix_path != null or isLoopback(s.host);
+    }
+
+    /// The ways of logging in the server may ask for: `require_auth`, else
+    /// all of them when its certificate is verified or it is on this
+    /// machine, else all but the password in clear text or MD5, which
+    /// anyone between the two could take.
+    fn authMethods(s: *const Settings) pg.Conn.AuthMethods {
+        if (s.require_auth) |m| return m;
+        if (s.sslmode.verifies() or s.local()) return .{};
+        return .{ .password = false, .md5 = false };
     }
 
     fn parseSeconds(text: []const u8) !?Duration {
@@ -417,8 +479,17 @@ pub const Client = struct {
             }
             tls_config = .{ .store = self.store, .auth = self.cert };
         } else if (s.sslmode.needsTls()) {
-            log.err("postgres: sslmode={t} needs TLS, which this build leaves out (-Dtls=none)", .{s.sslmode});
+            if (s.sslmode_set) {
+                log.err("postgres: sslmode={t} needs TLS, which this build leaves out (-Dtls=none)", .{s.sslmode});
+            } else {
+                log.err("postgres: {s} is not on this machine, so sslmode defaults to verify-full, which needs TLS, and this build leaves it out (-Dtls=none); build with TLS, or set sslmode=disable to send everything in plain text", .{s.host});
+            }
             return error.TlsNotBuilt;
+        } else if (s.sslmode != .disable and !s.local()) {
+            log.warn("postgres: sslmode={t}, but this build has no TLS (-Dtls=none): {s} gets the connection, data and all, in plain text", .{ s.sslmode, s.host });
+        }
+        if (has_tls and !s.sslmode.verifies() and s.sslmode != .disable and !s.local()) {
+            log.warn("postgres: sslmode={t} encrypts without checking who the server is; use verify-full to be sure it is {s}", .{ s.sslmode, s.host });
         }
         errdefer if (comptime has_tls) self.freeTls();
 
@@ -438,6 +509,8 @@ pub const Client = struct {
                 .application_name = s.application_name orelse opts.application_name,
                 .startup_parameters = startup,
                 .timeout = millis(self.connect_timeout orelse .fromSeconds(60)),
+                .allow = s.authMethods(),
+                .channel_binding = s.channel_binding,
             },
             .connect = .{
                 .host = s.unix_path orelse s.host,
@@ -471,7 +544,7 @@ pub const Client = struct {
             shard.* = .{ .pool = try pg.Pool.init(io, gpa, o) };
             made += 1;
         }
-        log.info("postgres \"{s}\": {f} (sslmode={t}), up to {d} connections over {d} executors", .{ self.name, s, s.sslmode, @max(total, executors), executors });
+        log.info("postgres \"{s}\": {f} (sslmode={t}{s}), up to {d} connections over {d} executors", .{ self.name, s, s.sslmode, if (s.sslmode_set) "" else ", the default for this host", @max(total, executors), executors });
         return self;
     }
 
@@ -736,9 +809,19 @@ pub const Client = struct {
                 const e = refused orelse return ctx.failf(self.errors, .unavailable, "{f} refused the connection", .{s.*});
                 return ctx.fail(self.errors, .{ .system = .postgresql, .class = .unavailable, .code = e.code, .message = e.message });
             },
-            error.TlsNotSupportedByServer => return ctx.failf(self.errors, .unavailable, "{f} does not accept TLS, and sslmode={t} requires it", .{ s.*, s.sslmode }),
+            error.TlsNotSupportedByServer => return ctx.failf(self.errors, .unavailable, "{f} does not accept TLS, and sslmode={t} requires it{s}", .{ s.*, s.sslmode, defaultHint(s) }),
+            error.TlsCertificateVerifyFailed, error.CertificateIssuerNotFound, error.CertificateExpired, error.CertificateNotYetValid, error.CertificateHostMismatch, error.CertificateSignatureInvalid => return ctx.failf(self.errors, .unavailable, "cannot connect to {f}: its certificate did not verify ({t}) under sslmode={t}{s}", .{ s.*, err, s.sslmode, defaultHint(s) }),
+            error.AuthMethodNotAllowed => return ctx.failf(self.errors, .unavailable, "{f} asked for a way of logging in that is not allowed here: the password in clear text or as MD5 goes only to a server whose certificate is verified (sslmode=verify-full) or on this machine; require_auth=md5 (or password) allows it", .{s.*}),
+            error.ChannelBindingRequired => return ctx.failf(self.errors, .unavailable, "{f} did not log in with SCRAM-SHA-256-PLUS over TLS, and channel_binding=require insists on it", .{s.*}),
             else => return ctx.failf(self.errors, .unavailable, "cannot connect to {f}: {t}", .{ s.*, err }),
         }
+    }
+
+    /// What to say when the sslmode was not given and the remote default
+    /// (verify-full) is why the connection failed.
+    fn defaultHint(s: *const Settings) []const u8 {
+        if (s.sslmode_set) return "";
+        return " (verify-full is the default for a server on another host: give sslrootcert=<the server's CA file> for a private CA, or sslmode=disable for a server on a private network without TLS)";
     }
 
     fn give(self: *Client, lease: Lease) void {
@@ -814,7 +897,7 @@ fn sendCancel(io: std.Io, conn: *pg.Conn) void {
 
 fn brokenConnection(err: anyerror) bool {
     return switch (err) {
-        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy => true,
+        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow => true,
         else => false,
     };
 }
@@ -1525,6 +1608,40 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
     try testing.expectEqualStrings("worker", sock.database);
     try testing.expectEqualStrings("postgres://worker@/var/run/postgresql/.s.PGSQL.5433/worker", try std.fmt.bufPrint(&buf, "{f}", .{sock}));
 
+    // No sslmode: verify-full for another host, prefer for this machine;
+    // and the password goes in clear text or as MD5 only to a verified
+    // server or to this machine.
+    const Default = struct { []const u8, SslMode, bool };
+    for ([_]Default{
+        .{ "postgres://db.example.com/d", .verify_full, true },
+        .{ "postgres://10.0.0.5/d", .verify_full, true },
+        .{ "postgres://localhost/d", .prefer, true },
+        .{ "postgres://127.0.0.2:5433/d", .prefer, true },
+        .{ "postgres://[::1]/d", .prefer, true },
+        .{ "postgres://%2Ftmp/d", .prefer, true },
+        .{ "postgres://db.example.com/d?sslmode=prefer", .prefer, false },
+        .{ "postgres://db.example.com/d?sslmode=require", .require, false },
+        .{ "postgres://db.example.com/d?sslmode=disable", .disable, false },
+        .{ "postgres://db.example.com/d?sslmode=verify-ca&sslrootcert=ca.pem", .verify_ca, true },
+        .{ "postgres://localhost/d?sslmode=require", .require, true },
+    }) |case| {
+        const got = try Settings.resolve(arena, .{ .environ = .empty, .url = case[0] });
+        try testing.expectEqual(case[1], got.sslmode);
+        const m = got.authMethods();
+        try testing.expectEqual(case[2], m.password and m.md5);
+        try testing.expect(m.scram_sha_256 and m.none);
+    }
+    try testing.expectEqual(SslMode.disable, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d" })).sslmode);
+
+    // require_auth and channel_binding, from the URL or the variables
+    const strict = try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d?sslmode=prefer&require_auth=scram-sha-256&channel_binding=require" });
+    try testing.expectEqual(pg.Conn.AuthMethods{ .none = false, .password = false, .md5 = false, .scram_sha_256 = true }, strict.authMethods());
+    try testing.expectEqual(pg.Conn.ChannelBinding.require, strict.channel_binding);
+    try testing.expectEqual(@as(usize, 0), strict.parameters.len);
+    const allowed = try Settings.resolve(arena, .{ .environ = environ(&.{ "PGREQUIREAUTH=md5", "PGCHANNELBINDING=disable" }), .url = "postgres://db.example.com/d?sslmode=require" });
+    try testing.expect(allowed.authMethods().md5 and !allowed.authMethods().scram_sha_256);
+    try testing.expectEqual(pg.Conn.ChannelBinding.disable, allowed.channel_binding);
+
     // require with a root certificate checks the chain, as in libpq.
     try testing.expectEqual(SslMode.verify_ca, (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=require&sslrootcert=ca.pem" })).sslmode);
     try testing.expect((try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://h/d?sslnegotiation=direct" })).direct_tls);
@@ -1552,6 +1669,8 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         .{ "postgres://h/d?connect_timeout=soon", "connect_timeout \"soon\"" },
         .{ "postgres://h/d?pool_max_conns=0", "pool_max_conns is 0" },
         .{ "postgres://h/d?sslpassword=x", "the parameter sslpassword is not supported" },
+        .{ "postgres://h/d?require_auth=plain", "require_auth \"plain\"" },
+        .{ "postgres://h/d?channel_binding=maybe", "channel_binding \"maybe\"" },
         .{ "postgres://h:99999/d", "InvalidPort" },
         .{ "host=localhost dbname=app", "InvalidUrl" },
     }) |bad| {
