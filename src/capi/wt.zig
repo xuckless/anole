@@ -181,7 +181,7 @@ pub const SessionSlot = struct {
 
 /// A consumer's memory passed with `ANOLE_BODY_BORROW`, and the handle it
 /// was passed with (`ANOLE_EV_SENT` names it).
-const Borrowed = struct { handle: u64, data: []const u8 };
+const Borrowed = struct { handle: u64, data: []const u8, sent: []align(8) u8 };
 
 pub const StreamSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
@@ -234,6 +234,7 @@ pub const StreamSlot = struct {
     fn clear(s: *StreamSlot) void {
         s.out.deinit(gpa);
         s.sending.deinit(gpa);
+        for (s.borrowed.items) |b| engine.freeRecord(b.sent.ptr);
         s.borrowed.deinit(gpa);
     }
 
@@ -250,7 +251,7 @@ pub const StreamSlot = struct {
         s.borrowed = .empty;
         s.lock.unlock();
         defer list.deinit(gpa);
-        for (list.items) |b| s.exec.postSent(b.handle, b.data);
+        for (list.items) |b| s.exec.postSentRec(b.handle, b.sent);
     }
 
     /// Frees the slot (`ANOLE_EV_SENT` first for what it borrowed).
@@ -295,17 +296,19 @@ pub const ExecState = struct {
     }
 };
 
-fn sessionOf(e: *Engine, hv: u64) ?struct { *SessionSlot, u32 } {
+fn sessionOf(e: *Engine, hv: u64) engine.HandleError!struct { *SessionSlot, u32 } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.kind != .wt_session or h.exec >= e.execs.len) return null;
-    const s = e.execs[h.exec].wt.sessions.slot(h.slot) orelse return null;
+    if (hv == 0 or h.gen == 0 or h.kind != .wt_session) return error.WrongKind;
+    if (h.exec >= e.execs.len) return error.Over;
+    const s = e.execs[h.exec].wt.sessions.slot(h.slot) orelse return error.Over;
     return .{ s, h.gen };
 }
 
-fn streamOf(e: *Engine, hv: u64) ?struct { *StreamSlot, u32 } {
+fn streamOf(e: *Engine, hv: u64) engine.HandleError!struct { *StreamSlot, u32 } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.kind != .wt_stream or h.exec >= e.execs.len) return null;
-    const s = e.execs[h.exec].wt.streams.slot(h.slot) orelse return null;
+    if (hv == 0 or h.gen == 0 or h.kind != .wt_stream) return error.WrongKind;
+    if (h.exec >= e.execs.len) return error.Over;
+    const s = e.execs[h.exec].wt.streams.slot(h.slot) orelse return error.Over;
     return .{ s, h.gen };
 }
 
@@ -357,7 +360,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
         .remote = remote[0..engine.remoteText(req, &remote)],
         .claims = engine.claimsOf(req),
     };
-    if (gpa.alignedAlloc(u8, .@"8", head.size())) |rec| {
+    if (engine.allocRecord(head.size())) |rec| {
         _ = head.encode(.wt_open, s.handle(g), rec);
         x.postRecord(rec, true);
     } else |_| {}
@@ -733,7 +736,7 @@ fn postCode(x: *Exec, typ: abi.EventType, h: u64, code: u32) void {
 /// at once: what is written waits until the stream opens (the peer's
 /// stream limit may hold it).
 pub fn openStream(e: *Engine, hv: u64, uni: bool) engine.AnswerError!u64 {
-    const s, const g = sessionOf(e, hv) orelse return e.gone();
+    const s, const g = sessionOf(e, hv) catch |err| return e.badHandle(err);
     const x = s.exec;
     spin(&s.lock);
     if (!s.live(g) or s.close_code != null) {
@@ -764,7 +767,10 @@ pub fn openStream(e: *Engine, hv: u64, uni: bool) engine.AnswerError!u64 {
 /// gets `ANOLE_EV_SENT` for them, as for every borrowing call, so one
 /// borrow rule holds everywhere.
 pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) engine.AnswerError!bool {
-    const st, const g = streamOf(e, hv) orelse return e.gone();
+    const st, const g = streamOf(e, hv) catch |err| return e.badHandle(err);
+    // The SENT record first: a write that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
+    errdefer if (sent) |r| engine.freeRecord(r.ptr);
     spin(&st.lock);
     if (!st.live(g)) {
         st.lock.unlock();
@@ -778,7 +784,6 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) eng
         st.lock.unlock();
         return e.gone();
     }
-    // Room for the SENT first: a write that fails takes nothing.
     if (borrow) st.borrowed.ensureUnusedCapacity(gpa, 1) catch {
         st.lock.unlock();
         return error.OutOfMemory;
@@ -787,7 +792,7 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) eng
         st.lock.unlock();
         return error.OutOfMemory;
     };
-    if (borrow) st.borrowed.appendAssumeCapacity(.{ .handle = hv, .data = data });
+    if (borrow) st.borrowed.appendAssumeCapacity(.{ .handle = hv, .data = data, .sent = sent.? });
     st.bytes += data.len;
     if (fin) st.fin = true;
     const busy = st.bytes > e.stream_high_water;
@@ -803,11 +808,11 @@ pub const Op = enum { reset, stop, release };
 /// Resets the sending side, asks the peer to stop sending, or lets go of
 /// the stream (resetting what is unfinished; the handle is stale at once).
 pub fn streamOp(e: *Engine, hv: u64, op: Op, code: u32) engine.AnswerError!void {
-    const st, const g = streamOf(e, hv) orelse return e.gone();
+    const st, const g = try streamOf(e, hv);
     spin(&st.lock);
     if (!st.live(g)) {
         st.lock.unlock();
-        return e.gone();
+        return error.Over;
     }
     switch (op) {
         .reset => {
@@ -837,9 +842,13 @@ pub fn streamOp(e: *Engine, hv: u64, op: Op, code: u32) engine.AnswerError!void 
 }
 
 /// Queues a datagram. The session keeps `datagram_queue` of them waiting;
-/// past it the oldest is dropped (a datagram that waits goes stale).
-pub fn sendDatagram(e: *Engine, hv: u64, data: []const u8) engine.AnswerError!void {
-    const s, const g = sessionOf(e, hv) orelse return e.gone();
+/// past it the oldest is dropped (a datagram that waits goes stale). With
+/// `borrow` the bytes are copied all the same, and `ANOLE_EV_SENT` follows
+/// once the copy is queued.
+pub fn sendDatagram(e: *Engine, hv: u64, data: []const u8, borrow: bool) engine.AnswerError!void {
+    const s, const g = sessionOf(e, hv) catch |err| return e.badHandle(err);
+    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
+    errdefer if (sent) |r| engine.freeRecord(r.ptr);
     const copy = try gpa.dupe(u8, data);
     spin(&s.lock);
     if (!s.live(g) or s.close_code != null) {
@@ -864,13 +873,14 @@ pub fn sendDatagram(e: *Engine, hv: u64, data: []const u8) engine.AnswerError!vo
     }
     s.lock.unlock();
     if (dropped > 0) _ = e.wt_datagrams_dropped.fetchAdd(dropped, .monotonic);
+    if (sent) |r| s.exec.postSentRec(hv, r);
     s.wake();
 }
 
 /// The largest datagram the session takes now; 0 when the peer takes
 /// none.
 pub fn maxDatagram(e: *Engine, hv: u64) engine.AnswerError!usize {
-    const s, const g = sessionOf(e, hv) orelse return e.gone();
+    const s, const g = sessionOf(e, hv) catch |err| return e.badHandle(err);
     spin(&s.lock);
     defer s.lock.unlock();
     if (!s.live(g)) return e.gone();
@@ -881,13 +891,13 @@ pub fn maxDatagram(e: *Engine, hv: u64) engine.AnswerError!usize {
 /// 1024 bytes); ANOLE_EV_WT_CLOSE follows.
 pub fn close(e: *Engine, hv: u64, code: u32, reason: []const u8) engine.AnswerError!void {
     if (reason.len > 1024) return error.Invalid;
-    const s, const g = sessionOf(e, hv) orelse return e.gone();
+    const s, const g = try sessionOf(e, hv);
     const copy = try gpa.dupe(u8, reason);
     spin(&s.lock);
     if (!s.live(g) or s.close_code != null) {
         s.lock.unlock();
         gpa.free(copy);
-        return e.gone();
+        return error.Over;
     }
     s.close_code = code;
     gpa.free(s.close_reason);

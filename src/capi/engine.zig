@@ -1082,6 +1082,7 @@ pub const Engine = struct {
         // (this one, and the executors, databases and pools it starts)
         // take none.
         if (!e.signals) blockSignals();
+        server_mod.failed_listener_index = null;
         const cfg = e.config;
         const a = e.arena.allocator();
         var server_cfg: http.ServerConfig = .{};
@@ -1164,6 +1165,7 @@ pub const Engine = struct {
         db.close(e);
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
+                e.noteFailedListener(app.failedListener(), err);
                 e.start_error = err;
                 e.started.set(threadedIo());
             } else if (e.start_error == null) log.err("server stopped: {t}", .{err});

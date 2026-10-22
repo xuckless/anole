@@ -230,16 +230,16 @@ const Query = struct {
 
 /// Queues `sql` for `c` (`anole_db_query`, `anole_db_exec`).
 pub fn submit(d: *Db, c: *Consumer, verb: Verb, sql: []const u8, params: []const abi.DbValue, opts: abi.DbOptions, user_data: u64) QueryError!void {
-    if (comptime !features.sqlite and !features.postgres) return error.Unsupported;
+    if (comptime !features.sqlite and !features.postgres and !features.redis and !features.mongodb) return error.Unsupported;
     const e = d.engine;
     if (c.engine != e) return error.Invalid;
     switch (e.phase.load(.acquire)) {
-        .running, .draining => {},
+        .open, .starting, .running, .draining => {},
         else => return error.State,
     }
     if (!d.open.load(.acquire)) return error.State;
     if (c.execs.items.len == 0) return error.State;
-    for (params) |p| if (p.type > abi.DB_TYPE_BOOL) return error.Invalid;
+    for (params) |p| if (p.type > abi.DB_TYPE_BOOL or p.reserved != 0) return error.Invalid;
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();

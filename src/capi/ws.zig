@@ -38,6 +38,8 @@ const OutMsg = struct {
     type: websocket.MessageType,
     data: []const u8,
     owned: bool,
+    /// Borrowed: the `ANOLE_EV_SENT` record the sending call built.
+    sent: ?[]align(8) u8 = null,
 };
 
 pub const WsSlot = struct {
@@ -47,7 +49,7 @@ pub const WsSlot = struct {
     msgs: std.ArrayList(OutMsg) = .empty,
     /// Bytes queued or being sent.
     bytes: usize = 0,
-    /// A send got ANOLE_BUSY: ANOLE_EV_WS_DRAIN when there is room again.
+    /// A send got ANOLE_BUSY: ANOLE_EV_WRITABLE when there is room again.
     want_event: bool = false,
     /// A sender task is running or about to.
     scheduled: bool = false,
@@ -134,7 +136,10 @@ pub const ExecState = struct {
         for (st.chunks[0..st.nchunks]) |*cv| {
             const c = cv.load(.acquire).?;
             for (c) |*s| {
-                for (s.msgs.items) |m| if (m.owned) gpa.free(m.data);
+                for (s.msgs.items) |m| {
+                    if (m.owned) gpa.free(m.data);
+                    if (m.sent) |r| engine.freeRecord(r.ptr);
+                }
                 s.msgs.deinit(gpa);
                 gpa.free(s.close_reason);
                 for (s.topics.items) |t| gpa.free(t);
@@ -151,10 +156,11 @@ pub const ExecState = struct {
     }
 };
 
-fn slotOf(e: *Engine, hv: u64) ?struct { *WsSlot, u32 } {
+fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *WsSlot, u32 } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.kind != .websocket or h.exec >= e.execs.len) return null;
-    const s = e.execs[h.exec].ws.slot(h.slot) orelse return null;
+    if (hv == 0 or h.gen == 0 or h.kind != .websocket) return error.WrongKind;
+    if (h.exec >= e.execs.len) return error.Over;
+    const s = e.execs[h.exec].ws.slot(h.slot) orelse return error.Over;
     return .{ s, h.gen };
 }
 
@@ -198,7 +204,7 @@ fn onOpen(state: ?*anyopaque, sock: *Socket, req: *dusty.Request) anyerror!void 
         .claims = engine.claimsOf(req),
     };
     const size = head.size();
-    const rec = try gpa.alignedAlloc(u8, .@"8", size);
+    const rec = try engine.allocRecord(size);
     _ = head.encode(.ws_open, s.handle(g), rec);
     x.postRecord(rec, true);
 }
@@ -209,12 +215,12 @@ fn onMessage(_: ?*anyopaque, sock: *Socket, msg: websocket.Message) anyerror!voi
     _ = x.engine.ws_in.fetchAdd(1, .monotonic);
     const size = @sizeOf(abi.WsMessageEvent) + msg.data.len;
     const n = abi.alignUp(size);
-    const rec = try gpa.alignedAlloc(u8, .@"8", n);
+    const rec = try engine.allocRecord(n);
     const ev: *abi.WsMessageEvent = @ptrCast(rec.ptr);
     ev.* = .{
         .ev = .{ .type = @backingInt(abi.EventType.ws_message), .len = @intCast(n), .handle = s.handle(s.gen()) },
         .route_id = s.route.id,
-        .type = if (msg.type == .text) @intCast(abi.WS_TEXT) else @intCast(abi.WS_BINARY),
+        .type = if (msg.type == .text) abi.WS_TEXT else abi.WS_BINARY,
         .data = .{ .off = @sizeOf(abi.WsMessageEvent), .len = @intCast(msg.data.len) },
     };
     @memcpy(rec[@sizeOf(abi.WsMessageEvent)..][0..msg.data.len], msg.data);
@@ -242,7 +248,7 @@ fn onClose(_: ?*anyopaque, sock: *Socket) void {
     gpa.free(s.close_reason);
     s.close_reason = &.{};
     s.release();
-    for (rest.items) |m| if (m.owned) gpa.free(m.data) else x.postSent(s.handle(g), m.data);
+    for (rest.items) |m| if (m.owned) gpa.free(m.data) else if (m.sent) |r| x.postSentRec(s.handle(g), r);
     rest.deinit(gpa);
     for (s.topics.items) |t| {
         e.rooms.leave(t, sock);
@@ -265,12 +271,7 @@ fn onClose(_: ?*anyopaque, sock: *Socket) void {
 }
 
 fn newRecord(size: usize, typ: abi.EventType, h: u64) ![]align(8) u8 {
-    const n = abi.alignUp(size);
-    const rec = try gpa.alignedAlloc(u8, .@"8", n);
-    @memset(rec, 0);
-    const ev: *abi.Event = @ptrCast(rec.ptr);
-    ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = h };
-    return rec;
+    return engine.newRecord(size, typ, h);
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +331,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
                 } else |_| failed = true;
             }
             sent += m.data.len;
-            if (m.owned) gpa.free(m.data) else x.postSent(s.handle(g), m.data);
+            if (m.owned) gpa.free(m.data) else if (m.sent) |r| x.postSentRec(s.handle(g), r);
         }
         if (close_code) |c| sock.close(@fromBackingInt(@intCast(c)), reason) catch {};
         s.acquire();
@@ -338,30 +339,32 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         const drained = s.want_event and s.bytes <= high / 2;
         if (drained) s.want_event = false;
         s.release();
-        if (drained) x.postEvent(.ws_drain, s.handle(g));
+        if (drained) x.postEvent(.writable, s.handle(g));
         if (failed) return;
     }
 }
 
 /// Queues a message; true when the outbox is past its high-water mark.
-pub fn send(e: *Engine, hv: u64, typ: c_int, data: []const u8, borrow: bool) engine.AnswerError!bool {
+pub fn send(e: *Engine, hv: u64, typ: u32, data: []const u8, borrow: bool) engine.AnswerError!bool {
     const mt: websocket.MessageType = switch (typ) {
         abi.WS_TEXT => .text,
         abi.WS_BINARY => .binary,
         else => return error.Invalid,
     };
     if (data.len > e.config.limits.ws_max_message) return error.Invalid;
-    const s, const g = slotOf(e, hv) orelse return e.gone();
+    const s, const g = slotOf(e, hv) catch |err| return e.badHandle(err);
+    // The SENT record first: a call that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
+    errdefer if (sent) |r| engine.freeRecord(r.ptr);
     const owned: ?[]u8 = if (borrow) null else try gpa.dupe(u8, data);
+    errdefer if (owned) |o| gpa.free(o);
     s.acquire();
     if (!s.live(g)) {
         s.release();
-        if (owned) |o| gpa.free(o);
         return e.gone();
     }
-    s.msgs.append(gpa, .{ .type = mt, .data = owned orelse data, .owned = !borrow }) catch {
+    s.msgs.append(gpa, .{ .type = mt, .data = owned orelse data, .owned = !borrow, .sent = sent }) catch {
         s.release();
-        if (owned) |o| gpa.free(o);
         return error.OutOfMemory;
     };
     s.bytes += data.len;
@@ -375,16 +378,17 @@ pub fn send(e: *Engine, hv: u64, typ: c_int, data: []const u8, borrow: bool) eng
     return busy;
 }
 
+/// A cleanup call: `error.Over` when the socket is already closed.
 pub fn close(e: *Engine, hv: u64, code: u16, reason: []const u8) engine.AnswerError!void {
-    if (!(code >= 1000 and code <= 1003) and !(code >= 1007 and code <= 1014) and !(code >= 3000 and code <= 4999)) return error.Invalid;
+    if (!(code >= 1000 and code <= 1003) and !(code >= 1007 and code <= 1014) and !(code >= 3000 and code <= 4999) and code != 1001) return error.Invalid;
     if (reason.len > 123) return error.Invalid;
-    const s, const g = slotOf(e, hv) orelse return e.gone();
+    const s, const g = try slotOf(e, hv);
     const copy = try gpa.dupe(u8, reason);
     s.acquire();
     if (!s.live(g) or s.close_code != null) {
         s.release();
         gpa.free(copy);
-        return e.gone();
+        return error.Over;
     }
     s.close_code = code;
     gpa.free(s.close_reason);
@@ -410,10 +414,12 @@ fn checkTopic(topic: []const u8) engine.AnswerError!void {
     if (topic.len == 0 or topic.len > 255) return error.Invalid;
 }
 
+/// Joining is an answer call (`Gone` when the socket is over); leaving is a
+/// cleanup call (`Over`).
 pub fn subscribe(e: *Engine, hv: u64, topic: []const u8, join: bool) engine.AnswerError!void {
     try checkTopic(topic);
-    const s, const g = slotOf(e, hv) orelse return e.gone();
-    if (!s.live(g)) return e.gone();
+    const s, const g = if (join) slotOf(e, hv) catch |err| return e.badHandle(err) else try slotOf(e, hv);
+    if (!s.live(g)) return if (join) e.gone() else error.Over;
     const c = try gpa.create(TopicCmd);
     c.* = .{ .cmd = .{ .run = runTopic }, .handle = hv, .topic = gpa.dupe(u8, topic) catch {
         gpa.destroy(c);
@@ -446,7 +452,7 @@ fn awaitTopicChanges(e: *Engine, want: u32) std.Io.Cancelable!void {
 fn runTopic(cmd: *Command, x: *Exec) void {
     const c: *TopicCmd = @fieldParentPtr("cmd", cmd);
     const e = x.engine;
-    const found = slotOf(e, c.handle);
+    const found = slotOf(e, c.handle) catch null;
     if (found == null or !found.?[0].live(found.?[1]) or found.?[0].socket == null or e.phase.load(.acquire) == .stopped) {
         gpa.free(c.topic);
         gpa.destroy(c);
@@ -533,7 +539,7 @@ pub fn publishLimits(e: *const Engine) struct { tasks: usize, bytes: usize } {
 
 var next_publisher: std.atomic.Value(usize) = .init(0);
 
-pub fn publish(e: *Engine, topic: []const u8, typ: c_int, data: []const u8, except: u64) engine.AnswerError!void {
+pub fn publish(e: *Engine, topic: []const u8, typ: u32, data: []const u8, except: u64) engine.AnswerError!void {
     try checkTopic(topic);
     const mt: websocket.MessageType = switch (typ) {
         abi.WS_TEXT => .text,
@@ -541,7 +547,7 @@ pub fn publish(e: *Engine, topic: []const u8, typ: c_int, data: []const u8, exce
         else => return error.Invalid,
     };
     if (data.len > e.config.limits.ws_max_message) return error.Invalid;
-    if (e.phase.load(.acquire) != .running) return error.Gone;
+    if (e.phase.load(.acquire) != .running) return error.State;
     // Counted before anything is copied; `free` gives it back.
     const lim = publishLimits(e);
     const size = topic.len + data.len;
@@ -580,7 +586,7 @@ fn publishTask(e: *Engine, p: *PublishCmd) std.Io.Cancelable!void {
     var except: ?*Socket = null;
     if (p.except != 0) if (slotOf(e, p.except)) |found| {
         if (found[0].live(found[1])) except = found[0].socket;
-    };
+    } else |_| {};
     const reached = e.rooms.broadcast(p.topic, p.type, p.data, except);
     _ = e.ws_out.fetchAdd(reached, .monotonic);
 }

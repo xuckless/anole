@@ -1046,6 +1046,8 @@ pub fn Server(comptime Ctx: type) type {
         settled: std.Io.Event = .unset,
         /// Why `run` stopped before it was listening.
         start_error: ?anyerror = null,
+        /// The listener (by index) that could not be opened.
+        failed_listener: ?usize = null,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -1285,7 +1287,10 @@ pub fn Server(comptime Ctx: type) type {
             var opened: usize = 0;
             defer for (active[0..opened]) |*l| l.close(self.io, self.allocator);
             for (listeners, active, addresses) |*cfg, *l, *address| {
-                l.* = try self.open(cfg, cfg.kernel_backlog orelse default_backlog, cfg.acceptorCountFor(cpu_count, executors));
+                l.* = self.open(cfg, cfg.kernel_backlog orelse default_backlog, cfg.acceptorCountFor(cpu_count, executors)) catch |err| {
+                    self.failed_listener = opened;
+                    return err;
+                };
                 opened += 1;
                 address.* = l.address;
             }
