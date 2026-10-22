@@ -445,6 +445,17 @@ pub const Options = struct {
     pub const ClientAuth = http.ClientAuth;
 };
 
+/// Whether a listener on `address` serving `cert` gets the development
+/// certificate warning: `dev_self_signed` anywhere but loopback or a unix
+/// socket.
+fn warnsDevCert(cert: Options.Cert, address: http.Address) bool {
+    if (cert != .dev_self_signed) return false;
+    return switch (address) {
+        .ip => |ip| !address_mod.isLoopback(ip),
+        .unix => false,
+    };
+}
+
 /// The core's server configuration for `opts`: the only place one is built.
 /// The listeners are set later, by `listenOn`.
 fn coreConfig(opts: Options) http.ServerConfig {
@@ -1043,13 +1054,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 var config: ?http.ServerConfig.Tls = null;
                 if (l.tls) |t| {
                     if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
-                    if (t.cert == .dev_self_signed) switch (address) {
-                        .ip => |ip| if (!address_mod.isLoopback(ip)) std.log.scoped(.anole).warn(
-                            "listener \"{s}\" serves a development certificate (dev_self_signed) on {f}: browsers will warn and clients cannot verify it. Use Cert.fromFiles(...) outside development.",
-                            .{ spec.name, ip },
-                        ),
-                        .unix => {},
-                    };
+                    if (warnsDevCert(t.cert, address)) std.log.scoped(.anole).warn(
+                        "listener \"{s}\" serves a development certificate (dev_self_signed) on {f}: browsers will warn and clients cannot verify it. Use Cert.fromFiles(...) outside development.",
+                        .{ spec.name, address.ip },
+                    );
                     const cs = for (certs.items) |cs| {
                         if (CertState.sameSource(cs.source, t.cert)) break cs;
                     } else blk: {
@@ -3223,4 +3231,178 @@ test "anole.Server: the open-file limit is raised, and max_connections follows i
     var g = try capped.io().concurrent(Capped.run, .{&capped});
     try capped.run();
     try g.await(capped.io());
+}
+
+test "options: coreConfig maps every group" {
+    const cfg = coreConfig(.{
+        .timeouts = .{
+            .request = .fromSeconds(61),
+            .read_header = .fromSeconds(7),
+            .write = .fromSeconds(13),
+            .keepalive = .fromSeconds(91),
+            .idle_park = .fromMilliseconds(250),
+            .shutdown = .fromSeconds(17),
+        },
+        .limits = .{
+            .body_max = 3 << 20,
+            .max_head_size = 8192,
+            .max_header_count = 33,
+            .max_param_count = 9,
+            .max_query_count = 34,
+            .max_form_count = 35,
+            .max_multiform_count = 36,
+            .max_connections = 77,
+            .max_requests_per_connection = 5,
+            .ws_max_message = 2 << 20,
+        },
+        .proxy = .{ .trusted_hops = 2, .trust_forwarded_proto = false, .trust_forwarded_host = true },
+        .request = .{ .require_host = false, .decompress = false, .keep_buffers = true },
+        .response = .{ .write_buffer_size = 4096, .date = false, .default_content_type = .json, .max_header_count = 70, .brotli_quality = 7 },
+        .http2 = .{ .max_concurrent_streams = 9, .stream_window = 1000 },
+        .errors = .json,
+    });
+    try std.testing.expectEqual(Duration.fromSeconds(61), cfg.timeout.request.?);
+    try std.testing.expectEqual(Duration.fromSeconds(7), cfg.timeout.read_header.?);
+    try std.testing.expectEqual(Duration.fromSeconds(13), cfg.timeout.write.?);
+    try std.testing.expectEqual(Duration.fromSeconds(91), cfg.timeout.keepalive.?);
+    try std.testing.expectEqual(Duration.fromMilliseconds(250), cfg.timeout.idle_park.?);
+    try std.testing.expectEqual(Duration.fromSeconds(17), cfg.timeout.shutdown.?);
+    try std.testing.expectEqual(@as(?usize, 5), cfg.timeout.request_count);
+    try std.testing.expectEqual(@as(usize, 3 << 20), cfg.request.max_body_size);
+    try std.testing.expectEqual(@as(?usize, 3 << 20), cfg.request.max_content_length);
+    try std.testing.expectEqual(@as(usize, 8192), cfg.request.buffer_size);
+    try std.testing.expectEqual(@as(usize, 33), cfg.request.max_header_count);
+    try std.testing.expectEqual(@as(usize, 9), cfg.request.max_param_count);
+    try std.testing.expectEqual(@as(usize, 34), cfg.request.max_query_count);
+    try std.testing.expectEqual(@as(usize, 35), cfg.request.max_form_count);
+    try std.testing.expectEqual(@as(usize, 36), cfg.request.max_multiform_count);
+    try std.testing.expectEqual(@as(usize, 2 << 20), cfg.request.ws_max_message);
+    try std.testing.expect(!cfg.request.require_host);
+    try std.testing.expect(!cfg.request.decompress);
+    try std.testing.expect(cfg.request.keep_buffers_between_requests);
+    try std.testing.expectEqual(@as(?u32, 77), cfg.max_connections);
+    try std.testing.expectEqual(@as(usize, 2), cfg.trusted_proxy_hops);
+    try std.testing.expect(!cfg.trust_forwarded_proto);
+    try std.testing.expect(cfg.trust_forwarded_host);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.response.write_buffer_size);
+    try std.testing.expect(!cfg.response.date);
+    try std.testing.expectEqual(@as(?http.ContentType, .json), cfg.response.default_content_type);
+    try std.testing.expectEqual(@as(usize, 70), cfg.response.max_header_count);
+    try std.testing.expectEqual(@as(u4, 7), cfg.response.brotli_quality);
+    try std.testing.expectEqual(@as(u32, 9), cfg.http2.max_concurrent_streams);
+    try std.testing.expectEqual(http.ErrorFormat.json, cfg.errors);
+    try std.testing.expectEqual(@as(usize, 0), cfg.listeners.len);
+}
+
+test "options: limits.max_connections 0 follows the open-file limit" {
+    try std.testing.expectEqual(@as(?u32, http.ServerConfig.max_connections_from_fd_limit), coreConfig(.{}).max_connections);
+    try std.testing.expectEqual(@as(?u32, 5), coreConfig(.{ .limits = .{ .max_connections = 5 } }).max_connections);
+}
+
+test "options: shutdown drains for 10 s by default" {
+    try std.testing.expectEqual(Duration.fromSeconds(10), coreConfig(.{}).timeout.shutdown.?);
+}
+
+test "options: http2 with one field set keeps 250 streams" {
+    try std.testing.expectEqual(@as(u32, 250), coreConfig(.{ .http2 = .{ .stream_window = 128 * 1024 } }).http2.max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 250), coreConfig(.{}).http2.max_concurrent_streams);
+}
+
+test "options: no struct-typed default is a partial literal" {
+    const check = struct {
+        fn walk(comptime T: type) void {
+            comptime {
+                const info = @typeInfo(T).@"struct";
+                for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
+                    const S = switch (@typeInfo(FT)) {
+                        .@"struct" => FT,
+                        .optional => |o| if (@typeInfo(o.child) == .@"struct") o.child else continue,
+                        else => continue,
+                    };
+                    // Types holding what cannot be built from `.{}`, or that are not ours.
+                    if (S == Duration or S == std.process.Init.Minimal) continue;
+                    if (attrs.defaultValue(FT)) |dv| {
+                        if (@typeInfo(FT) == .optional) continue;
+                        // A default that is the type's own default.
+                        if (@hasDecl(S, "__no_default")) continue;
+                        const plain = canDefault(S);
+                        if (plain) |p| if (!std.meta.eql(dv, p)) @compileError("ServerOptions." ++ name ++ " defaults to a partial literal: put the default in " ++ @typeName(S));
+                    }
+                    if (@hasDecl(S, "default_walk_skip")) continue;
+                    if (ownStruct(S)) walk(S);
+                }
+            }
+        }
+        /// `S{}` when every field has a default.
+        fn canDefault(comptime S: type) ?S {
+            const info = @typeInfo(S).@"struct";
+            for (info.field_attrs, info.field_types) |a, FT| if (a.default_value_ptr == null and @typeInfo(FT) != .optional) return null;
+            return S{};
+        }
+        /// Only the option structs of this file and the core's config.
+        fn ownStruct(comptime S: type) bool {
+            const name = @typeName(S);
+            return std.mem.startsWith(u8, name, "server.Options") or std.mem.startsWith(u8, name, "config.ServerConfig");
+        }
+    };
+    check.walk(Options);
+}
+
+test "run: a port in use is error.AddressInUse and names its listener" {
+    const gpa = std.testing.allocator;
+    const tio = std.testing.io;
+    var taken = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(tio, .{ .reuse_address = false });
+    defer taken.deinit(tio);
+    var app = try App.init(gpa, .{
+        .http = .{ .address = "127.0.0.1", .port = taken.socket.address.getPort() },
+        .executors = .exact(1),
+    });
+    defer app.deinit();
+    try std.testing.expectError(error.AddressInUse, app.run());
+    try std.testing.expectEqualStrings("http", app.failedListener().?);
+    try std.testing.expectError(error.AddressInUse, app.waitReady());
+}
+
+test "setCertificate: a key that does not match is error.KeyMismatch, from either reload" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var a = try tls.selfSigned(gpa, .{});
+    defer a.deinit(gpa);
+    var b = try tls.selfSigned(gpa, .{});
+    defer b.deinit(gpa);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = a.cert });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = a.key });
+    var cert_buf: [160]u8 = undefined;
+    var key_buf: [160]u8 = undefined;
+    var app = try App.init(gpa, .{
+        .https = .{ .port = 0, .cert = .fromFiles(tmpPath(&cert_buf, &tmp, "cert.pem"), tmpPath(&key_buf, &tmp, "key.pem")) },
+        .http3 = null,
+        .listen_tls_http3 = false,
+        .executors = .exact(1),
+    });
+    defer app.deinit();
+    const Run = struct {
+        fn run(s: *App, other_key: []const u8, mixed_cert: []const u8, td: *const std.testing.TmpDir) !void {
+            defer s.stop();
+            try s.waitReady();
+            // setCertificate: A's certificate with B's key.
+            try std.testing.expectError(error.KeyMismatch, s.setCertificate(.fromPem(mixed_cert, other_key)));
+            // reloadCertificates: the key file swapped for B's.
+            try td.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = other_key });
+            try std.testing.expectError(error.KeyMismatch, s.reloadCertificates());
+        }
+    };
+    var f = try app.io().concurrent(Run.run, .{ &app, b.key, a.cert, &tmp });
+    try app.run();
+    try f.await(app.io());
+}
+
+test "listenOn: only a development certificate off loopback warns" {
+    try std.testing.expect(warnsDevCert(.dev_self_signed, .{ .ip = .{ .ip4 = .unspecified(8443) } }));
+    try std.testing.expect(!warnsDevCert(.dev_self_signed, .{ .ip = .{ .ip4 = .loopback(8443) } }));
+    try std.testing.expect(!warnsDevCert(.dev_self_signed, .{ .ip = .{ .ip6 = .loopback(8443) } }));
+    try std.testing.expect(!warnsDevCert(.fromPem("c", "k"), .{ .ip = .{ .ip4 = .unspecified(8443) } }));
+    try std.testing.expect(!warnsDevCert(.dev_self_signed, .{ .unix = try std.Io.net.UnixAddress.init("/tmp/x.sock") }));
 }
