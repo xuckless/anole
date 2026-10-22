@@ -5,6 +5,14 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- WebSocket over HTTP/1.1: a control frame whose header claims more than
+  125 bytes, or that is fragmented, is refused (close 1002) before its
+  payload is waited for, on callback sockets too; control-frame payloads no
+  longer take memory from the message being assembled. No configuration
+  change needed.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings
