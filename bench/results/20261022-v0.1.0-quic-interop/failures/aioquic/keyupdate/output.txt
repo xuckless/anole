@@ -1,0 +1,75 @@
+2026-10-22 00:10:31,531 Generated random file: euphoric-calm-rogue of size: 3145728
+2026-10-22 00:10:31,531 Requests: ['https://server4:443/euphoric-calm-rogue']
+2026-10-22 00:10:31,557 
+2026-10-22 00:10:31,557 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_cqx0pwhb/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=keyupdate CLIENT_WWW=/tmp/client_www_txejse63/ CLIENT_DOWNLOADS=/tmp/client_download_gz42bppq/ SERVER_WWW=/tmp/server_www__u99f2ds/ SERVER_DOWNLOADS=/tmp/server_download_ifjupj8b/ SERVER_LOGS=/tmp/logs_server_2qsvs7vl CLIENT_LOGS=/tmp/logs_client_hxbkvooc SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=aiortc/aioquic-qns:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/euphoric-calm-rogue" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:11:04,358  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container server Starting 
+ Container client Starting 
+sim  | waiting 10s for server:443
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+ Container server Started 
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+ Container client Started 
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+sim     | server:443 is available after 500.769338ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Starting client
+client exited with code 1
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 4 Packets: 5 Packets: 13 Packets: 9 Packets: 15 Packets: 28 Packets: 39 Packets: 36 Packets: 50 Packets: 66 Packets: 62 Packets: 73 Packets: 68 Packets: 81 Packets: 73 Packets: 84 Packets: 86 Packets: 74 Packets: 76 Packets: 87 Packets: 77 Packets: 88 Packets: 81 Packets: 91 Packets: 82 Packets: 92 Packets: 83 Packets: 94 Packets: 84 Packets: 95 Packets: 85 Packets: 96 Packets: 86 Packets: 98 Packets: 88 Packets: 89 Packets: 90 Packets: 99 Packets: 91 Packets: 100 Packets: 101 Packets: 92 Packets: 96 Packets: 105 Packets: 101 Packets: 111 Packets: 103 Packets: 114 Packets: 105 Packets: 115 Packets: 107 Packets: 117 Packets: 109 Packets: 118 Packets: 119 Packets: 110 Packets: 111 Packets: 120 Packets: 112 Packets: 121 Packets: 113 Packets: 122 Packets: 123 Packets: 114 Packets: 124 Packets: 115 Packets: 116 Packets: 118 Packets: 119 Packets: 125 Packets: 127 Packets: 121 Packets: 128 Packets: 129 Packets: 122 Packets: 123 Packets: 124 Received signal: 15
+sim     | msg="15", +30.778821823s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     |    0# 
+ Container sim Stopped 
+sim exited with code 143
+
+
+2026-10-22 00:11:04,533 Container exits: b'\x1b[Kclient exited with code 1' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:11:04,533 Using the client's key log file.
+2026-10-22 00:11:04,537 
+2026-10-22 00:11:04,537 Using the client's key log file.
+2026-10-22 00:11:04,537 Using the client's key log file.
+2026-10-22 00:11:04,541 
+2026-10-22 00:11:04,541 Using the client's key log file.
+2026-10-22 00:11:04,659 Wrong version. Expected 0x1, got ['0x6b3343cf']
+2026-10-22 00:11:04,659 Using the client's key log file.
+2026-10-22 00:11:04,895 Wrong version. Expected 0x1, got ['0x6b3343cf']

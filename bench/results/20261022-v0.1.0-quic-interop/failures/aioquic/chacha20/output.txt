@@ -1,0 +1,234 @@
+2026-10-22 00:09:49,850 Generated random file: brutal-broken-mesprit of size: 3145728
+2026-10-22 00:09:49,850 Requests: ['https://server4:443/brutal-broken-mesprit']
+2026-10-22 00:09:49,875 
+2026-10-22 00:09:49,875 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_rf90d5l1/ TESTCASE_SERVER=chacha20 TESTCASE_CLIENT=chacha20 CLIENT_WWW=/tmp/client_www_70wcpv9s/ CLIENT_DOWNLOADS=/tmp/client_download_sl8hdqa4/ SERVER_WWW=/tmp/server_www_zpv8g2y0/ SERVER_DOWNLOADS=/tmp/server_download_5aatlg9j/ SERVER_LOGS=/tmp/logs_server_j04frg7n CLIENT_LOGS=/tmp/logs_client_ez73x3nn SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=aiortc/aioquic-qns:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/brutal-broken-mesprit" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:09:55,604  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+ Container client Started 
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+ Container server Started 
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 501.51244ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Starting client
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 3 Packets: 5 Packets: 10 Packets: 10 Packets: 18 Packets: 30 Packets: 154 Packets: 147 Packets: 415 Packets: 565 Packets: 624 Packets: 1057 Packets: 1006 Packets: 1482 Packets: 1429 Packets: 1874 Packets: 1820 Packets: 2245 Packets: 2309 Packets: 2728 Packets: 2675 Packets: 3150 Packets: 3092 Packets: 3508 Packets: 3444 Packets: 3871 Packets: 3811 Packets: 4172 Packets: 4239 Packets: 4317 Packets: 4276 Packets: 4319 Received signal: 15
+sim     | msg="15", Packets captured: 4276
+sim     | Packets captured: 4319
+sim     | +4.292967119s 0 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=Packets received/dropped on interface 'eth0': 4276/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | 24Packets received/dropped on interface 'eth1': 4319/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | 
+sim     | NS_FATAL, terminating
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:09:55,790 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:09:55,790 Using the client's key log file.
+2026-10-22 00:09:55,798 
+2026-10-22 00:09:55,799 Using the client's key log file.
+2026-10-22 00:09:55,799 Using the client's key log file.
+2026-10-22 00:09:55,808 
+2026-10-22 00:09:55,809 Using the client's key log file.
+2026-10-22 00:09:56,170 At least one QUIC packet could not be decrypted
+2026-10-22 00:09:56,170 Packet (Length: 1242)
+Layer ETH
+:	Destination: d6:b2:4c:13:d2:b6
+	.... ..1. .... .... .... .... = LG bit: Locally administered address (this is NOT the factory default)
+	.... ...0 .... .... .... .... = IG bit: Individual address (unicast)
+	Source: 4e:9b:9a:92:d1:05
+	.... ..1. .... .... .... .... = LG bit: Locally administered address (this is NOT the factory default)
+	.... ...0 .... .... .... .... = IG bit: Individual address (unicast)
+	Type: IPv4 (0x0800)
+	Stream index: 11
+Layer IP
+:	0100 .... = Version: 4
+	.... 0101 = Header Length: 20 bytes (5)
+	Differentiated Services Field: 0x00 (DSCP: CS0, ECN: Not-ECT)
+	0000 00.. = Differentiated Services Codepoint: Default (0)
+	.... ..00 = Explicit Congestion Notification: Not ECN-Capable Transport (0)
+	Total Length: 1228
+	Identification: 0x0944 (2372)
+	010. .... = Flags: 0x2, Don't fragment
+	0... .... = Reserved bit: Not set
+	.1.. .... = Don't fragment: Set
+	..0. .... = More fragments: Not set
+	...0 0000 0000 0000 = Fragment Offset: 0
+	Time to Live: 64
+	Protocol: UDP (17)
+	Header Checksum: 0x44c6 [validation disabled]
+	Header checksum status: Unverified
+	Source Address: 193.167.0.100
+	Destination Address: 193.167.100.100
+	Stream index: 2
+Layer UDP
+:	Source Port: 34299
+	Destination Port: 443
+	Length: 1208
+	Checksum: 0x46c2 [unverified]
+	Checksum Status: Unverified
+	Stream index: 0
+	Stream Packet Number: 4
+	Timestamps
+	Time since first frame: 39.148728 milliseconds
+	Time since previous frame: 370.576 microseconds
+	UDP payload (1200 bytes)
+Layer QUIC
+:	QUIC Connection information
+	Connection Number: 0
+	Packet Length: 67
+	1... .... = Header Form: Long Header (1)
+	.1.. .... = Fixed Bit: True
+	..01 .... = Packet Type: Initial (1)
+	.... 10.. = Reserved: 2
+	.... ..10 = Packet Number Length: 3 bytes (2)
+	Version: 2 (0x6b3343cf)
+	Destination Connection ID Length: 18
+	Destination Connection ID: ec10fd6b17e73e700e06cca46edf466de97b
+	Source Connection ID Length: 8
+	Source Connection ID: fac977ca8f111139
+	Token Length: 0
+	Length: 31
+	Packet Number: 9967454
+	Payload: 9aa31e25192ffd174d99c3af07ac392462990d573c1d106124c59201
+	Expert Info (Warning/Decryption): Decryption failed: Decryption (checktag) failed: Checksum error
+	Decryption failed: Decryption (checktag) failed: Checksum error
+	Severity level: Warning
+	Group: Decryption
+Layer QUIC
+:	Packet Length: 106
+	1... .... = Header Form: Long Header (1)
+	.1.. .... = Fixed Bit: True
+	..11 .... = Packet Type: Handshake (3)
+	.... 00.. = Reserved: 0
+	.... ..01 = Packet Number Length: 2 bytes (1)
+	Version: 2 (0x6b3343cf)
+	Destination Connection ID Length: 18
+	Destination Connection ID: ec10fd6b17e73e700e06cca46edf466de97b
+	Source Connection ID Length: 8
+	Source Connection ID: fac977ca8f111139
+	Length: 71
+	Packet Number: 2
+	Payload: 8ac4ec12f148a4dee6f82191c7073c203611fde82ffcc75f120379be69cabeb48c3db3c1eabe5351cb48a54629eed9f89ffc6dd621f95787f7e6937b367a14d67525907162
+	ACK
+	Frame Type: ACK (0x0000000000000002)
+	Largest Acknowledged: 1382980490
+	ACK Delay: 129
+	ACK Range Count: 0
+	First ACK Range: 0
+	Offset: 0
+	Length: 36
+	Crypto Data
+	Handshake Protocol: Finished
+	Handshake Type: Finished (20)
+	Length: 32
+	Verify Data: 73378158c2d050df6c08447c07c5948cef9772dc969c06008f92a4648d95756f
+	CRYPTO
+	Frame Type: CRYPTO (0x0000000000000006)
+Layer QUIC
+:	Packet Length: 1027
+	QUIC Short Header DCID=ec10fd6b17e73e700e06cca46edf466de97b PKN=3
+	0... .... = Header Form: Short Header (0)
+	.1.. .... = Fixed Bit: True
+	..1. .... = Spin Bit: True
+	...0 0... = Reserved: 0
+	.... .0.. = Key Phase Bit: False
+	.... ..01 = Packet Number Length: 2 bytes (1)
+	Destination Connection ID: ec10fd6b17e73e700e06cca46edf466de97b
+	Packet Number: 3
+	Protected Payload […]: eaf3b09ab66b949927eec23ca1e49bbb09b2972d40038ff7d954d6db010a327341682938150b7155bd269d0f7629d112cd74efcb868bd1bc02dfed2babf18d3ea1d84714c276c5983ec77fbc36fad503b1519bb3648eb51c55c8023e48a6855a04d532362746c60617a7ca
+	ACK
+	Frame Type: ACK (0x0000000000000002)
+	Largest Acknowledged: 1382980490
+	ACK Delay: 129
+	ACK Range Count: 0
+	First ACK Range: 0
+	Sequence: 1
+	Retire Prior To: 0
+	Connection ID Length: 8
+	Connection ID: a1ab6d3e2d590555
+	Stateless Reset Token: a8c4e04faea25becc7622e8a40901ba2
+	Padding Length: 809
+	NEW_CONNECTION_ID
+	NEW_CONNECTION_ID
+	NEW_CONNECTION_ID
+	NEW_CONNECTION_ID
+	NEW_CONNECTION_ID
+	NEW_CONNECTION_ID
+	PADDING Length: 809
+	Frame Type: NEW_CONNECTION_ID (0x0000000000000018)
+	Frame Type: NEW_CONNECTION_ID (0x0000000000000018)
+	Frame Type: NEW_CONNECTION_ID (0x0000000000000018)
+	Frame Type: NEW_CONNECTION_ID (0x0000000000000018)
+	Frame Type: NEW_CONNECTION_ID (0x0000000000000018)
+	Frame Type: NEW_CONNECTION_ID (0x0000000000000018)
+	Frame Type: PADDING (0x0000000000000000)
+	Sequence: 2
+	Sequence: 3
+	Sequence: 4
+	Sequence: 5
+	Sequence: 6
+	Retire Prior To: 0
+	Retire Prior To: 0
+	Retire Prior To: 0
+	Retire Prior To: 0
+	Retire Prior To: 0
+	Connection ID Length: 8
+	Connection ID Length: 8
+	Connection ID Length: 8
+	Connection ID Length: 8
+	Connection ID Length: 8
+	Connection ID: 2137cfa63c10bb1f
+	Connection ID: 011a53f10e4afc6e
+	Connection ID: 1ad24ae9fbdbfc21
+	Connection ID: 0d8dfc830b6feaff
+	Connection ID: 63a97fb5f46bf2ef
+	Stateless Reset Token: b2311c1b228228d10c2f6f4b06bf3999
+	Stateless Reset Token: 1eec8be0b9a352d503bdc11046402004
+	Stateless Reset Token: 2f56add4cbaba41936ebc2e406be878c
+	Stateless Reset Token: 65fdc759b1027d0d488bd81ecb5350fe
+	Stateless Reset Token: 57d5604e751f2e0ecdd27c2a2fd3d2c8
+
+2026-10-22 00:09:56,363 Wrong version. Expected 0x1, got ['0x6b3343cf']

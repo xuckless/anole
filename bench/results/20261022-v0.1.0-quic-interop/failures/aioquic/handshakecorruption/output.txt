@@ -1,0 +1,1416 @@
+2026-10-22 00:13:02,557 Generated random file: merry-small-glasses of size: 1024
+2026-10-22 00:13:02,558 Generated random file: steaming-overjoyed-shoe of size: 1024
+2026-10-22 00:13:02,558 Generated random file: light-zesty-elephant of size: 1024
+2026-10-22 00:13:02,558 Generated random file: sweet-zestful-glue of size: 1024
+2026-10-22 00:13:02,558 Generated random file: jealous-violet-viking of size: 1024
+2026-10-22 00:13:02,558 Generated random file: jealous-ample-cat of size: 1024
+2026-10-22 00:13:02,558 Generated random file: wet-many-monitor of size: 1024
+2026-10-22 00:13:02,558 Generated random file: warm-yellow-buffalo of size: 1024
+2026-10-22 00:13:02,558 Generated random file: sad-quiet-zip of size: 1024
+2026-10-22 00:13:02,558 Generated random file: red-dry-pilot of size: 1024
+2026-10-22 00:13:02,558 Generated random file: zippy-moderate-viking of size: 1024
+2026-10-22 00:13:02,558 Generated random file: ashamed-indigo-barbarian of size: 1024
+2026-10-22 00:13:02,558 Generated random file: black-glad-fighter of size: 1024
+2026-10-22 00:13:02,559 Generated random file: wet-enough-segway of size: 1024
+2026-10-22 00:13:02,559 Generated random file: cold-cold-giraffe of size: 1024
+2026-10-22 00:13:02,559 Generated random file: warm-olive-laserdisc of size: 1024
+2026-10-22 00:13:02,559 Generated random file: maroon-angry-lawyer of size: 1024
+2026-10-22 00:13:02,559 Generated random file: red-vast-bowtie of size: 1024
+2026-10-22 00:13:02,559 Generated random file: sufficient-enough-ocelot of size: 1024
+2026-10-22 00:13:02,559 Generated random file: aquamarine-dark-anteater of size: 1024
+2026-10-22 00:13:02,559 Generated random file: white-sweet-samurai of size: 1024
+2026-10-22 00:13:02,559 Generated random file: medium-happy-jirachi of size: 1024
+2026-10-22 00:13:02,559 Generated random file: mild-gray-pikachu of size: 1024
+2026-10-22 00:13:02,559 Generated random file: chilly-guilty-paper of size: 1024
+2026-10-22 00:13:02,559 Generated random file: few-blue-laptop of size: 1024
+2026-10-22 00:13:02,559 Generated random file: warm-frightened-lemur of size: 1024
+2026-10-22 00:13:02,560 Generated random file: bountiful-bitter-pilot of size: 1024
+2026-10-22 00:13:02,560 Generated random file: soft-indigo-necklace of size: 1024
+2026-10-22 00:13:02,560 Generated random file: sour-subtropical-sock of size: 1024
+2026-10-22 00:13:02,560 Generated random file: bright-surprised-pharaoh of size: 1024
+2026-10-22 00:13:02,560 Generated random file: excited-few-knight of size: 1024
+2026-10-22 00:13:02,560 Generated random file: turquoise-mild-floppy of size: 1024
+2026-10-22 00:13:02,560 Generated random file: bored-rough-journal of size: 1024
+2026-10-22 00:13:02,560 Generated random file: icy-soft-prince of size: 1024
+2026-10-22 00:13:02,560 Generated random file: wet-colossal-notebook of size: 1024
+2026-10-22 00:13:02,560 Generated random file: dry-cruel-rom of size: 1024
+2026-10-22 00:13:02,560 Generated random file: overjoyed-indigo-ninja of size: 1024
+2026-10-22 00:13:02,560 Generated random file: sad-teal-floppy of size: 1024
+2026-10-22 00:13:02,560 Generated random file: plentiful-hard-rom of size: 1024
+2026-10-22 00:13:02,560 Generated random file: zesty-freezing-thief of size: 1024
+2026-10-22 00:13:02,561 Generated random file: boiling-few-mongoose of size: 1024
+2026-10-22 00:13:02,561 Generated random file: glad-frozen-mouse of size: 1024
+2026-10-22 00:13:02,561 Generated random file: elated-happy-lemur of size: 1024
+2026-10-22 00:13:02,561 Generated random file: excited-navy-pencil of size: 1024
+2026-10-22 00:13:02,561 Generated random file: hot-merry-dress of size: 1024
+2026-10-22 00:13:02,561 Generated random file: ecstatic-warm-bag of size: 1024
+2026-10-22 00:13:02,561 Generated random file: slow-dull-eraser of size: 1024
+2026-10-22 00:13:02,561 Generated random file: soft-sharp-tiger of size: 1024
+2026-10-22 00:13:02,561 Generated random file: dirty-thick-chameleon of size: 1024
+2026-10-22 00:13:02,561 Generated random file: sharp-empty-king of size: 1024
+2026-10-22 00:13:02,561 Requests: ['https://server4:443/merry-small-glasses', 'https://server4:443/steaming-overjoyed-shoe', 'https://server4:443/light-zesty-elephant', 'https://server4:443/sweet-zestful-glue', 'https://server4:443/jealous-violet-viking', 'https://server4:443/jealous-ample-cat', 'https://server4:443/wet-many-monitor', 'https://server4:443/warm-yellow-buffalo', 'https://server4:443/sad-quiet-zip', 'https://server4:443/red-dry-pilot', 'https://server4:443/zippy-moderate-viking', 'https://server4:443/ashamed-indigo-barbarian', 'https://server4:443/black-glad-fighter', 'https://server4:443/wet-enough-segway', 'https://server4:443/cold-cold-giraffe', 'https://server4:443/warm-olive-laserdisc', 'https://server4:443/maroon-angry-lawyer', 'https://server4:443/red-vast-bowtie', 'https://server4:443/sufficient-enough-ocelot', 'https://server4:443/aquamarine-dark-anteater', 'https://server4:443/white-sweet-samurai', 'https://server4:443/medium-happy-jirachi', 'https://server4:443/mild-gray-pikachu', 'https://server4:443/chilly-guilty-paper', 'https://server4:443/few-blue-laptop', 'https://server4:443/warm-frightened-lemur', 'https://server4:443/bountiful-bitter-pilot', 'https://server4:443/soft-indigo-necklace', 'https://server4:443/sour-subtropical-sock', 'https://server4:443/bright-surprised-pharaoh', 'https://server4:443/excited-few-knight', 'https://server4:443/turquoise-mild-floppy', 'https://server4:443/bored-rough-journal', 'https://server4:443/icy-soft-prince', 'https://server4:443/wet-colossal-notebook', 'https://server4:443/dry-cruel-rom', 'https://server4:443/overjoyed-indigo-ninja', 'https://server4:443/sad-teal-floppy', 'https://server4:443/plentiful-hard-rom', 'https://server4:443/zesty-freezing-thief', 'https://server4:443/boiling-few-mongoose', 'https://server4:443/glad-frozen-mouse', 'https://server4:443/elated-happy-lemur', 'https://server4:443/excited-navy-pencil', 'https://server4:443/hot-merry-dress', 'https://server4:443/ecstatic-warm-bag', 'https://server4:443/slow-dull-eraser', 'https://server4:443/soft-sharp-tiger', 'https://server4:443/dirty-thick-chameleon', 'https://server4:443/sharp-empty-king']
+2026-10-22 00:13:02,583 
+2026-10-22 00:13:02,583 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_5v6o9ub0/ TESTCASE_SERVER=multiconnect TESTCASE_CLIENT=multiconnect CLIENT_WWW=/tmp/client_www_r3vmrg2j/ CLIENT_DOWNLOADS=/tmp/client_download_cya00f41/ SERVER_WWW=/tmp/server_www_jt9xyzlz/ SERVER_DOWNLOADS=/tmp/server_download_3fmyyg_7/ SERVER_LOGS=/tmp/logs_server_ox5qgn3g CLIENT_LOGS=/tmp/logs_client_ztwi7m95 SCENARIO="corrupt-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3" CLIENT=aiortc/aioquic-qns:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/merry-small-glasses https://server4:443/steaming-overjoyed-shoe https://server4:443/light-zesty-elephant https://server4:443/sweet-zestful-glue https://server4:443/jealous-violet-viking https://server4:443/jealous-ample-cat https://server4:443/wet-many-monitor https://server4:443/warm-yellow-buffalo https://server4:443/sad-quiet-zip https://server4:443/red-dry-pilot https://server4:443/zippy-moderate-viking https://server4:443/ashamed-indigo-barbarian https://server4:443/black-glad-fighter https://server4:443/wet-enough-segway https://server4:443/cold-cold-giraffe https://server4:443/warm-olive-laserdisc https://server4:443/maroon-angry-lawyer https://server4:443/red-vast-bowtie https://server4:443/sufficient-enough-ocelot https://server4:443/aquamarine-dark-anteater https://server4:443/white-sweet-samurai https://server4:443/medium-happy-jirachi https://server4:443/mild-gray-pikachu https://server4:443/chilly-guilty-paper https://server4:443/few-blue-laptop https://server4:443/warm-frightened-lemur https://server4:443/bountiful-bitter-pilot https://server4:443/soft-indigo-necklace https://server4:443/sour-subtropical-sock https://server4:443/bright-surprised-pharaoh https://server4:443/excited-few-knight https://server4:443/turquoise-mild-floppy https://server4:443/bored-rough-journal https://server4:443/icy-soft-prince https://server4:443/wet-colossal-notebook https://server4:443/dry-cruel-rom https://server4:443/overjoyed-indigo-ninja https://server4:443/sad-teal-floppy https://server4:443/plentiful-hard-rom https://server4:443/zesty-freezing-thief https://server4:443/boiling-few-mongoose https://server4:443/glad-frozen-mouse https://server4:443/elated-happy-lemur https://server4:443/excited-navy-pencil https://server4:443/hot-merry-dress https://server4:443/ecstatic-warm-bag https://server4:443/slow-dull-eraser https://server4:443/soft-sharp-tiger https://server4:443/dirty-thick-chameleon https://server4:443/sharp-empty-king" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:14:28,832  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container server Starting 
+ Container client Starting 
+sim  | waiting 10s for server:443
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+ Container server Started 
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+ Container client Started 
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+sim     | server:443 is available after 500.757365ms
+sim     | Using scenario: corrupt-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Starting client
+client  | https://server4:443/merry-small-glasses
+sim     | Packets: 1 Packets: 1 Packets: 7 Packets: 6 Packets: 11 Packets: 10 Forwarding 1200 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/1 (0.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/1 (0.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/2 (0.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/2 (0.0%)
+sim     | Forwarding 67 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/3 (0.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/4 (0.0%)
+sim     | Forwarding 109 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/5 (0.0%)
+sim     | Packets: 15 Packets: 37 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/3 (0.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/4 (0.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/5 (0.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/6 (0.0%)
+sim     | Forwarding 205 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/6 (0.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 0/7 (0.0%)
+sim     | Corrupting 49 bytes 193.167.0.100:47107 -> 193.167.100.100:443 offset 22 0x8 -> 0xcd, corrupted 1/8 (12.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:47107 -> 193.167.100.100:443, corrupted 1/9 (11.1%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:47107, corrupted 0/7 (0.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47107 offset 45 0x99 -> 0xf, corrupted 1/8 (12.5%)
+client  | https://server4:443/steaming-overjoyed-shoe
+sim     | Packets: 30 Packets: 50 Packets: 60 Packets: 36 Packets: 43 Packets: 64 Forwarding 1200 bytes 193.167.0.100:39584 -> 193.167.100.100:443, corrupted 1/10 (10.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584 offset 44 0x87 -> 0x8b, corrupted 2/9 (22.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 2/10 (20.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:39584 -> 193.167.100.100:443, corrupted 1/11 (9.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 2/11 (18.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:39584 -> 193.167.100.100:443, corrupted 1/12 (8.3%)
+sim     | Forwarding 71 bytes 193.167.0.100:39584 -> 193.167.100.100:443, corrupted 1/13 (7.7%)
+sim     | Forwarding 109 bytes 193.167.0.100:39584 -> 193.167.100.100:443, corrupted 1/14 (7.1%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39584 offset 40 0xb1 -> 0xb2, corrupted 3/12 (25.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 3/13 (23.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 3/14 (21.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 3/15 (20.0%)
+sim     | Forwarding 205 bytes 193.167.0.100:39584 -> 193.167.100.100:443, corrupted 1/15 (6.7%)
+sim     | Corrupting 52 bytes 193.167.0.100:39584 -> 193.167.100.100:443 offset 32 0x87 -> 0x3, corrupted 2/16 (12.5%)
+sim     | Corrupting 41 bytes 193.167.0.100:39584 -> 193.167.100.100:443 offset 38 0xfe -> 0x9a, corrupted 3/17 (17.6%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:39584 offset 19 0x38 -> 0xfd, corrupted 4/16 (25.0%)
+client  | https://server4:443/light-zesty-elephant
+sim     | Packets: 47 Packets: 70 Packets: 63 Packets: 84 Packets: 65 Forwarding 1200 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 3/18 (16.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38047, corrupted 4/17 (23.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38047, corrupted 4/18 (22.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 3/19 (15.8%)
+sim     | Forwarding 49 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 3/20 (15.0%)
+sim     | Forwarding 68 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 3/21 (14.3%)
+sim     | Packets: 67 Packets: 85 Corrupting 109 bytes 193.167.0.100:38047 -> 193.167.100.100:443 offset 44 0xd1 -> 0x1b, corrupted 4/22 (18.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39584 offset 22 0x94 -> 0x3d, corrupted 5/19 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584 offset 9 0x71 -> 0x68, corrupted 6/20 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 6/21 (28.6%)
+sim     | Forwarding 109 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 4/23 (17.4%)
+sim     | Packets: 74 Packets: 92 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:38047, corrupted 6/22 (27.3%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:38047 offset 22 0xc8 -> 0x2f, corrupted 7/23 (30.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38047, corrupted 7/24 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38047, corrupted 7/25 (28.0%)
+sim     | Corrupting 50 bytes 193.167.0.100:38047 -> 193.167.100.100:443 offset 43 0x86 -> 0xf6, corrupted 5/24 (20.8%)
+sim     | Forwarding 51 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 5/25 (20.0%)
+sim     | Forwarding 41 bytes 193.167.0.100:38047 -> 193.167.100.100:443, corrupted 5/26 (19.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:38047, corrupted 7/26 (26.9%)
+client  | https://server4:443/sweet-zestful-glue
+sim     | Packets: 82 Packets: 96 Packets: 103 Packets: 87 Forwarding 1200 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 5/27 (18.5%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44290 offset 23 0x5e -> 0xd7, corrupted 8/27 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/28 (28.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 5/28 (17.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/29 (27.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 5/29 (17.2%)
+sim     | Corrupting 66 bytes 193.167.0.100:44290 -> 193.167.100.100:443 offset 47 0xd -> 0x1f, corrupted 6/30 (20.0%)
+sim     | Forwarding 109 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 6/31 (19.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/30 (26.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/31 (25.8%)
+sim     | Corrupting 49 bytes 193.167.0.100:44290 -> 193.167.100.100:443 offset 23 0x25 -> 0x4b, corrupted 7/32 (21.9%)
+sim     | Packets: 104 Packets: 88 Forwarding 206 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 7/33 (21.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/32 (25.0%)
+sim     | Forwarding 66 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 7/34 (20.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/33 (24.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:44290 -> 193.167.100.100:443, corrupted 7/35 (20.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:44290, corrupted 8/34 (23.5%)
+sim     | Packets: 114 Packets: 98 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 8/35 (22.9%)
+client  | https://server4:443/jealous-violet-viking
+sim     | Packets: 120 Packets: 105 Forwarding 1200 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/36 (19.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55685, corrupted 8/36 (22.2%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55685 offset 49 0x60 -> 0x96, corrupted 9/37 (24.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/37 (18.9%)
+sim     | Forwarding 69 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/38 (18.4%)
+sim     | Packets: 123 Packets: 106 Forwarding 109 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/39 (17.9%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55685 offset 32 0x38 -> 0xc0, corrupted 10/38 (26.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55685, corrupted 10/39 (25.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55685, corrupted 10/40 (25.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55685, corrupted 10/41 (24.4%)
+sim     | Forwarding 205 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/40 (17.5%)
+sim     | Forwarding 47 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/41 (17.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:55685 -> 193.167.100.100:443, corrupted 7/42 (16.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55685, corrupted 10/42 (23.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55685, corrupted 10/43 (23.3%)
+client  | https://server4:443/jealous-ample-cat
+sim     | Packets: 127 Packets: 113 Packets: 123 Packets: 137 Packets: 125 Packets: 138 Forwarding 1200 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/43 (16.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 10/44 (22.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 10/45 (22.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/44 (15.9%)
+sim     | Forwarding 65 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/45 (15.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/46 (15.2%)
+sim     | Forwarding 109 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/47 (14.9%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:38628 offset 4 0x6f -> 0xca, corrupted 11/46 (23.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 11/47 (23.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 11/48 (22.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 11/49 (22.4%)
+sim     | Forwarding 205 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/48 (14.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/49 (14.3%)
+sim     | Forwarding 41 bytes 193.167.0.100:38628 -> 193.167.100.100:443, corrupted 7/50 (14.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 11/50 (22.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38628, corrupted 11/51 (21.6%)
+client  | https://server4:443/wet-many-monitor
+sim     | Packets: 126 Packets: 140 Packets: 143 Packets: 153 Packets: 144 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 11/52 (21.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 11/53 (20.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 7/51 (13.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 11/54 (20.4%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 3 0x94 -> 0xa5, corrupted 12/55 (21.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 7/52 (13.5%)
+sim     | Corrupting 64 bytes 193.167.0.100:39712 -> 193.167.100.100:443 offset 33 0xef -> 0x3a, corrupted 8/53 (15.1%)
+sim     | Forwarding 109 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 8/54 (14.8%)
+sim     | Packets: 145 Packets: 154 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 44 0x1a -> 0xa4, corrupted 13/56 (23.2%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 6 0xf5 -> 0x92, corrupted 14/57 (24.6%)
+sim     | Forwarding 109 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 8/55 (14.5%)
+sim     | Packets: 157 Packets: 164 Forwarding 109 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 8/56 (14.3%)
+sim     | Packets: 158 Packets: 165 Packets: 159 Packets: 166 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 14/58 (24.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 14/59 (23.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 14/60 (23.3%)
+sim     | Corrupting 48 bytes 193.167.0.100:39712 -> 193.167.100.100:443 offset 8 0xb7 -> 0xa5, corrupted 9/57 (15.8%)
+sim     | Packets: 164 Packets: 169 Forwarding 109 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 9/58 (15.5%)
+sim     | Packets: 170 Packets: 177 Packets: 180 Packets: 173 Packets: 182 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 14/61 (23.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 9/59 (15.3%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 20 0x6f -> 0x54, corrupted 15/62 (24.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 15/63 (23.8%)
+sim     | Forwarding 206 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 9/60 (15.0%)
+sim     | Corrupting 50 bytes 193.167.0.100:39712 -> 193.167.100.100:443 offset 28 0x9e -> 0x9a, corrupted 10/61 (16.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 15/64 (23.4%)
+sim     | Forwarding 64 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 10/62 (16.1%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 21 0xff -> 0xa9, corrupted 16/65 (24.6%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 27 0x5c -> 0x9f, corrupted 17/66 (25.8%)
+sim     | Packets: 183 Packets: 174 Corrupting 65 bytes 193.167.0.100:39712 -> 193.167.100.100:443 offset 22 0x35 -> 0x5, corrupted 11/63 (17.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 17/67 (25.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 17/68 (25.0%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 33 0xa3 -> 0x9c, corrupted 18/69 (26.1%)
+sim     | Forwarding 48 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 11/64 (17.2%)
+sim     | Forwarding 49 bytes 193.167.0.100:39712 -> 193.167.100.100:443, corrupted 11/65 (16.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/70 (25.7%)
+sim     | Corrupting 64 bytes 193.167.0.100:39712 -> 193.167.100.100:443 offset 6 0xeb -> 0x59, corrupted 12/66 (18.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/71 (25.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/72 (25.0%)
+sim     | Corrupting 41 bytes 193.167.0.100:39712 -> 193.167.100.100:443 offset 7 0x75 -> 0xf0, corrupted 13/67 (19.4%)
+sim     | Packets: 192 Packets: 185 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/73 (24.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/74 (24.3%)
+client  | https://server4:443/warm-yellow-buffalo
+sim     | Packets: 193 Packets: 201 Forwarding 1200 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 13/68 (19.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41385, corrupted 18/75 (24.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41385, corrupted 18/76 (23.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 13/69 (18.8%)
+sim     | Forwarding 67 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 13/70 (18.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 13/71 (18.3%)
+sim     | Corrupting 109 bytes 193.167.0.100:41385 -> 193.167.100.100:443 offset 4 0xcf -> 0xe5, corrupted 14/72 (19.4%)
+sim     | Packets: 203 Packets: 195 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/77 (23.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 18/78 (23.1%)
+sim     | Forwarding 109 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 14/73 (19.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41385 offset 15 0x8 -> 0xaf, corrupted 19/79 (24.1%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:41385 offset 31 0xaa -> 0x90, corrupted 20/80 (25.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41385, corrupted 20/81 (24.7%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41385 offset 13 0xcf -> 0xa0, corrupted 21/82 (25.6%)
+sim     | Corrupting 53 bytes 193.167.0.100:41385 -> 193.167.100.100:443 offset 28 0xbb -> 0xea, corrupted 15/74 (20.3%)
+sim     | Packets: 203 Packets: 210 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41385, corrupted 21/83 (25.3%)
+sim     | Forwarding 223 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 15/75 (20.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:41385 offset 23 0x4a -> 0x73, corrupted 22/84 (26.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:41385, corrupted 22/85 (25.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41385, corrupted 22/86 (25.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:41385 -> 193.167.100.100:443, corrupted 15/76 (19.7%)
+client  | https://server4:443/sad-quiet-zip
+sim     | Packets: 210 Packets: 217 Packets: 215 Packets: 221 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 22/87 (25.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 22/88 (25.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 15/77 (19.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/89 (24.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/90 (24.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 15/78 (19.2%)
+sim     | Corrupting 45 bytes 193.167.0.100:37543 -> 193.167.100.100:443 offset 13 0x24 -> 0xdf, corrupted 16/79 (20.3%)
+sim     | Forwarding 61 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 16/80 (20.0%)
+sim     | Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 22/91 (24.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 22/92 (23.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 22/93 (23.7%)
+sim     | Forwarding 109 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 16/81 (19.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/94 (23.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/95 (23.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/96 (22.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/97 (22.7%)
+sim     | Forwarding 205 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 16/82 (19.5%)
+sim     | Forwarding 45 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 16/83 (19.3%)
+sim     | Forwarding 41 bytes 193.167.0.100:37543 -> 193.167.100.100:443, corrupted 16/84 (19.0%)
+sim     | Packets: 222 Packets: 216 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/98 (22.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37543, corrupted 22/99 (22.2%)
+client  | https://server4:443/red-dry-pilot
+sim     | Packets: 245 Packets: 239 Packets: 246 Forwarding 1200 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 16/85 (18.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 22/100 (22.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47731 offset 10 0x47 -> 0xcd, corrupted 23/101 (22.8%)
+sim     | Corrupting 1200 bytes 193.167.0.100:47731 -> 193.167.100.100:443 offset 1 0x6b -> 0x3b, corrupted 17/86 (19.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 17/87 (19.5%)
+sim     | Corrupting 61 bytes 193.167.0.100:47731 -> 193.167.100.100:443 offset 10 0x68 -> 0x5d, corrupted 18/88 (20.5%)
+sim     | Packets: 247 Packets: 240 Corrupting 109 bytes 193.167.0.100:47731 -> 193.167.100.100:443 offset 42 0x31 -> 0xda, corrupted 19/89 (21.3%)
+sim     | Packets: 252 Packets: 243 Forwarding 109 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 19/90 (21.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 23/102 (22.5%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47731 offset 15 0x98 -> 0x41, corrupted 24/103 (23.3%)
+sim     | Forwarding 53 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 19/91 (20.9%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47731 offset 43 0x56 -> 0xa2, corrupted 25/104 (24.0%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:47731 offset 19 0x7c -> 0xf8, corrupted 26/105 (24.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 26/106 (24.5%)
+sim     | Corrupting 54 bytes 193.167.0.100:47731 -> 193.167.100.100:443 offset 28 0x58 -> 0xe6, corrupted 20/92 (21.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 26/107 (24.3%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47731 offset 48 0x94 -> 0x43, corrupted 27/108 (25.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 27/109 (24.8%)
+sim     | Forwarding 54 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 20/93 (21.5%)
+sim     | Forwarding 56 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 20/94 (21.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 27/110 (24.5%)
+sim     | Packets: 254 Packets: 244 Forwarding 206 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 20/95 (21.1%)
+sim     | Corrupting 56 bytes 193.167.0.100:47731 -> 193.167.100.100:443 offset 3 0x4b -> 0xc2, corrupted 21/96 (21.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 27/111 (24.3%)
+sim     | Forwarding 61 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 21/97 (21.6%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47731 offset 48 0xa7 -> 0x9e, corrupted 28/112 (25.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 26 0x31 -> 0x62, corrupted 29/113 (25.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 29/114 (25.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 29/115 (25.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 29/116 (25.0%)
+sim     | Forwarding 62 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 21/98 (21.4%)
+sim     | Corrupting 52 bytes 193.167.0.100:47731 -> 193.167.100.100:443 offset 29 0xe5 -> 0x2c, corrupted 22/99 (22.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:47731 -> 193.167.100.100:443, corrupted 22/100 (22.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:47731, corrupted 29/117 (24.8%)
+client  | https://server4:443/zippy-moderate-viking
+sim     | Packets: 265 Packets: 257 Packets: 269 Packets: 274 Forwarding 1200 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 22/101 (21.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36391, corrupted 29/118 (24.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36391, corrupted 29/119 (24.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 22/102 (21.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 22/103 (21.4%)
+sim     | Forwarding 69 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 22/104 (21.2%)
+sim     | Corrupting 109 bytes 193.167.0.100:36391 -> 193.167.100.100:443 offset 45 0x61 -> 0xa0, corrupted 23/105 (21.9%)
+sim     | Packets: 270 Packets: 275 Forwarding 109 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 23/106 (21.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36391, corrupted 29/120 (24.2%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:36391 offset 14 0xbf -> 0x42, corrupted 30/121 (24.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36391 offset 33 0x9b -> 0x37, corrupted 31/122 (25.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36391, corrupted 31/123 (25.2%)
+sim     | Corrupting 50 bytes 193.167.0.100:36391 -> 193.167.100.100:443 offset 2 0xb -> 0x26, corrupted 24/107 (22.4%)
+sim     | Forwarding 52 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 24/108 (22.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36391, corrupted 31/124 (25.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36391, corrupted 31/125 (24.8%)
+sim     | Forwarding 52 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 24/109 (22.0%)
+sim     | Forwarding 41 bytes 193.167.0.100:36391 -> 193.167.100.100:443, corrupted 24/110 (21.8%)
+client  | https://server4:443/ashamed-indigo-barbarian
+sim     | Packets: 282 Packets: 276 Packets: 291 Packets: 285 Forwarding 1200 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 24/111 (21.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 31/126 (24.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 31/127 (24.4%)
+sim     | Packets: 292 Packets: 286 Forwarding 1200 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 24/112 (21.4%)
+sim     | Forwarding 45 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 24/113 (21.2%)
+sim     | Forwarding 72 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 24/114 (21.1%)
+sim     | Corrupting 109 bytes 193.167.0.100:34520 -> 193.167.100.100:443 offset 25 0xe1 -> 0x43, corrupted 25/115 (21.7%)
+sim     | Packets: 289 Packets: 298 Forwarding 109 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 25/116 (21.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 31/128 (24.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 31/129 (24.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 31/130 (23.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 31/131 (23.7%)
+sim     | Forwarding 46 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 25/117 (21.4%)
+sim     | Forwarding 45 bytes 193.167.0.100:34520 -> 193.167.100.100:443, corrupted 25/118 (21.2%)
+sim     | Corrupting 41 bytes 193.167.0.100:34520 -> 193.167.100.100:443 offset 17 0x8d -> 0x93, corrupted 26/119 (21.8%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:34520 offset 25 0x85 -> 0x2, corrupted 32/132 (24.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/133 (24.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/134 (23.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/135 (23.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/136 (23.5%)
+sim     | Packets: 292 Packets: 299 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/137 (23.4%)
+sim     | Packets: 305 Packets: 311 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/138 (23.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/139 (23.0%)
+sim     | Packets: 306 Packets: 312 Packets: 308 Packets: 313 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/140 (22.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 32/141 (22.7%)
+client  | https://server4:443/black-glad-fighter
+sim     | Packets: 314 Packets: 309 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 42 0x5e -> 0x3e, corrupted 33/142 (23.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 33/143 (23.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 26/120 (21.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 33/144 (22.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57338 offset 16 0x79 -> 0xc6, corrupted 34/145 (23.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 26/121 (21.5%)
+sim     | Forwarding 46 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 26/122 (21.3%)
+sim     | Corrupting 66 bytes 193.167.0.100:57338 -> 193.167.100.100:443 offset 50 0x46 -> 0xa7, corrupted 27/123 (22.0%)
+sim     | Packets: 310 Packets: 317 Forwarding 109 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 27/124 (21.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 34/146 (23.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 34/147 (23.1%)
+sim     | Forwarding 48 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 27/125 (21.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 27/126 (21.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 34/148 (23.0%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:57338 offset 3 0x5 -> 0xb3, corrupted 35/149 (23.5%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57338 offset 16 0xe -> 0xfe, corrupted 36/150 (24.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 27/127 (21.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 36/151 (23.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 36/152 (23.7%)
+sim     | Forwarding 206 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 27/128 (21.1%)
+sim     | Forwarding 49 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 27/129 (20.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 36/153 (23.5%)
+sim     | Packets: 318 Packets: 324 Corrupting 66 bytes 193.167.0.100:57338 -> 193.167.100.100:443 offset 25 0xed -> 0xdc, corrupted 28/130 (21.5%)
+sim     | Forwarding 67 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 28/131 (21.4%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520 offset 49 0x76 -> 0xd9, corrupted 37/154 (24.0%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520 offset 2 0xf -> 0xd1, corrupted 38/155 (24.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57338, corrupted 38/156 (24.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:57338 -> 193.167.100.100:443, corrupted 28/132 (21.2%)
+client  | https://server4:443/wet-enough-segway
+sim     | Packets: 337 Packets: 332 Packets: 339 Packets: 336 Forwarding 1200 bytes 193.167.0.100:52048 -> 193.167.100.100:443, corrupted 28/133 (21.1%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048 offset 12 0xc3 -> 0x7b, corrupted 39/157 (24.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048 offset 36 0xc9 -> 0xd8, corrupted 40/158 (25.3%)
+sim     | Packets: 337 Packets: 340 Corrupting 1200 bytes 193.167.0.100:52048 -> 193.167.100.100:443 offset 49 0xad -> 0x8f, corrupted 29/134 (21.6%)
+sim     | Packets: 339 Packets: 342 Forwarding 1200 bytes 193.167.0.100:52048 -> 193.167.100.100:443, corrupted 29/135 (21.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 40/159 (25.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52048 -> 193.167.100.100:443, corrupted 29/136 (21.3%)
+sim     | Corrupting 65 bytes 193.167.0.100:52048 -> 193.167.100.100:443 offset 36 0x89 -> 0x76, corrupted 30/137 (21.9%)
+sim     | Packets: 343 Packets: 340 Forwarding 109 bytes 193.167.0.100:52048 -> 193.167.100.100:443, corrupted 30/138 (21.7%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52048 offset 43 0x50 -> 0xd, corrupted 41/160 (25.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 41/161 (25.5%)
+sim     | Corrupting 53 bytes 193.167.0.100:52048 -> 193.167.100.100:443 offset 41 0xf0 -> 0xf3, corrupted 31/139 (22.3%)
+sim     | Forwarding 206 bytes 193.167.0.100:52048 -> 193.167.100.100:443, corrupted 31/140 (22.1%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 41/162 (25.3%)
+sim     | Packets: 343 Packets: 347 Corrupting 65 bytes 193.167.0.100:52048 -> 193.167.100.100:443 offset 24 0x78 -> 0x1a, corrupted 32/141 (22.7%)
+sim     | Forwarding 66 bytes 193.167.0.100:52048 -> 193.167.100.100:443, corrupted 32/142 (22.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 41/163 (25.2%)
+sim     | Corrupting 41 bytes 193.167.0.100:52048 -> 193.167.100.100:443 offset 3 0x26 -> 0xe5, corrupted 33/143 (23.1%)
+sim     | Packets: 353 Packets: 349 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 41/164 (25.0%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520 offset 18 0x50 -> 0x4e, corrupted 42/165 (25.5%)
+client  | https://server4:443/cold-cold-giraffe
+sim     | Packets: 356 Packets: 351 Corrupting 1200 bytes 193.167.0.100:46845 -> 193.167.100.100:443 offset 40 0xa4 -> 0x6b, corrupted 34/144 (23.6%)
+sim     | Packets: 358 Packets: 353 Forwarding 1200 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 34/145 (23.4%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52048 offset 41 0xf5 -> 0x18, corrupted 43/166 (25.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845 offset 35 0x0 -> 0x1, corrupted 44/167 (26.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 44/168 (26.2%)
+sim     | Corrupting 1200 bytes 193.167.0.100:46845 -> 193.167.100.100:443 offset 38 0xf7 -> 0xd8, corrupted 35/146 (24.0%)
+sim     | Packets: 359 Packets: 354 Packets: 362 Packets: 357 Forwarding 1200 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 35/147 (23.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 44/169 (26.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 35/148 (23.6%)
+sim     | Forwarding 65 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 35/149 (23.5%)
+sim     | Forwarding 109 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 35/150 (23.3%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46845 offset 20 0x20 -> 0x14, corrupted 45/170 (26.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 45/171 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845 offset 25 0x28 -> 0xca, corrupted 46/172 (26.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 46/173 (26.6%)
+sim     | Forwarding 205 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 35/151 (23.2%)
+sim     | Forwarding 54 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 35/152 (23.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 46/174 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 46/175 (26.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46845, corrupted 46/176 (26.1%)
+sim     | Corrupting 54 bytes 193.167.0.100:46845 -> 193.167.100.100:443 offset 2 0x1 -> 0x9b, corrupted 36/153 (23.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:46845 -> 193.167.100.100:443, corrupted 36/154 (23.4%)
+sim     | Packets: 358 Packets: 363 Packets: 372 Packets: 375 Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 46/177 (26.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584 offset 8 0xcd -> 0x3b, corrupted 47/178 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:39584, corrupted 47/179 (26.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 47/180 (26.1%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048 offset 37 0x7a -> 0x4a, corrupted 48/181 (26.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 48/182 (26.4%)
+client  | https://server4:443/warm-olive-laserdisc
+sim     | Packets: 376 Packets: 373 Forwarding 1200 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 36/155 (23.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47801, corrupted 48/183 (26.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47801, corrupted 48/184 (26.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 36/156 (23.1%)
+sim     | Forwarding 45 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 36/157 (22.9%)
+sim     | Forwarding 68 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 36/158 (22.8%)
+sim     | Corrupting 109 bytes 193.167.0.100:47801 -> 193.167.100.100:443 offset 13 0x48 -> 0xb9, corrupted 37/159 (23.3%)
+sim     | Packets: 383 Packets: 384 Forwarding 109 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 37/160 (23.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47801, corrupted 48/185 (25.9%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:47801 offset 6 0xa3 -> 0x80, corrupted 49/186 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47801 offset 20 0x46 -> 0x8b, corrupted 50/187 (26.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47801, corrupted 50/188 (26.6%)
+sim     | Corrupting 46 bytes 193.167.0.100:47801 -> 193.167.100.100:443 offset 1 0xf5 -> 0x73, corrupted 38/161 (23.6%)
+sim     | Forwarding 48 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 38/162 (23.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47801, corrupted 50/189 (26.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47801, corrupted 50/190 (26.3%)
+sim     | Corrupting 48 bytes 193.167.0.100:47801 -> 193.167.100.100:443 offset 6 0x5a -> 0x26, corrupted 39/163 (23.9%)
+sim     | Forwarding 41 bytes 193.167.0.100:47801 -> 193.167.100.100:443, corrupted 39/164 (23.8%)
+client  | https://server4:443/maroon-angry-lawyer
+sim     | Packets: 389 Packets: 391 Packets: 397 Packets: 399 Corrupting 1200 bytes 193.167.0.100:43744 -> 193.167.100.100:443 offset 8 0xbf -> 0x5e, corrupted 40/165 (24.2%)
+sim     | Packets: 400 Forwarding 1200 bytes 193.167.0.100:43744 -> 193.167.100.100:443, corrupted 40/166 (24.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43744, corrupted 50/191 (26.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43744, corrupted 50/192 (26.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:43744 -> 193.167.100.100:443, corrupted 40/167 (24.0%)
+sim     | Forwarding 67 bytes 193.167.0.100:43744 -> 193.167.100.100:443, corrupted 40/168 (23.8%)
+sim     | Corrupting 46 bytes 193.167.0.100:43744 -> 193.167.100.100:443 offset 1 0x30 -> 0xda, corrupted 41/169 (24.3%)
+sim     | Packets: 398 Packets: 401 Corrupting 109 bytes 193.167.0.100:43744 -> 193.167.100.100:443 offset 46 0x79 -> 0xd2, corrupted 42/170 (24.7%)
+sim     | Corrupting 109 bytes 193.167.0.100:43744 -> 193.167.100.100:443 offset 20 0xc2 -> 0x91, corrupted 43/171 (25.1%)
+sim     | Packets: 407 Packets: 402 Packets: 408 Forwarding 109 bytes 193.167.0.100:43744 -> 193.167.100.100:443, corrupted 43/172 (25.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:43744, corrupted 50/193 (25.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:43744, corrupted 50/194 (25.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43744, corrupted 50/195 (25.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43744, corrupted 50/196 (25.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 50/197 (25.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 50/198 (25.3%)
+sim     | Forwarding 45 bytes 193.167.0.100:43744 -> 193.167.100.100:443, corrupted 43/173 (24.9%)
+sim     | Forwarding 41 bytes 193.167.0.100:43744 -> 193.167.100.100:443, corrupted 43/174 (24.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 50/199 (25.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 50/200 (25.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:43744 offset 39 0x56 -> 0xe2, corrupted 51/201 (25.4%)
+sim     | Packets: 403 Packets: 409 Packets: 419 Packets: 423 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 51/202 (25.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 51/203 (25.1%)
+client  | https://server4:443/red-vast-bowtie
+sim     | Packets: 424 Packets: 420 Packets: 425 Packets: 421 Packets: 426 Forwarding 1200 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 43/175 (24.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 51/204 (25.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 15 0x7f -> 0x37, corrupted 52/205 (25.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 43/176 (24.4%)
+sim     | Forwarding 46 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 43/177 (24.3%)
+sim     | Corrupting 63 bytes 193.167.0.100:40798 -> 193.167.100.100:443 offset 25 0x9a -> 0xce, corrupted 44/178 (24.7%)
+sim     | Corrupting 109 bytes 193.167.0.100:40798 -> 193.167.100.100:443 offset 37 0x6b -> 0xef, corrupted 45/179 (25.1%)
+sim     | Packets: 424 Packets: 429 Forwarding 109 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 45/180 (25.0%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 26 0x20 -> 0x7e, corrupted 53/206 (25.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 53/207 (25.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 45/181 (24.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 53/208 (25.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 9 0x31 -> 0xd7, corrupted 54/209 (25.8%)
+sim     | Corrupting 48 bytes 193.167.0.100:40798 -> 193.167.100.100:443 offset 8 0x65 -> 0x21, corrupted 46/182 (25.3%)
+sim     | Packets: 429 Packets: 435 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 33 0xf4 -> 0x95, corrupted 55/210 (26.2%)
+sim     | Forwarding 206 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 46/183 (25.1%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 6 0x17 -> 0xc9, corrupted 56/211 (26.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 56/212 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 56/213 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 26 0x2f -> 0xc1, corrupted 57/214 (26.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 46/184 (25.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 46/185 (24.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 57/215 (26.5%)
+sim     | Forwarding 52 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 46/186 (24.7%)
+sim     | Packets: 434 Packets: 440 Corrupting 64 bytes 193.167.0.100:40798 -> 193.167.100.100:443 offset 32 0x64 -> 0xa3, corrupted 47/187 (25.1%)
+sim     | Packets: 447 Packets: 444 Corrupting 39 bytes 193.167.0.100:40798 -> 193.167.100.100:443 offset 27 0x20 -> 0x92, corrupted 48/188 (25.5%)
+sim     | Packets: 445 Packets: 448 Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 57/216 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 57/217 (26.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 57/218 (26.1%)
+sim     | Packets: 448 Packets: 449 Packets: 450 Packets: 454 Forwarding 206 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 48/189 (25.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 57/219 (26.0%)
+sim     | Forwarding 63 bytes 193.167.0.100:40798 -> 193.167.100.100:443, corrupted 48/190 (25.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 57/220 (25.9%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 28 0x11 -> 0x68, corrupted 58/221 (26.2%)
+sim     | Corrupting 41 bytes 193.167.0.100:40798 -> 193.167.100.100:443 offset 24 0x7 -> 0x6a, corrupted 49/191 (25.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 58/222 (26.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 58/223 (26.0%)
+sim     | Packets: 451 Packets: 455 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 20 0xb7 -> 0x20, corrupted 59/224 (26.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 59/225 (26.2%)
+client  | https://server4:443/sufficient-enough-ocelot
+sim     | Packets: 462 Packets: 458 Forwarding 1200 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 49/192 (25.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51937, corrupted 59/226 (26.1%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51937 offset 43 0x2a -> 0x19, corrupted 60/227 (26.4%)
+sim     | Corrupting 1200 bytes 193.167.0.100:51937 -> 193.167.100.100:443 offset 19 0x5c -> 0x51, corrupted 50/193 (25.9%)
+sim     | Forwarding 72 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 50/194 (25.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 60/228 (26.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 60/229 (26.2%)
+sim     | Forwarding 109 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 50/195 (25.6%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51937 offset 23 0xf1 -> 0x84, corrupted 61/230 (26.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51937, corrupted 61/231 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51937, corrupted 61/232 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51937 offset 21 0x32 -> 0x3e, corrupted 62/233 (26.6%)
+sim     | Forwarding 205 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 50/196 (25.5%)
+sim     | Corrupting 48 bytes 193.167.0.100:51937 -> 193.167.100.100:443 offset 29 0x38 -> 0x6a, corrupted 51/197 (25.9%)
+sim     | Packets: 463 Packets: 460 Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:51937 offset 22 0x75 -> 0x91, corrupted 63/234 (26.9%)
+sim     | Forwarding 206 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 51/198 (25.8%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:51937 offset 29 0x14 -> 0xf1, corrupted 64/235 (27.2%)
+sim     | Packets: 476 Packets: 475 Packets: 476 Forwarding 206 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 51/199 (25.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51937, corrupted 64/236 (27.1%)
+sim     | Forwarding 50 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 51/200 (25.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 64/237 (27.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 64/238 (26.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51937, corrupted 64/239 (26.8%)
+sim     | Forwarding 41 bytes 193.167.0.100:51937 -> 193.167.100.100:443, corrupted 51/201 (25.4%)
+client  | https://server4:443/aquamarine-dark-anteater
+sim     | Packets: 477 Packets: 477 Packets: 485 Packets: 485 Forwarding 1200 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/202 (25.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34642, corrupted 64/240 (26.7%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34642 offset 14 0x68 -> 0x33, corrupted 65/241 (27.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/203 (25.1%)
+sim     | Forwarding 50 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/204 (25.0%)
+sim     | Forwarding 72 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/205 (24.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 65/242 (26.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 65/243 (26.7%)
+sim     | Forwarding 109 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/206 (24.8%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34642 offset 29 0xe4 -> 0x11, corrupted 66/244 (27.0%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:34642 offset 35 0xb -> 0x5a, corrupted 67/245 (27.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34642, corrupted 67/246 (27.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34642, corrupted 67/247 (27.1%)
+sim     | Forwarding 51 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/207 (24.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:34642 -> 193.167.100.100:443, corrupted 51/208 (24.5%)
+client  | https://server4:443/white-sweet-samurai
+sim     | Packets: 486 Packets: 486 Packets: 501 Packets: 498 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 67/248 (27.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 13 0xfb -> 0xc2, corrupted 68/249 (27.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 51/209 (24.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 68/250 (27.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 68/251 (27.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 51/210 (24.3%)
+sim     | Corrupting 67 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/211 (24.6%)
+sim     | Forwarding 46 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/212 (24.5%)
+sim     | Packets: 502 Packets: 499 Forwarding 109 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/213 (24.4%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49601 offset 31 0xb4 -> 0x81, corrupted 69/252 (27.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 69/253 (27.3%)
+sim     | Forwarding 48 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/214 (24.3%)
+sim     | Forwarding 206 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/215 (24.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 69/254 (27.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 69/255 (27.1%)
+sim     | Forwarding 67 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/216 (24.1%)
+sim     | Forwarding 46 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/217 (24.0%)
+sim     | Packets: 509 Packets: 506 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 69/256 (27.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 69/257 (26.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49601, corrupted 69/258 (26.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:49601 -> 193.167.100.100:443, corrupted 52/218 (23.9%)
+client  | https://server4:443/medium-happy-jirachi
+sim     | Packets: 521 Packets: 514 Forwarding 1200 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 52/219 (23.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 69/259 (26.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 69/260 (26.5%)
+sim     | Packets: 522 Packets: 518 Forwarding 1200 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 52/220 (23.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 52/221 (23.5%)
+sim     | Corrupting 68 bytes 193.167.0.100:60027 -> 193.167.100.100:443 offset 15 0x8b -> 0x5e, corrupted 53/222 (23.9%)
+sim     | Forwarding 109 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 53/223 (23.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 69/261 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 69/262 (26.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 53/224 (23.7%)
+sim     | Forwarding 50 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 53/225 (23.6%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60027 offset 38 0x73 -> 0x95, corrupted 70/263 (26.6%)
+sim     | Forwarding 206 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 53/226 (23.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:60027 offset 27 0xf2 -> 0x7e, corrupted 71/264 (26.9%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60027 offset 50 0xe1 -> 0xfb, corrupted 72/265 (27.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 72/266 (27.1%)
+sim     | Packets: 525 Packets: 524 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60027 offset 19 0x51 -> 0xfb, corrupted 73/267 (27.3%)
+sim     | Forwarding 52 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 53/227 (23.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 73/268 (27.2%)
+sim     | Forwarding 54 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 53/228 (23.2%)
+sim     | Corrupting 69 bytes 193.167.0.100:60027 -> 193.167.100.100:443 offset 5 0xa1 -> 0xf8, corrupted 54/229 (23.6%)
+sim     | Packets: 538 Packets: 534 Packets: 541 Packets: 537 Forwarding 206 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 54/230 (23.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:60027 offset 34 0x3b -> 0x58, corrupted 74/269 (27.5%)
+sim     | Packets: 542 Packets: 538 Packets: 543 Packets: 539 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 33 0xfe -> 0xa3, corrupted 75/270 (27.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 75/271 (27.7%)
+sim     | Forwarding 69 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 54/231 (23.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60027, corrupted 75/272 (27.6%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:60027 offset 13 0xf1 -> 0x9b, corrupted 76/273 (27.8%)
+sim     | Forwarding 41 bytes 193.167.0.100:60027 -> 193.167.100.100:443, corrupted 54/232 (23.3%)
+client  | https://server4:443/mild-gray-pikachu
+sim     | Packets: 544 Packets: 540 Packets: 550 Packets: 544 Forwarding 1200 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 54/233 (23.2%)
+sim     | Packets: 551 Packets: 545 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/274 (27.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/275 (27.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 54/234 (23.1%)
+sim     | Forwarding 49 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 54/235 (23.0%)
+sim     | Corrupting 65 bytes 193.167.0.100:50973 -> 193.167.100.100:443 offset 19 0xd5 -> 0x5e, corrupted 55/236 (23.3%)
+sim     | Forwarding 109 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 55/237 (23.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/276 (27.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/277 (27.4%)
+sim     | Forwarding 50 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 55/238 (23.1%)
+sim     | Forwarding 50 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 55/239 (23.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/278 (27.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 55/240 (22.9%)
+sim     | Forwarding 206 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 55/241 (22.8%)
+sim     | Packets: 554 Packets: 546 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/279 (27.2%)
+sim     | Corrupting 65 bytes 193.167.0.100:50973 -> 193.167.100.100:443 offset 21 0xbe -> 0x4c, corrupted 56/242 (23.1%)
+sim     | Corrupting 66 bytes 193.167.0.100:50973 -> 193.167.100.100:443 offset 44 0xf0 -> 0x15, corrupted 57/243 (23.5%)
+sim     | Packets: 564 Packets: 559 Forwarding 66 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 57/244 (23.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50973, corrupted 76/280 (27.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:50973 -> 193.167.100.100:443, corrupted 57/245 (23.3%)
+client  | https://server4:443/chilly-guilty-paper
+sim     | Packets: 565 Packets: 563 Packets: 567 Packets: 565 Forwarding 1200 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 57/246 (23.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/281 (27.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/282 (27.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 57/247 (23.1%)
+sim     | Corrupting 49 bytes 193.167.0.100:49242 -> 193.167.100.100:443 offset 43 0xb1 -> 0x74, corrupted 58/248 (23.4%)
+sim     | Corrupting 67 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 59/249 (23.7%)
+sim     | Forwarding 109 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 59/250 (23.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/283 (26.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/284 (26.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 59/251 (23.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/285 (26.7%)
+sim     | Packets: 568 Packets: 566 Corrupting 50 bytes 193.167.0.100:49242 -> 193.167.100.100:443 offset 45 0xd8 -> 0x24, corrupted 60/252 (23.8%)
+sim     | Corrupting 206 bytes 193.167.0.100:49242 -> 193.167.100.100:443 offset 39 0x51 -> 0xca, corrupted 61/253 (24.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/286 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/287 (26.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 76/288 (26.4%)
+sim     | Forwarding 49 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 61/254 (24.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 61/255 (23.9%)
+sim     | Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 76/289 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048 offset 44 0x5b -> 0x30, corrupted 77/290 (26.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52048, corrupted 77/291 (26.5%)
+sim     | Packets: 578 Packets: 578 Forwarding 68 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 61/256 (23.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 77/292 (26.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49242, corrupted 77/293 (26.3%)
+sim     | Forwarding 41 bytes 193.167.0.100:49242 -> 193.167.100.100:443, corrupted 61/257 (23.7%)
+sim     | Packets: 588 Packets: 588 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712, corrupted 77/294 (26.2%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:39712 offset 13 0x6b -> 0xb1, corrupted 78/295 (26.4%)
+client  | https://server4:443/few-blue-laptop
+sim     | Packets: 592 Packets: 594 Corrupting 1200 bytes 193.167.0.100:57953 -> 193.167.100.100:443 offset 46 0xd3 -> 0xbb, corrupted 62/258 (24.0%)
+sim     | Packets: 594 Forwarding 1200 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 62/259 (23.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57953 offset 49 0x58 -> 0x97, corrupted 79/296 (26.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 79/297 (26.6%)
+sim     | Corrupting 1200 bytes 193.167.0.100:57953 -> 193.167.100.100:443 offset 41 0xd -> 0x88, corrupted 63/260 (24.2%)
+sim     | Packets: 595 Packets: 595 Forwarding 1200 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 63/261 (24.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 79/298 (26.5%)
+sim     | Forwarding 1200 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 63/262 (24.0%)
+sim     | Corrupting 63 bytes 193.167.0.100:57953 -> 193.167.100.100:443 offset 38 0xb6 -> 0xb4, corrupted 64/263 (24.3%)
+sim     | Packets: 598 Packets: 598 Corrupting 109 bytes 193.167.0.100:57953 -> 193.167.100.100:443 offset 26 0x53 -> 0xe2, corrupted 65/264 (24.6%)
+sim     | Packets: 602 Packets: 603 Forwarding 109 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 65/265 (24.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 79/299 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 79/300 (26.3%)
+sim     | Forwarding 49 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 65/266 (24.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 79/301 (26.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57953 offset 3 0x16 -> 0x73, corrupted 80/302 (26.5%)
+sim     | Corrupting 50 bytes 193.167.0.100:57953 -> 193.167.100.100:443 offset 32 0x87 -> 0xad, corrupted 66/267 (24.7%)
+sim     | Forwarding 206 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 66/268 (24.6%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:57953 offset 20 0x33 -> 0x7, corrupted 81/303 (26.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 81/304 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 81/305 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 81/306 (26.5%)
+sim     | Forwarding 52 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 66/269 (24.5%)
+sim     | Packets: 603 Packets: 604 Forwarding 51 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 66/270 (24.4%)
+sim     | Forwarding 64 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 66/271 (24.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 81/307 (26.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:57953, corrupted 81/308 (26.3%)
+sim     | Forwarding 41 bytes 193.167.0.100:57953 -> 193.167.100.100:443, corrupted 66/272 (24.3%)
+client  | https://server4:443/warm-frightened-lemur
+sim     | Packets: 615 Packets: 616 Packets: 618 Packets: 620 Forwarding 1200 bytes 193.167.0.100:41565 -> 193.167.100.100:443, corrupted 66/273 (24.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 81/309 (26.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 81/310 (26.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:41565 -> 193.167.100.100:443, corrupted 66/274 (24.1%)
+sim     | Forwarding 45 bytes 193.167.0.100:41565 -> 193.167.100.100:443, corrupted 66/275 (24.0%)
+sim     | Forwarding 69 bytes 193.167.0.100:41565 -> 193.167.100.100:443, corrupted 66/276 (23.9%)
+sim     | Packets: 621 Packets: 619 Corrupting 109 bytes 193.167.0.100:41565 -> 193.167.100.100:443 offset 15 0x2e -> 0xfd, corrupted 67/277 (24.2%)
+sim     | Packets: 626 Packets: 625 Corrupting 109 bytes 193.167.0.100:41565 -> 193.167.100.100:443 offset 45 0x60 -> 0x2e, corrupted 68/278 (24.5%)
+sim     | Packets: 626 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 81/311 (26.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 81/312 (26.0%)
+sim     | Forwarding 109 bytes 193.167.0.100:41565 -> 193.167.100.100:443, corrupted 68/279 (24.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 81/313 (25.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 81/314 (25.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 48 0x6c -> 0xe4, corrupted 82/315 (26.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 9 0xc3 -> 0xb0, corrupted 83/316 (26.3%)
+sim     | Corrupting 46 bytes 193.167.0.100:41565 -> 193.167.100.100:443 offset 45 0xf8 -> 0x1e, corrupted 69/280 (24.6%)
+sim     | Packets: 627 Packets: 627 Corrupting 205 bytes 193.167.0.100:41565 -> 193.167.100.100:443 offset 10 0x2e -> 0x1a, corrupted 70/281 (24.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 83/317 (26.2%)
+sim     | Corrupting 48 bytes 193.167.0.100:41565 -> 193.167.100.100:443 offset 31 0xce -> 0x51, corrupted 71/282 (25.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 30 0x69 -> 0xe8, corrupted 84/318 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 84/319 (26.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 26 0x31 -> 0xdf, corrupted 85/320 (26.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:41565 -> 193.167.100.100:443, corrupted 71/283 (25.1%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 50 0xd1 -> 0x7b, corrupted 86/321 (26.8%)
+sim     | Packets: 636 Packets: 636 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 42 0x73 -> 0x51, corrupted 87/322 (27.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 87/323 (26.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 87/324 (26.9%)
+sim     | Corrupting 41 bytes 193.167.0.100:41565 -> 193.167.100.100:443 offset 6 0xc -> 0xc9, corrupted 72/284 (25.4%)
+sim     | Packets: 642 Packets: 640 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 10 0xb9 -> 0xa8, corrupted 88/325 (27.1%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 42 0xa9 -> 0xf5, corrupted 89/326 (27.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 89/327 (27.2%)
+sim     | Packets: 643 Packets: 645 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 89/328 (27.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 89/329 (27.1%)
+sim     | Packets: 648 Packets: 644 Packets: 649 Packets: 645 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 9 0x5a -> 0x3d, corrupted 90/330 (27.3%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 49 0xb5 -> 0x96, corrupted 91/331 (27.5%)
+client  | https://server4:443/bountiful-bitter-pilot
+sim     | Packets: 650 Packets: 651 Forwarding 1200 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 72/285 (25.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 91/332 (27.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 91/333 (27.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 72/286 (25.2%)
+sim     | Forwarding 45 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 72/287 (25.1%)
+sim     | Corrupting 70 bytes 193.167.0.100:51107 -> 193.167.100.100:443 offset 14 0x58 -> 0x57, corrupted 73/288 (25.3%)
+sim     | Forwarding 109 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/289 (25.3%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51107 offset 34 0xcb -> 0xa5, corrupted 92/334 (27.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 92/335 (27.5%)
+sim     | Forwarding 48 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/290 (25.2%)
+sim     | Packets: 646 Packets: 652 Forwarding 206 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/291 (25.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 92/336 (27.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 92/337 (27.3%)
+sim     | Forwarding 48 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/292 (25.0%)
+sim     | Forwarding 70 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/293 (24.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 92/338 (27.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51107 offset 16 0x1f -> 0xe, corrupted 93/339 (27.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 93/340 (27.4%)
+sim     | Forwarding 46 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/294 (24.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51107, corrupted 93/341 (27.3%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51107 offset 44 0x13 -> 0xb6, corrupted 94/342 (27.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:51107 -> 193.167.100.100:443, corrupted 73/295 (24.7%)
+sim     | Packets: 661 Packets: 655 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 29 0xa9 -> 0xa3, corrupted 95/343 (27.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 95/344 (27.6%)
+client  | https://server4:443/soft-indigo-necklace
+sim     | Packets: 673 Packets: 665 Corrupting 1200 bytes 193.167.0.100:36936 -> 193.167.100.100:443 offset 23 0x0 -> 0xf1, corrupted 74/296 (25.0%)
+sim     | Packets: 675 Packets: 667 Forwarding 1200 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 74/297 (24.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 18 0x5e -> 0xd4, corrupted 96/345 (27.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 37 0xb8 -> 0xf4, corrupted 97/346 (28.0%)
+sim     | Packets: 676 Packets: 668 Forwarding 1200 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 74/298 (24.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 97/347 (28.0%)
+sim     | Packets: 679 Packets: 669 Forwarding 1200 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 74/299 (24.7%)
+sim     | Corrupting 68 bytes 193.167.0.100:36936 -> 193.167.100.100:443 offset 4 0x5e -> 0x36, corrupted 75/300 (25.0%)
+sim     | Corrupting 109 bytes 193.167.0.100:36936 -> 193.167.100.100:443 offset 7 0xc -> 0xed, corrupted 76/301 (25.2%)
+sim     | Packets: 681 Packets: 673 Forwarding 109 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/302 (25.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 97/348 (27.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 25 0x91 -> 0x79, corrupted 98/349 (28.1%)
+sim     | Forwarding 46 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/303 (25.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 98/350 (28.0%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 38 0xfe -> 0x0, corrupted 99/351 (28.2%)
+sim     | Forwarding 48 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/304 (25.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 22 0x2d -> 0x67, corrupted 100/352 (28.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 100/353 (28.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 100/354 (28.2%)
+sim     | Packets: 682 Packets: 674 Forwarding 49 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/305 (24.9%)
+sim     | Forwarding 206 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/306 (24.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 100/355 (28.2%)
+sim     | Forwarding 68 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/307 (24.8%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 12 0x91 -> 0x1b, corrupted 101/356 (28.4%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 101/357 (28.3%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936 offset 7 0xb3 -> 0xf, corrupted 102/358 (28.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:36936, corrupted 102/359 (28.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:36936 -> 193.167.100.100:443, corrupted 76/308 (24.7%)
+sim     | Packets: 683 Packets: 692 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 102/360 (28.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34520, corrupted 102/361 (28.3%)
+client  | https://server4:443/sour-subtropical-sock
+sim     | Packets: 701 Packets: 688 Forwarding 1200 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 76/309 (24.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42713, corrupted 102/362 (28.2%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42713 offset 15 0xb2 -> 0x1d, corrupted 103/363 (28.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 76/310 (24.5%)
+sim     | Forwarding 46 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 76/311 (24.4%)
+sim     | Forwarding 69 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 76/312 (24.4%)
+sim     | Corrupting 109 bytes 193.167.0.100:42713 -> 193.167.100.100:443 offset 36 0xae -> 0x93, corrupted 77/313 (24.6%)
+sim     | Packets: 705 Packets: 692 Forwarding 109 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 77/314 (24.5%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42713 offset 28 0x39 -> 0x52, corrupted 104/364 (28.6%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:42713, corrupted 104/365 (28.5%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42713 offset 9 0x24 -> 0x6f, corrupted 105/366 (28.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42713, corrupted 105/367 (28.6%)
+sim     | Corrupting 49 bytes 193.167.0.100:42713 -> 193.167.100.100:443 offset 11 0x68 -> 0xd5, corrupted 78/315 (24.8%)
+sim     | Corrupting 205 bytes 193.167.0.100:42713 -> 193.167.100.100:443 offset 42 0xa9 -> 0xe5, corrupted 79/316 (25.0%)
+sim     | Packets: 711 Packets: 698 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42713, corrupted 105/368 (28.5%)
+sim     | Corrupting 48 bytes 193.167.0.100:42713 -> 193.167.100.100:443 offset 19 0x7e -> 0xb, corrupted 80/317 (25.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42713 offset 15 0xcd -> 0x1, corrupted 106/369 (28.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42713, corrupted 106/370 (28.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42713, corrupted 106/371 (28.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 80/318 (25.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:42713 -> 193.167.100.100:443, corrupted 80/319 (25.1%)
+sim     | Packets: 716 Packets: 703 Packets: 708 Packets: 721 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 12 0xdd -> 0x53, corrupted 107/372 (28.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 107/373 (28.7%)
+client  | https://server4:443/bright-surprised-pharaoh
+sim     | Packets: 709 Packets: 722 Packets: 710 Packets: 724 Forwarding 1200 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 80/320 (25.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222 offset 2 0x33 -> 0xaa, corrupted 108/374 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 108/375 (28.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 80/321 (24.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222 offset 2 0x33 -> 0x6, corrupted 109/376 (29.0%)
+sim     | Packets: 711 Packets: 725 Forwarding 1200 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 80/322 (24.8%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 109/377 (28.9%)
+sim     | Corrupting 1200 bytes 193.167.0.100:48222 -> 193.167.100.100:443 offset 39 0x7e -> 0x2d, corrupted 81/323 (25.1%)
+sim     | Packets: 730 Packets: 714 Packets: 731 Packets: 716 Corrupting 1200 bytes 193.167.0.100:48222 -> 193.167.100.100:443 offset 38 0x75 -> 0xcd, corrupted 82/324 (25.3%)
+sim     | Packets: 717 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 109/378 (28.8%)
+sim     | Corrupting 1200 bytes 193.167.0.100:48222 -> 193.167.100.100:443 offset 5 0x12 -> 0x5f, corrupted 83/325 (25.5%)
+sim     | Forwarding 72 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 83/326 (25.5%)
+sim     | Corrupting 109 bytes 193.167.0.100:48222 -> 193.167.100.100:443 offset 33 0x40 -> 0xbc, corrupted 84/327 (25.7%)
+sim     | Packets: 718 Packets: 732 Forwarding 109 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 84/328 (25.6%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48222 offset 7 0xe9 -> 0xc, corrupted 110/379 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 110/380 (28.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222 offset 49 0x29 -> 0x94, corrupted 111/381 (29.1%)
+sim     | Corrupting 52 bytes 193.167.0.100:48222 -> 193.167.100.100:443 offset 33 0x22 -> 0x4f, corrupted 85/329 (25.8%)
+sim     | Forwarding 205 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 85/330 (25.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 111/382 (29.1%)
+sim     | Packets: 734 Packets: 722 Packets: 739 Packets: 726 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 111/383 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 111/384 (28.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48222 offset 2 0xa4 -> 0x99, corrupted 112/385 (29.1%)
+sim     | Forwarding 54 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 85/331 (25.7%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48222 offset 43 0x5b -> 0xa2, corrupted 113/386 (29.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48222, corrupted 113/387 (29.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:48222 -> 193.167.100.100:443, corrupted 85/332 (25.6%)
+sim     | Packets: 740 Packets: 727 Packets: 746 Packets: 731 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798, corrupted 113/388 (29.1%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40798 offset 1 0xba -> 0x77, corrupted 114/389 (29.3%)
+client  | https://server4:443/excited-few-knight
+sim     | Packets: 747 Packets: 732 Packets: 733 Packets: 749 Forwarding 1200 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/333 (25.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53833, corrupted 114/390 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53833, corrupted 114/391 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/334 (25.4%)
+sim     | Forwarding 66 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/335 (25.4%)
+sim     | Forwarding 46 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/336 (25.3%)
+sim     | Forwarding 109 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/337 (25.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53833, corrupted 114/392 (29.1%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:53833 offset 28 0xdf -> 0x5, corrupted 115/393 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53833, corrupted 115/394 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53833, corrupted 115/395 (29.1%)
+sim     | Forwarding 46 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/338 (25.1%)
+sim     | Forwarding 48 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/339 (25.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:53833 -> 193.167.100.100:443, corrupted 85/340 (25.0%)
+sim     | Packets: 734 Packets: 750 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53833 offset 35 0xbf -> 0x73, corrupted 116/396 (29.3%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:53833 offset 7 0xe -> 0x8b, corrupted 117/397 (29.5%)
+client  | https://server4:443/turquoise-mild-floppy
+sim     | Packets: 746 Packets: 765 Forwarding 1200 bytes 193.167.0.100:49488 -> 193.167.100.100:443, corrupted 85/341 (24.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49488 offset 48 0x31 -> 0xfe, corrupted 118/398 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49488, corrupted 118/399 (29.6%)
+sim     | Packets: 766 Packets: 747 Forwarding 1200 bytes 193.167.0.100:49488 -> 193.167.100.100:443, corrupted 85/342 (24.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49488, corrupted 118/400 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49488 -> 193.167.100.100:443, corrupted 85/343 (24.8%)
+sim     | Forwarding 69 bytes 193.167.0.100:49488 -> 193.167.100.100:443, corrupted 85/344 (24.7%)
+sim     | Forwarding 109 bytes 193.167.0.100:49488 -> 193.167.100.100:443, corrupted 85/345 (24.6%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49488 offset 15 0x82 -> 0x7c, corrupted 119/401 (29.7%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:49488 offset 10 0x7 -> 0xa9, corrupted 120/402 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49488, corrupted 120/403 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49488, corrupted 120/404 (29.7%)
+sim     | Corrupting 47 bytes 193.167.0.100:49488 -> 193.167.100.100:443 offset 27 0x1d -> 0x92, corrupted 86/346 (24.9%)
+sim     | Forwarding 41 bytes 193.167.0.100:49488 -> 193.167.100.100:443, corrupted 86/347 (24.8%)
+client  | https://server4:443/bored-rough-journal
+sim     | Packets: 750 Packets: 769 Packets: 757 Packets: 778 Corrupting 1200 bytes 193.167.0.100:54217 -> 193.167.100.100:443 offset 30 0xa0 -> 0x8, corrupted 87/348 (25.0%)
+sim     | Packets: 758 Forwarding 1200 bytes 193.167.0.100:54217 -> 193.167.100.100:443, corrupted 87/349 (24.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 120/405 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 120/406 (29.6%)
+sim     | Corrupting 1200 bytes 193.167.0.100:54217 -> 193.167.100.100:443 offset 47 0xd9 -> 0x7c, corrupted 88/350 (25.1%)
+sim     | Forwarding 67 bytes 193.167.0.100:54217 -> 193.167.100.100:443, corrupted 88/351 (25.1%)
+sim     | Forwarding 50 bytes 193.167.0.100:54217 -> 193.167.100.100:443, corrupted 88/352 (25.0%)
+sim     | Corrupting 109 bytes 193.167.0.100:54217 -> 193.167.100.100:443 offset 49 0x70 -> 0x58, corrupted 89/353 (25.2%)
+sim     | Packets: 759 Packets: 779 Forwarding 109 bytes 193.167.0.100:54217 -> 193.167.100.100:443, corrupted 89/354 (25.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 120/407 (29.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 121/408 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 121/409 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 121/410 (29.5%)
+sim     | Corrupting 50 bytes 193.167.0.100:54217 -> 193.167.100.100:443 offset 47 0xc3 -> 0x3d, corrupted 90/355 (25.4%)
+sim     | Forwarding 51 bytes 193.167.0.100:54217 -> 193.167.100.100:443, corrupted 90/356 (25.3%)
+sim     | Corrupting 41 bytes 193.167.0.100:54217 -> 193.167.100.100:443 offset 30 0xa7 -> 0xb4, corrupted 91/357 (25.5%)
+sim     | Packets: 766 Packets: 784 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 121/411 (29.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 121/412 (29.4%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:54217 offset 47 0xc2 -> 0x16, corrupted 122/413 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 122/414 (29.5%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217 offset 6 0xea -> 0x21, corrupted 123/415 (29.6%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217 offset 30 0xb3 -> 0x67, corrupted 124/416 (29.8%)
+client  | https://server4:443/icy-soft-prince
+sim     | Packets: 773 Packets: 792 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 124/417 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 124/418 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 91/358 (25.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56589, corrupted 124/419 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56589, corrupted 124/420 (29.5%)
+sim     | Packets: 796 Packets: 776 Forwarding 1200 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 91/359 (25.3%)
+sim     | Corrupting 63 bytes 193.167.0.100:56589 -> 193.167.100.100:443 offset 14 0x72 -> 0xed, corrupted 92/360 (25.6%)
+sim     | Corrupting 46 bytes 193.167.0.100:56589 -> 193.167.100.100:443 offset 23 0x5c -> 0x97, corrupted 93/361 (25.8%)
+sim     | Forwarding 109 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 93/362 (25.7%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56589 offset 38 0x39 -> 0x2b, corrupted 125/421 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56589, corrupted 125/422 (29.6%)
+sim     | Forwarding 48 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 93/363 (25.6%)
+sim     | Forwarding 206 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 93/364 (25.5%)
+sim     | Packets: 786 Packets: 803 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:56589, corrupted 125/423 (29.6%)
+sim     | Forwarding 63 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 93/365 (25.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56589, corrupted 125/424 (29.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:56589, corrupted 125/425 (29.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:56589 -> 193.167.100.100:443, corrupted 93/366 (25.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 125/426 (29.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 125/427 (29.3%)
+client  | https://server4:443/wet-colossal-notebook
+sim     | Packets: 790 Packets: 810 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 125/428 (29.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 19 0x24 -> 0xe0, corrupted 126/429 (29.4%)
+sim     | Corrupting 1200 bytes 193.167.0.100:57403 -> 193.167.100.100:443 offset 46 0xed -> 0xa4, corrupted 94/367 (25.6%)
+sim     | Packets: 799 Packets: 818 Forwarding 1200 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 94/368 (25.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 126/430 (29.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57403 offset 21 0xac -> 0xc3, corrupted 127/431 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 94/369 (25.5%)
+sim     | Forwarding 46 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 94/370 (25.4%)
+sim     | Forwarding 69 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 94/371 (25.3%)
+sim     | Packets: 821 Packets: 802 Corrupting 109 bytes 193.167.0.100:57403 -> 193.167.100.100:443 offset 37 0xe3 -> 0x88, corrupted 95/372 (25.5%)
+sim     | Packets: 807 Packets: 826 Corrupting 109 bytes 193.167.0.100:57403 -> 193.167.100.100:443 offset 25 0x7d -> 0xb1, corrupted 96/373 (25.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 127/432 (29.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 127/433 (29.3%)
+sim     | Packets: 827 Packets: 808 Forwarding 109 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 96/374 (25.7%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57403 offset 20 0x95 -> 0x9d, corrupted 128/434 (29.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:57403 offset 13 0x12 -> 0x82, corrupted 129/435 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 129/436 (29.6%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57403 offset 31 0x49 -> 0xc8, corrupted 130/437 (29.7%)
+sim     | Corrupting 48 bytes 193.167.0.100:57403 -> 193.167.100.100:443 offset 14 0x68 -> 0xee, corrupted 97/375 (25.9%)
+sim     | Packets: 813 Packets: 831 Forwarding 206 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 97/376 (25.8%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:57403 offset 21 0x1 -> 0xa9, corrupted 131/438 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/439 (29.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 97/377 (25.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/440 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/441 (29.7%)
+sim     | Forwarding 50 bytes 193.167.0.100:57403 -> 193.167.100.100:443, corrupted 97/378 (25.7%)
+sim     | Corrupting 41 bytes 193.167.0.100:57403 -> 193.167.100.100:443 offset 36 0xc1 -> 0x7f, corrupted 98/379 (25.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/442 (29.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/443 (29.6%)
+sim     | Packets: 816 Packets: 836 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/444 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/445 (29.4%)
+client  | https://server4:443/dry-cruel-rom
+sim     | Packets: 825 Packets: 845 Corrupting 1200 bytes 193.167.0.100:53498 -> 193.167.100.100:443 offset 25 0xf8 -> 0x11, corrupted 99/380 (26.1%)
+sim     | Packets: 827 Packets: 846 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/446 (29.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/447 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 99/381 (26.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53498, corrupted 131/448 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53498, corrupted 131/449 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 99/382 (25.9%)
+sim     | Forwarding 45 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 99/383 (25.8%)
+sim     | Forwarding 61 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 99/384 (25.8%)
+sim     | Corrupting 109 bytes 193.167.0.100:53498 -> 193.167.100.100:443 offset 3 0x43 -> 0xd5, corrupted 100/385 (26.0%)
+sim     | Packets: 847 Packets: 828 Corrupting 109 bytes 193.167.0.100:53498 -> 193.167.100.100:443 offset 29 0x83 -> 0xfb, corrupted 101/386 (26.2%)
+sim     | Packets: 838 Packets: 855 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 131/450 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 131/451 (29.0%)
+sim     | Packets: 856 Packets: 839 Corrupting 109 bytes 193.167.0.100:53498 -> 193.167.100.100:443 offset 37 0xec -> 0x20, corrupted 102/387 (26.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/452 (29.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 131/453 (28.9%)
+sim     | Packets: 842 Packets: 859 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53498, corrupted 131/454 (28.9%)
+sim     | Forwarding 61 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 102/388 (26.3%)
+sim     | Packets: 848 Packets: 864 Packets: 849 Packets: 865 Forwarding 109 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 102/389 (26.2%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53498 offset 49 0x9c -> 0xda, corrupted 132/455 (29.0%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:53498 offset 36 0xe7 -> 0x4b, corrupted 133/456 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53498, corrupted 133/457 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53498, corrupted 133/458 (29.0%)
+sim     | Forwarding 47 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 102/390 (26.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:53498 -> 193.167.100.100:443, corrupted 102/391 (26.1%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53498 offset 34 0xd -> 0x35, corrupted 134/459 (29.2%)
+client  | https://server4:443/overjoyed-indigo-ninja
+sim     | Packets: 850 Packets: 866 Packets: 854 Packets: 873 Forwarding 1200 bytes 193.167.0.100:58261 -> 193.167.100.100:443, corrupted 102/392 (26.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 10 0x25 -> 0xee, corrupted 135/460 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 135/461 (29.3%)
+sim     | Corrupting 1200 bytes 193.167.0.100:58261 -> 193.167.100.100:443 offset 22 0xef -> 0xc4, corrupted 103/393 (26.2%)
+sim     | Packets: 855 Packets: 874 Corrupting 1200 bytes 193.167.0.100:58261 -> 193.167.100.100:443 offset 30 0xb0 -> 0x17, corrupted 104/394 (26.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 135/462 (29.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 135/463 (29.2%)
+sim     | Packets: 858 Packets: 877 Corrupting 1200 bytes 193.167.0.100:58261 -> 193.167.100.100:443 offset 40 0xcd -> 0xa0, corrupted 105/395 (26.6%)
+sim     | Packets: 862 Packets: 879 Packets: 880 Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 19 0x48 -> 0xd4, corrupted 136/464 (29.3%)
+sim     | Packets: 881 Forwarding 1200 bytes 193.167.0.100:58261 -> 193.167.100.100:443, corrupted 105/396 (26.5%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 21 0xfd -> 0x38, corrupted 137/465 (29.5%)
+sim     | Packets: 863 Packets: 882 Packets: 883 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 137/466 (29.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 137/467 (29.3%)
+sim     | Packets: 864 Packets: 884 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 137/468 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:58261 -> 193.167.100.100:443, corrupted 105/397 (26.4%)
+sim     | Forwarding 70 bytes 193.167.0.100:58261 -> 193.167.100.100:443, corrupted 105/398 (26.4%)
+sim     | Packets: 888 Packets: 872 Forwarding 109 bytes 193.167.0.100:58261 -> 193.167.100.100:443, corrupted 105/399 (26.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 137/469 (29.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 137/470 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 137/471 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 137/472 (29.0%)
+sim     | Corrupting 49 bytes 193.167.0.100:58261 -> 193.167.100.100:443 offset 25 0xd8 -> 0xbd, corrupted 106/400 (26.5%)
+sim     | Corrupting 41 bytes 193.167.0.100:58261 -> 193.167.100.100:443 offset 18 0x7 -> 0x4f, corrupted 107/401 (26.7%)
+sim     | Packets: 891 Packets: 875 Packets: 895 Packets: 881 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 137/473 (29.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 137/474 (28.9%)
+sim     | Packets: 882 Packets: 896 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 18 0xdb -> 0xf6, corrupted 138/475 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 138/476 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 138/477 (28.9%)
+sim     | Packets: 886 Packets: 900 Packets: 887 Packets: 902 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 5 0x25 -> 0xea, corrupted 139/478 (29.1%)
+client  | https://server4:443/sad-teal-floppy
+sim     | Packets: 903 Corrupting 1200 bytes 193.167.0.100:48300 -> 193.167.100.100:443 offset 42 0xc0 -> 0xd, corrupted 108/402 (26.9%)
+sim     | Packets: 888 Forwarding 1200 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 108/403 (26.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48300 offset 11 0x18 -> 0x8a, corrupted 140/479 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 140/480 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 108/404 (26.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 140/481 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 108/405 (26.7%)
+sim     | Corrupting 63 bytes 193.167.0.100:48300 -> 193.167.100.100:443 offset 36 0x40 -> 0xf4, corrupted 109/406 (26.8%)
+sim     | Forwarding 109 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 109/407 (26.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 140/482 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 140/483 (29.0%)
+sim     | Forwarding 49 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 109/408 (26.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 140/484 (28.9%)
+sim     | Packets: 904 Packets: 889 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 140/485 (28.9%)
+sim     | Forwarding 50 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 109/409 (26.7%)
+sim     | Forwarding 50 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 109/410 (26.6%)
+sim     | Forwarding 206 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 109/411 (26.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:48300 offset 34 0x32 -> 0x8c, corrupted 141/486 (29.0%)
+sim     | Packets: 900 Packets: 916 Forwarding 64 bytes 193.167.0.100:48300 -> 193.167.100.100:443, corrupted 109/412 (26.5%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300 offset 38 0x16 -> 0x84, corrupted 142/487 (29.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 142/488 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 142/489 (29.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300 offset 3 0x4d -> 0xc7, corrupted 143/490 (29.2%)
+sim     | Corrupting 41 bytes 193.167.0.100:48300 -> 193.167.100.100:443 offset 4 0xa4 -> 0x5f, corrupted 110/413 (26.6%)
+sim     | Packets: 904 Packets: 920 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 143/491 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 143/492 (29.1%)
+client  | https://server4:443/plentiful-hard-rom
+sim     | Packets: 908 Packets: 925 Forwarding 1200 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/414 (26.6%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 31 0xaa -> 0x29, corrupted 144/493 (29.2%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 42 0x68 -> 0xdb, corrupted 145/494 (29.4%)
+sim     | Packets: 910 Packets: 927 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300 offset 1 0x51 -> 0x1d, corrupted 146/495 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 146/496 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/415 (26.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 146/497 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/416 (26.4%)
+sim     | Forwarding 66 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/417 (26.4%)
+sim     | Forwarding 109 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/418 (26.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 146/498 (29.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 146/499 (29.3%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 42 0xa -> 0xa4, corrupted 147/500 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 147/501 (29.3%)
+sim     | Packets: 911 Packets: 932 Forwarding 205 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/419 (26.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/420 (26.2%)
+sim     | Forwarding 52 bytes 193.167.0.100:56181 -> 193.167.100.100:443, corrupted 110/421 (26.1%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 25 0x27 -> 0xff, corrupted 148/502 (29.5%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 26 0xed -> 0xc5, corrupted 149/503 (29.6%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 29 0xd8 -> 0x41, corrupted 150/504 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 150/505 (29.7%)
+sim     | Corrupting 41 bytes 193.167.0.100:56181 -> 193.167.100.100:443 offset 7 0x56 -> 0xd8, corrupted 111/422 (26.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 150/506 (29.6%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 15 0x8f -> 0x66, corrupted 151/507 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 151/508 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 151/509 (29.7%)
+sim     | Packets: 943 Packets: 925 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 151/510 (29.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 151/511 (29.5%)
+sim     | Packets: 955 Packets: 931 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 151/512 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 151/513 (29.4%)
+client  | https://server4:443/zesty-freezing-thief
+sim     | Corrupting 1200 bytes 193.167.0.100:59875 -> 193.167.100.100:443 offset 17 0xfc -> 0x83, corrupted 112/423 (26.5%)
+sim     | Packets: 959 Packets: 933 Forwarding 1200 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 112/424 (26.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 151/514 (29.4%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 20 0x31 -> 0x6a, corrupted 152/515 (29.5%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:59875 offset 1 0x6b -> 0xf8, corrupted 153/516 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:59875, corrupted 153/517 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 112/425 (26.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:59875, corrupted 153/518 (29.5%)
+sim     | Corrupting 1200 bytes 193.167.0.100:59875 -> 193.167.100.100:443 offset 43 0x22 -> 0x26, corrupted 113/426 (26.5%)
+sim     | Forwarding 68 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 113/427 (26.5%)
+sim     | Packets: 937 Forwarding 109 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 113/428 (26.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:59875, corrupted 153/519 (29.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:59875 offset 37 0x1e -> 0x29, corrupted 154/520 (29.6%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:59875 offset 38 0x3f -> 0x65, corrupted 155/521 (29.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:59875 offset 27 0xb2 -> 0xc9, corrupted 156/522 (29.9%)
+sim     | Forwarding 50 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 113/429 (26.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:59875, corrupted 156/523 (29.8%)
+sim     | Forwarding 52 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 113/430 (26.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:59875, corrupted 156/524 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:59875, corrupted 156/525 (29.7%)
+sim     | Forwarding 51 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 113/431 (26.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:59875 -> 193.167.100.100:443, corrupted 113/432 (26.2%)
+client  | https://server4:443/boiling-few-mongoose
+sim     | Packets: 945 Packets: 969 Packets: 953 Packets: 980 Forwarding 1200 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 113/433 (26.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 156/526 (29.7%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 157/527 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 113/434 (26.0%)
+sim     | Forwarding 68 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 113/435 (26.0%)
+sim     | Packets: 954 Packets: 981 Forwarding 109 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 113/436 (25.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 157/528 (29.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 157/529 (29.7%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 14 0xa -> 0x99, corrupted 158/530 (29.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 7 0xcd -> 0xde, corrupted 159/531 (29.9%)
+sim     | Corrupting 205 bytes 193.167.0.100:48543 -> 193.167.100.100:443 offset 39 0xe9 -> 0x7f, corrupted 114/437 (26.1%)
+sim     | Corrupting 52 bytes 193.167.0.100:48543 -> 193.167.100.100:443 offset 9 0x96 -> 0xae, corrupted 115/438 (26.3%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 41 0x43 -> 0xe9, corrupted 160/532 (30.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 160/533 (30.0%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 44 0x97 -> 0xed, corrupted 161/534 (30.1%)
+sim     | Corrupting 109 bytes 193.167.0.100:48543 -> 193.167.100.100:443 offset 23 0xf3 -> 0xe2, corrupted 116/439 (26.4%)
+sim     | Packets: 958 Packets: 986 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 161/535 (30.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 161/536 (30.0%)
+sim     | Packets: 966 Packets: 995 Forwarding 109 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 116/440 (26.4%)
+sim     | Packets: 997 Packets: 968 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 161/537 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 161/538 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 161/539 (29.9%)
+sim     | Forwarding 53 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 116/441 (26.3%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 3 0x78 -> 0xd, corrupted 162/540 (30.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 162/541 (29.9%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 33 0xc7 -> 0xbb, corrupted 163/542 (30.1%)
+sim     | Corrupting 206 bytes 193.167.0.100:48543 -> 193.167.100.100:443 offset 10 0xe3 -> 0xea, corrupted 117/442 (26.5%)
+sim     | Forwarding 56 bytes 193.167.0.100:48543 -> 193.167.100.100:443, corrupted 117/443 (26.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 163/543 (30.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 163/544 (30.0%)
+sim     | Packets: 998 Packets: 969 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 163/545 (29.9%)
+sim     | Corrupting 41 bytes 193.167.0.100:48543 -> 193.167.100.100:443 offset 8 0xfa -> 0x58, corrupted 118/444 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 163/546 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 163/547 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 163/548 (29.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 163/549 (29.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 163/550 (29.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 163/551 (29.6%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 8 0xe6 -> 0xdc, corrupted 164/552 (29.7%)
+sim     | Packets: 980 Packets: 1009 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565, corrupted 164/553 (29.7%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:41565 offset 24 0x56 -> 0x8a, corrupted 165/554 (29.8%)
+client  | https://server4:443/glad-frozen-mouse
+sim     | Packets: 1017 Packets: 988 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 33 0xef -> 0xde, corrupted 166/555 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 166/556 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 118/445 (26.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 166/557 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 166/558 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 118/446 (26.5%)
+sim     | Forwarding 65 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 118/447 (26.4%)
+sim     | Forwarding 50 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 118/448 (26.3%)
+sim     | Packets: 1019 Packets: 989 Forwarding 109 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 118/449 (26.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 166/559 (29.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 166/560 (29.6%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 39 0xf7 -> 0xf4, corrupted 167/561 (29.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 47 0x1 -> 0x62, corrupted 168/562 (29.9%)
+sim     | Corrupting 205 bytes 193.167.0.100:52273 -> 193.167.100.100:443 offset 7 0xe5 -> 0xbc, corrupted 119/450 (26.4%)
+sim     | Corrupting 50 bytes 193.167.0.100:52273 -> 193.167.100.100:443 offset 26 0xfe -> 0xd9, corrupted 120/451 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 168/563 (29.8%)
+sim     | Forwarding 52 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 120/452 (26.5%)
+sim     | Packets: 1028 Packets: 996 Forwarding 109 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 120/453 (26.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 168/564 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 168/565 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 168/566 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 168/567 (29.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 168/568 (29.6%)
+sim     | Forwarding 52 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 120/454 (26.4%)
+sim     | Forwarding 52 bytes 193.167.0.100:52273 -> 193.167.100.100:443, corrupted 120/455 (26.4%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 49 0x8d -> 0x49, corrupted 169/569 (29.7%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 50 0x46 -> 0xba, corrupted 170/570 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 170/571 (29.8%)
+sim     | Corrupting 41 bytes 193.167.0.100:52273 -> 193.167.100.100:443 offset 29 0x4e -> 0xb, corrupted 121/456 (26.5%)
+sim     | Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 170/572 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 170/573 (29.7%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 45 0x18 -> 0x69, corrupted 171/574 (29.8%)
+sim     | Packets: 1004 Packets: 1039 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 15 0x5b -> 0x7e, corrupted 172/575 (29.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 172/576 (29.9%)
+sim     | Packets: 1050 Packets: 1016 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 172/577 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 172/578 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 172/579 (29.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 172/580 (29.7%)
+client  | https://server4:443/elated-happy-lemur
+sim     | Packets: 1017 Packets: 1052 Forwarding 1200 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 121/457 (26.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 172/581 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 172/582 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 121/458 (26.4%)
+sim     | Corrupting 66 bytes 193.167.0.100:51564 -> 193.167.100.100:443 offset 44 0x44 -> 0xab, corrupted 122/459 (26.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 122/460 (26.5%)
+sim     | Corrupting 109 bytes 193.167.0.100:51564 -> 193.167.100.100:443 offset 26 0x92 -> 0x39, corrupted 123/461 (26.7%)
+sim     | Packets: 1021 Packets: 1056 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 172/583 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 172/584 (29.5%)
+sim     | Forwarding 109 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 123/462 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 172/585 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 172/586 (29.4%)
+sim     | Forwarding 50 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 123/463 (26.6%)
+sim     | Corrupting 50 bytes 193.167.0.100:51564 -> 193.167.100.100:443 offset 7 0x33 -> 0xf, corrupted 124/464 (26.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 172/587 (29.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 124/465 (26.7%)
+sim     | Packets: 1028 Packets: 1061 Forwarding 206 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 124/466 (26.6%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 172/588 (29.3%)
+sim     | Forwarding 66 bytes 193.167.0.100:51564 -> 193.167.100.100:443, corrupted 124/467 (26.6%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564 offset 6 0x32 -> 0x5d, corrupted 173/589 (29.4%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:51564 offset 27 0x2c -> 0x3, corrupted 174/590 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 174/591 (29.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 174/592 (29.4%)
+sim     | Corrupting 67 bytes 193.167.0.100:51564 -> 193.167.100.100:443 offset 25 0x14 -> 0x91, corrupted 125/468 (26.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 174/593 (29.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 174/594 (29.3%)
+sim     | Corrupting 41 bytes 193.167.0.100:51564 -> 193.167.100.100:443 offset 18 0x24 -> 0xa7, corrupted 126/469 (26.9%)
+sim     | Packets: 1038 Packets: 1070 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 174/595 (29.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 174/596 (29.2%)
+client  | https://server4:443/excited-navy-pencil
+sim     | Packets: 1047 Packets: 1079 Corrupting 1200 bytes 193.167.0.100:55653 -> 193.167.100.100:443 offset 46 0xe2 -> 0x39, corrupted 127/470 (27.0%)
+sim     | Packets: 1049 Packets: 1080 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 174/597 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 174/598 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/471 (27.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55653, corrupted 174/599 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55653, corrupted 174/600 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/472 (26.9%)
+sim     | Forwarding 67 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/473 (26.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/474 (26.8%)
+sim     | Forwarding 109 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/475 (26.7%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55653 offset 13 0x2e -> 0x79, corrupted 175/601 (29.1%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:55653 offset 33 0x39 -> 0xd7, corrupted 176/602 (29.2%)
+sim     | Packets: 1081 Packets: 1050 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55653, corrupted 176/603 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55653, corrupted 176/604 (29.1%)
+sim     | Forwarding 52 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/476 (26.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:55653 -> 193.167.100.100:443, corrupted 127/477 (26.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 176/605 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 176/606 (29.0%)
+client  | https://server4:443/hot-merry-dress
+sim     | Packets: 1060 Packets: 1095 Forwarding 1200 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 127/478 (26.6%)
+sim     | Packets: 1099 Packets: 1066 Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570 offset 18 0xf7 -> 0xcd, corrupted 177/607 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 177/608 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 127/479 (26.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 177/609 (29.1%)
+sim     | Corrupting 1200 bytes 193.167.0.100:37570 -> 193.167.100.100:443 offset 4 0xcf -> 0xa7, corrupted 128/480 (26.7%)
+sim     | Corrupting 63 bytes 193.167.0.100:37570 -> 193.167.100.100:443 offset 4 0xf7 -> 0xbb, corrupted 129/481 (26.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 177/610 (29.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564 offset 38 0x40 -> 0xfe, corrupted 178/611 (29.1%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 46 0xe2 -> 0xaf, corrupted 179/612 (29.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 179/613 (29.2%)
+sim     | Forwarding 109 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 129/482 (26.8%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37570 offset 45 0xed -> 0x48, corrupted 180/614 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 180/615 (29.3%)
+sim     | Corrupting 48 bytes 193.167.0.100:37570 -> 193.167.100.100:443 offset 3 0x2b -> 0x4d, corrupted 130/483 (26.9%)
+sim     | Packets: 1102 Packets: 1067 Forwarding 206 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 130/484 (26.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 180/616 (29.2%)
+sim     | Forwarding 63 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 130/485 (26.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570 offset 50 0x1a -> 0xfd, corrupted 181/617 (29.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 181/618 (29.3%)
+sim     | Packets: 1112 Packets: 1078 Packets: 1116 Packets: 1081 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 181/619 (29.2%)
+sim     | Corrupting 50 bytes 193.167.0.100:37570 -> 193.167.100.100:443 offset 25 0xd -> 0x43, corrupted 131/486 (27.0%)
+sim     | Packets: 1082 Packets: 1117 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 181/620 (29.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 181/621 (29.1%)
+sim     | Packets: 1084 Packets: 1121 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 181/622 (29.1%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564 offset 19 0xaf -> 0x77, corrupted 182/623 (29.2%)
+sim     | Packets: 1087 Packets: 1124 Packets: 1125 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 182/624 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 182/625 (29.1%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37570 offset 10 0x64 -> 0x21, corrupted 183/626 (29.2%)
+sim     | Forwarding 50 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 131/487 (26.9%)
+sim     | Packets: 1126 Packets: 1088 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 183/627 (29.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37570, corrupted 183/628 (29.1%)
+sim     | Corrupting 52 bytes 193.167.0.100:37570 -> 193.167.100.100:443 offset 48 0x8b -> 0xe1, corrupted 132/488 (27.0%)
+sim     | Forwarding 41 bytes 193.167.0.100:37570 -> 193.167.100.100:443, corrupted 132/489 (27.0%)
+client  | https://server4:443/ecstatic-warm-bag
+sim     | Packets: 1131 Packets: 1091 Packets: 1094 Packets: 1132 Forwarding 1200 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 132/490 (26.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 183/629 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 183/630 (29.0%)
+sim     | Corrupting 1200 bytes 193.167.0.100:57783 -> 193.167.100.100:443 offset 40 0x21 -> 0x54, corrupted 133/491 (27.1%)
+sim     | Forwarding 45 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 133/492 (27.0%)
+sim     | Forwarding 65 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 133/493 (27.0%)
+sim     | Corrupting 109 bytes 193.167.0.100:57783 -> 193.167.100.100:443 offset 20 0x59 -> 0xb3, corrupted 134/494 (27.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 183/631 (29.0%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 4 0x16 -> 0x6d, corrupted 184/632 (29.1%)
+sim     | Packets: 1095 Packets: 1133 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 184/633 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 184/634 (29.0%)
+sim     | Corrupting 109 bytes 193.167.0.100:57783 -> 193.167.100.100:443 offset 50 0xd4 -> 0xca, corrupted 135/495 (27.3%)
+sim     | Packets: 1104 Packets: 1143 Packets: 1107 Corrupting 109 bytes 193.167.0.100:57783 -> 193.167.100.100:443 offset 38 0x1 -> 0x45, corrupted 136/496 (27.4%)
+sim     | Packets: 1108 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 184/635 (29.0%)
+sim     | Forwarding 61 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 136/497 (27.4%)
+sim     | Packets: 1109 Packets: 1144 Packets: 1110 Packets: 1145 Forwarding 109 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 136/498 (27.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 184/636 (28.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 184/637 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 184/638 (28.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 184/639 (28.8%)
+sim     | Corrupting 46 bytes 193.167.0.100:57783 -> 193.167.100.100:443 offset 34 0x18 -> 0x2c, corrupted 137/499 (27.5%)
+sim     | Forwarding 45 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 137/500 (27.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:57783 -> 193.167.100.100:443, corrupted 137/501 (27.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 184/640 (28.7%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:48300 offset 40 0xd3 -> 0x5f, corrupted 185/641 (28.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57783, corrupted 185/642 (28.8%)
+sim     | Packets: 1111 Packets: 1146 Packets: 1121 Packets: 1156 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 185/643 (28.8%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564 offset 26 0x2a -> 0xd0, corrupted 186/644 (28.9%)
+sim     | Packets: 1122 Packets: 1157 Packets: 1158 Corrupting 1342 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 22 0x8e -> 0x8b, corrupted 187/645 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 187/646 (28.9%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58261 offset 17 0x94 -> 0x66, corrupted 188/647 (29.1%)
+sim     | Packets: 1123 Packets: 1159 Packets: 1124 Packets: 1162 Packets: 1163 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273 offset 24 0x3d -> 0x9b, corrupted 189/648 (29.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 189/649 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 189/650 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:57403, corrupted 189/651 (29.0%)
+sim     | Packets: 1165 Packets: 1125 Packets: 1169 Packets: 1130 Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181 offset 49 0xdb -> 0x99, corrupted 190/652 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 190/653 (29.1%)
+client  | https://server4:443/slow-dull-eraser
+sim     | Packets: 1131 Packets: 1170 Forwarding 1200 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 137/502 (27.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 190/654 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 190/655 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 137/503 (27.2%)
+sim     | Corrupting 64 bytes 193.167.0.100:50385 -> 193.167.100.100:443 offset 18 0xc9 -> 0x4, corrupted 138/504 (27.4%)
+sim     | Corrupting 46 bytes 193.167.0.100:50385 -> 193.167.100.100:443 offset 42 0x18 -> 0x33, corrupted 139/505 (27.5%)
+sim     | Forwarding 109 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 139/506 (27.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 190/656 (29.0%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50385 offset 37 0x94 -> 0x9e, corrupted 191/657 (29.1%)
+sim     | Forwarding 46 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 139/507 (27.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 191/658 (29.0%)
+sim     | Forwarding 49 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 139/508 (27.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 191/659 (29.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 191/660 (28.9%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543 offset 11 0xcb -> 0xbc, corrupted 192/661 (29.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 192/662 (29.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 139/509 (27.3%)
+sim     | Corrupting 232 bytes 193.167.0.100:50385 -> 193.167.100.100:443 offset 49 0x40 -> 0xdf, corrupted 140/510 (27.5%)
+sim     | Packets: 1134 Packets: 1173 Forwarding 233 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 140/511 (27.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50385, corrupted 192/663 (29.0%)
+sim     | Forwarding 41 bytes 193.167.0.100:50385 -> 193.167.100.100:443, corrupted 140/512 (27.3%)
+client  | https://server4:443/soft-sharp-tiger
+sim     | Packets: 1188 Packets: 1150 Packets: 1191 Packets: 1152 Forwarding 1200 bytes 193.167.0.100:55678 -> 193.167.100.100:443, corrupted 140/513 (27.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55678, corrupted 192/664 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55678, corrupted 192/665 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55678 -> 193.167.100.100:443, corrupted 140/514 (27.2%)
+sim     | Forwarding 64 bytes 193.167.0.100:55678 -> 193.167.100.100:443, corrupted 140/515 (27.2%)
+sim     | Corrupting 50 bytes 193.167.0.100:55678 -> 193.167.100.100:443 offset 13 0x9e -> 0x2c, corrupted 141/516 (27.3%)
+sim     | Corrupting 109 bytes 193.167.0.100:55678 -> 193.167.100.100:443 offset 13 0x7e -> 0x9f, corrupted 142/517 (27.5%)
+sim     | Packets: 1153 Packets: 1192 Forwarding 109 bytes 193.167.0.100:55678 -> 193.167.100.100:443, corrupted 142/518 (27.4%)
+sim     | Corrupting 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55678 offset 46 0x7f -> 0xd3, corrupted 193/666 (29.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55678, corrupted 193/667 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55678, corrupted 193/668 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55678, corrupted 193/669 (28.8%)
+sim     | Corrupting 52 bytes 193.167.0.100:55678 -> 193.167.100.100:443, corrupted 143/519 (27.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:55678 -> 193.167.100.100:443, corrupted 143/520 (27.5%)
+sim     | Packets: 1197 Packets: 1160 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 193/670 (28.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:54217, corrupted 193/671 (28.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 193/672 (28.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 193/673 (28.7%)
+client  | https://server4:443/dirty-thick-chameleon
+sim     | Packets: 1166 Packets: 1203 Packets: 1170 Packets: 1207 Packets: 1171 Forwarding 1200 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 143/521 (27.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 193/674 (28.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 193/675 (28.6%)
+sim     | Corrupting 1200 bytes 193.167.0.100:38034 -> 193.167.100.100:443 offset 46 0x51 -> 0x49, corrupted 144/522 (27.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 144/523 (27.5%)
+sim     | Corrupting 69 bytes 193.167.0.100:38034 -> 193.167.100.100:443 offset 10 0x4c -> 0xe8, corrupted 145/524 (27.7%)
+sim     | Forwarding 109 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/525 (27.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 193/676 (28.6%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38034 offset 19 0x4f -> 0x1, corrupted 194/677 (28.7%)
+sim     | Forwarding 50 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/526 (27.6%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:38034 offset 9 0xcf -> 0xd9, corrupted 195/678 (28.8%)
+sim     | Packets: 1172 Packets: 1208 Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:38034 offset 12 0xfc -> 0xf, corrupted 196/679 (28.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 196/680 (28.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 196/681 (28.8%)
+sim     | Forwarding 206 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/527 (27.5%)
+sim     | Forwarding 51 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/528 (27.5%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:38034 offset 9 0xcf -> 0xa5, corrupted 197/682 (28.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 197/683 (28.8%)
+sim     | Forwarding 54 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/529 (27.4%)
+sim     | Packets: 1180 Packets: 1217 Forwarding 70 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/530 (27.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 197/684 (28.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:38034, corrupted 197/685 (28.8%)
+sim     | Forwarding 41 bytes 193.167.0.100:38034 -> 193.167.100.100:443, corrupted 145/531 (27.3%)
+client  | https://server4:443/sharp-empty-king
+sim     | Packets: 1225 Packets: 1186 Packets: 1228 Packets: 1189 Forwarding 1200 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 145/532 (27.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37759, corrupted 197/686 (28.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37759, corrupted 197/687 (28.7%)
+sim     | Corrupting 1200 bytes 193.167.0.100:37759 -> 193.167.100.100:443 offset 46 0xc -> 0xb1, corrupted 146/533 (27.4%)
+sim     | Forwarding 49 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 146/534 (27.3%)
+sim     | Forwarding 64 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 146/535 (27.3%)
+sim     | Forwarding 109 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 146/536 (27.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37759, corrupted 197/688 (28.6%)
+sim     | Corrupting 40 bytes 193.167.100.100:443 -> 193.167.0.100:37759 offset 33 0xbb -> 0x96, corrupted 198/689 (28.7%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37759 offset 10 0x31 -> 0xec, corrupted 199/690 (28.8%)
+sim     | Corrupting 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37759 offset 19 0xfb -> 0x70, corrupted 200/691 (28.9%)
+sim     | Forwarding 50 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 146/537 (27.2%)
+sim     | Packets: 1190 Packets: 1229 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37759, corrupted 200/692 (28.9%)
+sim     | Forwarding 53 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 146/538 (27.1%)
+sim     | Corrupting 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37759 offset 16 0xb8 -> 0xf4, corrupted 201/693 (29.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37759, corrupted 201/694 (29.0%)
+sim     | Forwarding 54 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 146/539 (27.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37759, corrupted 201/695 (28.9%)
+sim     | Corrupting 206 bytes 193.167.0.100:37759 -> 193.167.100.100:443 offset 11 0xb7 -> 0x80, corrupted 147/540 (27.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:37759 -> 193.167.100.100:443, corrupted 147/541 (27.2%)
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+sim     | Packets: 1199 Packets: 1241 Packets: 1205 Packets: 1246 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51564, corrupted 201/696 (28.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:56181, corrupted 201/697 (28.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:48543, corrupted 201/698 (28.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:52273, corrupted 201/699 (28.8%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:58261, corrupted 201/700 (28.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:48300, corrupted 201/701 (28.7%)
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1206 Packets: 1247 Packets: 1211 Packets: 1252 Packets: 1253 Packets: 1212 Packets: 1214 Packets: 1255 Received signal: 15
+sim     | msg="15", +82.828396693sPackets captured: 1255
+sim     |  0 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | Packets captured: 1214
+sim     | Packets received/dropped on interface 'eth1': 1255/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets received/dropped on interface 'eth0': 1214/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | NS_FATAL, terminating
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:14:29,017 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:14:29,019 Using the client's key log file.
+2026-10-22 00:14:29,025 
+2026-10-22 00:14:29,025 Using the client's key log file.
+2026-10-22 00:14:29,025 Using the client's key log file.
+2026-10-22 00:14:29,030 
+2026-10-22 00:14:29,031 Using the client's key log file.
+2026-10-22 00:14:29,700 Wrong version. Expected 0x1, got ['0x6b3343cf']

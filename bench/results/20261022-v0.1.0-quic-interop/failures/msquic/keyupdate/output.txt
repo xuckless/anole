@@ -1,0 +1,90 @@
+2026-10-22 00:24:27,151 Generated random file: purple-harsh-singer of size: 3145728
+2026-10-22 00:24:27,151 Requests: ['https://server4:443/purple-harsh-singer']
+2026-10-22 00:24:27,175 
+2026-10-22 00:24:27,175 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_w46wjl5t/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=keyupdate CLIENT_WWW=/tmp/client_www_3dh9tf90/ CLIENT_DOWNLOADS=/tmp/client_download_hol4fr7x/ SERVER_WWW=/tmp/server_www_a0a8q95b/ SERVER_DOWNLOADS=/tmp/server_download_o4fhhvoa/ SERVER_LOGS=/tmp/logs_server_79b0qgpe CLIENT_LOGS=/tmp/logs_client_7nxcyrj_ SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=ghcr.io/microsoft/msquic/qns:main SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/purple-harsh-singer" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:24:36,454  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksumming: off
+client  | 	tx-checksum-ip-generic: off
+client  | 	tx-checksum-sctp: off
+client  | tcp-segmentation-offload: off
+client  | 	tx-tcp-segmentation: off [requested on]
+client  | 	tx-tcp-ecn-segmentation: off [requested on]
+client  | 	tx-tcp-mangleid-segmentation: off [requested on]
+client  | 	tx-tcp6-segmentation: off [requested on]
+client  | tx-udp-segmentation: off [requested on]
+ Container client Started 
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+ Container server Started 
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 500.788719ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_left.pcap
+sim     | File: /logs/trace_node_right.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Connecting to server4
+client  | Client params (before files):-test:U -sslkeylogfile:/logs/keys.log 
+client  | Sending request: GET /purple-harsh-singer
+client  | 
+client  |       TARGET  VHDCRZSQUMBGA2E    VERSION   ALPN
+client  |  ============================================
+client  |      server4  ---------------
+client  | 
+client  | Total execution time: 2.070s
+client  | 
+client  | Client complete.
+client  | Script complete.
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 4 Packets: 5 Packets: 12 Packets: 9 Packets: 33 Packets: 43 Packets: 57 Packets: 48 Packets: 60 Packets: 65 Packets: 74 Packets: 79 Packets: 87 Packets: 92 Packets: 101 Packets: 94 Packets: 102 Packets: 110 Packets: 118 Packets: 110 Packets: 129 Packets: 120 Packets: 130 Packets: 121 Packets: 122 Packets: 131 Packets: 123 Packets: 132 Packets: 133 Packets: 124 Packets: 136 Packets: 125 Packets: 137 Packets: 138 Packets: 126 Packets: 143 Packets: 131 Received signal: 15
+sim     | msg="15", +7.923657699s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets: 146 Packets captured: 146
+sim     | Packets: 134 Packets captured: 134
+sim     | Packets received/dropped on interface 'eth0': 146/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# Packets received/dropped on interface 'eth1': 134/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:24:36,633 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:24:36,633 Using the client's key log file.
+2026-10-22 00:24:36,637 
+2026-10-22 00:24:36,637 Using the client's key log file.
+2026-10-22 00:24:36,637 Using the client's key log file.
+2026-10-22 00:24:36,641 
+2026-10-22 00:24:36,641 Using the client's key log file.
+2026-10-22 00:24:36,761 Missing files: ['purple-harsh-singer']
+2026-10-22 00:24:36,762 Using the client's key log file.
+2026-10-22 00:24:37,005 Missing files: ['purple-harsh-singer']

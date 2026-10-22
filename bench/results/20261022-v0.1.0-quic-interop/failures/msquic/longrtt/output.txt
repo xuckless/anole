@@ -1,0 +1,90 @@
+2026-10-22 00:22:57,825 Generated random file: unforgiving-sad-bluetooth of size: 1024
+2026-10-22 00:22:57,825 Requests: ['https://server4:443/unforgiving-sad-bluetooth']
+2026-10-22 00:22:57,849 
+2026-10-22 00:22:57,849 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_lse2lppe/ TESTCASE_SERVER=handshake TESTCASE_CLIENT=handshake CLIENT_WWW=/tmp/client_www_0595wx3f/ CLIENT_DOWNLOADS=/tmp/client_download_j_enznp4/ SERVER_WWW=/tmp/server_www_5gul48sx/ SERVER_DOWNLOADS=/tmp/server_download_lv6nydmf/ SERVER_LOGS=/tmp/logs_server_66hlvd7_ CLIENT_LOGS=/tmp/logs_client_pzsv4i2h SCENARIO="simple-p2p --delay=750ms --bandwidth=10Mbps --queue=25" CLIENT=ghcr.io/microsoft/msquic/qns:main SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/unforgiving-sad-bluetooth" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:23:13,552  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksumming: off
+client  | 	tx-checksum-ip-generic: off
+client  | 	tx-checksum-sctp: off
+client  | tcp-segmentation-offload: off
+client  | 	tx-tcp-segmentation: off [requested on]
+client  | 	tx-tcp-ecn-segmentation: off [requested on]
+client  | 	tx-tcp-mangleid-segmentation: off [requested on]
+client  | 	tx-tcp6-segmentation: off [requested on]
+client  | tx-udp-segmentation: off [requested on]
+ Container client Started 
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+ Container server Started 
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 500.633393ms
+sim     | Using scenario: simple-p2p --delay=750ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_left.pcap
+sim     | File: /logs/trace_node_right.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Connecting to server4
+client  | Client params (before files):-test:H -sslkeylogfile:/logs/keys.log 
+client  | Sending request: GET /unforgiving-sad-bluetooth
+client  | 
+client  |       TARGET  VHDCRZSQUMBGA2E    VERSION   ALPN
+client  |  ============================================
+client  |      server4  ---------------
+client  | 
+client  | Total execution time: 3.013s
+client  | 
+client  | Client complete.
+client  | Script complete.
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 3 Packets: 6 Packets: 11 Packets: 12 Packets: 32 Packets: 15 Packets: 36 Packets: 16 Packets: 37 Packets: 18 Packets: 44 Packets: 30 Packets: 50 Packets: 37 Packets: 51 Packets: 41 Packets: 61 Packets: 44 Packets: 64 Packets: 48 Packets: 66 Packets: 50 Packets: 67 Packets: 55 Packets: 69 Packets: 58 Packets: 72 Packets: 75 Packets: 59 Packets: 77 Packets: 61 Packets: 79 Packets: 63 Packets: 80 Packets: 66 Packets: 84 Packets: 69 Packets: 70 Packets: 86 Packets: 87 Packets: 88 Packets: 73 Packets: 89 Packets: 74 Packets: 90 Packets: 75 Packets: 93 Packets: 78 Packets: 81 Packets: 97 Packets: 99 Packets: 83 Packets: 85 Packets: 101 Packets: 86 Packets: 102 Packets: 87 Packets: 103 Packets: 88 Packets: 89 Received signal: 15
+sim     | msg="15", +14.078674284s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 103
+sim     | Packets captured: 89
+sim     | Packets received/dropped on interface 'eth0': 103/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets received/dropped on interface 'eth1': 89/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# 
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:23:13,730 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:23:13,730 Using the client's key log file.
+2026-10-22 00:23:13,736 
+2026-10-22 00:23:13,736 Using the client's key log file.
+2026-10-22 00:23:13,736 Using the client's key log file.
+2026-10-22 00:23:13,740 
+2026-10-22 00:23:13,740 Using the client's key log file.
+2026-10-22 00:23:13,863 Missing files: ['unforgiving-sad-bluetooth']
+2026-10-22 00:23:14,112 Missing files: ['unforgiving-sad-bluetooth']

@@ -1,0 +1,1410 @@
+2026-10-22 00:11:05,502 Generated random file: bored-bitter-necromancer of size: 1024
+2026-10-22 00:11:05,502 Generated random file: massive-jubilant-teacher of size: 1024
+2026-10-22 00:11:05,502 Generated random file: empty-elated-blacksmith of size: 1024
+2026-10-22 00:11:05,502 Generated random file: olive-glad-gorilla of size: 1024
+2026-10-22 00:11:05,502 Generated random file: unlimited-excessive-ring of size: 1024
+2026-10-22 00:11:05,502 Generated random file: jubilant-enormous-bicycle of size: 1024
+2026-10-22 00:11:05,503 Generated random file: upbeat-arctic-politician of size: 1024
+2026-10-22 00:11:05,503 Generated random file: surplus-ashamed-student of size: 1024
+2026-10-22 00:11:05,503 Generated random file: icy-brutal-paper of size: 1024
+2026-10-22 00:11:05,503 Generated random file: brutal-glad-subway of size: 1024
+2026-10-22 00:11:05,503 Generated random file: enough-tangy-car of size: 1024
+2026-10-22 00:11:05,503 Generated random file: delighted-black-carvan of size: 1024
+2026-10-22 00:11:05,503 Generated random file: titanic-plentiful-elephant of size: 1024
+2026-10-22 00:11:05,503 Generated random file: fast-indigo-fisherman of size: 1024
+2026-10-22 00:11:05,503 Generated random file: sad-intense-tie of size: 1024
+2026-10-22 00:11:05,503 Generated random file: blue-shy-book of size: 1024
+2026-10-22 00:11:05,503 Generated random file: gigantic-teal-engineer of size: 1024
+2026-10-22 00:11:05,503 Generated random file: merciless-giant-marker of size: 1024
+2026-10-22 00:11:05,503 Generated random file: calm-zestful-raikou of size: 1024
+2026-10-22 00:11:05,503 Generated random file: quiet-salty-carvan of size: 1024
+2026-10-22 00:11:05,503 Generated random file: toasty-endless-vhs of size: 1024
+2026-10-22 00:11:05,503 Generated random file: gray-violet-pants of size: 1024
+2026-10-22 00:11:05,503 Generated random file: dark-cold-dress of size: 1024
+2026-10-22 00:11:05,503 Generated random file: elated-maroon-sloth of size: 1024
+2026-10-22 00:11:05,503 Generated random file: ample-satisfied-pharaoh of size: 1024
+2026-10-22 00:11:05,503 Generated random file: teal-sharp-squirtle of size: 1024
+2026-10-22 00:11:05,503 Generated random file: envious-wet-dancer of size: 1024
+2026-10-22 00:11:05,503 Generated random file: tremendous-ecstatic-armadillo of size: 1024
+2026-10-22 00:11:05,503 Generated random file: dark-gigantic-purse of size: 1024
+2026-10-22 00:11:05,503 Generated random file: worried-peaceful-keyboard of size: 1024
+2026-10-22 00:11:05,503 Generated random file: fast-aquamarine-notebook of size: 1024
+2026-10-22 00:11:05,503 Generated random file: titanic-tropical-moltres of size: 1024
+2026-10-22 00:11:05,503 Generated random file: merciless-immense-koala of size: 1024
+2026-10-22 00:11:05,504 Generated random file: thick-small-bulbasaur of size: 1024
+2026-10-22 00:11:05,504 Generated random file: monstrous-euphoric-wizard of size: 1024
+2026-10-22 00:11:05,504 Generated random file: unlimited-cold-wolverine of size: 1024
+2026-10-22 00:11:05,504 Generated random file: tan-surplus-segway of size: 1024
+2026-10-22 00:11:05,504 Generated random file: roasting-bitter-armadillo of size: 1024
+2026-10-22 00:11:05,504 Generated random file: monstrous-sweet-lawyer of size: 1024
+2026-10-22 00:11:05,504 Generated random file: green-tired-firefighter of size: 1024
+2026-10-22 00:11:05,504 Generated random file: bitter-dark-car of size: 1024
+2026-10-22 00:11:05,504 Generated random file: cyan-temperate-lion of size: 1024
+2026-10-22 00:11:05,504 Generated random file: cold-teal-raikou of size: 1024
+2026-10-22 00:11:05,504 Generated random file: lively-scalding-pharaoh of size: 1024
+2026-10-22 00:11:05,504 Generated random file: anxious-bright-sorcerer of size: 1024
+2026-10-22 00:11:05,504 Generated random file: icy-red-chameleon of size: 1024
+2026-10-22 00:11:05,504 Generated random file: noisy-ecstatic-watch of size: 1024
+2026-10-22 00:11:05,504 Generated random file: giant-hot-wallet of size: 1024
+2026-10-22 00:11:05,504 Generated random file: spicy-anxious-blacksmith of size: 1024
+2026-10-22 00:11:05,504 Generated random file: cruel-immense-hat of size: 1024
+2026-10-22 00:11:05,504 Requests: ['https://server4:443/bored-bitter-necromancer', 'https://server4:443/massive-jubilant-teacher', 'https://server4:443/empty-elated-blacksmith', 'https://server4:443/olive-glad-gorilla', 'https://server4:443/unlimited-excessive-ring', 'https://server4:443/jubilant-enormous-bicycle', 'https://server4:443/upbeat-arctic-politician', 'https://server4:443/surplus-ashamed-student', 'https://server4:443/icy-brutal-paper', 'https://server4:443/brutal-glad-subway', 'https://server4:443/enough-tangy-car', 'https://server4:443/delighted-black-carvan', 'https://server4:443/titanic-plentiful-elephant', 'https://server4:443/fast-indigo-fisherman', 'https://server4:443/sad-intense-tie', 'https://server4:443/blue-shy-book', 'https://server4:443/gigantic-teal-engineer', 'https://server4:443/merciless-giant-marker', 'https://server4:443/calm-zestful-raikou', 'https://server4:443/quiet-salty-carvan', 'https://server4:443/toasty-endless-vhs', 'https://server4:443/gray-violet-pants', 'https://server4:443/dark-cold-dress', 'https://server4:443/elated-maroon-sloth', 'https://server4:443/ample-satisfied-pharaoh', 'https://server4:443/teal-sharp-squirtle', 'https://server4:443/envious-wet-dancer', 'https://server4:443/tremendous-ecstatic-armadillo', 'https://server4:443/dark-gigantic-purse', 'https://server4:443/worried-peaceful-keyboard', 'https://server4:443/fast-aquamarine-notebook', 'https://server4:443/titanic-tropical-moltres', 'https://server4:443/merciless-immense-koala', 'https://server4:443/thick-small-bulbasaur', 'https://server4:443/monstrous-euphoric-wizard', 'https://server4:443/unlimited-cold-wolverine', 'https://server4:443/tan-surplus-segway', 'https://server4:443/roasting-bitter-armadillo', 'https://server4:443/monstrous-sweet-lawyer', 'https://server4:443/green-tired-firefighter', 'https://server4:443/bitter-dark-car', 'https://server4:443/cyan-temperate-lion', 'https://server4:443/cold-teal-raikou', 'https://server4:443/lively-scalding-pharaoh', 'https://server4:443/anxious-bright-sorcerer', 'https://server4:443/icy-red-chameleon', 'https://server4:443/noisy-ecstatic-watch', 'https://server4:443/giant-hot-wallet', 'https://server4:443/spicy-anxious-blacksmith', 'https://server4:443/cruel-immense-hat']
+2026-10-22 00:11:05,529 
+2026-10-22 00:11:05,529 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_ydwgw_t4/ TESTCASE_SERVER=multiconnect TESTCASE_CLIENT=multiconnect CLIENT_WWW=/tmp/client_www_wfscwym4/ CLIENT_DOWNLOADS=/tmp/client_download_0olvrnhg/ SERVER_WWW=/tmp/server_www_9dwpy1am/ SERVER_DOWNLOADS=/tmp/server_download_otem2fk3/ SERVER_LOGS=/tmp/logs_server_2mifs40g CLIENT_LOGS=/tmp/logs_client_sevczeu4 SCENARIO="drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3" CLIENT=aiortc/aioquic-qns:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/bored-bitter-necromancer https://server4:443/massive-jubilant-teacher https://server4:443/empty-elated-blacksmith https://server4:443/olive-glad-gorilla https://server4:443/unlimited-excessive-ring https://server4:443/jubilant-enormous-bicycle https://server4:443/upbeat-arctic-politician https://server4:443/surplus-ashamed-student https://server4:443/icy-brutal-paper https://server4:443/brutal-glad-subway https://server4:443/enough-tangy-car https://server4:443/delighted-black-carvan https://server4:443/titanic-plentiful-elephant https://server4:443/fast-indigo-fisherman https://server4:443/sad-intense-tie https://server4:443/blue-shy-book https://server4:443/gigantic-teal-engineer https://server4:443/merciless-giant-marker https://server4:443/calm-zestful-raikou https://server4:443/quiet-salty-carvan https://server4:443/toasty-endless-vhs https://server4:443/gray-violet-pants https://server4:443/dark-cold-dress https://server4:443/elated-maroon-sloth https://server4:443/ample-satisfied-pharaoh https://server4:443/teal-sharp-squirtle https://server4:443/envious-wet-dancer https://server4:443/tremendous-ecstatic-armadillo https://server4:443/dark-gigantic-purse https://server4:443/worried-peaceful-keyboard https://server4:443/fast-aquamarine-notebook https://server4:443/titanic-tropical-moltres https://server4:443/merciless-immense-koala https://server4:443/thick-small-bulbasaur https://server4:443/monstrous-euphoric-wizard https://server4:443/unlimited-cold-wolverine https://server4:443/tan-surplus-segway https://server4:443/roasting-bitter-armadillo https://server4:443/monstrous-sweet-lawyer https://server4:443/green-tired-firefighter https://server4:443/bitter-dark-car https://server4:443/cyan-temperate-lion https://server4:443/cold-teal-raikou https://server4:443/lively-scalding-pharaoh https://server4:443/anxious-bright-sorcerer https://server4:443/icy-red-chameleon https://server4:443/noisy-ecstatic-watch https://server4:443/giant-hot-wallet https://server4:443/spicy-anxious-blacksmith https://server4:443/cruel-immense-hat" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:12:52,101  Container sim Recreate 
+ Container sim Recreated 
+ Container server Recreate 
+ Container client Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+ Container client Started 
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+ Container server Started 
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 500.965719ms
+sim     | Using scenario: drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Starting client
+client  | https://server4:443/bored-bitter-necromancer
+sim     | Packets: 1 Packets: 1 Packets: 9 Packets: 4 Forwarding 1200 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 0/1 (0.0%)
+sim     | Packets: 14 Packets: 10 Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 1/1 (100.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 2/2 (100.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 0/2 (0.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 3/3 (100.0%)
+sim     | Packets: 21 Packets: 37 Packets: 45 Packets: 23 Forwarding 1200 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 0/3 (0.0%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 3/4 (75.0%)
+sim     | Packets: 27 Packets: 47 Dropping 1200 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 1/4 (25.0%)
+sim     | Packets: 34 Packets: 53 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 3/5 (60.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 1/5 (20.0%)
+sim     | Forwarding 72 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 1/6 (16.7%)
+sim     | Packets: 39 Packets: 58 Forwarding 109 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 1/7 (14.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 3/6 (50.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 3/7 (42.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 4/8 (50.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 5/9 (55.6%)
+sim     | Dropping 205 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 2/8 (25.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 2/9 (22.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 5/10 (50.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 5/11 (45.5%)
+sim     | Forwarding 51 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 2/10 (20.0%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 6/12 (50.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 6/13 (46.2%)
+sim     | Forwarding 54 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 2/11 (18.2%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 7/14 (50.0%)
+sim     | Dropping 109 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 3/12 (25.0%)
+sim     | Packets: 44 Packets: 62 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 7/15 (46.7%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53761, dropped 8/16 (50.0%)
+sim     | Forwarding 41 bytes 193.167.0.100:53761 -> 193.167.100.100:443, dropped 3/13 (23.1%)
+client  | https://server4:443/massive-jubilant-teacher
+sim     | Packets: 60 Packets: 74 Packets: 65 Packets: 76 Dropping 1200 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 4/14 (28.6%)
+sim     | Packets: 77 Dropping 1200 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 5/15 (33.3%)
+sim     | Packets: 66 Packets: 78 Forwarding 1200 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 5/16 (31.2%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 9/17 (52.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/18 (55.6%)
+sim     | Packets: 67 Packets: 79 Packets: 70 Packets: 80 Packets: 71 Packets: 81 Dropping 1200 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 6/17 (35.3%)
+sim     | Packets: 73 Packets: 82 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/19 (52.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 6/18 (33.3%)
+sim     | Dropping 72 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 7/19 (36.8%)
+sim     | Packets: 74 Packets: 84 Dropping 109 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 8/20 (40.0%)
+sim     | Packets: 76 Packets: 88 Dropping 109 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 9/21 (42.9%)
+sim     | Packets: 77 Packets: 90 Packets: 79 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/20 (50.0%)
+sim     | Forwarding 65 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 9/22 (40.9%)
+sim     | Dropping 50 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 10/23 (43.5%)
+sim     | Packets: 81 Packets: 91 Packets: 83 Packets: 94 Forwarding 109 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 10/24 (41.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/21 (47.6%)
+sim     | Dropping 50 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/25 (44.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/22 (45.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/23 (43.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/24 (41.7%)
+sim     | Forwarding 50 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/26 (42.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/27 (40.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/25 (40.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/26 (38.5%)
+sim     | Forwarding 50 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/28 (39.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/29 (37.9%)
+sim     | Forwarding 206 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/30 (36.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/27 (37.0%)
+sim     | Packets: 85 Packets: 95 Forwarding 72 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/31 (35.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/28 (35.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:58125, dropped 10/29 (34.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:58125 -> 193.167.100.100:443, dropped 11/32 (34.4%)
+client  | https://server4:443/empty-elated-blacksmith
+sim     | Packets: 99 Packets: 110 Packets: 102 Packets: 112 Forwarding 1200 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/33 (33.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 10/30 (33.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 10/31 (32.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/34 (32.4%)
+sim     | Forwarding 45 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/35 (31.4%)
+sim     | Forwarding 71 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/36 (30.6%)
+sim     | Forwarding 109 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/37 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 10/32 (31.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 10/33 (30.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 11/34 (32.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 12/35 (34.3%)
+sim     | Forwarding 205 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/38 (28.9%)
+sim     | Forwarding 46 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 11/39 (28.2%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 13/36 (36.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 13/37 (35.1%)
+sim     | Dropping 48 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 12/40 (30.0%)
+sim     | Packets: 103 Packets: 113 Forwarding 109 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 12/41 (29.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 13/38 (34.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 14/39 (35.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 14/40 (35.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 12/42 (28.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 12/43 (27.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37963, dropped 14/41 (34.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:37963 -> 193.167.100.100:443, dropped 12/44 (27.3%)
+client  | https://server4:443/olive-glad-gorilla
+sim     | Packets: 118 Packets: 126 Packets: 125 Packets: 132 Packets: 133 Forwarding 1200 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 12/45 (26.7%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 15/42 (35.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 15/43 (34.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 12/46 (26.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 15/44 (34.1%)
+sim     | Dropping 1200 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 13/47 (27.7%)
+sim     | Forwarding 66 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 13/48 (27.1%)
+sim     | Packets: 126 Packets: 134 Forwarding 109 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 13/49 (26.5%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 16/45 (35.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 16/46 (34.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 16/47 (34.0%)
+sim     | Dropping 205 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 14/50 (28.0%)
+sim     | Dropping 48 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 15/51 (29.4%)
+sim     | Dropping 41 bytes 193.167.0.100:52236 -> 193.167.100.100:443, dropped 16/52 (30.8%)
+client  | https://server4:443/unlimited-excessive-ring
+sim     | Packets: 132 Packets: 140 Packets: 136 Packets: 149 Forwarding 1200 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 16/53 (30.2%)
+sim     | Packets: 142 Packets: 153 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 16/48 (33.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 16/49 (32.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 16/54 (29.6%)
+sim     | Dropping 72 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 17/55 (30.9%)
+sim     | Dropping 50 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 18/56 (32.1%)
+sim     | Forwarding 109 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 18/57 (31.6%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 17/50 (34.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 17/51 (33.3%)
+sim     | Forwarding 52 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 18/58 (31.0%)
+sim     | Packets: 148 Packets: 155 Forwarding 206 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 18/59 (30.5%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 18/52 (34.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 18/53 (34.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 18/54 (33.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 18/55 (32.7%)
+sim     | Packets: 155 Packets: 166 Forwarding 73 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 18/60 (30.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 19/56 (33.9%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 20/57 (35.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 20/58 (34.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37349, dropped 21/59 (35.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:37349 -> 193.167.100.100:443, dropped 18/61 (29.5%)
+client  | https://server4:443/jubilant-enormous-bicycle
+sim     | Packets: 164 Packets: 173 Packets: 170 Packets: 176 Dropping 1200 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 19/62 (30.6%)
+sim     | Packets: 177 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 21/60 (35.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 19/63 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 21/61 (34.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 21/62 (33.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 19/64 (29.7%)
+sim     | Forwarding 73 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 19/65 (29.2%)
+sim     | Forwarding 46 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 19/66 (28.8%)
+sim     | Dropping 109 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 20/67 (29.9%)
+sim     | Packets: 171 Packets: 178 Forwarding 109 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 20/68 (29.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 22/63 (34.9%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 23/64 (35.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 24/65 (36.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 24/66 (36.4%)
+sim     | Forwarding 48 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 20/69 (29.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 25/67 (37.3%)
+sim     | Packets: 179 Packets: 187 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 26/68 (38.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 27/69 (39.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 27/70 (38.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 28/71 (39.4%)
+sim     | Forwarding 206 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 20/70 (28.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:43844 -> 193.167.100.100:443, dropped 20/71 (28.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:43844, dropped 28/72 (38.9%)
+client  | https://server4:443/upbeat-arctic-politician
+sim     | Packets: 186 Packets: 190 Packets: 192 Packets: 193 Forwarding 1200 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 20/72 (27.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 28/73 (38.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 28/74 (37.8%)
+sim     | Packets: 193 Packets: 194 Forwarding 1200 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 20/73 (27.4%)
+sim     | Dropping 49 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 21/74 (28.4%)
+sim     | Forwarding 72 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 21/75 (28.0%)
+sim     | Dropping 109 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 22/76 (28.9%)
+sim     | Packets: 196 Packets: 200 Forwarding 109 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 22/77 (28.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 28/75 (37.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 28/76 (36.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 28/77 (36.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 29/78 (37.2%)
+sim     | Forwarding 49 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 22/78 (28.2%)
+sim     | Forwarding 205 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 22/79 (27.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 29/79 (36.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 29/80 (36.2%)
+sim     | Forwarding 52 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 22/80 (27.5%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 30/81 (37.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 30/82 (36.6%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51031, dropped 31/83 (37.3%)
+sim     | Packets: 198 Packets: 201 Forwarding 41 bytes 193.167.0.100:51031 -> 193.167.100.100:443, dropped 22/81 (27.2%)
+sim     | Packets: 211 Packets: 211 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 31/84 (36.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 31/85 (36.5%)
+client  | https://server4:443/surplus-ashamed-student
+sim     | Packets: 212 Packets: 212 Packets: 215 Packets: 216 Packets: 216 Forwarding 1200 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 22/82 (26.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 31/86 (36.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 31/87 (35.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 22/83 (26.5%)
+sim     | Forwarding 71 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 22/84 (26.2%)
+sim     | Dropping 50 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 23/85 (27.1%)
+sim     | Forwarding 109 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 23/86 (26.7%)
+sim     | Packets: 217 Packets: 217 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 31/88 (35.2%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 32/89 (36.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 32/90 (35.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 32/91 (35.2%)
+sim     | Forwarding 51 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 23/87 (26.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:60223 -> 193.167.100.100:443, dropped 23/88 (26.1%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60223, dropped 33/92 (35.9%)
+client  | https://server4:443/icy-brutal-paper
+sim     | Packets: 227 Packets: 224 Packets: 229 Packets: 229 Forwarding 1200 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 23/89 (25.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55325, dropped 33/93 (35.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55325, dropped 33/94 (35.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 23/90 (25.6%)
+sim     | Dropping 64 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 24/91 (26.4%)
+sim     | Dropping 46 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 25/92 (27.2%)
+sim     | Forwarding 109 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 25/93 (26.9%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55325, dropped 34/95 (35.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55325, dropped 34/96 (35.4%)
+sim     | Forwarding 48 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 25/94 (26.6%)
+sim     | Packets: 230 Packets: 230 Forwarding 206 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 25/95 (26.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55325, dropped 34/97 (35.1%)
+sim     | Dropping 64 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 26/96 (27.1%)
+sim     | Forwarding 65 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 26/97 (26.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55325, dropped 34/98 (34.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:55325 -> 193.167.100.100:443, dropped 26/98 (26.5%)
+client  | https://server4:443/brutal-glad-subway
+sim     | Packets: 238 Packets: 238 Packets: 242 Packets: 243 Forwarding 1200 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 26/99 (26.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 34/99 (34.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 35/100 (35.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 26/100 (26.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 26/101 (25.7%)
+sim     | Forwarding 66 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 26/102 (25.5%)
+sim     | Dropping 109 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 27/103 (26.2%)
+sim     | Packets: 243 Packets: 244 Dropping 109 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 28/104 (26.9%)
+sim     | Packets: 248 Packets: 250 Packets: 249 Packets: 251 Dropping 109 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 29/105 (27.6%)
+sim     | Packets: 252 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 35/101 (34.7%)
+sim     | Forwarding 65 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 29/106 (27.4%)
+sim     | Packets: 250 Packets: 253 Packets: 255 Packets: 251 Forwarding 109 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 29/107 (27.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 35/102 (34.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 35/103 (34.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 36/104 (34.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 36/105 (34.3%)
+sim     | Dropping 50 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 30/108 (27.8%)
+sim     | Forwarding 52 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 30/109 (27.5%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 37/106 (34.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 37/107 (34.6%)
+sim     | Dropping 41 bytes 193.167.0.100:60555 -> 193.167.100.100:443, dropped 31/110 (28.2%)
+sim     | Packets: 252 Packets: 256 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 37/108 (34.3%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 38/109 (34.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 38/110 (34.5%)
+sim     | Dropping 1342 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 39/111 (35.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 39/112 (34.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 39/113 (34.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 39/114 (34.2%)
+sim     | Packets: 260 Packets: 264 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 39/115 (33.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 39/116 (33.6%)
+sim     | Packets: 271 Packets: 270 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 39/117 (33.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 39/118 (33.1%)
+sim     | Packets: 271 Packets: 273 Packets: 273 Packets: 274 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 39/119 (32.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 40/120 (33.3%)
+sim     | Packets: 274 Packets: 275 Packets: 275 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 40/121 (33.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 40/122 (32.8%)
+client  | https://server4:443/enough-tangy-car
+sim     | Packets: 276 Packets: 276 Packets: 277 Packets: 277 Packets: 278 Packets: 278 Packets: 280 Packets: 280 Forwarding 1200 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 31/111 (27.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 41/123 (33.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 42/124 (33.9%)
+sim     | Packets: 281 Packets: 281 Forwarding 1200 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 31/112 (27.7%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 43/125 (34.4%)
+sim     | Packets: 284 Packets: 282 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 43/126 (34.1%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 44/127 (34.6%)
+sim     | Dropping 1200 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 32/113 (28.3%)
+sim     | Packets: 286 Packets: 283 Packets: 288 Packets: 285 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 44/128 (34.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 32/114 (28.1%)
+sim     | Dropping 64 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 33/115 (28.7%)
+sim     | Packets: 289 Packets: 286 Forwarding 109 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 33/116 (28.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 44/129 (34.1%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 45/130 (34.6%)
+sim     | Forwarding 46 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 33/117 (28.2%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 46/131 (35.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 46/132 (34.8%)
+sim     | Forwarding 48 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 33/118 (28.0%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 47/133 (35.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 47/134 (35.1%)
+sim     | Forwarding 50 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 33/119 (27.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 47/135 (34.8%)
+sim     | Dropping 206 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 34/120 (28.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 34/121 (28.1%)
+sim     | Packets: 291 Packets: 290 Packets: 302 Packets: 298 Forwarding 65 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 34/122 (27.9%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 48/136 (35.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 48/137 (35.0%)
+sim     | Dropping 205 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 35/123 (28.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 48/138 (34.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51186, dropped 48/139 (34.5%)
+sim     | Packets: 303 Packets: 299 Forwarding 41 bytes 193.167.0.100:51186 -> 193.167.100.100:443, dropped 35/124 (28.2%)
+client  | https://server4:443/delighted-black-carvan
+sim     | Packets: 308 Packets: 304 Dropping 1200 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 36/125 (28.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 36/126 (28.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 48/140 (34.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 49/141 (34.8%)
+sim     | Packets: 309 Packets: 305 Forwarding 1200 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 36/127 (28.3%)
+sim     | Dropping 70 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 37/128 (28.9%)
+sim     | Forwarding 109 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 37/129 (28.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 49/142 (34.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 49/143 (34.3%)
+sim     | Dropping 51 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 38/130 (29.2%)
+sim     | Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 49/144 (34.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 50/145 (34.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52236, dropped 51/146 (34.9%)
+sim     | Forwarding 206 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 38/131 (29.0%)
+sim     | Packets: 312 Packets: 310 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 51/147 (34.7%)
+sim     | Forwarding 70 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 38/132 (28.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 51/148 (34.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:53562 -> 193.167.100.100:443, dropped 38/133 (28.6%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:53562, dropped 52/149 (34.9%)
+client  | https://server4:443/titanic-plentiful-elephant
+sim     | Packets: 322 Packets: 317 Packets: 325 Packets: 320 Forwarding 1200 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 38/134 (28.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 53/150 (35.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 53/151 (35.1%)
+sim     | Dropping 1200 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 39/135 (28.9%)
+sim     | Packets: 326 Packets: 321 Forwarding 1200 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 39/136 (28.7%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 54/152 (35.5%)
+sim     | Packets: 329 Packets: 324 Forwarding 1200 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 39/137 (28.5%)
+sim     | Dropping 65 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 55/153 (35.9%)
+sim     | Packets: 331 Packets: 325 Packets: 332 Packets: 326 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 55/154 (35.7%)
+sim     | Dropping 1200 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 40/138 (29.0%)
+sim     | Forwarding 74 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 40/139 (28.8%)
+sim     | Packets: 333 Packets: 327 Dropping 109 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 41/140 (29.3%)
+sim     | Packets: 330 Packets: 334 Forwarding 109 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 41/141 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 55/155 (35.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 55/156 (35.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33508, dropped 55/157 (35.0%)
+sim     | Dropping 45 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 42/142 (29.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:33508 -> 193.167.100.100:443, dropped 42/143 (29.4%)
+sim     | Packets: 335 Packets: 331 Packets: 339 Packets: 336 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 55/158 (34.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 56/159 (35.2%)
+client  | https://server4:443/fast-indigo-fisherman
+sim     | Packets: 340 Packets: 337 Packets: 343 Packets: 338 Packets: 344 Packets: 339 Packets: 345 Packets: 340 Forwarding 1200 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 42/144 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 56/160 (35.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 57/161 (35.4%)
+sim     | Dropping 1200 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 43/145 (29.7%)
+sim     | Forwarding 69 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 43/146 (29.5%)
+sim     | Packets: 346 Packets: 341 Forwarding 109 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 43/147 (29.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 57/162 (35.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 57/163 (35.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 58/164 (35.4%)
+sim     | Dropping 219 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 44/148 (29.7%)
+sim     | Dropping 206 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 45/149 (30.2%)
+sim     | Packets: 350 Packets: 345 Packets: 353 Packets: 349 Forwarding 206 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 45/150 (30.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 58/165 (35.2%)
+sim     | Packets: 354 Packets: 350 Packets: 355 Packets: 351 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 59/166 (35.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 59/167 (35.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 59/168 (35.1%)
+sim     | Dropping 55 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 46/151 (30.5%)
+sim     | Packets: 356 Packets: 352 Packets: 358 Packets: 354 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 60/169 (35.5%)
+sim     | Packets: 359 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 60/170 (35.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 61/171 (35.7%)
+sim     | Forwarding 58 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 46/152 (30.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 61/172 (35.5%)
+sim     | Forwarding 60 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 46/153 (30.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51537, dropped 61/173 (35.3%)
+sim     | Forwarding 41 bytes 193.167.0.100:51537 -> 193.167.100.100:443, dropped 46/154 (29.9%)
+client  | https://server4:443/sad-intense-tie
+sim     | Packets: 360 Packets: 355 Packets: 366 Packets: 360 Forwarding 1200 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 46/155 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 61/174 (35.1%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 62/175 (35.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 46/156 (29.5%)
+sim     | Dropping 63 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 47/157 (29.9%)
+sim     | Forwarding 109 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 47/158 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 62/176 (35.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 62/177 (35.0%)
+sim     | Dropping 51 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 48/159 (30.2%)
+sim     | Packets: 367 Packets: 361 Forwarding 206 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 48/160 (30.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 62/178 (34.8%)
+sim     | Forwarding 63 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 48/161 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 62/179 (34.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:38494 -> 193.167.100.100:443, dropped 48/162 (29.6%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:38494, dropped 63/180 (35.0%)
+client  | https://server4:443/blue-shy-book
+sim     | Packets: 374 Packets: 369 Packets: 379 Packets: 373 Forwarding 1200 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 48/163 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 63/181 (34.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 63/182 (34.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 48/164 (29.3%)
+sim     | Forwarding 49 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 48/165 (29.1%)
+sim     | Forwarding 61 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 48/166 (28.9%)
+sim     | Packets: 380 Packets: 374 Dropping 109 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 49/167 (29.3%)
+sim     | Packets: 380 Packets: 385 Forwarding 109 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 49/168 (29.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 64/183 (35.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 64/184 (34.8%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 65/185 (35.1%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 66/186 (35.5%)
+sim     | Forwarding 205 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 49/169 (29.0%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 67/187 (35.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 67/188 (35.6%)
+sim     | Forwarding 52 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 49/170 (28.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 67/189 (35.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 67/190 (35.3%)
+sim     | Dropping 52 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 50/171 (29.2%)
+sim     | Forwarding 52 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 50/172 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:34826, dropped 67/191 (35.1%)
+sim     | Packets: 386 Packets: 382 Forwarding 41 bytes 193.167.0.100:34826 -> 193.167.100.100:443, dropped 50/173 (28.9%)
+sim     | Packets: 399 Packets: 391 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 67/192 (34.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:60555, dropped 67/193 (34.7%)
+client  | https://server4:443/gigantic-teal-engineer
+sim     | Packets: 400 Packets: 392 Packets: 403 Packets: 395 Dropping 1200 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 51/174 (29.3%)
+sim     | Packets: 396 Forwarding 1200 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 51/175 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 67/194 (34.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 67/195 (34.4%)
+sim     | Dropping 1200 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 52/176 (29.5%)
+sim     | Forwarding 70 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 52/177 (29.4%)
+sim     | Dropping 50 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 53/178 (29.8%)
+sim     | Forwarding 109 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 53/179 (29.6%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 68/196 (34.7%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 69/197 (35.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 69/198 (34.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 69/199 (34.7%)
+sim     | Forwarding 52 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 53/180 (29.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:50568 -> 193.167.100.100:443, dropped 53/181 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50568, dropped 69/200 (34.5%)
+client  | https://server4:443/merciless-giant-marker
+sim     | Packets: 404 Packets: 397 Packets: 415 Packets: 408 Dropping 1200 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 54/182 (29.7%)
+sim     | Packets: 409 Forwarding 1200 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 54/183 (29.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 70/201 (34.8%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 71/202 (35.1%)
+sim     | Packets: 416 Packets: 410 Packets: 418 Forwarding 1200 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 54/184 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 71/203 (35.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 54/185 (29.2%)
+sim     | Dropping 70 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 55/186 (29.6%)
+sim     | Dropping 109 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 56/187 (29.9%)
+sim     | Packets: 419 Packets: 411 Forwarding 109 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 56/188 (29.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 72/204 (35.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 73/205 (35.6%)
+sim     | Packets: 422 Packets: 416 Packets: 424 Dropping 109 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 57/189 (30.2%)
+sim     | Packets: 417 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 73/206 (35.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 73/207 (35.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 74/208 (35.6%)
+sim     | Forwarding 48 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 57/190 (30.0%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/209 (35.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/210 (35.7%)
+sim     | Forwarding 206 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 57/191 (29.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 57/192 (29.7%)
+sim     | Packets: 425 Packets: 418 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/211 (35.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/212 (35.4%)
+sim     | Forwarding 50 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 57/193 (29.5%)
+sim     | Forwarding 70 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 57/194 (29.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/213 (35.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/214 (35.0%)
+sim     | Dropping 41 bytes 193.167.0.100:51688 -> 193.167.100.100:443, dropped 58/195 (29.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 75/215 (34.9%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 76/216 (35.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 76/217 (35.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 76/218 (34.9%)
+client  | https://server4:443/calm-zestful-raikou
+sim     | Packets: 435 Packets: 424 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 76/219 (34.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 76/220 (34.5%)
+sim     | Dropping 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/196 (30.1%)
+sim     | Packets: 443 Packets: 434 Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/197 (29.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 77/221 (34.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 77/222 (34.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/198 (29.8%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 78/223 (35.0%)
+sim     | Packets: 447 Packets: 439 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 78/224 (34.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 78/225 (34.7%)
+sim     | Packets: 452 Packets: 442 Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/199 (29.6%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 78/226 (34.5%)
+sim     | Packets: 456 Packets: 446 Packets: 448 Packets: 457 Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/200 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 78/227 (34.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/201 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 78/228 (34.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 78/229 (34.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/202 (29.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 78/230 (33.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 78/231 (33.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/203 (29.1%)
+sim     | Forwarding 67 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/204 (28.9%)
+sim     | Forwarding 109 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/205 (28.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 78/232 (33.6%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 79/233 (33.9%)
+sim     | Forwarding 50 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 59/206 (28.6%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 80/234 (34.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 80/235 (34.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 80/236 (33.9%)
+sim     | Dropping 51 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 60/207 (29.0%)
+sim     | Dropping 41 bytes 193.167.0.100:47954 -> 193.167.100.100:443, dropped 61/208 (29.3%)
+sim     | Packets: 458 Packets: 449 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 80/237 (33.8%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 81/238 (34.0%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 82/239 (34.3%)
+sim     | Packets: 477 Packets: 467 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 82/240 (34.2%)
+client  | https://server4:443/quiet-salty-carvan
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 83/241 (34.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 83/242 (34.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 61/209 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48609, dropped 83/243 (34.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48609, dropped 83/244 (34.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 61/210 (29.0%)
+sim     | Forwarding 49 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 61/211 (28.9%)
+sim     | Forwarding 66 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 61/212 (28.8%)
+sim     | Packets: 480 Packets: 468 Forwarding 109 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 61/213 (28.6%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:48609, dropped 84/245 (34.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:48609, dropped 84/246 (34.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48609, dropped 84/247 (34.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:48609, dropped 84/248 (33.9%)
+sim     | Dropping 205 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 62/214 (29.0%)
+sim     | Dropping 49 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 63/215 (29.3%)
+sim     | Forwarding 41 bytes 193.167.0.100:48609 -> 193.167.100.100:443, dropped 63/216 (29.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 84/249 (33.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 84/250 (33.6%)
+client  | https://server4:443/toasty-endless-vhs
+sim     | Packets: 490 Packets: 477 Packets: 498 Packets: 487 Packets: 489 Forwarding 1200 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 63/217 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 84/251 (33.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 85/252 (33.7%)
+sim     | Dropping 1200 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 64/218 (29.4%)
+sim     | Forwarding 46 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 64/219 (29.2%)
+sim     | Forwarding 66 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 64/220 (29.1%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 86/253 (34.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 86/254 (33.9%)
+sim     | Dropping 109 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 65/221 (29.4%)
+sim     | Packets: 499 Packets: 490 Dropping 109 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 66/222 (29.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 87/255 (34.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 87/256 (34.0%)
+sim     | Packets: 506 Packets: 497 Dropping 109 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 67/223 (30.0%)
+sim     | Packets: 499 Packets: 507 Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 88/257 (34.2%)
+sim     | Packets: 508 Forwarding 109 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 67/224 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 88/258 (34.1%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 88/259 (34.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 88/260 (33.8%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 89/261 (34.1%)
+sim     | Forwarding 46 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 67/225 (29.8%)
+sim     | Forwarding 46 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 67/226 (29.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 89/262 (34.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 89/263 (33.8%)
+sim     | Forwarding 48 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 67/227 (29.5%)
+sim     | Dropping 48 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 68/228 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49955, dropped 89/264 (33.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:49955 -> 193.167.100.100:443, dropped 68/229 (29.7%)
+sim     | Packets: 509 Packets: 500 Packets: 520 Packets: 511 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 89/265 (33.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 89/266 (33.5%)
+sim     | Packets: 521 Packets: 512 Packets: 524 Packets: 515 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 90/267 (33.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 90/268 (33.6%)
+sim     | Packets: 525 Packets: 516 Packets: 531 Packets: 520 Packets: 533 Packets: 534 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 90/269 (33.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 90/270 (33.3%)
+client  | https://server4:443/gray-violet-pants
+sim     | Packets: 536 Packets: 521 Packets: 537 Packets: 524 Dropping 1200 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 69/230 (30.0%)
+sim     | Packets: 525 Dropping 1200 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 70/231 (30.3%)
+sim     | Packets: 526 Forwarding 1200 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 70/232 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/271 (33.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/272 (33.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 70/233 (30.0%)
+sim     | Forwarding 65 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 70/234 (29.9%)
+sim     | Forwarding 46 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 70/235 (29.8%)
+sim     | Dropping 109 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 71/236 (30.1%)
+sim     | Packets: 538 Packets: 527 Dropping 109 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 72/237 (30.4%)
+sim     | Packets: 535 Packets: 543 Forwarding 109 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 72/238 (30.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/273 (33.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/274 (32.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/275 (32.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/276 (32.6%)
+sim     | Forwarding 46 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 72/239 (30.1%)
+sim     | Dropping 45 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 73/240 (30.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:42709 -> 193.167.100.100:443, dropped 73/241 (30.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42709, dropped 90/277 (32.5%)
+sim     | Packets: 544 Packets: 536 Packets: 551 Packets: 544 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 91/278 (32.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 91/279 (32.6%)
+client  | https://server4:443/dark-cold-dress
+sim     | Packets: 552 Packets: 545 Packets: 554 Packets: 546 Forwarding 1200 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 73/242 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 91/280 (32.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 91/281 (32.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 73/243 (30.0%)
+sim     | Dropping 63 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 74/244 (30.3%)
+sim     | Forwarding 50 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 74/245 (30.2%)
+sim     | Dropping 109 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 75/246 (30.5%)
+sim     | Packets: 555 Packets: 547 Forwarding 109 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 75/247 (30.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 92/282 (32.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 92/283 (32.5%)
+sim     | Forwarding 53 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 75/248 (30.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 92/284 (32.4%)
+sim     | Packets: 560 Packets: 554 Forwarding 231 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 75/249 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 92/285 (32.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:53763, dropped 92/286 (32.2%)
+sim     | Forwarding 41 bytes 193.167.0.100:53763 -> 193.167.100.100:443, dropped 75/250 (30.0%)
+client  | https://server4:443/elated-maroon-sloth
+sim     | Packets: 565 Packets: 559 Forwarding 1200 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 75/251 (29.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/287 (32.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/288 (32.3%)
+sim     | Packets: 569 Packets: 562 Forwarding 1200 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 75/252 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/289 (32.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 75/253 (29.6%)
+sim     | Forwarding 67 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 75/254 (29.5%)
+sim     | Dropping 109 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 76/255 (29.8%)
+sim     | Packets: 572 Packets: 565 Forwarding 109 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 76/256 (29.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/290 (32.1%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/291 (32.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/292 (31.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/293 (31.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 93/294 (31.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 93/295 (31.5%)
+sim     | Dropping 45 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 77/257 (30.0%)
+sim     | Dropping 41 bytes 193.167.0.100:36932 -> 193.167.100.100:443, dropped 78/258 (30.2%)
+sim     | Packets: 576 Packets: 569 Packets: 584 Packets: 579 Packets: 585 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/296 (31.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/297 (31.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 93/298 (31.2%)
+client  | https://server4:443/ample-satisfied-pharaoh
+sim     | Packets: 586 Packets: 580 Dropping 1200 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 79/259 (30.5%)
+sim     | Packets: 583 Packets: 588 Forwarding 1200 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 79/260 (30.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 94/299 (31.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 95/300 (31.7%)
+sim     | Packets: 589 Packets: 584 Packets: 591 Dropping 1200 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 80/261 (30.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 96/301 (31.9%)
+sim     | Packets: 592 Packets: 585 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/302 (31.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 80/262 (30.5%)
+sim     | Forwarding 71 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 80/263 (30.4%)
+sim     | Packets: 593 Packets: 586 Forwarding 109 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 80/264 (30.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/303 (31.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/304 (31.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/305 (31.5%)
+sim     | Forwarding 45 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 80/265 (30.2%)
+sim     | Dropping 41 bytes 193.167.0.100:46936 -> 193.167.100.100:443, dropped 81/266 (30.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/306 (31.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/307 (31.3%)
+sim     | Packets: 596 Packets: 589 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/308 (31.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/309 (31.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/310 (31.0%)
+sim     | Packets: 603 Packets: 597 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/311 (30.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/312 (30.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/313 (30.7%)
+sim     | Packets: 606 Packets: 600 Packets: 608 Packets: 602 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/314 (30.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/315 (30.5%)
+sim     | Packets: 609 Packets: 603 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 96/316 (30.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 96/317 (30.3%)
+sim     | Packets: 611 Packets: 605 Packets: 614 Packets: 608 Packets: 615 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/318 (30.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 96/319 (30.1%)
+client  | https://server4:443/teal-sharp-squirtle
+sim     | Packets: 616 Packets: 609 Packets: 612 Packets: 617 Forwarding 1200 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 81/267 (30.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 97/320 (30.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 97/321 (30.2%)
+sim     | Dropping 1200 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 82/268 (30.6%)
+sim     | Dropping 1200 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 83/269 (30.9%)
+sim     | Packets: 618 Packets: 613 Packets: 620 Packets: 615 Forwarding 1200 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 83/270 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 97/322 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 83/271 (30.6%)
+sim     | Forwarding 67 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 83/272 (30.5%)
+sim     | Packets: 621 Packets: 616 Forwarding 109 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 83/273 (30.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 97/323 (30.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 97/324 (29.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 98/325 (30.2%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 99/326 (30.4%)
+sim     | Forwarding 205 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 83/274 (30.3%)
+sim     | Dropping 46 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 84/275 (30.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 99/327 (30.3%)
+sim     | Dropping 109 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 85/276 (30.8%)
+sim     | Packets: 626 Packets: 620 Forwarding 109 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 85/277 (30.7%)
+sim     | Packets: 635 Packets: 629 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 99/328 (30.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 99/329 (30.1%)
+sim     | Dropping 109 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 86/278 (30.9%)
+sim     | Packets: 636 Packets: 630 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 99/330 (30.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 86/279 (30.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 99/331 (29.9%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 100/332 (30.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 100/333 (30.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 86/280 (30.7%)
+sim     | Dropping 51 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 87/281 (31.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 100/334 (29.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 100/335 (29.9%)
+sim     | Forwarding 39 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 87/282 (30.9%)
+sim     | Forwarding 41 bytes 193.167.0.100:40090 -> 193.167.100.100:443, dropped 87/283 (30.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:40090, dropped 100/336 (29.8%)
+client  | https://server4:443/envious-wet-dancer
+sim     | Packets: 640 Packets: 635 Packets: 650 Packets: 645 Forwarding 1200 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 87/284 (30.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 100/337 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 100/338 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 87/285 (30.5%)
+sim     | Dropping 45 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 88/286 (30.8%)
+sim     | Forwarding 66 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 88/287 (30.7%)
+sim     | Dropping 109 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 89/288 (30.9%)
+sim     | Packets: 651 Packets: 646 Forwarding 109 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 89/289 (30.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 100/339 (29.5%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 101/340 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 101/341 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 101/342 (29.5%)
+sim     | Forwarding 48 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 89/290 (30.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:45491 -> 193.167.100.100:443, dropped 89/291 (30.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 101/343 (29.4%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:45491, dropped 102/344 (29.7%)
+sim     | Packets: 656 Packets: 653 Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 102/345 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 102/346 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 102/347 (29.4%)
+client  | https://server4:443/tremendous-ecstatic-armadillo
+sim     | Packets: 665 Packets: 660 Forwarding 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 89/292 (30.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 103/348 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 103/349 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 89/293 (30.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 104/350 (29.7%)
+sim     | Packets: 671 Packets: 666 Forwarding 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 89/294 (30.3%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 104/351 (29.6%)
+sim     | Packets: 676 Packets: 669 Forwarding 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 89/295 (30.2%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 104/352 (29.5%)
+sim     | Packets: 678 Packets: 671 Forwarding 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 89/296 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 104/353 (29.5%)
+sim     | Dropping 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 90/297 (30.3%)
+sim     | Packets: 680 Packets: 673 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 104/354 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 90/298 (30.2%)
+sim     | Forwarding 77 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 90/299 (30.1%)
+sim     | Packets: 682 Packets: 676 Forwarding 109 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 90/300 (30.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 104/355 (29.3%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 105/356 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 105/357 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 105/358 (29.3%)
+sim     | Forwarding 51 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 90/301 (29.9%)
+sim     | Dropping 41 bytes 193.167.0.100:40411 -> 193.167.100.100:443, dropped 91/302 (30.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 105/359 (29.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 106/360 (29.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 107/361 (29.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:51688, dropped 107/362 (29.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 107/363 (29.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 107/364 (29.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 108/365 (29.6%)
+client  | https://server4:443/dark-gigantic-purse
+sim     | Packets: 685 Packets: 679 Forwarding 1200 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 91/303 (30.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 108/366 (29.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 109/367 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 109/368 (29.6%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 110/369 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 110/370 (29.7%)
+sim     | Packets: 699 Packets: 690 Forwarding 1200 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 91/304 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 110/371 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 91/305 (29.8%)
+sim     | Dropping 67 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 92/306 (30.1%)
+sim     | Forwarding 109 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 92/307 (30.0%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 111/372 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 111/373 (29.8%)
+sim     | Dropping 48 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 93/308 (30.2%)
+sim     | Packets: 705 Packets: 697 Dropping 206 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 94/309 (30.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 112/374 (29.9%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 113/375 (30.1%)
+sim     | Packets: 713 Packets: 703 Dropping 68 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 95/310 (30.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 113/376 (30.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 113/377 (30.0%)
+sim     | Packets: 715 Packets: 705 Packets: 709 Packets: 717 Forwarding 206 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 95/311 (30.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 113/378 (29.9%)
+sim     | Dropping 67 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 96/312 (30.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 113/379 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 113/380 (29.7%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 114/381 (29.9%)
+sim     | Forwarding 68 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 96/313 (30.7%)
+sim     | Dropping 47 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 97/314 (30.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:56426, dropped 114/382 (29.8%)
+sim     | Forwarding 41 bytes 193.167.0.100:56426 -> 193.167.100.100:443, dropped 97/315 (30.8%)
+sim     | Packets: 718 Packets: 710 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 114/383 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 114/384 (29.7%)
+client  | https://server4:443/worried-peaceful-keyboard
+sim     | Packets: 726 Packets: 718 Dropping 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/316 (31.0%)
+sim     | Packets: 721 Packets: 728 Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/317 (30.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 115/385 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 115/386 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/318 (30.8%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 116/387 (30.0%)
+sim     | Packets: 729 Packets: 722 Packets: 733 Packets: 724 Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/319 (30.7%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 116/388 (29.9%)
+sim     | Packets: 734 Packets: 725 Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/320 (30.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 117/389 (30.1%)
+sim     | Packets: 736 Packets: 727 Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 118/390 (30.3%)
+sim     | Packets: 738 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 118/391 (30.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 119/392 (30.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/321 (30.5%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 119/393 (30.3%)
+sim     | Packets: 739 Packets: 728 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 120/394 (30.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:47954, dropped 120/395 (30.4%)
+sim     | Packets: 744 Packets: 732 Packets: 746 Packets: 733 Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/322 (30.4%)
+sim     | Packets: 734 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/396 (30.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 98/323 (30.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/397 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/398 (30.2%)
+sim     | Dropping 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 99/324 (30.6%)
+sim     | Dropping 1200 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 100/325 (30.8%)
+sim     | Dropping 73 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/326 (31.0%)
+sim     | Forwarding 109 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/327 (30.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/399 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/400 (30.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/328 (30.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/329 (30.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/401 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/402 (29.9%)
+sim     | Forwarding 50 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/330 (30.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/331 (30.5%)
+sim     | Forwarding 206 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 101/332 (30.4%)
+sim     | Packets: 747 Packets: 735 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/403 (29.8%)
+sim     | Dropping 73 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 102/333 (30.6%)
+sim     | Forwarding 74 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 102/334 (30.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:52000, dropped 120/404 (29.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:52000 -> 193.167.100.100:443, dropped 102/335 (30.4%)
+client  | https://server4:443/fast-aquamarine-notebook
+sim     | Packets: 763 Packets: 752 Packets: 757 Packets: 765 Dropping 1200 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 103/336 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 103/337 (30.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 120/405 (29.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 121/406 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 103/338 (30.5%)
+sim     | Forwarding 72 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 103/339 (30.4%)
+sim     | Packets: 766 Packets: 758 Forwarding 109 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 103/340 (30.3%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 122/407 (30.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 122/408 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 122/409 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 122/410 (29.8%)
+sim     | Dropping 205 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 104/341 (30.5%)
+sim     | Forwarding 52 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 104/342 (30.4%)
+sim     | Dropping 41 bytes 193.167.0.100:57331 -> 193.167.100.100:443, dropped 105/343 (30.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 123/411 (29.9%)
+sim     | Packets: 771 Packets: 762 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 123/412 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 123/413 (29.8%)
+sim     | Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 123/414 (29.7%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 124/415 (29.9%)
+sim     | Packets: 780 Packets: 769 Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:36932, dropped 125/416 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 125/417 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 125/418 (29.9%)
+client  | https://server4:443/titanic-tropical-moltres
+sim     | Packets: 785 Packets: 773 Forwarding 1200 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 105/344 (30.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 126/419 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 126/420 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 105/345 (30.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 126/421 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 105/346 (30.3%)
+sim     | Forwarding 72 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 105/347 (30.3%)
+sim     | Dropping 109 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 106/348 (30.5%)
+sim     | Packets: 786 Packets: 775 Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 127/422 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 127/423 (30.0%)
+sim     | Dropping 109 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 107/349 (30.7%)
+sim     | Packets: 793 Packets: 782 Packets: 795 Packets: 784 Dropping 109 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 108/350 (30.9%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 128/424 (30.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 129/425 (30.4%)
+sim     | Packets: 796 Packets: 785 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 129/426 (30.3%)
+sim     | Forwarding 61 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 108/351 (30.8%)
+sim     | Forwarding 46 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 108/352 (30.7%)
+sim     | Packets: 798 Packets: 786 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 129/427 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 129/428 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 129/429 (30.1%)
+sim     | Packets: 801 Packets: 789 Forwarding 109 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 108/353 (30.6%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 130/430 (30.2%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 130/431 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 130/432 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37735, dropped 130/433 (30.0%)
+sim     | Dropping 205 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 109/354 (30.8%)
+sim     | Forwarding 45 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 109/355 (30.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:37735 -> 193.167.100.100:443, dropped 109/356 (30.6%)
+sim     | Packets: 807 Packets: 795 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 130/434 (30.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:46936, dropped 130/435 (29.9%)
+sim     | Packets: 814 Packets: 802 Packets: 815 Packets: 803 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 130/436 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 130/437 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 130/438 (29.7%)
+client  | https://server4:443/merciless-immense-koala
+sim     | Packets: 816 Packets: 804 Dropping 1200 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 110/357 (30.8%)
+sim     | Packets: 809 Packets: 820 Dropping 1200 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 111/358 (31.0%)
+sim     | Packets: 810 Forwarding 1200 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 111/359 (30.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44107, dropped 130/439 (29.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44107, dropped 131/440 (29.8%)
+sim     | Dropping 1200 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 112/360 (31.1%)
+sim     | Forwarding 71 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 112/361 (31.0%)
+sim     | Packets: 821 Packets: 811 Forwarding 109 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 112/362 (30.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44107, dropped 131/441 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44107, dropped 131/442 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44107, dropped 131/443 (29.6%)
+sim     | Dropping 216 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 113/363 (31.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:44107 -> 193.167.100.100:443, dropped 113/364 (31.0%)
+client  | https://server4:443/thick-small-bulbasaur
+sim     | Packets: 825 Packets: 815 Packets: 832 Packets: 823 Dropping 1200 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 114/365 (31.2%)
+sim     | Dropping 1200 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/366 (31.4%)
+sim     | Packets: 824 Packets: 825 Forwarding 1200 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/367 (31.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/444 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/445 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/368 (31.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/446 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/369 (31.2%)
+sim     | Forwarding 69 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/370 (31.1%)
+sim     | Packets: 833 Packets: 826 Forwarding 109 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/371 (31.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/447 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/448 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/449 (29.4%)
+sim     | Forwarding 217 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/372 (30.9%)
+sim     | Forwarding 41 bytes 193.167.0.100:37318 -> 193.167.100.100:443, dropped 115/373 (30.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 132/450 (29.3%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:37318, dropped 133/451 (29.5%)
+client  | https://server4:443/monstrous-euphoric-wizard
+sim     | Packets: 840 Packets: 832 Packets: 847 Packets: 838 Forwarding 1200 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 115/374 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 133/452 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 133/453 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 115/375 (30.7%)
+sim     | Forwarding 45 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 115/376 (30.6%)
+sim     | Dropping 73 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/377 (30.8%)
+sim     | Forwarding 109 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/378 (30.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 134/454 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 134/455 (29.5%)
+sim     | Forwarding 48 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/379 (30.6%)
+sim     | Packets: 848 Packets: 839 Forwarding 206 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/380 (30.5%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 135/456 (29.6%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 136/457 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 136/458 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 136/459 (29.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 137/460 (29.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/381 (30.4%)
+sim     | Forwarding 50 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/382 (30.4%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 138/461 (29.9%)
+sim     | Packets: 857 Packets: 848 Forwarding 74 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 116/383 (30.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 138/462 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 138/463 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 138/464 (29.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 139/465 (29.9%)
+sim     | Dropping 51 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 117/384 (30.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 139/466 (29.8%)
+sim     | Forwarding 52 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 117/385 (30.4%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 140/467 (30.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42802, dropped 140/468 (29.9%)
+sim     | Forwarding 41 bytes 193.167.0.100:42802 -> 193.167.100.100:443, dropped 117/386 (30.3%)
+sim     | Packets: 866 Packets: 853 Dropping 1342 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 141/469 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 141/470 (30.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 142/471 (30.1%)
+client  | https://server4:443/unlimited-cold-wolverine
+sim     | Packets: 876 Packets: 862 Forwarding 1200 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 117/387 (30.2%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/472 (30.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/473 (30.2%)
+sim     | Dropping 1200 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 118/388 (30.4%)
+sim     | Packets: 880 Packets: 864 Forwarding 1200 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 118/389 (30.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/474 (30.2%)
+sim     | Dropping 1200 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 119/390 (30.5%)
+sim     | Forwarding 72 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 119/391 (30.4%)
+sim     | Forwarding 109 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 119/392 (30.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/475 (30.1%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/476 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/477 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/478 (29.9%)
+sim     | Dropping 205 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 120/393 (30.5%)
+sim     | Forwarding 49 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 120/394 (30.5%)
+sim     | Dropping 41 bytes 193.167.0.100:50649 -> 193.167.100.100:443, dropped 121/395 (30.6%)
+sim     | Packets: 883 Packets: 867 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 143/479 (29.9%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 144/480 (30.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 144/481 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 144/482 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 144/483 (29.8%)
+sim     | Packets: 893 Packets: 879 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 144/484 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 144/485 (29.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 145/486 (29.8%)
+client  | https://server4:443/tan-surplus-segway
+sim     | Packets: 897 Packets: 883 Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/396 (30.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 146/487 (30.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 146/488 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/397 (30.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 147/489 (30.1%)
+sim     | Packets: 900 Packets: 885 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 148/490 (30.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:40411, dropped 148/491 (30.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 148/492 (30.1%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 149/493 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/398 (30.4%)
+sim     | Forwarding 63 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 149/494 (30.2%)
+sim     | Packets: 905 Packets: 888 Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/399 (30.3%)
+sim     | Dropping 63 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 150/495 (30.3%)
+sim     | Packets: 913 Packets: 894 Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/400 (30.2%)
+sim     | Packets: 915 Packets: 895 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 150/496 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/401 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 150/497 (30.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 150/498 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 121/402 (30.1%)
+sim     | Dropping 1200 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 122/403 (30.3%)
+sim     | Dropping 66 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 123/404 (30.4%)
+sim     | Forwarding 109 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 123/405 (30.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 151/499 (30.3%)
+sim     | Packets: 917 Packets: 896 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 151/500 (30.2%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 152/501 (30.3%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 153/502 (30.5%)
+sim     | Forwarding 50 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 123/406 (30.3%)
+sim     | Forwarding 109 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 123/407 (30.2%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 153/503 (30.4%)
+sim     | Forwarding 52 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 123/408 (30.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 153/504 (30.4%)
+sim     | Dropping 52 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 124/409 (30.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 153/505 (30.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 153/506 (30.2%)
+sim     | Forwarding 206 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 124/410 (30.2%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 154/507 (30.4%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 155/508 (30.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 155/509 (30.5%)
+sim     | Forwarding 54 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 124/411 (30.2%)
+sim     | Packets: 923 Packets: 904 Forwarding 67 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 124/412 (30.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 155/510 (30.4%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:49306, dropped 156/511 (30.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:49306 -> 193.167.100.100:443, dropped 124/413 (30.0%)
+client  | https://server4:443/roasting-bitter-armadillo
+sim     | Packets: 940 Packets: 918 Packets: 943 Packets: 920 Dropping 1200 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 125/414 (30.2%)
+sim     | Packets: 921 Forwarding 1200 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 125/415 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 156/512 (30.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 156/513 (30.4%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 125/416 (30.0%)
+sim     | Forwarding 73 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 125/417 (30.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 125/418 (29.9%)
+sim     | Dropping 109 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 126/419 (30.1%)
+sim     | Packets: 944 Packets: 922 Dropping 109 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 127/420 (30.2%)
+sim     | Packets: 929 Packets: 949 Packets: 930 Forwarding 109 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 127/421 (30.2%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 157/514 (30.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 157/515 (30.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 157/516 (30.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 158/517 (30.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 127/422 (30.1%)
+sim     | Dropping 205 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 128/423 (30.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 158/518 (30.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 158/519 (30.4%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55686, dropped 159/520 (30.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:55686 -> 193.167.100.100:443, dropped 128/424 (30.2%)
+sim     | Packets: 950 Packets: 931 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 159/521 (30.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 159/522 (30.5%)
+client  | https://server4:443/monstrous-sweet-lawyer
+sim     | Packets: 960 Packets: 938 Packets: 963 Packets: 941 Forwarding 1200 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 128/425 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 159/523 (30.4%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 160/524 (30.5%)
+sim     | Forwarding 1200 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 128/426 (30.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 128/427 (30.0%)
+sim     | Forwarding 70 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 128/428 (29.9%)
+sim     | Forwarding 109 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 128/429 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 160/525 (30.5%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 160/526 (30.4%)
+sim     | Packets: 964 Packets: 942 Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 161/527 (30.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 161/528 (30.5%)
+sim     | Forwarding 205 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 128/430 (29.8%)
+sim     | Dropping 50 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 129/431 (29.9%)
+sim     | Forwarding 52 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 129/432 (29.9%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 162/529 (30.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 162/530 (30.6%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 163/531 (30.7%)
+sim     | Forwarding 54 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 129/433 (29.8%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 164/532 (30.8%)
+sim     | Forwarding 109 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 129/434 (29.7%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 165/533 (31.0%)
+sim     | Packets: 975 Packets: 952 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 165/534 (30.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58368, dropped 165/535 (30.8%)
+sim     | Forwarding 206 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 129/435 (29.7%)
+sim     | Forwarding 41 bytes 193.167.0.100:58368 -> 193.167.100.100:443, dropped 129/436 (29.6%)
+client  | https://server4:443/green-tired-firefighter
+sim     | Packets: 984 Packets: 957 Packets: 987 Packets: 960 Forwarding 1342 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 165/536 (30.8%)
+sim     | Packets: 988 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 165/537 (30.7%)
+sim     | Packets: 961 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 165/538 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 129/437 (29.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 165/539 (30.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 166/540 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 129/438 (29.5%)
+sim     | Forwarding 46 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 129/439 (29.4%)
+sim     | Dropping 71 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 130/440 (29.5%)
+sim     | Forwarding 109 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 130/441 (29.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 166/541 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 166/542 (30.6%)
+sim     | Dropping 48 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 131/442 (29.6%)
+sim     | Forwarding 49 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 131/443 (29.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 166/543 (30.6%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 166/544 (30.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 166/545 (30.5%)
+sim     | Forwarding 48 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 131/444 (29.5%)
+sim     | Packets: 991 Packets: 963 Forwarding 239 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 131/445 (29.4%)
+sim     | Forwarding 46 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 131/446 (29.4%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 167/546 (30.6%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 168/547 (30.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 168/548 (30.7%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 169/549 (30.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 169/550 (30.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44576, dropped 169/551 (30.7%)
+sim     | Dropping 240 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 132/447 (29.5%)
+sim     | Forwarding 41 bytes 193.167.0.100:44576 -> 193.167.100.100:443, dropped 132/448 (29.5%)
+client  | https://server4:443/bitter-dark-car
+sim     | Packets: 1007 Packets: 983 Packets: 1016 Packets: 989 Dropping 1200 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/449 (29.6%)
+sim     | Packets: 992 Forwarding 1200 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/450 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 169/552 (30.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 170/553 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/451 (29.5%)
+sim     | Forwarding 50 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/452 (29.4%)
+sim     | Forwarding 63 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/453 (29.4%)
+sim     | Forwarding 109 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/454 (29.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 170/554 (30.7%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 170/555 (30.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 171/556 (30.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 171/557 (30.7%)
+sim     | Forwarding 205 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/455 (29.2%)
+sim     | Forwarding 50 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 133/456 (29.2%)
+sim     | Dropping 52 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 134/457 (29.3%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 171/558 (30.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 171/559 (30.6%)
+sim     | Forwarding 52 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 134/458 (29.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 171/560 (30.5%)
+sim     | Dropping 41 bytes 193.167.0.100:42508 -> 193.167.100.100:443, dropped 135/459 (29.4%)
+sim     | Packets: 1017 Packets: 994 Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 172/561 (30.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 172/562 (30.6%)
+sim     | Packets: 1034 Packets: 1010 Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 173/563 (30.7%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 174/564 (30.9%)
+client  | https://server4:443/cyan-temperate-lion
+sim     | Packets: 1036 Forwarding 1200 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 135/460 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45209, dropped 174/565 (30.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45209, dropped 174/566 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 135/461 (29.3%)
+sim     | Forwarding 67 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 135/462 (29.2%)
+sim     | Dropping 46 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 136/463 (29.4%)
+sim     | Forwarding 109 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 136/464 (29.3%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:45209, dropped 175/567 (30.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:45209, dropped 175/568 (30.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45209, dropped 175/569 (30.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:45209, dropped 175/570 (30.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 175/571 (30.6%)
+sim     | Dropping 205 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 137/465 (29.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 175/572 (30.6%)
+sim     | Packets: 1038 Packets: 1011 Dropping 48 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 138/466 (29.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:45209 -> 193.167.100.100:443, dropped 138/467 (29.6%)
+client  | https://server4:443/cold-teal-raikou
+sim     | Packets: 1050 Packets: 1027 Packets: 1052 Forwarding 1200 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 138/468 (29.5%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 176/573 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 176/574 (30.7%)
+sim     | Dropping 1200 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/469 (29.6%)
+sim     | Packets: 1053 Packets: 1028 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 176/575 (30.6%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 177/576 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/470 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 177/577 (30.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/471 (29.5%)
+sim     | Forwarding 64 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/472 (29.4%)
+sim     | Packets: 1056 Packets: 1031 Forwarding 109 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/473 (29.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 177/578 (30.6%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 177/579 (30.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 177/580 (30.5%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 177/581 (30.5%)
+sim     | Forwarding 205 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/474 (29.3%)
+sim     | Forwarding 49 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 139/475 (29.3%)
+sim     | Dropping 41 bytes 193.167.0.100:53110 -> 193.167.100.100:443, dropped 140/476 (29.4%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/582 (30.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/583 (30.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/584 (30.5%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/585 (30.4%)
+sim     | Packets: 1063 Packets: 1037 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/586 (30.4%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/587 (30.3%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/588 (30.3%)
+sim     | Packets: 1076 Packets: 1048 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/589 (30.2%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 178/590 (30.2%)
+client  | https://server4:443/lively-scalding-pharaoh
+sim     | Packets: 1051 Packets: 1078 Forwarding 1200 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 140/477 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 178/591 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 178/592 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 140/478 (29.3%)
+sim     | Forwarding 45 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 140/479 (29.2%)
+sim     | Forwarding 71 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 140/480 (29.2%)
+sim     | Forwarding 109 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 140/481 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 178/593 (30.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 178/594 (30.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 179/595 (30.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 179/596 (30.0%)
+sim     | Dropping 205 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 141/482 (29.3%)
+sim     | Forwarding 46 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 141/483 (29.2%)
+sim     | Forwarding 48 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 141/484 (29.1%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 179/597 (30.0%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44473, dropped 179/598 (29.9%)
+sim     | Forwarding 48 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 141/485 (29.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:44473 -> 193.167.100.100:443, dropped 141/486 (29.0%)
+sim     | Packets: 1079 Packets: 1054 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 179/599 (29.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 179/600 (29.8%)
+client  | https://server4:443/anxious-bright-sorcerer
+sim     | Packets: 1098 Packets: 1070 Packets: 1099 Packets: 1073 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 179/601 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 179/602 (29.7%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 141/487 (29.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 180/603 (29.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 180/604 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 141/488 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 180/605 (29.8%)
+sim     | Forwarding 1200 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 141/489 (28.8%)
+sim     | Dropping 71 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 142/490 (29.0%)
+sim     | Packets: 1100 Packets: 1074 Forwarding 109 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 142/491 (28.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 180/606 (29.7%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 181/607 (29.8%)
+sim     | Forwarding 50 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 142/492 (28.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 181/608 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 181/609 (29.7%)
+sim     | Dropping 53 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 143/493 (29.0%)
+sim     | Forwarding 52 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 143/494 (28.9%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 182/610 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 182/611 (29.8%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 182/612 (29.7%)
+sim     | Packets: 1109 Packets: 1083 Forwarding 109 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 143/495 (28.9%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 182/613 (29.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 182/614 (29.6%)
+sim     | Dropping 53 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 144/496 (29.0%)
+sim     | Forwarding 206 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 144/497 (29.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 182/615 (29.6%)
+sim     | Forwarding 71 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 144/498 (28.9%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 183/616 (29.7%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 184/617 (29.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 184/618 (29.8%)
+sim     | Packets: 1119 Packets: 1092 Dropping 52 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 145/499 (29.1%)
+sim     | Forwarding 72 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 145/500 (29.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 184/619 (29.7%)
+sim     | Packets: 1128 Packets: 1101 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 184/620 (29.7%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:44837, dropped 184/621 (29.6%)
+sim     | Forwarding 41 bytes 193.167.0.100:44837 -> 193.167.100.100:443, dropped 145/501 (28.9%)
+client  | https://server4:443/icy-red-chameleon
+sim     | Packets: 1130 Packets: 1103 Packets: 1132 Packets: 1105 Forwarding 1200 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 145/502 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 184/622 (29.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 185/623 (29.7%)
+sim     | Dropping 1200 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 146/503 (29.0%)
+sim     | Dropping 46 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/504 (29.2%)
+sim     | Forwarding 65 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/505 (29.1%)
+sim     | Forwarding 109 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/506 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 185/624 (29.6%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 185/625 (29.6%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 185/626 (29.6%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 186/627 (29.7%)
+sim     | Packets: 1133 Packets: 1106 Forwarding 205 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/507 (29.0%)
+sim     | Forwarding 48 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/508 (28.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 186/628 (29.6%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 186/629 (29.6%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 186/630 (29.5%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 186/631 (29.5%)
+sim     | Forwarding 50 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/509 (28.9%)
+sim     | Forwarding 46 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/510 (28.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:49974, dropped 186/632 (29.4%)
+sim     | Forwarding 41 bytes 193.167.0.100:49974 -> 193.167.100.100:443, dropped 147/511 (28.8%)
+client  | https://server4:443/noisy-ecstatic-watch
+sim     | Packets: 1142 Packets: 1117 Packets: 1151 Packets: 1124 Forwarding 1200 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 147/512 (28.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 186/633 (29.4%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 186/634 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 147/513 (28.7%)
+sim     | Forwarding 68 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 147/514 (28.6%)
+sim     | Dropping 46 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 148/515 (28.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 186/635 (29.3%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 186/636 (29.2%)
+sim     | Forwarding 109 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 148/516 (28.7%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 186/637 (29.2%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/638 (29.3%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/639 (29.3%)
+sim     | Packets: 1152 Packets: 1125 Dropping 46 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 149/517 (28.8%)
+sim     | Dropping 49 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 150/518 (29.0%)
+sim     | Dropping 109 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 151/519 (29.1%)
+sim     | Packets: 1139 Packets: 1164 Packets: 1140 Forwarding 109 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 151/520 (29.0%)
+sim     | Packets: 1165 Packets: 1141 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/640 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/641 (29.2%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/642 (29.1%)
+sim     | Forwarding 47 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 151/521 (29.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/643 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:33064, dropped 187/644 (29.0%)
+sim     | Dropping 48 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 152/522 (29.1%)
+sim     | Forwarding 206 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 152/523 (29.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:33064 -> 193.167.100.100:443, dropped 152/524 (29.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 187/645 (29.0%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 187/646 (28.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 187/647 (28.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 187/648 (28.9%)
+client  | https://server4:443/giant-hot-wallet
+sim     | Packets: 1166 Packets: 1142 Packets: 1178 Packets: 1155 Forwarding 1200 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 152/525 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 187/649 (28.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 187/650 (28.8%)
+sim     | Dropping 1200 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 153/526 (29.1%)
+sim     | Forwarding 49 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 153/527 (29.0%)
+sim     | Forwarding 64 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 153/528 (29.0%)
+sim     | Forwarding 109 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 153/529 (28.9%)
+sim     | Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 188/651 (28.9%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 189/652 (29.0%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 190/653 (29.1%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 190/654 (29.1%)
+sim     | Forwarding 52 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 153/530 (28.9%)
+sim     | Packets: 1179 Packets: 1156 Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55797, dropped 190/655 (29.0%)
+sim     | Forwarding 41 bytes 193.167.0.100:55797 -> 193.167.100.100:443, dropped 153/531 (28.8%)
+client  | https://server4:443/spicy-anxious-blacksmith
+sim     | Packets: 1191 Packets: 1165 Packets: 1167 Forwarding 1200 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 153/532 (28.8%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 190/656 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 190/657 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 153/533 (28.7%)
+sim     | Forwarding 72 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 153/534 (28.7%)
+sim     | Dropping 50 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 154/535 (28.8%)
+sim     | Dropping 109 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 155/536 (28.9%)
+sim     | Packets: 1192 Packets: 1168 Forwarding 109 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 155/537 (28.9%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 190/658 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 190/659 (28.8%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 191/660 (28.9%)
+sim     | Dropping 49 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 156/538 (29.0%)
+sim     | Forwarding 205 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 156/539 (28.9%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 192/661 (29.0%)
+sim     | Packets: 1197 Packets: 1174 Packets: 1202 Packets: 1178 Forwarding 206 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 156/540 (28.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 193/662 (29.2%)
+sim     | Packets: 1203 Packets: 1179 Packets: 1204 Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 193/663 (29.1%)
+sim     | Forwarding 52 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 156/541 (28.8%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 193/664 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:58894, dropped 193/665 (29.0%)
+sim     | Forwarding 52 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 156/542 (28.8%)
+sim     | Forwarding 41 bytes 193.167.0.100:58894 -> 193.167.100.100:443, dropped 156/543 (28.7%)
+sim     | Packets: 1205 Packets: 1180 Dropping 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 194/666 (29.1%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 194/667 (29.1%)
+client  | https://server4:443/cruel-immense-hat
+sim     | Packets: 1211 Packets: 1186 Packets: 1213 Packets: 1187 Forwarding 1200 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 156/544 (28.7%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 194/668 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 194/669 (29.0%)
+sim     | Forwarding 1200 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 156/545 (28.6%)
+sim     | Forwarding 65 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 156/546 (28.6%)
+sim     | Forwarding 50 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 156/547 (28.5%)
+sim     | Dropping 109 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/548 (28.6%)
+sim     | Packets: 1214 Packets: 1188 Forwarding 109 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/549 (28.6%)
+sim     | Forwarding 1406 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 194/670 (29.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 194/671 (28.9%)
+sim     | Forwarding 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 194/672 (28.9%)
+sim     | Dropping 1200 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 195/673 (29.0%)
+sim     | Forwarding 50 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/550 (28.5%)
+sim     | Forwarding 50 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/551 (28.5%)
+sim     | Forwarding 205 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/552 (28.4%)
+sim     | Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 195/674 (28.9%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 195/675 (28.9%)
+sim     | Forwarding 52 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/553 (28.4%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 196/676 (29.0%)
+sim     | Packets: 1220 Packets: 1195 Forwarding 1444 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 196/677 (29.0%)
+sim     | Dropping 1444 bytes 193.167.100.100:443 -> 193.167.0.100:55048, dropped 197/678 (29.1%)
+sim     | Forwarding 41 bytes 193.167.0.100:55048 -> 193.167.100.100:443, dropped 157/554 (28.3%)
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+sim     | Packets: 1232 Packets: 1205 Packets: 1234 Packets: 1206 Packets: 1235 Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:42508, dropped 197/679 (29.0%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:53110, dropped 197/680 (29.0%)
+sim     | Dropping 40 bytes 193.167.100.100:443 -> 193.167.0.100:50649, dropped 198/681 (29.1%)
+sim     | Forwarding 40 bytes 193.167.100.100:443 -> 193.167.0.100:57331, dropped 198/682 (29.0%)
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1238 Packets: 1207 Packets: 1241 Packets: 1209 Received signal: 15
+sim     | msg="15", +104.698968868s 0 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 1241
+sim     | Packets received/dropped on interface 'eth1': 1241/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# Packets captured: 1209
+sim     | Packets received/dropped on interface 'eth0': 1209/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:12:52,290 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:12:52,292 Using the client's key log file.
+2026-10-22 00:12:52,297 
+2026-10-22 00:12:52,298 Using the client's key log file.
+2026-10-22 00:12:52,298 Using the client's key log file.
+2026-10-22 00:12:52,304 
+2026-10-22 00:12:52,305 Using the client's key log file.
+2026-10-22 00:12:53,042 Wrong version. Expected 0x1, got ['0x6b3343cf']

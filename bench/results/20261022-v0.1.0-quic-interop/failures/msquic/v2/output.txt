@@ -1,0 +1,85 @@
+2026-10-22 00:29:39,159 Generated random file: hot-wet-jaguar of size: 1024
+2026-10-22 00:29:39,159 Requests: ['https://server4:443/hot-wet-jaguar']
+2026-10-22 00:29:39,186 
+2026-10-22 00:29:39,186 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_bw1g2zs5/ TESTCASE_SERVER=v2 TESTCASE_CLIENT=v2 CLIENT_WWW=/tmp/client_www_odhrswxu/ CLIENT_DOWNLOADS=/tmp/client_download_4babbgrs/ SERVER_WWW=/tmp/server_www_hazd889_/ SERVER_DOWNLOADS=/tmp/server_download_1qg1xm2m/ SERVER_LOGS=/tmp/logs_server_1c52j0j6 CLIENT_LOGS=/tmp/logs_client_ufz2w_28 SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=ghcr.io/microsoft/msquic/qns:main SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/hot-wet-jaguar" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:29:46,522  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+ Container client Started 
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksumming: off
+client  | 	tx-checksum-ip-generic: off
+client  | 	tx-checksum-sctp: off
+client  | tcp-segmentation-offload: off
+client  | 	tx-tcp-segmentation: off [requested on]
+client  | 	tx-tcp-ecn-segmentation: off [requested on]
+client  | 	tx-tcp-mangleid-segmentation: off [requested on]
+client  | 	tx-tcp6-segmentation: off [requested on]
+client  | tx-udp-segmentation: off [requested on]
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+ Container server Started 
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 501.45062ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Connecting to server4
+client  | Client params (before files):-test:2 -sslkeylogfile:/logs/keys.log 
+client  | Sending request: GET /hot-wet-jaguar
+client  | 
+client  |       TARGET  VHDCRZSQUMBGA2E    VERSION   ALPN
+client  |  ============================================
+client  |      server4  ---------------
+client  | 
+client  | Total execution time: 0.071s
+client  | 
+client  | Client complete.
+client  | Script complete.
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 4 Packets: 4 Packets: 7 Packets: 9 Packets: 27 Packets: 45 Packets: 33 Packets: 47 Packets: 38 Packets: 50 Packets: 42 Packets: 58 Packets: 46 Packets: 61 Packets: 50 Packets: 65 Packets: 52 Packets: 66 Packets: 53 Packets: 67 Packets: 54 Packets: 68 Packets: 56 Packets: 70 Packets: 57 Packets: 71 Packets: 58 Packets: 72 Packets: 59 Packets: 73 Packets: 60 Packets: 74 Packets: 75 Packets: 61 Received signal: 15
+sim     | msg="15", +5.453597991s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     |    0# 
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:29:46,702 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:29:46,702 Using the client's key log file.
+2026-10-22 00:29:46,706 
+2026-10-22 00:29:46,706 Using the client's key log file.
+2026-10-22 00:29:46,706 Using the client's key log file.
+2026-10-22 00:29:46,711 
+2026-10-22 00:29:46,711 Using the client's key log file.
+2026-10-22 00:29:47,543 Missing files: ['hot-wet-jaguar']

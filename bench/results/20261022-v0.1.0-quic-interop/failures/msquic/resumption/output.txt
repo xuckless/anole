@@ -1,0 +1,89 @@
+2026-10-22 00:29:48,173 Generated random file: subtropical-giant-doctor of size: 5120
+2026-10-22 00:29:48,173 Generated random file: rough-freezing-wizard of size: 10240
+2026-10-22 00:29:48,173 Requests: ['https://server4:443/subtropical-giant-doctor', 'https://server4:443/rough-freezing-wizard']
+2026-10-22 00:29:48,201 
+2026-10-22 00:29:48,201 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_a5vgd8rw/ TESTCASE_SERVER=resumption TESTCASE_CLIENT=resumption CLIENT_WWW=/tmp/client_www_25oy0e8m/ CLIENT_DOWNLOADS=/tmp/client_download_zmtls7ji/ SERVER_WWW=/tmp/server_www_25egn9u4/ SERVER_DOWNLOADS=/tmp/server_download_k8xt007e/ SERVER_LOGS=/tmp/logs_server_zi4_vren CLIENT_LOGS=/tmp/logs_client_3vvoat9l SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=ghcr.io/microsoft/msquic/qns:main SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/subtropical-giant-doctor https://server4:443/rough-freezing-wizard" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:29:56,006  Container server Recreate 
+ Container client Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container server Starting 
+ Container client Starting 
+sim  | waiting 10s for server:443
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+ Container server Started 
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksumming: off
+client  | 	tx-checksum-ip-generic: off
+client  | 	tx-checksum-sctp: off
+client  | tcp-segmentation-offload: off
+client  | 	tx-tcp-segmentation: off [requested on]
+client  | 	tx-tcp-ecn-segmentation: off [requested on]
+client  | 	tx-tcp-mangleid-segmentation: off [requested on]
+client  | 	tx-tcp6-segmentation: off [requested on]
+client  | tx-udp-segmentation: off [requested on]
+ Container client Started 
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+sim     | server:443 is available after 501.089194ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_left.pcap
+sim     | File: /logs/trace_node_right.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Connecting to server4
+client  | Client params (before files):-test:R -sslkeylogfile:/logs/keys.log 
+client  | Sending request: GET /subtropical-giant-doctor
+client  | 
+client  |       TARGET  VHDCRZSQUMBGA2E    VERSION   ALPN
+client  |  ============================================
+client  |      server4  ---------------
+client  | 
+client  | Total execution time: 0.557s
+client  | 
+client  | Client complete.
+client  | Script complete.
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 5 Packets: 5 Packets: 11 Packets: 10 Packets: 32 Packets: 19 Packets: 29 Packets: 41 Packets: 33 Packets: 44 Packets: 49 Packets: 64 Packets: 54 Packets: 71 Packets: 57 Packets: 73 Packets: 58 Packets: 76 Packets: 77 Packets: 60 Packets: 61 Packets: 78 Packets: 79 Packets: 62 Packets: 80 Packets: 81 Packets: 63 Packets: 65 Packets: 82 Packets: 83 Packets: 66 Packets: 84 Packets: 67 Packets: 85 Packets: 68 Packets: 87 Packets: 70 Packets: 88 Packets: 71 Received signal: 15
+sim     | msg="15", +6.379649123s Packets: 72 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 88
+sim     | Packets received/dropped on interface 'eth0': 88/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets captured: 72
+sim     | Packets received/dropped on interface 'eth1': 72/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# 
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:29:56,176 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:29:56,176 Using the client's key log file.
+2026-10-22 00:29:56,181 
+2026-10-22 00:29:56,181 Using the client's key log file.
+2026-10-22 00:29:56,181 Using the client's key log file.
+2026-10-22 00:29:56,186 
+2026-10-22 00:29:56,186 Using the client's key log file.
+2026-10-22 00:29:56,186 Using the client's key log file.
+2026-10-22 00:29:56,557 Missing files: ['subtropical-giant-doctor', 'rough-freezing-wizard']

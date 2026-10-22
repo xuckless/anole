@@ -1,0 +1,78 @@
+2026-10-22 00:10:15,443 Generated random file: fast-boiling-bowtie of size: 10485760
+2026-10-22 00:10:15,443 Requests: ['https://server4:443/fast-boiling-bowtie']
+2026-10-22 00:10:15,469 
+2026-10-22 00:10:15,469 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_wk575z71/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=transfer CLIENT_WWW=/tmp/client_www_pcl3diqo/ CLIENT_DOWNLOADS=/tmp/client_download_5k8swo28/ SERVER_WWW=/tmp/server_www_ebikbeyz/ SERVER_DOWNLOADS=/tmp/server_download_51edy3e2/ SERVER_LOGS=/tmp/logs_server_lhmqlw_2 CLIENT_LOGS=/tmp/logs_client_zoydaeva SCENARIO="blackhole --delay=15ms --bandwidth=10Mbps --queue=25 --on=5s --off=2s" CLIENT=aiortc/aioquic-qns:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/fast-boiling-bowtie" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:10:30,046  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+ Container client Started 
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+ Container server Started 
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 500.897892ms
+sim     | Using scenario: blackhole --delay=15ms --bandwidth=10Mbps --queue=25 --on=5s --off=2s
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Starting client
+sim     | Packets: 1 Packets: 1 Packets: 6 Packets: 8 Packets: 9 Packets: 12 Packets: 19 Packets: 29 Packets: 137 Packets: 140 Packets: 392 Packets: 576 Packets: 531 Packets: 988 Packets: 941 Packets: 1367 Packets: 1313 Packets: 1687 Packets: 1742 Packets: 2162 Packets: 2119 Packets: 2588 Packets: 2540 Packets: 3017 Packets: 2968 Packets: 3428 Packets: 3372 Packets: 3821 Packets: 3766 Packets: 4243 Packets: 4188 Packets: 4590 Packets: 4654 Packets: 5010 Packets: 4958 Packets: 5426 Packets: 5376 Packets: 5848 Packets: 5793 Packets: 6266 Packets: 6206 5s: Enabling blackhole
+sim     | Packets: 6684 Packets: 6627 Packets: 6720 Packets: 6781 Packets: 6783 Packets: 6722 Packets: 6785 Packets: 6786 Packets: 6723 Packets: 6787 Packets: 6788 Packets: 6789 7s: Disabling blackhole
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 6790 Packets: 6724 Packets: 6928 Packets: 6838 Packets: 7343 Packets: 7244 Packets: 7776 Packets: 7673 Packets: 8163 Packets: 8055 Packets: 8579 Packets: 8470 Packets: 8995 Packets: 8885 Packets: 9415 Packets: 9303 Packets: 9841 Packets: 9725 Packets: 10244 Packets: 10138 Packets: 10669 Packets: 10562 Packets: 11095 Packets: 10980 Packets: 11517 Packets: 11404 Packets: 11907 Packets: 11786 Packets: 12290 Packets: 12174 Packets: 12715 Packets: 12597 Packets: 13128 Packets: 13022 Packets: 13555 Packets: 13444 Packets: 13948 Packets: 13838 Packets: 14258 Packets: 14371 Packets: 14513 Packets: 14418 Packets: 14514 Received signal: 15
+sim     | msg="15", +13.046583681s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 14514
+sim     | Packets captured: 14418
+sim     | Packets received/dropped on interface 'eth1': 14514/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets received/dropped on interface 'eth0': 14418/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     |    0# 
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:10:30,241 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:10:30,241 Using the client's key log file.
+2026-10-22 00:10:30,254 
+2026-10-22 00:10:30,258 Using the client's key log file.
+2026-10-22 00:10:30,258 Using the client's key log file.
+2026-10-22 00:10:30,272 
+2026-10-22 00:10:30,275 Using the client's key log file.
+2026-10-22 00:10:30,902 Wrong version. Expected 0x1, got ['0x6b3343cf']

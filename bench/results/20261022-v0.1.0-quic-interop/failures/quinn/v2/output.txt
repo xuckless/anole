@@ -1,0 +1,75 @@
+2026-10-22 01:02:33,876 Generated random file: zestful-silver-sultan of size: 1024
+2026-10-22 01:02:33,876 Requests: ['https://server4:443/zestful-silver-sultan']
+2026-10-22 01:02:33,902 
+2026-10-22 01:02:33,902 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_y8wdps56/ TESTCASE_SERVER=v2 TESTCASE_CLIENT=v2 CLIENT_WWW=/tmp/client_www_ea_u0k3l/ CLIENT_DOWNLOADS=/tmp/client_download_woh3yq30/ SERVER_WWW=/tmp/server_www_buss86rw/ SERVER_DOWNLOADS=/tmp/server_download_o62i5wt7/ SERVER_LOGS=/tmp/logs_server_063fhir5 CLIENT_LOGS=/tmp/logs_client_8072qc8u SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=stammw/quinn-interop:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/zestful-silver-sultan" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 01:02:39,372  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container server Recreated 
+ Container client Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+ Container client Started 
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | Executing client
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+ Container server Started 
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 500.714974ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 5 Packets: 7 Packets: 11 Packets: 14 Packets: 13 Packets: 32 Packets: 15 Packets: 18 Packets: 33 Packets: 43 Packets: 27 Packets: 31 Packets: 47 Packets: 50 Packets: 33 Packets: 35 Packets: 55 Packets: 36 Packets: 56 Packets: 57 Packets: 58 Packets: 37 Packets: 59 Packets: 60 Packets: 38 Packets: 72 Packets: 52 Packets: 53 Packets: 73 Received signal: 15
+sim     | msg="15", +4.281584455s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     |    0# Packets captured: 53
+sim     | Packets captured: 73
+sim     | Packets received/dropped on interface 'eth1': 53/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets received/dropped on interface 'eth0': 73/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 01:02:39,541 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 01:02:39,542 Using the client's key log file.
+2026-10-22 01:02:39,547 
+2026-10-22 01:02:39,547 Using the client's key log file.
+2026-10-22 01:02:39,547 Using the client's key log file.
+2026-10-22 01:02:39,551 
+2026-10-22 01:02:39,551 Using the client's key log file.
+2026-10-22 01:02:40,134 Wrong version in server Initial. Expected 0x6b3343cf, got {'0x1'}

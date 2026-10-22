@@ -1,0 +1,90 @@
+2026-10-21 23:56:50,084 Generated random file: wet-bored-giratina of size: 10485760
+2026-10-21 23:56:50,085 Requests: ['https://server4:443/wet-bored-giratina']
+2026-10-21 23:56:50,109 
+2026-10-21 23:56:50,109 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_2nskjfoh/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=transfer CLIENT_WWW=/tmp/client_www_5766tzk6/ CLIENT_DOWNLOADS=/tmp/client_download_6e242kbr/ SERVER_WWW=/tmp/server_www_xo7njg90/ SERVER_DOWNLOADS=/tmp/server_download_b3gdfjq1/ SERVER_LOGS=/tmp/logs_server_xy_34ira CLIENT_LOGS=/tmp/logs_client_t1fk5qa0 SCENARIO="rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s" CLIENT=peterdoornbosch/kwik_n_flupke-interop SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/wet-bored-giratina" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-21 23:57:23,585  Container sim Recreate 
+ Container sim Recreated 
+ Container server Recreate 
+ Container client Recreate 
+ Container server Recreated 
+ Container client Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container server Starting 
+ Container client Starting 
+sim  | waiting 10s for server:443
+server  | Setting up routes...
+ Container server Started 
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+client  | Setting up routes...
+ Container client Started 
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | Certificate was added to keystore
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+sim     | server:443 is available after 501.554461ms
+sim     | Using scenario: rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s
+sim     | Capturing on 'eth0'
+sim     | Capturing on 'eth1'
+sim     | File: /logs/trace_node_left.pcap
+sim     | File: /logs/trace_node_right.pcap
+sim     | 0s: first rebind in 1s, frequency 5s
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Writing keys to /logs/keys.log
+sim     | Packets: 1 Packets: 1 Packets: 6 Packets: 6 Packets: 10 Packets: 11 Packets: 13 Packets: 12 1s:  rebinding: 193.167.0.100:56849 -> 193.167.0.100:57607
+sim     | 1.10987s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | 1.11243s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | Packets: 33 Packets: 20 1.41481s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | 1.41743s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | Packets: 31 Packets: 42 Packets: 54 Packets: 41 Packets: 57 Packets: 45 2.02209s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | 2.02464s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | Packets: 62 Packets: 51 Packets: 53 Packets: 63 Packets: 64 Packets: 55 Packets: 66 Packets: 56 Packets: 67 Packets: 57 3.23467s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | 3.23715s: unknown binding for destination 193.167.0.100:56849, dropping packet
+sim     | Packets: 58 Packets: 59 Packets: 68 Packets: 60 Packets: 69 Packets: 61 Packets: 72 Packets: 64 Packets: 74 Packets: 65 Packets: 66 Packets: 75 Packets: 67 Packets: 79 Packets: 70 6s:  rebinding: 193.167.0.100:57607 -> 193.167.0.100:59022
+sim     | Packets: 71 Packets: 80 Packets: 81 Packets: 72 Packets: 82 Packets: 73 Packets: 83 Packets: 91 Packets: 86 Packets: 93 Packets: 97 Packets: 88 Packets: 98 11s:  rebinding: 193.167.0.100:59022 -> 193.167.0.100:18108
+sim     | Packets: 99 Packets: 89 Packets: 100 Packets: 90 Packets: 91 Packets: 101 Packets: 92 Packets: 102 16s:  rebinding: 193.167.0.100:18108 -> 193.167.0.100:39968
+sim     | Packets: 103 Packets: 93 21s:  rebinding: 193.167.0.100:39968 -> 193.167.0.100:745
+sim     | 26s:  rebinding: 193.167.0.100:745 -> 193.167.0.100:38910
+sim     | Packets: 104 Packets: 105 Packets: 94 Packets: 106 Packets: 95 Packets: 96 31s:  rebinding: 193.167.0.100:38910 -> 193.167.0.100:64331
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container server Stopping 
+ Container client Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 107 Packets: 97 Received signal: 15
+sim     | msg="15", +32.237632028s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-21 23:57:23,763 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-21 23:57:23,763 Using the client's key log file.
+2026-10-21 23:57:23,768 
+2026-10-21 23:57:23,768 Using the client's key log file.
+2026-10-21 23:57:23,768 Using the client's key log file.
+2026-10-21 23:57:23,773 
+2026-10-21 23:57:23,773 Using the client's key log file.
+2026-10-21 23:57:24,024 File size of /tmp/client_download_6e242kbr/wet-bored-giratina doesn't match. Original: 10485760 bytes, downloaded: 0 bytes.
+2026-10-21 23:57:24,024 Using the client's key log file.
+2026-10-21 23:57:24,284 File size of /tmp/client_download_6e242kbr/wet-bored-giratina doesn't match. Original: 10485760 bytes, downloaded: 0 bytes.

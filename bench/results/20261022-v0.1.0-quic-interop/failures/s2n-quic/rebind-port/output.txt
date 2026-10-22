@@ -1,0 +1,143 @@
+2026-10-22 01:06:31,492 Generated random file: gigantic-temperate-lugia of size: 10485760
+2026-10-22 01:06:31,492 Requests: ['https://server4:443/gigantic-temperate-lugia']
+2026-10-22 01:06:31,517 
+2026-10-22 01:06:31,517 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_r5c2o6ti/ TESTCASE_SERVER=transfer TESTCASE_CLIENT=transfer CLIENT_WWW=/tmp/client_www_l10p1wal/ CLIENT_DOWNLOADS=/tmp/client_download_py3fl_yj/ SERVER_WWW=/tmp/server_www_7q4rw4ez/ SERVER_DOWNLOADS=/tmp/server_download_6majv7fp/ SERVER_LOGS=/tmp/logs_server_ndwyepq6 CLIENT_LOGS=/tmp/logs_client_46aqquga SCENARIO="rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s" CLIENT=ghcr.io/aws/s2n-quic/s2n-quic-qns:latest SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/gigantic-temperate-lugia" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 01:06:43,793  Container sim Recreate 
+ Container sim Recreated 
+ Container client Recreate 
+ Container server Recreate 
+ Container client Recreated 
+ Container server Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+ Container client Started 
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksum-ip-generic: off
+client  | tx-tcp-segmentation: off [not requested]
+client  | tx-tcp-ecn-segmentation: off [not requested]
+client  | tx-tcp-mangleid-segmentation: off [not requested]
+client  | tx-tcp6-segmentation: off [not requested]
+client  | tx-udp-segmentation: off [not requested]
+client  | tx-checksum-sctp: off
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | x86_64
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+ Container server Started 
+server  | Setting up routes...
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 500.680977ms
+sim     | Using scenario: rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+sim     | 0s: first rebind in 1s, frequency 5s
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | connecting to server4 at 193.167.100.100:443
+client  | GET /gigantic-temperate-lugia
+sim     | Packets: 1 Packets: 1 Packets: 3 Packets: 5 Packets: 11 Packets: 9 Packets: 32 Packets: 51 1s:  rebinding: 193.167.0.100:44364 -> 193.167.0.100:57607
+sim     | 1.0002s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00138s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00256s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00374s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00492s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.0061s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00728s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00846s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.00964s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01082s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.012s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01318s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01435s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01553s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01559s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01677s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01795s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.01913s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02031s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02149s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02267s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02385s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02503s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02621s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02739s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02857s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.02974s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.0298s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.03098s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.03216s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.03334s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.09705s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 1.09865s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | Packets: 366 Packets: 256 Packets: 521 Packets: 407 Packets: 680 Packets: 552 Packets: 719 Packets: 841 2.12442s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | 2.1254s: unknown binding for destination 193.167.0.100:44364, dropping packet
+sim     | Packets: 901 Packets: 1031 Packets: 1238 Packets: 1115 Packets: 1347 Packets: 1479 Packets: 1581 Packets: 1712 Packets: 1949 Packets: 1818 Packets: 2194 Packets: 2055 Packets: 2431 Packets: 2291 Packets: 2669 Packets: 2529 Packets: 2764 Packets: 2912 Packets: 3003 Packets: 3134 Packets: 3371 Packets: 3242 Packets: 3479 Packets: 3615 Packets: 3852 Packets: 3716 Packets: 4093 Packets: 3953 Packets: 4189 Packets: 4337 Packets: 4427 Packets: 4574 6s:  rebinding: 193.167.0.100:57607 -> 193.167.0.100:59022
+sim     | 6.00003s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00121s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00239s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00357s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00475s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00593s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00711s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00829s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.00946s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01064s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01182s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.013s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01418s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01536s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01654s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.01772s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.0189s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.02008s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.08426s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 6.0858s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | Packets: 4801 Packets: 4667 Packets: 4931 Packets: 4795 Packets: 5058 Packets: 4913 Packets: 5197 Packets: 5053 7.112s: unknown binding for destination 193.167.0.100:57607, dropping packet
+sim     | 7.11298s: unknown binding for destination 193.167.0.100:57607, dropping packet
+client  | Request /gigantic-temperate-lugia completed successfully
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+sim     | Packets: 5368 Packets: 5220 Packets: 5417 Packets: 5573 Packets: 5800 Packets: 5641 Packets: 6040 Packets: 5880 Packets: 6279 Packets: 6118 Packets: 6355 Packets: 6528 Packets: 6593 Packets: 6765 Packets: 6991 Packets: 6834 Packets: 7071 Packets: 7235 Packets: 7306 Packets: 7468 Packets: 7704 Packets: 7543 Packets: 7779 Packets: 7953 Packets: 8015 Packets: 8187 Packets: 8252 Packets: 8425 Packets: 8622 Packets: 8480 Packets: 8623 Packets: 8481 11s:  rebinding: 193.167.0.100:59022 -> 193.167.0.100:18108
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Received signal: 15
+sim     | msg="15", +11.000000000s -1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+sim     | Packets captured: 8623
+sim     |    0# Packets captured: 8481
+sim     | Packets received/dropped on interface 'eth1': 8623/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets received/dropped on interface 'eth0': 8481/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 01:06:43,994 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 01:06:43,995 Using the client's key log file.
+2026-10-22 01:06:44,009 
+2026-10-22 01:06:44,012 Using the client's key log file.
+2026-10-22 01:06:44,012 Using the client's key log file.
+2026-10-22 01:06:44,025 
+2026-10-22 01:06:44,028 Using the client's key log file.
+2026-10-22 01:06:44,535 Check of downloaded files succeeded.
+2026-10-22 01:06:44,535 Using the client's key log file.
+2026-10-22 01:06:45,043 Check of downloaded files succeeded.
+2026-10-22 01:06:59,190 Server saw these paths used: {(('193.167.100.100', 443), ('193.167.0.100', 44364)), (('193.167.100.100', 443), ('193.167.0.100', 57607)), (('193.167.100.100', 443), ('193.167.0.100', 59022))}
+2026-10-22 01:07:00,073 PATH_CHALLENGE without a PATH_RESPONSE: ['6e:ba:ad:c8:36:32:d8:f1']

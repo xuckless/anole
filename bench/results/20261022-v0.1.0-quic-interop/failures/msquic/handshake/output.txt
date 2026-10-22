@@ -1,0 +1,89 @@
+2026-10-22 00:22:32,243 Generated random file: thick-warm-zapdos of size: 1024
+2026-10-22 00:22:32,244 Requests: ['https://server4:443/thick-warm-zapdos']
+2026-10-22 00:22:32,267 
+2026-10-22 00:22:32,268 Command: WAITFORSERVER=server:443 CERTS=/tmp/certs_8xg871aq/ TESTCASE_SERVER=handshake TESTCASE_CLIENT=handshake CLIENT_WWW=/tmp/client_www_2lsst2zu/ CLIENT_DOWNLOADS=/tmp/client_download_9o7_lc1e/ SERVER_WWW=/tmp/server_www__rouwit_/ SERVER_DOWNLOADS=/tmp/server_download__7mynmxr/ SERVER_LOGS=/tmp/logs_server_mfk9o3im CLIENT_LOGS=/tmp/logs_client_i4kp8_5l SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" CLIENT=ghcr.io/microsoft/msquic/qns:main SERVER=anole-interop:latest REQUESTS_CLIENT="https://server4:443/thick-warm-zapdos" REQUESTS_SERVER=""  docker compose --env-file empty.env up --abort-on-container-exit --timeout 10 sim client server 
+2026-10-22 00:22:39,314  Container sim Recreate 
+ Container sim Recreated 
+ Container server Recreate 
+ Container client Recreate 
+ Container server Recreated 
+ Container client Recreated 
+Attaching to client, server, sim
+ Container sim Starting 
+ Container sim Started 
+ Container client Starting 
+ Container server Starting 
+sim  | waiting 10s for server:443
+ Container client Started 
+client  | Setting up routes...
+client  | Actual changes:
+client  | tx-checksumming: off
+client  | 	tx-checksum-ip-generic: off
+client  | 	tx-checksum-sctp: off
+client  | tcp-segmentation-offload: off
+client  | 	tx-tcp-segmentation: off [requested on]
+client  | 	tx-tcp-ecn-segmentation: off [requested on]
+client  | 	tx-tcp-mangleid-segmentation: off [requested on]
+client  | 	tx-tcp6-segmentation: off [requested on]
+client  | tx-udp-segmentation: off [requested on]
+client  | Endpoint's IPv4 address is 193.167.0.100
+client  | Endpoint's IPv6 address is fd00:cafe:cafe::100
+client  | wait-for-it.sh: waiting 30 seconds for sim:57832
+server  | Setting up routes...
+ Container server Started 
+server  | Actual changes:
+server  | tx-checksum-ip-generic: off
+server  | tx-tcp-segmentation: off [not requested]
+server  | tx-tcp-ecn-segmentation: off [not requested]
+server  | tx-tcp-mangleid-segmentation: off [not requested]
+server  | tx-tcp6-segmentation: off [not requested]
+server  | tx-udp-segmentation: off [not requested]
+server  | tx-checksum-sctp: off
+server  | Endpoint's IPv4 address is 193.167.100.100
+server  | Endpoint's IPv6 address is fd00:cafe:cafe:100::100
+sim     | server:443 is available after 501.495934ms
+sim     | Using scenario: simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25
+sim     | Capturing on 'eth1'
+sim     | Capturing on 'eth0'
+sim     | File: /logs/trace_node_right.pcap
+sim     | File: /logs/trace_node_left.pcap
+client  | wait-for-it.sh: sim:57832 is available after 1 seconds
+client  | Connecting to server4
+client  | Client params (before files):-test:H -sslkeylogfile:/logs/keys.log 
+client  | Sending request: GET /thick-warm-zapdos
+client  | 
+client  |       TARGET  VHDCRZSQUMBGA2E    VERSION   ALPN
+client  |  ============================================
+client  |      server4  ---------------
+client  | 
+client  | Total execution time: 0.070s
+client  | 
+client  | Client complete.
+client  | Script complete.
+client exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container client Stopping 
+ Container server Stopping 
+ Container client Stopped 
+ Container server Stopped 
+ Container sim Stopping 
+server exited with code 0
+sim     | Packets: 1 Packets: 1 Packets: 3 Packets: 5 Packets: 7 Packets: 9 Packets: 45 Packets: 26 Packets: 46 Packets: 35 Packets: 53 Packets: 39 Packets: 58 Packets: 43 Packets: 48 Packets: 63 Packets: 64 Packets: 50 Packets: 65 Packets: 51 Packets: 66 Packets: 52 Packets: 67 Packets: 69 Packets: 54 Packets: 71 Packets: 55 Packets: 72 Packets: 56 Packets: 73 Packets: 74 Packets: 57 Received signal: 15
+sim     | Packets captured: 57
+sim     | Packets captured: 74
+sim     | msg="15", Packets received/dropped on interface 'eth0': 74/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | Packets received/dropped on interface 'eth1': 57/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)
+sim     | +5.910285455s 1 file=/ns3/scratch/helper/quic-network-simulator-helper.cc, line=24
+sim     | NS_FATAL, terminating
+ Container sim Stopped 
+sim exited with code 143
+
+2026-10-22 00:22:39,498 Container exits: b'\x1b[Kclient exited with code 0' | b'\x1b[Kserver exited with code 0' | b'\x1b[Ksim exited with code 143'
+2026-10-22 00:22:39,498 Using the client's key log file.
+2026-10-22 00:22:39,503 
+2026-10-22 00:22:39,503 Using the client's key log file.
+2026-10-22 00:22:39,503 Using the client's key log file.
+2026-10-22 00:22:39,507 
+2026-10-22 00:22:39,507 Using the client's key log file.
+2026-10-22 00:22:39,507 Using selector: EpollSelector
+2026-10-22 00:22:39,621 Missing files: ['thick-warm-zapdos']
