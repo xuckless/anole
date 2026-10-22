@@ -827,10 +827,10 @@ pub const Client = struct {
         var j = job;
         const J = @TypeOf(j);
         const observed = self.observer.start(&ctx);
-        const deadline: ?dusty.Deadline = if (tx) |t|
-            t.deadline
-        else if (timeout) |t|
+        const deadline: ?dusty.Deadline = if (timeout) |t|
             .init(ctx.io, .{ .duration = .{ .raw = t, .clock = .awake } })
+        else if (tx) |t|
+            t.deadline
         else
             null;
         const result = self.guarded(&ctx, deadline, J.run, .{ &j, self, &ctx, tx, sql });
@@ -979,7 +979,19 @@ pub const Client = struct {
 
 /// Why a call outside a transaction that left one open failed.
 const left_open = "the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: " ++
-    "separate calls do not keep a connection; use begin() or transaction() (C ABI: one call with the whole transaction, until the transaction API)";
+    "separate calls do not keep a connection; use begin() or transaction() (C ABI: anole_db_begin)";
+
+/// A connection given back inside a transaction by `Rows.deinit` or
+/// `Conn.release`: rolled back (cancel-protected), and logged.
+fn rollbackLeftOpen(io: std.Io, conn: *pg.Conn, comptime what: []const u8) void {
+    if (conn._state != .transaction) return;
+    log.err(what, .{});
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+    conn.rollback() catch {
+        conn._state = .fail;
+    };
+}
 
 /// Asks the server to stop what `conn` runs (CancelRequest on a
 /// connection of its own), within a second, whatever cancels the caller:
@@ -1147,35 +1159,49 @@ pub const Tx = struct {
     deadline: ?dusty.Deadline,
     state: enum { open, done, broken } = .open,
 
+    /// The verbs with per-call options: `timeout` (bounding that statement
+    /// instead of the transaction's deadline) and `prepare` apply; a
+    /// `coalesce` or `cache` fails the call (`error.Database`, `lastError`:
+    /// "coalesce and cache are not for calls inside a transaction").
+    pub fn with(self: *Tx, opts: db.QueryOptions) TxQuery {
+        return .{ .tx = self, .opts = opts };
+    }
+
     /// `Client.exec` on the transaction's connection.
     pub fn exec(self: *Tx, c: anytype, sql: []const u8, args: anytype) Error!u64 {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Exec(@TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).exec(c, sql, args);
     }
 
     /// `Client.one` on the transaction's connection.
     pub fn one(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).one(T, c, sql, args);
     }
 
     /// `Client.optional` on the transaction's connection.
     pub fn optional(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).optional(T, c, sql, args);
     }
 
     /// `Client.all` on the transaction's connection.
     pub fn all(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).all(T, c, sql, args);
     }
 
     /// The rows one at a time; finish with them (`deinit`) before the
     /// next call on the transaction.
     pub fn iterate(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).iterate(T, c, sql, args);
+    }
+
+    /// `Query.table` on the transaction's connection: rows whose columns are
+    /// known at run time (the C ABI's `anole_db_tx_query`).
+    pub fn table(self: *Tx, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
+        return self.with(.{}).table(c, sql, values);
+    }
+
+    /// `Query.run` on the transaction's connection.
+    pub fn run(self: *Tx, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        return self.with(.{}).run(c, sql, values);
     }
 
     /// Commits. A transaction that already failed (a statement of it
@@ -1236,6 +1262,58 @@ pub const Tx = struct {
     };
 };
 
+/// `Tx.with`: the transaction's verbs with options.
+pub const TxQuery = struct {
+    tx: *Tx,
+    opts: db.QueryOptions,
+
+    /// The checks every call makes: the transaction is usable, and the
+    /// options are ones a call inside a transaction can take.
+    fn ready(self: TxQuery, c: anytype) Error!?Duration {
+        try self.tx.usable(c);
+        if (self.opts.coalesce or self.opts.cache != null) {
+            var ctx = erase(c);
+            return ctx.failf(self.tx.db.errors, .other, "coalesce and cache are not for calls inside a transaction", .{});
+        }
+        return internal.callTimeout(self.opts.timeout, null);
+    }
+
+    pub fn exec(self: TxQuery, c: anytype, sql: []const u8, args: anytype) Error!u64 {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn one(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn optional(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn all(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn iterate(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn table(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, TableJob{ .values = values, .prepare = self.opts.prepare });
+    }
+
+    pub fn run(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+    }
+};
+
 /// A connection of pg.zig's own (`Client.acquire`).
 pub const Conn = struct {
     db: *Client,
@@ -1248,6 +1326,7 @@ pub const Conn = struct {
     /// canceled, and the connection closed.
     pub fn release(self: *const Conn) void {
         if (self.lease.conn._state == .query) stopBackend(self.io, self.lease.conn);
+        rollbackLeftOpen(self.io, self.lease.conn, "acquire(): the connection was given back inside a transaction; rolled back");
         self.db.give(self.lease);
     }
 };
@@ -1275,6 +1354,7 @@ pub fn Rows(comptime T: type) type {
                 return self.db.failed(&self.ctx, self.leased(), err, self.tx);
             } orelse {
                 self.done = true;
+                if (self.lease) |l| try self.db.leftOpen(&self.ctx, l);
                 return null;
             };
             return decodeRow(T, &row, &self.columns, &self.ctx, self.db.errors) catch |err| {
@@ -1287,7 +1367,10 @@ pub fn Rows(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             self.finish();
             self.result.deinit();
-            if (self.lease) |l| self.db.give(l);
+            if (self.lease) |l| {
+                rollbackLeftOpen(self.ctx.io, self.conn, "the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back");
+                self.db.give(l);
+            }
             self.* = undefined;
         }
 
