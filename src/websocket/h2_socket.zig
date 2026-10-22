@@ -173,6 +173,8 @@ pub const H2Socket = struct {
             .close => return self.close(.normal, data),
             else => return error.InvalidOpcode,
         };
+        // The codec asserts these rather than failing.
+        if (opcode.isControl() and (compressed or data.len > codec.max_control_payload_len)) return error.LargeControlFrame;
         try self.writeFrameOpts(.{ .opcode = opcode, .compressed = compressed }, data, self.sendFlush());
     }
 
@@ -193,13 +195,12 @@ pub const H2Socket = struct {
     }
 
     fn sendClose(self: *H2Socket, code: CloseCode, reason: []const u8) !void {
-        if (self.closed) return;
         var payload: [codec.max_control_payload_len]u8 = undefined;
         std.mem.writeInt(u16, payload[0..2], @backingInt(code), .big);
         const n = @min(reason.len, payload.len - 2);
         @memcpy(payload[2..][0..n], reason[0..n]);
+        // Once: `writeFrameOpts` checks and sets `closed` under its lock.
         try self.writeFrame(.close, payload[0 .. 2 + n]);
-        self.closed = true;
     }
 
     /// A protocol failure: close with `code` if sending is still open.
@@ -222,7 +223,11 @@ pub const H2Socket = struct {
     fn writeFrameOpts(self: *H2Socket, opts: codec.WriteFrameOptions, payload: []const u8, after: Flush) !void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
-        if (self.closed) return error.ConnectionClosed;
+        // A second close is nothing; anything after a close fails.
+        if (self.closed) return if (opts.opcode == .close) {} else error.ConnectionClosed;
+        if (opts.opcode == .close) self.closed = true;
+        // A frame cut short leaves the peer unable to find the next one.
+        errdefer self.closed = true;
         const w = &self.out.interface;
         codec.writeFrame(w, payload, opts) catch return self.out.err orelse error.WriteFailed;
         if (after == .batch and self.batch.hold(self.io, flushHeld)) return;

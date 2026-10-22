@@ -25,6 +25,11 @@ breaking changes are listed anyway.
   is not thread-safe over HTTP/1.1, so a broadcast compressing for a socket
   from another executor cannot corrupt it. The docs now say that
   `req.arena` and `call.arena` are not thread-safe.
+- WebSocket over HTTP/2 and HTTP/3: RSV1 on a control frame or a
+  continuation is refused (close 1002) when permessage-deflate is in use; a
+  ping or pong over 125 bytes from the handler fails with
+  `error.LargeControlFrame`; a close goes out once even when two tasks
+  close at the same time, and a frame cut short ends sending.
 
 ### C ABI (ABI 0.1)
 

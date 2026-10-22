@@ -162,3 +162,50 @@ test "H2Socket: a message, a ping and a close, whole and a byte at a time" {
         try std.testing.expectEqualStrings("\x8a\x02hi\x88\x02\x03\xe8", t.out);
     }
 }
+
+test "H2Socket: RSV1 only on a compressed message's first frame, never on a control frame or a continuation" {
+    if (comptime !features.compression) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{
+        // A ping with RSV1.
+        "\xc9\x80\x00\x00\x00\x00",
+        // A text message in pieces, RSV1 on its continuation.
+        "\x41\x81\x00\x00\x00\x00a\xc0\x81\x00\x00\x00\x00b",
+    }) |frames| {
+        const t = try run(arena, frames, frames.len, H2Socket.buffer_len, true);
+        try std.testing.expectEqual(error.ReservedRsvBit, t.end);
+        // Close 1002.
+        try std.testing.expectEqualStrings("\x88\x02\x03\xea", t.out);
+    }
+}
+
+test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sock = try arena.create(H2Socket);
+    const out = try arena.alloc(u8, 1024);
+    sock.* = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .body = undefined,
+        .out = .{ .res = undefined, .interface = .fixed(out) },
+        .in_buf = undefined,
+        .out_buf = undefined,
+        .frames = .init(.{}),
+        .max_message_size = max_message_size,
+    };
+    defer sock.batch.deinit(std.testing.io);
+    const big: [126]u8 = @splat('p');
+    try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.ping, &big, false));
+    try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.pong, &big, false));
+    try std.testing.expectError(error.LargeControlFrame, sock.ping(&big));
+    try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.ping, "x", true));
+    // A close goes out once, however often it is asked for.
+    try sock.close(.normal, "");
+    try sock.close(.going_away, "");
+    try std.testing.expectEqualStrings("\x88\x02\x03\xe8", sock.out.interface.buffered());
+    try std.testing.expectError(error.ConnectionClosed, sock.sendMessage(.text, "late", false));
+}
