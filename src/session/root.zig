@@ -479,7 +479,7 @@ pub const Middleware = struct {
             }
             // A new id, which only a cookie can hand out: none is stored
             // once the response has started.
-            if (res._headers_written) return error.HeadersAlreadySent;
+            if (res.headersSent()) return error.HeadersAlreadySent;
             const session_id = try newId(req.arena, req.io);
             try store.save(session_id, try serialize(req.arena, &req.session), ttl);
             return res.setCookie(self.config.cookie_name, session_id, opts);

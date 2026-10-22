@@ -948,6 +948,12 @@ pub const Response = struct {
         return error.ResponseAborted;
     }
 
+    /// Whether the head has gone out, so the status and headers can no longer
+    /// change (a stream, an event stream or a file has started).
+    pub fn headersSent(self: *const Response) bool {
+        return self._headers_written;
+    }
+
     /// Whether the peer went away, so a failure is not the handler's fault.
     pub fn peerGone(self: *Response) bool {
         if (self._sink) |sink| return sink.peerGone();

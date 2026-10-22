@@ -67,7 +67,7 @@ pub fn excluded(req: *const dusty.Request, list: []const []const u8) bool {
 /// the 101, so a WebSocket reads the same on both. An app's own
 /// `uncaughtError` may still choose another.
 pub fn statusOf(req: *const dusty.Request, res: *const dusty.Response, result: anytype) u16 {
-    if (result) |_| {} else |err| if (!res._headers_written) {
+    if (result) |_| {} else |err| if (!res.headersSent()) {
         const status = dusty.errorStatus(err) orelse return 500;
         return @intCast(@backingInt(status));
     }

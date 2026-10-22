@@ -122,7 +122,7 @@ pub fn Chain(comptime Ctx: type) type {
                     // The connection is asked, not the error: a handler
                     // can return an `EndOfStream` of its own.
                     if (self.res.peerGone()) return err;
-                    if (self.res._headers_written) {
+                    if (self.res.headersSent()) {
                         // The response already started (e.g. streaming/chunked
                         // body or a WebSocket upgrade), so headers were sent
                         // with framing that doesn't account for an error body.
@@ -175,7 +175,7 @@ pub fn Chain(comptime Ctx: type) type {
         }
 
         fn handleMethodNotAllowed(self: *Self, allow: []const u8) !void {
-            if (!self.res._headers_written) self.res.resetBody() catch {};
+            if (!self.res.headersSent()) self.res.resetBody() catch {};
             try self.res.header("Allow", allow);
             if (comptime Ctx != void and @hasDecl(Ctx, "methodNotAllowed")) {
                 try self.ctx.methodNotAllowed(self.req, self.res);
@@ -190,7 +190,7 @@ pub fn Chain(comptime Ctx: type) type {
             // of the 404. Unlike the error path, nothing has checked the
             // headers yet: a middleware that started streaming has already
             // committed the framing, so there is nothing to replace.
-            if (!self.res._headers_written) self.res.resetBody() catch {};
+            if (!self.res.headersSent()) self.res.resetBody() catch {};
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
                 try self.ctx.notFound(self.req, self.res);
             } else {
