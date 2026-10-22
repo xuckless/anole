@@ -109,8 +109,7 @@ Fixes from the QUIC interop runner's matrix (Anole's server against all
   `ClientConnection.quicVersion()` reports the version in use.
 - Interop runner endpoint only (`hq_interop_root`): the server takes
   "hq-interop" or "h3" in the order the client lists them (msquic offers
-  hq-interop first and speaks HTTP/0.9), and allows 100 concurrent
-  streams rather than 1000 (quiche's client ran out of file descriptors).
+  hq-interop first and speaks HTTP/0.9).
 
 ## 0.1.1 (2026-10-22)
 
