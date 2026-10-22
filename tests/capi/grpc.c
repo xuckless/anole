@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,22 @@ static anole_str S(const char *s) {
   return r;
 }
 
+/* A hang fails the run instead of holding CI until the job's timeout: the
+   last "ok" line printed (stdout is line-buffered) names the last step that
+   passed. abort() leaves a core where cores are kept. */
+static void on_watchdog(int sig) {
+  (void)sig;
+  const char *msg = "FAIL: still running after the watchdog's limit (hung); the step after the last \"ok\" line hangs\n";
+  (void)!write(2, msg, strlen(msg));
+  abort();
+}
+
+static void start_watchdog(unsigned seconds) {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  signal(SIGALRM, on_watchdog);
+  alarm(seconds);
+}
+
 static void sleep_ms(int ms) {
   struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
   nanosleep(&ts, NULL);
@@ -63,7 +80,9 @@ typedef struct {
   int kind;
   char acc[4096]; /* client streaming: the messages so far */
   size_t acc_len;
-  int left; /* "busy" server streams: messages still to send */
+  int busy;          /* a "busy" server stream: pump_busy sends it */
+  int left;          /* messages still to send */
+  size_t last_size;  /* the last message's size, when not 1 KiB */
   int index;
 } call_state;
 
@@ -109,11 +128,13 @@ static int is(anole_str s, const char *lit) { return s.len == strlen(lit) && mem
 
 /* Sends the rest of a "busy" stream until ANOLE_BUSY, or finishes it. */
 static void pump_busy(call_state *st) {
-  static char kb[1024];
+  static char kb[1024], big[5000];
   memset(kb, 'b', sizeof kb);
+  memset(big, 'B', sizeof big);
   while (st->left > 0) {
     st->left--;
-    anole_status r = anole_grpc_send(st->call, kb, sizeof kb, 0);
+    int last_big = st->left == 0 && st->last_size == sizeof big;
+    anole_status r = anole_grpc_send(st->call, last_big ? big : kb, last_big ? sizeof big : sizeof kb, 0);
     CHECK(r == ANOLE_OK || r == ANOLE_BUSY);
     if (r == ANOLE_BUSY) {
       atomic_fetch_add(&busies, 1);
@@ -181,7 +202,17 @@ static void on_call(const anole_grpc_call_event *ev) {
       CHECK(ev->kind == ANOLE_GRPC_SERVER_STREAMING);
       if (is(msg, "busy")) {
         call_state *st = state_of(c, 1);
+        st->busy = 1;
         st->left = 64;
+        pump_busy(st);
+        return;
+      }
+      if (is(msg, "busylast")) {
+        /* The last message is past the high-water mark by itself. */
+        call_state *st = state_of(c, 1);
+        st->busy = 1;
+        st->left = 2;
+        st->last_size = 5000;
         pump_busy(st);
         return;
       }
@@ -268,7 +299,9 @@ static void *consumer_main(void *arg) {
         case ANOLE_EV_WRITABLE: {
           atomic_fetch_add(&writables, 1);
           call_state *st = state_of(ev->handle, 0);
-          if (st && st->left > 0) pump_busy(st);
+          /* Even with nothing left to send: the stream ends here when its
+             last message was the one past the high-water mark. */
+          if (st && st->busy) pump_busy(st);
           break;
         }
         case ANOLE_EV_ABORT:
@@ -298,6 +331,9 @@ static int dial(void) {
   CHECK(connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+  /* An answer that never comes fails the run (read_all) rather than hang it. */
+  struct timeval tv = {20, 0};
+  CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0);
   return fd;
 }
 
@@ -307,7 +343,7 @@ typedef struct {
   unsigned char *body;
   size_t len, cap;
   /* The response's frames: messages, and the trailer block. */
-  char messages[128][1100];
+  char messages[128][5100];
   size_t message_len[128];
   int nmessages;
   char trailers[1024];
@@ -324,6 +360,7 @@ static size_t read_all(int fd, unsigned char **out) {
       CHECK(b);
     }
     ssize_t k = read(fd, b + len, cap - len);
+    if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) CHECK(!"no answer within 20 s");
     if (k <= 0) break;
     len += (size_t)k;
   }
@@ -499,6 +536,7 @@ static void h2_call_and_hold(int fd) {
 }
 
 int main(void) {
+  start_watchdog(300);
   CHECK(anole_has_feature(S("grpc")) == 1);
   const char *json =
       "{\"executors\": 2, \"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}],"
@@ -567,6 +605,12 @@ int main(void) {
     const char *w[] = {"wait"};
     call("ServerStream", w, 1, NULL, r);
     CHECK(r->nmessages == 64 && has_trailer(r, "grpc-status:0"));
+    /* ANOLE_BUSY on the last message: the ANOLE_EV_WRITABLE after it is
+       when the consumer ends the stream. */
+    const char *l[] = {"busylast"};
+    call("ServerStream", l, 1, NULL, r);
+    CHECK(r->nmessages == 2 && r->message_len[0] == 1024 && r->message_len[1] == 5000);
+    CHECK(has_trailer(r, "grpc-status:0"));
     printf("ok backpressure\n");
   }
   /* Client streaming: more messages than read_ahead (2). */
