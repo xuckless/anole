@@ -150,7 +150,7 @@ pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// What its handles are (`Handle.Kind`): a request, or a gRPC call.
     /// Set by the executor while the slot is free.
-    kind: std.atomic.Value(u8) = .init(@intFromEnum(Handle.Kind.request)),
+    kind: std.atomic.Value(u8) = .init(@backingInt(Handle.Kind.request)),
     /// What a waiting request's task waits on (an answer, the deadline,
     /// stream data), and what an attached stream task waits on.
     event: std.Io.Event = .unset,
@@ -420,8 +420,8 @@ pub const Exec = struct {
         s.orphan = false;
         s.body_error = null;
         s.claims = "";
-        if (comptime features.grpc) if (s.kind.load(.monotonic) == @intFromEnum(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
-        s.kind.store(@intFromEnum(Handle.Kind.request), .monotonic);
+        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
+        s.kind.store(@backingInt(Handle.Kind.request), .monotonic);
         _ = x.engine.inflight.fetchSub(1, .monotonic);
         // 0 is skipped so that no handle is ever 0.
         const next = nextGen(gen);
@@ -496,7 +496,7 @@ pub const Exec = struct {
     }
 
     pub fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
-        const kind: Handle.Kind = @enumFromInt(x.slots[i].kind.load(.monotonic));
+        const kind: Handle.Kind = @fromBackingInt(@intCast(x.slots[i].kind.load(.monotonic)));
         return Handle.encode(.{ .gen = @intCast(gen), .kind = kind, .slot = @intCast(i), .exec = x.index });
     }
 };
@@ -1699,7 +1699,7 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
                 if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, genOf(w)));
                 x.release(si);
             } else if (s.detached != null) {
-                if (comptime features.grpc) if (s.kind.load(.monotonic) == @intFromEnum(Handle.Kind.grpc_call)) {
+                if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
                     grpc.finishDetached(x, si);
                     continue;
                 };
@@ -2029,7 +2029,7 @@ pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) ?struct { *Exec, *Slot
     const x = &e.execs[h.exec];
     if (h.slot >= x.slots.len) return null;
     const s = &x.slots[h.slot];
-    if (s.kind.load(.acquire) != @intFromEnum(kind)) return null;
+    if (s.kind.load(.acquire) != @backingInt(kind)) return null;
     return .{ x, s, h };
 }
 

@@ -370,7 +370,9 @@ the client reset the stream or left, the deadline passed (the client got
 DEADLINE_EXCEEDED), or its request messages failed a limit (the client got
 RESOURCE_EXHAUSTED, or INTERNAL for a malformed frame). Calls on the handle
 then return `ANOLE_E_GONE`. Anole enforces deadlines: a call needs no timer
-in the language.
+in the language. Over HTTP/2 a client's RST_STREAM aborts the call at once;
+over HTTP/1.1 (gRPC-Web, Connect) a client that hangs up while the answer is
+pending is noticed only at the call's deadline, as for REST requests.
 
 **The hot path.** A unary or server-streaming call that arrives whole over
 HTTP/2 or HTTP/3 (the usual case) is detached, as a `no_wait` REST route's

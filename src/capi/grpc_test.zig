@@ -127,7 +127,7 @@ const Consumer = struct {
                     if (call.flags & abi.GRPC_CALL_MESSAGE == 0) return error.NoMessage;
                     const req = try decode(pb.EchoRequest, arena, str(rec, call.message));
                     if (std.mem.eql(u8, req.message, "fail")) {
-                        return g.finish(e, h, @intFromEnum(grpc.Code.not_found), "no such thing: fail", &.{
+                        return g.finish(e, h, @backingInt(grpc.Code.not_found), "no such thing: fail", &.{
                             .{ .name = .of("x-why"), .value = .of("test") },
                             .{ .name = .of("x-raw-bin"), .value = .of("\x00\x01\xff") },
                         });
@@ -177,7 +177,7 @@ const Consumer = struct {
                     for ([_][]const u8{ "a", "b" }) |n| _ = try g.send(e, h, try encode(arena, tpb.Book{ .name = n }), false, false);
                     try g.finish(e, h, 0, "", &.{});
                 },
-                else => try g.finish(e, h, @intFromEnum(grpc.Code.unimplemented), "", &.{}),
+                else => try g.finish(e, h, @backingInt(grpc.Code.unimplemented), "", &.{}),
             },
             else => return error.WrongService,
         }

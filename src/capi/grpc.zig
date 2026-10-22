@@ -259,9 +259,7 @@ pub fn init(e: *Engine, why: *std.Io.Writer) config_mod.Problem!void {
     for (cfg.services, services, 0..) |*sc, *svc, i| {
         svc.* = .{ .name = sc.name, .cfg = sc, .methods = &.{} };
         const desc: ?*const schema.Service = if (e.grpc.schema) |*sch| sch.service(sc.name) orelse
-            return fail(why, "grpc.services[{d}]: {s} is not in the descriptors", .{ i, sc.name })
-        else
-            null;
+            return fail(why, "grpc.services[{d}]: {s} is not in the descriptors", .{ i, sc.name }) else null;
         const n = if (sc.methods) |ms| ms.len else desc.?.methods.len;
         const methods = a.alloc(Method, n) catch return fail(why, "grpc: out of memory", .{});
         for (methods, 0..) |*m, j| {
@@ -270,7 +268,7 @@ pub fn init(e: *Engine, why: *std.Io.Writer) config_mod.Problem!void {
             var kind: ?serving.MethodKind = null;
             if (sc.methods) |ms| {
                 name = ms[j].name;
-                if (ms[j].kind) |k| kind = @enumFromInt(@intFromEnum(k));
+                if (ms[j].kind) |k| kind = @fromBackingInt(@intCast(@backingInt(k)));
                 if (desc) |d| {
                     for (d.methods) |*cand| if (std.mem.eql(u8, cand.name, name)) {
                         dm = cand;
@@ -397,7 +395,7 @@ pub fn buildRoutes(e: *Engine, app: *anole.App, global_ok: bool) !void {
         while (!e.grpc.health_lock.tryLock()) std.atomic.spinLoopHint();
         defer e.grpc.health_lock.unlock();
         for (e.grpc.pending.items) |p| {
-            try health.set(p.name, @enumFromInt(p.status));
+            try health.set(p.name, @fromBackingInt(@intCast(p.status)));
             gpa.free(p.name);
         }
         e.grpc.pending.clearAndFree(gpa);
@@ -549,7 +547,7 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     _ = e.requests.fetchAdd(1, .monotonic);
     const gen = genOf(s.word.load(.monotonic));
     serving.setDeadline(call, timeout_ns, m.options.max_call_duration);
-    s.kind.store(@intFromEnum(Handle.Kind.grpc_call), .monotonic);
+    s.kind.store(@backingInt(Handle.Kind.grpc_call), .monotonic);
     s.req = r;
     s.flags = 0;
     s.remote_len = engine.remoteText(r, &s.remote);
@@ -651,10 +649,10 @@ fn collectMetadata(req: *http.Request) ![]const [2][]const u8 {
 fn isTransportHeader(name: []const u8) bool {
     if (name.len == 0 or name[0] == ':') return true;
     const list = [_][]const u8{
-        "content-type",     "te",                       "grpc-timeout",           "grpc-encoding",
-        "grpc-accept-encoding", "content-length",       "content-encoding",       "accept-encoding",
+        "content-type",             "te",                 "grpc-timeout",             "grpc-encoding",
+        "grpc-accept-encoding",     "content-length",     "content-encoding",         "accept-encoding",
         "connect-protocol-version", "connect-timeout-ms", "connect-content-encoding", "connect-accept-encoding",
-        "connection",       "keep-alive",               "transfer-encoding",      "upgrade",
+        "connection",               "keep-alive",         "transfer-encoding",        "upgrade",
         "host",
     };
     for (list) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
@@ -889,7 +887,7 @@ fn applyStatus(call: *Call, s: *const Slot) !void {
     const g = &s.grpc;
     const tb = s.trailer_bytes.items;
     if (g.code != 0) {
-        call.status = @enumFromInt(g.code);
+        call.status = @fromBackingInt(@intCast(g.code));
         call.status_message = try call.arena.dupe(u8, tb[g.status_off..][0..g.status_len]);
     }
     for (s.trailers.items) |t| {
@@ -1118,8 +1116,8 @@ pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8) usize {
         .ev = .{ .type = @backingInt(abi.EventType.grpc_call), .len = @intCast(size), .handle = handle },
         .route_id = m.service.cfg.handler,
         .method_id = m.id,
-        .kind = @intFromEnum(m.kind),
-        .protocol = @intFromEnum(g.call.impl.protocol),
+        .kind = @backingInt(m.kind),
+        .protocol = @backingInt(g.call.impl.protocol),
         .flags = g.flags,
         .version = req.version_major * 10 + req.version_minor,
         .nmetadata = @intCast(g.metadata.len),
@@ -1399,7 +1397,7 @@ const HealthCmd = struct {
             gpa.destroy(self);
         }
         const app = x.engine.app orelse return;
-        app.grpcHealth().set(self.name, @enumFromInt(self.status)) catch {};
+        app.grpcHealth().set(self.name, @fromBackingInt(@intCast(self.status))) catch {};
     }
 };
 
