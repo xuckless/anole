@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Core, always used, pinned by commit. zio: Anole's fork
-        // xuckless/zio, branch `anole-upstream-merge`: lalinsky/zio main
+        // xuckless/zio, branch `anole`: lalinsky/zio main
         // 035d245 (2026-10-21) merged into the fork. Upstream now carries
         // what used to be fork patches: the pinned overflow queue drained
         // into the ring fully (#841), sendmmsg in sendMany (#833, #843) and
