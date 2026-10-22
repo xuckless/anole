@@ -54,7 +54,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 1 /* additions */
+#define ANOLE_ABI_VERSION_MINOR 2 /* additions */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 
 #if defined(_WIN32) && defined(ANOLE_SHARED)
@@ -105,15 +105,16 @@ ANOLE_API uint32_t anole_abi_version(void);
 /* Anole's version, such as "0.2.0"; static storage. */
 ANOLE_API anole_str anole_version(void);
 /* 1 when `name` is built in, else 0: "tls", "http2", "http3", "websocket",
-   "compression", "brotli", "auth", "sqlite". */
+   "compression", "brotli", "auth", "grpc", "sqlite". */
 ANOLE_API int anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
-   (a request, a WebSocket; gRPC calls, WebTransport sessions and streams
+   (a request, a WebSocket, a gRPC call; WebTransport sessions and streams
    and database queries later), and a function given a handle of another
    kind answers ANOLE_E_GONE. The bits are Anole's: treat them as opaque. */
-typedef uint64_t anole_req; /* one request: from ANOLE_EV_REQUEST until answered */
-typedef uint64_t anole_ws;  /* one WebSocket: from ANOLE_EV_WS_OPEN until ANOLE_EV_WS_CLOSE */
+typedef uint64_t anole_req;       /* one request: from ANOLE_EV_REQUEST until answered */
+typedef uint64_t anole_ws;        /* one WebSocket: from ANOLE_EV_WS_OPEN until ANOLE_EV_WS_CLOSE */
+typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL until finished or aborted */
 typedef struct anole_server anole_server;     /* opaque */
 typedef struct anole_consumer anole_consumer; /* opaque */
 
@@ -231,10 +232,15 @@ enum anole_event_type {
   ANOLE_EV_WS_CLOSE = 8,   /* anole_ws_close_event: the handle is stale from now on */
   ANOLE_EV_WS_DRAIN = 9,   /* anole_event: a WebSocket that took ANOLE_BUSY has room */
   ANOLE_EV_DB_RESULT = 10, /* reserved for anole_db_* (SQLite, PostgreSQL, Redis, MongoDB) */
-  ANOLE_EV_STOPPED = 11    /* anole_event: the server stopped; the consumer's last event */
-  /* Reserved before ABI 1.0: 12-19 gRPC calls (their own handle kind),
-     20-29 WebTransport sessions, streams and datagrams, 30-39 more
-     database events. A consumer skips types it does not know (ev.len). */
+  ANOLE_EV_STOPPED = 11,   /* anole_event: the server stopped; the consumer's last event */
+  ANOLE_EV_GRPC_CALL = 12, /* anole_grpc_call_event; handle: anole_grpc_call */
+  ANOLE_EV_GRPC_MESSAGE = 13,   /* anole_grpc_message_event: a request message of a client- or
+                                   bidirectional-streaming call */
+  ANOLE_EV_GRPC_HALF_CLOSE = 14 /* anole_event: the client sent its last request message */
+  /* Reserved before ABI 1.0: 15-19 gRPC, 20-29 WebTransport sessions,
+     streams and datagrams, 30-39 more database events. A consumer skips
+     types it does not know (ev.len). ANOLE_EV_ABORT, ANOLE_EV_WRITABLE and
+     ANOLE_EV_SENT also come for gRPC calls (ev.handle an anole_grpc_call). */
 };
 
 /* Every event starts with this. Records are 8-byte aligned and `len`
@@ -325,6 +331,68 @@ typedef struct anole_ws_close_event {
   uint16_t reserved;
   anole_span reason;
 } anole_ws_close_event;
+
+/* ---- gRPC events ---------------------------------------------------------- */
+
+/* The call modes, and the wire protocols a call came in on. */
+enum {
+  ANOLE_GRPC_UNARY = 0,
+  ANOLE_GRPC_SERVER_STREAMING = 1,
+  ANOLE_GRPC_CLIENT_STREAMING = 2,
+  ANOLE_GRPC_BIDI_STREAMING = 3
+};
+enum {
+  ANOLE_GRPC_PROTOCOL_GRPC = 0,           /* gRPC over HTTP/2 */
+  ANOLE_GRPC_PROTOCOL_GRPC_WEB = 1,       /* gRPC-Web (HTTP/1.1 or 2) */
+  ANOLE_GRPC_PROTOCOL_GRPC_WEB_TEXT = 2,  /* gRPC-Web, base64 body */
+  ANOLE_GRPC_PROTOCOL_CONNECT = 3,        /* Connect unary (POST, or GET) */
+  ANOLE_GRPC_PROTOCOL_CONNECT_STREAM = 4, /* Connect streaming */
+  ANOLE_GRPC_PROTOCOL_HTTP_JSON = 5       /* JSON transcoding (google.api.http) */
+};
+
+#define ANOLE_GRPC_CALL_MESSAGE 1u     /* `message` is the request message (unary, server streaming) */
+#define ANOLE_GRPC_CALL_SECURE 4u      /* arrived over TLS (or QUIC) */
+#define ANOLE_GRPC_CALL_EARLY_DATA 8u  /* arrived in TLS 1.3 / QUIC 0-RTT (replayable) */
+#define ANOLE_GRPC_CALL_JSON 16u       /* the client speaks JSON; Anole converted (messages are still protobuf) */
+#define ANOLE_GRPC_CALL_COMPRESSED 32u /* the client compresses its messages (Anole inflated them) */
+
+/* ANOLE_EV_GRPC_CALL: a call to a configured service ("grpc" in the
+   configuration). Messages always cross as protobuf bytes, whatever the
+   client spoke (Anole converts Connect JSON, gRPC-Web JSON and transcoded
+   REST with the descriptors). Followed by `anole_span metadata[2 *
+   nmetadata]` (name, value: names lower-cased, the protocols' own headers
+   left out, `-bin` values decoded to bytes), then the bytes the spans
+   point into. The consumer answers with anole_grpc_send and
+   anole_grpc_finish; ANOLE_EV_ABORT ends the call instead (client gone,
+   deadline passed, request messages failed). */
+typedef struct anole_grpc_call_event {
+  anole_event ev;
+  uint32_t route_id;      /* the service's "handler" id */
+  uint16_t method_id;     /* the method's index in the service's "methods" (else the descriptors') */
+  uint8_t kind;           /* ANOLE_GRPC_UNARY .. ANOLE_GRPC_BIDI_STREAMING */
+  uint8_t protocol;       /* ANOLE_GRPC_PROTOCOL_* */
+  uint16_t flags;         /* ANOLE_GRPC_CALL_* */
+  uint8_t version;        /* HTTP version: 11, 20, 30 */
+  uint8_t reserved0;
+  uint16_t nmetadata;
+  uint16_t reserved1;
+  anole_span method;      /* "/package.Service/Method" */
+  anole_span message;     /* with ANOLE_GRPC_CALL_MESSAGE: the request message (may be empty) */
+  anole_span remote_addr; /* the client, "ip:port", proxies applied */
+  anole_span listener;    /* the listener's name */
+  anole_span id;          /* the request ID (request_id middleware), else empty */
+  anole_span claims;      /* a verified JWT's claims as JSON (jwt middleware), else empty */
+  int64_t timeout_us;     /* time left before the deadline when polled; -1 for none */
+} anole_grpc_call_event;
+
+/* ANOLE_EV_GRPC_MESSAGE: one request message (protobuf bytes), followed by
+   them. Each takes one unit of credit (see anole_grpc_read). */
+typedef struct anole_grpc_message_event {
+  anole_event ev;
+  uint32_t route_id;
+  uint32_t reserved;
+  anole_span data;
+} anole_grpc_message_event;
 
 static inline anole_str anole_event_str(const void *record, anole_span s) {
   anole_str r;
@@ -439,6 +507,80 @@ ANOLE_API anole_status anole_ws_unsubscribe(anole_ws w, anole_str topic);
    no event follows, publish again later. */
 ANOLE_API anole_status anole_ws_publish(anole_server *s, anole_str topic, int type, const void *data, size_t len,
                                         anole_ws except);
+
+/* ---- gRPC ------------------------------------------------------------------- */
+
+/* Status codes (google.rpc.Code). */
+enum {
+  ANOLE_GRPC_OK = 0,
+  ANOLE_GRPC_CANCELLED = 1,
+  ANOLE_GRPC_UNKNOWN = 2,
+  ANOLE_GRPC_INVALID_ARGUMENT = 3,
+  ANOLE_GRPC_DEADLINE_EXCEEDED = 4,
+  ANOLE_GRPC_NOT_FOUND = 5,
+  ANOLE_GRPC_ALREADY_EXISTS = 6,
+  ANOLE_GRPC_PERMISSION_DENIED = 7,
+  ANOLE_GRPC_RESOURCE_EXHAUSTED = 8,
+  ANOLE_GRPC_FAILED_PRECONDITION = 9,
+  ANOLE_GRPC_ABORTED = 10,
+  ANOLE_GRPC_OUT_OF_RANGE = 11,
+  ANOLE_GRPC_UNIMPLEMENTED = 12,
+  ANOLE_GRPC_INTERNAL = 13,
+  ANOLE_GRPC_UNAVAILABLE = 14,
+  ANOLE_GRPC_DATA_LOSS = 15,
+  ANOLE_GRPC_UNAUTHENTICATED = 16
+};
+
+/* anole_grpc_send flag: the call ends after this message with OK and no
+   trailing metadata (a unary answer in one call). */
+#define ANOLE_GRPC_SEND_FINISH 2u
+
+/* Metadata (anole_header name/value pairs) a consumer sends: a lower-case
+   key (letters, digits, '-', '_', '.'), not the protocols' own (grpc-*
+   except grpc-status-details-bin, connect-*, trailer-*, content-type, te,
+   HTTP's framing); a printable ASCII value, except under a key ending in
+   "-bin", whose value is bytes (Anole base64-encodes them). Copied.
+   ANOLE_E_INVALID otherwise. */
+
+/* Initial metadata (response headers), before the first message; at most
+   once. ANOLE_E_STATE after a message. */
+ANOLE_API anole_status anole_grpc_send_headers(anole_grpc_call c, const anole_header *metadata, size_t n);
+
+/* One response message (protobuf bytes; copied, or borrowed with
+   ANOLE_BODY_BORROW, then ANOLE_EV_SENT follows with ev.handle = c).
+   Unary and client streaming: the one answer message, kept until
+   anole_grpc_finish (a second: ANOLE_E_STATE); with ANOLE_GRPC_SEND_FINISH
+   it is sent with OK at once. Server and bidirectional streaming: sent
+   now, in order; ANOLE_BUSY when it went in but past
+   limits.stream_high_water bytes are queued (send no more until
+   ANOLE_EV_WRITABLE). ANOLE_E_GONE once the call is over (ANOLE_EV_ABORT,
+   or finished). */
+ANOLE_API anole_status anole_grpc_send(anole_grpc_call c, const void *msg, size_t len, uint32_t flags);
+
+/* anole_grpc_send for a blocking consumer thread: waits up to timeout_ms
+   (< 0: no limit) for room, then sends (copied). ANOLE_E_TIMEOUT. */
+ANOLE_API anole_status anole_grpc_send_wait(anole_grpc_call c, const void *msg, size_t len, int32_t timeout_ms);
+
+/* Ends the call: the status (an ANOLE_GRPC_* code), its message (UTF-8, at
+   most 64 KiB, copied; sent as grpc-message) and trailing metadata. After
+   a stream's messages are sent. ANOLE_E_STATE for OK on a unary or
+   client-streaming call without its message. The handle is stale after. */
+ANOLE_API anole_status anole_grpc_finish(anole_grpc_call c, uint32_t code, anole_str message,
+                                         const anole_header *trailers, size_t n);
+
+/* Client and bidirectional streaming: takes n more ANOLE_EV_GRPC_MESSAGE
+   events. A call starts with the service's read_ahead (default 8); Anole
+   stops reading the client's messages while the credit is spent, so a
+   slow consumer holds back the client (HTTP/2 flow control). ANOLE_E_STATE
+   on other calls. */
+ANOLE_API anole_status anole_grpc_read(anole_grpc_call c, uint32_t n);
+
+/* grpc.health.v1 ("grpc": {"health": true}): a service's status ("" for
+   the server as a whole). Every configured service and "" start SERVING;
+   all turn NOT_SERVING when the server drains. Any thread, before or after
+   start. ANOLE_E_STATE when health is off. */
+enum { ANOLE_GRPC_HEALTH_UNKNOWN = 0, ANOLE_GRPC_HEALTH_SERVING = 1, ANOLE_GRPC_HEALTH_NOT_SERVING = 2 };
+ANOLE_API anole_status anole_grpc_health_set(anole_server *s, anole_str service, int status);
 
 #ifdef __cplusplus
 }

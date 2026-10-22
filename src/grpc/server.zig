@@ -1217,7 +1217,21 @@ pub fn writePayload(call: *Call, payload: []const u8) !void {
         } else {
             call.impl.unary_response = payload;
         },
-        else => try writeBytes(call, try frame.encodeWithCompression(call.arena, payload, call.impl.response_compression)),
+        else => {
+            // Collected and not compressed: the frame goes straight into
+            // the body, one copy.
+            if (call.impl.buffer) |b| if (call.impl.response_compression == .identity and call.impl.protocol != .grpc_web_text) {
+                var head: [frame.header_size]u8 = undefined;
+                head[0] = 0;
+                std.mem.writeInt(u32, head[1..5], @intCast(payload.len), .big);
+                try b.ensureUnusedCapacity(call.arena, head.len + payload.len);
+                b.appendSliceAssumeCapacity(&head);
+                b.appendSliceAssumeCapacity(payload);
+                call.impl.started = true;
+                return;
+            };
+            try writeBytes(call, try frame.encodeWithCompression(call.arena, payload, call.impl.response_compression));
+        },
     }
 }
 
@@ -1244,13 +1258,42 @@ fn writeFrame(call: *Call, flags: u8, payload: []const u8) !void {
     try writeBytes(call, framed);
 }
 
+/// One response message of a stream of any length, in the call's codec:
+/// `writePayload`, but framed (compressed, base64 for gRPC-Web text) in
+/// `scratch` and freed once written, so that a long stream does not grow
+/// the call's arena. Collected calls (`impl.buffer`) and the protocols
+/// that keep the message for `finish` go through `writePayload`.
+pub fn writeStreamed(call: *Call, payload: []const u8) !void {
+    if (call.impl.buffer != null) return writePayload(call, payload);
+    switch (call.impl.protocol) {
+        .grpc, .grpc_web, .grpc_web_text, .connect_stream => {
+            const framed = try frame.encodeWithCompression(scratch, payload, call.impl.response_compression);
+            defer scratch.free(framed);
+            return writeBytesWith(call, framed, scratch);
+        },
+        .http_json => if (call.impl.json_array) {
+            try writeBytesWith(call, if (call.impl.started) "," else "[", scratch);
+            return writeBytesWith(call, payload, scratch);
+        } else return writePayload(call, payload),
+        .connect => return writePayload(call, payload),
+    }
+}
+
 /// Response body bytes, base64-encoded for gRPC-Web text, starting the
 /// response with the first.
 fn writeBytes(call: *Call, bytes: []const u8) !void {
-    const data = if (call.impl.protocol == .grpc_web_text) blk: {
-        const enc = try call.arena.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-        break :blk std.base64.standard.Encoder.encode(enc, bytes);
-    } else bytes;
+    return writeBytesWith(call, bytes, call.arena);
+}
+
+/// `writeBytes`, with gRPC-Web text's base64 made with `allocator` (and
+/// freed after, unless it is the call's arena).
+fn writeBytesWith(call: *Call, bytes: []const u8, allocator: std.mem.Allocator) !void {
+    const encoded: ?[]u8 = if (call.impl.protocol == .grpc_web_text)
+        try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len))
+    else
+        null;
+    defer if (encoded) |enc| if (allocator.ptr != call.arena.ptr) allocator.free(enc);
+    const data = if (encoded) |enc| std.base64.standard.Encoder.encode(enc, bytes) else bytes;
     try call.impl.write_mutex.lock(call.io);
     defer call.impl.write_mutex.unlock(call.io);
     call.impl.started = true;

@@ -33,6 +33,8 @@ test "anole.h: every struct as abi.zig lays it out" {
     try expectSameLayout(abi.SentEvent, c.anole_sent_event);
     try expectSameLayout(abi.WsMessageEvent, c.anole_ws_message_event);
     try expectSameLayout(abi.WsCloseEvent, c.anole_ws_close_event);
+    try expectSameLayout(abi.GrpcCallEvent, c.anole_grpc_call_event);
+    try expectSameLayout(abi.GrpcMessageEvent, c.anole_grpc_message_event);
 }
 
 test "anole.h: every constant as abi.zig has it" {
@@ -66,6 +68,25 @@ test "anole.h: every constant as abi.zig has it" {
     try eq(abi.WS_BINARY, c.ANOLE_WS_BINARY);
     try eq(abi.POLL_NOARM, c.ANOLE_POLL_NOARM);
     try eq(abi.BODY_BORROW, c.ANOLE_BODY_BORROW);
+    try eq(abi.GRPC_UNARY, c.ANOLE_GRPC_UNARY);
+    try eq(abi.GRPC_SERVER_STREAMING, c.ANOLE_GRPC_SERVER_STREAMING);
+    try eq(abi.GRPC_CLIENT_STREAMING, c.ANOLE_GRPC_CLIENT_STREAMING);
+    try eq(abi.GRPC_BIDI_STREAMING, c.ANOLE_GRPC_BIDI_STREAMING);
+    try eq(abi.GRPC_PROTOCOL_GRPC, c.ANOLE_GRPC_PROTOCOL_GRPC);
+    try eq(abi.GRPC_PROTOCOL_GRPC_WEB, c.ANOLE_GRPC_PROTOCOL_GRPC_WEB);
+    try eq(abi.GRPC_PROTOCOL_GRPC_WEB_TEXT, c.ANOLE_GRPC_PROTOCOL_GRPC_WEB_TEXT);
+    try eq(abi.GRPC_PROTOCOL_CONNECT, c.ANOLE_GRPC_PROTOCOL_CONNECT);
+    try eq(abi.GRPC_PROTOCOL_CONNECT_STREAM, c.ANOLE_GRPC_PROTOCOL_CONNECT_STREAM);
+    try eq(abi.GRPC_PROTOCOL_HTTP_JSON, c.ANOLE_GRPC_PROTOCOL_HTTP_JSON);
+    try eq(abi.GRPC_CALL_MESSAGE, c.ANOLE_GRPC_CALL_MESSAGE);
+    try eq(abi.GRPC_CALL_SECURE, c.ANOLE_GRPC_CALL_SECURE);
+    try eq(abi.GRPC_CALL_EARLY_DATA, c.ANOLE_GRPC_CALL_EARLY_DATA);
+    try eq(abi.GRPC_CALL_JSON, c.ANOLE_GRPC_CALL_JSON);
+    try eq(abi.GRPC_CALL_COMPRESSED, c.ANOLE_GRPC_CALL_COMPRESSED);
+    try eq(abi.GRPC_SEND_FINISH, c.ANOLE_GRPC_SEND_FINISH);
+    try eq(abi.GRPC_HEALTH_UNKNOWN, c.ANOLE_GRPC_HEALTH_UNKNOWN);
+    try eq(abi.GRPC_HEALTH_SERVING, c.ANOLE_GRPC_HEALTH_SERVING);
+    try eq(abi.GRPC_HEALTH_NOT_SERVING, c.ANOLE_GRPC_HEALTH_NOT_SERVING);
     const info = @typeInfo(abi.EventType).@"enum";
     inline for (info.field_names, info.field_values) |n, v| {
         const name = comptime blk: {

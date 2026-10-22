@@ -24,6 +24,8 @@ pub const Config = struct {
     /// Middleware for every route, in order, before the route's own.
     middleware: []const Middleware = &.{},
     routes: []const Route = &.{},
+    /// gRPC services whose methods a consumer implements (-Dgrpc).
+    grpc: ?Grpc = null,
     observe: Observe = .{},
 
     pub const Listener = struct {
@@ -232,6 +234,64 @@ pub const Config = struct {
         /// request's own host ("https://app.example.com"); "*" for any.
         origins: []const []const u8 = &.{},
     };
+    pub const Grpc = struct {
+        /// The services' descriptors, a serialized FileDescriptorSet with
+        /// its imports (`protoc --include_imports --descriptor_set_out`,
+        /// `buf build -o`), as base64; or
+        descriptor_set: ?[]const u8 = null,
+        /// the path of that file, read by anole_server_create. Without
+        /// descriptors, every service lists its methods, and only protobuf
+        /// (not JSON) is served: no Connect JSON, no transcoding.
+        descriptor_set_file: ?[]const u8 = null,
+        services: []const GrpcService = &.{},
+        /// grpc.health.v1.Health, served by Anole: the server ("") and
+        /// every service here SERVING until anole_grpc_health_set says
+        /// otherwise; NOT_SERVING once the server drains.
+        health: bool = false,
+    };
+    pub const GrpcService = struct {
+        /// The full name, "package.Service".
+        name: []const u8,
+        /// The consumer's route id for its calls.
+        handler: u32,
+        /// The methods served, in the order their ids follow; left out:
+        /// all of the service's, in the descriptors' order.
+        methods: ?[]const GrpcMethod = null,
+        /// The largest request message (after inflating); a larger one ends
+        /// the call with RESOURCE_EXHAUSTED.
+        max_message_size: u32 = 4 << 20,
+        /// The most request message bytes one call takes in all (each
+        /// message counted at its size plus 64).
+        max_received_bytes: u64 = 64 << 20,
+        /// How long a request message may take to arrive once it started
+        /// (and the first one of a unary or server-streaming call from the
+        /// start of the call); 0 for no limit but the deadline.
+        read_timeout_ms: u32 = 30_000,
+        /// The longest a call may run, capping the client's deadline; 0 for
+        /// none (calls without a client deadline run until they end).
+        max_call_duration_ms: u32 = 0,
+        /// When response messages are gzipped: "mirror" (when the request
+        /// was), "accepted" (whenever the client accepts gzip), "never".
+        response_compression: enum { mirror, accepted, never } = .mirror,
+        /// Request messages of a client- or bidirectional-streaming call
+        /// delivered before the consumer asks for more (anole_grpc_read).
+        read_ahead: u32 = 8,
+        /// REST routes for the methods annotated with google.api.http
+        /// (needs descriptors).
+        transcode: bool = true,
+        /// Unary and server-streaming calls that arrive whole run on the
+        /// protocol's reader, detached (as `no_wait` routes do).
+        no_wait: bool = true,
+    };
+    pub const GrpcMethod = struct {
+        name: []const u8,
+        /// The call mode; from the descriptors when left out (and checked
+        /// against them when both say).
+        kind: ?enum { unary, server_streaming, client_streaming, bidi_streaming } = null,
+        /// A unary method without side effects is also served as Connect
+        /// GET (descriptors: `idempotency_level = NO_SIDE_EFFECTS`).
+        no_side_effects: ?bool = null,
+    };
     pub const Cache = struct {
         /// When the answer's Cache-Control does not say.
         ttl_ms: u32 = 10_000,
@@ -309,6 +369,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             return fail(why, "listeners[{d}].name \"{s}\" is taken", .{ i, l.name.? });
     }
     if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
+    if (cfg.grpc) |g| try checkGrpc(g, why);
     try checkMiddleware(cfg.middleware, "middleware", why);
     var timeouts: [max_timeouts]u32 = undefined;
     var ntimeouts: usize = 1;
@@ -345,6 +406,26 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         }
         var buf: [32]u8 = undefined;
         try checkMiddleware(r.middleware, std.fmt.bufPrint(&buf, "routes[{d}].middleware", .{i}) catch "routes[].middleware", why);
+    }
+}
+
+fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
+    if (comptime !features.grpc) return fail(why, "grpc: gRPC is not built in (-Dgrpc)", .{});
+    if (g.descriptor_set != null and g.descriptor_set_file != null) return fail(why, "grpc: one of descriptor_set and descriptor_set_file", .{});
+    const descriptors = g.descriptor_set != null or g.descriptor_set_file != null;
+    if (g.services.len == 0) return fail(why, "grpc.services: at least one", .{});
+    for (g.services, 0..) |svc, i| {
+        if (svc.name.len == 0 or svc.name.len > 255) return fail(why, "grpc.services[{d}].name: 1-255 bytes", .{i});
+        for (g.services[0..i]) |other| if (std.mem.eql(u8, other.name, svc.name)) return fail(why, "grpc.services[{d}]: {s} twice", .{ i, svc.name });
+        if (svc.max_message_size == 0 or svc.max_message_size > max_record_payload) return fail(why, "grpc.services[{d}].max_message_size: 1 to {d}", .{ i, max_record_payload });
+        if (svc.methods == null and !descriptors) return fail(why, "grpc.services[{d}]: methods, or the descriptors (descriptor_set)", .{i});
+        const methods = svc.methods orelse continue;
+        if (methods.len > std.math.maxInt(u16)) return fail(why, "grpc.services[{d}].methods: too many", .{i});
+        for (methods, 0..) |m, j| {
+            if (m.name.len == 0 or std.mem.indexOfAny(u8, m.name, "/?# ") != null) return fail(why, "grpc.services[{d}].methods[{d}].name: a method name", .{ i, j });
+            if (m.kind == null and !descriptors) return fail(why, "grpc.services[{d}].methods[{d}].kind: needed without descriptors", .{ i, j });
+            for (methods[0..j]) |other| if (std.mem.eql(u8, other.name, m.name)) return fail(why, "grpc.services[{d}].methods: {s} twice", .{ i, m.name });
+        }
     }
 }
 
