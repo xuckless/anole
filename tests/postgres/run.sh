@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs anole.pg's tests (`zig build test-postgres`) against a throwaway
 # PostgreSQL in Docker: once in plain text and once over TLS with
-# sslmode=verify-full, logging in with scram-sha-256 both times.
+# sslmode=verify-full, logging in with scram-sha-256 both times; then the C
+# ABI's suite (`zig build capi-test`) over TLS.
 #
 # The server's certificate and its CA are made here for this run, in a
 # temporary directory removed on exit (nothing is committed); the
@@ -70,3 +71,9 @@ echo "== plain"
 "$ZIG" build test-postgres --summary all -Dpostgres-test-url="$BASE?sslmode=disable" "$@"
 echo "== TLS (verify-full)"
 "$ZIG" build test-postgres --summary all -Dpostgres-test-url="$BASE?sslmode=verify-full&sslrootcert=$CERTS/root.crt" "$@"
+# The C ABI's suite (tests/capi/consumer.c), its PostgreSQL part included;
+# CAPI=0 skips it.
+if [ "${CAPI:-1}" != 0 ]; then
+  echo "== C ABI (verify-full)"
+  "$ZIG" build capi-test --summary all -Dpostgres-test-url="$BASE?sslmode=verify-full&sslrootcert=$CERTS/root.crt" "$@"
+fi

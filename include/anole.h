@@ -93,7 +93,8 @@ enum {
   ANOLE_E_UNSUPPORTED = -7, /* compiled out, or not on this OS */
   ANOLE_E_TOOBIG = -8,      /* anole_poll: the next event does not fit */
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
-  ANOLE_E_TIMEOUT = -10     /* a blocking call's timeout passed */
+  ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
+  ANOLE_E_DB = -11          /* a database refused a statement (anole_db_result_event) */
 };
 
 /* The text of the last error on the calling thread: valid until the next
@@ -105,7 +106,7 @@ ANOLE_API uint32_t anole_abi_version(void);
 /* Anole's version, such as "0.2.0"; static storage. */
 ANOLE_API anole_str anole_version(void);
 /* 1 when `name` is built in, else 0: "tls", "http2", "http3", "websocket",
-   "compression", "brotli", "auth", "grpc", "sqlite". */
+   "compression", "brotli", "auth", "grpc", "sqlite", "postgres", "redis". */
 ANOLE_API int anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
@@ -231,7 +232,7 @@ enum anole_event_type {
   ANOLE_EV_WS_MESSAGE = 7, /* anole_ws_message_event */
   ANOLE_EV_WS_CLOSE = 8,   /* anole_ws_close_event: the handle is stale from now on */
   ANOLE_EV_WS_DRAIN = 9,   /* anole_event: a WebSocket that took ANOLE_BUSY has room */
-  ANOLE_EV_DB_RESULT = 10, /* reserved for anole_db_* (SQLite, PostgreSQL, Redis, MongoDB) */
+  ANOLE_EV_DB_RESULT = 10, /* anole_db_result_event: a query's answer (anole_db_query, anole_db_exec) */
   ANOLE_EV_STOPPED = 11,   /* anole_event: the server stopped; the consumer's last event */
   ANOLE_EV_GRPC_CALL = 12, /* anole_grpc_call_event; handle: anole_grpc_call */
   ANOLE_EV_GRPC_MESSAGE = 13,   /* anole_grpc_message_event: a request message of a client- or
@@ -581,6 +582,175 @@ ANOLE_API anole_status anole_grpc_read(anole_grpc_call c, uint32_t n);
    start. ANOLE_E_STATE when health is off. */
 enum { ANOLE_GRPC_HEALTH_UNKNOWN = 0, ANOLE_GRPC_HEALTH_SERVING = 1, ANOLE_GRPC_HEALTH_NOT_SERVING = 2 };
 ANOLE_API anole_status anole_grpc_health_set(anole_server *s, anole_str service, int status);
+
+/* ---- databases ---------------------------------------------------------------- */
+
+/* A database from the configuration's "databases": SQLite, PostgreSQL or
+   Redis (MongoDB follows). Statements run on Anole's threads and never
+   block the caller: each call queues one, and its answer comes back as an
+   ANOLE_EV_DB_RESULT to the consumer named in the call, with the caller's
+   user_data. SQLite: reads run beside the writer (WAL), writes take turns on
+   the database's writer thread. PostgreSQL and Redis: each executor has its
+   own pool of connections. Statements may be queued from anole_server_start until
+   the server stops; ones still running when it stops get no answer
+   (ANOLE_EV_STOPPED is the consumer's last event). */
+typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
+
+/* The database named `name` in the configuration (after
+   anole_server_create). ANOLE_E_INVALID when there is none. */
+ANOLE_API anole_status anole_db_find(anole_server *s, anole_str name, anole_db **out);
+
+/* Value and cell types. ANOLE_DB_BOOL holds 0 or 1 in `i`. ARRAY, MAP and
+   ERROR are cells of a Redis reply only (see anole_db_cell). */
+enum {
+  ANOLE_DB_NULL = 0,
+  ANOLE_DB_INT = 1,
+  ANOLE_DB_FLOAT = 2,
+  ANOLE_DB_TEXT = 3,
+  ANOLE_DB_BLOB = 4,
+  ANOLE_DB_BOOL = 5,
+  ANOLE_DB_ARRAY = 6,
+  ANOLE_DB_MAP = 7,
+  ANOLE_DB_ERROR = 8
+};
+
+/* A parameter: binds SQLite's `?` (or `?NNN`), PostgreSQL's $1, $2... in
+   order. Text and blobs are copied by the call. SQLite binds a bool as 1 or
+   0. PostgreSQL sends each value as the parameter's type when it can (an
+   int to int2/int4/int8/numeric, a blob to bytea), else as text that
+   PostgreSQL parses into that type: text holding '2026-10-22T10:00:00Z' for
+   a timestamptz, '{1,2}' for an int4[], an int for a text parameter.
+   Redis: `sql` holds the command's name and any fixed words ("GET",
+   "CLIENT INFO"), split on spaces; each parameter is one more argument,
+   binary-safe: text and blobs as they are, numbers in decimal, a bool as 1
+   or 0, NULL left out. Keys and values always go in parameters. */
+typedef struct anole_db_value {
+  uint32_t type; /* ANOLE_DB_* */
+  uint32_t reserved;
+  union {
+    int64_t i;   /* ANOLE_DB_INT, ANOLE_DB_BOOL */
+    double f;    /* ANOLE_DB_FLOAT */
+    anole_str s; /* ANOLE_DB_TEXT (UTF-8), ANOLE_DB_BLOB */
+  } v;
+} anole_db_value;
+
+/* Query flags. ANOLE_DB_WRITE (SQLite): run on the writer, for a statement
+   that writes but does not look like it (a SELECT with side effects).
+   ANOLE_DB_COALESCE: identical reads in flight at once (same statement and
+   parameters) share one run, each caller getting its own answer.
+   ANOLE_DB_NO_PREPARE: do not keep the prepared statement (SQL built at run
+   time). ANOLE_DB_DROP_EMPTY: with a cache_ttl_ms, an answer with no row is
+   served but not kept (cache-aside). */
+#define ANOLE_DB_WRITE 1u
+#define ANOLE_DB_COALESCE 2u
+#define ANOLE_DB_NO_PREPARE 4u
+#define ANOLE_DB_DROP_EMPTY 8u
+
+typedef struct anole_db_options {
+  size_t size;           /* sizeof(anole_db_options): fields past it read as 0 */
+  uint32_t flags;        /* ANOLE_DB_* */
+  uint32_t timeout_ms;   /* 0: none; past it, the statement is interrupted (ANOLE_E_TIMEOUT);
+                            PostgreSQL also gets a CancelRequest */
+  uint32_t cache_ttl_ms; /* reads: keep the answer this long per executor, served
+                            from memory meanwhile; 0: not kept */
+  uint32_t reserved;
+  anole_str cache_tag;   /* a name to drop kept answers by (anole_db_invalidate); copied */
+} anole_db_options;
+
+/* Queues a read (or any statement that returns rows): the answer holds the
+   column names and every row. `params` (copied) bind in order; `opts` may
+   be NULL. `c` receives the answer; it must be fed by at least one
+   executor (ANOLE_E_STATE otherwise, or before start or after the stop).
+   ANOLE_E_INVALID: a bad value type or options size. Returns at once.
+   Redis: runs the command and answers with its whole reply. timeout_ms,
+   ANOLE_DB_COALESCE and cache_ttl_ms apply; the last two only to commands
+   that just read (GET, MGET, HGETALL, LRANGE, ZRANGE... as anole.redis's
+   read_commands), others run as they are. */
+ANOLE_API anole_status anole_db_query(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
+                                      size_t nparams, const anole_db_options *opts, uint64_t user_data);
+/* Queues a write (SQLite: on the writer): the answer has `changes` and, for
+   SQLite, `last_insert_rowid` (PostgreSQL: 0; use RETURNING with
+   anole_db_query), and no rows. With no parameters, `sql` may hold several
+   statements (a schema), run in order. Redis: runs the command and answers
+   with no cells; `changes` is its reply when that is an integer (DEL,
+   INCR, LPUSH...), else 0. */
+ANOLE_API anole_status anole_db_exec(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
+                                     size_t nparams, const anole_db_options *opts, uint64_t user_data);
+/* Drops the answers kept with cache_tag `tag` on every executor ({NULL, 0}:
+   every kept answer), and keeps reads that started before from filling the
+   cache. Call it after a write commits. */
+ANOLE_API anole_status anole_db_invalidate(anole_db *db, anole_str tag);
+
+/* Where an answer came from. */
+enum { ANOLE_DB_FROM_DATABASE = 0, ANOLE_DB_FROM_COALESCED = 1, ANOLE_DB_FROM_CACHE = 2 };
+
+/* What kind of failure (error_class), for every database Anole speaks. */
+enum {
+  ANOLE_DB_ERR_NONE = 0,
+  ANOLE_DB_ERR_UNIQUE = 1,        /* a unique or primary key */
+  ANOLE_DB_ERR_EXCLUSION = 2,
+  ANOLE_DB_ERR_FOREIGN_KEY = 3,
+  ANOLE_DB_ERR_NOT_NULL = 4,
+  ANOLE_DB_ERR_CHECK = 5,
+  ANOLE_DB_ERR_SERIALIZATION = 6, /* lost a race with another transaction */
+  ANOLE_DB_ERR_DEADLOCK = 7,
+  ANOLE_DB_ERR_UNAVAILABLE = 8,   /* no connection, or busy past its timeout */
+  ANOLE_DB_ERR_TIMEOUT = 9,
+  ANOLE_DB_ERR_OTHER = 10         /* syntax, a wrong parameter count, ... */
+};
+
+/* One cell of a row. Text and blobs are spans in the record.
+   SQLite: each cell has its own type (NULL, INT, FLOAT, TEXT, BLOB);
+   db_type is 0.
+   PostgreSQL: db_type is the column's type OID (pg_type.oid: 16 bool, 20
+   int8, 1700 numeric, 1184 timestamptz, 3802 jsonb...). bool is
+   ANOLE_DB_BOOL; int2, int4, int8, oid and xid are ANOLE_DB_INT; float4 and
+   float8 are ANOLE_DB_FLOAT; bytea is ANOLE_DB_BLOB; every other type is
+   ANOLE_DB_TEXT in PostgreSQL's text format (as psql prints it: numeric
+   exactly, '2026-10-22 10:00:00+00', '{1,2}', JSON text), for the caller to
+   parse by db_type, as the language's own PostgreSQL drivers do.
+   Redis: the reply is a tree of cells in preorder, with no columns
+   (ncolumns 0, nrows the number of cells). Bulk strings are BLOB (bytes,
+   often UTF-8), status replies ("OK") TEXT, integers INT, nil NULL, RESP3
+   doubles FLOAT and booleans BOOL. An ARRAY cell with `i` = n is followed by
+   its n items, each a whole subtree; a MAP with `i` = n by n key, value
+   pairs. ERROR (text) is an error reply inside another, as EXEC's. */
+typedef struct anole_db_cell {
+  uint32_t type;    /* ANOLE_DB_* */
+  uint32_t db_type; /* PostgreSQL: the type OID; 0 otherwise */
+  union {
+    int64_t i;
+    double f;
+    anole_span s;
+  } v;
+} anole_db_cell;
+
+/* ANOLE_EV_DB_RESULT: ev.handle is 0; user_data as given to the call.
+   Followed by the column names (`columns`: ncolumns anole_span), the cells
+   (`cells`: nrows * ncolumns anole_db_cell, row after row) and their bytes.
+   A large answer makes a large record: anole_poll answers ANOLE_E_TOOBIG
+   until its buffer fits it (limits.db_result_max bounds it). */
+typedef struct anole_db_result_event {
+  anole_event ev;
+  uint64_t user_data;
+  int32_t status;       /* ANOLE_OK; ANOLE_E_DB (error_class says why), ANOLE_E_TIMEOUT
+                           (timeout_ms), ANOLE_E_TOOBIG (past limits.db_result_max),
+                           ANOLE_E_NOMEM */
+  uint16_t http_status; /* the status Anole's own handlers answer for this failure
+                           (409 unique, 503 unavailable, 504 timeout, 500 other); 0 on success */
+  uint8_t error_class;  /* ANOLE_DB_ERR_* */
+  uint8_t source;       /* ANOLE_DB_FROM_* */
+  uint32_t ncolumns;
+  uint32_t nrows;
+  uint64_t changes;          /* anole_db_exec: rows changed */
+  int64_t last_insert_rowid; /* anole_db_exec, SQLite: the rowid of the last row inserted */
+  anole_span columns;
+  anole_span cells;
+  anole_span error;      /* the database's message (for logs; not for clients) */
+  anole_span error_code; /* the database's own code as text (SQLite's extended code,
+                            PostgreSQL's SQLSTATE, the first word of a Redis error) */
+  anole_span constraint; /* the constraint that failed, when the database names it */
+} anole_db_result_event;
 
 #ifdef __cplusplus
 }

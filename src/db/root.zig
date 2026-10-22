@@ -130,6 +130,38 @@ pub const Ctx = struct {
     last_source: ?Source = null,
 };
 
+/// A value whose type is known only at run time: a parameter of a SQL
+/// connector's `table` and `run` (`anole.pg`, `anole.sqlite`), or a cell of
+/// a `Table`. What the C ABI (`anole_db_*`) and the language bindings pass.
+pub const Value = union(enum) {
+    null,
+    int: i64,
+    float: f64,
+    bool: bool,
+    /// UTF-8 text; in a row, copied into the arena.
+    text: []const u8,
+    /// Bytes; in a row, copied into the arena.
+    blob: []const u8,
+};
+
+/// Rows whose columns are known only at run time: the result's column
+/// names, each column's type as the database names it (PostgreSQL's type
+/// OIDs; empty for SQLite, whose types are per value), and each row's
+/// cells in column order.
+pub const Table = struct {
+    columns: []const []const u8,
+    types: []const u32 = &.{},
+    rows: []const []const Value,
+};
+
+/// What a write did (`run`): the rows it changed, and for SQLite the rowid
+/// of the last row inserted on the connection (0 for PostgreSQL: use
+/// `RETURNING` with `table`).
+pub const Changes = struct {
+    changes: u64,
+    last_insert_rowid: i64 = 0,
+};
+
 /// Per call (`with`). The defaults are the plain path: no extra bound, a
 /// prepared statement, nothing cached.
 pub const QueryOptions = struct {

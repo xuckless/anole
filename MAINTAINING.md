@@ -151,7 +151,9 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   instead of OpenSSL (Anole's is `src/pg/tls.zig`), plus security patches
   (server messages checked before they are read, LISTEN channel names
   bounded, SCRAM nonce and iteration count checks, `require_auth` and
-  SCRAM channel binding, the pool's optional session reset). The first four are
+  SCRAM channel binding, the pool's optional session reset), and for the
+  C ABI parameters as a slice of tagged unions and `QueryOpts.text_results`
+  (branch `capi-dynamic`, generic, not offered upstream yet). The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig

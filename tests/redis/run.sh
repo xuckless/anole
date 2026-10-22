@@ -72,3 +72,9 @@ echo "== $IMAGE, plain"
 "$ZIG" build test-redis --summary all -Dredis-test-url="redis://127.0.0.1:$PORT" "$@"
 echo "== $IMAGE, TLS (rediss://, an ACL user, database 1)"
 "$ZIG" build test-redis --summary all -Dredis-test-url="rediss://anole:$PASSWORD@localhost:$TLS_PORT/1?ssl_ca_certs=$CERTS/root.crt" "$@"
+# The C ABI's suite (tests/capi/consumer.c), its Redis part included, over
+# TLS; CAPI=0 skips it.
+if [ "${CAPI:-1}" != 0 ]; then
+  echo "== $IMAGE, the C ABI (rediss://)"
+  "$ZIG" build capi-test --summary all -Dredis-test-url="rediss://anole:$PASSWORD@localhost:$TLS_PORT/1?ssl_ca_certs=$CERTS/root.crt" "$@"
+fi

@@ -134,11 +134,12 @@
         },
         // -Dpostgres: Anole's fork of karlseguin/pg.zig (MIT), branch
         // `anole`: a read timeout, CancelRequest, the automatic statement
-        // cache, pool lifetimes, a refused connect's error, and TLS through
-        // an injected module (Anole's BoringSSL, src/pg/tls.zig).
+        // cache, pool lifetimes, a refused connect's error, TLS through an
+        // injected module (Anole's BoringSSL, src/pg/tls.zig), parameters
+        // as a slice of tagged unions and text results (the C ABI).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#003c011cc2461fdd21efa9a7a08108bad3199a36",
-            .hash = "pg-0.0.0-Wp_7gYm8CAB9sodlvuNgHCqxlITSi7ET3AFqyRw3M7sa",
+            .url = "git+https://github.com/xuckless/pg.zig#dea575b5f1daae55edfcc45cc7adaf7018183ba1",
+            .hash = "pg-0.0.0-Wp_7gW7OCABszevEQGLQhzswriTPtrBbU0hPt2SQoL23",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON

@@ -119,7 +119,8 @@ The URL takes libpq's parameters:
 A host that is a directory is a Unix socket's:
 `postgres://app@%2Fvar%2Frun%2Fpostgresql/app`.
 
-**TLS and logging in.** Without an `sslmode` (in the URL or `PGSSLMODE`),
+**TLS and logging in.** Without an `sslmode` (in the URL, `Options.sslmode`
+or `PGSSLMODE`, in that order),
 a server on another host is reached with `verify-full`: TLS, with its
 certificate checked against the system's store (or `sslrootcert`, or
 `Options.tls.ca`) and its host name. A server on this machine (`localhost`,
@@ -190,6 +191,17 @@ type: `try app.db.one(i64, req, "SELECT count(*) FROM posts", .{})`.
 Other types: cast in the SQL (`::text`, `::int8`). Parameters take pg.zig's
 types plus `anole.db.Time` (a timestamp). Strings in rows are copies in the
 request's arena, so they outlive the call.
+
+When the columns and parameters are known only at run time (what the C ABI
+and the language bindings do), `with(opts).table(req, sql, params)` returns
+an `anole.db.Table` (column names, type OIDs, rows of `anole.db.Value`) and
+`with(opts).run(req, sql, params)` the rows changed, with `params` a
+`[]const anole.db.Value`. Values come in PostgreSQL's text format: bool,
+the integer types and float4/float8 are converted, bytea becomes bytes,
+and everything else stays text (numeric exactly, dates as PostgreSQL prints
+them, JSON text) for the caller to parse by the column's type OID. A
+parameter goes as its type when the statement's parameter takes it in
+binary, else as text that PostgreSQL parses.
 
 ### Errors
 
@@ -794,6 +806,12 @@ const profile = try app.redis.with(.{ .cache = .{ .ttl = .fromSeconds(30), .tag 
 _ = try app.redis.hset(req, key, changed);
 app.redis.cache.invalidate(.{ .tag = "profiles" });
 ```
+
+A command known only at run time (what the C ABI and the language
+bindings send) goes through `with(opts).reply(req, args)`, with `args` a
+`[]const []const u8` (the name, then the items). It returns the `Reply`,
+and `.coalesce` and `.cache` apply as above when the name is a read
+command.
 
 ### Pipelines and transactions
 
