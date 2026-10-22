@@ -1,0 +1,48 @@
+name: testssl
+
+# testssl.sh against Anole's HTTPS listener (examples/full, development
+# certificate): protocols, cipher families, known vulnerabilities and
+# forward secrecy (tools/testssl_check.py). BREACH is informational for any
+# compressing server and is not failed on; certificate trust is ignored.
+on:
+  pull_request:
+  schedule:
+    - cron: "29 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testssl:
+    name: testssl.sh against the TLS listener
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: testssl
+      - name: Build examples/full
+        run: zig build full -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/anole"
+      - name: Start the server
+        run: |
+          ls "$RUNNER_TEMP/anole/bin"
+          "$RUNNER_TEMP/anole/bin/full" 8080 8443 > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/8443) 2>/dev/null && exit 0
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/server.log"; exit 1
+      - name: Fetch testssl.sh (pinned)
+        run: git clone --depth 1 --branch v3.2.2 https://github.com/testssl/testssl.sh.git "$RUNNER_TEMP/testssl"
+      - name: Scan
+        run: |
+          "$RUNNER_TEMP/testssl/testssl.sh" --quiet --warnings off --color 0 \
+            --jsonfile "$RUNNER_TEMP/testssl.json" 127.0.0.1:8443 || true
+      - name: Check the report
+        run: python3 tools/testssl_check.py "$RUNNER_TEMP/testssl.json"
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/server.log"
