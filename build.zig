@@ -35,6 +35,7 @@ const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
 const brotli_build = @import("build/brotli.zig");
 const yyjson_build = @import("build/yyjson.zig");
+const upb_build = @import("build/upb.zig");
 const hiredis_build = @import("build/hiredis.zig");
 const sqlite_build = @import("build/sqlite.zig");
 
@@ -102,7 +103,7 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite;
+        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite or f.grpc;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
@@ -262,21 +263,22 @@ pub fn addProtoModule(b: *std.Build, anole_dep: *std.Build.Dependency, proto: Pr
 }
 
 /// zig-protobuf's pinned protoc for the machine running the build (its
-/// `build_util.getProtocBin`, which its build.zig does not export).
+/// `build_util.getProtocBin`, which its build.zig does not export). Google's
+/// release binaries, pinned by hash in zig-protobuf's build.zig.zon; on
+/// Windows the win64 one (also on arm64 Windows, which runs x64 programs).
 fn protocBinary(pb_builder: *std.Build) ?std.Build.LazyPath {
-    const os = switch (builtin.os.tag) {
-        .macos => "osx",
-        .linux => "linux",
-        else => @compileError("protoc: Anole builds on Linux and macOS"),
+    const name = switch (builtin.os.tag) {
+        .windows => "protoc-win64",
+        .macos, .linux => "protoc-" ++ (if (builtin.os.tag == .macos) "osx" else "linux") ++ "-" ++ switch (builtin.cpu.arch) {
+            .aarch64 => "aarch_64",
+            .x86_64 => "x86_64",
+            .x86 => "x86_32",
+            else => @compileError("protoc: no pinned binary for this CPU"),
+        },
+        else => @compileError("protoc: Anole builds on Linux, macOS and Windows"),
     };
-    const arch = switch (builtin.cpu.arch) {
-        .aarch64 => "aarch_64",
-        .x86_64 => "x86_64",
-        .x86 => "x86_32",
-        else => @compileError("protoc: no pinned binary for this CPU"),
-    };
-    const dep = pb_builder.lazyDependency("protoc-" ++ os ++ "-" ++ arch, .{}) orelse return null;
-    return dep.path("bin/protoc");
+    const dep = pb_builder.lazyDependency(name, .{}) orelse return null;
+    return dep.path(if (builtin.os.tag == .windows) "bin/protoc.exe" else "bin/protoc");
 }
 
 /// The `package` a .proto file in the project declares, or null. The
@@ -505,6 +507,12 @@ pub fn build(b: *std.Build) void {
     {
         const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
         b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
+    }
+    // test-grpc: the gRPC tests alone (the native server and client, JSON
+    // transcoding, and the C ABI's gRPC server).
+    if (features.grpc) {
+        const grpc_tests = b.addTest(.{ .name = "anole-test-grpc", .root_module = tests.root_module, .filters = &.{ "gRPC", "transcoding", "capi grpc" }, .use_llvm = use_llvm });
+        b.step("test-grpc", "Run the gRPC tests (native, transcoding, the C ABI's)").dependOn(&b.addRunArtifact(grpc_tests).step);
     }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
@@ -806,6 +814,9 @@ pub fn build(b: *std.Build) void {
             hide.addArg("hide");
             hide.addFileArg(merged.getEmittedBin());
             lib_obj = hide.addOutputFileArg("anole.o");
+            // Mach-O: the merge drops N_ALT_ENTRY/N_NO_DEAD_STRIP, which the
+            // tool takes back from the inputs (tools/capi_symbols.zig).
+            if (os.isDarwin()) for (linkedInputs(b, capi_mod)) |input| hide.addFileArg(input);
             const static_lib = b.addLibrary(.{
                 .name = "anole",
                 .linkage = .static,
@@ -886,10 +897,62 @@ pub fn build(b: *std.Build) void {
             capi_test_step.dependOn(&run_consumer.step);
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
+            // The gRPC suite (tests/capi/grpc.c): its own process, as one
+            // anole_server is allowed per process.
+            if (features.grpc) {
+                const grpc_c = b.addExecutable(.{
+                    .name = "capi-grpc",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                grpc_c.root_module.addCSourceFile(.{ .file = b.path("tests/capi/grpc.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                grpc_c.root_module.addIncludePath(b.path("include"));
+                grpc_c.root_module.linkLibrary(static_lib);
+                const run_grpc_c = b.addRunArtifact(grpc_c);
+                run_grpc_c.stdio = .inherit;
+                run_grpc_c.has_side_effects = true;
+                capi_test_step.dependOn(&run_grpc_c.step);
+                const grpc_step = b.step("capi-grpc", "Build the C gRPC consumers (tests/capi/grpc.c; grpc_interop.c, grpc.testing.TestService for tests/grpc/interop/run.sh)");
+                grpc_step.dependOn(&b.addInstallArtifact(grpc_c, .{}).step);
+                const interop_c = b.addExecutable(.{
+                    .name = "capi-grpc-interop",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                interop_c.root_module.addCSourceFile(.{ .file = b.path("tests/capi/grpc_interop.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                interop_c.root_module.addIncludePath(b.path("include"));
+                interop_c.root_module.linkLibrary(static_lib);
+                grpc_step.dependOn(&b.addInstallArtifact(interop_c, .{}).step);
+                // Compiled with capi-test, so it cannot rot; run by hand or in CI.
+                capi_test_step.dependOn(&interop_c.step);
+            }
+
+            // A TLS listener in a program linked with dead-stripping, as
+            // bindings and release links are (tests/capi/tls_start.c): the
+            // packed object must survive being cut at its symbols. Zig's
+            // linker here; the system's in capi-test-asan.
+            const tls_driver = if (features.tls == .boringssl) b.addExecutable(.{
+                .name = "capi-tls-start-driver",
+                .root_module = b.createModule(.{ .root_source_file = b.path("tests/capi/tls_start.zig"), .target = b.graph.host, .optimize = .Debug }),
+            }) else null;
+            if (tls_driver) |driver| {
+                const tls_start = b.addExecutable(.{
+                    .name = "capi-tls-start",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                tls_start.root_module.addCSourceFile(.{ .file = b.path("tests/capi/tls_start.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                tls_start.root_module.addIncludePath(b.path("include"));
+                tls_start.root_module.linkLibrary(static_lib);
+                tls_start.link_gc_sections = true; // Mach-O -dead_strip, ELF --gc-sections
+                const run_tls_start = b.addRunArtifact(driver);
+                run_tls_start.addArtifactArg(tls_start);
+                run_tls_start.has_side_effects = true;
+                run_tls_start.stdio = .inherit;
+                capi_test_step.dependOn(&run_tls_start.step);
+            }
+
             // capi-test-asan: the C suite built by the system C compiler
             // with AddressSanitizer and UBSan (Zig ships no ASan runtime);
             // libanole itself keeps Zig's own safety checks.
-            const asan_step = b.step("capi-test-asan", "Run the C ABI suite built with -fsanitize=address,undefined (needs a system cc)");
+            const asan_step = b.step("capi-test-asan", "Run the C ABI suite built with -fsanitize=address,undefined, and a TLS listener in a dead-stripped link (needs a system cc)");
             const cc = b.addSystemCommand(&.{ "cc", "-O1", "-g", "-std=c11", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined" });
             cc.addPrefixedDirectoryArg("-I", b.path("include"));
             cc.addFileArg(b.path("tests/capi/consumer.c"));
@@ -909,6 +972,20 @@ pub fn build(b: *std.Build) void {
             if (redis_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
             if (mongodb_test_url) |url| run_asan.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
             asan_step.dependOn(&run_asan.step);
+            if (tls_driver) |driver| {
+                const ds = b.addSystemCommand(&.{ "cc", "-O2", "-std=c11" });
+                ds.addPrefixedDirectoryArg("-I", b.path("include"));
+                ds.addFileArg(b.path("tests/capi/tls_start.c"));
+                ds.addFileArg(static_lib.getEmittedBin());
+                if (os == .linux) ds.addArgs(&.{ "-Wl,--gc-sections", "-lpthread", "-ldl", "-lm" }) else ds.addArg("-Wl,-dead_strip");
+                ds.addArg("-o");
+                const ds_exe = ds.addOutputFileArg("capi-tls-start-cc");
+                const run_ds = b.addRunArtifact(driver);
+                run_ds.addFileArg(ds_exe);
+                run_ds.has_side_effects = true;
+                run_ds.stdio = .inherit;
+                asan_step.dependOn(&run_ds.step);
+            }
         }
         test_step.dependOn(capi_test_step);
         capi_step.dependOn(&b.addInstallHeaderFile(b.path("include/anole.h"), "anole.h").step);
@@ -1353,6 +1430,8 @@ const CModules = struct {
     protobuf: ?*std.Build.Module = null,
     /// yyjson.h (json)
     yyjson: ?*std.Build.Module = null,
+    /// src/capi/upb_shim.h over upb (grpc): the C ABI's gRPC JSON.
+    upb: ?*std.Build.Module = null,
     /// hiredis.h (redis)
     hiredis: ?*std.Build.Module = null,
     /// xuckless/zig-jwt (auth).
@@ -1386,6 +1465,7 @@ const CModules = struct {
         const websocket_dep = if (f.websocket) b.lazyDependency("websocket_zig", .{ .target = target, .optimize = optimize }) else null;
         const protobuf_dep = if (f.grpc) b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) else null;
         const yyjson_dep = if (f.json) b.lazyDependency("yyjson", .{}) else null;
+        const upb_dep = if (f.grpc) b.lazyDependency("upb", .{}) else null;
         const hiredis_dep = if (f.redis) b.lazyDependency("hiredis", .{}) else null;
         const jwt_dep = if (f.auth) b.lazyDependency("zig_jwt", .{ .target = target, .optimize = optimize }) else null;
         const pg_tls_dep = if (f.postgres and f.needsTls()) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .injected }) else null;
@@ -1406,6 +1486,7 @@ const CModules = struct {
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
+        if (f.grpc and upb_dep == null) return null;
         if (f.redis and hiredis_dep == null) return null;
         if (f.auth and jwt_dep == null) return null;
         if (f.postgres and (pg_plain_dep == null or (f.needsTls() and pg_tls_dep == null))) return null;
@@ -1450,6 +1531,10 @@ const CModules = struct {
         if (yyjson_dep) |up| {
             const lib = yyjson_build.library(b, up, target, optimize);
             m.yyjson = yyjson_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
+        if (upb_dep) |up| {
+            const lib = upb_build.library(b, up, target, optimize);
+            m.upb = upb_build.module(b, Translator, tc_dep.?, lib, target, optimize);
         }
         if (zstd_dep) |up| {
             const lib = zstd_build.library(b, up, target, optimize);
@@ -1559,7 +1644,10 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         mod.addImport("anole_h2_client", o.core.h2Client(f));
     }
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
-    if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
+    if (f.grpc) {
+        mod.addImport("protobuf", o.c.protobuf.?);
+        mod.addImport("anole_upb_c", o.c.upb.?);
+    }
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
     if (f.mongodb) mod.addImport("bson", o.bson.?);
@@ -1587,6 +1675,24 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         .optimize = o.optimize,
         .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
     }));
+    // The test services' descriptors (a FileDescriptorSet with imports,
+    // made by the pinned protoc), for the C ABI's gRPC tests: what a
+    // consumer passes as grpc.descriptor_set.
+    if (f.grpc and o.for_test) if (b.lazyDependency("protobuf", .{ .target = b.graph.host })) |pb_dep| if (protocBinary(pb_dep.builder)) |protoc| {
+        const run = b.addRunFile(protoc);
+        run.setName("protoc test descriptors");
+        run.addArg("--include_imports");
+        const set = run.addPrefixedOutputFileArg("--descriptor_set_out=", "test.binpb");
+        run.addArg("-I");
+        run.addDirectoryArg(b.path("tests/grpc/proto"));
+        run.addArg("-I");
+        run.addDirectoryArg(b.path("src/grpc/proto"));
+        run.addFileArg(b.path("tests/grpc/proto/echo.proto"));
+        run.addFileArg(b.path("tests/grpc/proto/transcode.proto"));
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(set, "test.binpb");
+        mod.addAnonymousImport("anole_test_descriptors", .{ .root_source_file = wf.add("descriptors.zig", "pub const set = @embedFile(\"test.binpb\");\n") });
+    };
     if (f.compression) {
         mod.addImport("anole_zlib", o.c.zlib.?);
         mod.addImport("anole_zlib_c", o.c.zlib_c.?);
@@ -1603,4 +1709,23 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         if (o.for_test) mod.addImport("anole_h3_layout", o.c.h3_layout.?);
     }
     return mod;
+}
+
+/// Every static library and object a module links, through the modules it
+/// imports and the libraries those link (for tools/capi_symbols.zig).
+fn linkedInputs(b: *std.Build, root: *std.Build.Module) []const std.Build.LazyPath {
+    var out: std.ArrayList(std.Build.LazyPath) = .empty;
+    var seen: std.AutoHashMapUnmanaged(*std.Build.Step.Compile, void) = .empty;
+    var todo: std.ArrayList(*std.Build.Module) = .empty;
+    todo.append(b.allocator, root) catch @panic("OOM");
+    while (todo.pop()) |top| for (top.getGraph().modules) |m| for (m.link_objects.items) |lo| switch (lo) {
+        .static_path => |p| out.append(b.allocator, p) catch @panic("OOM"),
+        .other_step => |c| if (c.kind == .lib and c.linkage != .dynamic) {
+            if ((seen.getOrPut(b.allocator, c) catch @panic("OOM")).found_existing) continue;
+            out.append(b.allocator, c.getEmittedBin()) catch @panic("OOM");
+            todo.append(b.allocator, c.root_module) catch @panic("OOM");
+        },
+        else => {},
+    };
+    return out.items;
 }

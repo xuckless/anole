@@ -123,6 +123,10 @@ fn answer(err: engine.AnswerError) i32 {
         error.Unsupported => abi.E_UNSUPPORTED,
         error.Timeout => abi.E_TIMEOUT,
         error.Again => abi.E_AGAIN,
+        error.State => blk: {
+            setError("not in this state (a second message for a unary answer, metadata after the first message, OK without a response message, ...)", .{});
+            break :blk abi.E_STATE;
+        },
     };
 }
 
@@ -155,6 +159,7 @@ export fn anole_has_feature(name: Str) c_int {
         .{ "compression", f.compression },
         .{ "brotli", f.brotli },
         .{ "auth", f.auth },
+        .{ "grpc", f.grpc },
         .{ "sqlite", f.sqlite },
         .{ "postgres", f.postgres },
         .{ "redis", f.redis },
@@ -408,6 +413,65 @@ export fn anole_ws_publish(s: ?*anyopaque, topic: Str, typ: c_int, data: ?*const
     const e = engineOf(s) orelse return abi.E_INVALID;
     const b = bytes(data, len) orelse return abi.E_INVALID;
     engine.ws.publish(e, topic.slice(), typ, b, except) catch |err| return answer(err);
+    return abi.OK;
+}
+
+// ---- gRPC ------------------------------------------------------------------------------
+
+const have_grpc = anole.features.grpc;
+
+export fn anole_grpc_send_headers(c: u64, metadata: ?[*]const Header, n: usize) i32 {
+    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    const md = headersOf(metadata, n) orelse return abi.E_INVALID;
+    engine.grpc.sendHeaders(e, c, md) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_grpc_send(c: u64, msg: ?*const anyopaque, len: usize, flags: u32) i32 {
+    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    if (flags & ~(abi.BODY_BORROW | abi.GRPC_SEND_FINISH) != 0) return abi.E_INVALID;
+    const b = bytes(msg, len) orelse return abi.E_INVALID;
+    const busy = engine.grpc.send(e, c, b, flags & abi.BODY_BORROW != 0, flags & abi.GRPC_SEND_FINISH != 0) catch |err| return answer(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_grpc_send_wait(c: u64, msg: ?*const anyopaque, len: usize, timeout_ms: i32) i32 {
+    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    const b = bytes(msg, len) orelse return abi.E_INVALID;
+    engine.grpc.sendWait(e, c, b, timeout_ms) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_grpc_finish(c: u64, code: u32, message: Str, trailers: ?[*]const Header, n: usize) i32 {
+    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    const ts = headersOf(trailers, n) orelse return abi.E_INVALID;
+    engine.grpc.finish(e, c, code, message.slice(), ts) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_grpc_read(c: u64, n: u32) i32 {
+    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    const e = live() orelse return abi.E_GONE;
+    if (n == 0) return abi.E_INVALID;
+    engine.grpc.read(e, c, n) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_grpc_health_set(s: ?*anyopaque, service: Str, status: c_int) i32 {
+    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    clearError();
+    const e = engineOf(s) orelse return abi.E_INVALID;
+    engine.grpc.healthSet(e, service.slice(), status) catch |err| return switch (err) {
+        error.State => blk: {
+            setError("anole_grpc_health_set: the configuration has no \"grpc\": {{\"health\": true}}", .{});
+            break :blk abi.E_STATE;
+        },
+        else => answer(err),
+    };
     return abi.OK;
 }
 

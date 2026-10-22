@@ -660,6 +660,16 @@ pass their framing cases over h2c and TLS and the TLS profile, except five
 results the tool itself causes (listed with reasons in
 `tests/grpc/interop/http2-known-failures.txt`). All of it runs in CI.
 
+## From other languages
+
+The C ABI (`libanole`, what anole-node and anole-py are built on) serves
+gRPC services whose methods are written in the binding's language: Anole
+keeps the protocols, framing, compression, deadlines, limits, Connect,
+gRPC-Web, JSON transcoding and the health service, and hands each call to
+the language as protobuf bytes. See [the C ABI's gRPC section](c-abi.md#grpc).
+The same interop client passes its 14 cases against a C implementation of
+the test service on that ABI (`tests/capi/grpc_interop.c`).
+
 ## Not there yet
 
 - gRPC over HTTP/3. Native gRPC runs over HTTP/2 only.

@@ -49,6 +49,14 @@ pub const ws = if (features.websocket) @import("ws.zig") else struct {
         pub fn deinit(_: *ExecState) void {}
     };
 };
+/// gRPC services implemented by consumers (`anole_grpc_*`).
+pub const grpc = if (features.grpc) @import("grpc.zig") else struct {
+    pub const SlotState = struct {};
+    pub const ExecState = struct {
+        pub fn deinit(_: *ExecState) void {}
+    };
+    pub const EngineState = struct {};
+};
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const config = config_mod;
@@ -89,13 +97,13 @@ pub const SlotState = enum(u32) {
     expired,
 };
 
-fn pack(gen: u32, state: SlotState) u64 {
+pub fn pack(gen: u32, state: SlotState) u64 {
     return (@as(u64, gen) << 32) | @backingInt(state);
 }
-fn genOf(word: u64) u32 {
+pub fn genOf(word: u64) u32 {
     return @intCast(word >> 32);
 }
-fn stateOf(word: u64) SlotState {
+pub fn stateOf(word: u64) SlotState {
     return @fromBackingInt(@intCast(@as(u32, @truncate(word))));
 }
 
@@ -135,12 +143,15 @@ pub fn nextGen(gen: u32) u32 {
     return if (gen >= max_gen) 1 else gen + 1;
 }
 
-const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
+pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
 const Reply = enum { respond, release, fd };
 
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
+    /// What its handles are (`Handle.Kind`): a request, or a gRPC call.
+    /// Set by the executor while the slot is free.
+    kind: std.atomic.Value(u8) = .init(@backingInt(Handle.Kind.request)),
     /// What a waiting request's task waits on (an answer, the deadline,
     /// stream data), and what an attached stream task waits on.
     event: std.Io.Event = .unset,
@@ -205,11 +216,13 @@ pub const Slot = struct {
     /// way must not free a slot still on it).
     drained: std.atomic.Value(bool) = .init(true),
     next_free: u32 = no_slot,
+    /// A gRPC call's own state (`kind` grpc_call).
+    grpc: grpc.SlotState = .{},
 
     /// Above this, a slot's answer buffer is freed after use.
     const keep_capacity = 64 * 1024;
 
-    fn replyBody(s: *const Slot) []const u8 {
+    pub fn replyBody(s: *const Slot) []const u8 {
         if (s.borrowed) |b| return b;
         return s.bytes.items[s.body_off..][0..s.body_len];
     }
@@ -252,7 +265,7 @@ const Ring = struct {
         gpa.free(r.buf);
     }
     /// Producer. False when full.
-    fn push(r: *Ring, e: Entry) bool {
+    pub fn push(r: *Ring, e: Entry) bool {
         const tail = r.tail.raw;
         if (tail - r.head.load(.acquire) == r.buf.len) return false;
         r.buf[tail & r.mask] = e;
@@ -261,7 +274,7 @@ const Ring = struct {
         r.tail.store(tail + 1, .seq_cst);
         return true;
     }
-    fn full(r: *Ring) bool {
+    pub fn full(r: *Ring) bool {
         return r.tail.raw - r.head.load(.acquire) == r.buf.len;
     }
     /// Consumer.
@@ -339,13 +352,20 @@ pub const Exec = struct {
     /// whole messages.
     record_bytes: std.atomic.Value(usize) = .init(0),
     ws: ws.ExecState = .{},
+    grpc: grpc.ExecState = .{},
     db: db.ExecState = .{},
 
-    fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
+    /// The capi task is asleep for a whole request timeout: wakes it, as a
+    /// deadline (or a lost doorbell) now needs watching.
+    pub fn wakeIfIdle(x: *Exec) void {
         if (x.idle) {
             x.idle = false;
             x.kick.set(x.engine.io);
         }
+    }
+
+    fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
+        x.wakeIfIdle();
         const s = &x.slots[i];
         s.deadline = deadline;
         s.list = list;
@@ -367,7 +387,7 @@ pub const Exec = struct {
         s.linked = false;
     }
 
-    fn alloc(x: *Exec) ?u32 {
+    pub fn alloc(x: *Exec) ?u32 {
         const i = x.free_head;
         if (i == no_slot) return null;
         x.free_head = x.slots[i].next_free;
@@ -376,7 +396,7 @@ pub const Exec = struct {
 
     /// Frees slot `i`: a new generation makes every handle to the old one
     /// stale. What its pipes still hold is freed or reported sent.
-    fn release(x: *Exec, i: u32) void {
+    pub fn release(x: *Exec, i: u32) void {
         x.unlink(i);
         const s = &x.slots[i];
         const gen = genOf(s.word.load(.monotonic));
@@ -402,6 +422,8 @@ pub const Exec = struct {
         s.orphan = false;
         s.body_error = null;
         s.claims = "";
+        if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
+        s.kind.store(@backingInt(Handle.Kind.request), .monotonic);
         _ = x.engine.inflight.fetchSub(1, .monotonic);
         // 0 is skipped so that no handle is ever 0.
         const next = nextGen(gen);
@@ -410,7 +432,7 @@ pub const Exec = struct {
         x.free_head = i;
     }
 
-    fn closePipe(x: *Exec, p: *Pipe, gen: u32, i: u32) void {
+    pub fn closePipe(x: *Exec, p: *Pipe, gen: u32, i: u32) void {
         p.acquire();
         const was_open = p.gen != 0;
         const rest = p.close();
@@ -475,8 +497,9 @@ pub const Exec = struct {
         if (old == null) x.kick.set(x.engine.io);
     }
 
-    fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
-        return Handle.encode(.{ .gen = @intCast(gen), .kind = .request, .slot = @intCast(i), .exec = x.index });
+    pub fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
+        const kind: Handle.Kind = @fromBackingInt(@intCast(x.slots[i].kind.load(.monotonic)));
+        return Handle.encode(.{ .gen = @intCast(gen), .kind = kind, .slot = @intCast(i), .exec = x.index });
     }
 };
 
@@ -660,6 +683,8 @@ pub const Engine = struct {
     dbs: []db.Db = &.{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa) else {},
+    /// gRPC services, methods, descriptors and health.
+    grpc: grpc.EngineState = .{},
 
     pub fn create(json: []const u8, signals: bool, why: *std.Io.Writer) !*Engine {
         const e = try gpa.create(Engine);
@@ -676,6 +701,8 @@ pub const Engine = struct {
         const a = e.arena.allocator();
         // The document is copied: parsed values may point into it.
         e.config = try config_mod.parse(a, try a.dupe(u8, json), why);
+        if (comptime features.grpc) try grpc.init(e, why);
+        errdefer if (comptime features.grpc) grpc.deinit(e);
         const cfg = &e.config;
         e.inline_body_max = cfg.limits.inline_body_max;
         e.stream_high_water = cfg.limits.stream_high_water;
@@ -705,6 +732,7 @@ pub const Engine = struct {
     /// Whether any route sends events to a consumer.
     pub fn needsConsumer(e: *const Engine) bool {
         for (e.config.routes) |r| if (r.handler != null or r.websocket != null) return true;
+        if (e.config.grpc) |g| if (g.services.len > 0) return true;
         return false;
     }
 
@@ -849,6 +877,7 @@ pub const Engine = struct {
         if (cfg.observe.health) |h| _ = app.health(.{ .healthz_path = h.live, .readyz_path = h.ready });
         for (cfg.middleware) |m| app.use(try config_mod.middleware(app, a, m));
         const global_ok = config_mod.neverWaits(cfg.middleware);
+        if (comptime features.grpc) try grpc.buildRoutes(e, app, global_ok);
         for (cfg.routes) |rc| {
             const method: ?http.Method = if (rc.method) |m| config_mod.methodOf(m) else null;
             var chain: std.ArrayList(M) = .empty;
@@ -1008,8 +1037,10 @@ pub const Engine = struct {
                 c.run(c, x);
             }
             x.ws.deinit();
+            x.grpc.deinit();
         }
         gpa.free(e.execs);
+        if (comptime features.grpc) grpc.deinit(e);
         for (e.consumers.items) |c| {
             c.deinit();
             gpa.destroy(c);
@@ -1438,7 +1469,7 @@ fn releaseChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
 
 /// A chunk nobody reads any more: freed, reported sent, or left to the
 /// request's arena.
-fn dropChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
+pub fn dropChunk(x: *Exec, si: u32, gen: u32, ch: Chunk) void {
     switch (ch.owner) {
         .pipe => gpa.free(ch.data),
         .consumer => x.postSent(x.handleOf(si, gen), ch.data),
@@ -1550,7 +1581,7 @@ fn failBody(x: *Exec, si: u32, gen: u32, status: http.Status) void {
 /// The engine let go of a detached request (its stream or connection
 /// ended). On the request's executor; afterwards nothing here may touch
 /// the request.
-fn detachedAborted(ctx: *anyopaque) void {
+pub fn detachedAborted(ctx: *anyopaque) void {
     const s: *Slot = @ptrCast(@alignCast(ctx));
     const e = global.?;
     const x = execOfSlot(e, s);
@@ -1684,6 +1715,10 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
                 if (stateOf(w) == .streaming) x.postEvent(.abort, x.handleOf(si, genOf(w)));
                 x.release(si);
             } else if (s.detached != null) {
+                if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) {
+                    grpc.finishDetached(x, si);
+                    continue;
+                };
                 finishDetached(x, si);
             } else s.event.set(io);
         }
@@ -1736,6 +1771,11 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
                 any_out = true;
             }
         }
+        // gRPC calls' deadlines (each call's own).
+        if (comptime features.grpc) if (grpc.sweep(x, now)) |next| {
+            until = @min(until, next);
+            any_out = true;
+        };
         // Requests out: also watch for a lost doorbell, every rewake_ms.
         if (e.rewake > 0 and (any_out or !x.ring.isEmpty())) if (x.consumer) |c| {
             if (!x.ring.isEmpty() and c.awake.load(.acquire) and now - c.last_poll.load(.monotonic) > e.rewake) c.rewake();
@@ -1925,15 +1965,15 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool) PollError!usize {
                     x.ring.pop();
                     continue;
                 }
-                const head = headOf(s);
-                const size = head.size();
+                const is_grpc = features.grpc and h.kind == .grpc_call;
+                const size = if (is_grpc) grpc.recordSize(s) else headOf(s).size();
                 if (size > out.len - pos) {
                     s.word.store(queued, .release);
                     if (pos == 0) return error.TooBig;
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += head.encode(.request, entry.handle, out[pos..][0..size]);
+                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size]) else headOf(s).encode(.request, entry.handle, out[pos..][0..size]);
                 s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
                 progressed = true;
@@ -1989,16 +2029,24 @@ pub fn pollWait(c: *Consumer, out: []u8, timeout_ms: i32) PollError!usize {
 // ---------------------------------------------------------------------------
 // Consumer side: answers (any thread)
 
-pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again };
+pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again, State };
 
 pub const CHeader = abi.Header;
 
 fn slotOf(e: *Engine, hv: u64) ?struct { *Exec, *Slot, Handle } {
+    return slotOfKind(e, hv, .request);
+}
+
+/// The slot a handle of `kind` names, if it could be one: the generation
+/// is the caller's to check (a stale handle finds its slot moved on).
+pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) ?struct { *Exec, *Slot, Handle } {
     const h = Handle.decode(hv);
-    if (h.gen == 0 or h.kind != .request or h.exec >= e.execs.len) return null;
+    if (h.gen == 0 or h.kind != kind or h.exec >= e.execs.len) return null;
     const x = &e.execs[h.exec];
     if (h.slot >= x.slots.len) return null;
-    return .{ x, &x.slots[h.slot], h };
+    const s = &x.slots[h.slot];
+    if (s.kind.load(.acquire) != @backingInt(kind)) return null;
+    return .{ x, s, h };
 }
 
 /// Claims slot `hv` for an answer: `out` to `responding`.
@@ -2009,7 +2057,7 @@ fn claim(e: *Engine, hv: u64) error{Gone}!struct { *Exec, *Slot, Handle } {
 }
 
 /// Hands slot `si` to its executor (`done` or `streaming`).
-fn handBack(x: *Exec, s: *Slot, h: Handle, state: SlotState) void {
+pub fn handBack(x: *Exec, s: *Slot, h: Handle, state: SlotState) void {
     s.drained.store(false, .monotonic);
     s.word.store(pack(h.gen, state), .release);
     // Onto the executor's done list; only the push that finds it empty
@@ -2022,7 +2070,7 @@ fn handBack(x: *Exec, s: *Slot, h: Handle, state: SlotState) void {
     if (old == no_slot) x.kick.set(x.engine.io);
 }
 
-fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
+pub fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
     var total: usize = 0;
     for (headers) |hd| {
         total += hd.name.len + hd.value.len;
@@ -2035,7 +2083,7 @@ fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
     return total;
 }
 
-fn storeHeaders(list: *std.ArrayList(ReplyHeader), bytes: *std.ArrayList(u8), headers: []const CHeader, extra: usize) !void {
+pub fn storeHeaders(list: *std.ArrayList(ReplyHeader), bytes: *std.ArrayList(u8), headers: []const CHeader, extra: usize) !void {
     var total = extra;
     for (headers) |hd| total += hd.name.len + hd.value.len;
     if (total > std.math.maxInt(u32)) return error.Invalid;
@@ -2258,4 +2306,5 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
 test {
     _ = config_mod;
     _ = @import("engine_test.zig");
+    if (features.grpc) _ = grpc;
 }

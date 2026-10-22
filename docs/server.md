@@ -181,6 +181,7 @@ not load or an address that does not parse is returned by `listen`, and by
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
 | `error_handler` | `null` | A function that answers handler errors, with `anole.defaultError` to fall back on. |
 | `server` | `.{}` | The rest of the HTTP core's `ServerConfig`: timeouts, limits, proxies. |
+| `client` | `.{}` | The server's outbound client (`anole.client(req)`): its `ClientConfig`, with the connection pool, timeout and CAs; see [clients.md](clients.md#the-connection-pool). |
 
 You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
