@@ -37,7 +37,7 @@
 //!         }
 //!     }
 //!
-//! HTTP/1.1 runs on the HTTP core's RFC 6455 implementation (from
+//! HTTP/1.1 runs on the HTTP core's RFC 6455 implementation (adapted from
 //! lalinsky/dusty, MIT). HTTP/2 and HTTP/3 run on the sans-IO frame codec
 //! of xuckless/websocket-zig (a fork of mattrobenolt/websocket-zig, MIT)
 //! over the stream's request body and streamed response; h2_socket.zig is
@@ -55,9 +55,8 @@
 //!
 //! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
 //! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
-//! upgrades with `upgrade` here, not the core's HTTP/1.1-only
-//! `anole.websocket.upgrade`, or turn `http2.enable_connect_protocol` (and
-//! `http3.enable_connect_protocol`) off.
+//! upgrades with `upgrade` here, or turn `http2.enable_connect_protocol`
+//! (and `http3.enable_connect_protocol`) off.
 //!
 //! permessage-deflate (RFC 7692) is accepted when offered and
 //! `-Dcompression` is on (`UpgradeOptions.compression`), on either version.

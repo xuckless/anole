@@ -128,25 +128,27 @@ The same route serves every version. An RFC 8441 or RFC 9220 request
 reaches the router as a `GET` with `req.protocol` set to `"websocket"`. On
 the wire the server accepts it with a 200, as both RFCs require, but the
 access log, metrics and spans record it as 101, like an HTTP/1.1 upgrade, so
-a WebSocket reads the same on all of them. `ws.conn` tells you which kind
-you got: `.h1`, or `.h2` for a socket on a stream (HTTP/2 or HTTP/3).
+a WebSocket reads the same on all of them. `ws.httpVersion()` tells you
+which version you got (`.http1`, `.http2` or `.http3`), and `ws.isClosed()`
+whether a close went out or came in or the connection ended.
 
 The socket lives as long as the handler. It is held in the request's arena,
 so do not keep a pointer to it after the handler returns. Always
 `defer ws.deinit()`; on HTTP/2 and HTTP/3 that also ends the stream.
 
-Over HTTP/2, call `anole.websocket.upgrade`, not the HTTP core's
-`res.upgradeWebSocket`. That call handles HTTP/1.1 only and returns null
-for an HTTP/2 request. If you must keep code that uses it, turn RFC 8441 off
-in the server options (keep the stream limit, which this field replaces):
+Always open a socket with `anole.websocket.upgrade` (or `app.ws`,
+`app.wsCallbacks`): it covers all three versions, checks `Origin` and
+negotiates the extensions. A server that must not accept RFC 8441 or
+RFC 9220 handshakes turns them off in the server options (keep the stream
+limit, which this field replaces):
 
 ```zig
 .http2 = .{ .max_concurrent_streams = 250, .enable_connect_protocol = false },
 ```
 
-Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
-(`res.upgradeWebSocket` never handled HTTP/3 anyway). A plain CONNECT, without
-`:protocol`, gets 501 over HTTP/3: Anole is no proxy.
+Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same.
+A plain CONNECT, without `:protocol`, gets 501 over HTTP/3: Anole is no
+proxy.
 
 ### Upgrade options
 
@@ -161,6 +163,43 @@ Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same
 | `deflate` | see below | Compressor settings. |
 | `close_on_drain` | true | Send close 1001 when the server starts to drain (see [Shutdown](#shutdown)). |
 | `drain_reason` | `"server shutting down"` | The reason in that close frame. |
+| `subprotocols` | none | The subprotocols you speak, most preferred first (see [Subprotocols and handshake headers](#subprotocols-and-handshake-headers)). |
+| `headers` | none | Extra headers on the handshake's answer. |
+
+### Subprotocols and handshake headers
+
+Browsers fail a connection whose answer does not echo the subprotocol they
+asked for (graphql-transport-ws, STOMP, MQTT). List yours, most preferred
+first; the first one the client offered in `Sec-WebSocket-Protocol` is
+selected and echoed, and `ws.subprotocol` says which (null when the client
+offered none of them: the socket then opens without one, as RFC 6455
+4.2.2 asks). Each must be a token.
+
+```zig
+fn chat(app: *App, req: *anole.Request, res: *anole.Response) !void {
+    if (!anole.websocket.isUpgrade(req)) return res.fail(.upgrade_required, "");
+    const user = (try app.sessions.user(req)) orelse return res.fail(.unauthorized, "");
+    var ws = (try anole.websocket.upgrade(req, res, .{
+        .subprotocols = &.{"graphql-transport-ws"},
+        .headers = &.{.{ .name = "X-User", .value = user.id }},
+    })).?;
+    defer ws.deinit();
+    while (try ws.next()) |msg| try handle(app, &ws, msg);
+}
+```
+
+`headers` go out with the handshake's answer (a cookie, a request ID). The
+names the handshake writes itself (`Upgrade`, `Connection`,
+`Sec-WebSocket-*`) and the framing headers (`Content-Length`,
+`Transfer-Encoding`) are refused with `error.InvalidHeaderName`.
+
+`anole.websocket.isUpgrade(req)` tells a handler whether the request is a
+handshake before it decides (authentication, rate limits): answer 401 or
+403 yourself instead of calling `upgrade`, as a browser sees them as a
+failed connection. `offeredSubprotocols(req)` iterates what the client
+offered and `selectSubprotocol(req, preferred)` applies the rule. Route
+middleware runs before `app.ws` and `app.wsCallbacks` handlers, so a 401
+from middleware refuses those handshakes too.
 
 ### Origins
 
@@ -194,9 +233,6 @@ options. `.any` lets every page in; use it only for an endpoint that does
 not trust cookies or other credentials the browser adds itself, such as one
 that authenticates with a token in its first message. The C ABI's WebSocket
 routes take `"origins": ["https://app.example.com"]` (or `["*"]`).
-
-The HTTP core's own `res.upgradeWebSocket` does not check `Origin`; check it
-yourself if you call it directly.
 
 ## Receiving and sending
 

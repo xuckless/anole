@@ -33,9 +33,10 @@ const App = struct {
 const chat_idle: std.Io.Duration = .fromSeconds(300);
 
 fn versionName(ws: *const websocket.Socket) []const u8 {
-    return switch (ws.conn) {
-        .h1 => "HTTP/1.1",
-        .h2 => "HTTP/2",
+    return switch (ws.httpVersion()) {
+        .http1 => "HTTP/1.1",
+        .http2 => "HTTP/2",
+        .http3 => "HTTP/3",
     };
 }
 
