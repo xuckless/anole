@@ -7,6 +7,12 @@ breaking changes are listed anyway.
 
 ### Security
 
+- HTTP/2: a stream refused before it reached a handler (a header list past
+  `max_header_list_size`, or one nghttp2 rejects) is freed when it closes;
+  it used to be kept until the connection ended, so one connection could
+  hold memory without bound. A peer whose streams keep being refused is
+  sent GOAWAY(ENHANCE_YOUR_CALM) past `http2.refused_stream_burst` (100,
+  refilled at `refused_stream_rate`, 10 a second).
 - PROXY protocol v2: a header whose TLV length is near 65535 is refused
   instead of crashing the process (or, in ReleaseFast, reading past a
   buffer). Only listeners with `proxy_protocol = true` were affected.

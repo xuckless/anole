@@ -231,6 +231,10 @@ pub fn Engine(comptime Ctx: type) type {
             writer_gone: bool = false,
             /// In `Registry`.
             node: std.DoublyLinkedList.Node = .{},
+            /// `refusedHead`'s token bucket: what is left, and the second
+            /// it was last refilled.
+            refused_tokens: u64 = 0,
+            refused_at: i64 = 0,
 
             /// Bumped (under the mutex) whenever the session may have output.
             /// The writer waits on it.
@@ -577,6 +581,8 @@ pub fn Engine(comptime Ctx: type) type {
                 .allocator = server.allocator,
                 .config = server.config.http2,
                 .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
+                .refused_tokens = server.config.http2.refused_stream_burst,
+                .refused_at = std.Io.Clock.awake.now(server.io).toSeconds(),
             };
             defer conn.ready.deinit(conn.allocator);
             defer conn.awaiting.deinit(conn.allocator);
@@ -2028,9 +2034,41 @@ pub fn Engine(comptime Ctx: type) type {
             if (stream.reset) stream.cancelHandler();
             // Reset with its response detached: the owner lets go now.
             if (stream.reset) abortDetached(stream);
+            // A stream whose head never completed (refused for its size,
+            // or by nghttp2's checks) has no handler and never will: free
+            // it now rather than with the connection. One waiting for its
+            // body to run inline (`await_body`) is let go by
+            // `startAwaiting`.
+            if (!stream.counted and !stream.await_body) {
+                stream.handler_done = true;
+                if (!conn.closing) refusedHead(conn, session);
+            }
             stream.release(.protocol);
             conn.kickWriter();
             return 0;
+        }
+
+        /// Counts a stream the server refused before it reached a handler.
+        /// Each costs the server the head it decoded but costs the peer
+        /// only a few bytes (the resets are the server's, which
+        /// `stream_reset_burst` does not count), so past
+        /// `refused_stream_burst`, refilled at `refused_stream_rate` a
+        /// second, the connection ends with GOAWAY(ENHANCE_YOUR_CALM).
+        /// Under the mutex.
+        fn refusedHead(conn: *Conn, session: ?*c.nghttp2_session) void {
+            const now = std.Io.Clock.awake.now(conn.io).toSeconds();
+            const burst = conn.config.refused_stream_burst;
+            if (now > conn.refused_at) {
+                const refill = std.math.mul(u64, @intCast(now - conn.refused_at), conn.config.refused_stream_rate) catch burst;
+                conn.refused_tokens = @min(burst, conn.refused_tokens +| refill);
+                conn.refused_at = now;
+            }
+            if (conn.refused_tokens > 0) {
+                conn.refused_tokens -= 1;
+                return;
+            }
+            log.debug("HTTP/2: too many refused streams, closing the connection", .{});
+            _ = c.nghttp2_session_terminate_session(session, c.NGHTTP2_ENHANCE_YOUR_CALM);
         }
 
         /// Data provider: takes what the handler queued without waiting.

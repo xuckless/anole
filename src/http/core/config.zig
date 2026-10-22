@@ -423,6 +423,13 @@ pub const ServerConfig = struct {
         stream_reset_rate: u64 = 33,
         /// CONTINUATION frames allowed after one HEADERS (CVE-2024-28182).
         max_continuations: usize = 8,
+        /// Streams the server may refuse before they reach a handler (a
+        /// header list past `max_header_list_size`, or one nghttp2's checks
+        /// reject) in a burst, refilled at `refused_stream_rate` per
+        /// second, before the connection is closed with
+        /// GOAWAY(ENHANCE_YOUR_CALM).
+        refused_stream_burst: u64 = 100,
+        refused_stream_rate: u64 = 10,
         /// Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441), so a
         /// client may open a WebSocket, or another protocol, on a stream
         /// with an extended CONNECT. Such a request reaches the router as a

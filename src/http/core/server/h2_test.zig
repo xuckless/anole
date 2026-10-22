@@ -36,6 +36,8 @@ const TestClient = struct {
     /// The last-stream-ID of each GOAWAY received, in order.
     goaways: [4]i32 = undefined,
     goaway_count: usize = 0,
+    /// The error code of the last GOAWAY received.
+    goaway_error: u32 = 0,
     /// DATA frames received with no payload and END_STREAM: an end that
     /// could have gone on the frame before it.
     empty_ends: usize = 0,
@@ -250,6 +252,7 @@ const TestClient = struct {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
+        if (frame.*.hd.type == c.NGHTTP2_GOAWAY) self.goaway_error = frame.*.goaway.error_code;
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
             self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
             self.goaway_count += 1;
@@ -1250,4 +1253,101 @@ test "HTTP/2: :authority is the host; a host field that differs from it is refus
     // Two host fields: nghttp2 refuses the stream itself.
     try std.testing.expectEqual(@as(u16, 0), client.get(two_hosts).status);
     try std.testing.expectEqual(@as(u32, c.NGHTTP2_PROTOCOL_ERROR), client.get(two_hosts).error_code);
+}
+
+/// Counts the bytes allocated and not yet freed.
+const LiveAllocator = struct {
+    inner: std.mem.Allocator,
+    live: std.atomic.Value(isize) = .init(0),
+
+    fn allocator(self: *LiveAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawAlloc(len, alignment, ra) orelse return null;
+        _ = self.live.fetchAdd(@intCast(len), .monotonic);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.inner.rawResize(memory, alignment, new_len, ra)) return false;
+        _ = self.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        return true;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        _ = self.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        return p;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *LiveAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+        _ = self.live.fetchSub(@intCast(memory.len), .monotonic);
+    }
+};
+
+/// Streams whose head the server refuses: a header list past the limit,
+/// and two host fields (refused by nghttp2's own checks).
+fn sendRefusedHeads(client: *TestClient, n: usize) !void {
+    const big: [1500]u8 = @splat('x');
+    for (0..n) |i| {
+        if (i % 2 == 0) {
+            _ = try client.requestWith("/hello", "localhost", &.{ TestClient.nv("x-a", &big), TestClient.nv("x-b", &big) });
+        } else {
+            _ = try client.requestWith("/hello", null, &.{ TestClient.nv("host", "a.example"), TestClient.nv("x-a", &big), TestClient.nv("host", "b.example") });
+        }
+    }
+    try client.run();
+}
+
+test "HTTP/2: a stream whose head is refused is freed when it closes, not with the connection" {
+    const io = std.testing.io;
+    var live: LiveAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(live.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        // The refusal budget is the next test's.
+        .http2 = .{ .max_header_list_size = 2048, .refused_stream_burst = 1000 },
+    }, {});
+    defer server.deinit();
+    server.router.get("/hello", Handlers.hello);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // The first round fills the connection's spare streams.
+    try sendRefusedHeads(&client, 40);
+    const before = live.live.load(.monotonic);
+    try sendRefusedHeads(&client, 80);
+    const after = live.live.load(.monotonic);
+    try std.testing.expect(after - before < 32 * 1024);
+    // The connection still serves.
+    const ok = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(ok).body.items);
+}
+
+test "HTTP/2: a peer whose streams keep being refused is sent GOAWAY(ENHANCE_YOUR_CALM)" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .http2 = .{ .max_header_list_size = 2048, .refused_stream_burst = 20, .refused_stream_rate = 1 },
+    }, {});
+    defer server.deinit();
+    server.router.get("/hello", Handlers.hello);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    sendRefusedHeads(&client, 60) catch {};
+    try client.runUntilClosed();
+    try std.testing.expect(client.goaway_count >= 1);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_ENHANCE_YOUR_CALM), client.goaway_error);
 }
