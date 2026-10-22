@@ -54,6 +54,8 @@ pub const DeleteResult = @import("collection.zig").DeleteResult;
 pub const ReturnDocument = @import("collection.zig").ReturnDocument;
 /// `anole.bson.ObjectId`, the usual `_id`.
 pub const ObjectId = @import("bson").ObjectId;
+/// Collection calls named at run time, with BSON arguments (the C ABI).
+pub const dynamic = @import("dynamic.zig");
 
 test {
     _ = @import("uri.zig");
@@ -64,6 +66,7 @@ test {
     _ = @import("connection.zig");
     _ = @import("client.zig");
     _ = @import("collection.zig");
+    _ = @import("dynamic.zig");
     _ = @import("fake_test.zig");
     _ = @import("live_test.zig");
 }

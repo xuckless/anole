@@ -625,6 +625,14 @@ the call fails (500, logged). Decoded strings are copies in the request's
 arena. In JSON responses an ObjectId is its hex string, a date an ISO
 8601 string, and a raw document relaxed Extended JSON.
 
+Calls named only at run time, with BSON documents for arguments (what the
+C ABI and the language bindings send), go through
+`anole.mongodb.dynamic.run(collection, database, ctx, op, args)`: `op` is
+the method's name (`.find`, `.insertMany`, `.runCommand`...), `args` the
+documents in the drivers' order, and options use the command's own names
+(`sort`, `limit`, `batchSize`, `upsert`...). Reads return
+`bson.Document`s, writes the driver's result as a document.
+
 ### Errors
 
 | Server error | Error | Status |

@@ -168,6 +168,8 @@ pub const DB_BOOL: u32 = 5;
 pub const DB_ARRAY: u32 = 6;
 pub const DB_MAP: u32 = 7;
 pub const DB_ERROR: u32 = 8;
+/// A BSON document (MongoDB): its bytes in the span.
+pub const DB_BSON: u32 = 9;
 
 pub const DbValue = extern struct {
     type: u32,

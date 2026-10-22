@@ -32,6 +32,13 @@ const redis = if (features.redis) anole.redis else struct {
     pub const Client = void;
     pub const Reply = void;
 };
+const mongodb = if (features.mongodb) anole.mongodb else struct {
+    pub const Client = void;
+    pub const dynamic = struct {
+        pub const Result = void;
+    };
+};
+const bson = anole.bson;
 
 const log = std.log.scoped(.anole);
 
@@ -50,6 +57,7 @@ const Client = union(enum) {
     sqlite: *sqlite.Client,
     postgres: *pg.Client,
     redis: *redis.Client,
+    mongodb: *mongodb.Client,
 };
 
 /// Per executor: the tasks of the queries it runs, canceled at the stop.
@@ -69,6 +77,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
             if (comptime features.postgres) try openPostgres(d, app, p) else unreachable;
         } else if (d.config.redis) |r| {
             if (comptime features.redis) try openRedis(d, app, r) else unreachable;
+        } else if (d.config.mongodb) |m| {
+            if (comptime features.mongodb) try openMongodb(d, app, m) else unreachable;
         } else {
             if (comptime features.sqlite) try openSqlite(d, app, d.config.sqlite.?) else unreachable;
         }
@@ -151,6 +161,27 @@ fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
         },
     });
     d.client = .{ .redis = client };
+}
+
+fn openMongodb(d: *Db, app: *anole.App, m: config_mod.Config.Mongodb) !void {
+    const ms = std.Io.Duration.fromMilliseconds;
+    const Tls = @typeInfo(@FieldType(anole.mongodb.Options, "tls")).optional.child;
+    const ca: ?Tls = if (m.ca_file) |f| .{ .ca = .{ .file = .{ .path = f } } } else if (m.ca_pem) |pem| .{ .ca = .{ .pem = pem } } else null;
+    const client = try app.mongodb(anole.mongodb.Options{
+        .url = m.url,
+        .database = m.database,
+        .name = d.config.name,
+        .tls = ca,
+        .max_connections = m.max_connections,
+        .acquire_timeout = ms(m.acquire_timeout_ms),
+        .server_selection_timeout = ms(m.server_selection_timeout_ms),
+        .connect_timeout = ms(m.connect_timeout_ms),
+        .cache = .{
+            .max_entries = d.config.cache.max_entries,
+            .max_bytes = std.math.cast(usize, d.config.cache.max_bytes) orelse std.math.maxInt(usize),
+        },
+    });
+    d.client = .{ .mongodb = client };
 }
 
 /// The databases are closed with the server: no new query from now on.
@@ -247,6 +278,7 @@ pub fn invalidate(d: *Db, tag: []const u8) error{State}!void {
         .sqlite => |client| if (comptime features.sqlite) &client.cache else unreachable,
         .postgres => |client| if (comptime features.postgres) &client.cache else unreachable,
         .redis => |client| if (comptime features.redis) &client.cache else unreachable,
+        .mongodb => |client| if (comptime features.mongodb) &client.cache else unreachable,
     };
     if (tag.len == 0) cache.invalidate(.all) else cache.invalidate(.{ .tag = tag });
 }
@@ -297,6 +329,16 @@ fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
                 } else |err| answer.failed(&ctx, err);
             } else |err| answer.failed(&ctx, err);
         } else unreachable,
+        .mongodb => |client| if (comptime features.mongodb) {
+            if (mongoCall(client.with(options), &ctx, q.sql, q.params)) |result| switch (q.verb) {
+                .query => answer.mongo = result,
+                .exec => answer.changes = .{ .changes = switch (result) {
+                    .documents => |docs| docs.len,
+                    .count => |n| n,
+                    .write => |w| w.changes,
+                } },
+            } else |err| answer.failed(&ctx, err);
+        } else unreachable,
     }
     if (db.lastSource(&ctx)) |src| answer.source = switch (src) {
         .database => abi.DB_FROM_DATABASE,
@@ -324,6 +366,7 @@ const Answer = struct {
     table: ?db.Table = null,
     changes: ?db.Changes = null,
     reply: ?redis.Reply = null,
+    mongo: ?mongodb.dynamic.Result = null,
     message: []const u8 = "",
     code: []const u8 = "",
     constraint: []const u8 = "",
@@ -375,6 +418,22 @@ const Answer = struct {
         if (comptime features.redis) if (a.reply) |r| {
             nrows = replyCells(r, &bytes);
         };
+        // MongoDB: one column, a BSON document (or the count) per row.
+        if (comptime features.mongodb) if (a.mongo) |m| {
+            ncol = 1;
+            bytes += mongo_column.len;
+            switch (m) {
+                .documents => |docs| {
+                    nrows = docs.len;
+                    for (docs) |doc| bytes += doc.bytes.len;
+                },
+                .count => nrows = 1,
+                .write => |w| {
+                    nrows = 1;
+                    bytes += w.summary.bytes.len;
+                },
+            }
+        };
         const cols_off = @sizeOf(Ev);
         const cells_off = cols_off + ncol * @sizeOf(abi.Span);
         // A Redis reply has no columns: its cells are a tree in preorder.
@@ -405,6 +464,18 @@ const Answer = struct {
             const cells: [*]abi.DbCell = @ptrCast(@alignCast(rec.ptr + cells_off));
             var k: usize = 0;
             putReply(r, cells, &k, &w);
+        };
+        if (comptime features.mongodb) if (a.mongo) |m| {
+            const names: [*]abi.Span = @ptrCast(@alignCast(rec.ptr + cols_off));
+            names[0] = w.put(mongo_column);
+            const cells: [*]abi.DbCell = @ptrCast(@alignCast(rec.ptr + cells_off));
+            switch (m) {
+                .documents => |docs| for (docs, 0..) |doc, i| {
+                    cells[i] = .{ .type = abi.DB_BSON, .v = .{ .s = w.put(doc.bytes) } };
+                },
+                .count => |n| cells[0] = .{ .type = abi.DB_INT, .v = .{ .i = @intCast(@min(n, std.math.maxInt(i64))) } },
+                .write => |wr| cells[0] = .{ .type = abi.DB_BSON, .v = .{ .s = w.put(wr.summary.bytes) } },
+            }
         };
         if (a.table) |t| {
             const names: [*]abi.Span = @ptrCast(@alignCast(rec.ptr + cols_off));
@@ -463,6 +534,38 @@ fn putReply(r: redis.Reply, cells: [*]abi.DbCell, k: *usize, w: *Writer) void {
         .array, .map => |items| for (items) |item| putReply(item, cells, k, w),
         else => {},
     }
+}
+
+/// The name of a MongoDB answer's one column.
+const mongo_column = "document";
+
+/// A MongoDB call from `anole_db_*`: `sql` names the operation, the
+/// collection and, optionally, another database than the default
+/// ("find users", "aggregate events analytics"; `runCommand` takes only
+/// the database, optionally); each parameter is a BSON document (a blob).
+fn mongoCall(q: anole.mongodb.Query, ctx: *db.Ctx, sql: []const u8, params: []const db.Value) anole.mongodb.Error!anole.mongodb.dynamic.Result {
+    const dyn = anole.mongodb.dynamic;
+    var words = std.mem.tokenizeAny(u8, sql, " \t\r\n");
+    const name = words.next() orelse return mongoBad(ctx, "an empty operation: \"find <collection>\", \"insertOne <collection>\"...", .{});
+    const op = std.meta.stringToEnum(dyn.Op, name) orelse return mongoBad(ctx, "unknown operation \"{s}\": find, findOne, aggregate, countDocuments, insertOne, insertMany, updateOne, updateMany, replaceOne, deleteOne, deleteMany, runCommand", .{name});
+    var collection_name: []const u8 = "";
+    if (op != .runCommand) collection_name = words.next() orelse return mongoBad(ctx, "{s}: name the collection (\"{s} <collection>\")", .{ name, name });
+    const database_name = words.next();
+    if (words.next() != null) return mongoBad(ctx, "\"{s}\": an operation, a collection and a database at most", .{sql});
+    const docs = try ctx.arena.alloc(bson.Document, params.len);
+    for (params, docs, 1..) |p, *doc, i| {
+        const bytes = switch (p) {
+            .blob => |b| b,
+            else => return mongoBad(ctx, "{s}: parameter {d} is not a BSON document (ANOLE_DB_BLOB)", .{ name, i }),
+        };
+        doc.* = bson.Document.init(bytes) catch |err| return mongoBad(ctx, "{s}: parameter {d} is not a valid BSON document ({t})", .{ name, i, err });
+    }
+    const database = if (database_name) |n| q.db(n) else q.db(q.client.default_database);
+    return dyn.run(database.collection(collection_name), database, ctx, op, docs);
+}
+
+fn mongoBad(ctx: *db.Ctx, comptime fmt: []const u8, args: anytype) anole.mongodb.Error {
+    return anole.mongodb.dynamic.badRequest(ctx, fmt, args);
 }
 
 /// A Redis command from a call: the words of `sql` (the command's name

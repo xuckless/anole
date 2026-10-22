@@ -92,10 +92,11 @@ pub const Config = struct {
     pub const Database = struct {
         /// What `anole_db_find` looks it up by: unique, 1-255 bytes.
         name: []const u8,
-        /// Exactly one of `sqlite`, `postgres` and `redis`.
+        /// Exactly one of `sqlite`, `postgres`, `redis` and `mongodb`.
         sqlite: ?Sqlite = null,
         postgres: ?Postgres = null,
         redis: ?Redis = null,
+        mongodb: ?Mongodb = null,
         /// The bounds of the answers kept for queries with cache_ttl_ms,
         /// over every executor.
         cache: CacheBounds = .{},
@@ -178,6 +179,31 @@ pub const Config = struct {
         /// Open a connection per executor at start, and fail the start if
         /// that fails.
         connect_at_start: bool = false,
+    };
+
+    /// A MongoDB deployment, as `anole.mongodb.Options` (docs/database.md).
+    pub const Mongodb = struct {
+        /// mongodb:// or mongodb+srv:// connection string; its options win
+        /// over the fields below. Null: MONGODB_URI, else
+        /// mongodb://localhost:27017.
+        url: ?[]const u8 = null,
+        /// The database operations name no other for. Null: the URL's
+        /// path, else "test".
+        database: ?[]const u8 = null,
+        /// The CA certificates (PEM) the server's certificate is checked
+        /// against, as a file or as the PEM text: either turns TLS on, and a
+        /// URL that turns it off or stops checking is refused.
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        /// Connections at most, split between the executors (maxPoolSize;
+        /// 0: no limit).
+        max_connections: u32 = 100,
+        /// How long an operation waits for a pooled connection.
+        acquire_timeout_ms: u32 = 10_000,
+        /// How long an operation waits for a server it can use (a primary).
+        server_selection_timeout_ms: u32 = 30_000,
+        /// TCP connect and TLS handshake.
+        connect_timeout_ms: u32 = 10_000,
     };
 
     pub const CacheBounds = struct {
@@ -424,8 +450,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
         for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
             return fail(why, "databases[{d}].name \"{s}\" is taken", .{ i, d.name });
-        const kinds = @as(u8, @intFromBool(d.sqlite != null)) + @intFromBool(d.postgres != null) + @intFromBool(d.redis != null);
-        if (kinds != 1) return fail(why, "databases[{d}]: exactly one of sqlite, postgres and redis", .{i});
+        const kinds = @as(u8, @intFromBool(d.sqlite != null)) + @intFromBool(d.postgres != null) + @intFromBool(d.redis != null) + @intFromBool(d.mongodb != null);
+        if (kinds != 1) return fail(why, "databases[{d}]: exactly one of sqlite, postgres, redis and mongodb", .{i});
         if (d.sqlite) |sq| {
             if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
             if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
@@ -444,6 +470,10 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (comptime !features.redis) return fail(why, "databases[{d}].redis: Redis is not built in (-Dredis)", .{i});
             if (r.ca_file != null and r.ca_pem != null) return fail(why, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
             if (r.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].redis.max_connections: at least 1", .{i});
+        }
+        if (d.mongodb) |m| {
+            if (comptime !features.mongodb) return fail(why, "databases[{d}].mongodb: MongoDB is not built in (-Dmongodb)", .{i});
+            if (m.ca_file != null and m.ca_pem != null) return fail(why, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
         }
     }
     try checkMiddleware(cfg.middleware, "middleware", why);
@@ -692,6 +722,7 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
         "{\"databases\": [{\"name\": \"d\", \"redis\": {}, \"postgres\": {}}]}",
         "{\"databases\": [{\"name\": \"d\", \"redis\": {\"max_connections\": 0}}]}",
+        "{\"databases\": [{\"name\": \"d\", \"mongodb\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
     };
     for (bad) |doc| {
         why.end = 0;

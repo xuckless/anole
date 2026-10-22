@@ -106,7 +106,7 @@ ANOLE_API uint32_t anole_abi_version(void);
 /* Anole's version, such as "0.2.0"; static storage. */
 ANOLE_API anole_str anole_version(void);
 /* 1 when `name` is built in, else 0: "tls", "http2", "http3", "websocket",
-   "compression", "brotli", "auth", "sqlite", "postgres", "redis". */
+   "compression", "brotli", "auth", "sqlite", "postgres", "redis", "mongodb". */
 ANOLE_API int anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
@@ -443,13 +443,13 @@ ANOLE_API anole_status anole_ws_publish(anole_server *s, anole_str topic, int ty
 
 /* ---- databases ---------------------------------------------------------------- */
 
-/* A database from the configuration's "databases": SQLite, PostgreSQL or
-   Redis (MongoDB follows). Statements run on Anole's threads and never
+/* A database from the configuration's "databases": SQLite, PostgreSQL,
+   Redis or MongoDB. Statements run on Anole's threads and never
    block the caller: each call queues one, and its answer comes back as an
    ANOLE_EV_DB_RESULT to the consumer named in the call, with the caller's
    user_data. SQLite: reads run beside the writer (WAL), writes take turns on
-   the database's writer thread. PostgreSQL and Redis: each executor has its
-   own pool of connections. Statements may be queued from anole_server_start until
+   the database's writer thread. PostgreSQL, Redis and MongoDB: each
+   executor has its own pool of connections. Statements may be queued from anole_server_start until
    the server stops; ones still running when it stops get no answer
    (ANOLE_EV_STOPPED is the consumer's last event). */
 typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
@@ -459,7 +459,8 @@ typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
 ANOLE_API anole_status anole_db_find(anole_server *s, anole_str name, anole_db **out);
 
 /* Value and cell types. ANOLE_DB_BOOL holds 0 or 1 in `i`. ARRAY, MAP and
-   ERROR are cells of a Redis reply only (see anole_db_cell). */
+   ERROR are cells of a Redis reply only, BSON of a MongoDB answer (see
+   anole_db_cell). */
 enum {
   ANOLE_DB_NULL = 0,
   ANOLE_DB_INT = 1,
@@ -469,7 +470,8 @@ enum {
   ANOLE_DB_BOOL = 5,
   ANOLE_DB_ARRAY = 6,
   ANOLE_DB_MAP = 7,
-  ANOLE_DB_ERROR = 8
+  ANOLE_DB_ERROR = 8,
+  ANOLE_DB_BSON = 9
 };
 
 /* A parameter: binds SQLite's `?` (or `?NNN`), PostgreSQL's $1, $2... in
@@ -481,7 +483,19 @@ enum {
    Redis: `sql` holds the command's name and any fixed words ("GET",
    "CLIENT INFO"), split on spaces; each parameter is one more argument,
    binary-safe: text and blobs as they are, numbers in decimal, a bool as 1
-   or 0, NULL left out. Keys and values always go in parameters. */
+   or 0, NULL left out. Keys and values always go in parameters.
+   MongoDB: `sql` names the operation and the collection, and optionally a
+   database other than the configured one ("find users", "aggregate events
+   analytics"); runCommand takes only the database, optionally. Each
+   parameter is a BSON document (ANOLE_DB_BLOB), in the order the drivers'
+   methods take them: find(filter, options), findOne(filter, options),
+   aggregate(pipeline, options), countDocuments(filter, options),
+   insertOne(document), insertMany(document, ...), updateOne/updateMany(
+   filter, update or pipeline, options), replaceOne(filter, replacement,
+   options), deleteOne/deleteMany(filter, options), runCommand(command).
+   Options use the command's own names (sort, projection, limit, skip,
+   batchSize, allowDiskUse, upsert, arrayFilters, hint, collation...). A
+   pipeline is a BSON array (or a document whose values are the stages). */
 typedef struct anole_db_value {
   uint32_t type; /* ANOLE_DB_* */
   uint32_t reserved;
@@ -531,7 +545,8 @@ ANOLE_API anole_status anole_db_query(anole_db *db, anole_consumer *c, anole_str
    anole_db_query), and no rows. With no parameters, `sql` may hold several
    statements (a schema), run in order. Redis: runs the command and answers
    with no cells; `changes` is its reply when that is an integer (DEL,
-   INCR, LPUSH...), else 0. */
+   INCR, LPUSH...), else 0. MongoDB: no cells; `changes` is the documents
+   inserted, modified (and upserted) or deleted, or for a read the count. */
 ANOLE_API anole_status anole_db_exec(anole_db *db, anole_consumer *c, anole_str sql, const anole_db_value *params,
                                      size_t nparams, const anole_db_options *opts, uint64_t user_data);
 /* Drops the answers kept with cache_tag `tag` on every executor ({NULL, 0}:
@@ -572,7 +587,13 @@ enum {
    often UTF-8), status replies ("OK") TEXT, integers INT, nil NULL, RESP3
    doubles FLOAT and booleans BOOL. An ARRAY cell with `i` = n is followed by
    its n items, each a whole subtree; a MAP with `i` = n by n key, value
-   pairs. ERROR (text) is an error reply inside another, as EXEC's. */
+   pairs. ERROR (text) is an error reply inside another, as EXEC's.
+   MongoDB: one column, "document". find, findOne and aggregate answer a
+   row per document, each cell ANOLE_DB_BSON (the document's bytes, for the
+   binding's BSON library); countDocuments one ANOLE_DB_INT; the writes one
+   BSON row with the driver's result ({insertedId}, {insertedCount,
+   insertedIds}, {matchedCount, modifiedCount, upsertedId}, {deletedCount});
+   runCommand one BSON row, the server's reply. */
 typedef struct anole_db_cell {
   uint32_t type;    /* ANOLE_DB_* */
   uint32_t db_type; /* PostgreSQL: the type OID; 0 otherwise */
@@ -606,7 +627,8 @@ typedef struct anole_db_result_event {
   anole_span cells;
   anole_span error;      /* the database's message (for logs; not for clients) */
   anole_span error_code; /* the database's own code as text (SQLite's extended code,
-                            PostgreSQL's SQLSTATE, the first word of a Redis error) */
+                            PostgreSQL's SQLSTATE, the first word of a Redis error,
+                            MongoDB's error code: "11000") */
   anole_span constraint; /* the constraint that failed, when the database names it */
 } anole_db_result_event;
 

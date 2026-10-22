@@ -39,6 +39,16 @@ breaking changes are listed anyway.
 - `anole.redis`'s `Query.reply` sends a command known only at run time
   (`[]const []const u8`), through the cache for read commands; the result
   caches copy types that hold themselves (a reply tree).
+- `anole_db_*` with MongoDB: a `"mongodb"` database (`url`, `database`,
+  `ca_file`/`ca_pem`, pool and selection timeouts). `sql` names the
+  operation and the collection (`"find orders"`): find, findOne,
+  aggregate, countDocuments, insertOne, insertMany, updateOne, updateMany,
+  replaceOne, deleteOne, deleteMany, and runCommand; parameters are BSON
+  documents in the drivers' order, options under the command's names.
+  Answers are rows of `ANOLE_DB_BSON` documents (a new cell type), a count,
+  or the driver's write result; `anole_db_exec` gives the count changed.
+- `anole.mongodb.dynamic`: those operations named at run time with BSON
+  arguments; `aggregate` caches a `bson.Array` pipeline that only reads.
 
 ## 0.1.1 (2026-10-22)
 
