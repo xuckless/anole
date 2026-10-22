@@ -257,7 +257,7 @@ export fn anole_consumer_attach(s: ?*anyopaque, options: ?*const abi.ConsumerOpt
         setError("Windows has no doorbell fd: pass a wake callback, or use anole_poll_wait", .{});
         return abi.E_UNSUPPORTED;
     }
-    const c = e.attach(o.wake, o.wake_ud, shared) catch |err| return switch (err) {
+    const c = e.attach(o.wake, o.wake_ud, shared) catch |err| return switch (@as(anyerror, err)) {
         error.State => fail(abi.E_STATE, "anole_consumer_attach (before anole_server_start, 256 at most)", err),
         error.OutOfMemory => fail(abi.E_NOMEM, "anole_consumer_attach", err),
         else => fail(abi.E_SYSTEM, "anole_consumer_attach", err),

@@ -147,7 +147,8 @@ pub const Slot = struct {
     body_len: u32 = 0,
     /// `ANOLE_BODY_BORROW`: the consumer's own memory.
     borrowed: ?[]const u8 = null,
-    fd: std.posix.fd_t = -1,
+    /// A file to send (`anole_respond_fd`; POSIX only).
+    fd: c_int = -1,
     fd_offset: u64 = 0,
     fd_len: u64 = 0,
     /// Trailers of a streamed answer (`stream_end`), written under `out`'s
@@ -191,6 +192,11 @@ pub const Slot = struct {
 };
 
 pub const no_slot = std.math.maxInt(u32);
+
+fn closeFd(fd: c_int) void {
+    if (comptime builtin.os.tag == .windows) return;
+    _ = std.c.close(fd);
+}
 
 // ---------------------------------------------------------------------------
 // The SPSC ring: one executor produces, one consumer thread consumes.
@@ -343,7 +349,7 @@ pub const Exec = struct {
         x.closePipe(&s.in, gen, i);
         x.closePipe(&s.out, gen, i);
         if (s.fd >= 0) {
-            _ = std.c.close(s.fd);
+            closeFd(s.fd);
             s.fd = -1;
         }
         if (s.borrowed) |b| {
@@ -440,8 +446,8 @@ pub const Consumer = struct {
     shared: bool,
     /// Anole's own doorbell when the consumer gave no callback: an eventfd
     /// (Linux) or a pipe (elsewhere).
-    fd_read: std.posix.fd_t = -1,
-    fd_write: std.posix.fd_t = -1,
+    fd_read: c_int = -1,
+    fd_write: c_int = -1,
     /// True while the consumer will poll again without being woken.
     awake: std.atomic.Value(bool) align(std.atomic.cache_line) = .init(false),
     /// Bumped by every wake, for threads blocked in `poll_wait`.
@@ -523,8 +529,8 @@ pub const Consumer = struct {
 
     fn deinit(c: *Consumer) void {
         if (have_fd) {
-            if (c.fd_read >= 0) _ = std.c.close(c.fd_read);
-            if (c.fd_write >= 0 and c.fd_write != c.fd_read) _ = std.c.close(c.fd_write);
+            if (c.fd_read >= 0) closeFd(c.fd_read);
+            if (c.fd_write >= 0 and c.fd_write != c.fd_read) closeFd(c.fd_write);
         }
         c.execs.deinit(gpa);
     }
@@ -906,7 +912,7 @@ pub const Engine = struct {
                 s.trailer_bytes.deinit(gpa);
                 s.in.deinit();
                 s.out.deinit();
-                if (s.fd >= 0) _ = std.c.close(s.fd);
+                if (s.fd >= 0) closeFd(s.fd);
             }
             gpa.free(x.slots);
             x.ring.deinit();
@@ -1228,6 +1234,7 @@ fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void
             } else res.body = try req.arena.dupe(u8, s.replyBody());
         },
         .fd => {
+            if (comptime builtin.os.tag == .windows) unreachable; // respondFd refuses
             const len = s.fd_len;
             res.file = .{
                 .handle = .{ .handle = s.fd, .flags = .{ .nonblocking = false } },
@@ -1979,10 +1986,11 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     try checkStatus(status);
     _ = try checkHeaders(headers);
     // A regular file, and how much of it.
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return error.Invalid;
-    if (!std.c.S.ISREG(@intCast(st.mode))) return error.Invalid;
-    const size: u64 = @intCast(st.size);
+    if (fd < 0) return error.Invalid;
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const st = file.stat(threadedIo()) catch return error.Invalid;
+    if (st.kind != .file) return error.Invalid;
+    const size: u64 = st.size;
     if (offset > size) return error.Invalid;
     const n = if (len == 0) size - offset else len;
     if (offset + n > size) return error.Invalid;
@@ -1990,7 +1998,7 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     errdefer s.word.store(pack(h.gen, .out), .release);
     const dup = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
     if (dup < 0) return error.Invalid;
-    errdefer _ = std.c.close(dup);
+    errdefer closeFd(dup);
     try storeHeaders(&s.headers, &s.bytes, headers, 0);
     s.reply = .fd;
     s.status = status;
