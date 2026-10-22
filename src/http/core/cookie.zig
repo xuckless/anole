@@ -85,8 +85,10 @@ pub const Cookie = struct {
 /// Options for setting a cookie in a response.
 pub const CookieOpts = struct {
     /// `Path`; empty for none (the browser uses the request's directory).
+    /// A `;` or a control character in it is `error.InvalidCookiePath`.
     path: []const u8 = "",
-    /// `Domain`; empty for this host only.
+    /// `Domain`; empty for this host only. A `;` or a control character in
+    /// it is `error.InvalidCookieDomain`.
     domain: []const u8 = "",
     /// `Max-Age`; null for a cookie that ends with the browser session,
     /// zero to delete one.
@@ -128,10 +130,21 @@ pub fn validateCookieValue(value: []const u8) error{InvalidCookieValue}!void {
     }
 }
 
+/// An attribute value (`Path`, `Domain`): no `;`, which would end it and
+/// start another attribute, and no control characters (RFC 6265 4.1.1).
+fn validAttributeValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c < 0x20 or c == 0x7f or c == ';') return false;
+    }
+    return true;
+}
+
 /// Serialize a cookie name/value pair with options into a Set-Cookie header value.
 pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []const u8, opts: CookieOpts) ![]u8 {
     try validateCookieName(name);
     try validateCookieValue(value);
+    if (!validAttributeValue(opts.path)) return error.InvalidCookiePath;
+    if (!validAttributeValue(opts.domain)) return error.InvalidCookieDomain;
     // Estimate length: name=value + attributes (110 is typical for cookie attributes per Go's implementation)
     const estimated_len = name.len + value.len + opts.path.len + opts.domain.len + 110;
     var buf = std.ArrayListUnmanaged(u8).empty;
@@ -331,4 +344,15 @@ test "Cookie: jsonStringify" {
     try expectCookieJson(
         \\{"a":""}
     , "a=");
+}
+
+test "serializeCookie: refuses a path or domain that would add attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.InvalidCookiePath, serializeCookie(a, "a", "b", .{ .path = "/; Domain=example.com" }));
+    try std.testing.expectError(error.InvalidCookiePath, serializeCookie(a, "a", "b", .{ .path = "/\x01" }));
+    try std.testing.expectError(error.InvalidCookieDomain, serializeCookie(a, "a", "b", .{ .domain = "example.com; Secure" }));
+    try std.testing.expectError(error.InvalidCookieDomain, serializeCookie(a, "a", "b", .{ .domain = "a\x7fb" }));
+    try std.testing.expectEqualStrings("a=b; Path=/x; Domain=example.com", try serializeCookie(a, "a", "b", .{ .path = "/x", .domain = "example.com" }));
 }

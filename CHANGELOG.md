@@ -12,6 +12,9 @@ breaking changes are listed anyway.
   a CRLF is split across two writes). Before, data relayed from one user
   could add `event`, `id` or `retry` fields to the events other users got.
   No configuration change needed.
+- `setCookie` refuses a `path` or `domain` containing `;` or a control
+  character (`error.InvalidCookiePath`, `error.InvalidCookieDomain`), so a
+  value taken from a request cannot add cookie attributes.
 
 ### C ABI (ABI 0.1)
 
