@@ -135,6 +135,10 @@ pub const logFn = @import("log.zig").logFn;
 /// middleware, static files, client; adapted from lalinsky/dusty), for
 /// everything `Server` does not wrap.
 pub const http = @import("http/root.zig");
+/// The engine under the C ABI (`include/anole.h`, `zig build capi`): the
+/// queues, handles and lifecycle that libanole's exported functions wrap.
+/// For bindings' builds, not for Zig applications.
+pub const capi = @import("capi/engine.zig");
 /// What a handler reads: `req.params`, `req.query`, `req.headers`,
 /// `req.bind(T)`, `req.body()`, `req.arena`, `req.io`.
 pub const Request = http.Request;
