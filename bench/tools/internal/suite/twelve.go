@@ -31,7 +31,7 @@ func pg(db string, sql ...string) error {
 
 // twelveSecret replaces the challenge's HS256 secret ("twelve-dollar-challenge",
 // 23 bytes) for every server: RFC 7518 3.2 asks for at least 32, and Anole's
-// JWT verification (0.1.2 on) refuses shorter ones. bench/postgres/run.sh
+// JWT verification refuses shorter ones (since 0.1.0). bench/postgres/run.sh
 // signs tokens.json with the same secret.
 const twelveSecret = "twelve-dollar-challenge-hs256-32-byte-key"
 
