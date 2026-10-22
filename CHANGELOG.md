@@ -36,6 +36,10 @@ breaking changes are listed anyway.
   `Transfer-Encoding` and `Connection` (`error.InvalidHeaderName`); use
   `res.keepalive = false` to close the connection. A second
   `Content-Length` from `addHeader` replaces the first.
+- A request body with broken framing (chunked) or a corrupt gzip/deflate
+  coding is answered 400 and logged at `debug`, instead of 500 at `err`.
+  Reading it fails with the new `error.MalformedBody` (was the parser's
+  `InvalidChunkSize`/`ParseFailed`/... or zlib's `CorruptInput`).
 
 ### C ABI (ABI 0.1)
 

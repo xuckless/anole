@@ -3817,6 +3817,32 @@ test "Server: an HTTP/1.1 request needs exactly one Host" {
     try std.testing.expect(std.mem.endsWith(u8, old, "host=-"));
 }
 
+test "Server: a request body with broken framing is a 400, and the connection closes" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.post("/take", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            const body = try req.body();
+            try res.print(.text, "{d}", .{if (body) |b| b.len else 0});
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    // A chunk size that is not hex, then a pipelined request that must
+    // not be served from the broken stream.
+    const resp = try rawAll(io, &server, "POST /take HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\nxx\r\n0\r\n\r\nPOST /take HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400 "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "HTTP/1.1 "));
+}
+
 test "Server: forwarding headers are ignored without trusted hops" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});

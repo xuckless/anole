@@ -552,8 +552,9 @@ the client gets:
   stands for.
 - Request-body faults get a 4xx: `BodyTooBig` 413,
   `UnsupportedContentEncoding` 415, and 400 for `InvalidJsonBody` and
-  `MissingBody` (from `bind` and `json`) and a body that is not valid gzip or
-  zstd.
+  `MissingBody` (from `bind` and `json`), `IncompleteBody` (a body cut
+  short) and `MalformedBody` (broken chunked framing, or a body that is not
+  valid gzip or zstd). They are logged at `debug`, not `err`.
 - Anything else is logged at `err` and answered 500, and what the handler
   wrote is discarded. That includes `std.json`'s `SyntaxError` when the JSON
   was not the request's own (a config file, an upstream response).

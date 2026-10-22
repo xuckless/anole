@@ -1331,7 +1331,7 @@ test "Request: a streaming read resolves through the reader it hands out" {
     var sink_buf: [64]u8 = undefined;
     var sink: std.Io.Writer = .fixed(&sink_buf);
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
-    try std.testing.expectEqual(error.CorruptInput, r.err.?);
+    try std.testing.expectEqual(error.MalformedBody, r.err.?);
 }
 
 test "Request.body: a body cut short is IncompleteBody, not a failed read" {
@@ -1405,7 +1405,7 @@ test "Request.body: framing the parser rejects is reported as itself" {
 
     try parseHeaders(&reader, &parser);
 
-    try std.testing.expectError(error.InvalidChunkSize, req.body());
+    try std.testing.expectError(error.MalformedBody, req.body());
 }
 
 test "Request.body: large body over 128 bytes" {
