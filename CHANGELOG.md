@@ -23,6 +23,12 @@ breaking changes are listed anyway.
   other repeated request fields are all kept, as over HTTP/1.1. Before,
   only the last of each was kept, which could drop or shadow a session
   cookie.
+- WebTransport: a peer's stream that is reset before it names its session
+  is now freed. A peer's streams now hold its stream credit until the
+  handler releases them (before, credit came back as soon as a stream
+  ended, even if it was never accepted), and at most 100 streams each way
+  wait to be accepted per session. A peer that opens streams a handler
+  does not accept now waits for credit instead of growing server memory.
 
 ### C ABI (ABI 0.1)
 

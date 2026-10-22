@@ -149,6 +149,12 @@ writes.
 `closeSend` is reset then, and a receiving side not read to its end is
 stopped. One task may read a stream while another writes it.
 
+The peer's streams count against its stream limit (100 unidirectional,
+and `max_streams_bidi` shared with requests) until the handler releases
+them, not only until they end: streams a handler never accepts hold that
+credit, and the peer cannot open more. Up to 100 streams each way wait to
+be accepted; past that new ones are refused.
+
 ## Datagrams
 
 ```zig
