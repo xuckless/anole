@@ -103,8 +103,9 @@
             .lazy = true,
         },
         .protobuf = .{
-            .url = "git+https://github.com/Arwalk/zig-protobuf#e9e18c7664b8c950e5fc679259c968dd66ccc48b",
-            .hash = "protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv",
+            // Temporary (sec/grpc): the local zig-protobuf clone, branch
+            // `anole` (e9e18c7 + decoding hardening).
+            .path = "../../anole-forks/zig-protobuf",
             .lazy = true,
         },
         .yyjson = .{

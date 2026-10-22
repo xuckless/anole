@@ -134,6 +134,54 @@ breaking changes are listed anyway.
   indefinitely.
   Reading it fails with the new `error.MalformedBody` (was the parser's
   `InvalidChunkSize`/`ParseFailed`/... or zlib's `CorruptInput`).
+- `anole.json.parse` / `readBody`: a whole-number float just past the range
+  of an integer field (such as `9223372036854775808.0` for an `i64`) is
+  refused as `error.Overflow` (400 from `readBody`) instead of stopping the
+  process. No configuration change.
+- `anole.json.parse`: input nested deeper than the new
+  `ParseOptions.max_depth` (128) fails with `error.NestingTooDeep`, which
+  only a type that contains itself can reach, and `YYJSON_READ_INSITU` in
+  `ParseOptions.flags` is ignored (the input is read-only). `json.Error`
+  gains `NestingTooDeep` (breaking for exhaustive switches).
+- gRPC, gRPC-Web, Connect and transcoded routes: protobuf decoding is
+  hardened (zig-protobuf with Anole's patches): messages and groups nest at
+  most 100 levels, string and bytes lengths are checked against the input
+  before memory is allocated for them, and Timestamps with an out-of-range
+  month, day or time are refused. Connect and gRPC-Web JSON request
+  messages nested deeper than 100 levels fail the call. Such requests fail
+  with INTERNAL (INVALID_ARGUMENT, 400, on transcoded routes) instead of
+  stopping the process or allocating up to 2 GiB. No configuration change.
+- JSON transcoding: a query parameter can no longer override a field the
+  path template sets when the template names it by its JSON name
+  (`{bookId}`) and the query by its proto name (`?book_id=`), or the other
+  way around. The path's value stands, as documented. No configuration
+  change.
+- gRPC: new per-registration limits (`RegisterOptions`). `read_timeout`
+  (default 30 s) bounds how long a request message may take to arrive,
+  which a call without `grpc-timeout` used not to bound at all;
+  `max_received_bytes` (default 64 MiB) bounds what one call receives in
+  all, since decoded messages stay in the call's arena; `max_call_duration`
+  (default none) caps every call. A message frame's memory now grows with the
+  bytes that arrive instead of being allocated in full from its 5-byte
+  header, and frames are freed once decoded. Transcoded routes read the body
+  under the server's request timeout before the call's deadline applies.
+  Behaviour change: a client-streaming call that receives more than 64 MiB
+  in all now fails with RESOURCE_EXHAUSTED; raise `max_received_bytes` for
+  such services.
+- JSON transcoding: a binding with a `body` answers 415 to a non-empty body
+  whose `Content-Type` is not `application/json` (or `+json`). Breaking for
+  clients that post JSON with another content type.
+- gRPC: `Call.addTrailer` refuses names that are not metadata keys and
+  values that are not printable ASCII (base64 text under a `-bin` name) with
+  `error.InvalidMetadata`, so client data echoed into a trailer cannot add
+  trailer lines in gRPC-Web. New `Call.addBinaryTrailer` encodes raw bytes.
+  Breaking for handlers that passed raw bytes or upper-case names.
+- gRPC client: a call takes at most `Channel.max_received_bytes` (64 MiB,
+  `CallOptions.max_received_bytes` per call) of response messages in all,
+  then is canceled with RESOURCE_EXHAUSTED, so a server streaming without
+  end cannot grow the caller's arena without bound. Response frames are read
+  and inflated outside the arena and freed once decoded. Behaviour change
+  for clients of streams that send more than 64 MiB.
 
 ### C ABI (ABI 0.1)
 
