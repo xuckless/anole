@@ -125,7 +125,7 @@ pub const Options = struct {
     /// machine. See `Listener`.
     ///
     ///     .listeners = &.{
-    ///         .{ .name = "public", .address = "0.0.0.0", .port = 443, .tls = .{ .cert = cert }, .http3 = true },
+    ///         .{ .name = "public", .address = "", .port = 443, .tls = .{ .cert = cert }, .http3 = true },
     ///         .{ .name = "admin", .port = 9090 },
     ///     },
     listeners: []const Listener = &.{},
@@ -188,8 +188,12 @@ pub const Options = struct {
 
     /// `Options.http`: a cleartext listener.
     pub const Http = struct {
-        /// The interface to bind: "127.0.0.1" (this machine), "0.0.0.0"
-        /// (every IPv4 interface), "::" (every IPv6 one).
+        /// The interface to bind: "127.0.0.1" (this machine), "" (every
+        /// interface, IPv6 and IPv4 alike: one dual-stack socket on `::`,
+        /// or `0.0.0.0` where the system has no IPv6; what
+        /// `listen(":3000")` binds), "0.0.0.0" (every IPv4 interface
+        /// only), "::" (every IPv6 one, and IPv4 too where the system's
+        /// default maps it).
         address: []const u8 = "127.0.0.1",
         /// 0 picks a free port (see `addresses`).
         port: u16 = 8080,
@@ -204,8 +208,9 @@ pub const Options = struct {
 
     /// `Options.http3`: HTTP/3 over QUIC beside the TLS listener.
     pub const Http3 = struct {
-        /// The UDP address and port; `https`'s when null (the usual setup:
-        /// one port number, over TCP and UDP).
+        /// The UDP address, as `Http.address` (so "" is dual-stack);
+        /// `https`'s when null (the usual setup: one port number, over TCP
+        /// and UDP).
         address: ?[]const u8 = null,
         /// The UDP port; null for the TLS listener's.
         port: ?u16 = null,
@@ -849,12 +854,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             var certs: std.ArrayList(*CertState) = .empty;
             errdefer for (certs.items) |cs| cs.deinit();
             var h3_at: ?usize = null;
+            // Whether "" (every interface) can be one dual-stack socket:
+            // asked once, when a listener names it.
+            var dual: DualStack = .{};
             for (specs, listeners, 0..) |spec, *out, i| {
                 const l = spec.listener;
+                var ipv6_only: ?bool = null;
                 const address: http.Address = if (l.unix) |path|
                     .{ .unix = try std.Io.net.UnixAddress.init(path) }
-                else
-                    .{ .ip = try std.Io.net.IpAddress.parse(l.address, l.port) };
+                else blk: {
+                    const bind = try address_mod.resolve(l.address, l.port, l.address.len == 0 and dual.get());
+                    ipv6_only = bind.ipv6_only;
+                    break :blk .{ .ip = bind.ip };
+                };
                 var config: ?http.ServerConfig.Tls = null;
                 if (l.tls) |t| {
                     if (comptime features.tls != .boringssl) return error.TlsNotBuilt;
@@ -876,7 +888,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 }
                 if (l.http3) h3_at = i;
                 if (address == .unix and !handoff_mode) try clearStaleUnixSocket(rt_io, address.unix);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, i, address);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, i, address, ipv6_only);
                 if (fd) |f| try held.append(a, .{ .fd = f, .name = spec.name });
                 out.* = .{
                     .address = address,
@@ -884,6 +896,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .http1 = l.http1,
                     .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
                     .socket_per_acceptor = per_core_sockets and address == .ip,
+                    .ipv6_only = ipv6_only,
                     .proxy_protocol = l.proxy_protocol,
                     .tls = config,
                     .fd = fd,
@@ -915,8 +928,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
                 const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.len, &h3_buf) else &.{};
                 const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
+                // The UDP socket follows the TCP listener's address, "" (dual-stack) included.
+                const udp_host = q.address orelse l.address;
+                const udp_bind = try address_mod.resolve(udp_host, q.port orelse l.port, udp_host.len == 0 and dual.get());
                 const ep = try h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
-                    .address = try std.Io.net.IpAddress.parse(q.address orelse l.address, q.port orelse l.port),
+                    .address = udp_bind.ip,
+                    .ipv6_only = udp_bind.ipv6_only,
                     .cert_pem = cs.pem.cert,
                     .key_pem = cs.pem.key,
                     .max_streams_bidi = q.max_streams_bidi,
@@ -960,6 +977,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.certs = certs.items;
         }
 
+        /// `address_mod.dualStackAvailable`, asked at most once.
+        const DualStack = struct {
+            known: ?bool = null,
+
+            fn get(d: *DualStack) bool {
+                if (d.known == null) d.known = address_mod.dualStackAvailable();
+                return d.known.?;
+            }
+        };
+
         /// The HTTP/3 endpoint's mutual TLS settings: the TCP listener's
         /// mode, with its CAs (`bundle`, loaded by the caller).
         fn h3ClientAuth(client_auth: ?http.ServerConfig.Tls.ClientAuth, bundle: ?std.crypto.Certificate.Bundle) if (features.http3) ?h3.ClientAuth else void {
@@ -977,14 +1004,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// The socket for one listener in hand-off mode: inherited if one
         /// was passed in under `name` (or at `index`), else opened here.
         /// Null outside hand-off mode (dusty binds).
-        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address) !?handoff.Fd {
+        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| return fd;
             switch (address) {
                 .ip => |ip| {
                     // SO_REUSEPORT would share the port with whoever has it.
-                    try http.checkAddressFree(ip);
-                    const s = try ip.listen(io_, .{ .reuse_address = true });
+                    try http.checkAddressFree(ip, ipv6_only);
+                    const s = try http.listenIp(io_, ip, .{ .reuse_address = true, .ipv6_only = ipv6_only });
                     return s.socket.handle;
                 },
                 .unix => |unix| {
@@ -1057,9 +1084,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         /// Serves on `address`, in Go's notation, until SIGINT, SIGTERM or
-        /// `stop`, as `run` does: ":3000" is every IPv4 interface (as in
-        /// a container), "127.0.0.1:3000" or "localhost:3000" this machine
-        /// only, "[::]:3000" every IPv6 interface. HTTP/1.1, and HTTP/2 for
+        /// `stop`, as `run` does: ":3000" is every interface, IPv6 and
+        /// IPv4 alike (as in a container; IPv4 alone where the system has
+        /// no IPv6), "0.0.0.0:3000" every IPv4 interface only,
+        /// "127.0.0.1:3000" or "localhost:3000" this machine only,
+        /// "[::]:3000" every IPv6 interface. HTTP/1.1, and HTTP/2 for
         /// clients that open with its preface (h2c). For a server whose
         /// `init` options named neither `http` nor `https`; it serves the
         /// options' `listeners` too.

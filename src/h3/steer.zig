@@ -248,12 +248,12 @@ test "steering in the kernel: each datagram reaches the socket its ID names" {
     };
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     for (&fds) |*fd| {
-        fd.* = try net.bindReusePort(address);
+        fd.* = try net.bindReusePort(address, null);
         bound += 1;
         address = boundAddress(fd.*);
     }
     try attach(fds[0], sockets);
-    const client = try net.bindReusePort(.{ .ip4 = .loopback(0) });
+    const client = try net.bindReusePort(.{ .ip4 = .loopback(0) }, null);
     defer _ = std.c.close(client);
 
     var buf: [128]u8 = undefined;

@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
 It logs one line per listener as it starts, with what each one speaks:
 
 ```
-info(anole): listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)
+info(anole): listening on http://[::]:8080 (HTTP/1.1, HTTP/2 cleartext; IPv6 and IPv4)
 ```
 
 A port that another process already listens on is an error,
@@ -119,7 +119,8 @@ preface (h2c), on `address` in Go's notation, until SIGINT, SIGTERM or
 
 | Address | Binds |
 | --- | --- |
-| `":3000"` | every IPv4 interface (`0.0.0.0`), as a container or a server needs |
+| `":3000"` | every interface, IPv6 and IPv4 alike, as a container or a server needs (see [IPv6 and IPv4](#ipv6-and-ipv4)) |
+| `"0.0.0.0:3000"` | every IPv4 interface only |
 | `"127.0.0.1:3000"`, `"localhost:3000"` | this machine only |
 | `"[::]:3000"` | every IPv6 interface (and IPv4 too where the system maps it) |
 | `"[::1]:3000"` | IPv6 loopback |
@@ -169,14 +170,15 @@ You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
 `.{ .https = ... }` serves HTTPS only, and a server that wants both names
 both. Listeners named in the options bind to `127.0.0.1` unless given an
-`address`; use `"0.0.0.0"` or `"::"` to accept connections from other
-machines (`listen(":3000")` does the first).
+`address`; use `""` (every interface, IPv6 and IPv4 alike, as
+`listen(":3000")` binds), `"0.0.0.0"` (IPv4 only) or `"::"` to accept
+connections from other machines.
 
 ```zig
 var app = try anole.Server(void).init(init.gpa, .{
-    .http = .{ .address = "0.0.0.0", .port = 80 },
+    .http = .{ .address = "", .port = 80 },
     .https = .{
-        .address = "0.0.0.0",
+        .address = "",
         .port = 443,
         .cert = .{ .files = .{
             .cert_path = "/etc/anole/fullchain.pem",
@@ -245,13 +247,13 @@ const cert: anole.Cert = .fromFiles("/certs/server.crt", "/certs/server.key");
 var app = try anole.App.init(init.gpa, .{
     .listeners = &.{
         // HTTP/1.1, and h2c for clients that open with the preface (gRPC too).
-        .{ .name = "http", .address = "0.0.0.0", .port = 8080 },
+        .{ .name = "http", .address = "", .port = 8080 },
         // TLS, HTTP/1.1 only: h2 is not offered.
-        .{ .name = "https-h1", .address = "0.0.0.0", .port = 8081, .tls = .{ .cert = cert }, .http2 = false },
+        .{ .name = "https-h1", .address = "", .port = 8081, .tls = .{ .cert = cert }, .http2 = false },
         // h2c only.
-        .{ .name = "h2c", .address = "0.0.0.0", .port = 8082, .http1 = false },
+        .{ .name = "h2c", .address = "", .port = 8082, .http1 = false },
         // TLS with HTTP/2 and HTTP/1.1, and HTTP/3 on UDP 8443.
-        .{ .name = "https", .address = "0.0.0.0", .port = 8443, .tls = .{ .cert = cert }, .http3 = true },
+        .{ .name = "https", .address = "", .port = 8443, .tls = .{ .cert = cert }, .http3 = true },
     },
     .process = init.minimal,
 });
@@ -263,7 +265,7 @@ such as metrics on an internal port, put them in a group behind
 
 ```zig
 var app = try anole.App.init(init.gpa, .{
-    .https = .{ .address = "0.0.0.0", .port = 443, .cert = cert },
+    .https = .{ .address = "", .port = 443, .cert = cert },
     .listeners = &.{
         .{ .name = "admin", .port = 9090 }, // 127.0.0.1 only
         .{ .name = "proxy", .unix = "/run/myapp/http.sock" },
@@ -438,9 +440,39 @@ naming the address. Connections a stopped server left in `TIME_WAIT` do not
 trip it, so a quick restart works. Port 0 is not checked, and neither are
 sockets inherited from systemd or a SIGUSR2 predecessor. HTTP/3's UDP
 sockets get the same check, with a probe that sets no option at all (UDP has
-no `TIME_WAIT`), before the first of them binds. On macOS, as on other BSDs, a listener on a specific address beside one on the wildcard
+no `TIME_WAIT`), before the first of them binds. A dual-stack listener's
+probe is dual-stack too, so it also finds an IPv4 socket on the port. On macOS, as on other BSDs, a listener on a specific address beside one on the wildcard
 address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
 allowed: the kernel treats those as different addresses.
+
+### IPv6 and IPv4
+
+A listener on every interface without a family (`listen(":3000")`,
+`listenTls(":443", ...)`, or `address = ""` in the options) is dual-stack:
+one socket on `::` with `IPV6_V6ONLY` off, which takes IPv6 clients and
+IPv4 ones alike. Its HTTP/3 endpoint follows it, so a client that resolves
+`localhost` to `::1` and does not fall back to `127.0.0.1` (h2load's
+HTTP/3 mode, many QUIC clients) connects as well as one that uses IPv4. The
+startup line names it `http://[::]:3000 (...; IPv6 and IPv4)`. On Linux
+the per-core `SO_REUSEPORT` sockets, the per-core HTTP/3 sockets with their
+connection-ID steering, and the sockets a SIGUSR2 restart hands over are all
+dual-stack the same way.
+
+Where the system has no IPv6 (turned off at boot, `EAFNOSUPPORT`, or a
+container without it), the same listener binds `0.0.0.0` instead, IPv4
+only; so does Windows, a development target. An explicit address is bound
+as it is: `"0.0.0.0"` stays IPv4 only, and `"::"` keeps the system's
+default (IPv6 only on macOS; on Linux both, unless `net.ipv6.bindv6only`
+says otherwise).
+
+An IPv4 client of a dual-stack socket arrives as an IPv4-mapped address
+(`::ffff:127.0.0.1`). Anole reports it as plain IPv4 (`127.0.0.1`) in
+`req.remote_address`, so access logs, rate-limit keys and anything keyed by
+the client address see one client one way whichever socket it came in on;
+so are mapped addresses in `X-Forwarded-For` and PROXY protocol headers
+(`anole.http.unmapIpv4` does it for addresses of your own). HTTP/3 keeps
+the mapped address inside QUIC, where address validation tokens and Retry
+are bound to it, and unmaps it only for the request.
 
 ### Many connections
 
@@ -800,24 +832,25 @@ WantedBy=multi-user.target
 ```
 
 One socket unit per name, since `FileDescriptorName` names every socket of
-its unit:
+its unit. A port alone binds `[::]` dual-stack, as Anole does on its own
+(systemd's `BindIPv6Only=default`); write `0.0.0.0:80` for IPv4 only:
 
 ```ini
 # anole-http.socket
 [Socket]
-ListenStream=0.0.0.0:80
+ListenStream=80
 FileDescriptorName=http
 Service=anole.service
 
 # anole-https.socket
 [Socket]
-ListenStream=0.0.0.0:443
+ListenStream=443
 FileDescriptorName=https
 Service=anole.service
 
 # anole-h3.socket
 [Socket]
-ListenDatagram=0.0.0.0:443
+ListenDatagram=443
 FileDescriptorName=h3
 Service=anole.service
 ```
@@ -895,6 +928,8 @@ lacks, and does instead:
   macOS: no per-core `SO_REUSEPORT` sockets. Listeners bind without
   `SO_REUSEADDR`, which on Windows would let another socket take the same
   port; the bind itself fails with `error.AddressInUse` on a port in use.
+- **IPv4 for `":port"`**: a listener without a host binds `0.0.0.0`, not a
+  dual-stack `::`. Name `"[::]:port"` or `"[::1]:port"` for IPv6.
 - **HTTP/3 on one UDP socket**, without connection-ID steering, UDP batching
   (GSO/GRO) or control messages: no ECN, and replies from a listener on a
   wildcard address leave from the address Windows picks rather than the one

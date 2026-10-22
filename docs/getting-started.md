@@ -63,7 +63,8 @@ curl localhost:3000/   # Hello, World!
 
 The first build compiles the C libraries, which takes a minute or two; later
 builds reuse them. The server logs
-`listening on http://0.0.0.0:3000 (HTTP/1.1, HTTP/2 cleartext)` and serves
+`listening on http://[::]:3000 (HTTP/1.1, HTTP/2 cleartext; IPv6 and IPv4)`
+(`http://0.0.0.0:3000` where the system has no IPv6) and serves
 until Ctrl-C or SIGTERM, then lets the requests in flight finish and
 returns. A Debug build also logs a line for each runtime thread it starts
 and stops; `pub const std_options = anole.std_options;` in `main.zig` keeps
@@ -254,8 +255,8 @@ options and call `run`:
 
 ```zig
 var app = try anole.App.init(init.gpa, .{
-    .http = .{ .address = "0.0.0.0", .port = 80 },
-    .https = .{ .address = "0.0.0.0", .port = 443, .cert = .fromFiles("fullchain.pem", "privkey.pem") },
+    .http = .{ .address = "", .port = 80 }, // "": every interface, IPv6 and IPv4
+    .https = .{ .address = "", .port = 443, .cert = .fromFiles("fullchain.pem", "privkey.pem") },
 });
 defer app.deinit();
 app.get("/", hello);

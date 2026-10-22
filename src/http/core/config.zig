@@ -149,6 +149,14 @@ pub const Listener = struct {
     /// Ignored on Windows, where SO_REUSEADDR would let another socket
     /// bind the same port.
     reuse_address: bool = true,
+    /// IPV6_V6ONLY for a listener on an IPv6 address. False takes IPv4
+    /// clients too on the same socket (`::` then serves both families):
+    /// they arrive as IPv4-mapped addresses (`::ffff:127.0.0.1`), which
+    /// requests report as plain IPv4. True takes IPv6 alone. Null leaves
+    /// the system's default (IPv6 alone on macOS and Windows; on Linux,
+    /// `net.ipv6.bindv6only`, normally both). Ignored for IPv4 addresses,
+    /// and for an inherited socket (`fd`), which is bound already.
+    ipv6_only: ?bool = null,
     /// Serve cleartext HTTP/2 to a client that opens with the HTTP/2
     /// connection preface ("prior knowledge", RFC 9113 §3.3), alongside
     /// HTTP/1.x on the same port. Needs the `use_http2` build option, and

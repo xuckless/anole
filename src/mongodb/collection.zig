@@ -211,6 +211,12 @@ pub const Collection = struct {
         return struct {
             collection: Collection,
 
+            pub const shape: db.ReadShape = switch (verb) {
+                .find, .aggregate, .distinct => .all,
+                .find_optional => .optional,
+                .estimated_count => .one,
+            };
+
             pub fn run(r: @This(), c: anytype, _: []const u8, args: anytype) Error!switch (verb) {
                 .find, .aggregate, .distinct => []T,
                 .find_optional => ?T,

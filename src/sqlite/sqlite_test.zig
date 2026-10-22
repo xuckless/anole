@@ -370,6 +370,55 @@ test "sqlite: coalesced and cached reads on 4 executors; invalidation after a wr
     try testing.expectEqual(@as(u64, 2), db.cache.stats().hits);
 }
 
+test "sqlite: cache-aside with keep_empty = false, and lastSource for hit or miss" {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("aside.db") });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const by_title = "SELECT id, title, done FROM notes WHERE title = ?";
+    const all_by_title = "SELECT id, title, done FROM notes WHERE title LIKE ?";
+    try testing.expectEqual(@as(?anole_db.Source, null), anole_db.lastSource(ctx));
+
+    // Not kept while empty: every call asks the database again...
+    const aside = db.with(.{ .cache = .{ .ttl = .fromSeconds(60), .keep_empty = false } });
+    for (0..2) |_| {
+        try testing.expect(try aside.optional(Note, ctx, by_title, .{"k"}) == null);
+        try testing.expectEqual(@as(?anole_db.Source, .database), anole_db.lastSource(ctx));
+        try testing.expectEqual(@as(usize, 0), (try aside.all(Note, ctx, all_by_title, .{"k%"})).len);
+        try testing.expectEqual(@as(?anole_db.Source, .database), anole_db.lastSource(ctx));
+    }
+    try testing.expectEqual(@as(u64, 0), db.cache.stats().hits);
+    // ...so the row a miss filled in is seen at once, then kept.
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('k')", .{});
+    try testing.expectEqualStrings("k", (try aside.optional(Note, ctx, by_title, .{"k"})).?.title);
+    try testing.expectEqual(@as(?anole_db.Source, .database), anole_db.lastSource(ctx));
+    try testing.expectEqualStrings("k", (try aside.optional(Note, ctx, by_title, .{"k"})).?.title);
+    try testing.expectEqual(@as(?anole_db.Source, .cache), anole_db.lastSource(ctx));
+    try testing.expectEqual(@as(usize, 1), (try aside.all(Note, ctx, all_by_title, .{"k%"})).len);
+    try testing.expectEqual(@as(usize, 1), (try aside.all(Note, ctx, all_by_title, .{"k%"})).len);
+    try testing.expectEqual(@as(?anole_db.Source, .cache), anole_db.lastSource(ctx));
+    // A plain call leaves the last source alone.
+    _ = try db.optional(Note, ctx, by_title, .{"k"});
+    try testing.expectEqual(@as(?anole_db.Source, .cache), anole_db.lastSource(ctx));
+
+    // The default keeps "none" like any other result.
+    const keeping = db.with(.{ .cache = .{ .ttl = .fromSeconds(60) } });
+    try testing.expect(try keeping.optional(Note, ctx, by_title, .{"absent"}) == null);
+    try testing.expectEqual(@as(?anole_db.Source, .database), anole_db.lastSource(ctx));
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('absent')", .{});
+    try testing.expect(try keeping.optional(Note, ctx, by_title, .{"absent"}) == null);
+    try testing.expectEqual(@as(?anole_db.Source, .cache), anole_db.lastSource(ctx));
+}
+
 test "sqlite: :memory: is one database seen from every executor" {
     var r: Runtime = undefined;
     try r.init(4, 2);

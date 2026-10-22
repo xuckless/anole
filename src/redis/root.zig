@@ -70,7 +70,9 @@
 //!   `command`, pipelines, pub/sub and calls on an `acquire`d connection
 //!   run as they are. Drop kept replies with `cache.invalidate(.{ .tag })`,
 //!   or `cache.invalidateQuery("GET", .{key})` (the name, then the rest of
-//!   the command).
+//!   the command). For cache-aside, `.keep_empty = false` keeps no nil (nor
+//!   an empty list or set), so a key filled after a miss is read at once;
+//!   `anole.db.lastSource(req)` says whether a call was a hit.
 //! - Cancellation: a call canceled in flight (the request's deadline, an
 //!   HTTP/2 reset, `with(.{ .timeout })`) closes its connection, whose
 //!   reply may still be on its way.
@@ -1027,6 +1029,8 @@ pub const Query = struct {
 fn Read(comptime T: type, comptime mode: Mode) type {
     return struct {
         query: Query,
+
+        pub const shape = @field(db.ReadShape, @tagName(mode));
 
         pub fn run(r: @This(), c: anytype, name: []const u8, args: anytype) Error!Out(T, mode) {
             return r.query.plain(T, mode, c, .{ name, args });
@@ -2086,6 +2090,8 @@ const Fake = struct {
     /// GETs and INCRs answered; a GET of "shared" waits 50 ms first.
     gets: std.atomic.Value(u32) = .init(0),
     incrs: std.atomic.Value(u32) = .init(0),
+    /// "filled" is nil to GET until a SET of it.
+    filled: std.atomic.Value(bool) = .init(false),
 
     fn port(self: *Fake) u16 {
         return self.listener.socket.address.getPort();
@@ -2129,10 +2135,13 @@ const Fake = struct {
                 if (eql(u8, words[1][0..lens[1]], "shared")) io.sleep(.fromMilliseconds(50), .awake) catch return;
             }
             if (eql(u8, cmd, "INCR")) _ = self.incrs.fetchAdd(1, .monotonic);
+            const key = words[1][0..lens[1]];
+            if (eql(u8, cmd, "SET") and eql(u8, key, "filled")) self.filled.store(true, .monotonic);
+            const nil = eql(u8, key, "missing") or (eql(u8, key, "filled") and !self.filled.load(.monotonic));
             const reply: []const u8 = if (eql(u8, cmd, "SET") or eql(u8, cmd, "MULTI"))
                 "+OK\r\n"
             else if (eql(u8, cmd, "GET"))
-                (if (eql(u8, words[1][0..lens[1]], "missing")) "$-1\r\n" else "$5\r\nvalue\r\n")
+                (if (nil) "$-1\r\n" else "$5\r\nvalue\r\n")
             else if (eql(u8, cmd, "INCR"))
                 ":42\r\n"
             else if (eql(u8, cmd, "HGETALL"))
@@ -2154,6 +2163,52 @@ const Fake = struct {
         }
     }
 };
+
+test "redis: cache-aside: keep_empty = false asks again after nil; lastSource for X-Cache" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const client = try Client.init(gpa, io, .{ .url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()}), .environ = .empty });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    // nil is not kept: each GET goes to the server until the value is
+    // there, and then the value is kept.
+    const aside = client.with(.{ .cache = .{ .ttl = .fromSeconds(60), .keep_empty = false } });
+    try testing.expect(try aside.get(&c, "filled") == null);
+    try testing.expectEqual(@as(?db.Source, .database), db.lastSource(&c));
+    try testing.expect(try aside.get(&c, "filled") == null);
+    try testing.expectEqual(@as(?db.Source, .database), db.lastSource(&c));
+    try testing.expectEqual(@as(u32, 2), fake.gets.load(.monotonic));
+    // The miss filled in, as cache-aside does: no invalidation needed.
+    _ = try client.set(&c, "filled", "value", .{});
+    try testing.expectEqualStrings("value", (try aside.get(&c, "filled")).?);
+    try testing.expectEqual(@as(?db.Source, .database), db.lastSource(&c));
+    try testing.expectEqualStrings("value", (try aside.get(&c, "filled")).?);
+    try testing.expectEqual(@as(?db.Source, .cache), db.lastSource(&c));
+    try testing.expectEqual(@as(u32, 3), fake.gets.load(.monotonic));
+
+    // By default nil is kept like any reply.
+    const keeping = client.with(.{ .cache = .{ .ttl = .fromSeconds(60) } });
+    try testing.expect(try keeping.get(&c, "missing") == null);
+    try testing.expect(try keeping.get(&c, "missing") == null);
+    try testing.expectEqual(@as(?db.Source, .cache), db.lastSource(&c));
+    try testing.expectEqual(@as(u32, 4), fake.gets.load(.monotonic));
+    // A plain call leaves the last source as it was.
+    _ = try client.get(&c, "missing");
+    try testing.expectEqual(@as(?db.Source, .cache), db.lastSource(&c));
+}
 
 test "redis: calls over a fake server: replies, types, pipelines, errors and timeouts" {
     const zio = @import("zio");

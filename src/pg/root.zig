@@ -910,6 +910,8 @@ fn Read(comptime T: type, comptime mode: Mode) type {
     return struct {
         query: Query,
 
+        pub const shape = @field(db.ReadShape, @tagName(mode));
+
         pub fn run(r: @This(), c: anytype, sql: []const u8, args: anytype) Error!Fetch(T, mode, @TypeOf(args)).Out {
             const q = r.query;
             return q.db.call(c, q.opts.timeout, null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });

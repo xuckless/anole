@@ -102,8 +102,10 @@ fn forwardedRemoteAddress(headers: *const Headers, trusted_proxy_hops: usize) ?s
     return selected;
 }
 
+/// IPv4-mapped addresses, from a dual-stack socket or a forwarding
+/// header, are reported as IPv4 (`unmapIpv4`).
 fn remoteAddress(peer: std.Io.net.IpAddress, headers: *const Headers, trusted_proxy_hops: usize) std.Io.net.IpAddress {
-    return forwardedRemoteAddress(headers, trusted_proxy_hops) orelse peer;
+    return unmapIpv4(forwardedRemoteAddress(headers, trusted_proxy_hops) orelse peer);
 }
 
 /// The last value of a comma-separated forwarding header: the one the
@@ -629,9 +631,9 @@ pub const Connection = struct {
     /// own `EndOfStream`, from a file or from a std helper at the end of
     /// the body, is spelled like a disconnect and is not one.
     /// The client's address: the socket peer, or what a PROXY protocol
-    /// header named.
+    /// header named; IPv4 when a dual-stack socket saw it IPv4-mapped.
     pub fn peerAddress(self: *const Connection) std.Io.net.IpAddress {
-        return self.proxied_peer orelse self.stream.socket.address;
+        return unmapIpv4(self.proxied_peer orelse self.stream.socket.address);
     }
 
     pub fn peerGone(self: *Connection) bool {
@@ -716,12 +718,13 @@ pub const Listener = @import("config.zig").Listener;
 /// The server calls it before binding an IP listener that sets
 /// `reuse_address`, and not for an inherited socket (`Listener.fd`), which
 /// is already bound; call it before opening a socket of your own that is to
-/// be handed over.
+/// be handed over. `ipv6_only` is the socket's (`Listener.ipv6_only`): a
+/// dual-stack `::` (false) also conflicts with IPv4 sockets on the port.
 ///
 /// Nothing on Windows: listeners there bind without SO_REUSEADDR (which on
 /// Windows lets a second socket take a port that is in use), so the bind
 /// itself fails on a port in use.
-pub fn checkAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void {
+pub fn checkAddressFree(address: std.Io.net.IpAddress, ipv6_only: ?bool) error{AddressInUse}!void {
     if (comptime builtin.os.tag == .windows) return;
     if (address.getPort() == 0) return;
     const posix = std.posix;
@@ -738,6 +741,10 @@ pub fn checkAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void 
     defer _ = sys.close(fd);
     const one: c_int = 1;
     if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int))) != .SUCCESS) return;
+    if (comptime builtin.os.tag != .windows) if (ipv6_only) |v6only| if (address == .ip6) {
+        const value: c_int = @intFromBool(v6only);
+        if (posix.errno(sys.setsockopt(fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @ptrCast(&value), @sizeOf(c_int))) != .SUCCESS) return;
+    };
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const len = std.Io.Threaded.addressToPosix(&address, &storage);
     if (posix.errno(sys.bind(fd, &storage.any, len)) == .ADDRINUSE) {
@@ -746,6 +753,85 @@ pub fn checkAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void 
         if (!builtin.is_test) log.err("{f} is already in use: another process is listening on it", .{address});
         return error.AddressInUse;
     }
+}
+
+/// `listenIp`'s options: `IpAddress.ListenOptions`, plus IPV6_V6ONLY.
+pub const ListenIpOptions = struct {
+    kernel_backlog: u31 = std.Io.net.default_kernel_backlog,
+    /// SO_REUSEADDR, and SO_REUSEPORT where there is one.
+    reuse_address: bool = false,
+    /// As `Listener.ipv6_only`: null leaves the system's default.
+    ipv6_only: ?bool = null,
+};
+
+/// A listening TCP socket on `address`: `IpAddress.listen`, which has no
+/// option for IPV6_V6ONLY, unless `options.ipv6_only` sets it on an IPv6
+/// address. Then the socket is opened here, and made non-blocking under
+/// zio, as zio's own are.
+pub fn listenIp(io: std.Io, address: std.Io.net.IpAddress, options: ListenIpOptions) std.Io.net.IpAddress.ListenError!std.Io.net.Server {
+    const plain: std.Io.net.IpAddress.ListenOptions = .{ .kernel_backlog = options.kernel_backlog, .reuse_address = options.reuse_address };
+    if (comptime builtin.os.tag == .windows) return address.listen(io, plain);
+    const v6only = options.ipv6_only orelse return address.listen(io, plain);
+    if (address != .ip6) return address.listen(io, plain);
+    const posix = std.posix;
+    const c = std.c;
+    const fd = c.socket(posix.AF.INET6, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    if (fd < 0) return switch (posix.errno(@as(c_int, -1))) {
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .PROTONOSUPPORT => error.ProtocolUnsupportedBySystem,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
+    errdefer _ = c.close(fd);
+    _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+    const value: c_int = @intFromBool(v6only);
+    if (c.setsockopt(fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, &value, @sizeOf(c_int)) != 0) return error.OptionUnsupported;
+    if (options.reuse_address) {
+        const one: c_int = 1;
+        if (c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one, @sizeOf(c_int)) != 0) return error.OptionUnsupported;
+        // Best-effort, as std's and zio's `listen`.
+        if (@hasDecl(posix.SO, "REUSEPORT")) _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &one, @sizeOf(c_int));
+    }
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    var len = std.Io.Threaded.addressToPosix(&address, &storage);
+    if (c.bind(fd, &storage.any, len) != 0) return switch (posix.errno(@as(c_int, -1))) {
+        .ADDRINUSE => error.AddressInUse,
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .ACCES, .PERM => error.AccessDenied,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .NOMEM, .NOBUFS => error.SystemResources,
+        else => error.Unexpected,
+    };
+    if (c.listen(fd, options.kernel_backlog) != 0) return switch (posix.errno(@as(c_int, -1))) {
+        .ADDRINUSE => error.AddressInUse,
+        else => error.Unexpected,
+    };
+    if (placement.executorCount(io) != null) {
+        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.Unexpected;
+        _ = c.fcntl(fd, c.F.SETFL, flags | @as(c_int, 1 << @bitOffsetOf(posix.O, "NONBLOCK")));
+    }
+    len = @sizeOf(std.Io.Threaded.PosixAddress);
+    const bound = if (c.getsockname(fd, &storage.any, &len) == 0) std.Io.Threaded.addressFromPosix(&storage) else address;
+    return .{ .socket = .{ .handle = fd, .address = bound }, .options = {} };
+}
+
+/// `address` as a client on the other end knows it: an IPv4-mapped IPv6
+/// address (`::ffff:127.0.0.1`, how a dual-stack socket sees an IPv4
+/// peer) becomes the IPv4 address itself, with the same port. Any other
+/// address is returned as it is. Requests' `remote_address` goes through
+/// it, so logs, rate limits and `X-Forwarded-For` see one client one way
+/// whichever socket it came in on.
+pub fn unmapIpv4(address: std.Io.net.IpAddress) std.Io.net.IpAddress {
+    const a = switch (address) {
+        .ip4 => return address,
+        .ip6 => |a| a,
+    };
+    const prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    if (!std.mem.eql(u8, a.bytes[0..12], &prefix)) return address;
+    return .{ .ip4 = .{ .bytes = a.bytes[12..16].*, .port = a.port } };
 }
 
 /// Where a listener is and what it speaks, for the line logged when it
@@ -772,6 +858,8 @@ pub fn describeListener(w: *std.Io.Writer, cfg: *const Listener, address: Addres
         first = false;
     }
     for (cfg.extra_protocols) |p| try w.print(", {s}", .{p});
+    // `[::]` alone reads as IPv6 only.
+    if (address == .ip and address.ip == .ip6 and cfg.ipv6_only == false) try w.writeAll("; IPv6 and IPv4");
     if (cfg.proxy_protocol) try w.writeAll("; PROXY protocol");
     try w.writeAll(")");
 }
@@ -1458,12 +1546,13 @@ pub fn Server(comptime Ctx: type) type {
             l.server = switch (cfg.address) {
                 .ip => |ip| blk: {
                     // SO_REUSEPORT would share the port with whoever has it.
-                    if (cfg.reuse_address) try checkAddressFree(ip);
-                    break :blk try ip.listen(self.io, .{
+                    if (cfg.reuse_address) try checkAddressFree(ip, cfg.ipv6_only);
+                    break :blk try listenIp(self.io, ip, .{
                         .kernel_backlog = kernel_backlog,
                         // Windows' SO_REUSEADDR would let another socket
                         // bind the port too (`checkAddressFree`).
                         .reuse_address = cfg.reuse_address and builtin.os.tag != .windows,
+                        .ipv6_only = cfg.ipv6_only,
                     });
                 },
                 .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = kernel_backlog }),
@@ -1481,9 +1570,10 @@ pub fn Server(comptime Ctx: type) type {
                 // The address the first socket got, so a listener given port
                 // zero binds every socket to the same port.
                 for (extra) |*s| {
-                    s.* = try l.address.ip.listen(self.io, .{
+                    s.* = try listenIp(self.io, l.address.ip, .{
                         .kernel_backlog = kernel_backlog,
                         .reuse_address = true,
+                        .ipv6_only = cfg.ipv6_only,
                     });
                     bound += 1;
                 }
@@ -2764,6 +2854,29 @@ test "trusted proxy hops select X-Forwarded-For from the right" {
     try headers.put("X-Forwarded-For", "not-an-address, 203.0.113.10");
     const malformed = remoteAddress(peer, &headers, 2);
     try std.testing.expect(malformed.ip4.eql(peer.ip4));
+}
+
+test "IPv4-mapped peers and forwarded addresses are reported as IPv4" {
+    var headers = try Headers.init(std.testing.allocator, 2);
+    defer headers.deinit(std.testing.allocator);
+    // A dual-stack socket's IPv4 peer: the same client as 127.0.0.1.
+    const mapped = try std.Io.net.IpAddress.parse("::ffff:127.0.0.1", 4321);
+    const direct = remoteAddress(mapped, &headers, 0);
+    try std.testing.expect(direct == .ip4);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, direct.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 4321), direct.ip4.port);
+    // A proxy reached over the dual-stack socket, naming a mapped client.
+    try headers.add("X-Forwarded-For", "::ffff:198.51.100.7");
+    const forwarded = remoteAddress(mapped, &headers, 1);
+    try std.testing.expect(forwarded == .ip4);
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 7 }, forwarded.ip4.bytes);
+    // Real IPv6 addresses stay as they are.
+    const v6 = try std.Io.net.IpAddress.parse("::1", 80);
+    try std.testing.expect(unmapIpv4(v6).ip6.eql(v6.ip6));
+    const nat64 = try std.Io.net.IpAddress.parse("64:ff9b::7f00:1", 80);
+    try std.testing.expect(unmapIpv4(nat64) == .ip6);
+    const ip4 = try std.Io.net.IpAddress.parse("10.0.0.1", 80);
+    try std.testing.expect(unmapIpv4(ip4).ip4.eql(ip4.ip4));
 }
 
 /// A Connection with no real transport, in TLS mode, so the error accessors
