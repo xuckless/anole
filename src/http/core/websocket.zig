@@ -8,6 +8,21 @@ const placement = @import("placement.zig");
 
 const log = std.log.scoped(.anole);
 
+/// Whether `req` is an HTTP/1.1 WebSocket handshake (RFC 6455 4.2.1): a GET
+/// with `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version:
+/// 13` and a valid `Sec-WebSocket-Key`.
+pub fn isHandshake(req: *const @import("request.zig").Request) bool {
+    if (req.method != .get) return false;
+    const upgrade = req.headers.get("Upgrade") orelse return false;
+    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, upgrade, " \t"), "websocket")) return false;
+    const connection = req.headers.get("Connection") orelse return false;
+    if (std.ascii.findIgnoreCase(connection, "upgrade") == null) return false;
+    const version = req.headers.get("Sec-WebSocket-Version") orelse return false;
+    if (!std.mem.eql(u8, version, "13")) return false;
+    const key = req.headers.get("Sec-WebSocket-Key") orelse return false;
+    return WebSocket.validKey(key);
+}
+
 /// An established WebSocket connection (RFC 6455). Obtained from
 /// `Response._upgradeWebSocket` on the server side and `Client.connectWebSocket`
 /// on the client side; call `deinit` when done.

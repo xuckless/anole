@@ -128,7 +128,93 @@ pub const UpgradeOptions = struct {
     close_on_drain: bool = true,
     /// The reason sent with the drain's close 1001.
     drain_reason: []const u8 = "server shutting down",
+    /// The subprotocols this endpoint speaks, most preferred first. The
+    /// first of them that the client offered (`Sec-WebSocket-Protocol`,
+    /// every line, comma-separated) is selected, echoed in the handshake's
+    /// answer and set as `Socket.subprotocol`. When the client offered none
+    /// of them, or none at all, the socket opens without one (RFC 6455
+    /// 4.2.2). Each must be a token (RFC 9110 tchar); `upgrade` fails with
+    /// `error.InvalidSubprotocol` otherwise.
+    subprotocols: []const []const u8 = &.{},
+    /// Extra headers on the handshake's answer (101 over HTTP/1.1, 200 over
+    /// HTTP/2 and HTTP/3): `Set-Cookie`, `X-Request-Id`. A name the
+    /// handshake writes itself (`Upgrade`, `Connection`, any
+    /// `Sec-WebSocket-*`) or a framing header (`Content-Length`,
+    /// `Transfer-Encoding`) is `error.InvalidHeaderName`. The values must
+    /// stay valid until `upgrade` returns.
+    headers: []const std.http.Header = &.{},
 };
+
+/// Whether `req` is a WebSocket handshake `upgrade` would accept, origins
+/// aside: an HTTP/1.1 GET with `Upgrade: websocket`, `Connection: upgrade`,
+/// `Sec-WebSocket-Version: 13` and a valid `Sec-WebSocket-Key`; or an
+/// HTTP/2 or HTTP/3 extended CONNECT with `:protocol websocket` and
+/// version 13.
+pub fn isUpgrade(req: *const dusty.Request) bool {
+    if (req.protocol) |protocol| {
+        if (!(features.http2 or features.http3) or !std.ascii.eqlIgnoreCase(protocol, "websocket")) return false;
+        const version = req.headers.get("Sec-WebSocket-Version") orelse return false;
+        return std.mem.eql(u8, version, "13");
+    }
+    return dusty.isWebSocketHandshake(req);
+}
+
+/// The subprotocols the client offered, in its order: every
+/// `Sec-WebSocket-Protocol` line, split on commas, spaces and tabs trimmed,
+/// empty items skipped.
+pub fn offeredSubprotocols(req: *const dusty.Request) SubprotocolIterator {
+    return .{ .headers = req.headers.iterator() };
+}
+
+pub const SubprotocolIterator = struct {
+    headers: dusty.Headers.Iterator,
+    rest: []const u8 = "",
+
+    pub fn next(it: *SubprotocolIterator) ?[]const u8 {
+        while (true) {
+            while (it.rest.len > 0) {
+                const comma = std.mem.indexOfScalar(u8, it.rest, ',') orelse it.rest.len;
+                const item = std.mem.trim(u8, it.rest[0..comma], " \t");
+                it.rest = if (comma < it.rest.len) it.rest[comma + 1 ..] else "";
+                if (item.len > 0) return item;
+            }
+            while (it.headers.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Protocol")) {
+                    it.rest = entry.value;
+                    break;
+                }
+            } else return null;
+        }
+    }
+};
+
+/// The first of `preferred` that `req` offered, or null.
+pub fn selectSubprotocol(req: *const dusty.Request, preferred: []const []const u8) ?[]const u8 {
+    for (preferred) |want| {
+        var it = offeredSubprotocols(req);
+        while (it.next()) |offered| if (std.mem.eql(u8, offered, want)) return want;
+    }
+    return null;
+}
+
+/// Whether `name` is a header an endpoint may add to the handshake's
+/// answer: not one the handshake writes itself or the framing owns.
+pub fn handshakeHeaderAllowed(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const refused = [_][]const u8{ "Upgrade", "Connection", "Content-Length", "Transfer-Encoding" };
+    for (refused) |r| if (std.ascii.eqlIgnoreCase(name, r)) return false;
+    return !std.ascii.startsWithIgnoreCase(name, "Sec-WebSocket-");
+}
+
+/// Whether `text` is a token (RFC 9110 tchar), which a subprotocol must be.
+pub fn isToken(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        if (std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return false;
+    }
+    return true;
+}
 
 /// permessage-deflate settings: window size, memory level, level, and the
 /// shortest message worth compressing (64 bytes). Empty without
@@ -180,6 +266,9 @@ pub const Socket = struct {
     /// The code of the peer's close, once one arrived (null for a close
     /// with no code, or none yet).
     close_code: ?CloseCode = null,
+    /// The subprotocol selected in the handshake; null for none. Lives as
+    /// long as the socket.
+    subprotocol: ?[]const u8 = null,
     /// The application's, for state it keeps per socket: a callback socket
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
@@ -435,19 +524,21 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
 fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, owner: ?std.mem.Allocator) !?Socket {
     // An extended CONNECT, over HTTP/2 or HTTP/3.
     const h2 = req.protocol != null;
-    if (h2) {
-        if (!(features.http2 or features.http3) or !std.ascii.eqlIgnoreCase(req.protocol.?, "websocket")) return null;
-        const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
-        if (!std.mem.eql(u8, version, "13")) return null;
-    } else {
-        const up = req.headers.get("Upgrade") orelse return null;
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, up, " \t"), "websocket")) return null;
-    }
+    if (!isUpgrade(req)) return null;
     // A WebSocket handshake from here: from a page that may open it?
     if (!origin.allowed(req, options.allowed_origins)) return error.Forbidden;
+    for (options.subprotocols) |sp| if (!isToken(sp)) return error.InvalidSubprotocol;
+    for (options.headers) |h| if (!handshakeHeaderAllowed(h.name)) return error.InvalidHeaderName;
 
     // What lives as long as the socket.
     const alloc = if (h2) req.arena else owner orelse req.arena;
+
+    // The subprotocol the client offered that we prefer, and the extra
+    // headers: on the response before the handshake's answer goes out.
+    const subprotocol: ?[]const u8 = if (selectSubprotocol(req, options.subprotocols)) |sp| try alloc.dupe(u8, sp) else null;
+    errdefer if (owner != null and !h2) if (subprotocol) |sp| alloc.free(sp);
+    if (subprotocol) |sp| try res.header("Sec-WebSocket-Protocol", sp);
+    for (options.headers) |h| try res.header(try req.arena.dupe(u8, h.name), try req.arena.dupe(u8, h.value));
 
     // permessage-deflate: the first offer we can take, answered in the
     // handshake's response.
@@ -478,6 +569,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         .allocator = alloc,
         .io = req.io,
         .max_message_size = max_message,
+        .subprotocol = subprotocol,
         .drain = req.drain,
         .executor = placement.currentExecutor(req.io),
         // The stream's task serves the socket for its whole life over
@@ -493,6 +585,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         ws.* = (try res._upgradeWebSocket(req)) orelse {
             if (owner != null) alloc.destroy(ws);
             if (comptime features.compression) if (owner != null) if (deflate) |d| alloc.destroy(d);
+            if (owner != null) if (subprotocol) |sp| alloc.free(sp);
             return null;
         };
         // Its messages' memory too, when the socket outlives the request
@@ -527,6 +620,7 @@ fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
     socket.deinit();
     if (comptime features.compression) if (socket.deflate) |d| owner.destroy(d);
     if (socket.drain_watch) |w| owner.destroy(w);
+    if (socket.subprotocol) |sp| owner.free(sp);
     owner.destroy(ws);
 }
 

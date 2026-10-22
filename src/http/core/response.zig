@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const http = @import("http.zig");
 const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
+const WebSocketModule = @import("websocket.zig");
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
@@ -1494,19 +1495,8 @@ pub const Response = struct {
         // WebSocket (RFC 8441), which a sink does not offer.
         if (self._sink != null) return null;
         // RFC 6455 §4.2.1: a GET, with a key of 16 bytes in base64.
-        if (req.method != .get) return null;
-        // Validate upgrade headers
-        const upgrade = req.headers.get("Upgrade") orelse return null;
-        if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
-
-        const connection = req.headers.get("Connection") orelse return null;
-        if (std.ascii.findIgnoreCase(connection, "upgrade") == null) return null;
-
-        const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
-        if (!std.mem.eql(u8, version, "13")) return null;
-
-        const key = req.headers.get("Sec-WebSocket-Key") orelse return null;
-        if (!WebSocket.validKey(key)) return null;
+        if (!WebSocketModule.isHandshake(req)) return null;
+        const key = req.headers.get("Sec-WebSocket-Key").?;
 
         // Compute accept key
         var accept_key: [28]u8 = undefined;

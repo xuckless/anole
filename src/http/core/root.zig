@@ -50,6 +50,8 @@ pub const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 pub const EventStream = @import("response.zig").EventStream;
 pub const EventWriter = @import("response.zig").EventWriter;
 pub const WebSocket = @import("websocket.zig").WebSocket;
+/// Whether an HTTP/1.1 request is a valid WebSocket handshake.
+pub const isWebSocketHandshake = @import("websocket.zig").isHandshake;
 /// How a WebSocket sends once per read (`WebSocket`); for layers that
 /// frame WebSocket messages themselves.
 pub const WebSocketBatch = @import("websocket.zig").Batch;
