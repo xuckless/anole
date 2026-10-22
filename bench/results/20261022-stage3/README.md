@@ -132,3 +132,77 @@ Notes:
   (179k). Every other case orders the other way, so I count it as run-to-run
   spread.
 - **Errors:** none in any raw case.
+
+## Concurrent connections (done 14:20)
+
+Setup: 1 CPU, HTTP/1.1 GET /json, wrk with 16 threads and `--timeout 10s`.
+Each count runs 30 s × 3, and the median run is kept. Memory is the server's
+peak (anon + kernel).
+
+req/s:
+
+| server | 16 | 64 | 256 | 1,024 | 4,096 | 10,000 | 25,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| anole | 238k | 252k | 228k | 217k | 154k | 120k | 133k |
+| fiber | 220k | 218k | 210k | 206k | 161k | 146k | 143k |
+| axum | 223k | 216k | 209k | 201k | 199k | 199k | 198k |
+| express | 82k | 81k | 80k | 76k | 68k | 65k | 60k |
+| fastify | 124k | 123k | 121k | 119k | 100k | 93k | 84k |
+| fastapi | 20k | 20k | 19k | 18k | 17k | 17k | 17k |
+
+p99 latency:
+
+| server | 16 | 64 | 256 | 1,024 | 4,096 | 10,000 | 25,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| anole | 0.1 ms | 0.3 ms | 1.3 ms | 5.1 ms | 27.7 ms | 85.7 ms | 6.32 s |
+| fiber | 0.1 ms | 0.6 ms | 1.8 ms | 5.9 ms | 27.1 ms | 72.6 ms | 183.3 ms |
+| axum | 0.1 ms | 0.3 ms | 1.3 ms | 168.3 ms | 776.4 ms | 1.96 s | 4.53 s |
+| express | 0.4 ms | 1.2 ms | 3.7 ms | 1.99 s | 877.3 ms | 76.8 ms | 173.9 ms |
+| fastify | 0.2 ms | 0.6 ms | 2.3 ms | 1.22 s | 2.31 s | 58.1 ms | 118.4 ms |
+| fastapi | 1.5 ms | 3.4 ms | 262.7 ms | 5.29 s | 1.84 s | 85.2 ms | 90.3 ms |
+
+memory, MB:
+
+| server | 16 | 64 | 256 | 1,024 | 4,096 | 10,000 | 25,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| anole | 2 | 3 | 7 | 23 | 89 | 218 | 498 |
+| fiber | 7 | 7 | 16 | 49 | 179 | 393 | 917 |
+| axum | 2 | 3 | 10 | 33 | 137 | 346 | 833 |
+| express | 67 | 92 | 103 | 192 | 237 | 269 | 334 |
+| fastify | 60 | 62 | 97 | 185 | 218 | 277 | 320 |
+| fastapi | 41 | 42 | 48 | 77 | 90 | 90 | 99 |
+
+errors (wrk: connect, read, write, timeout):
+
+| server | 16 | 64 | 256 | 1,024 | 4,096 | 10,000 | 25,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| anole | 0 | 0 | 0 | 0 | 0 | 0 | 3,809 |
+| fiber | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| axum | 0 | 0 | 0 | 0 | 0 | 0 | 1,414 |
+| express | 0 | 0 | 0 | 0 | 811 | 782 | 711 |
+| fastify | 0 | 0 | 0 | 0 | 699 | 661 | 553 |
+| fastapi | 0 | 0 | 0 | 341 | 507 | 2,433 | 2,614 |
+
+Notes:
+- **Up to 1,024 connections, Anole leads on throughput.** Its p99 ties Axum's
+  as the lowest up to 256 connections and is the lowest at 1,024 (5.1 ms,
+  against Fiber's 5.9 ms and Axum's 168 ms). It also uses the least memory of
+  the compiled stacks: 23 MB at 1,024 connections, against 33 MB for Axum and
+  49 MB for Fiber.
+- **From 4,096 up, Anole falls behind on throughput:**
+  - at 4,096 connections: Anole 154k, Fiber 161k, Axum 199k;
+  - at 10,000: Anole 120k, Fiber 146k.
+  - Its memory stays the lowest of the three: 218 MB at 10,000 and 498 MB at
+    25,000, against 393 and 917 MB for Fiber.
+- **25,000 connections is a real problem for Anole.**
+  - Its p50 is 183 ms, the same as Fiber's.
+  - But p99 is 6.32 s, p99.9 is 8.87 s, and the max hits wrk's 10 s timeout.
+  - There were 3,809 errors.
+  - So a share of connections is starved while the rest are served normally.
+    Fiber, with the same p50, keeps p99 at 183 ms and has no errors.
+- **Axum** holds about 200k req/s at every count. But from 1,024 connections
+  its tail grows to seconds (4.53 s at 25,000, with 1,414 errors): it serves
+  some connections and starves others.
+- **Express, Fastify and FastAPI** start failing connections at 1,024–4,096.
+  From there their p99 drops back to tens of ms, because it only counts the
+  requests that succeed. Read their latency together with the error row.

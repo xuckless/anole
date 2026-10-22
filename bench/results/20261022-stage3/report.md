@@ -86,3 +86,48 @@ Requests per second, then p99 latency for wrk runs (HTTP/1.1) or mean latency fo
 | fastify | **206,435** p99 1.47 ms [426 MB, 4.00] | **166,055** p99 1.92 ms [654 MB, 4.00] | **149,510** mean 4.21 ms [1331 MB, 3.99] | **133,359** mean 4.86 ms [974 MB, 3.99] | N/A |
 | fastapi | **13,025** p99 21.12 ms [200 MB, 4.00] | **12,643** p99 22.54 ms [269 MB, 4.00] | **4,697** mean 135.89 ms [853 MB, 2.04] | N/A | **5,098** mean 100.05 ms [345 MB, 3.93] |
 
+## Concurrent connections (HTTP/1.1 keep-alive, GET /json)
+
+req/s / p99 ms / server memory MB at each connection count.
+
+### 1cpu
+
+| Server | c=16 | c=64 | c=256 | c=1024 | c=4096 | c=10000 | c=25000 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| anole | 237,779 / 0.1 / 2 | 251,999 / 0.3 / 3 | 228,215 / 1.3 / 7 | 217,067 / 5.1 / 23 | 154,480 / 27.7 / 89 | 120,000 / 85.7 / 218 | 133,042 / 6319.6 / 498 |
+| fiber | 220,119 / 0.1 / 7 | 217,576 / 0.6 / 7 | 209,755 / 1.8 / 16 | 205,675 / 5.9 / 49 | 160,833 / 27.1 / 179 | 145,847 / 72.6 / 393 | 142,702 / 183.3 / 917 |
+| axum | 223,468 / 0.1 / 2 | 215,925 / 0.3 / 3 | 208,744 / 1.3 / 10 | 200,571 / 168.3 / 33 | 199,141 / 776.4 / 137 | 198,600 / 1958.4 / 346 | 198,347 / 4530.6 / 833 |
+| express | 82,337 / 0.4 / 67 | 80,864 / 1.2 / 92 | 79,676 / 3.7 / 103 | 75,809 / 1990.2 / 192 | 67,682 / 877.3 / 237 | 64,660 / 76.8 / 269 | 59,700 / 173.9 / 334 |
+| fastify | 124,489 / 0.2 / 60 | 122,596 / 0.6 / 62 | 121,255 / 2.3 / 97 | 119,086 / 1222.5 / 185 | 99,694 / 2314.2 / 218 | 93,180 / 58.1 / 277 | 84,276 / 118.4 / 320 |
+| fastapi | 20,006 / 1.5 / 41 | 19,817 / 3.4 / 42 | 19,171 / 262.7 / 48 | 17,783 / 5292.4 / 77 | 17,424 / 1843.0 / 90 | 17,372 / 85.2 / 90 | 16,902 / 90.3 / 99 |
+
+## Latency at fixed request rates (open loop, GET /json)
+
+oha with `--latency-correction` (coordinated omission accounted for), 64 connections. p50 / p99 / p99.9 in ms; a rate a server could not sustain is marked in the notes.
+
+| Server | Proto | Rate | Achieved req/s | p50 | p99 | p99.9 | max | Memory MB | CPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| axum | h1 | rate=1000 | 1,000 | 0.02 | 0.10 | 0.17 | 10.5 | 3 | 0.01 |
+| axum | h1 | rate=5000 | 5,000 | 0.06 | 0.17 | 0.23 | 7.7 | 4 | 0.03 |
+| axum | h1 | rate=20000 | 19,998 | 0.11 | 0.25 | 0.53 | 18.5 | 4 | 0.08 |
+| axum | h1 | rate=50%max | 109,324 | 0.48 | 1.16 | 31.53 | 80.0 | 4 | 0.33 |
+| axum | h1 | rate=75%max | 163,987 | 0.81 | 51.67 | 102.93 | 148.9 | 4 | 0.46 |
+| axum | h2-tls | rate=1000 | 1,000 | 0.04 | 0.13 | 0.28 | 63.5 | 4 | 0.02 |
+| axum | h2-tls | rate=5000 | 5,001 | 0.08 | 0.21 | 42.44 | 47.9 | 5 | 0.05 |
+| axum | h2-tls | rate=20000 | 20,000 | 0.18 | 0.42 | 43.64 | 74.4 | 5 | 0.15 |
+| axum | h2-tls | rate=75%max | 122,102 [1] | 5119.76 | 10454.98 | 10546.16 | 10557.3 | 5 | 0.73 |
+| axum | h2-tls | rate=50%max | 124,108 | 1.29 | 346.41 | 357.90 | 359.6 | 5 | 0.73 |
+| axum | h3 | rate=1000 | fail [2] | | | | | | |
+| axum | h3 | rate=5000 | fail [3] | | | | | | |
+| axum | h3 | rate=20000 | fail [4] | | | | | | |
+| axum | h3 | rate=50%max | fail [5] | | | | | | |
+| axum | h3 | rate=75%max | fail [6] | | | | | | |
+
+## Notes
+
+1. latency axum 1cpu h2-tls /json rate=75%max: fell behind: 122102 of 188416 req/s
+2. latency axum 1cpu h3 /json rate=1000: error: oha --no-tui --output-format json -z 30s -c 64 --insecure -q 1000 --latency-correction --http-version 3 https://127.0.0.1:8443/json: exit status 1: Error: Your Oha instance has not been built with HTT...
+3. latency axum 1cpu h3 /json rate=5000: error: oha --no-tui --output-format json -z 30s -c 64 --insecure -q 5000 --latency-correction --http-version 3 https://127.0.0.1:8443/json: exit status 1: Error: Your Oha instance has not been built with HTT...
+4. latency axum 1cpu h3 /json rate=20000: error: oha --no-tui --output-format json -z 30s -c 64 --insecure -q 20000 --latency-correction --http-version 3 https://127.0.0.1:8443/json: exit status 1: Error: Your Oha instance has not been built with HT...
+5. latency axum 1cpu h3 /json rate=50%max: error: oha --no-tui --output-format json -z 30s -c 64 --insecure -q 58824 --latency-correction --http-version 3 https://127.0.0.1:8443/json: exit status 1: Error: Your Oha instance has not been built with HT...
+6. latency axum 1cpu h3 /json rate=75%max: error: oha --no-tui --output-format json -z 30s -c 64 --insecure -q 88236 --latency-correction --http-version 3 https://127.0.0.1:8443/json: exit status 1: Error: Your Oha instance has not been built with HT...
