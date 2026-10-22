@@ -110,8 +110,8 @@ pub const UpgradeOptions = struct {
     allowed_origins: Origins = .same_origin,
     /// The largest message `receive` assembles (after inflating). A bigger
     /// one fails `receive` with `error.MessageTooLarge`, and the peer gets
-    /// close 1009 first.
-    max_message_size: usize = WebSocket.default_max_message_size,
+    /// close 1009 first. Null: the server's `limits.ws_max_message` (1 MiB).
+    max_message_size: ?usize = null,
     /// Replaces the request's timeout once the socket is open: a socket
     /// outlives `timeout.request`. Set a deadline here, or call
     /// `req.setTimeout` before each `receive` for an idle limit.
@@ -471,12 +471,13 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     };
     const negotiated = if (comptime features.compression) deflate != null else false;
 
+    const max_message = options.max_message_size orelse req._config.ws_max_message;
     var socket: Socket = .{
         .conn = undefined,
         .deflate = deflate,
         .allocator = alloc,
         .io = req.io,
-        .max_message_size = options.max_message_size,
+        .max_message_size = max_message,
         .drain = req.drain,
         .executor = placement.currentExecutor(req.io),
         // The stream's task serves the socket for its whole life over
@@ -485,7 +486,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         .task = if (h2 or abort_cancels_h1_reader) placement.currentTask(req.io) else null,
     };
     if (h2) {
-        socket.conn = .{ .h2 = try H2Socket.accept(req, res, options.max_message_size, negotiated) };
+        socket.conn = .{ .h2 = try H2Socket.accept(req, res, max_message, negotiated) };
     } else {
         const ws = try alloc.create(WebSocket);
         errdefer if (owner != null) alloc.destroy(ws);
@@ -497,7 +498,7 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         // Its messages' memory too, when the socket outlives the request
         // (empty yet).
         if (owner != null) ws.msg_arena = .init(alloc);
-        ws.max_message_size = options.max_message_size;
+        ws.max_message_size = max_message;
         ws.rsv1_allowed = negotiated;
         socket.conn = .{ .h1 = ws };
     }

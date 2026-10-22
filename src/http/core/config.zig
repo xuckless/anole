@@ -477,6 +477,9 @@ pub const ServerConfig = struct {
         max_form_count: usize = 32,
         /// Maximum number of multipart form fields
         max_multiform_count: usize = 32,
+        /// The largest WebSocket message, in or out (after inflating): what
+        /// `anole.websocket.UpgradeOptions.max_message_size` falls back on.
+        ws_max_message: usize = 1024 * 1024,
     };
 
     /// `ServerConfig.response`.

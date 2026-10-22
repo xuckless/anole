@@ -55,7 +55,7 @@ pub const WebSocket = struct {
     control_payload: [125]u8 = undefined,
 
     /// The largest message a socket accepts unless told otherwise: 16 MiB.
-    pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
+    pub const default_max_message_size: usize = 1024 * 1024; // 1 MiB
 
     /// A frame's opcode. Handlers see `.text` and `.binary` messages, and
     /// `.close` when the peer closes; pings are answered for them.

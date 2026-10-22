@@ -470,6 +470,7 @@ fn coreConfig(opts: Options) http.ServerConfig {
             .max_query_count = opts.limits.max_query_count,
             .max_form_count = opts.limits.max_form_count,
             .max_multiform_count = opts.limits.max_multiform_count,
+            .ws_max_message = opts.limits.ws_max_message,
         },
         .response = opts.response,
         .http2 = opts.http2,
