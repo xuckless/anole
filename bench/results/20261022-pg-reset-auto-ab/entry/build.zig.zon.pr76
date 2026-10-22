@@ -1,0 +1,13 @@
+.{
+    .name = .anole_arena,
+    .version = "0.1.0",
+    .fingerprint = 0xff88c6f071d5a960,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "proto" },
+    .dependencies = .{
+        .anole = .{
+            .url = "git+https://github.com/xuckless/anole#5098bb580bf8e28dd83ee8e0e6d36565e939219e",
+            .hash = "anole-0.1.1-WO_-F1zqXABr8064Xwglsq6aEbtzkOUjF9ipCAAhlDki",
+        },
+    },
+}
