@@ -18,6 +18,8 @@ pub const Error = error{InvalidListenAddress};
 /// Splits `text` into an IP literal and a port. The only name taken is
 /// "localhost" (127.0.0.1): a server binds addresses, not host names.
 pub fn parse(text: []const u8) Error!Parsed {
+    // "3000": every interface, as ":3000".
+    if (text.len > 0 and allDigits(text)) return .{ .host = any, .port = std.fmt.parseInt(u16, text, 10) catch return error.InvalidListenAddress };
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidListenAddress;
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidListenAddress;
     var host = text[0..colon];
@@ -34,6 +36,25 @@ pub fn parse(text: []const u8) Error!Parsed {
     if (std.ascii.eqlIgnoreCase(host, "localhost")) host = "127.0.0.1";
     _ = std.Io.net.IpAddress.parse(host, port) catch return error.InvalidListenAddress;
     return .{ .host = host, .port = port };
+}
+
+fn allDigits(text: []const u8) bool {
+    for (text) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// Whether `ip` is a loopback address: 127.0.0.0/8, ::1 and ::ffff:127.0.0.0/104.
+pub fn isLoopback(ip: std.Io.net.IpAddress) bool {
+    switch (ip) {
+        .ip4 => |a| return a.bytes[0] == 127,
+        .ip6 => |a| {
+            const b = a.bytes;
+            const zeros = [_]u8{0} ** 15;
+            if (std.mem.eql(u8, b[0..15], &zeros) and b[15] == 1) return true;
+            const mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            return std.mem.eql(u8, b[0..12], &mapped) and b[12] == 127;
+        },
+    }
 }
 
 /// The listener address that means every interface, IPv6 and IPv4 alike:
@@ -118,4 +139,24 @@ test "listen addresses: every interface is dual-stack where it can be" {
     try std.testing.expect(explicit6.ip == .ip6);
     try std.testing.expectEqual(@as(?bool, null), explicit6.ipv6_only);
     try std.testing.expectError(error.InvalidListenAddress, resolve("example.com", 80, true));
+}
+
+test "listen addresses: a bare port is every interface" {
+    const p = try parse("3000");
+    try std.testing.expectEqualStrings(any, p.host);
+    try std.testing.expectEqual(@as(u16, 3000), p.port);
+    try std.testing.expectEqual(@as(u16, 0), (try parse("0")).port);
+    try std.testing.expectError(error.InvalidListenAddress, parse("65536"));
+    try std.testing.expectError(error.InvalidListenAddress, parse("3000x"));
+    try std.testing.expectError(error.InvalidListenAddress, parse(""));
+}
+
+test "address: isLoopback" {
+    try std.testing.expect(isLoopback(try std.Io.net.IpAddress.parse("127.0.0.1", 1)));
+    try std.testing.expect(isLoopback(try std.Io.net.IpAddress.parse("127.5.5.5", 1)));
+    try std.testing.expect(isLoopback(try std.Io.net.IpAddress.parse("::1", 1)));
+    try std.testing.expect(isLoopback(try std.Io.net.IpAddress.parse("::ffff:127.0.0.1", 1)));
+    try std.testing.expect(!isLoopback(try std.Io.net.IpAddress.parse("10.0.0.1", 1)));
+    try std.testing.expect(!isLoopback(try std.Io.net.IpAddress.parse("::", 1)));
+    try std.testing.expect(!isLoopback(try std.Io.net.IpAddress.parse("0.0.0.0", 1)));
 }
