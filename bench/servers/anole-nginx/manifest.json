@@ -1,0 +1,18 @@
+{
+  "name": "anole-nginx",
+  "label": "Anole (Zig, zio) behind nginx 1.30.1",
+  "modes": {
+    "h1": "nginx 1.30.1 → anole (dusty HTTP/1.1; h2c on the same port)",
+    "tls": "nginx 1.30.1 (OpenSSL) → anole (dusty HTTP/1.1; h2c on the same port)",
+    "h3": "nginx 1.30.1 QUIC → anole (dusty HTTP/1.1; h2c on the same port)"
+  },
+  "tls_alpn": [
+    "h2",
+    "http/1.1"
+  ],
+  "twelve": "anole.pg (app.postgres, Anole's fork of pg.zig) + anole.auth.verify, behind nginx 1.30.1",
+  "scenarios": [
+    "raw",
+    "twelve"
+  ]
+}

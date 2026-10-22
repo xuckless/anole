@@ -1,0 +1,47 @@
+# nginx in front of a framework, in the same container: the proxy settings a
+# production deployment would use, the same for every framework. HTTP/1.1
+# to the app on 127.0.0.1:9080 with a keep-alive upstream pool, no caching,
+# no access log. Client side as the baseline nginx (75 s keep-alive, request
+# caps lifted, 250 h2 streams).
+worker_processes @WORKERS@;
+worker_rlimit_nofile 1048576;
+error_log stderr warn;
+pid /tmp/front/nginx.pid;
+
+events {
+    worker_connections 65535;
+}
+
+http {
+    include /front/mime.types;
+    default_type application/octet-stream;
+    access_log off;
+    keepalive_timeout 75s;
+    keepalive_requests 1000000;
+    http2_max_concurrent_streams 250;
+    client_max_body_size 8m;
+    ssl_certificate @CERT@;
+    ssl_certificate_key @KEY@;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    upstream app {
+        server 127.0.0.1:9080;
+        keepalive 256;
+        keepalive_requests 1000000;
+        keepalive_timeout 75s;
+    }
+
+    server {
+        @LISTEN@
+        server_name _;
+
+        location / {
+            proxy_pass http://app;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}

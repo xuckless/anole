@@ -1,0 +1,18 @@
+{
+  "name": "fiber-nginx",
+  "label": "Go Fiber v3.6.1 behind nginx 1.30.1",
+  "modes": {
+    "h1": "nginx 1.30.1 → fiber v3.6.1 (fasthttp v1.75.0)",
+    "tls": "nginx 1.30.1 (OpenSSL) → fiber v3.6.1 (fasthttp v1.75.0)",
+    "h3": "nginx 1.30.1 QUIC → fiber v3.6.1 (fasthttp v1.75.0)"
+  },
+  "tls_alpn": [
+    "h2",
+    "http/1.1"
+  ],
+  "twelve": "pgx/v5 v5.11.0 pgxpool + golang-jwt/v5 v5.3.1, behind nginx 1.30.1",
+  "scenarios": [
+    "raw",
+    "twelve"
+  ]
+}

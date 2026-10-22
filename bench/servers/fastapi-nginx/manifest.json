@@ -1,0 +1,18 @@
+{
+  "name": "fastapi-nginx",
+  "label": "FastAPI 0.146.0 (Starlette 1.9.0, Python 3.13.16) behind nginx 1.30.1",
+  "modes": {
+    "h1": "nginx 1.30.1 → uvicorn 0.54.0 (httptools 0.9.0, uvloop 0.23.0)",
+    "tls": "nginx 1.30.1 (OpenSSL) → uvicorn 0.54.0 (httptools 0.9.0, uvloop 0.23.0)",
+    "h3": "nginx 1.30.1 QUIC → uvicorn 0.54.0 (httptools 0.9.0, uvloop 0.23.0)"
+  },
+  "tls_alpn": [
+    "h2",
+    "http/1.1"
+  ],
+  "twelve": "asyncpg 0.32.0 pool + PyJWT 2.15.1, behind nginx 1.30.1",
+  "scenarios": [
+    "raw",
+    "twelve"
+  ]
+}
