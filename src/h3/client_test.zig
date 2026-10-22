@@ -602,6 +602,23 @@ test "h3 server: cookie crumbs are joined with \"; \", other repeated fields all
     try std.testing.expectEqualStrings("a=1; b=2; c=3|one|two", body);
 }
 
+test "h3 server: hq_interop_root is refused outside the interop runner's program" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var pem = try anole_tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var http: dusty.Server(void) = .init(gpa, io, .{ .listeners = &.{} }, {});
+    defer http.deinit();
+    try std.testing.expectError(error.HqInteropNotAllowed, Endpoint.init(gpa, io, &http, .{
+        .address = .{ .ip4 = .loopback(0) },
+        .cert_pem = pem.cert,
+        .key_pem = pem.key,
+        .hq_interop_root = ".",
+    }));
+}
+
 test "h3 server: Response.abort resets the stream, and the connection carries on" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });

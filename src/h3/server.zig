@@ -115,6 +115,8 @@ pub const Options = struct {
     /// Also speak HTTP/0.9 over QUIC (ALPN "hq-interop"), serving the files
     /// under this directory: what the QUIC interop runner's tests use. Only
     /// for interop testing; it bypasses the router and every middleware.
+    /// `init` refuses it (`error.HqInteropNotAllowed`) unless the program's
+    /// root file declares `pub const anole_hq_interop = true;`.
     hq_interop_root: ?[]const u8 = null,
     /// Mutual TLS: ask for client certificates and verify them, as the TCP
     /// listener does. Handlers read the certificate with
@@ -391,6 +393,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// The listener: its endpoints, their sockets bound (or adopted) in
         /// order, and the steering program on them. Returns the first.
         pub fn init(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options) !*Self {
+            if (options.hq_interop_root != null and !hq_interop_allowed) return error.HqInteropNotAllowed;
             const inherited: []const std.posix.fd_t = if (options.fd) |*fd| fd[0..1] else options.fds;
             const count: usize = if (inherited.len > 0)
                 inherited.len
@@ -563,7 +566,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             var tls = try quic_tls.Context.init(.{
                 .cert_pem = options.cert_pem,
                 .key_pem = options.key_pem,
-                .hq_interop = options.hq_interop_root != null,
+                .hq_interop = hq_interop_allowed and options.hq_interop_root != null,
                 .client_auth = options.client_auth,
                 .early_data = options.early_data,
             });
@@ -3144,7 +3147,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onRecvTxKey(_: ?*c.ngtcp2_conn, level: c.ngtcp2_encryption_level, user_data: ?*anyopaque) callconv(.c) c_int {
             if (level != c.NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
             const conn = connOf(user_data);
-            if (quic_tls.isHq(conn.ssl)) {
+            if (hq_interop_allowed and quic_tls.isHq(conn.ssl)) {
                 conn.hq = true;
                 return 0;
             }
@@ -3321,6 +3324,13 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
     };
 }
+
+/// Whether `Options.hq_interop_root` may be used: only in a program built
+/// for the QUIC interop runner, whose root file says so.
+const hq_interop_allowed = blk: {
+    const root = @import("root");
+    break :blk @hasDecl(root, "anole_hq_interop") and root.anole_hq_interop;
+};
 
 /// The 0-RTT context a connection of an endpoint with `options` gets, from
 /// a throwaway connection with fixed IDs: for tests that compare endpoints

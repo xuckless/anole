@@ -29,6 +29,11 @@ breaking changes are listed anyway.
   ended, even if it was never accepted), and at most 100 streams each way
   wait to be accepted per session. A peer that opens streams a handler
   does not accept now waits for credit instead of growing server memory.
+- HTTP/3: `http3.hq_interop_root` (the QUIC interop runner's HTTP/0.9 file
+  server, which bypasses the router and middleware) is refused with
+  `error.HqInteropNotAllowed` unless the program's root file declares
+  `pub const anole_hq_interop = true;`. Breaking only for programs that
+  set it.
 
 ### C ABI (ABI 0.1)
 
