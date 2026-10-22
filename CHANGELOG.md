@@ -57,6 +57,18 @@ breaking changes are listed anyway.
   implementation of the test service (`tests/capi/grpc_interop.c`). See
   docs/c-abi.md#grpc.
 
+### Fixed
+
+- C ABI: a program linked against `libanole.a` with dead-stripping
+  (`-Wl,-dead_strip`, or `zig cc -O1` and Zig's release links) crashed on
+  macOS when its first TLS listener started: the packed object lost the
+  symbol flags that keep BoringSSL's assembly together, so the linker cut
+  it apart. The flags are restored when libanole is packed.
+- C ABI: on x86_64 Linux, a program or extension linked against
+  `libanole.a` with GNU ld got an executable stack (the packed object had
+  no `.note.GNU-stack`); glibc 2.41 refuses to load such an extension.
+  The note is added when libanole is packed.
+
 ## 0.1.1 (2026-10-22)
 
 ### Security
