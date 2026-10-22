@@ -1066,3 +1066,58 @@ test "h3 client: a response head past max_header_list_size fails the stream, and
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
 }
+
+test "h3 server: a reload that changes the client CAs stops earlier sessions from resuming" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .client_auth = .request });
+    defer f.stop(gpa, io);
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    var other = try anole_tls.selfSigned(gpa, .{});
+    defer other.deinit(gpa);
+    var other_bundle = try @import("../tls/testing.zig").bundleFromPem(gpa, std.Io.Clock.real.now(io).toSeconds(), other.cert);
+    defer other_bundle.deinit(gpa);
+
+    const Connect = struct {
+        fn run(fx: *Fixture, gpa_: std.mem.Allocator, io_: std.Io, cache_: *client.SessionCache) !*client.ClientConnection {
+            return client.ClientConnection.connect(gpa_, io_, .{
+                .host = "localhost",
+                .address = fx.ep.address(),
+                .port = fx.ep.address().getPort(),
+                .tls = .{ .ca = .{ .pem = fx.pem.cert }, .client_certificate = .{ .pem = .{ .cert = fx.pem.cert, .key = fx.pem.key } } },
+                .session_cache = cache_,
+                .connect_timeout = .fromSeconds(3),
+            });
+        }
+    };
+    {
+        const conn = try Connect.run(&f, gpa, io, &cache);
+        defer conn.close();
+        const body = try get(conn, "/peer", gpa);
+        gpa.free(body);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+    // The same client CAs: the session resumes.
+    f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, .{ .ca_der = f.bundle.bytes.items, .mode = .request }));
+    {
+        const conn = try Connect.run(&f, gpa, io, &cache);
+        defer conn.close();
+        try std.testing.expect(conn.resumed());
+        const body = try get(conn, "/peer", gpa);
+        gpa.free(body);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+    // Other client CAs, which do not cover the client's certificate.
+    f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, .{ .ca_der = other_bundle.bytes.items, .mode = .request }));
+    if (Connect.run(&f, gpa, io, &cache)) |conn| {
+        defer conn.close();
+        try std.testing.expect(!conn.resumed());
+        if (get(conn, "/peer", gpa)) |body| {
+            gpa.free(body);
+            return error.ServedAfterTheClientCasChanged;
+        } else |_| {}
+    } else |_| {}
+}

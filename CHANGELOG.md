@@ -37,6 +37,11 @@ breaking changes are listed anyway.
 - TLS clients: the cache of trust stores built from CA bundles and the
   HTTP/3 session-ticket cache are keyed by SHA-256 of their contents, so
   two different CA sets or client identities can never share an entry.
+- Mutual TLS: a TLS session resumes only under the client-auth settings
+  (CAs and mode) it was verified under, on TCP and QUIC listeners, and a
+  certificate reload that changes them no longer carries the ticket keys
+  over. Removing a client CA and reloading now stops clients whose
+  certificates it vouched for from resuming with older sessions.
 
 ### C ABI (ABI 0.1)
 

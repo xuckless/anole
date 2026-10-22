@@ -703,6 +703,12 @@ systemd hears `RELOADING=1` and then `READY=1`.
   handshakes in progress included, keep the one they started with, which is
   freed when the last of them closes.
 - Session tickets issued before still resume: the ticket keys carry over.
+  Not when the reload changes `client_auth` (its CAs or its mode): a
+  resumed session's client certificate is not verified again, so sessions
+  from before such a reload never resume, on TCP or QUIC, and every client
+  goes through a full handshake and certificate check under the new CAs.
+  Removing a compromised CA and reloading takes effect for new connections
+  at once; connections already open stay until they close.
 - A reload that fails (a file missing, a key that does not match the
   certificate) returns the error, or logs it on SIGHUP, and the server goes
   on with the certificate it had.

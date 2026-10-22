@@ -335,6 +335,13 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, opt: config.Server)
     c.SSL_set_shed_handshake_config(ssl, 1);
 
     if (opt.client_auth) |ca| {
+        // A session resumes only under the client-auth policy it was
+        // verified under: a resumed session's client certificate is not
+        // verified again, so one from before the client CAs changed (a
+        // reload) must not resume.
+        const ca_digest = if (ca.trust) |t| t.digest else digestOf(ca.root_ca.bytes.items);
+        const sid_ctx = clientAuthSessionContext("anole tcp", @intFromEnum(ca.auth_type), ca_digest);
+        if (c.SSL_set_session_id_context(ssl, &sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
         // The CertificateRequest also names the acceptable CAs, so a client
         // holding several certificates can pick the right one.
         const trust = if (ca.trust) |t| try t.share(true) else try trustStore(ca.root_ca, true);
@@ -821,6 +828,10 @@ fn newServerCtx() !*c.SSL_CTX {
     // holds up to 20k sessions per listener behind one lock that every
     // executor thread would share.
     _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_OFF);
+    // Sessions of a listener without client certificates; one that asks for
+    // them sets a context of its own per connection (`server`).
+    const sid_ctx = "anole tcp";
+    if (c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len) != 1) return error.OutOfMemory;
     c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, null);
     try installTicketKeys(ctx);
     return ctx;
@@ -1091,7 +1102,7 @@ fn trustStore(bundle: std.crypto.Certificate.Bundle, want_names: bool) Handshake
     const slot = &store_cache[store_cache_next];
     store_cache_next = (store_cache_next + 1) % store_cache.len;
     if (slot.*) |old| {
-        var t: TrustStore = .{ .store = old.store, .names = old.names };
+        var t: TrustStore = .{ .store = old.store, .names = old.names, .digest = old.digest };
         t.deinit();
     }
     slot.* = .{ .digest = digest, .len = der.len, .store = built.store, .names = built.names };
@@ -1106,6 +1117,9 @@ pub const TrustStore = struct {
     store: *c.X509_STORE,
     /// The certificates' subject names (DER), for a server's client CA list.
     names: *c.struct_stack_st_CRYPTO_BUFFER,
+    /// SHA-256 of the bundle, for the session context of a listener that
+    /// verifies clients with it.
+    digest: [32]u8,
 
     /// A store holding every certificate in `bundle`.
     pub fn init(bundle: std.crypto.Certificate.Bundle) error{OutOfMemory}!TrustStore {
@@ -1141,7 +1155,7 @@ pub const TrustStore = struct {
             }
         }
         c.ERR_clear_error();
-        return .{ .store = store, .names = names };
+        return .{ .store = store, .names = names, .digest = digestOf(der) };
     }
 
     /// New references to the store and, if asked, the names.
@@ -1149,6 +1163,27 @@ pub const TrustStore = struct {
         return trustFrom(.{ .digest = @splat(0), .len = 0, .store = self.store, .names = self.names }, want_names);
     }
 };
+
+fn digestOf(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+/// A TLS session context (`SSL_set_session_id_context`, at most 32 bytes)
+/// for a listener that verifies client certificates: the listener kind,
+/// whether a certificate is required, and the CAs (`ca_digest`, SHA-256 of
+/// their DER). BoringSSL resumes a session only under the context it was
+/// made in, so a change to any of them sends clients through a full
+/// handshake, and their certificates through verification, again. HTTP/3's
+/// listener (src/h3/quic_tls.zig) uses it too.
+pub fn clientAuthSessionContext(comptime kind: []const u8, mode: u8, ca_digest: [32]u8) [32]u8 {
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    hash.update(kind ++ " client auth\x00");
+    hash.update(&.{mode});
+    hash.update(&ca_digest);
+    return hash.finalResult();
+}
 
 /// The trust store for a client connection made outside dusty (Anole's
 /// HTTP/2 and HTTP/3 clients), from `ca`, a `dusty.TlsCa`. `.system` is

@@ -976,3 +976,86 @@ test "TLS hello: a response body that runs to the end of the connection needs cl
         }
     }
 }
+
+test "TLS hello: a reload that changes the client CAs stops earlier sessions from resuming" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket (SSL_set_fd), not ported to Winsock
+    var h = try Https.init();
+    defer h.deinit();
+    const io = h.io;
+    const gpa = std.testing.allocator;
+    var other = try selfSigned(gpa, .{});
+    defer other.deinit(gpa);
+    // The self-signed certificate is the server's, the client's and, at
+    // first, the CA that verifies the client.
+    var listeners = [_]dusty.Listener{.{ .address = loopback, .tls = .{
+        .pem = .{ .cert = h.pem.cert, .key = h.pem.key },
+        .client_auth = .{ .ca = .{ .pem = h.pem.cert } },
+    } }};
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &listeners }, {});
+    defer server.deinit();
+    server.router.get("/", handleHello);
+    var server_future = try io.concurrent(runServer, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    var identity = try dusty_tls.config.CertKeyPair.fromSlice(gpa, io, h.pem.cert, h.pem.key);
+    defer identity.deinit(gpa);
+
+    const Visit = struct {
+        var latest: ?*c.SSL_SESSION = null;
+        reused: bool = false,
+        hello: bool = false,
+
+        fn onNewSession(_: ?*c.SSL, session: ?*c.SSL_SESSION) callconv(.c) c_int {
+            if (latest) |old| c.SSL_SESSION_free(old);
+            latest = session;
+            return 1;
+        }
+
+        fn run(v: *@This(), ctx: *c.SSL_CTX, port: u16, session: ?*c.SSL_SESSION) !void {
+            const conn = RawClient.connect(ctx, port, session) catch |err| switch (err) {
+                error.Handshake => return,
+                else => return err,
+            };
+            defer conn.close();
+            v.reused = c.SSL_session_reused(conn.ssl) == 1;
+            v.hello = (conn.get() catch return).hello;
+        }
+    };
+
+    for ([_]u16{ c.TLS1_3_VERSION, c.TLS1_2_VERSION }) |tls_version| {
+        const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+        defer c.SSL_CTX_free(ctx);
+        _ = c.SSL_CTX_set_min_proto_version(ctx, tls_version);
+        _ = c.SSL_CTX_set_max_proto_version(ctx, tls_version);
+        _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
+        c.SSL_CTX_sess_set_new_cb(ctx, Visit.onNewSession);
+        try std.testing.expectEqual(1, c.SSL_CTX_use_certificate(ctx, identity.cert));
+        try std.testing.expectEqual(1, c.SSL_CTX_use_PrivateKey(ctx, identity.key));
+        defer if (Visit.latest) |sess| {
+            c.SSL_SESSION_free(sess);
+            Visit.latest = null;
+        };
+        const port = server.address.ip.getPort();
+
+        listeners[0].tls.?.client_auth = .{ .ca = .{ .pem = h.pem.cert } };
+        try server.reloadTls();
+        var first: Visit = .{};
+        try RawClient.onThread(io, Visit.run, .{ &first, ctx, port, null });
+        try std.testing.expect(first.hello);
+
+        // The same client CAs again: the session still resumes.
+        try server.reloadTls();
+        var same: Visit = .{};
+        try RawClient.onThread(io, Visit.run, .{ &same, ctx, port, Visit.latest orelse return error.NoSession });
+        try std.testing.expect(same.reused and same.hello);
+
+        // Other client CAs, which do not cover the client's certificate:
+        // a session from before must not stand in for verifying it.
+        listeners[0].tls.?.client_auth = .{ .ca = .{ .pem = other.cert } };
+        try server.reloadTls();
+        var after: Visit = .{};
+        try RawClient.onThread(io, Visit.run, .{ &after, ctx, port, Visit.latest orelse return error.NoSession });
+        try std.testing.expect(!after.reused);
+        try std.testing.expect(!after.hello);
+    }
+}
