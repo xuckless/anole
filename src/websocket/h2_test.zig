@@ -597,7 +597,7 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    lobby = .initOptions(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
+    lobby = .init(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
     defer lobby.deinit();
 
     var server = dusty.Server(void).init(gpa, io, .{

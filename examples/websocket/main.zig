@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
 
     // The rooms take the runtime's Io from the first socket that joins, so
     // they can be made before the server.
-    var state: App = .{ .rooms = .init(init.gpa) };
+    var state: App = .{ .rooms = .init(init.gpa, .{}) };
     defer state.rooms.deinit();
     var app = try anole.Server(App).init(init.gpa, .{
         // HTTP/1.1, plus HTTP/2 (h2c) for clients that open with its preface.

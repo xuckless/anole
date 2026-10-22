@@ -972,12 +972,8 @@ pub const Rooms = struct {
     /// No rooms yet. `allocator` holds the room names, members and queued
     /// messages; it must be thread-safe when sockets on several executors
     /// join.
-    pub fn init(allocator: std.mem.Allocator) Rooms {
-        return .{ .allocator = allocator };
-    }
-
-    /// `init` with options other than the defaults.
-    pub fn initOptions(allocator: std.mem.Allocator, options: Options) Rooms {
+    /// `Rooms.init(gpa, .{})` takes the defaults.
+    pub fn init(allocator: std.mem.Allocator, options: Options) Rooms {
         return .{ .allocator = allocator, .options = options };
     }
 

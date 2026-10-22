@@ -110,7 +110,7 @@ pub const MemoryStore = struct {
         node: std.DoublyLinkedList.Node = .{},
     };
 
-    /// `initOptions`' settings.
+    /// `init`'s settings.
     pub const Options = struct {
         /// Sessions kept at most; past it, the one written longest ago is
         /// dropped (its user is signed out), with a warning in the log.

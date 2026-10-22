@@ -342,15 +342,15 @@ compressor. The server declines an 8-bit server window.
 
 `anole.websocket.Rooms` keeps named groups of sockets. Create one per server
 and reach it from your handlers through the server's context type.
-`Rooms.init` takes only an allocator (the rooms take the runtime's `std.Io`
-from the first socket that joins), so it can be made before the server:
+`Rooms.init(allocator, .{})` takes an allocator and options (the rooms take
+the runtime's `std.Io` from the first socket that joins), so it can be made before the server:
 
 ```zig
 const App = struct {
     rooms: anole.websocket.Rooms,
 };
 
-var state: App = .{ .rooms = .init(init.gpa) };
+var state: App = .{ .rooms = .init(init.gpa, .{}) };
 defer state.rooms.deinit();
 var app = try anole.Server(App).init(init.gpa, .{}, &state);
 defer app.deinit();
@@ -389,7 +389,7 @@ lock. Each member with something queued has a task of its own, on the
 socket's executor, that sends its queue in order. A slow client therefore
 holds up nobody else, not even the broadcaster: it only fills its own queue.
 
-The queue is bounded. `Rooms.initOptions(allocator, .{ ... })` sets
+The queue is bounded. `Rooms.init(allocator, .{ ... })` sets
 `anole.websocket.Rooms.Options`:
 
 | Field | Default | Meaning |
