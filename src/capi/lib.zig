@@ -112,23 +112,40 @@ fn headersOf(h: ?[*]const Header, n: usize) ?[]const Header {
     return (h orelse return null)[0..n];
 }
 
-fn answer(err: engine.AnswerError) i32 {
-    return switch (err) {
-        error.Gone => abi.E_GONE,
-        error.Invalid => blk: {
-            setError("invalid argument (status, header, flag or size)", .{});
-            break :blk abi.E_INVALID;
-        },
-        error.OutOfMemory => abi.E_NOMEM,
-        error.Unsupported => abi.E_UNSUPPORTED,
-        error.Timeout => abi.E_TIMEOUT,
-        error.Again => abi.E_AGAIN,
+fn answer(e: engine.AnswerError) i32 {
+    return switch (e) {
+        error.Gone => failCode(abi.E_GONE),
+        error.Invalid => failCode(abi.E_INVALID),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Timeout => failCode(abi.E_TIMEOUT),
+        error.Again => failCode(abi.E_AGAIN),
         error.State => blk: {
             setError("not in this state (a second message for a unary answer, metadata after the first message, OK without a response message, ...)", .{});
             break :blk abi.E_STATE;
         },
-        error.TooBig => abi.E_TOOBIG,
+        error.TooBig => failCode(abi.E_TOOBIG),
     };
+}
+
+/// An error answer with the code's own text, so `anole_last_error` never
+/// shows what an earlier call left (every non-OK answer sets it).
+fn failCode(code: i32) i32 {
+    setError("{s}", .{switch (code) {
+        abi.E_INVALID => "invalid argument (status, header, flag or size)",
+        abi.E_GONE => "stale handle: answered, expired, aborted, closed or never valid",
+        abi.E_AGAIN => "nothing now; an event follows",
+        abi.E_NOMEM => "out of memory",
+        abi.E_CONFIG => "invalid configuration",
+        abi.E_STATE => "not allowed in this state",
+        abi.E_UNSUPPORTED => "not built in, or not on this OS",
+        abi.E_TOOBIG => "too big (the next event does not fit the buffer, or past a size limit)",
+        abi.E_SYSTEM => "the OS refused",
+        abi.E_TIMEOUT => "the timeout passed",
+        abi.E_DB => "the database refused the statement",
+        else => "error",
+    }});
+    return code;
 }
 
 fn live() ?*Engine {
@@ -175,8 +192,8 @@ export fn anole_has_feature(name: Str) c_int {
 
 export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyopaque) i32 {
     clearError();
-    const o = readSized(abi.ServerOptions, options orelse return abi.E_INVALID) orelse return abi.E_INVALID;
-    const dst = out orelse return abi.E_INVALID;
+    const o = readSized(abi.ServerOptions, options orelse return failCode(abi.E_INVALID)) orelse return failCode(abi.E_INVALID);
+    const dst = out orelse return failCode(abi.E_INVALID);
     if (engine.global != null) {
         setError("one anole_server per process", .{});
         return abi.E_STATE;
@@ -185,7 +202,7 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
         setError("log_level: 0 or ANOLE_LOG_ERROR..ANOLE_LOG_DEBUG", .{});
         return abi.E_INVALID;
     }
-    if (o.flags & ~abi.SERVER_SIGNALS != 0) return abi.E_INVALID;
+    if (o.flags & ~abi.SERVER_SIGNALS != 0) return failCode(abi.E_INVALID);
     log_max.store(if (o.log_level == 0) abi.LOG_INFO else o.log_level, .monotonic);
     if (o.log) |f| {
         log_fn = f;
@@ -207,7 +224,7 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
 
 export fn anole_server_start(s: ?*anyopaque) i32 {
     clearError();
-    const e = engineOf(s) orelse return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
     if (e.consumers.items.len == 0 and e.needsConsumer()) {
         setError("routes name handlers but no consumer is attached", .{});
         return abi.E_STATE;
@@ -221,26 +238,26 @@ export fn anole_server_start(s: ?*anyopaque) i32 {
 }
 
 export fn anole_server_port(s: ?*anyopaque, i: u32, out: ?*u16) i32 {
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    if (i >= e.ports.items.len) return abi.E_INVALID;
-    (out orelse return abi.E_INVALID).* = e.ports.items[i];
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    if (i >= e.ports.items.len) return failCode(abi.E_INVALID);
+    (out orelse return failCode(abi.E_INVALID)).* = e.ports.items[i];
     return abi.OK;
 }
 
 export fn anole_server_drain(s: ?*anyopaque) i32 {
-    const e = engineOf(s) orelse return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
     e.drain() catch |err| return fail(abi.E_STATE, "anole_server_drain", err);
     return abi.OK;
 }
 
 export fn anole_server_wait(s: ?*anyopaque, timeout_ms: i32) i32 {
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    return if (e.wait(timeout_ms)) abi.OK else abi.E_TIMEOUT;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    return if (e.wait(timeout_ms)) abi.OK else failCode(abi.E_TIMEOUT);
 }
 
 export fn anole_server_reload_certificates(s: ?*anyopaque) i32 {
     clearError();
-    const e = engineOf(s) orelse return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
     e.reloadCertificates() catch |err| return switch (err) {
         error.State, error.NoTlsListener => fail(abi.E_STATE, "anole_server_reload_certificates", err),
         else => fail(abi.E_SYSTEM, "anole_server_reload_certificates", err),
@@ -250,14 +267,14 @@ export fn anole_server_reload_certificates(s: ?*anyopaque) i32 {
 
 export fn anole_server_reload_tls(s: ?*anyopaque, flags: u32, cert: ?[*]const u8, cert_len: usize, key: ?[*]const u8, key_len: usize) i32 {
     clearError();
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    if (flags & ~abi.TLS_PEM != 0) return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    if (flags & ~abi.TLS_PEM != 0) return failCode(abi.E_INVALID);
     const c = cert orelse {
-        if (key != null) return abi.E_INVALID;
+        if (key != null) return failCode(abi.E_INVALID);
         return anole_server_reload_certificates(s);
     };
-    const k = key orelse return abi.E_INVALID;
-    if (cert_len == 0 or key_len == 0) return abi.E_INVALID;
+    const k = key orelse return failCode(abi.E_INVALID);
+    if (cert_len == 0 or key_len == 0) return failCode(abi.E_INVALID);
     const cs = c[0..cert_len];
     const ks = k[0..key_len];
     const source: anole.Cert = if (flags & abi.TLS_PEM != 0)
@@ -279,10 +296,10 @@ export fn anole_server_destroy(s: ?*anyopaque) void {
 }
 
 export fn anole_server_stats(s: ?*anyopaque, out: ?*abi.Stats) i32 {
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    const dst = out orelse return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    const dst = out orelse return failCode(abi.E_INVALID);
     const size = dst.size;
-    if (size < @sizeOf(usize)) return abi.E_INVALID;
+    if (size < @sizeOf(usize)) return failCode(abi.E_INVALID);
     const st = e.stats();
     const n = @min(size, @sizeOf(abi.Stats));
     @memcpy(@as([*]u8, @ptrCast(dst))[@sizeOf(usize)..n], std.mem.asBytes(&st)[@sizeOf(usize)..n]);
@@ -293,10 +310,10 @@ export fn anole_server_stats(s: ?*anyopaque, out: ?*abi.Stats) i32 {
 
 export fn anole_consumer_attach(s: ?*anyopaque, options: ?*const abi.ConsumerOptions, out: ?*?*anyopaque) i32 {
     clearError();
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    const o = readSized(abi.ConsumerOptions, options orelse return abi.E_INVALID) orelse return abi.E_INVALID;
-    const dst = out orelse return abi.E_INVALID;
-    if (o.flags & ~abi.CONSUMER_SHARED != 0) return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    const o = readSized(abi.ConsumerOptions, options orelse return failCode(abi.E_INVALID)) orelse return failCode(abi.E_INVALID);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    if (o.flags & ~abi.CONSUMER_SHARED != 0) return failCode(abi.E_INVALID);
     const shared = o.flags & abi.CONSUMER_SHARED != 0;
     if (o.wake == null and !shared and builtin.os.tag == .windows) {
         setError("Windows has no doorbell fd: pass a wake callback, or use anole_poll_wait", .{});
@@ -326,77 +343,77 @@ fn pollBuf(buf: ?*anyopaque, cap: usize) ?[]u8 {
 }
 
 export fn anole_poll(c: ?*anyopaque, buf: ?*anyopaque, cap: usize, flags: u32) i64 {
-    const consumer = consumerOf(c) orelse return abi.E_INVALID;
-    const out = pollBuf(buf, cap) orelse return abi.E_INVALID;
-    if (flags & ~abi.POLL_NOARM != 0) return abi.E_INVALID;
-    const n = engine.poll(consumer, out, flags & abi.POLL_NOARM == 0) catch return abi.E_TOOBIG;
+    const consumer = consumerOf(c) orelse return failCode(abi.E_INVALID);
+    const out = pollBuf(buf, cap) orelse return failCode(abi.E_INVALID);
+    if (flags & ~abi.POLL_NOARM != 0) return failCode(abi.E_INVALID);
+    const n = engine.poll(consumer, out, flags & abi.POLL_NOARM == 0) catch return failCode(abi.E_TOOBIG);
     return @intCast(n);
 }
 
 export fn anole_poll_wait(c: ?*anyopaque, buf: ?*anyopaque, cap: usize, timeout_ms: i32) i64 {
-    const consumer = consumerOf(c) orelse return abi.E_INVALID;
-    const out = pollBuf(buf, cap) orelse return abi.E_INVALID;
-    const n = engine.pollWait(consumer, out, timeout_ms) catch return abi.E_TOOBIG;
+    const consumer = consumerOf(c) orelse return failCode(abi.E_INVALID);
+    const out = pollBuf(buf, cap) orelse return failCode(abi.E_INVALID);
+    const n = engine.pollWait(consumer, out, timeout_ms) catch return failCode(abi.E_TOOBIG);
     return @intCast(n);
 }
 
 // ---- requests and responses -------------------------------------------------------
 
 export fn anole_req_read(r: u64, buf: ?*anyopaque, cap: usize, timeout_ms: i32) i64 {
-    const e = live() orelse return abi.E_GONE;
-    if (cap == 0) return abi.E_INVALID;
-    const p: [*]u8 = @ptrCast(buf orelse return abi.E_INVALID);
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (cap == 0) return failCode(abi.E_INVALID);
+    const p: [*]u8 = @ptrCast(buf orelse return failCode(abi.E_INVALID));
     const n = engine.reqRead(e, r, p[0..cap], timeout_ms) catch |err| return answer(err);
     return @intCast(n);
 }
 
 export fn anole_respond(r: u64, status: u16, headers: ?[*]const Header, nheaders: usize, body: ?*const anyopaque, len: usize, flags: u32) i32 {
-    const e = live() orelse return abi.E_GONE;
-    if (flags & ~abi.BODY_BORROW != 0) return abi.E_INVALID;
-    const hs = headersOf(headers, nheaders) orelse return abi.E_INVALID;
-    const b = bytes(body, len) orelse return abi.E_INVALID;
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (flags & ~abi.BODY_BORROW != 0) return failCode(abi.E_INVALID);
+    const hs = headersOf(headers, nheaders) orelse return failCode(abi.E_INVALID);
+    const b = bytes(body, len) orelse return failCode(abi.E_INVALID);
     engine.respond(e, r, status, hs, b, flags & abi.BODY_BORROW != 0) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_respond_fd(r: u64, status: u16, headers: ?[*]const Header, nheaders: usize, fd: c_int, offset: u64, len: u64) i32 {
-    const e = live() orelse return abi.E_GONE;
-    const hs = headersOf(headers, nheaders) orelse return abi.E_INVALID;
+    const e = live() orelse return failCode(abi.E_GONE);
+    const hs = headersOf(headers, nheaders) orelse return failCode(abi.E_INVALID);
     engine.respondFd(e, r, status, hs, fd, offset, len) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_stream_start(r: u64, status: u16, headers: ?[*]const Header, nheaders: usize) i32 {
-    const e = live() orelse return abi.E_GONE;
-    const hs = headersOf(headers, nheaders) orelse return abi.E_INVALID;
+    const e = live() orelse return failCode(abi.E_GONE);
+    const hs = headersOf(headers, nheaders) orelse return failCode(abi.E_INVALID);
     engine.streamStart(e, r, status, hs) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_stream_write(r: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
-    const e = live() orelse return abi.E_GONE;
-    if (flags & ~abi.BODY_BORROW != 0) return abi.E_INVALID;
-    const b = bytes(data, len) orelse return abi.E_INVALID;
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (flags & ~abi.BODY_BORROW != 0) return failCode(abi.E_INVALID);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     const busy = engine.streamWrite(e, r, b, flags & abi.BODY_BORROW != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 
 export fn anole_stream_write_wait(r: u64, data: ?*const anyopaque, len: usize, timeout_ms: i32) i32 {
-    const e = live() orelse return abi.E_GONE;
-    const b = bytes(data, len) orelse return abi.E_INVALID;
+    const e = live() orelse return failCode(abi.E_GONE);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     engine.streamWriteWait(e, r, b, timeout_ms) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_stream_end(r: u64, trailers: ?[*]const Header, ntrailers: usize) i32 {
-    const e = live() orelse return abi.E_GONE;
-    const ts = headersOf(trailers, ntrailers) orelse return abi.E_INVALID;
+    const e = live() orelse return failCode(abi.E_GONE);
+    const ts = headersOf(trailers, ntrailers) orelse return failCode(abi.E_INVALID);
     engine.streamEnd(e, r, ts) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_release(r: u64) i32 {
-    const e = live() orelse return abi.E_GONE;
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.release(e, r) catch |err| return answer(err);
     return abi.OK;
 }
@@ -406,39 +423,39 @@ export fn anole_release(r: u64) i32 {
 const have_ws = anole.features.websocket;
 
 export fn anole_ws_send(w: u64, typ: c_int, data: ?*const anyopaque, len: usize, flags: u32) i32 {
-    if (comptime !have_ws) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    if (flags & ~abi.BODY_BORROW != 0) return abi.E_INVALID;
-    const b = bytes(data, len) orelse return abi.E_INVALID;
+    if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (flags & ~abi.BODY_BORROW != 0) return failCode(abi.E_INVALID);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     const busy = engine.ws.send(e, w, typ, b, flags & abi.BODY_BORROW != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 
 export fn anole_ws_close(w: u64, code: u16, reason: Str) i32 {
-    if (comptime !have_ws) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.ws.close(e, w, code, reason.slice()) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_ws_subscribe(w: u64, topic: Str) i32 {
-    if (comptime !have_ws) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.ws.subscribe(e, w, topic.slice(), true) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_ws_unsubscribe(w: u64, topic: Str) i32 {
-    if (comptime !have_ws) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.ws.subscribe(e, w, topic.slice(), false) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_ws_publish(s: ?*anyopaque, topic: Str, typ: c_int, data: ?*const anyopaque, len: usize, except: u64) i32 {
-    if (comptime !have_ws) return abi.E_UNSUPPORTED;
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    const b = bytes(data, len) orelse return abi.E_INVALID;
+    if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     engine.ws.publish(e, topic.slice(), typ, b, except) catch |err| return answer(err);
     return abi.OK;
 }
@@ -448,50 +465,50 @@ export fn anole_ws_publish(s: ?*anyopaque, topic: Str, typ: c_int, data: ?*const
 const have_grpc = anole.features.grpc;
 
 export fn anole_grpc_send_headers(c: u64, metadata: ?[*]const Header, n: usize) i32 {
-    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    const md = headersOf(metadata, n) orelse return abi.E_INVALID;
+    if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const md = headersOf(metadata, n) orelse return failCode(abi.E_INVALID);
     engine.grpc.sendHeaders(e, c, md) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_grpc_send(c: u64, msg: ?*const anyopaque, len: usize, flags: u32) i32 {
-    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    if (flags & ~(abi.BODY_BORROW | abi.GRPC_SEND_FINISH) != 0) return abi.E_INVALID;
-    const b = bytes(msg, len) orelse return abi.E_INVALID;
+    if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (flags & ~(abi.BODY_BORROW | abi.GRPC_SEND_FINISH) != 0) return failCode(abi.E_INVALID);
+    const b = bytes(msg, len) orelse return failCode(abi.E_INVALID);
     const busy = engine.grpc.send(e, c, b, flags & abi.BODY_BORROW != 0, flags & abi.GRPC_SEND_FINISH != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 
 export fn anole_grpc_send_wait(c: u64, msg: ?*const anyopaque, len: usize, timeout_ms: i32) i32 {
-    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    const b = bytes(msg, len) orelse return abi.E_INVALID;
+    if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const b = bytes(msg, len) orelse return failCode(abi.E_INVALID);
     engine.grpc.sendWait(e, c, b, timeout_ms) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_grpc_finish(c: u64, code: u32, message: Str, trailers: ?[*]const Header, n: usize) i32 {
-    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    const ts = headersOf(trailers, n) orelse return abi.E_INVALID;
+    if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const ts = headersOf(trailers, n) orelse return failCode(abi.E_INVALID);
     engine.grpc.finish(e, c, code, message.slice(), ts) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_grpc_read(c: u64, n: u32) i32 {
-    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    if (n == 0) return abi.E_INVALID;
+    if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (n == 0) return failCode(abi.E_INVALID);
     engine.grpc.read(e, c, n) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_grpc_health_set(s: ?*anyopaque, service: Str, status: c_int) i32 {
-    if (comptime !have_grpc) return abi.E_UNSUPPORTED;
+    if (comptime !have_grpc) return failCode(abi.E_UNSUPPORTED);
     clearError();
-    const e = engineOf(s) orelse return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
     engine.grpc.healthSet(e, service.slice(), status) catch |err| return switch (err) {
         error.State => blk: {
             setError("anole_grpc_health_set: the configuration has no \"grpc\": {{\"health\": true}}", .{});
@@ -507,62 +524,62 @@ export fn anole_grpc_health_set(s: ?*anyopaque, service: Str, status: c_int) i32
 const have_wt = anole.features.http3;
 
 export fn anole_wt_open_stream(w: u64, flags: u32, out: ?*u64) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    const o = out orelse return abi.E_INVALID;
-    if (flags & ~abi.WT_UNI != 0) return abi.E_INVALID;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const o = out orelse return failCode(abi.E_INVALID);
+    if (flags & ~abi.WT_UNI != 0) return failCode(abi.E_INVALID);
     o.* = engine.wt.openStream(e, w, flags & abi.WT_UNI != 0) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_wt_stream_write(st: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    if (flags & ~abi.WT_FIN != 0) return abi.E_INVALID;
-    const b = bytes(data, len) orelse return abi.E_INVALID;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    if (flags & ~abi.WT_FIN != 0) return failCode(abi.E_INVALID);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     const busy = engine.wt.write(e, st, b, flags & abi.WT_FIN != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 
 export fn anole_wt_stream_reset(st: u64, code: u32) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.wt.streamOp(e, st, .reset, code) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_wt_stream_stop(st: u64, code: u32) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.wt.streamOp(e, st, .stop, code) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_wt_stream_release(st: u64) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.wt.streamOp(e, st, .release, 0) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_wt_send_datagram(w: u64, data: ?*const anyopaque, len: usize) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
-    const b = bytes(data, len) orelse return abi.E_INVALID;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
     engine.wt.sendDatagram(e, w, b) catch |err| return answer(err);
     return abi.OK;
 }
 
 export fn anole_wt_max_datagram(w: u64) i64 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     const n = engine.wt.maxDatagram(e, w) catch |err| return answer(err);
     return @intCast(n);
 }
 
 export fn anole_wt_close(w: u64, code: u32, reason: Str) i32 {
-    if (comptime !have_wt) return abi.E_UNSUPPORTED;
-    const e = live() orelse return abi.E_GONE;
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    const e = live() orelse return failCode(abi.E_GONE);
     engine.wt.close(e, w, code, reason.slice()) catch |err| return answer(err);
     return abi.OK;
 }
@@ -577,8 +594,8 @@ fn dbOf(d: ?*anyopaque) ?*db_mod.Db {
 
 export fn anole_db_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
     clearError();
-    const e = engineOf(s) orelse return abi.E_INVALID;
-    const dst = out orelse return abi.E_INVALID;
+    const e = engineOf(s) orelse return failCode(abi.E_INVALID);
+    const dst = out orelse return failCode(abi.E_INVALID);
     const d = db_mod.find(e, name.slice()) orelse {
         setError("no database \"{s}\" in the configuration", .{name.slice()});
         return abi.E_INVALID;
@@ -589,10 +606,10 @@ export fn anole_db_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
 
 fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
     clearError();
-    const d = dbOf(d_) orelse return abi.E_INVALID;
-    const c = consumerOf(c_) orelse return abi.E_INVALID;
-    const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return abi.E_INVALID)[0..nparams];
-    const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) orelse return abi.E_INVALID else .{ .size = @sizeOf(abi.DbOptions) };
+    const d = dbOf(d_) orelse return failCode(abi.E_INVALID);
+    const c = consumerOf(c_) orelse return failCode(abi.E_INVALID);
+    const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return failCode(abi.E_INVALID))[0..nparams];
+    const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) orelse return failCode(abi.E_INVALID) else .{ .size = @sizeOf(abi.DbOptions) };
     db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return switch (err) {
         error.Invalid => blk: {
             setError("invalid argument (a value type, or a consumer of another server)", .{});
@@ -602,8 +619,8 @@ fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, param
             setError("the server is not running, or no executor feeds this consumer", .{});
             break :blk abi.E_STATE;
         },
-        error.OutOfMemory => abi.E_NOMEM,
-        error.Unsupported => abi.E_UNSUPPORTED,
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
     };
     return abi.OK;
 }
@@ -617,7 +634,7 @@ export fn anole_db_exec(d: ?*anyopaque, c: ?*anyopaque, sql: Str, params: ?[*]co
 }
 
 export fn anole_db_invalidate(d_: ?*anyopaque, tag: Str) i32 {
-    const d = dbOf(d_) orelse return abi.E_INVALID;
-    db_mod.invalidate(d, tag.slice()) catch return abi.E_STATE;
+    const d = dbOf(d_) orelse return failCode(abi.E_INVALID);
+    db_mod.invalidate(d, tag.slice()) catch return failCode(abi.E_STATE);
     return abi.OK;
 }

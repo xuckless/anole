@@ -184,7 +184,9 @@ handle.
 
 `>= 0` is success: `ANOLE_OK`, or `ANOLE_BUSY` (taken, but past the
 high-water mark: wait for `ANOLE_EV_WRITABLE` or `ANOLE_EV_WS_DRAIN`).
-Negative codes mean nothing was done unless the function says otherwise:
+Negative codes mean nothing was done unless the function says otherwise,
+and each sets `anole_last_error` (the code's own text, or a more specific
+one):
 
 | Code | Meaning |
 | --- | --- |
@@ -389,7 +391,11 @@ anole_wt_close(w, 0, (anole_str){"bye", 3});
   its session: the peer may open a new stream only as earlier ones are
   released. A release resets a sending side not ended with
   `ANOLE_WT_FIN` and stops a receiving side not read to its end; one
-  written with `ANOLE_WT_FIN` first sends everything.
+  written with `ANOLE_WT_FIN` first sends everything. Once the session
+  is over its streams answer `ANOLE_E_GONE`, release too, and that can
+  come before `ANOLE_EV_WT_CLOSE` is read: the peer may close at any
+  time. Release a stream before an answer after which the peer may
+  close.
 - Datagrams: received ones are `ANOLE_EV_WT_DATAGRAM` (the session keeps
   up to 256 or 1 MiB waiting for the consumer, then drops new ones, as
   Anole does in Zig). Sent ones wait in a queue of the route's

@@ -124,6 +124,9 @@ breaking changes are listed anyway.
   on the socket's executor and the publish fans out from another, so a
   socket that had just subscribed could miss it. A publish now waits for
   the subscriptions taken before it.
+- C ABI: after an error answer, `anole_last_error` could still show the
+  text an earlier call left (an `ANOLE_E_GONE` read as "invalid
+  argument"). Every negative answer now sets its own text.
 - WebTransport: a one-way stream that arrived whole (its data and its end)
   before its session was established on the receiving side was dropped,
   so a server that opened a stream right after accepting the session could

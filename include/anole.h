@@ -98,7 +98,8 @@ enum {
 };
 
 /* The text of the last error on the calling thread: valid until the next
-   anole_* call on that thread. Empty when there is none. */
+   anole_* call on that thread. Every negative answer sets it. Empty when
+   there is none. */
 ANOLE_API anole_str anole_last_error(void);
 /* Compare with ANOLE_ABI_VERSION at load: the major must match, the minor
    must be >= the header's. */
@@ -702,7 +703,9 @@ ANOLE_API anole_status anole_wt_stream_reset(anole_wt_stream s, uint32_t code);
 ANOLE_API anole_status anole_wt_stream_stop(anole_wt_stream s, uint32_t code);
 /* Done with the stream: a sending side not ended with ANOLE_WT_FIN is reset
    and a receiving side not read to its end is stopped (code 0); the handle
-   is stale at once. Every stream must be released (or its session closed). */
+   is stale at once. Every stream must be released (or its session closed).
+   ANOLE_E_GONE once the session is over, which can be before its
+   ANOLE_EV_WT_CLOSE is read: the stream was let go with it. */
 ANOLE_API anole_status anole_wt_stream_release(anole_wt_stream s);
 /* Queues a datagram (copied). Datagrams are unreliable: the session keeps
    the route's datagram_queue of them waiting to go out, and past it drops
