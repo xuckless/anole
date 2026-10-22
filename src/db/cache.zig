@@ -56,6 +56,12 @@ pub const Shape = enum {
     optional,
     /// A slice of rows (`all`): empty with none.
     all,
+    /// Rows under run-time column names (`anole.db.Table`): empty with
+    /// no row.
+    table,
+    /// A reply whose shape is known only at run time (`anole.redis.Reply`):
+    /// empty when nil, or an empty array or map.
+    reply,
 };
 
 /// Whether `out`, a read's result of `shape`, is empty.
@@ -64,6 +70,12 @@ fn isEmpty(comptime shape: Shape, out: anytype) bool {
         .one => false,
         .optional => out == null,
         .all => out.len == 0,
+        .table => out.rows.len == 0,
+        .reply => switch (out) {
+            .nil => true,
+            .array, .map => |items| items.len == 0,
+            else => false,
+        },
     };
 }
 

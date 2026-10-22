@@ -32,6 +32,13 @@ checks that the object and the shared library export `anole_*` alone. Hidden
 symbols are still global within one link: two static libraries that both
 define, say, `SSL_new` still clash when linked into the same extension.
 
+Dead-stripping is safe (`-Wl,-dead_strip` on macOS, `-Wl,--gc-sections` on
+Linux, Zig's release links): the packing step restores the Mach-O symbol
+flags that keep BoringSSL's assembly whole, and the ELF object carries
+`.note.GNU-stack`, so programs and extensions linking it keep a
+non-executable stack. `zig build capi-test` serves HTTPS from a dead-stripped
+link of `libanole.a`; `capi-test-asan` does the same with the system linker.
+
 The build flags apply: `-Dprofile=minimal` gives a library without TLS,
 HTTP/2, HTTP/3 or WebSocket. `anole_has_feature("http3")` says what is in.
 
@@ -133,9 +140,10 @@ are `anole_span`s (offset from the record's start, length).
 | `ANOLE_EV_WS_MESSAGE` | `anole_ws_message_event`, then the bytes | `anole_ws` |
 | `ANOLE_EV_WS_CLOSE` | `anole_ws_close_event`: the socket is done | `anole_ws` |
 | `ANOLE_EV_WS_DRAIN` | `anole_event`: a socket that took `ANOLE_BUSY` has room | `anole_ws` |
+| `ANOLE_EV_DB_RESULT` | `anole_db_result_event`, then column names, cells, bytes | 0 (`user_data`) |
 | `ANOLE_EV_STOPPED` | `anole_event`: the server stopped; the consumer's last event | 0 |
 
-Types 10 and 12-39 are reserved (database results, gRPC calls, WebTransport).
+Types 12-39 are reserved (gRPC calls, WebTransport, more database events).
 
 A request record carries the route's `handler` id, the method (an enum and
 the name as sent), the HTTP version (11, 20, 30), the raw path and query, the
@@ -185,7 +193,8 @@ Negative codes mean nothing was done unless the function says otherwise:
 | `ANOLE_E_UNSUPPORTED` | compiled out, or not on this OS |
 | `ANOLE_E_TOOBIG` | the next event does not fit the poll buffer (it stays queued) |
 | `ANOLE_E_SYSTEM` | the OS refused (a port in use, a certificate that will not load) |
-| `ANOLE_E_TIMEOUT` | a blocking call's timeout passed |
+| `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
+| `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
 
 ## Configuration
 
@@ -289,6 +298,172 @@ per executor, and the larger of 16 x `limits.ws_high_water` and
 2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
 `ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
 
+## Databases
+
+`anole_db_*` runs SQL without blocking the caller, for event-loop consumers
+(Node, asyncio). A database is configured with the server and opened at
+start, before the listeners, with its `init` script (SQL). SQLite,
+PostgreSQL and Redis are the kinds so far:
+
+```json
+"databases": [
+  { "name": "main",
+    "sqlite": { "path": "app.db", "init": "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT UNIQUE NOT NULL);" },
+    "cache": { "max_entries": 4096, "max_bytes": 33554432 } }
+]
+```
+
+```c
+anole_db *db;
+anole_db_find(s, (anole_str){"main", 4}, &db);
+anole_db_value p[] = {{ANOLE_DB_TEXT, 0, {.s = {"milk", 4}}}};
+anole_db_exec(db, consumer, sql_insert, p, 1, NULL, /*user_data*/ 7);
+anole_db_options o = {sizeof o, ANOLE_DB_COALESCE, 0, /*cache_ttl_ms*/ 5000, 0, {"notes", 5}};
+anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
+/* later, from anole_poll: ANOLE_EV_DB_RESULT with user_data 7, then 8 */
+```
+
+- Each call copies the statement and its parameters and returns at once.
+  The answer is one `ANOLE_EV_DB_RESULT` record for the consumer named in
+  the call, carrying the call's `user_data` (a binding's promise ID).
+  Answers to different calls may arrive in any order.
+- SQLite runs as in Zig ([database.md](database.md)): reads on read-only
+  connections on Anole's blocking pool beside the writer (WAL), writes in
+  turn on the database's writer thread, `:memory:` all on the writer.
+- `anole_db_query` returns rows: the column names (`columns`), then
+  `nrows * ncolumns` cells (`anole_db_cell`: null, integer, float, bool,
+  text or blob), row after row, all in the record. A bool parameter binds
+  as 1 or 0 in SQLite. `anole_db_exec` returns
+  `changes` and `last_insert_rowid`; with no parameters its SQL may hold
+  several statements.
+- Options (`anole_db_options`, or NULL):
+  - `timeout_ms` interrupts the statement (`ANOLE_E_TIMEOUT`, 504).
+  - `ANOLE_DB_COALESCE`: identical reads in flight at once on one executor
+    share one run.
+  - `cache_ttl_ms`: the answer is kept per executor and served from memory
+    (`source` says whether it was). `cache_tag` names a group of kept
+    answers to drop by, with `anole_db_invalidate` after a write.
+  - Nothing is coalesced or cached unless the call asks.
+- Failures come back in the record, never as a call's return:
+  - `status` is `ANOLE_E_DB`, `ANOLE_E_TIMEOUT`, `ANOLE_E_TOOBIG` (an answer
+    past `limits.db_result_max`) or `ANOLE_E_NOMEM`.
+  - `error_class` gives the kind of failure (`ANOLE_DB_ERR_UNIQUE`, ...).
+  - `http_status` is what Anole's own handlers would answer for it (409, 503,
+    504, 500).
+  - The database's message, its code and the constraint are in the record,
+    for logs. Don't send them to clients.
+- Queries can be queued from `anole_server_start` until the server stops.
+  Queries still running at the stop get no answer.
+
+### PostgreSQL
+
+The same calls, options, answers and error classes, with a `"postgres"`
+database:
+
+```json
+"databases": [
+  { "name": "main",
+    "postgres": { "url": "postgres://app:secret@db.internal:5432/app",
+                  "ca_file": "/etc/ssl/db-ca.pem",
+                  "init": "CREATE TABLE IF NOT EXISTS notes (id bigserial PRIMARY KEY, title text UNIQUE NOT NULL)" } }
+]
+```
+
+- It is `anole.pg` underneath ([database.md](database.md)): each executor
+  has its own pool, so a query never leaves the executor that runs it,
+  and `timeout_ms` also sends PostgreSQL a CancelRequest.
+- TLS is checked by default. A server on another host gets
+  `sslmode=verify-full` (TLS, the certificate and the host name checked
+  against the system's store) unless the URL, `"sslmode"` or `PGSSLMODE`
+  says otherwise; a server on this machine gets `prefer`. For a private CA,
+  give `"ca_file"` (or `"ca_pem"`, the PEM text): with either, the server is
+  always checked, and an sslmode that would not check it is refused. The
+  URL's `sslrootcert`, `sslcert` and `sslkey` work as in libpq. `"sslmode"`
+  and an `sslmode=` in the URL together are refused.
+- `"url"` may be left out: then `DATABASE_URL`, else libpq's variables
+  (`PGHOST`, `PGUSER`, `PGPASSWORD`...), from the process's environment.
+- Parameters are `$1`, `$2`... Each value goes as the parameter's type when
+  PostgreSQL takes it that way (an int for int4, int8 or numeric, a blob
+  for bytea, a bool for bool), else as text that PostgreSQL parses into the
+  parameter's type: a timestamptz as text (`"2026-10-22T10:00:00Z"`), an
+  array literal (`"{1,2}"`), a number for a text parameter. A value
+  PostgreSQL can't parse fails the query (`ANOLE_E_DB`, SQLSTATE 22P02).
+- Cells: `bool` is `ANOLE_DB_BOOL`; `int2`, `int4`, `int8`, `oid` are
+  `ANOLE_DB_INT`; `float4`, `float8` are `ANOLE_DB_FLOAT`; `bytea` is
+  `ANOLE_DB_BLOB`; every other type is `ANOLE_DB_TEXT` in PostgreSQL's text
+  format, as psql prints it: `numeric` exactly (`"12.50"`), timestamps as
+  the session prints them (`"2026-10-22 10:00:00+00"`), JSON as its text,
+  arrays as `"{1,2}"`. Every cell carries its column's type OID in
+  `db_type` (`20` int8, `1700` numeric, `1184` timestamptz, `3802`
+  jsonb...), so a binding parses text cells with its ecosystem's own
+  PostgreSQL type parsers (what node-postgres and psycopg do with the same
+  text) instead of Anole guessing at a JavaScript or Python type. NULL
+  cells carry the OID too.
+- `anole_db_exec` returns `changes` (rows inserted, updated or deleted);
+  `last_insert_rowid` is 0. For generated keys, use `RETURNING` with
+  `anole_db_query`.
+- Errors: `error_code` is the SQLSTATE (`"23505"`), `constraint` the
+  constraint's name; the classes are those of `anole.db`
+  (`ANOLE_DB_ERR_UNIQUE` for 23505, `SERIALIZATION` for 40001,
+  `UNAVAILABLE` when no connection could be had...).
+- `ANOLE_DB_WRITE` means nothing here (any connection runs any
+  statement).
+
+### Redis
+
+The same calls with a `"redis"` database (Redis or Valkey), on
+`anole.redis`:
+
+```json
+"databases": [
+  { "name": "kv", "redis": { "url": "rediss://app:secret@cache.internal:6380/0", "ca_file": "/etc/ssl/cache-ca.pem" } }
+]
+```
+
+```c
+anole_db_value p[] = {{ANOLE_DB_TEXT, 0, {.s = {"user:7", 6}}},
+                      {ANOLE_DB_BLOB, 0, {.s = {data, len}}},
+                      {ANOLE_DB_TEXT, 0, {.s = {"EX", 2}}},
+                      {ANOLE_DB_INT, 0, {.i = 60}}};
+anole_db_exec(db, consumer, (anole_str){"SET", 3}, p, 4, NULL, 1);
+anole_db_query(db, consumer, (anole_str){"GET", 3}, p, 1, &cached, 2);
+```
+
+- A command is an array of arguments: `sql` holds the command's name and
+  any fixed words (`"GET"`, `"CLIENT INFO"`, split on spaces), and each
+  parameter is one more argument, binary-safe: text and blobs as they are,
+  numbers in decimal, a bool as `1` or `0`, NULL left out. Keys and values
+  always go in parameters, never in `sql`, as with SQL.
+- `anole_db_query` answers with the whole reply. Replies are trees (an
+  array of arrays, a map), so they are not forced into rows: the cells are
+  the reply in preorder, `ncolumns` is 0 and `nrows` is the number of
+  cells. `ANOLE_DB_ARRAY` (`i` items follow, each a whole subtree) and
+  `ANOLE_DB_MAP` (`i` key, value pairs follow) are the inner nodes; bulk
+  strings are `ANOLE_DB_BLOB` (bytes: a binding decodes UTF-8 by default
+  and offers the bytes, as ioredis and redis-py do); status replies
+  (`"OK"`) are `ANOLE_DB_TEXT`; integers `ANOLE_DB_INT`; nil
+  `ANOLE_DB_NULL`; `ANOLE_DB_ERROR` is an error reply inside another
+  (EXEC's). A binding rebuilds the reply with one recursive walk; for a
+  flat reply (`GET`, `LRANGE`) it reads the cells after the first. Why
+  the same record rather than one of its own: one event, one parser and
+  one size limit for every database, and the cell types it needs already
+  exist but for three.
+- `anole_db_exec` runs the command for its effect: no cells, and
+  `changes` holds the reply when it is an integer (`DEL`, `INCR`,
+  `RPUSH`...).
+- `ANOLE_DB_COALESCE` and `cache_ttl_ms` apply only to commands that just
+  read (`GET`, `MGET`, `HGETALL`, `LRANGE`, `ZRANGE`... as
+  `anole.redis.read_commands`); others run as they are. `timeout_ms`
+  closes the connection the command waits on (a blocking pop, say).
+- An error reply is `ANOLE_E_DB`: `error_code` is its first word
+  (`"WRONGTYPE"`), `error` the whole message. `LOADING`, `READONLY`,
+  `OOM`, `BUSY` and the like, a refused login and an unreachable server are
+  `ANOLE_DB_ERR_UNAVAILABLE` (503); the rest `ANOLE_DB_ERR_OTHER` (500).
+  An empty command is answered with `http_status` 400.
+- One command per call. A transaction that must stay on one connection
+  (`MULTI`/`EXEC`, `WATCH`) goes in one `EVAL` script for now; pub/sub is
+  not part of `anole_db_*` (WebSocket topics cover fan-out to clients).
+
 ## Lifecycle
 
 ```c
@@ -328,19 +503,16 @@ routes with native ones.
 
 ## What comes next
 
-ABI 0.1 is the request/response and WebSocket core. Before the ABI freezes
-(1.0) and the bindings ship, these come as their own pull requests, in this
-order; their event types and handle kinds are reserved already:
+ABI 0.1 is the request/response and WebSocket core, plus `anole_db_*` with
+SQLite, PostgreSQL and Redis. Before the ABI freezes (1.0) and the bindings ship, these come as
+their own pull requests; their event types and handle kinds are reserved
+already:
 
-1. `anole_db_*` with SQLite: non-blocking queries for event-loop consumers,
-   with per-query request coalescing and a TTL result cache.
-2. gRPC: server, with service methods implemented in the language.
-3. WebTransport: sessions, streams and datagrams.
-4. PostgreSQL through `anole_db_*`.
-5. Redis.
-6. MongoDB.
-7. TLS extras: mutual TLS and the client certificate in the request,
-   certificate reload per listener.
-8. The freeze: ABI 1.0.
+- MongoDB through `anole_db_*`.
+- gRPC: server, with service methods implemented in the language.
+- WebTransport: sessions, streams and datagrams.
+- TLS extras: mutual TLS and the client certificate in the request,
+  certificate reload per listener.
+- Then the freeze: ABI 1.0.
 
 Auth beyond the configured `jwt` middleware comes later.

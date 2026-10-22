@@ -123,6 +123,19 @@ pub const Blob = struct {
     }
 };
 
+/// A value whose type is known only at run time (`anole.db.Value`): a
+/// parameter of `table` and `run`, or a cell of a `Table`. A bool binds as
+/// 1 or 0; cells are never bools.
+pub const Value = db.Value;
+
+/// Rows whose columns are known only at run time (`Query.table`,
+/// `anole.db.Table`); `types` is empty.
+pub const Table = db.Table;
+
+/// What a write did (`Query.run`, `anole.db.Changes`): the rows it changed,
+/// and the rowid of the last row inserted on the connection.
+pub const Changes = db.Changes;
+
 /// What every call fails with: `anole.db.Error`, a cancel, or memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
 
@@ -517,6 +530,21 @@ pub const Query = struct {
         return q.db.cache.read([]T, cx, q.options, sql, args, Read(.all, T){ .q = q });
     }
 
+    /// Every row, as values (`Value`) under the result's column names:
+    /// for callers that know neither until run time (the C ABI, a binding).
+    /// `params` bind `?` (or `?NNN`) in order. A read may run on a reader,
+    /// as `all` does; `coalesce` and `cache` apply.
+    pub fn table(q: Query, cx: anytype, sql: []const u8, params: []const Value) Error!Table {
+        return q.db.cache.read(Table, cx, q.options, sql, params, Read(.table, void){ .q = q });
+    }
+
+    /// Runs a statement on the writer and says what it changed: `exec` with
+    /// the last inserted rowid too, `params` as for `table`. With no
+    /// `params`, `sql` may hold several statements, run in order.
+    pub fn run(q: Query, cx: anytype, sql: []const u8, params: []const Value) Error!Changes {
+        return q.call(.run, void, cx, sql, params);
+    }
+
     /// A read as `anole.db.QueryCache` makes it: the plain call, with the
     /// caller's context or a shared call's own.
     fn Read(comptime op: Op, comptime T: type) type {
@@ -563,7 +591,7 @@ pub const Query = struct {
     fn dispatch(q: Query, comptime op: Op, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Out(op, T) {
         const self = q.db;
         const flags: Flags = .{ .prepare = q.options.prepare };
-        if (op != .exec and !q.options.write and self.readers.conns.len > 0 and operation(sql).reads()) {
+        if (op != .exec and op != .run and !q.options.write and self.readers.conns.len > 0 and operation(sql).reads()) {
             const conn = try self.acquireReader(cx.io);
             var failure: Failure = .{};
             var probe = flags;
@@ -1040,7 +1068,7 @@ const Stmt = struct {
 // ---------------------------------------------------------------------------
 // Jobs: what runs on the writer thread or a reader's pool thread
 
-const Op = enum { exec, one, optional, all };
+const Op = enum { exec, one, optional, all, table, run };
 
 fn Out(comptime op: Op, comptime T: type) type {
     return switch (op) {
@@ -1048,6 +1076,8 @@ fn Out(comptime op: Op, comptime T: type) type {
         .one => T,
         .optional => ?T,
         .all => []T,
+        .table => Table,
+        .run => Changes,
     };
 }
 
@@ -1075,7 +1105,13 @@ fn statement(comptime op: Op, comptime T: type, comptime Args: type) fn (*Client
             f.quiet = flags.quiet;
             const stmt = conn.prepare(d, sql, flags.prepare, f) catch |err| switch (err) {
                 error.MultipleStatements => {
-                    if (comptime op == .exec and @typeInfo(Args).@"struct".field_names.len == 0) return runScript(conn, sql, f);
+                    if (comptime op == .exec and Args != []const Value) {
+                        if (comptime @typeInfo(Args).@"struct".field_names.len == 0) return runScript(conn, sql, f);
+                    }
+                    if (comptime op == .run) if (args.len == 0) return .{
+                        .changes = try runScript(conn, sql, f),
+                        .last_insert_rowid = c.sqlite3_last_insert_rowid(conn.handle.db),
+                    };
                     return f.ours(.other, "one statement per call (the SQL holds more); exec runs several when given no arguments", .{});
                 },
                 else => |e| return e,
@@ -1085,15 +1121,34 @@ fn statement(comptime op: Op, comptime T: type, comptime Args: type) fn (*Client
             if (flags.reader and c.sqlite3_stmt_readonly(h) == 0) return error.NeedsWriter;
             try bindAll(h, arena, args, .static, f);
             switch (op) {
-                .exec => {
+                .exec, .run => {
                     const before = c.sqlite3_total_changes64(conn.handle.db);
                     while (true) {
                         const rc = c.sqlite3_step(h);
                         if (rc == c.SQLITE_DONE) break;
                         if (rc != c.SQLITE_ROW) return f.fromStep(conn, rc);
                     }
-                    if (c.sqlite3_total_changes64(conn.handle.db) == before) return 0;
-                    return @intCast(c.sqlite3_changes64(conn.handle.db));
+                    const changed: u64 = if (c.sqlite3_total_changes64(conn.handle.db) == before) 0 else @intCast(c.sqlite3_changes64(conn.handle.db));
+                    if (op == .exec) return changed;
+                    return .{ .changes = changed, .last_insert_rowid = c.sqlite3_last_insert_rowid(conn.handle.db) };
+                },
+                .table => {
+                    const ncol: usize = @intCast(c.sqlite3_column_count(h));
+                    const names = try arena.alloc([]const u8, ncol);
+                    for (names, 0..) |*n, i| {
+                        const name = c.sqlite3_column_name(h, @intCast(i));
+                        n.* = if (name != null) try arena.dupe(u8, std.mem.span(name)) else "";
+                    }
+                    var rows: std.ArrayList([]const Value) = .empty;
+                    while (true) {
+                        const rc = c.sqlite3_step(h);
+                        if (rc == c.SQLITE_DONE) break;
+                        if (rc != c.SQLITE_ROW) return f.fromStep(conn, rc);
+                        const row = try arena.alloc(Value, ncol);
+                        for (row, 0..) |*v, i| v.* = try columnValue(h, @intCast(i), arena);
+                        try rows.append(arena, row);
+                    }
+                    return .{ .columns = names, .rows = try rows.toOwnedSlice(arena) };
                 },
                 .one, .optional => {
                     const rc = c.sqlite3_step(h);
@@ -1231,6 +1286,7 @@ const Lifetime = enum {
 /// Binds a tuple in order, or a struct by name (`:name`, `@name` or
 /// `$name` in the SQL).
 fn bindAll(stmt: *c.sqlite3_stmt, arena: std.mem.Allocator, args: anytype, lifetime: Lifetime, f: *Failure) JobError!void {
+    if (@TypeOf(args) == []const Value) return bindValues(stmt, args, lifetime, f);
     const info = @typeInfo(@TypeOf(args)).@"struct";
     const want = c.sqlite3_bind_parameter_count(stmt);
     if (want != info.field_names.len) return f.ours(.other, "the statement takes {d} parameters, {d} given", .{ want, info.field_names.len });
@@ -1275,6 +1331,37 @@ fn bind(stmt: *c.sqlite3_stmt, index: c_int, value: anytype, arena: std.mem.Allo
         },
     };
     if (rc != c.SQLITE_OK) return f.ours(.other, "parameter {d}: {s}", .{ index, std.mem.span(c.sqlite3_errstr(rc)) });
+}
+
+/// `Value`s, in order (`?` or `?NNN`).
+fn bindValues(stmt: *c.sqlite3_stmt, values: []const Value, lifetime: Lifetime, f: *Failure) JobError!void {
+    const want: usize = @intCast(c.sqlite3_bind_parameter_count(stmt));
+    if (want != values.len) return f.ours(.other, "the statement takes {d} parameters, {d} given", .{ want, values.len });
+    const destructor = if (lifetime == .static) c.SQLITE_STATIC else c.sqliteTransientAsDestructor();
+    for (values, 1..) |v, i| {
+        const index: c_int = @intCast(i);
+        const rc = switch (v) {
+            .null => c.sqlite3_bind_null(stmt, index),
+            .int => |n| c.sqlite3_bind_int64(stmt, index, n),
+            .bool => |b| c.sqlite3_bind_int64(stmt, index, @intFromBool(b)),
+            .float => |x| c.sqlite3_bind_double(stmt, index, x),
+            .text => |t| c.sqlite3_bind_text64(stmt, index, t.ptr, t.len, destructor, c.SQLITE_UTF8),
+            .blob => |b| c.sqlite3_bind_blob64(stmt, index, b.ptr, b.len, destructor),
+        };
+        if (rc != c.SQLITE_OK) return f.ours(.other, "parameter {d}: {s}", .{ index, std.mem.span(c.sqlite3_errstr(rc)) });
+    }
+}
+
+/// Column `col` of the current row as a `Value`, its bytes in `arena`.
+fn columnValue(stmt: *c.sqlite3_stmt, col: c_int, arena: std.mem.Allocator) error{OutOfMemory}!Value {
+    const kind = c.sqlite3_column_type(stmt, col);
+    return switch (kind) {
+        c.SQLITE_NULL => .null,
+        c.SQLITE_INTEGER => .{ .int = c.sqlite3_column_int64(stmt, col) },
+        c.SQLITE_FLOAT => .{ .float = c.sqlite3_column_double(stmt, col) },
+        c.SQLITE_BLOB => .{ .blob = try arena.dupe(u8, columnBytes(stmt, col, kind)) },
+        else => .{ .text = try arena.dupe(u8, columnBytes(stmt, col, kind)) },
+    };
 }
 
 /// Whether `V` coerces to `[]const u8`: slices of bytes, and pointers to
