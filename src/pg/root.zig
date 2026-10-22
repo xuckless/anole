@@ -116,6 +116,9 @@ pub const Options = struct {
     /// What each class of server error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
     /// Certificates for TLS; whether TLS is used is the URL's `sslmode`.
+    /// With `tls.ca` set, the server's certificate is always checked:
+    /// `verify-full` when no sslmode is given, and an sslmode that does not
+    /// check it (`disable`, `allow`, `prefer`) is refused.
     tls: Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
@@ -270,7 +273,7 @@ const Settings = struct {
 
         const text = opts.url orelse db.env(env, "DATABASE_URL") orelse {
             s.parameters = parameters.items;
-            try s.finish(arena);
+            try s.finish(arena, opts, why);
             return s;
         };
         const url = db.Url.parse(arena, text) catch |err| return why.url(text, "{t}", .{err});
@@ -331,19 +334,25 @@ const Settings = struct {
             }
         }
         s.parameters = parameters.items;
-        try s.finish(arena);
+        try s.finish(arena, opts, why);
         return s;
     }
 
-    fn finish(s: *Settings, arena: std.mem.Allocator) !void {
+    fn finish(s: *Settings, arena: std.mem.Allocator, opts: Options, why: *Why) !void {
         if (s.host.len > 0 and s.host[0] == '/') {
             s.unix_path = try std.fmt.allocPrint(arena, "{s}/.s.PGSQL.{d}", .{ std.mem.trimEnd(u8, s.host, "/"), s.port });
         }
+        const code_ca = opts.tls.ca != null;
         // No sslmode given: the server's certificate is checked unless the
-        // server is on this machine.
-        if (!s.sslmode_set) s.sslmode = if (s.local()) .prefer else .verify_full;
+        // server is on this machine and the code gives no CA.
+        if (!s.sslmode_set) s.sslmode = if (s.local() and !code_ca) .prefer else .verify_full;
         // libpq: `require` with a root certificate checks the chain.
-        if (s.sslmode == .require and s.sslrootcert != null) s.sslmode = .verify_ca;
+        if (s.sslmode == .require and (s.sslrootcert != null or code_ca)) s.sslmode = .verify_ca;
+        // The URL and the environment may not turn off the checks the code
+        // asks for by giving a CA.
+        if (code_ca and !s.sslmode.verifies()) {
+            return why.set("sslmode={t} does not check the server's certificate, but Options.tls.ca gives a CA to check it with; take sslmode out of the URL and PGSSLMODE, or set verify-full", .{s.sslmode});
+        }
     }
 
     /// Whether the server is on this machine: a Unix socket, or a loopback
@@ -1620,6 +1629,16 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
     try testing.expectEqualStrings("/var/run/postgresql/.s.PGSQL.5433", sock.unix_path.?);
     try testing.expectEqualStrings("worker", sock.database);
     try testing.expectEqualStrings("postgres://worker@/var/run/postgresql/.s.PGSQL.5433/worker", try std.fmt.bufPrint(&buf, "{f}", .{sock}));
+
+    // A CA given in code: the URL cannot turn the check off.
+    const ca: Options.Tls = .{ .ca = .system };
+    var cw: Settings.Why = .{ .arena = arena };
+    try testing.expectEqual(SslMode.verify_full, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://localhost/d", .tls = ca }, &cw)).sslmode);
+    try testing.expectEqual(SslMode.verify_ca, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=require", .tls = ca }, &cw)).sslmode);
+    inline for (.{ "disable", "allow", "prefer" }) |mode| {
+        try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=" ++ mode, .tls = ca }, &cw));
+        try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGSSLMODE=" ++ mode}), .tls = ca }, &cw));
+    }
 
     // No sslmode: verify-full for another host, prefer for this machine;
     // and the password goes in clear text or as MD5 only to a verified
