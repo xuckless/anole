@@ -11,6 +11,12 @@ breaking changes are listed anyway.
   connection at once; the streams it covers finish. A stream released
   after a GOAWAY is reset and freed once the session has closed it, never
   while the session can still reach it.
+- HTTP/2 and HTTP/3 clients: a response's header fields are bounded by the
+  new `ConnectOptions.max_header_list_size` (64 KiB, advertised to the
+  server), and at most five informational (1xx) responses may precede the
+  final one. Past either the stream fails with `error.HeadersTooLarge` or
+  `error.TooManyInterimResponses` (new members of `StreamError`). The HTTP/2
+  client also reads a final response that follows a 1xx correctly now.
 
 ### C ABI (ABI 0.1)
 

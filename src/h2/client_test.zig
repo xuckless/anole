@@ -720,3 +720,71 @@ test "h2 client: a graceful GOAWAY lets the streams it covers finish" {
     defer gpa.free(body);
     try std.testing.expectEqualStrings("finished", body);
 }
+
+test "h2 client: a response head past the header list limit resets the stream" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const s = try request(conn, "/", .{});
+    defer s.release();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    // :status 200, one 100-byte field added to the dynamic table, then 600
+    // one-byte references to it: about 80 KB decoded from 700 bytes.
+    const head = [_]u8{ 0x88, 0x40, 5 } ++ "x-big" ++ [_]u8{100} ++ @as([100]u8, @splat('v')) ++ @as([600]u8, @splat(0xbe));
+    try peer.send(&frame(1, 0x4, 1, head));
+    try std.testing.expectError(error.HeadersTooLarge, s.waitHead());
+
+    // The connection carries on.
+    const t = try request(conn, "/", .{});
+    defer t.release();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.send(&frame(1, 0x5, 3, &.{0x88}));
+    try t.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), t.status);
+}
+
+test "h2 client: informational responses before the final one, up to a limit" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    // :status 103 (a literal on the static name), with a link field.
+    const early = [_]u8{ 0x08, 3 } ++ "103" ++ [_]u8{ 0x00, 4 } ++ "link" ++ [_]u8{5} ++ "</a>;";
+    {
+        // Five, then the response: its head and fields, not theirs.
+        const s = try request(conn, "/", .{});
+        defer s.release();
+        try io.sleep(.fromMilliseconds(20), .awake);
+        for (0..5) |_| try peer.send(&frame(1, 0x4, 1, early));
+        try peer.send(&frame(1, 0x4, 1, [_]u8{ 0x88, 0x00, 1 } ++ "x" ++ [_]u8{1} ++ "y"));
+        try peer.send(&frame(0, 0x1, 1, "ok"));
+        try s.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), s.status);
+        try std.testing.expectEqualStrings("y", s.header("x").?);
+        try std.testing.expect(s.header("link") == null);
+        const body = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("ok", body);
+    }
+    {
+        // Six is one too many.
+        const s = try request(conn, "/", .{});
+        defer s.release();
+        try io.sleep(.fromMilliseconds(20), .awake);
+        for (0..6) |_| try peer.send(&frame(1, 0x4, 3, early));
+        try std.testing.expectError(error.TooManyInterimResponses, s.waitHead());
+    }
+}

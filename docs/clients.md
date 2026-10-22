@@ -145,10 +145,17 @@ defer gpa.free(body);
 - `release` every stream you open, before `close`. Releasing an unfinished
   stream resets it (RST_STREAM CANCEL); `cancel` does that without releasing.
 - `waitHead` fails with `error.StreamReset`, `error.ConnectionClosed`,
-  `error.Timeout` (see [Timeouts](#timeouts)) or `error.Canceled`. A read or
+  `error.Timeout` (see [Timeouts](#timeouts)), `error.Canceled`,
+  `error.HeadersTooLarge` or `error.TooManyInterimResponses`. A read or
   write on a stream that ended early fails with `error.ReadFailed` or
   `error.WriteFailed`, the only errors a reader and a writer can return;
-  `s.readError()` and `s.writeError()` say which of those four it was.
+  `s.readError()` and `s.writeError()` say which it was.
+- `max_header_list_size` (64 KiB) bounds a response's header fields,
+  decoded, informational responses and trailers included, and is sent to
+  the server as SETTINGS_MAX_HEADER_LIST_SIZE. Up to five informational
+  (1xx) responses may come before the final one, as over HTTP/1.1.
+- After the server's GOAWAY, `request` fails with `error.ConnectionClosed`
+  and `isOpen()` is false, while the streams the GOAWAY covers finish.
 - A stream's `status`, `headers` and `trailers` live until `release`; copy
   what you keep.
 - `stream_window` (64 KiB) is what the server may send on a stream before
@@ -178,7 +185,9 @@ trust among other causes), `error.Timeout` (past `connect_timeout`, 10 s by
 default) or `error.NoH3`. `timeout` is each request's budget, as for
 HTTP/2. `stream_window` (256 KiB) and `max_data` (16 MiB) mean what they
 do for HTTP/2, with the same types; the stream window's default is larger
-because an HTTP/3 stream's buffer grows as data arrives. Only HTTP/3 has
+because an HTTP/3 stream's buffer grows as data arrives.
+`max_header_list_size` (64 KiB) and the limit of five informational
+responses are the same too (SETTINGS_MAX_FIELD_SECTION_SIZE over HTTP/3). Only HTTP/3 has
 `idle_timeout` (30 s, QUIC's idle timeout), `session_cache`, `early_data`
 and `webtransport` (below), and `RequestOptions.early`; `tls` is not
 optional. `anole.h3` exports the names `anole.h2` does:

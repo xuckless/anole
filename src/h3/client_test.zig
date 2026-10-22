@@ -130,6 +130,15 @@ fn slowNoWait(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "slow but whole";
 }
 
+/// Three 2000-byte header fields.
+fn bigHead(_: *dusty.Request, res: *dusty.Response) !void {
+    const value: [2000]u8 = @splat('v');
+    try res.header("x-a", &value);
+    try res.header("x-b", &value);
+    try res.header("x-c", &value);
+    res.body = "big head";
+}
+
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const s = try conn.request(&.{
         .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
@@ -188,6 +197,7 @@ const Fixture = struct {
         http.router.post("/early-post", earlyPost);
         http.router.get("/port", port);
         http.router.get("/download", download);
+        http.router.get("/big-head", bigHead);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -1030,4 +1040,29 @@ test "h3: a client that moves to a new port keeps its connection, and the server
         defer gpa.free(p);
         try std.testing.expectEqual(after, try std.fmt.parseInt(u16, p, 10));
     }
+}
+
+test "h3 client: a response head past max_header_list_size fails the stream, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .max_header_list_size = 4096,
+    });
+    defer conn.close();
+    {
+        const s = try request(conn, "GET", "/big-head", .{});
+        defer s.release();
+        try std.testing.expectError(error.HeadersTooLarge, s.waitHead());
+    }
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
 }
