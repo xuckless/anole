@@ -107,6 +107,16 @@
             .hash = "protobuf-7.0.0-0e82aj2WNAAZimii5Crz-Ce8fLdCHUW-Ra-95-3lLMnw",
             .lazy = true,
         },
+        // -Dgrpc: upb, protobuf's C runtime, from the protobuf 36.2 release
+        // tarball (BSD-3-Clause): the amalgamation in
+        // ruby/ext/google/protobuf_c and third_party/utf8_range, built by
+        // build/upb.zig. Only the C ABI's gRPC server links it (JSON <->
+        // protobuf from the consumer's descriptors).
+        .upb = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protobuf-36.2.tar.gz",
+            .hash = "N-V-__8AAPJv3gI7D9QT5MqUNa7RaXBRPTLdOd6eUVgbJ0Nm",
+            .lazy = true,
+        },
         .yyjson = .{
             .url = "https://github.com/ibireme/yyjson/archive/refs/tags/0.13.0.tar.gz",
             .hash = "N-V-__8AABFlbgB11C3wOoHo9lqDatPMvTuIdHI0vwVxDpTe",

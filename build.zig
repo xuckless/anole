@@ -35,6 +35,7 @@ const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
 const brotli_build = @import("build/brotli.zig");
 const yyjson_build = @import("build/yyjson.zig");
+const upb_build = @import("build/upb.zig");
 const hiredis_build = @import("build/hiredis.zig");
 const sqlite_build = @import("build/sqlite.zig");
 
@@ -102,7 +103,7 @@ pub const Features = struct {
         return f.tls == .boringssl;
     }
     fn needsTranslateC(f: Features) bool {
-        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite;
+        return f.tls != .none or f.http2 or f.http3 or f.compression or f.json or f.redis or f.sqlite or f.grpc;
     }
     /// True when every C library `f` needs is also needed by `have`.
     fn coveredBy(f: Features, have: Features) bool {
@@ -505,6 +506,12 @@ pub fn build(b: *std.Build) void {
     {
         const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
         b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
+    }
+    // test-grpc: the gRPC tests alone (the native server and client, JSON
+    // transcoding, and the C ABI's gRPC server).
+    if (features.grpc) {
+        const grpc_tests = b.addTest(.{ .name = "anole-test-grpc", .root_module = tests.root_module, .filters = &.{ "gRPC", "transcoding", "capi grpc" }, .use_llvm = use_llvm });
+        b.step("test-grpc", "Run the gRPC tests (native, transcoding, the C ABI's)").dependOn(&b.addRunArtifact(grpc_tests).step);
     }
 
     // The HTTP core's own tests (src/http/core, adapted from lalinsky/dusty)
@@ -1346,6 +1353,8 @@ const CModules = struct {
     protobuf: ?*std.Build.Module = null,
     /// yyjson.h (json)
     yyjson: ?*std.Build.Module = null,
+    /// src/capi/upb_shim.h over upb (grpc): the C ABI's gRPC JSON.
+    upb: ?*std.Build.Module = null,
     /// hiredis.h (redis)
     hiredis: ?*std.Build.Module = null,
     /// xuckless/zig-jwt (auth).
@@ -1379,6 +1388,7 @@ const CModules = struct {
         const websocket_dep = if (f.websocket) b.lazyDependency("websocket_zig", .{ .target = target, .optimize = optimize }) else null;
         const protobuf_dep = if (f.grpc) b.lazyDependency("protobuf", .{ .target = target, .optimize = optimize }) else null;
         const yyjson_dep = if (f.json) b.lazyDependency("yyjson", .{}) else null;
+        const upb_dep = if (f.grpc) b.lazyDependency("upb", .{}) else null;
         const hiredis_dep = if (f.redis) b.lazyDependency("hiredis", .{}) else null;
         const jwt_dep = if (f.auth) b.lazyDependency("zig_jwt", .{ .target = target, .optimize = optimize }) else null;
         const pg_tls_dep = if (f.postgres and f.needsTls()) b.lazyDependency("pg", .{ .target = target, .optimize = optimize, .tls = .injected }) else null;
@@ -1399,6 +1409,7 @@ const CModules = struct {
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
+        if (f.grpc and upb_dep == null) return null;
         if (f.redis and hiredis_dep == null) return null;
         if (f.auth and jwt_dep == null) return null;
         if (f.postgres and (pg_plain_dep == null or (f.needsTls() and pg_tls_dep == null))) return null;
@@ -1443,6 +1454,10 @@ const CModules = struct {
         if (yyjson_dep) |up| {
             const lib = yyjson_build.library(b, up, target, optimize);
             m.yyjson = yyjson_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
+        if (upb_dep) |up| {
+            const lib = upb_build.library(b, up, target, optimize);
+            m.upb = upb_build.module(b, Translator, tc_dep.?, lib, target, optimize);
         }
         if (zstd_dep) |up| {
             const lib = zstd_build.library(b, up, target, optimize);
@@ -1552,7 +1567,10 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         mod.addImport("anole_h2_client", o.core.h2Client(f));
     }
     if (f.websocket) mod.addImport("anole_websocket_codec", o.c.websocket.?);
-    if (f.grpc) mod.addImport("protobuf", o.c.protobuf.?);
+    if (f.grpc) {
+        mod.addImport("protobuf", o.c.protobuf.?);
+        mod.addImport("anole_upb_c", o.c.upb.?);
+    }
     if (f.json) mod.addImport("anole_yyjson_c", o.c.yyjson.?);
     if (f.redis) mod.addImport("anole_hiredis_c", o.c.hiredis.?);
     if (f.mongodb) mod.addImport("bson", o.bson.?);
