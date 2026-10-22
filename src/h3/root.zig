@@ -216,4 +216,5 @@ test {
     _ = @import("steer.zig");
     _ = @import("percore_test.zig");
     _ = @import("session_cache.zig");
+    _ = @import("quic_tls.zig");
 }

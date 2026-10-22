@@ -154,6 +154,48 @@ breaking changes are listed anyway.
   - `Client.dials` counts the connections a client opened. Breaking:
     `client.pool` is now `client.pool()` (the calling executor's pool).
 
+### HTTP/3
+
+Fixes from the QUIC interop runner's matrix (Anole's server against all
+15 client implementations).
+
+- Path validation after a NAT rebinding or a migration: both
+  PATH_CHALLENGE probes of a round now carry the same data (xuckless/ngtcp2
+  patch). Clients that answer only the latest challenge on a path (quinn,
+  picoquic, s2n-quic) answered the second probe only; validation still
+  succeeded, but observers that check the first challenge (the interop
+  runner's rebind-port and rebind-addr cases) did not see it answered.
+- The flush no longer holds (up to 1 ms, for the answers of the requests
+  a batch started) when the batch carried 0-RTT requests or completed the
+  handshake: the server's handshake flight, the ACK of the client's 0-RTT
+  packets and HANDSHAKE_DONE go out at once.
+- After a NAT rebinding, the first packet to the client's new address is
+  now always the PATH_CHALLENGE (xuckless/ngtcp2 patch): while pacing held
+  data back, an ACK the client's packets called for went out to the new
+  address first.
+- A NAT rebinding during the handshake: the server now follows the
+  client to its new address once a packet from there authenticates and is
+  new (xuckless/ngtcp2 patch), instead of sending to the old address while
+  ignoring the new one until the handshake timed out. On Linux, with one
+  UDP socket per core, a client's Initial and 0-RTT packets are now
+  steered by the first byte of the connection ID the client chose, not by
+  its address and port, so its packets from a new port reach the
+  endpoint that holds its connection rather than starting a second one.
+- A client whose first Initial reached the server without the start of
+  its ClientHello got a Retry, and if it resent its whole ClientHello
+  before that Retry arrived, the resent copy started a second connection
+  beside the one the Retry led to. Such an Initial now gets a Retry again
+  (the endpoint remembers its last 64 Retries for 10 s).
+  `h3.Stats.retries` counts the Retries sent.
+- `Http3.prefer_v2` (default true, as before): false keeps clients that
+  offer QUIC v2 beside v1 on v1. The interop server now moves clients to
+  v2 only in the runner's v2 case.
+- The h3 client: `ConnectOptions.quic_v2` offers QUIC v2 beside v1, and
+  `ClientConnection.quicVersion()` reports the version in use.
+- Interop runner endpoint only (`hq_interop_root`): the server takes
+  "hq-interop" or "h3" in the order the client lists them (msquic offers
+  hq-interop first and speaks HTTP/0.9).
+
 ## 0.1.1 (2026-10-22)
 
 ### Security

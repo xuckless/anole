@@ -79,8 +79,28 @@ const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 const hold_ns = std.time.ns_per_ms;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
-/// QUIC v2 first when the client offers both.
-const preferred_versions = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
+/// Retries an endpoint remembers (`Endpoint.retried`), and for how long:
+/// as long as a Retry's token is good.
+const retried_len = 64;
+const retried_ttl = 10 * std.time.ns_per_s;
+
+/// A Retry sent for a client's first flight (`Endpoint.retried`).
+const Retried = struct {
+    /// The client's original destination ID; `at` 0 for an empty slot.
+    dcid: net.CidKey = .{ .len = 0, .bytes = @splat(0) },
+    remote: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
+    at: u64 = 0,
+};
+/// The versions a connection may end up on, in order of preference
+/// (`Options.prefer_v2`): RFC 9368's compatible version negotiation moves
+/// a client that started in one to the first of these it also lists.
+const versions_v2_first = [_]u32{ c.NGTCP2_PROTO_VER_V2, c.NGTCP2_PROTO_VER_V1 };
+const versions_v1_first = [_]u32{ c.NGTCP2_PROTO_VER_V1, c.NGTCP2_PROTO_VER_V2 };
+
+/// The versions in `options`' order of preference.
+fn preferredVersions(options: *const Options) []const u32 {
+    return if (options.prefer_v2) &versions_v2_first else &versions_v1_first;
+}
 
 /// An `Endpoint`'s settings (`anole.h3.EndpointOptions`). A server sets
 /// them from `ServerOptions.Http3` and its TLS listener.
@@ -121,6 +141,10 @@ pub const Options = struct {
     /// `init` refuses it (`error.HqInteropNotAllowed`) unless the program's
     /// root file declares `pub const anole_hq_interop = true;`.
     hq_interop_root: ?[]const u8 = null,
+    /// Move a client that offers QUIC v2 (RFC 9369) beside v1 to v2,
+    /// through compatible version negotiation (RFC 9368). False keeps such
+    /// a client on v1, unless it starts in v2. Either way both are spoken.
+    prefer_v2: bool = true,
     /// Mutual TLS: ask for client certificates and verify them, as the TCP
     /// listener does. Handlers read the certificate with
     /// `Request.peerCertificate`.
@@ -269,6 +293,10 @@ pub const Stats = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Connections accepted.
     accepted: std.atomic.Value(u64) = .init(0),
+    /// Retry packets sent: to validate an address (`validate_address`),
+    /// for a ClientHello whose start was missing, and again to a client
+    /// that has not yet acted on one (`Endpoint.retried`).
+    retries: std.atomic.Value(u64) = .init(0),
     /// Packets handled on another thread than the endpoint's own: always
     /// zero; counted in test builds only.
     foreign: std.atomic.Value(u64) = .init(0),
@@ -345,6 +373,18 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
+        /// The latest Retries sent because a client's first Initial
+        /// arrived without the start of its ClientHello (ngtcp2 then wants
+        /// a Retry rather than keep the rest unvalidated): until the client
+        /// acts on the Retry, it may resend its whole ClientHello without a
+        /// token, which would otherwise start a second connection beside
+        /// the one the Retry leads to (neqo, whose ClientHello leads with
+        /// a later piece, in the runner's handshakecorruption case). Such
+        /// an Initial gets a Retry again. A ring: under a flood, older
+        /// entries are overwritten, and their clients merely get the
+        /// second connection. Only the endpoint task touches it.
+        retried: [retried_len]Retried = @splat(.{}),
+        retried_next: usize = 0,
         /// The listener requests report (address, `secure`).
         listener: dusty.Listener,
         /// Requests that came in 0-RTT: run before the handshake completed
@@ -1155,6 +1195,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
             }
 
+            if (hd.tokenlen == 0 and self.wasRetried(&hd.dcid, remote.ip())) {
+                // Its ClientHello again, sent before our Retry reached it.
+                return self.sendRetry(&hd, remote, local, data.len * 3);
+            }
+
             const conn = Conn.create(self, remote, local, &hd, pocid, token_type) catch |err| {
                 log.debug("new connection: {t}", .{err});
                 return;
@@ -1166,7 +1211,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             const rv = ngtcp2.connReadPkt(conn.q, &conn.path(), &pi, data, now(self.io));
             if (rv != 0) {
                 conn.unlock();
-                if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, local, data.len * 3);
+                if (rv == c.NGTCP2_ERR_RETRY) {
+                    self.rememberRetry(&hd.dcid, remote.ip());
+                    self.sendRetry(&hd, remote, local, data.len * 3);
+                }
                 self.giveUp(conn);
                 return;
             }
@@ -1212,6 +1260,22 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (n > 0) self.send(to, from, buf[0..@intCast(n)]);
         }
 
+        fn rememberRetry(self: *Self, dcid: *const c.ngtcp2_cid, remote: std.Io.net.IpAddress) void {
+            self.retried[self.retried_next] = .{ .dcid = .ofCid(dcid), .remote = remote, .at = @max(now(self.io), 1) };
+            self.retried_next = (self.retried_next + 1) % retried_len;
+        }
+
+        /// Whether `rememberRetry` saw this client's first flight lately.
+        fn wasRetried(self: *Self, dcid: *const c.ngtcp2_cid, remote: std.Io.net.IpAddress) bool {
+            const key: net.CidKey = .ofCid(dcid);
+            const t = now(self.io);
+            for (&self.retried) |*r| {
+                if (r.at == 0 or t -| r.at > retried_ttl) continue;
+                if (r.dcid.len == key.len and std.mem.eql(u8, r.dcid.bytes[0..r.dcid.len], key.bytes[0..key.len]) and r.remote.eql(&remote)) return true;
+            }
+            return false;
+        }
+
         fn sendRetry(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote_in: Addr, from: ?std.Io.net.IpAddress, max_len: usize) void {
             var remote = remote_in;
             var scid: c.ngtcp2_cid = undefined;
@@ -1223,7 +1287,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (token_len < 0) return;
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
             const n = c.ngtcp2_crypto_write_retry(&buf, @min(buf.len, max_len), chd.version, &chd.scid, &scid, &chd.dcid, &token, @intCast(token_len));
-            if (n > 0) self.send(remote.ip(), from, buf[0..@intCast(n)]);
+            if (n <= 0) return;
+            _ = self.stats.retries.fetchAdd(1, .monotonic);
+            self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
         fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr, from: ?std.Io.net.IpAddress) void {
@@ -1321,6 +1387,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Requests of the latest round whose handlers have yet to
             /// answer or wait: the flush holds for them (`hold_ns`).
             holding: std.atomic.Value(u32) = .init(0),
+            /// The latest round carried 0-RTT requests or completed the
+            /// handshake: its flush does not hold. A client that sent 0-RTT
+            /// sees its data acknowledged, and its handshake finished, in
+            /// the very next flight, not a hold later: clients whose RTT
+            /// guess is still tiny otherwise count that data lost and send
+            /// it again in 1-RTT.
+            hold_off: std.atomic.Value(bool) = .init(false),
             drain: enum { none, notice, final } = .none,
             /// The connection speaks "hq-interop", not HTTP/3.
             hq: bool = false,
@@ -1358,10 +1431,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.token_type = token_type;
                 settings.rand_ctx = .{ .native_handle = conn };
                 settings.max_window = 6 * ep.options.max_data;
-                // QUIC v2 (RFC 9369) when the client offers it, through
-                // compatible version negotiation; v1 otherwise.
-                settings.preferred_versions = &preferred_versions;
-                settings.preferred_versionslen = preferred_versions.len;
+                // QUIC v2 (RFC 9369) when the client offers it and
+                // `prefer_v2` is on, through compatible version
+                // negotiation; v1 otherwise.
+                const versions = preferredVersions(&ep.options);
+                settings.preferred_versions = versions.ptr;
+                settings.preferred_versionslen = versions.len;
                 settings.max_stream_window = 6 * ep.options.max_stream_data;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
@@ -1535,6 +1610,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.round_ts = ts;
                     _ = conn.round.fetchAdd(1, .monotonic);
                     conn.holding.store(0, .monotonic);
+                    conn.hold_off.store(false, .monotonic);
                     conn.hold_until = ts + hold_ns;
                 }
                 var r = remote;
@@ -1589,7 +1665,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         if (conn.wake_pending.swap(false, .monotonic)) conn.wakeStreams();
                         conn.unlock();
                     }
-                    if (conn.holding.load(.monotonic) > 0 and now(io) < conn.hold_until) {
+                    if (conn.holding.load(.monotonic) > 0 and !conn.hold_off.load(.monotonic) and now(io) < conn.hold_until) {
                         // Requests of the latest batch are still on their
                         // way to an answer: their packets, and the ACK
                         // that would otherwise leave alone, wait a little
@@ -1997,6 +2073,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 stream.round = conn.round.load(.monotonic);
                 stream.holds = true;
                 _ = conn.holding.fetchAdd(1, .monotonic);
+                // 0-RTT: the handshake's flight and the ACK go at once.
+                if (!conn.handshakeDone()) conn.hold_off.store(true, .monotonic);
                 _ = conn.tasks.fetchAdd(1, .acq_rel);
                 placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
                     _ = conn.tasks.fetchSub(1, .acq_rel);
@@ -3018,6 +3096,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             const p = c.ngtcp2_conn_get_path2(conn.q);
             const n = c.ngtcp2_crypto_generate_regular_token(&token, &conn.ep.secret, conn.ep.secret.len, p.*.remote.addr, p.*.remote.addrlen, wallClock(conn.ep.io));
             if (n > 0) _ = c.ngtcp2_conn_submit_new_token(conn.q, &token, @intCast(n));
+            // HANDSHAKE_DONE and the ACK of the client's Finished go in the
+            // next flight, not after the requests of this round.
+            conn.hold_off.store(true, .monotonic);
             if (conn.ep.options.early_data and c.SSL_session_reused(conn.ssl) != 0)
                 log.debug("resumed; 0-RTT: {s}", .{quic_tls.earlyDataReason(conn.ssl)});
             // Requests held for the handshake may go on.
