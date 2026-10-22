@@ -237,7 +237,9 @@ pub const Options = struct {
         /// handshake completes, which a replayed flight never does.
         early_data: bool = false,
         /// QUIC interop runner tests only: also speak "hq-interop"
-        /// (HTTP/0.9), serving the files under this directory.
+        /// (HTTP/0.9), serving the files under this directory. Refused
+        /// (`error.HqInteropNotAllowed`) unless the program's root file
+        /// declares `pub const anole_hq_interop = true;`.
         hq_interop_root: ?[]const u8 = null,
         /// UDP sockets on Linux, each served on an executor of its own,
         /// with the kernel steering each connection's datagrams to its

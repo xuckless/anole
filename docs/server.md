@@ -578,7 +578,9 @@ same for it, and `http3` holds the settings; one HTTP/3 port per server.
 [Cores](#cores)), `enable_connect_protocol` (true: extended CONNECT, for RFC 9220
 WebSockets) and `webtransport` (false; `app.webtransport` turns it on). With `validate_address`, every new client must prove its address
 with a Retry first, which costs a round trip and resists floods from
-spoofed sources. `hq_interop_root` is for the QUIC interop runner only.
+spoofed sources. `hq_interop_root` is for the QUIC interop runner only: `init` refuses it
+with `error.HqInteropNotAllowed` unless the program's root file declares
+`pub const anole_hq_interop = true;`.
 
 Supported: QUIC v1 and v2, Retry, stateless reset, ECN, session resumption,
 0-RTT (opt-in, below), connection migration and NAT rebinding, key update,

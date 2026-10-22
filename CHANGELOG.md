@@ -5,6 +5,44 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+### Security
+
+- HTTP/3: long-header packets whose connection ID is longer than QUIC
+  allows (20 bytes), and Version Negotiation packets sent to the server,
+  are dropped before any lookup. Previously one such datagram could crash
+  the process. Every deployment with HTTP/3 on should upgrade; no
+  configuration change is needed.
+- HTTP/3 server: the request head's size (64 KiB, as advertised in
+  SETTINGS) and field count (`request.max_header_count`) are enforced as
+  the fields arrive; a larger head is answered 431. Before, the whole head
+  was kept in memory however large it was.
+- HTTP/3 client: response heads and trailers are limited to the new
+  `ConnectOptions.max_field_section_size` (64 KiB by default, also sent to
+  the server); a server that sends more fails the connection.
+- HTTP/3 server: cookie fields sent separately are joined with "; " and
+  other repeated request fields are all kept, as over HTTP/1.1. Before,
+  only the last of each was kept, which could drop or shadow a session
+  cookie.
+- WebTransport: a peer's stream that is reset before it names its session
+  is now freed. A peer's streams now hold its stream credit until the
+  handler releases them (before, credit came back as soon as a stream
+  ended, even if it was never accepted), and at most 100 streams each way
+  wait to be accepted per session. A peer that opens streams a handler
+  does not accept now waits for credit instead of growing server memory.
+- HTTP/3 server: a new connection that is given up right after its first
+  datagram (for example because that datagram also carried an error) no
+  longer frees state that a 0-RTT request started from the same datagram
+  still uses. Only servers with `early_data` on were affected.
+- HTTP/3 server: a request the client resets now keeps counting against
+  `max_streams_bidi` until its handler returns. Before, its stream credit
+  came back at once, so handlers of reset requests could pile up past the
+  limit (the HTTP/3 form of HTTP/2's "rapid reset").
+- HTTP/3: `http3.hq_interop_root` (the QUIC interop runner's HTTP/0.9 file
+  server, which bypasses the router and middleware) is refused with
+  `error.HqInteropNotAllowed` unless the program's root file declares
+  `pub const anole_hq_interop = true;`. Breaking only for programs that
+  set it.
+
 ### C ABI (ABI 0.1)
 
 - `libanole`, Anole as a C library for the language bindings

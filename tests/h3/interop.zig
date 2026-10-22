@@ -8,6 +8,9 @@ const std = @import("std");
 const anole = @import("anole");
 
 pub const zio_options = anole.zio_options;
+/// Lets `http3.hq_interop_root` through: this program is the interop
+/// runner's endpoint, never a production server.
+pub const anole_hq_interop = true;
 pub const std_options: std.Options = .{
     .logFn = anole.logFn,
     .log_level = .info,
