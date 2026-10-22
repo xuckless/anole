@@ -467,6 +467,9 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
+    // compile-tests: build the test binaries without running them.
+    const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
+    compile_tests_step.dependOn(&tests.step);
 
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
@@ -546,6 +549,7 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         const run_core_tests = b.addRunArtifact(core_tests);
+        compile_tests_step.dependOn(&core_tests.step);
         // The TLS tests open certs/cert.pem and certs/key.pem from where
         // they run: a certificate made now by tests/test_cert.zig, so no
         // key is committed.

@@ -1256,7 +1256,7 @@ pub const Response = struct {
     /// If the template fails, what it wrote is discarded, so the handler can
     /// still send something else.
     pub fn render(self: *Response, content_type: ?http.ContentType, comptime template: anytype, args: RenderArgs(template)) !void {
-        var w = self.writer();
+        var w = try self.writer();
         const result = if (@TypeOf(template) == type)
             template.render(args, &w.interface)
         else
@@ -1276,7 +1276,7 @@ pub const Response = struct {
     /// still send something else.
     pub fn encode(self: *Response, content_type: ?http.ContentType, comptime encodeFn: anytype, value: anytype) !void {
         const params = comptime encodeParams(@TypeOf(encodeFn));
-        var w = self.writer();
+        var w = try self.writer();
         // Built in place rather than field by field, so a value known only
         // at compile time, such as a struct literal, can be passed.
         const result = switch (params.len) {
@@ -1349,7 +1349,7 @@ pub const Response = struct {
     /// Formats the body, sent as `content_type`, or as whatever the
     /// response already has when it is null.
     pub fn print(self: *Response, content_type: ?http.ContentType, comptime fmt: []const u8, args: anytype) BodyWriter.Error!void {
-        var w = self.writer();
+        var w = try self.writer();
         w.interface.print(fmt, args) catch {
             w.end() catch |err| {
                 self.clearWriter();
