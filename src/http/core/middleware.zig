@@ -229,7 +229,9 @@ pub const ErrorAnswer = struct { status: http.Status, body: []const u8 };
 /// - The request faults this server's own helpers return: `BodyTooBig`
 ///   (413), `UnsupportedContentEncoding` (415), `InvalidJsonBody`,
 ///   `MissingBody`, `InvalidZstd`, `IncompleteBody` and `MalformedBody`
-///   (a request body whose framing or coding is broken) (400).
+///   (a request body whose framing or coding is broken) (400), and
+///   `BadPathName` (404): the path `Response.sendFile` refuses because it
+///   would leave its directory, as a static route answers it.
 ///
 /// Any other error is the server's: a `SyntaxError` from parsing something
 /// other than the request body is a 500, not a 400.
@@ -238,6 +240,7 @@ pub fn errorStatus(err: anyerror) ?http.Status {
         error.BodyTooBig => .payload_too_large,
         error.UnsupportedContentEncoding => .unsupported_media_type,
         error.InvalidZstd, error.IncompleteBody, error.MalformedBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
+        error.BadPathName => .not_found,
         else => status_errors.get(@errorName(err)),
     };
 }
@@ -329,6 +332,7 @@ test "errorStatus: status-named errors, body faults, and nothing else" {
     try std.testing.expectEqual(http.Status.unsupported_media_type, errorStatus(error.UnsupportedContentEncoding).?);
     try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.InvalidJsonBody).?);
     try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.MissingBody).?);
+    try std.testing.expectEqual(http.Status.not_found, errorStatus(error.BadPathName).?);
     try std.testing.expectEqual(http.Status.unauthorized, errorStatus(error.Unauthorized).?);
     try std.testing.expectEqual(http.Status.forbidden, errorStatus(error.Forbidden).?);
     try std.testing.expectEqual(http.Status.not_found, errorStatus(error.NotFound).?);

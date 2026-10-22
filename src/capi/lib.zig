@@ -231,6 +231,12 @@ export fn anole_server_start(s: ?*anyopaque) i32 {
     }
     e.start() catch |err| return switch (err) {
         error.State => fail(abi.E_STATE, "anole_server_start", err),
+        // Two routes of the configuration (or one and a route Anole adds,
+        // such as metrics) that the router cannot tell apart.
+        error.RouteConflict => blk: {
+            setError("routes: {s}", .{e.start_why[0..e.start_why_len]});
+            break :blk abi.E_CONFIG;
+        },
         error.OutOfMemory => fail(abi.E_NOMEM, "anole_server_start", err),
         else => fail(abi.E_SYSTEM, "anole_server_start", err),
     };
@@ -535,9 +541,9 @@ export fn anole_wt_open_stream(w: u64, flags: u32, out: ?*u64) i32 {
 export fn anole_wt_stream_write(st: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
     if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
     const e = live() orelse return failCode(abi.E_GONE);
-    if (flags & ~abi.WT_FIN != 0) return failCode(abi.E_INVALID);
+    if (flags & ~(abi.BODY_BORROW | abi.WT_FIN) != 0) return failCode(abi.E_INVALID);
     const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
-    const busy = engine.wt.write(e, st, b, flags & abi.WT_FIN != 0) catch |err| return answer(err);
+    const busy = engine.wt.write(e, st, b, flags & abi.WT_FIN != 0, flags & abi.BODY_BORROW != 0) catch |err| return answer(err);
     return if (busy) abi.BUSY else abi.OK;
 }
 

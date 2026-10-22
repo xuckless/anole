@@ -79,6 +79,7 @@ fn Table(comptime T: type) type {
                 const c = try gpa.create(Chunk);
                 const base = t.nchunks * chunk_len;
                 for (c, 0..) |*s, j| s.* = .{
+                    .word = .init(pack(x.engine.first_gen, .free)),
                     .exec = x,
                     .index = @intCast(base + j),
                     .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
@@ -97,6 +98,14 @@ fn Table(comptime T: type) type {
             defer t.lock.unlock();
             s.next_free = t.free_head;
             t.free_head = s.index;
+        }
+
+        fn maxGen(t: *const Self) u32 {
+            var max: u32 = 0;
+            for (t.chunks[0..t.nchunks]) |*cv| {
+                for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
+            }
+            return max;
         }
 
         fn deinit(t: *Self) void {
@@ -170,6 +179,10 @@ pub const SessionSlot = struct {
     }
 };
 
+/// A consumer's memory passed with `ANOLE_BODY_BORROW`, and the handle it
+/// was passed with (`ANOLE_EV_SENT` names it).
+const Borrowed = struct { handle: u64, data: []const u8 };
+
 pub const StreamSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     lock: std.atomic.Mutex = .unlocked,
@@ -192,6 +205,9 @@ pub const StreamSlot = struct {
     /// The sending side is over (stopped by the peer, reset, the session
     /// gone): writes are refused.
     send_over: bool = false,
+    /// Writes made with `ANOLE_BODY_BORROW`: copied into `out` already,
+    /// owed an `ANOLE_EV_SENT` (posted by the executor, `postBorrowed`).
+    borrowed: std.ArrayList(Borrowed) = .empty,
 
     // Executor-local from here.
     stream: ?*Stream = null,
@@ -218,6 +234,29 @@ pub const StreamSlot = struct {
     fn clear(s: *StreamSlot) void {
         s.out.deinit(gpa);
         s.sending.deinit(gpa);
+        s.borrowed.deinit(gpa);
+    }
+
+    /// `ANOLE_EV_SENT` for the borrowed writes taken so far (they were
+    /// copied when taken). On the executor; before the slot is freed, so
+    /// none is lost.
+    fn postBorrowed(s: *StreamSlot) void {
+        spin(&s.lock);
+        if (s.borrowed.items.len == 0) {
+            s.lock.unlock();
+            return;
+        }
+        var list = s.borrowed;
+        s.borrowed = .empty;
+        s.lock.unlock();
+        defer list.deinit(gpa);
+        for (list.items) |b| s.exec.postSent(b.handle, b.data);
+    }
+
+    /// Frees the slot (`ANOLE_EV_SENT` first for what it borrowed).
+    fn free(s: *StreamSlot) void {
+        s.postBorrowed();
+        s.exec.wt.streams.free(s);
     }
 
     /// Takes the slot for a stream of `session`; the caller makes it open.
@@ -244,6 +283,11 @@ pub const StreamSlot = struct {
 pub const ExecState = struct {
     sessions: Table(SessionSlot) = .{},
     streams: Table(StreamSlot) = .{},
+
+    /// The highest generation of any slot (`Engine.destroy`).
+    pub fn maxGen(st: *const ExecState) u32 {
+        return @max(st.sessions.maxGen(), st.streams.maxGen());
+    }
 
     pub fn deinit(st: *ExecState) void {
         st.sessions.deinit();
@@ -444,7 +488,7 @@ fn adopt(s: *SessionSlot, g: u32, stream: *Stream, dir: @FieldType(StreamSlot, "
     st.reset(s, dir);
     st.stream = stream;
     s.streams.append(gpa, st) catch {
-        x.wt.streams.free(st);
+        st.free();
         return stream.release();
     };
     const sg = st.gen();
@@ -462,6 +506,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
     const x = s.exec;
     const sg = st.gen();
     const h = st.handle(sg);
+    st.postBorrowed();
 
     // Not opened yet (the peer's limit): try again.
     if (st.stream == null) {
@@ -470,7 +515,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         const drop = st.released and !st.fin;
         st.lock.unlock();
         if (drop) {
-            x.wt.streams.free(st);
+            st.free();
             return false;
         }
         const stream = session.tryOpen(if (st.dir == .bidi) .bidi else .uni) catch {
@@ -501,7 +546,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
     if (released and (st.send_done or !fin)) {
         stream.release();
         st.stream = null;
-        x.wt.streams.free(st);
+        st.free();
         progress.* = true;
         return false;
     }
@@ -563,7 +608,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         if (st.send_done) {
             stream.release();
             st.stream = null;
-            x.wt.streams.free(st);
+            st.free();
             progress.* = true;
             return false;
         }
@@ -614,11 +659,10 @@ fn dropOutput(st: *StreamSlot, h: u64) void {
 
 /// A stream slot of a session that is gone, never opened.
 fn abandon(st: *StreamSlot) void {
-    const x = st.exec;
     spin(&st.lock);
     st.word.store(pack(engine.nextGen(st.gen()), .free), .release);
     st.lock.unlock();
-    x.wt.streams.free(st);
+    st.free();
 }
 
 /// The session is over: its handles go stale, ANOLE_EV_WT_CLOSE.
@@ -646,7 +690,7 @@ fn finish(s: *SessionSlot, g: u32, session: *Session) void {
         // Session.deinit lets go of every stream the session had.
         st.stream = null;
         st.sending.clearRetainingCapacity();
-        x.wt.streams.free(st);
+        st.free();
     }
     s.streams.clearRetainingCapacity();
     s.session = null;
@@ -703,6 +747,7 @@ pub fn openStream(e: *Engine, hv: u64, uni: bool) engine.AnswerError!u64 {
     st.reset(s, if (uni) .uni_out else .bidi);
     s.opens.append(gpa, st) catch {
         s.lock.unlock();
+        // A consumer thread: nothing was written to it, so no SENT is owed.
         x.wt.streams.free(st);
         return error.OutOfMemory;
     };
@@ -714,8 +759,11 @@ pub fn openStream(e: *Engine, hv: u64, uni: bool) engine.AnswerError!u64 {
 }
 
 /// Queues `data` (and, with `fin`, the end after it); true when the
-/// stream is past its high-water mark (ANOLE_EV_WRITABLE follows).
-pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool) engine.AnswerError!bool {
+/// stream is past its high-water mark (ANOLE_EV_WRITABLE follows). The
+/// bytes are copied; with `borrow` (`ANOLE_BODY_BORROW`) the consumer also
+/// gets `ANOLE_EV_SENT` for them, as for every borrowing call, so one
+/// borrow rule holds everywhere.
+pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) engine.AnswerError!bool {
     const st, const g = streamOf(e, hv) orelse return e.gone();
     spin(&st.lock);
     if (!st.live(g)) {
@@ -730,10 +778,16 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool) engine.AnswerErro
         st.lock.unlock();
         return e.gone();
     }
+    // Room for the SENT first: a write that fails takes nothing.
+    if (borrow) st.borrowed.ensureUnusedCapacity(gpa, 1) catch {
+        st.lock.unlock();
+        return error.OutOfMemory;
+    };
     st.out.appendSlice(gpa, data) catch {
         st.lock.unlock();
         return error.OutOfMemory;
     };
+    if (borrow) st.borrowed.appendAssumeCapacity(.{ .handle = hv, .data = data });
     st.bytes += data.len;
     if (fin) st.fin = true;
     const busy = st.bytes > e.stream_high_water;

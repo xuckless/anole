@@ -706,6 +706,63 @@ static void test_basics(void) {
   printf("ok basics\n");
 }
 
+/* Route tables come from user code in bindings (app.get calls collected into
+   the JSON), so a conflict is a user mistake: ANOLE_E_CONFIG naming the
+   routes, never a panic that takes the host process with it. */
+static void test_route_conflicts(void) {
+#define LISTEN "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],"
+#define OK200 "\"respond\":{\"status\":200}"
+  static const struct {
+    const char *json, *names;
+  } cases[] = {
+      /* the same route twice */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/\"," OK200 "},{\"method\":\"GET\",\"path\":\"/\"," OK200 "}]}",
+       "GET /"},
+      /* one parameter position, two names */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/users/:id\"," OK200
+              "},{\"method\":\"GET\",\"path\":\"/users/:name/posts\"," OK200 "}]}",
+       "/users/:name/posts"},
+      /* a method route less specific than an any-method one */
+      {LISTEN "\"routes\":[{\"path\":\"/a/b\"," OK200 "},{\"method\":\"GET\",\"path\":\"/a/:x\"," OK200 "}]}", "/a/:x"},
+      /* a consumer route on a static prefix's own path */
+      {LISTEN "\"routes\":[{\"path\":\"/assets\",\"static\":{\"dir\":\".\"}},"
+              "{\"method\":\"GET\",\"path\":\"/assets/*rest\",\"handler\":1}]}",
+       "/assets/*rest"},
+      /* a route on the metrics path, which Anole adds while starting */
+      {LISTEN "\"observe\":{\"metrics\":{}},\"routes\":[{\"method\":\"GET\",\"path\":\"/metrics\"," OK200 "}]}",
+       "/metrics"},
+  };
+#undef LISTEN
+#undef OK200
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+    anole_server_options o = {sizeof o, {cases[i].json, strlen(cases[i].json)}, 0, 0, NULL, NULL};
+    anole_server *s = NULL;
+    int rc = anole_server_create(&o, &s);
+    if (rc == ANOLE_OK) {
+      anole_consumer *c = NULL;
+      anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+      CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+      rc = anole_server_start(s);
+    }
+    anole_str why = anole_last_error();
+    if (rc != ANOLE_E_CONFIG) fprintf(stderr, "route conflict case %zu: %d\n", i, rc);
+    CHECK(rc == ANOLE_E_CONFIG);
+    /* the message names the route */
+    CHECK(why.len > 0 && memmem(why.ptr, why.len, cases[i].names, strlen(cases[i].names)) != NULL);
+    anole_server_destroy(s);
+  }
+  /* and a server without conflicts still starts after them */
+  const char *fine = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"routes\":[{\"method\":\"GET\","
+                     "\"path\":\"/users/:id\",\"respond\":{\"status\":200}},{\"method\":\"GET\",\"path\":"
+                     "\"/users/:id/posts\",\"respond\":{\"status\":200}}]}";
+  anole_server *s = make_server(fine);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok route conflicts: ANOLE_E_CONFIG naming the routes, no panic\n");
+}
+
 static void test_main_server(void) {
   char json[4096];
   snprintf(json, sizeof json, test_config, 4, 128 * 1024, 64, 400, 600, have_websocket ? ws_route : "");
@@ -1079,6 +1136,69 @@ static void test_main_server(void) {
   current_server = NULL;
 }
 
+/* Polls `c` until a request arrives; its handle. */
+static anole_req next_request(anole_consumer *c) {
+  static _Alignas(8) unsigned char buf[64 * 1024];
+  for (int i = 0; i < 100; i++) {
+    int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      if (ev->type == ANOLE_EV_REQUEST) return ev->handle;
+      off += ev->len;
+    }
+  }
+  CHECK(!"no request arrived");
+  return 0;
+}
+
+/* A handle from a destroyed server is ANOLE_E_GONE on the next one, even
+   where the new server's request sits in the same slot (test suites create
+   and destroy a server per test; a late answer from one test must not land
+   on the next one's request). */
+static void test_stale_across_servers(void) {
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                     "\"timeouts\":{\"shutdown_ms\":200},"
+                     "\"routes\":[{\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1}]}";
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  anole_req old = 0;
+  for (int round = 0; round < 2; round++) {
+    anole_server *s = make_server(json);
+    anole_consumer *c = NULL;
+    CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+    CHECK(anole_server_start(s) == ANOLE_OK);
+    uint16_t port = 0;
+    CHECK(anole_server_port(s, 0, &port) == ANOLE_OK);
+    conn_reader cr = {0};
+    cr.fd = dial(port);
+    send_request(cr.fd, "GET", "/hold", NULL, 0);
+    anole_req h = next_request(c);
+    if (round == 0) {
+      /* Left unanswered: the drain cuts it. */
+      old = h;
+      CHECK(anole_server_drain(s) == ANOLE_OK);
+      CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+      anole_server_destroy(s);
+      close(cr.fd);
+      continue;
+    }
+    /* The old handle, as a late answer from the first server's test would
+       send it: refused, and the new request untouched. */
+    CHECK(anole_respond(old, 200, text_plain, 1, "old", 3, 0) == ANOLE_E_GONE);
+    CHECK(anole_respond(h, 200, text_plain, 1, "new", 3, 0) == ANOLE_OK);
+    response r;
+    response_init(&r);
+    read_response(&cr, &r, 0);
+    CHECK(r.status == 200 && strcmp(r.body, "new") == 0);
+    response_free(&r);
+    close(cr.fd);
+    CHECK(anole_server_drain(s) == ANOLE_OK);
+    CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+    anole_server_destroy(s);
+  }
+  printf("ok stale handles across servers: ANOLE_E_GONE\n");
+}
+
 /* A second server: a shared consumer on anole_poll_wait threads, max_inflight
    503, and a drain that cuts a request waiting past shutdown_ms. */
 static void test_shared_consumer(void) {
@@ -1255,6 +1375,44 @@ static void test_db(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && r->changes == 2);
 
+  /* A call that leaves a transaction open (a bare BEGIN, a script that
+     fails before its COMMIT) is rolled back and refused: separate calls
+     share no connection, and SQLite's writer is every request's, so later
+     writes would join it. A whole transaction in one call still works. */
+  anole_str t2count = LIT("SELECT count(*) FROM t2");
+  static const struct {
+    const char *sql;
+    int ok;
+    int64_t count; /* rows in t2 after it, as a reader sees them */
+  } txs[] = {
+      {"BEGIN", 0, 2},
+      {"INSERT INTO t2 VALUES (3)", 1, 3},
+      {"BEGIN IMMEDIATE; INSERT INTO t2 VALUES (4); INSERT INTO nope VALUES (1); COMMIT;", 0, 3},
+      {"INSERT INTO t2 VALUES (4)", 1, 4},
+      {"BEGIN; INSERT INTO t2 VALUES (5); INSERT INTO t2 VALUES (6); COMMIT;", 1, 6},
+      {"SAVEPOINT a", 0, 6},
+      {"INSERT INTO t2 VALUES (7)", 1, 7},
+  };
+  for (size_t i = 0; i < sizeof txs / sizeof *txs; i++) {
+    anole_str sql = {txs[i].sql, strlen(txs[i].sql)};
+    CHECK(anole_db_exec(db, c, sql, NULL, 0, NULL, 50 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    if (txs[i].ok) {
+      CHECK(r->status == ANOLE_OK);
+    } else {
+      CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
+    }
+    if (i == 0) {
+      anole_str why = anole_event_str(r, r->error);
+      CHECK(memmem(why.ptr, why.len, "transaction", 11) != NULL);
+    }
+    CHECK(anole_db_query(db, c, t2count, NULL, 0, NULL, 60 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    if (r->status != ANOLE_OK || db_cell(r, 0, 0)->v.i != txs[i].count)
+      fprintf(stderr, "after \"%s\": %lld rows\n", txs[i].sql, (long long)db_cell(r, 0, 0)->v.i);
+    CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == txs[i].count);
+  }
+
   /* the cache: a hit until invalidated */
   anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
   anole_str count = LIT("SELECT count(*) AS n FROM items");
@@ -1342,7 +1500,8 @@ static void test_db_postgres(void) {
            " \"limits\": {\"db_result_max\": 65536},"
            " \"databases\": [{\"name\": \"pg\", \"postgres\": {\"url\": \"%s\", \"max_connections\": 4,"
            "   \"init\": \"DROP TABLE IF EXISTS anole_capi_items; CREATE TABLE anole_capi_items (id bigserial PRIMARY KEY,"
-           " name text UNIQUE NOT NULL, qty int4, price numeric(8, 2), ok bool, data bytea, at timestamptz)\"}}]}",
+           " name text UNIQUE NOT NULL, qty int4, price numeric(8, 2), ok bool, data bytea, at timestamptz);"
+           " DROP TABLE IF EXISTS anole_capi_tx; CREATE TABLE anole_capi_tx (x int4)\"}}]}",
            url);
   anole_server *s = make_server(json);
   anole_db *db = NULL;
@@ -1401,6 +1560,43 @@ static void test_db_postgres(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
   CHECK(str_is(anole_event_str(r, r->error_code), "42601"));
+
+  /* A call that leaves a transaction open (a bare BEGIN) is rolled back and
+     refused: the connection went back to the pool closed, and the
+     statements meant for the transaction each committed on their own. A
+     whole transaction in one call (no parameters) still works. */
+  {
+    anole_str txcount = LIT("SELECT count(*) FROM anole_capi_tx");
+    static const struct {
+      const char *sql;
+      int ok;
+      int64_t count;
+    } txs[] = {
+        {"BEGIN", 0, 0},
+        {"INSERT INTO anole_capi_tx VALUES (1)", 1, 1},
+        {"START TRANSACTION ISOLATION LEVEL SERIALIZABLE", 0, 1},
+        {"BEGIN; INSERT INTO anole_capi_tx VALUES (2); INSERT INTO nope VALUES (1); COMMIT", 0, 1},
+        {"BEGIN; INSERT INTO anole_capi_tx VALUES (2); INSERT INTO anole_capi_tx VALUES (3); COMMIT", 1, 3},
+        {"INSERT INTO anole_capi_tx VALUES (4)", 1, 4},
+    };
+    for (size_t i = 0; i < sizeof txs / sizeof *txs; i++) {
+      anole_str sql = {txs[i].sql, strlen(txs[i].sql)};
+      CHECK(anole_db_exec(db, c, sql, NULL, 0, NULL, 50 + i) == ANOLE_OK);
+      r = db_next(c, rec, sizeof rec);
+      if (txs[i].ok != (r->status == ANOLE_OK)) {
+        anole_str why = anole_event_str(r, r->error);
+        fprintf(stderr, "\"%s\": status %d: %.*s\n", txs[i].sql, r->status, (int)why.len, why.ptr);
+      }
+      CHECK(txs[i].ok ? r->status == ANOLE_OK : r->status == ANOLE_E_DB);
+      if (i == 0) {
+        anole_str why = anole_event_str(r, r->error);
+        CHECK(r->error_class == ANOLE_DB_ERR_OTHER && memmem(why.ptr, why.len, "transaction", 11) != NULL);
+      }
+      CHECK(anole_db_query(db, c, txcount, NULL, 0, NULL, 60 + i) == ANOLE_OK);
+      r = db_next(c, rec, sizeof rec);
+      CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == txs[i].count);
+    }
+  }
   anole_str as_int = LIT("SELECT $1::int4");
   anole_db_value half = {ANOLE_DB_FLOAT, 0, {.f = 1.5}};
   CHECK(anole_db_query(db, c, as_int, &half, 1, NULL, 15) == ANOLE_OK);
@@ -1942,7 +2138,7 @@ typedef struct {
   wt_ent ents[32];
   anole_wt session;
   anole_wt_stream first_stream; /* for the stale check after the close */
-  int opened, closed, released, drains;
+  int opened, closed, released, drains, borrow_sent;
   uint32_t close_code, close_by;
   char reason[64];
 } wt_state;
@@ -1974,8 +2170,17 @@ static void wt_forget(wt_state *st, wt_ent *e) {
   st->released++;
 }
 
+/* Borrowed by a WebTransport write: static, as it must stay until
+   ANOLE_EV_SENT. */
+static const char wt_borrowed[] = "hello ";
+
 static void wt_event(wt_state *st, const anole_event *ev) {
   switch (ev->type) {
+  case ANOLE_EV_SENT: {
+    const anole_sent_event *se = (const anole_sent_event *)ev;
+    if (se->data == (uint64_t)(uintptr_t)wt_borrowed && se->len == 6) st->borrow_sent++;
+    break;
+  }
   case ANOLE_EV_WT_OPEN: {
     const anole_request_event *r = (const anole_request_event *)ev;
     CHECK(r->route_id == 5);
@@ -1985,7 +2190,12 @@ static void wt_event(wt_state *st, const anole_event *ev) {
     CHECK(anole_wt_max_datagram(ev->handle) > 0);
     anole_wt_stream u = 0;
     CHECK(anole_wt_open_stream(ev->handle, ANOLE_WT_UNI, &u) == ANOLE_OK && u != 0);
-    CHECK(anole_wt_stream_write(u, "hello from C", 12, ANOLE_WT_FIN) == ANOLE_OK);
+    /* Bit 0 is ANOLE_BODY_BORROW on every send-type call: a borrowed
+       write does not end the stream (ANOLE_EV_SENT follows); unknown flag
+       bits are refused. */
+    CHECK(anole_wt_stream_write(u, wt_borrowed, 6, ANOLE_BODY_BORROW) == ANOLE_OK);
+    CHECK(anole_wt_stream_write(u, "x", 1, 0x80) == ANOLE_E_INVALID);
+    CHECK(anole_wt_stream_write(u, "from C", 6, ANOLE_WT_FIN) == ANOLE_OK);
     /* Written with its end: still goes out whole after the release. */
     CHECK(anole_wt_stream_write(u, "more", 4, 0) == ANOLE_E_INVALID);
     CHECK(anole_wt_stream_release(u) == ANOLE_OK);
@@ -2110,6 +2320,7 @@ static void test_webtransport(void) {
   CHECK(st.opened == 1 && st.closed == 1);
   CHECK(st.close_code == 7 && st.close_by == ANOLE_WT_CLOSED_PEER && strcmp(st.reason, "done") == 0);
   CHECK(st.released >= 3);
+  CHECK(st.borrow_sent == 1);
   /* The session and its streams are stale after the close. */
   CHECK(anole_wt_close(st.session, 0, LIT("")) == ANOLE_E_GONE);
   CHECK(anole_wt_send_datagram(st.session, "x", 1) == ANOLE_E_GONE);
@@ -2201,7 +2412,9 @@ static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
   test_basics();
+  test_route_conflicts();
   test_main_server();
+  test_stale_across_servers();
   test_shared_consumer();
   test_db();
   test_db_postgres();

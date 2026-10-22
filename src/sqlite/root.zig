@@ -590,7 +590,7 @@ pub const Query = struct {
     /// writes) the writer.
     fn dispatch(q: Query, comptime op: Op, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Out(op, T) {
         const self = q.db;
-        const flags: Flags = .{ .prepare = q.options.prepare };
+        const flags: Flags = .{ .prepare = q.options.prepare, .plain = true };
         if (op != .exec and op != .run and !q.options.write and self.readers.conns.len > 0 and operation(sql).reads()) {
             const conn = try self.acquireReader(cx.io);
             var failure: Failure = .{};
@@ -1088,7 +1088,15 @@ const Flags = struct {
     reader: bool = false,
     /// A failure is not logged (a rollback that finds nothing to roll back).
     quiet: bool = false,
+    /// A call outside a transaction (`Client`'s, not a `Tx`'s): one that
+    /// leaves the connection inside a transaction is rolled back and fails.
+    plain: bool = false,
 };
+
+/// Why a plain call that left a transaction open failed.
+const left_open = "the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: " ++
+    "separate calls do not keep a connection, and the writer is shared by every request; " ++
+    "use begin() or transaction() (C ABI: one call with the whole transaction, until the transaction API)";
 
 /// What a job fails with. `Failed` carries a `Failure`, which the caller
 /// turns into `anole.db`'s error on its own task.
@@ -1102,6 +1110,20 @@ const PrepareError = error{ Failed, MultipleStatements, Canceled, OutOfMemory };
 fn statement(comptime op: Op, comptime T: type, comptime Args: type) fn (*Client, *Connection, std.mem.Allocator, []const u8, Args, Flags, *Failure) JobError!Out(op, T) {
     return struct {
         fn run(d: *Client, conn: *Connection, arena: std.mem.Allocator, sql: []const u8, args: Args, flags: Flags, f: *Failure) JobError!Out(op, T) {
+            const result = once(d, conn, arena, sql, args, flags, f);
+            // A plain call that left a transaction open (a bare BEGIN, a
+            // script that failed before its COMMIT): every later call on
+            // this connection would join it, from any request.
+            if (flags.plain and c.sqlite3_get_autocommit(conn.handle.db) == 0) {
+                _ = c.sqlite3_exec(conn.handle.db, "ROLLBACK", null, null, null);
+                // A failure of its own says more than that.
+                _ = result catch |err| return err;
+                return f.ours(.other, left_open, .{});
+            }
+            return result;
+        }
+
+        fn once(d: *Client, conn: *Connection, arena: std.mem.Allocator, sql: []const u8, args: Args, flags: Flags, f: *Failure) JobError!Out(op, T) {
             f.quiet = flags.quiet;
             const stmt = conn.prepare(d, sql, flags.prepare, f) catch |err| switch (err) {
                 error.MultipleStatements => {

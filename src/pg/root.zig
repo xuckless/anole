@@ -929,12 +929,31 @@ pub const Client = struct {
         }
     }
 
+    /// After a call outside a transaction (no `Tx`): a statement that left
+    /// the connection inside one (a bare `BEGIN`) is rolled back, and the
+    /// call fails. Given back as it was, the connection would be closed and
+    /// the statements meant for that transaction would each commit on
+    /// their own, on whatever connection they got.
+    fn leftOpen(self: *Client, ctx: *const Ctx, lease: Lease) Error!void {
+        const conn = lease.conn;
+        if (conn._state != .transaction) return;
+        conn.rollback() catch {
+            // Closed when it is given back, which ends the transaction too.
+            conn._state = .fail;
+        };
+        return ctx.failf(self.errors, .other, left_open, .{});
+    }
+
     fn canceled(_: *Client, ctx: *const Ctx, conn: *pg.Conn, tx: ?*Tx) Error {
         stopBackend(ctx.io, conn);
         if (tx) |t| t.state = .broken;
         return error.Canceled;
     }
 };
+
+/// Why a call outside a transaction that left one open failed.
+const left_open = "the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: " ++
+    "separate calls do not keep a connection; use begin() or transaction() (C ABI: one call with the whole transaction, until the transaction API)";
 
 /// Asks the server to stop what `conn` runs (CancelRequest on a
 /// connection of its own), within a second, whatever cancels the caller:
@@ -1275,6 +1294,7 @@ fn Exec(comptime Args: type) type {
             const lease = if (tx) |t| t.lease else try d.take(ctx);
             defer if (tx == null) d.give(lease);
             const n = lease.conn.execOpts(sql, params(job.args), .{ .statement_cache = job.prepare }) catch |err| return d.failed(ctx, lease, err, tx);
+            if (tx == null) try d.leftOpen(ctx, lease);
             return @intCast(@max(n orelse 0, 0));
         }
     };
@@ -1290,6 +1310,7 @@ const RunJob = struct {
         const lease = if (tx) |t| t.lease else try d.take(ctx);
         defer if (tx == null) d.give(lease);
         const n = lease.conn.execOpts(sql, job.values, .{ .statement_cache = job.prepare }) catch |err| return d.failed(ctx, lease, err, tx);
+        if (tx == null) try d.leftOpen(ctx, lease);
         return .{ .changes = @intCast(@max(n orelse 0, 0)) };
     }
 };
@@ -1309,7 +1330,7 @@ const TableJob = struct {
             .text_results = true,
         }) catch |err| return d.failed(ctx, lease, err, tx);
         defer result.deinit();
-        return readTable(d, ctx, lease, tx, result) catch |err| {
+        const table = readTable(d, ctx, lease, tx, result) catch |err| {
             // The rest of the rows are still to come: read past them, so
             // the connection can be used again.
             if (lease.conn._state == .query) result.drain() catch |e| {
@@ -1318,6 +1339,8 @@ const TableJob = struct {
             };
             return err;
         };
+        if (tx == null) try d.leftOpen(ctx, lease);
+        return table;
     }
 
     fn readTable(d: *Client, ctx: *Ctx, lease: Lease, tx: ?*Tx, result: *pg.Result) Error!db.Table {
@@ -1399,11 +1422,13 @@ fn Fetch(comptime T: type, comptime mode: Mode, comptime Args: type) type {
                 .all => {
                     var list: std.ArrayList(T) = .empty;
                     while (try rows.next()) |row| try list.append(ctx.arena, row);
+                    if (tx == null) try d.leftOpen(ctx, lease);
                     return list.items;
                 },
                 .one, .optional => {
                     const first = try rows.next();
                     rows.finish();
+                    if (tx == null) try d.leftOpen(ctx, lease);
                     if (mode == .one) return first orelse error.NotFound;
                     return first;
                 },
