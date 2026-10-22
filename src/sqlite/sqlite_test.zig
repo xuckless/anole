@@ -926,3 +926,123 @@ test "sqlite: app.sqlite, served: 201, 409 on a duplicate, 404 on none; metrics 
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
+
+test "sqlite: iterate over a bare BEGIN fails left-open and rolls back" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+    var rows = try db.with(.{ .write = true }).iterate(void, ctx, "BEGIN", .{});
+    defer rows.deinit();
+    try testing.expectError(error.Database, rows.next());
+    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "left a transaction open") != null);
+    // Back in autocommit: a following write commits on its own.
+    try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('after')", .{}));
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: Rows deinit inside an open transaction rolls back" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+    var rows = try db.with(.{ .write = true }).iterate(void, ctx, "BEGIN", .{});
+    rows.deinit();
+    try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('x')", .{}));
+    try testing.expectEqual(@as(i64, 1), c.sqlite3_get_autocommit(db.writer.conn.handle.db));
+}
+
+test "sqlite: acquire released inside a transaction rolls the writer back" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+    const conn = try db.acquire(ctx);
+    const Begin = struct {
+        fn run(h: *sqlite.driver.Db) void {
+            _ = c.sqlite3_exec(h.db, "BEGIN", null, null, null);
+        }
+    };
+    conn.run(Begin.run, .{}) catch {};
+    conn.release();
+    try testing.expectEqual(@as(i64, 1), c.sqlite3_get_autocommit(db.writer.conn.handle.db));
+}
+
+test "sqlite: Tx.table and Tx.run see the transaction's own writes" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    const ch = try tx.run(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "inside" }});
+    try testing.expectEqual(@as(u64, 1), ch.changes);
+    const t = try tx.table(ctx, "SELECT title FROM notes", &.{});
+    try testing.expectEqual(@as(usize, 1), t.rows.len);
+    try tx.commit(ctx);
+}
+
+test "sqlite: Tx.with refuses coalesce and cache" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    const level = quiet();
+    defer testing.log_level = level;
+    try testing.expectError(error.Database, tx.with(.{ .coalesce = true }).one(i64, ctx, "SELECT 1", .{}));
+    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "coalesce and cache") != null);
+}
+
+test "sqlite: commit after commit is an error, not an assert" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    try tx.commit(ctx);
+    const level = quiet();
+    defer testing.log_level = level;
+    try testing.expectError(error.Database, tx.commit(ctx));
+    try testing.expectError(error.Database, tx.rollback(ctx));
+    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "the transaction is over") != null);
+}
+
+test "sqlite: Options.timeout bounds a plain call and .max lifts it" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:", .timeout = .fromMilliseconds(50) });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+    const forever = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000000) SELECT count(*) FROM n";
+    try testing.expectError(error.GatewayTimeout, db.one(i64, ctx, forever, .{}));
+    const small = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100000) SELECT count(*) FROM n";
+    try testing.expectEqual(@as(i64, 100000), try db.with(.{ .timeout = .max }).one(i64, ctx, small, .{}));
+}
