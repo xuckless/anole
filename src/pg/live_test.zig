@@ -727,3 +727,33 @@ test "pg: live app.postgres: handlers, statuses, /readyz and /metrics" {
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
+
+test "pg: iterate over a bare BEGIN fails left-open; acquire released in a transaction rolls back" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const d = try open(io, .{ .max_connections = 1 });
+    defer d.deinit();
+    _ = try d.exec(&c, "DROP TABLE IF EXISTS anole_pg_guard; CREATE TABLE anole_pg_guard (n int)", .{});
+    defer _ = d.exec(&c, "DROP TABLE IF EXISTS anole_pg_guard", .{}) catch {};
+
+    const level = quiet();
+    defer testing.log_level = level;
+    {
+        var rows = try d.iterate(void, &c, "BEGIN", .{});
+        defer rows.deinit();
+        try testing.expectError(error.Database, rows.next());
+        try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "left a transaction open") != null);
+    }
+    {
+        const conn = try d.acquire(&c);
+        _ = try conn.raw.exec("BEGIN", .{});
+        _ = try conn.raw.exec("INSERT INTO anole_pg_guard VALUES (1)", .{});
+        conn.release();
+    }
+    try testing.expectEqual(@as(i64, 0), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_guard", .{}));
+}
