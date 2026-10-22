@@ -753,7 +753,7 @@ pub const Engine = struct {
         // way is closed.
         if (comptime features.websocket) e.rooms.options.max_queued_bytes = cfg.limits.ws_high_water;
         e.rewake = @as(i96, cfg.timeouts.rewake_ms) * std.time.ns_per_ms;
-        e.timeouts[0] = @as(i96, cfg.timeouts.request_ms) * std.time.ns_per_ms;
+        e.timeouts[0] = if (cfg.timeouts.request_ms) |ms| @as(i96, ms) * std.time.ns_per_ms else no_deadline;
         e.dbs = try a.alloc(db.Db, cfg.databases.len);
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
         // One per process: `respond` and the handlers find it here.
@@ -809,10 +809,13 @@ pub const Engine = struct {
         const cfg = e.config;
         const a = e.arena.allocator();
         // Anole's own backstop, past the consumer deadline.
-        var longest: u32 = cfg.timeouts.request_ms;
-        for (cfg.routes) |r| if (r.timeout_ms) |t| {
-            longest = @max(longest, t);
-        };
+        const request: ?std.Io.Duration = if (cfg.timeouts.request_ms) |default_ms| blk: {
+            var longest: u32 = default_ms;
+            for (cfg.routes) |r| if (r.timeout_ms) |t| {
+                longest = @max(longest, t);
+            };
+            break :blk .fromMilliseconds(@as(i64, longest) + 5000);
+        } else null;
         const listeners = buildListeners(a, cfg) catch |err| return e.failStart(err);
         var app = anole.App.init(gpa, .{
             .listeners = listeners,
@@ -820,24 +823,42 @@ pub const Engine = struct {
             .signals = e.signals,
             .raise_fd_limit = true,
             .timeouts = .{
-                .request = .fromMilliseconds(@as(i64, longest) + 5000),
-                .shutdown = .fromMilliseconds(cfg.timeouts.shutdown_ms),
-                .keepalive = .fromMilliseconds(cfg.timeouts.keepalive_ms),
+                .request = request,
+                .read_header = msOrNull(cfg.timeouts.read_header_ms),
+                .write = msOrNull(cfg.timeouts.write_ms),
+                .keepalive = msOrNull(cfg.timeouts.keepalive_ms),
+                .idle_park = msOrNull(cfg.timeouts.idle_park_ms),
+                .shutdown = msOrNull(cfg.timeouts.shutdown_ms),
             },
             .limits = .{
                 .body_max = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize),
+                .max_head_size = cfg.limits.max_head_size,
+                .max_header_count = cfg.limits.max_header_count,
+                .max_param_count = cfg.limits.max_param_count,
+                .max_query_count = cfg.limits.max_query_count,
+                .max_form_count = cfg.limits.max_form_count,
+                .max_multiform_count = cfg.limits.max_multiform_count,
                 .max_connections = cfg.limits.max_connections,
+                .max_requests_per_connection = cfg.limits.max_requests_per_connection,
+                .ws_max_message = cfg.limits.ws_max_message,
             },
-            .proxy = .{
-                .trusted_hops = @intCast(@min(cfg.trusted_proxy_hops, 255)),
-                .trust_forwarded_proto = cfg.trust_forwarded_proto,
-                .trust_forwarded_host = cfg.trust_forwarded_host,
-            },
+            .proxy = cfg.proxy,
+            .request = cfg.request,
+            .response = cfg.response,
+            .http2 = cfg.http2,
+            .errors = cfg.errors,
             .http3 = if (comptime features.http3) if (!wantsHttp3(cfg)) null else .{
+                .address = cfg.http3.address,
+                .port = cfg.http3.port,
                 .max_streams_bidi = cfg.http3.max_streams_bidi,
+                .validate_address = cfg.http3.validate_address,
                 .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
                 .alt_svc = cfg.http3.alt_svc,
                 .early_data = cfg.http3.early_data,
+                .prefer_v2 = cfg.http3.prefer_v2,
+                .sockets = cfg.http3.sockets,
+                .enable_connect_protocol = cfg.http3.enable_connect_protocol,
+                .inline_no_wait = cfg.http3.inline_no_wait,
                 .webtransport = wantsWebTransport(cfg),
             } else null,
         }) catch |err| return e.failStart(err);
@@ -929,7 +950,7 @@ pub const Engine = struct {
                     .client_auth = switch (config_mod.clientAuth(t.client_auth).?) {
                         .none => null,
                         inline .request, .require => |m| .{
-                            .ca = if (t.client_ca_file) |f| .{ .file = f } else .{ .pem = t.client_ca_pem.? },
+                            .ca = if (t.client_ca_file) |f| .{ .file = f } else if (t.client_ca_dir) |d| .{ .dir = d } else if (t.client_ca_system) .system else .{ .pem = t.client_ca_pem.? },
                             .mode = @field(http.ClientAuth.Mode, @tagName(m)),
                         },
                     },
@@ -1946,6 +1967,13 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
 
 // ---------------------------------------------------------------------------
 // Consumer side: poll (on the consumer's thread)
+
+/// What `timeouts.request_ms: null` stands for in the deadline lists: a day.
+const no_deadline: i96 = 24 * 3600 * std.time.ns_per_s;
+
+fn msOrNull(ms: ?u32) ?std.Io.Duration {
+    return if (ms) |v| std.Io.Duration.fromMilliseconds(v) else null;
+}
 
 fn methodCode(m: http.Method) u8 {
     return switch (m) {

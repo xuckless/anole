@@ -15,18 +15,21 @@ pub const Config = struct {
     /// Executor threads: 0 for one per CPU (cgroup-aware).
     executors: u32 = 0,
     listeners: []const Listener = &.{.{}},
-    limits: Limits = .{},
     timeouts: Timeouts = .{},
+    limits: Limits = .{},
+    /// Trust in proxies in front: `trusted_hops` of them for the client's
+    /// address from `X-Forwarded-For` (PROXY protocol is per listener),
+    /// and whether `X-Forwarded-Proto` / `X-Forwarded-Host` count.
+    proxy: anole.ServerOptions.Proxy = .{},
+    /// How requests are read.
+    request: anole.ServerOptions.RequestOptions = .{},
+    /// How responses are written.
+    response: anole.ServerOptions.ResponseOptions = .{},
+    /// HTTP/2 settings, for h2c and h2 over TLS.
+    http2: anole.ServerOptions.Http2 = .{},
     http3: Http3 = .{},
-    /// Proxies in front whose `X-Forwarded-For` (and PROXY protocol)
-    /// Anole trusts for the client's address: 0 trusts none.
-    trusted_proxy_hops: u8 = 0,
-    /// With trusted_proxy_hops: the last X-Forwarded-Proto value says
-    /// whether the request is secure.
-    trust_forwarded_proto: bool = true,
-    /// With trusted_proxy_hops: the last X-Forwarded-Host value is the
-    /// request's host (only when every proxy in front sets it).
-    trust_forwarded_host: bool = false,
+    /// How the server writes its own error answers: "auto", "json", "text".
+    errors: http.ErrorFormat = .auto,
     /// Middleware for every route, in order, before the route's own.
     middleware: []const Middleware = &.{},
     routes: []const Route = &.{},
@@ -81,11 +84,21 @@ pub const Config = struct {
         /// the PEM text: one of them with "request" and "require".
         client_ca_file: ?[]const u8 = null,
         client_ca_pem: ?[]const u8 = null,
+        /// Or a directory of PEM files, or the system's trust store.
+        client_ca_dir: ?[]const u8 = null,
+        client_ca_system: bool = false,
     };
 
     pub const Limits = struct {
         /// The largest request body, inline or streamed: past it, 413.
         body_max: u64 = 1 << 20,
+        /// The request line and headers: larger is 431. 1 KiB to 1 MiB.
+        max_head_size: usize = 16 * 1024,
+        max_header_count: usize = 32,
+        max_param_count: usize = 8,
+        max_query_count: usize = 32,
+        max_form_count: usize = 32,
+        max_multiform_count: usize = 32,
         /// Bodies up to this come inline in the request record; larger
         /// ones are read with anole_req_read. At most 1 GiB.
         inline_body_max: u32 = 64 * 1024,
@@ -104,6 +117,8 @@ pub const Config = struct {
         ws_max_message: u32 = 1 << 20,
         /// Open connections at most; 0 follows the open-file limit.
         max_connections: u32 = 0,
+        /// Requests per keep-alive connection; null: no limit.
+        max_requests_per_connection: ?u32 = null,
         /// The largest database answer, in bytes of its record: past it,
         /// the answer is ANOLE_E_TOOBIG.
         db_result_max: u32 = 16 << 20,
@@ -233,28 +248,51 @@ pub const Config = struct {
         max_bytes: u64 = 32 << 20,
     };
 
+    /// A duration is null for none.
     pub const Timeouts = struct {
         /// The default deadline of a consumer request: 504 from Anole after
         /// it. A route's `timeout_ms` overrides it (at most 16 distinct
-        /// values per server).
-        request_ms: u32 = 30_000,
-        /// How long the drain waits for requests in flight.
-        shutdown_ms: u32 = 10_000,
-        /// An idle keep-alive connection is closed after this.
-        keepalive_ms: u32 = 60_000,
+        /// values per server). Null: none.
+        request_ms: ?u32 = 30_000,
+        /// The request head on HTTP/1.x (Slowloris). Null: `request_ms` alone.
+        read_header_ms: ?u32 = 10_000,
+        /// A write the peer does not take for this long ends the response;
+        /// once a stream or file body has started it replaces the request
+        /// deadline. Null: none.
+        write_ms: ?u32 = 30_000,
+        /// An idle keep-alive connection is closed after this. Null: never.
+        keepalive_ms: ?u32 = 60_000,
+        /// An idle HTTP/1.1 connection gives up its task after this
+        /// (parks). Null or 0: never parks.
+        idle_park_ms: ?u32 = 1_000,
+        /// How long the drain waits for requests in flight. Null: for all.
+        shutdown_ms: ?u32 = 10_000,
         /// Ring a consumer's doorbell again when events wait and it has not
         /// polled for this long (a lost wake); 0 never.
         rewake_ms: u32 = 20,
     };
 
     pub const Http3 = struct {
+        /// The UDP address and port; null: the TLS listener's.
+        address: ?[]const u8 = null,
+        port: ?u16 = null,
         max_streams_bidi: u64 = 100,
+        /// Make every new client prove its address with a Retry first.
+        validate_address: bool = false,
         idle_timeout_ms: u32 = 30_000,
         /// Advertise HTTP/3 with Alt-Svc on the TLS listener's responses.
         alt_svc: bool = true,
         /// Take 0-RTT from resuming clients (replayable: safe methods only
         /// run before the handshake completes).
         early_data: bool = false,
+        /// Move clients that offer QUIC v2 to it.
+        prefer_v2: bool = true,
+        /// UDP sockets on Linux (1 to 255); null: one per executor.
+        sockets: ?u16 = null,
+        /// Extended CONNECT (RFC 9220): WebSockets over HTTP/3.
+        enable_connect_protocol: bool = true,
+        /// Run `no_wait` requests that arrive whole on the endpoint task.
+        inline_no_wait: bool = true,
     };
 
     pub const Middleware = union(enum) {
@@ -523,6 +561,10 @@ fn fail(why: *std.Io.Writer, comptime fmt: []const u8, args: anytype) Problem {
 fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     if (cfg.listeners.len == 0) return fail(why, "listeners: at least one", .{});
     if (cfg.executors > 256) return fail(why, "executors: at most 256", .{});
+    if (cfg.limits.max_head_size < 1024 or cfg.limits.max_head_size > 1 << 20) return fail(why, "limits.max_head_size: 1024 to 1048576", .{});
+    if (cfg.response.write_buffer_size == 0) return fail(why, "response.write_buffer_size: at least 1", .{});
+    if (cfg.response.brotli_quality > 11) return fail(why, "response.brotli_quality: 0 to 11", .{});
+    if (cfg.http3.sockets) |n| if (n == 0 or n > 255) return fail(why, "http3.sockets: 1 to 255", .{});
     if (cfg.limits.max_inflight == 0 or cfg.limits.max_inflight > 1 << 20) return fail(why, "limits.max_inflight: 1 to 1048576", .{});
     if (cfg.limits.inline_body_max > cfg.limits.body_max) return fail(why, "limits.inline_body_max is above limits.body_max", .{});
     // Events carry their length in 32 bits: what goes inside one is bounded
@@ -540,9 +582,10 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (files and (t.cert_file == null or t.key_file == null)) return fail(why, "listeners[{d}].tls: cert_file and key_file go together", .{i});
             if (pem and (t.cert_pem == null or t.key_pem == null)) return fail(why, "listeners[{d}].tls: cert_pem and key_pem go together", .{i});
             const mode = clientAuth(t.client_auth) orelse return fail(why, "listeners[{d}].tls.client_auth: \"none\", \"request\" or \"require\"", .{i});
-            const cas = @as(u8, @intFromBool(t.client_ca_file != null)) + @intFromBool(t.client_ca_pem != null);
-            if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs one of client_ca_file, client_ca_pem", .{ i, t.client_auth });
-            if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: client_ca_file and client_ca_pem go with client_auth \"request\" or \"require\"", .{i});
+            const cas = @as(u8, @intFromBool(t.client_ca_file != null)) + @intFromBool(t.client_ca_pem != null) +
+                @intFromBool(t.client_ca_dir != null) + @intFromBool(t.client_ca_system);
+            if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs exactly one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system", .{ i, t.client_auth });
+            if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: the client_ca_* settings go with client_auth \"request\" or \"require\"", .{i});
         }
         if (l.proxy_protocol_from.len > 0 and !l.proxy_protocol) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
         if (l.http3) {
@@ -550,7 +593,6 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
             http3_listeners += 1;
         }
-        if (l.http2 and !features.http2 and l.tls != null) {}
         if (l.name) |n| if (n.len == 0 or n.len > 255 or std.mem.indexOfScalar(u8, n, ':') != null)
             return fail(why, "listeners[{d}].name: 1-255 bytes, no ':'", .{i});
         for (cfg.listeners[0..i]) |other| if (l.name != null and other.name != null and std.mem.eql(u8, l.name.?, other.name.?))
@@ -591,7 +633,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     try checkMiddleware(cfg.middleware, "middleware", why);
     var timeouts: [max_timeouts]u32 = undefined;
     var ntimeouts: usize = 1;
-    timeouts[0] = cfg.timeouts.request_ms;
+    timeouts[0] = cfg.timeouts.request_ms orelse std.math.maxInt(u32);
     for (cfg.routes, 0..) |r, i| {
         const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
             @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null);
@@ -814,7 +856,7 @@ test "parse: the defaults, a full document, and what is refused" {
 
     const d = try parse(a, "{}", &why);
     try std.testing.expectEqual(@as(usize, 1), d.listeners.len);
-    try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms.?);
 
     const full_doc =
         \\{"executors": 2,
