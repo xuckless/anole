@@ -19,7 +19,7 @@ const log = std.log.scoped(.anole);
 
 /// The driver's name and version in the handshake's client metadata.
 pub const driver_name = "anole";
-pub const driver_version = "0.1.2";
+pub const driver_version = "0.1.3";
 
 /// Request IDs, unique in the process.
 var next_request_id: std.atomic.Value(i32) = .init(1);
