@@ -81,6 +81,7 @@ func runSuite(args []string) {
 	modes := fs.String("modes", "", "comma-separated server modes raw runs (h1, tls, h2c, h3); default all")
 	twelveFrom := fs.String("twelve-from", "", "cases.jsonl of an earlier $12 run: bisect each server's bracket instead of climbing the ladder")
 	prior := fs.String("prior", "", "comma-separated cases.jsonl files from earlier runs (max req/s for latency rates)")
+	conns := fs.String("conns", "", "comma-separated connection counts for the conns scenario; default the profile's")
 	fs.Parse(args)
 	if *out == "" {
 		log.Fatal("-out is required")
@@ -88,6 +89,16 @@ func runSuite(args []string) {
 	p, ok := suite.Profiles[*profile]
 	if !ok {
 		log.Fatalf("unknown profile %s", *profile)
+	}
+	if *conns != "" {
+		p.Conns = nil
+		for _, c := range strings.Split(*conns, ",") {
+			n, err := strconv.Atoi(c)
+			if err != nil || n <= 0 {
+				log.Fatalf("bad -conns value %q", c)
+			}
+			p.Conns = append(p.Conns, n)
+		}
 	}
 	var ts []sut.Tier
 	for _, t := range strings.Split(*tiers, ",") {

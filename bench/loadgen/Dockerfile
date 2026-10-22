@@ -17,6 +17,14 @@ RUN git clone -q https://github.com/MDA2AV/gcannon /gcannon && cd /gcannon \
  && git checkout -q 11c802b2bdfe9af2fac4ac2571ae2de4c530cc62 \
  && make -j"$(nproc)" >/dev/null && cp gcannon /usr/local/bin/gcannon
 
+# oha from source with its http3 feature (experimental, h3 + quinn): the
+# release binaries are built without it, and the latency scenario's h3 runs
+# need it.
+FROM rust:1.99.1-slim-trixie@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS oha
+ARG OHA=1.16.0
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install --locked oha@$OHA --features http3 --root /out
+
 FROM golang:1.27.2 AS tools
 WORKDIR /src
 COPY bench/tools/go.mod bench/tools/go.sum ./
@@ -31,13 +39,10 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 FROM fedora:44
 RUN dnf -q install -y nghttp2 curl jq openssl procps-ng iproute bash findutils ffmpeg-free liburing \
  && dnf clean all
-ARG OHA=1.16.0
 ARG K6=2.3.0
 ARG GHZ=0.121.0
 ARG DOCKER=29.9.1
-RUN curl -fsSL -o /usr/local/bin/oha https://github.com/hatoo/oha/releases/download/v$OHA/oha-linux-amd64 \
- && chmod +x /usr/local/bin/oha \
- && curl -fsSL https://github.com/grafana/k6/releases/download/v$K6/k6-v$K6-linux-amd64.tar.gz \
+RUN curl -fsSL https://github.com/grafana/k6/releases/download/v$K6/k6-v$K6-linux-amd64.tar.gz \
     | tar -xz -C /usr/local/bin --strip-components=1 k6-v$K6-linux-amd64/k6 \
  && curl -fsSL https://github.com/bojand/ghz/releases/download/v$GHZ/ghz-linux-x86_64.tar.gz \
     | tar -xz -C /usr/local/bin ghz \
@@ -46,5 +51,6 @@ RUN curl -fsSL -o /usr/local/bin/oha https://github.com/hatoo/oha/releases/downl
 COPY --from=wrk /usr/local/bin/wrk /usr/local/bin/wrk
 COPY --from=gcannon /usr/local/bin/gcannon /usr/local/bin/gcannon
 COPY --from=tools /out/benchctl /out/wtload /usr/local/bin/
+COPY --from=oha /out/bin/oha /usr/local/bin/oha
 WORKDIR /bench
 ENTRYPOINT ["benchctl"]

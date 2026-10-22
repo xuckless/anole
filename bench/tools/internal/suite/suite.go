@@ -363,7 +363,10 @@ func (s *Suite) Latency() {
 					rates = append(rates, rate{r, fmt.Sprintf("rate=%d", r)})
 				}
 			}
-			if max > 0 {
+			// The % of max rates only over HTTP/1.1 (wrk in raw): raw measures h2 and h3
+			// with h2load's 64 connections × 10 streams, which oha (one
+			// request in flight per connection) cannot reach.
+			if max > 0 && ohaProto == "1.1" {
 				for _, f := range latencyFractions {
 					rates = append(rates, rate{int(max * f), fmt.Sprintf("rate=%.0f%%max", f*100)})
 				}

@@ -242,7 +242,7 @@ h1-tls: p50 / p99 / p99.9 (achieved req/s)
 | express | 0.04 / 0.15 / 2.83 (1k) | 0.09 / 0.26 / 2.54 (5k) | 0.26 / 0.64 / 8.50 (20k) | 0.51 / 1.23 / 17 (31k) | 0.92 / 7.10 / 25 (47k) |
 | fastapi | 0.09 / 0.20 / 4.32 (1k) | 0.28 / 0.61 / 2.46 (5k) | – | 0.49 / 1.05 / 8.75 (9k) | 0.88 / 1.82 / 22 (13k) |
 
-h2-tls: p50 / p99 / p99.9 (achieved req/s)
+h2-tls: p50 / p99 / p99.9 (achieved req/s). **The 50%max and 75%max columns are invalid** (see the notes): only the fixed-rate columns compare.
 
 | server | 1000 | 5000 | 20000 | 50%max | 75%max |
 |---|---|---|---|---|---|
@@ -273,5 +273,10 @@ Notes:
   support ("Your Oha instance has not been built with HTTP/3 support"), so
   every h3 latency case is an error. That's a loadgen image bug: oha needs its
   `http3` feature. It isn't rerun here, since the scope was cut.
+- **Fixed for future runs** (bench/suite, not rerun here):
+  - the loadgen builds oha 1.16.0 from source with `--features http3`;
+  - the latency scenario keeps the % of max rates only over HTTP/1.1, where
+    raw's max comes from wrk and oha can reach it. h2 and h3 get the fixed
+    rates only.
 - **Errors:** 0–64 per run. These are connections still open when oha stops at
   30 s. They show up for every server.
