@@ -54,7 +54,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 3 /* additions */
+#define ANOLE_ABI_VERSION_MINOR 4 /* additions */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 
 #if defined(_WIN32) && defined(ANOLE_SHARED)
@@ -105,17 +105,20 @@ ANOLE_API anole_str anole_last_error(void);
 ANOLE_API uint32_t anole_abi_version(void);
 /* Anole's version, such as "0.2.0"; static storage. */
 ANOLE_API anole_str anole_version(void);
-/* 1 when `name` is built in, else 0: "tls", "http2", "http3", "websocket",
-   "compression", "brotli", "auth", "grpc", "sqlite", "postgres", "redis", "mongodb". */
+/* 1 when `name` is built in, else 0: "tls", "http2", "http3",
+   "webtransport" (with http3), "websocket", "compression", "brotli",
+   "auth", "grpc", "sqlite", "postgres", "redis", "mongodb". */
 ANOLE_API int anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
-   (a request, a WebSocket, a gRPC call; WebTransport sessions and streams
-   and database queries later), and a function given a handle of another
-   kind answers ANOLE_E_GONE. The bits are Anole's: treat them as opaque. */
+   (a request, a WebSocket, a gRPC call, a WebTransport session or stream;
+   database queries later), and a function given a handle of another kind
+   answers ANOLE_E_GONE. The bits are Anole's: treat them as opaque. */
 typedef uint64_t anole_req;       /* one request: from ANOLE_EV_REQUEST until answered */
 typedef uint64_t anole_ws;        /* one WebSocket: from ANOLE_EV_WS_OPEN until ANOLE_EV_WS_CLOSE */
 typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL until finished or aborted */
+typedef uint64_t anole_wt;        /* one WebTransport session: from ANOLE_EV_WT_OPEN until ANOLE_EV_WT_CLOSE */
+typedef uint64_t anole_wt_stream; /* one of its streams: until anole_wt_stream_release or the session's close */
 typedef struct anole_server anole_server;     /* opaque */
 typedef struct anole_consumer anole_consumer; /* opaque */
 
@@ -188,6 +191,8 @@ typedef struct anole_stats {
   uint64_t websockets;    /* open now */
   uint64_t ws_messages_in;
   uint64_t ws_messages_out;
+  uint64_t wt_sessions;          /* WebTransport sessions open now */
+  uint64_t wt_datagrams_dropped; /* outgoing datagrams dropped: past datagram_queue, or too large */
 } anole_stats;
 /* Counters since start. Fills what out->size covers. */
 ANOLE_API anole_status anole_server_stats(anole_server *s, anole_stats *out);
@@ -237,11 +242,23 @@ enum anole_event_type {
   ANOLE_EV_GRPC_CALL = 12, /* anole_grpc_call_event; handle: anole_grpc_call */
   ANOLE_EV_GRPC_MESSAGE = 13,   /* anole_grpc_message_event: a request message of a client- or
                                    bidirectional-streaming call */
-  ANOLE_EV_GRPC_HALF_CLOSE = 14 /* anole_event: the client sent its last request message */
-  /* Reserved before ABI 1.0: 15-19 gRPC, 20-29 WebTransport sessions,
-     streams and datagrams, 30-39 more database events. A consumer skips
-     types it does not know (ev.len). ANOLE_EV_ABORT, ANOLE_EV_WRITABLE and
-     ANOLE_EV_SENT also come for gRPC calls (ev.handle an anole_grpc_call). */
+  ANOLE_EV_GRPC_HALF_CLOSE = 14, /* anole_event: the client sent its last request message */
+  ANOLE_EV_WT_OPEN = 20,   /* anole_request_event (the CONNECT); handle: anole_wt */
+  ANOLE_EV_WT_CLOSE = 21,  /* anole_wt_close_event: the session and its streams are stale from now on */
+  ANOLE_EV_WT_DRAIN = 22,  /* anole_event: the session is draining (the server's drain or the
+                              peer's): finish up and close it */
+  ANOLE_EV_WT_STREAM = 23, /* anole_wt_stream_event: the peer opened a stream; handle: anole_wt_stream */
+  ANOLE_EV_WT_DATA = 24,   /* anole_wt_data_event: bytes of a stream, and/or its end */
+  ANOLE_EV_WT_STREAM_RESET = 25, /* anole_wt_code_event: the peer reset its sending side
+                                    (nothing more arrives) */
+  ANOLE_EV_WT_STREAM_STOP = 26,  /* anole_wt_code_event: the peer asked this side to stop
+                                    sending (writes now answer ANOLE_E_GONE) */
+  ANOLE_EV_WT_DATAGRAM = 27      /* anole_wt_datagram_event; handle: anole_wt */
+  /* Reserved before ABI 1.0: 15-19 gRPC, 28-29 more WebTransport, 30-39
+     more database events. A consumer skips types it does not know
+     (ev.len). ANOLE_EV_ABORT, ANOLE_EV_WRITABLE and ANOLE_EV_SENT also come
+     for gRPC calls (ev.handle an anole_grpc_call); ANOLE_EV_WRITABLE also
+     for a WebTransport stream (ev.handle an anole_wt_stream). */
 };
 
 /* Every event starts with this. Records are 8-byte aligned and `len`
@@ -394,6 +411,59 @@ typedef struct anole_grpc_message_event {
   uint32_t reserved;
   anole_span data;
 } anole_grpc_message_event;
+
+/* WebTransport (draft-02 over HTTP/3, what Chrome and Firefox speak). */
+#define ANOLE_WT_UNI 1u /* anole_wt_open_stream's flag, and ANOLE_EV_WT_STREAM's: one-way */
+#define ANOLE_WT_FIN 1u /* anole_wt_stream_write's flag, and ANOLE_EV_WT_DATA's: the end */
+enum { ANOLE_WT_CLOSED_LOCAL = 0, ANOLE_WT_CLOSED_PEER = 1, ANOLE_WT_CLOSED_CONNECTION = 2 };
+
+/* ANOLE_EV_WT_STREAM: a stream the peer opened, both ways or (ANOLE_WT_UNI)
+   read-only. Release it (anole_wt_stream_release) when done: the peer may
+   open another only as streams are released. */
+typedef struct anole_wt_stream_event {
+  anole_event ev;
+  uint32_t route_id;
+  uint32_t flags;   /* ANOLE_WT_UNI */
+  anole_wt session; /* the session it belongs to */
+} anole_wt_stream_event;
+
+/* ANOLE_EV_WT_DATA: the next bytes of a stream, in order (at most 32 KiB
+   each), followed by them; ANOLE_WT_FIN in flags with the last (or alone,
+   with no bytes). */
+typedef struct anole_wt_data_event {
+  anole_event ev;
+  uint32_t flags; /* ANOLE_WT_FIN */
+  uint32_t reserved;
+  anole_span data;
+} anole_wt_data_event;
+
+/* ANOLE_EV_WT_STREAM_RESET and ANOLE_EV_WT_STREAM_STOP: the peer's
+   application error code (0 when it sent none Anole could read). */
+typedef struct anole_wt_code_event {
+  anole_event ev;
+  uint32_t code;
+  uint32_t reserved;
+} anole_wt_code_event;
+
+/* ANOLE_EV_WT_DATAGRAM: one datagram, followed by its bytes. */
+typedef struct anole_wt_datagram_event {
+  anole_event ev;
+  uint32_t route_id;
+  uint32_t reserved;
+  anole_span data;
+} anole_wt_datagram_event;
+
+/* ANOLE_EV_WT_CLOSE: the session is over. code and reason: the
+   application's close (0 and empty when it ended without one); by: which
+   side closed it (ANOLE_WT_CLOSED_*). Every stream of it is stale too. */
+typedef struct anole_wt_close_event {
+  anole_event ev;
+  uint32_t route_id;
+  uint32_t code;
+  uint32_t by;
+  uint32_t reserved;
+  anole_span reason;
+} anole_wt_close_event;
 
 static inline anole_str anole_event_str(const void *record, anole_span s) {
   anole_str r;
@@ -583,6 +653,46 @@ ANOLE_API anole_status anole_grpc_read(anole_grpc_call c, uint32_t n);
    start. ANOLE_E_STATE when health is off. */
 enum { ANOLE_GRPC_HEALTH_UNKNOWN = 0, ANOLE_GRPC_HEALTH_SERVING = 1, ANOLE_GRPC_HEALTH_NOT_SERVING = 2 };
 ANOLE_API anole_status anole_grpc_health_set(anole_server *s, anole_str service, int status);
+
+/* ---- WebTransport ----------------------------------------------------------------- */
+
+/* A "webtransport" route accepts sessions (draft-02 over HTTP/3; the route
+   needs a listener with http3) and hands them to a consumer: ANOLE_EV_WT_OPEN
+   with the CONNECT request, then the session's streams, data and datagrams,
+   then ANOLE_EV_WT_CLOSE. Calls on a session or stream that is gone answer
+   ANOLE_E_GONE. */
+
+/* Opens a stream: both ways, or with ANOLE_WT_UNI write-only. The handle is
+   good at once; what is written waits until the stream opens (the peer's
+   stream limit may hold it). */
+ANOLE_API anole_status anole_wt_open_stream(anole_wt w, uint32_t flags, anole_wt_stream *out);
+/* Queues bytes to send on a stream (copied), and with ANOLE_WT_FIN its end
+   after them. ANOLE_BUSY: queued, but past limits.stream_high_water bytes
+   waiting: wait for ANOLE_EV_WRITABLE (ev.handle the stream). ANOLE_E_INVALID
+   for a read-only stream or after its end; ANOLE_E_GONE once its sending
+   side is over (reset, or stopped by the peer: ANOLE_EV_WT_STREAM_STOP). */
+ANOLE_API anole_status anole_wt_stream_write(anole_wt_stream s, const void *data, size_t len, uint32_t flags);
+/* Abandons sending (RESET_STREAM with the application code); what was
+   queued is dropped. */
+ANOLE_API anole_status anole_wt_stream_reset(anole_wt_stream s, uint32_t code);
+/* Asks the peer to stop sending (STOP_SENDING); what arrives is dropped. */
+ANOLE_API anole_status anole_wt_stream_stop(anole_wt_stream s, uint32_t code);
+/* Done with the stream: a sending side not ended with ANOLE_WT_FIN is reset
+   and a receiving side not read to its end is stopped (code 0); the handle
+   is stale at once. Every stream must be released (or its session closed). */
+ANOLE_API anole_status anole_wt_stream_release(anole_wt_stream s);
+/* Queues a datagram (copied). Datagrams are unreliable: the session keeps
+   the route's datagram_queue of them waiting to go out, and past it drops
+   the oldest (a datagram that waits goes stale; counted in
+   anole_stats.wt_datagrams_dropped). ANOLE_E_TOOBIG past
+   anole_wt_max_datagram. */
+ANOLE_API anole_status anole_wt_send_datagram(anole_wt w, const void *data, size_t len);
+/* The largest datagram the session takes now (it follows the path's
+   packet size), 0 when the peer takes none; or ANOLE_E_GONE. */
+ANOLE_API int64_t anole_wt_max_datagram(anole_wt w);
+/* Closes the session with an application code and a reason (at most 1024
+   bytes): every stream is reset, and ANOLE_EV_WT_CLOSE follows. */
+ANOLE_API anole_status anole_wt_close(anole_wt w, uint32_t code, anole_str reason);
 
 /* ---- databases ---------------------------------------------------------------- */
 

@@ -886,6 +886,18 @@ pub fn build(b: *std.Build) void {
             consumer.root_module.linkLibrary(static_lib);
             const run_consumer = b.addRunArtifact(consumer);
             run_consumer.addArg("test");
+            // The client of the suite's WebTransport test, in Zig (C has
+            // no WebTransport client): its path is the second argument.
+            const wt_client: ?*std.Build.Step.Compile = if (features.http3) b.addExecutable(.{
+                .name = "capi-wt-client",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/capi/wt_client.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                }),
+            }) else null;
+            if (wt_client) |wc| run_consumer.addArtifactArg(wc);
             // Its progress lines and Anole's warnings (a drain cut short on
             // purpose) on the terminal; a failure is its exit code.
             run_consumer.stdio = .inherit;
@@ -963,6 +975,7 @@ pub fn build(b: *std.Build) void {
             const run_asan = std.Build.Step.Run.create(b, "run capi-consumer-asan");
             run_asan.addFileArg(asan_exe);
             run_asan.addArg("test");
+            if (wt_client) |wc| run_asan.addArtifactArg(wc);
             run_asan.has_side_effects = true;
             run_asan.stdio = .inherit;
             // Zig's threads install a signal stack of their own (for the

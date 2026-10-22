@@ -324,8 +324,10 @@ pub const Config = struct {
         respond: ?Fixed = null,
         /// files under a directory (the path is the prefix);
         static: ?Static = null,
-        /// a WebSocket endpoint whose events go to a consumer.
+        /// a WebSocket endpoint whose events go to a consumer;
         websocket: ?WebSocket = null,
+        /// a WebTransport endpoint (HTTP/3) whose events go to a consumer.
+        webtransport: ?WebTransport = null,
         /// This route's request deadline (consumer routes).
         timeout_ms: ?u32 = null,
         /// Handler and respond routes run on the protocol's reader when
@@ -418,6 +420,20 @@ pub const Config = struct {
         /// A unary method without side effects is also served as Connect
         /// GET (descriptors: `idempotency_level = NO_SIDE_EFFECTS`).
         no_side_effects: ?bool = null,
+    };
+    pub const WebTransport = struct {
+        /// The consumer's route id for this endpoint's events.
+        handler: u32,
+        /// Close each session (code 0) when the server drains, right after
+        /// ANOLE_EV_WT_DRAIN; false leaves that to the consumer (until
+        /// timeouts.shutdown_ms).
+        close_on_drain: bool = true,
+        /// Pages of other origins that may open a session, besides the
+        /// request's own host; "*" for any.
+        origins: []const []const u8 = &.{},
+        /// Datagrams a session holds for sending; past it the oldest is
+        /// dropped.
+        datagram_queue: u32 = 64,
     };
     pub const Cache = struct {
         /// When the answer's Cache-Control does not say.
@@ -543,8 +559,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     timeouts[0] = cfg.timeouts.request_ms;
     for (cfg.routes, 0..) |r, i| {
         const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
-            @intFromBool(r.static != null) + @intFromBool(r.websocket != null);
-        if (kinds != 1) return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket", .{i});
+            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null);
+        if (kinds != 1) return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport", .{i});
         if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
         if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
         if (r.respond) |f| {
@@ -560,6 +576,14 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (r.websocket != null) {
             if (comptime !features.websocket) return fail(why, "routes[{d}].websocket: WebSocket is not built in (-Dwebsocket)", .{i});
             if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: a websocket route is GET", .{i});
+        }
+        if (r.webtransport) |w| {
+            if (comptime !features.http3) return fail(why, "routes[{d}].webtransport: HTTP/3 is not built in (-Dhttp3)", .{i});
+            if (r.method != null) return fail(why, "routes[{d}]: a webtransport route takes no method (an extended CONNECT)", .{i});
+            var h3 = false;
+            for (cfg.listeners) |l| h3 = h3 or l.http3;
+            if (!h3) return fail(why, "routes[{d}].webtransport: needs a listener with http3", .{i});
+            if (w.datagram_queue == 0) return fail(why, "routes[{d}].webtransport.datagram_queue: at least 1", .{i});
         }
         if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
         if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
@@ -804,6 +828,9 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"databases\": [{\"name\": \"d\", \"redis\": {}, \"postgres\": {}}]}",
         "{\"databases\": [{\"name\": \"d\", \"redis\": {\"max_connections\": 0}}]}",
         "{\"databases\": [{\"name\": \"d\", \"mongodb\": {\"ca_file\": \"a\", \"ca_pem\": \"b\"}}]}",
+        "{\"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"method\": \"GET\", \"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 0}}]}",
     };
     for (bad) |doc| {
         why.end = 0;

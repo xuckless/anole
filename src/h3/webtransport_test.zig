@@ -109,6 +109,20 @@ fn echoDatagrams(session: *wt.Session) std.Io.Cancelable!void {
     }
 }
 
+/// Opens a one-way stream at once, says something on it and ends it,
+/// then waits for the client to close: the stream can arrive whole before
+/// the client has the 200 (its session established).
+fn pushSession(session: *wt.Session) !void {
+    const uni = try session.openUniStream();
+    try uni.writer().writeAll("pushed at once");
+    try uni.closeSend();
+    uni.release();
+    while (true) {
+        const s = session.acceptStream() catch return;
+        s.release();
+    }
+}
+
 /// RFC 9220: frames echoed until a close.
 fn wsEcho(ws: *websocket.Socket) !void {
     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
@@ -129,6 +143,7 @@ const Fixture = struct {
         errdefer http.deinit();
         http.router.get("/wt", webtransport.route(void, echoSession, .{}));
         http.router.get("/ignore", webtransport.route(void, ignoreStreams, .{}));
+        http.router.get("/push", webtransport.route(void, pushSession, .{}));
         if (features.websocket) http.router.get("/ws", websocket.route(void, wsEcho, .{}));
         const ep = try Endpoint.init(gpa, io, http, .{
             .address = .{ .ip4 = .loopback(0) },
@@ -248,6 +263,29 @@ test "WebTransport: streams both ways, datagrams, and a close the server sees" {
     try std.testing.expectEqual(@as(u32, 42), last_close.code);
     try std.testing.expectEqualStrings("bye now", last_close.reason[0..last_close.reason_len]);
     try std.testing.expectEqual(.peer, last_close.by.?);
+}
+
+test "WebTransport: a one-way stream that arrives whole before its session is established is kept for it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    // Several sessions: in some the server's stream comes with its end
+    // before the client has the 200; it was dropped then.
+    for (0..8) |_| {
+        const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/push" });
+        defer session.deinit();
+        const u = try session.acceptUniStream();
+        defer u.release();
+        const got = try u.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("pushed at once", got);
+        try session.close(0, "");
+    }
 }
 
 test "WebTransport: a peer stream reset before its session prefix completes is freed" {

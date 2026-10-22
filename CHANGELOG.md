@@ -66,6 +66,20 @@ breaking changes are listed anyway.
   `-Dgrpc`. grpc-go's interop client passes its 14 cases against a C
   implementation of the test service (`tests/capi/grpc_interop.c`). See
   docs/c-abi.md#grpc.
+- C ABI 0.4: WebTransport, a `"webtransport"` route (HTTP/3) that hands
+  sessions to a consumer. Events `ANOLE_EV_WT_OPEN` (the CONNECT request),
+  `_WT_STREAM`, `_WT_DATA`, `_WT_STREAM_RESET`, `_WT_STREAM_STOP`,
+  `_WT_DATAGRAM`, `_WT_DRAIN`, `_WT_CLOSE` (20-27); handles `anole_wt` and
+  `anole_wt_stream`; calls `anole_wt_open_stream`, `anole_wt_stream_write`
+  (`ANOLE_BUSY`, then `ANOLE_EV_WRITABLE`), `anole_wt_stream_reset`,
+  `anole_wt_stream_stop`, `anole_wt_stream_release`,
+  `anole_wt_send_datagram` (a bounded queue that drops the oldest),
+  `anole_wt_max_datagram`, `anole_wt_close`; `anole_stats` gains
+  `wt_sessions` and `wt_datagrams_dropped`; `anole_has_feature("webtransport")`.
+- `anole.webtransport.Session` and `Stream` gain calls that never wait
+  (`tryAccept`, `tryOpen`, `takeDatagram`, `trySendDatagram`, `tryRead`,
+  `tryWrite`, `sendError`, with `generation`/`waitChange`), for code that
+  runs a session from one task.
 
 ### Fixed
 
@@ -83,6 +97,10 @@ breaking changes are listed anyway.
   on the socket's executor and the publish fans out from another, so a
   socket that had just subscribed could miss it. A publish now waits for
   the subscriptions taken before it.
+- WebTransport: a one-way stream that arrived whole (its data and its end)
+  before its session was established on the receiving side was dropped,
+  so a server that opened a stream right after accepting the session could
+  lose it; such a stream is now kept for the session.
 
 ### Clients
 

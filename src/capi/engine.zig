@@ -57,6 +57,11 @@ pub const grpc = if (features.grpc) @import("grpc.zig") else struct {
     };
     pub const EngineState = struct {};
 };
+pub const wt = if (features.http3) @import("wt.zig") else struct {
+    pub const ExecState = struct {
+        pub fn deinit(_: *ExecState) void {}
+    };
+};
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const config = config_mod;
@@ -353,6 +358,7 @@ pub const Exec = struct {
     record_bytes: std.atomic.Value(usize) = .init(0),
     ws: ws.ExecState = .{},
     grpc: grpc.ExecState = .{},
+    wt: wt.ExecState = .{},
     db: db.ExecState = .{},
 
     /// The capi task is asleep for a whole request timeout: wakes it, as a
@@ -620,6 +626,8 @@ pub const Route = struct {
     detachable: bool = true,
     /// A WebSocket endpoint's settings.
     ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
+    /// A WebTransport endpoint's settings.
+    wt: if (features.http3) ?wt.Options else void = if (features.http3) null else {},
 };
 
 // ---------------------------------------------------------------------------
@@ -679,6 +687,8 @@ pub const Engine = struct {
     /// so it reaches a socket that subscribed before it was called.
     topic_changes: std.atomic.Value(u32) = .init(0),
     topic_changes_done: std.atomic.Value(u32) = .init(0),
+    wt_sessions: std.atomic.Value(u64) = .init(0),
+    wt_datagrams_dropped: std.atomic.Value(u64) = .init(0),
     /// The configuration's databases (`anole_db *`).
     dbs: []db.Db = &.{},
     /// WebSocket topics, shared by every executor.
@@ -731,7 +741,7 @@ pub const Engine = struct {
 
     /// Whether any route sends events to a consumer.
     pub fn needsConsumer(e: *const Engine) bool {
-        for (e.config.routes) |r| if (r.handler != null or r.websocket != null) return true;
+        for (e.config.routes) |r| if (r.handler != null or r.websocket != null or r.webtransport != null) return true;
         if (e.config.grpc) |g| if (g.services.len > 0) return true;
         return false;
     }
@@ -792,6 +802,7 @@ pub const Engine = struct {
                 .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
                 .alt_svc = cfg.http3.alt_svc,
                 .early_data = cfg.http3.early_data,
+                .webtransport = wantsWebTransport(cfg),
             } else null,
         }) catch |err| return e.failStart(err);
         e.app = &app;
@@ -832,6 +843,11 @@ pub const Engine = struct {
             c.wake();
         }
         e.stopped.set(threadedIo());
+    }
+
+    fn wantsWebTransport(cfg: Config) bool {
+        for (cfg.routes) |r| if (r.webtransport != null) return true;
+        return false;
     }
 
     fn wantsHttp3(cfg: Config) bool {
@@ -921,12 +937,30 @@ pub const Engine = struct {
                     .allowed_origins = wsOrigins(wc.origins),
                 } };
                 group.inner.addRouteWith(.get, rc.path, ws.handler, .{ .data = route });
+            } else if (rc.webtransport) |wc| {
+                if (comptime !features.http3) unreachable;
+                const route = try a.create(Route);
+                route.* = .{ .engine = e, .id = wc.handler, .wt = .{
+                    .accept = .{
+                        .allowed_origins = wtOrigins(wc.origins),
+                        .close_on_drain = wc.close_on_drain,
+                    },
+                    .datagram_queue = wc.datagram_queue,
+                } };
+                // Extended CONNECT is routed as GET.
+                group.inner.addRouteWith(.get, rc.path, wt.handler, .{ .data = route });
             }
         }
     }
 
     /// A WebSocket route's `origins`: none is the same origin only, "*"
     /// any.
+    fn wtOrigins(origins: []const []const u8) anole.webtransport.Origins {
+        if (origins.len == 0) return .same_origin;
+        for (origins) |o| if (std.mem.eql(u8, o, "*")) return .any;
+        return .{ .list = origins };
+    }
+
     fn wsOrigins(origins: []const []const u8) anole.websocket.Origins {
         if (origins.len == 0) return .same_origin;
         for (origins) |o| if (std.mem.eql(u8, o, "*")) return .any;
@@ -1038,6 +1072,7 @@ pub const Engine = struct {
             }
             x.ws.deinit();
             x.grpc.deinit();
+            x.wt.deinit();
         }
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
@@ -1075,6 +1110,8 @@ pub const Engine = struct {
             .websockets = e.websockets.load(.monotonic),
             .ws_messages_in = e.ws_in.load(.monotonic),
             .ws_messages_out = e.ws_out.load(.monotonic),
+            .wt_sessions = e.wt_sessions.load(.monotonic),
+            .wt_datagrams_dropped = e.wt_datagrams_dropped.load(.monotonic),
         };
     }
 
@@ -2029,7 +2066,7 @@ pub fn pollWait(c: *Consumer, out: []u8, timeout_ms: i32) PollError!usize {
 // ---------------------------------------------------------------------------
 // Consumer side: answers (any thread)
 
-pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again, State };
+pub const AnswerError = error{ Gone, Invalid, OutOfMemory, Unsupported, Timeout, Again, State, TooBig };
 
 pub const CHeader = abi.Header;
 

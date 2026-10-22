@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1911,6 +1912,205 @@ static void test_db_mongodb(void) {
          coalesced, MANY);
 }
 
+/* ---- WebTransport: the server in C, the client in Zig (tests/capi/wt_client.zig,
+   passed as the second argument) ---------------------------------------------- */
+
+static const char *wt_client_path;
+
+typedef struct {
+  anole_wt_stream h;
+  anole_wt session;
+  int uni, ours, used;
+  char got[64];
+  size_t len;
+} wt_ent;
+
+typedef struct {
+  wt_ent ents[32];
+  anole_wt session;
+  anole_wt_stream first_stream; /* for the stale check after the close */
+  int opened, closed, released, drains;
+  uint32_t close_code, close_by;
+  char reason[64];
+} wt_state;
+
+static wt_ent *wt_find(wt_state *st, anole_wt_stream h) {
+  for (int i = 0; i < 32; i++)
+    if (st->ents[i].used && st->ents[i].h == h) return &st->ents[i];
+  return NULL;
+}
+
+static wt_ent *wt_add(wt_state *st, anole_wt_stream h, anole_wt session, int uni, int ours) {
+  for (int i = 0; i < 32; i++)
+    if (!st->ents[i].used) {
+      wt_ent *e = &st->ents[i];
+      memset(e, 0, sizeof *e);
+      e->used = 1, e->h = h, e->session = session, e->uni = uni, e->ours = ours;
+      if (!st->first_stream) st->first_stream = h;
+      return e;
+    }
+  CHECK(0);
+  return NULL;
+}
+
+static void wt_forget(wt_state *st, wt_ent *e) {
+  CHECK(anole_wt_stream_release(e->h) == ANOLE_OK);
+  /* Stale at once. */
+  CHECK(anole_wt_stream_write(e->h, "x", 1, 0) == ANOLE_E_GONE);
+  e->used = 0;
+  st->released++;
+}
+
+static void wt_event(wt_state *st, const anole_event *ev) {
+  switch (ev->type) {
+  case ANOLE_EV_WT_OPEN: {
+    const anole_request_event *r = (const anole_request_event *)ev;
+    CHECK(r->route_id == 5);
+    CHECK(str_is(anole_event_str(r, r->path), "/wt"));
+    st->session = ev->handle;
+    st->opened++;
+    CHECK(anole_wt_max_datagram(ev->handle) > 0);
+    anole_wt_stream u = 0;
+    CHECK(anole_wt_open_stream(ev->handle, ANOLE_WT_UNI, &u) == ANOLE_OK && u != 0);
+    CHECK(anole_wt_stream_write(u, "hello from C", 12, ANOLE_WT_FIN) == ANOLE_OK);
+    /* Written with its end: still goes out whole after the release. */
+    CHECK(anole_wt_stream_write(u, "more", 4, 0) == ANOLE_E_INVALID);
+    CHECK(anole_wt_stream_release(u) == ANOLE_OK);
+    CHECK(anole_wt_open_stream(ev->handle, 4, &u) == ANOLE_E_INVALID);
+    break;
+  }
+  case ANOLE_EV_WT_STREAM: {
+    const anole_wt_stream_event *se = (const anole_wt_stream_event *)ev;
+    CHECK(se->session == st->session && se->route_id == 5);
+    wt_add(st, ev->handle, se->session, (se->flags & ANOLE_WT_UNI) != 0, 0);
+    if (se->flags & ANOLE_WT_UNI) CHECK(anole_wt_stream_write(ev->handle, "x", 1, 0) == ANOLE_E_INVALID);
+    break;
+  }
+  case ANOLE_EV_WT_DATA: {
+    const anole_wt_data_event *de = (const anole_wt_data_event *)ev;
+    wt_ent *e = wt_find(st, ev->handle);
+    CHECK(e != NULL);
+    anole_str d = anole_event_str(de, de->data);
+    int fin = (de->flags & ANOLE_WT_FIN) != 0;
+    if (e->uni || e->ours) {
+      CHECK(e->len + d.len <= sizeof e->got);
+      memcpy(e->got + e->len, d.ptr, d.len);
+      e->len += d.len;
+      if (!fin) break;
+      char out[32];
+      if (e->uni) {
+        int n = snprintf(out, sizeof out, "uni:%zu", e->len);
+        CHECK(anole_wt_send_datagram(e->session, out, (size_t)n) == ANOLE_OK);
+      } else {
+        CHECK(e->len == 6 && memcmp(e->got, "thanks", 6) == 0);
+        CHECK(anole_wt_send_datagram(e->session, "thanked", 7) == ANOLE_OK);
+      }
+      wt_forget(st, e);
+    } else {
+      anole_status rc = anole_wt_stream_write(ev->handle, d.ptr, d.len, fin ? ANOLE_WT_FIN : 0);
+      CHECK(rc == ANOLE_OK || rc == ANOLE_BUSY);
+      if (fin) wt_forget(st, e);
+    }
+    break;
+  }
+  case ANOLE_EV_WT_DATAGRAM: {
+    const anole_wt_datagram_event *de = (const anole_wt_datagram_event *)ev;
+    anole_str d = anole_event_str(de, de->data);
+    char out[128];
+    int n = snprintf(out, sizeof out, "echo:%.*s", (int)d.len, d.ptr);
+    CHECK(anole_wt_send_datagram(ev->handle, out, (size_t)n) == ANOLE_OK);
+    if (d.len == 4 && memcmp(d.ptr, "open", 4) == 0) {
+      anole_wt_stream b = 0;
+      CHECK(anole_wt_open_stream(ev->handle, 0, &b) == ANOLE_OK);
+      wt_add(st, b, ev->handle, 0, 1);
+      CHECK(anole_wt_stream_write(b, "from C", 6, ANOLE_WT_FIN) == ANOLE_OK);
+    }
+    break;
+  }
+  case ANOLE_EV_WT_DRAIN:
+    st->drains++;
+    break;
+  case ANOLE_EV_WT_CLOSE: {
+    const anole_wt_close_event *ce = (const anole_wt_close_event *)ev;
+    CHECK(ev->handle == st->session && ce->route_id == 5);
+    st->close_code = ce->code;
+    st->close_by = ce->by;
+    anole_str r = anole_event_str(ce, ce->reason);
+    snprintf(st->reason, sizeof st->reason, "%.*s", (int)r.len, r.ptr);
+    st->closed++;
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+static void test_webtransport(void) {
+  anole_str name = LIT("webtransport");
+  if (!anole_has_feature(name) || wt_client_path == NULL) {
+    printf("ok webtransport (%s)\n", anole_has_feature(name) ? "no client given" : "not built in");
+    return;
+  }
+  const char *json = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 2000},"
+                     " \"listeners\": [{\"port\": 0, \"tls\": {\"self_signed\": true}, \"http3\": true}],"
+                     " \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 5}}]}";
+  anole_server *s = make_server(json);
+  anole_consumer *c = NULL;
+  anole_consumer_options co = {sizeof co, NULL, NULL, 0};
+  CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  uint16_t port = 0;
+  CHECK(anole_server_port(s, 1, &port) == ANOLE_OK && port != 0);
+
+  pid_t pid = fork();
+  CHECK(pid >= 0);
+  if (pid == 0) {
+    char arg[16];
+    snprintf(arg, sizeof arg, "%u", port);
+    execl(wt_client_path, wt_client_path, arg, (char *)NULL);
+    _exit(127);
+  }
+  static wt_state st;
+  memset(&st, 0, sizeof st);
+  static char buf[256 * 1024] __attribute__((aligned(8)));
+  int exited = 0, status = 0;
+  double deadline = now_ms() + 20000;
+  while ((!exited || !st.closed) && now_ms() < deadline) {
+    int64_t n = anole_poll_wait(c, buf, sizeof buf, 50);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      wt_event(&st, ev);
+      off += ev->len;
+    }
+    if (!exited && waitpid(pid, &status, WNOHANG) == pid) exited = 1;
+  }
+  if (!exited) {
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+  }
+  CHECK(exited && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  CHECK(st.opened == 1 && st.closed == 1);
+  CHECK(st.close_code == 7 && st.close_by == ANOLE_WT_CLOSED_PEER && strcmp(st.reason, "done") == 0);
+  CHECK(st.released >= 3);
+  /* The session and its streams are stale after the close. */
+  CHECK(anole_wt_close(st.session, 0, LIT("")) == ANOLE_E_GONE);
+  CHECK(anole_wt_send_datagram(st.session, "x", 1) == ANOLE_E_GONE);
+  CHECK(anole_wt_max_datagram(st.session) == ANOLE_E_GONE);
+  anole_wt_stream x = 0;
+  CHECK(anole_wt_open_stream(st.session, 0, &x) == ANOLE_E_GONE);
+  CHECK(anole_wt_stream_write(st.first_stream, "x", 1, 0) == ANOLE_E_GONE);
+  CHECK(anole_wt_stream_reset(st.first_stream, 1) == ANOLE_E_GONE);
+  /* A request handle is not a session. */
+  CHECK(anole_wt_close(1, 0, LIT("")) == ANOLE_E_GONE);
+  anole_stats stats = {sizeof stats};
+  CHECK(anole_server_stats(s, &stats) == ANOLE_OK && stats.wt_sessions == 0);
+  CHECK(anole_server_drain(s) == ANOLE_OK);
+  CHECK(anole_server_wait(s, -1) == ANOLE_OK);
+  anole_server_destroy(s);
+  printf("ok webtransport: a session from a Zig client, streams both ways, datagrams, the client's close\n");
+}
+
 static int run_tests(void) {
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
@@ -1921,6 +2121,7 @@ static int run_tests(void) {
   test_db_postgres();
   test_db_redis();
   test_db_mongodb();
+  test_webtransport();
   printf("PASS\n");
   return 0;
 }
@@ -1991,7 +2192,11 @@ static int serve(int executors, int port, int consumers) {
 int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   CHECK((anole_abi_version() >> 16) == ANOLE_ABI_VERSION_MAJOR);
-  if (argc >= 2 && strcmp(argv[1], "test") == 0) return run_tests();
+  if (argc >= 2 && strcmp(argv[1], "test") == 0) {
+    /* The WebTransport client (tests/capi/wt_client.zig), when built. */
+    if (argc >= 3) wt_client_path = argv[2];
+    return run_tests();
+  }
   if (argc >= 4 && strcmp(argv[1], "serve") == 0)
     return serve(atoi(argv[2]), atoi(argv[3]), argc >= 5 ? atoi(argv[4]) : 1);
   fprintf(stderr, "usage: consumer test | consumer serve <executors> <port> [consumers]\n");

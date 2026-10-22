@@ -731,6 +731,16 @@
             }
           ]
         },
+        "webtransport": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WebTransport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "timeout_ms": {
           "anyOf": [
             {
@@ -770,7 +780,7 @@
       "required": [
         "path"
       ],
-      "description": "Exactly one of handler, respond, static, websocket."
+      "description": "Exactly one of handler, respond, static, websocket, webtransport."
     },
     "Fixed": {
       "type": "object",
@@ -878,6 +888,42 @@
       "required": [
         "handler"
       ]
+    },
+    "WebTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The consumer's route id for this endpoint's events."
+        },
+        "close_on_drain": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close each session (code 0) when the server drains, right after ANOLE_EV_WT_DRAIN; false leaves that to the consumer (until timeouts.shutdown_ms)."
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Pages of other origins that may open a session, besides the request's own host; \"*\" for any. A browser request from any other origin gets 403."
+        },
+        "datagram_queue": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 64,
+          "description": "Datagrams a session holds for sending; past it the oldest is dropped (counted in anole_server_stats)."
+        }
+      },
+      "required": [
+        "handler"
+      ],
+      "description": "A WebTransport endpoint (draft-02, over HTTP/3): sessions, streams and datagrams go to a consumer. Needs a listener with http3; takes no method."
     },
     "Database": {
       "type": "object",
