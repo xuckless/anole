@@ -12,7 +12,7 @@ the server crashes or its calls collapse.
 | [fiber](servers/fiber) | Go 1.27.2, Fiber v3.6.1, gofiber/contrib websocket | webtransport-go v0.10.0 (quic-go) | compress/flate |
 | [axum](servers/axum) | Rust 1.99.1, axum 0.8.9, axum-server (rustls) | wtransport 0.7.2 (quinn) | flate2 (miniz_oxide) |
 
-Every app compresses each media packet it relays: raw DEFLATE at the
+By default every app compresses each media packet it relays (`MEDIA_DEFLATE=off` makes it a pure relay): raw DEFLATE at the
 library's default level (6), one stream per message. Each server's NOTES.md
 lists its choices and its deviations from the spec.
 
@@ -56,6 +56,7 @@ docker build -f bench/videocall/media/Dockerfile -t anole-bench/vc-media .
 docker build -f bench/loadgen/Dockerfile -t anole-bench/loadgen .
 for s in anole bun fiber axum; do docker build -f bench/videocall/servers/$s/Dockerfile -t anole-bench/vc-$s .; done
 bench/videocall/run.sh 20261022-videocall      # results/<id>/videocall/index.html
+MEDIA_DEFLATE=off bench/videocall/run.sh 20261022-videocall-relay   # pure relay
 ```
 
 `vcload -smoke -transport ws|wt -url https://127.0.0.1:8443` checks an app

@@ -85,7 +85,7 @@ func (u *smokeUser) quietMedia(d time.Duration) bool {
 
 func (u *smokeUser) send(s string) { u.c.sendText([]byte(s)) }
 
-func runSmoke(base, transport string) int {
+func runSmoke(base, transport string, deflate bool) int {
 	s := &smoke{base: base, d: newDialer(base, transport), transport: transport}
 	fmt.Printf("smoke %s %s\n", transport, base)
 
@@ -164,14 +164,18 @@ func runSmoke(base, transport string) int {
 		select {
 		case mb := <-b2.media:
 			h := parseHeader(mb)
-			ok := len(mb) > headerLen && h.Flags == flagCompressed|(map[bool]uint8{true: flagKey}[h.Kind == kindVideo]) && h.Seq == 0
-			err := inflate(h, mb[headerLen:])
+			want := map[bool]uint8{true: flagKey}[h.Kind == kindVideo]
+			if deflate {
+				want |= flagCompressed
+			}
+			ok := len(mb) > headerLen && h.Flags == want && h.Seq == 0
+			err := checkPayload(h, mb[headerLen:])
 			if h.Kind == kindVideo {
 				gotV = ok && err == nil && h.SentUS == sent && h.Len == uint32(len(key))
-				s.check("video relayed, compressed flag, inflates to the original", gotV, "flags %d err %v len %d", h.Flags, err, h.Len)
+				s.check("video relayed intact (inflated when compressed)", gotV, "flags %d err %v len %d", h.Flags, err, h.Len)
 			} else {
 				gotA = ok && err == nil && h.SentUS == sent+1 && h.Len == 160
-				s.check("audio relayed, compressed flag, inflates to the original", gotA, "flags %d err %v", h.Flags, err)
+				s.check("audio relayed intact (inflated when compressed)", gotA, "flags %d err %v", h.Flags, err)
 			}
 		case <-time.After(3 * time.Second):
 		}

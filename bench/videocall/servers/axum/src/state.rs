@@ -322,6 +322,14 @@ impl App {
                 None => return Ok(()),
             }
         };
+        // MEDIA_DEFLATE=off relays media as it came (the benchmark's
+        // no-compression pass).
+        static DEFLATE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("MEDIA_DEFLATE").as_deref() != Ok("off"));
+        if !*DEFLATE {
+            let _ = peer_tx.send(Out::Media(Bytes::copy_from_slice(data)));
+            return Ok(());
+        }
         let mut out = Vec::with_capacity(data.len());
         out.extend_from_slice(&data[..HEADER_LEN]);
         out[1] |= FLAG_COMPRESSED;

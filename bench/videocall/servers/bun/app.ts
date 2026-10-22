@@ -8,6 +8,8 @@ import { deflateRawSync } from 'node:zlib';
 export const HEADER_LEN = 24;
 export const MAX_MEDIA = 1 << 20; // 1 MiB
 const FLAG_COMPRESSED = 0x02;
+// MEDIA_DEFLATE=off relays media as it came (the benchmark's no-compression pass).
+const MEDIA_DEFLATE = process.env.MEDIA_DEFLATE !== 'off';
 const HISTORY_MAX = 100;
 
 export interface User {
@@ -191,6 +193,10 @@ export function handleMedia(conn: Conn, msg: Uint8Array): void {
   if (msg[1] & FLAG_COMPRESSED) return;
   const peer = peerOf(conn);
   if (!peer) return;
+  if (!MEDIA_DEFLATE) {
+    peer.sendMedia(msg[0], msg.subarray(0, HEADER_LEN), msg.subarray(HEADER_LEN));
+    return;
+  }
   const header = msg.slice(0, HEADER_LEN);
   header[1] |= FLAG_COMPRESSED;
   const body = deflateRawSync(msg.subarray(HEADER_LEN));

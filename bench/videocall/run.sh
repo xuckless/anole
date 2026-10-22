@@ -6,6 +6,7 @@
 #
 #   bench/videocall/run.sh [results-id]          # all of it
 #   SERVERS="anole bun" TRANSPORTS=ws STEP=5s bench/videocall/run.sh test-1
+#   MEDIA_DEFLATE=off bench/videocall/run.sh <id>   # a pure relay
 #
 # Server: 1 CPU (SUT_CPUS_1) / 2 GB, no swap. Load generator: LOAD_CPUS.
 # Images: anole-bench/vc-<app> (each servers/<app>/Dockerfile),
@@ -21,6 +22,8 @@ TRANSPORTS=${TRANSPORTS:-"ws wt"}
 STEP=${STEP:-5s}
 REST=${REST:-70}
 EXTRA=${EXTRA:-}
+# off: the servers relay media as it came, without deflating it.
+MEDIA_DEFLATE=${MEDIA_DEFLATE:-on}
 media=$bench/.data/media/vc
 sh "$bench/lib/certs.sh" >/dev/null
 [ -f "$media/video.h264" ] || docker run --rm -v "$media:/out:z" anole-bench/vc-media sh -c "gen.sh /out >/dev/null && chown -R $(id -u):$(id -g) /out"
@@ -41,7 +44,7 @@ for transport in $TRANSPORTS; do
     cid=$(docker run -d --name vc-sut --network host \
       --cpuset-cpus "$SUT_CPUS_1" --cpus 1 --memory 2g --memory-swap 2g \
       --ulimit nofile=1048576:1048576 \
-      -v "$bench/.data/certs:/certs:ro,z" -e PORT=8443 "anole-bench/vc-$app")
+      -v "$bench/.data/certs:/certs:ro,z" -e PORT=8443 -e MEDIA_DEFLATE="$MEDIA_DEFLATE" "anole-bench/vc-$app")
     ready=0
     for _ in $(seq 60); do
       curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/health 2>/dev/null | grep -q 200 && { ready=1; break; }
@@ -53,7 +56,7 @@ for transport in $TRANSPORTS; do
     log "$app $transport: ramp"
     docker run --rm --name vc-load --network host --cpuset-cpus "$LOAD_CPUS" \
       --ulimit nofile=1048576:1048576 --security-opt label=disable \
-      -u "$(id -u):$(id -g)" \
+      -u "$(id -u):$(id -g)" -e MEDIA_DEFLATE="$MEDIA_DEFLATE" \
       -v /sys/fs/cgroup:/host/cgroup:ro -v "$media:/data/media/vc:ro" -v "$dir:/out" \
       --entrypoint vcload anole-bench/loadgen \
       -transport "$transport" -url https://127.0.0.1:8443 -step "$STEP" \

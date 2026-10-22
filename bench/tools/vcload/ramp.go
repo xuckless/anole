@@ -211,7 +211,7 @@ func (r *ramp) run() error {
 	r.probe.Flush()
 	r.probeMu.Unlock()
 	sum := map[string]any{"transport": r.transport, "url": r.base, "stop": reason, "users": r.count(),
-		"start_us": r.start.UnixMicro(),
+		"start_us": r.start.UnixMicro(), "media_deflate": os.Getenv("MEDIA_DEFLATE") != "off",
 		"seconds": int(time.Since(r.start).Seconds()), "step_s": r.step.Seconds(), "clip": r.clip.String(),
 		"video_deadline_ms": r.videoDeadline.Milliseconds(), "audio_deadline_ms": r.audioDeadline.Milliseconds(),
 		"mem_peak_mb": cg.peakMB}
@@ -411,7 +411,7 @@ func (u *vuser) onMedia(b []byte) {
 		return
 	}
 	h := parseHeader(b)
-	ok := h.Flags&flagCompressed != 0 && inflate(h, b[headerLen:]) == nil
+	ok := checkPayload(h, b[headerLen:]) == nil
 	lat := recv - h.SentUS
 	u.mu.Lock()
 	peer := u.peer

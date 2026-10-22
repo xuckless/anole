@@ -16,6 +16,8 @@ const header_len = 24;
 /// The largest media message: the header and 1 MiB of payload.
 const max_media = header_len + (1 << 20);
 const history_len = 100;
+/// MEDIA_DEFLATE=off, read once in `main`.
+var media_deflate = true;
 const kind_video = 1;
 const flag_compressed = 2;
 
@@ -373,7 +375,7 @@ const Session = struct {
             const call = s.user.call orelse return;
             break :blk call.peerOf(s.user);
         };
-        sendMedia(s.io, peer, msg[0], try packer.pack(msg));
+        sendMedia(s.io, peer, msg[0], if (packer.deflate) try packer.pack(msg) else msg);
     }
 };
 
@@ -381,11 +383,14 @@ const Session = struct {
 /// message a stream of its own), reusing one compressor and buffer.
 const Packer = struct {
     gpa: std.mem.Allocator,
+    /// Off with MEDIA_DEFLATE=off: media is relayed as it came (the
+    /// benchmark's no-compression pass).
+    deflate: bool = true,
     out: std.Io.Writer.Allocating,
     z: ?zlib.Compress = null,
 
     fn init(gpa: std.mem.Allocator) !Packer {
-        return .{ .gpa = gpa, .out = try .initCapacity(gpa, 64 * 1024) };
+        return .{ .gpa = gpa, .out = try .initCapacity(gpa, 64 * 1024), .deflate = media_deflate };
     }
 
     fn deinit(p: *Packer) void {
@@ -548,6 +553,7 @@ pub fn main(init: std.process.Init) !void {
     const port = std.fmt.parseInt(u16, env.get("PORT") orelse "8443", 10) catch 8443;
     const cert: anole.Cert = .fromFiles(env.get("CERT") orelse "/certs/cert.pem", env.get("KEY") orelse "/certs/key.pem");
 
+    media_deflate = !std.mem.eql(u8, env.get("MEDIA_DEFLATE") orelse "on", "off");
     var state: App = .{ .gpa = init.gpa };
     defer state.deinit();
     var app = try anole.Server(App).init(init.gpa, .{

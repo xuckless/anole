@@ -38,6 +38,7 @@ func main() {
 	videoDeadline := flag.Duration("video-deadline", 200*time.Millisecond, "a frame later than this (one way) misses its playout")
 	audioDeadline := flag.Duration("audio-deadline", 150*time.Millisecond, "an audio packet later than this misses its playout")
 	chatEvery := flag.Duration("chat-every", 3*time.Second, "chat interval per user")
+	deflate := flag.Bool("deflate", true, "smoke: expect the server to deflate media (false for MEDIA_DEFLATE=off)")
 	flag.Parse()
 
 	if *transport != "ws" && *transport != "wt" {
@@ -45,7 +46,7 @@ func main() {
 		os.Exit(2)
 	}
 	if *smokeMode {
-		if runSmoke(*url, *transport) > 0 {
+		if runSmoke(*url, *transport, *deflate) > 0 {
 			os.Exit(1)
 		}
 		return

@@ -61,6 +61,18 @@ func mediaMessage(kind, flags uint8, seq uint32, sentUS int64, payload []byte) [
 
 var inflaters = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
 
+// checkPayload checks a relayed payload's length and CRC, inflating it
+// first when the server compressed it.
+func checkPayload(h header, body []byte) error {
+	if h.Flags&flagCompressed != 0 {
+		return inflate(h, body)
+	}
+	if uint32(len(body)) != h.Len || crc32.ChecksumIEEE(body) != h.CRC {
+		return errors.New("crc mismatch")
+	}
+	return nil
+}
+
 // inflate undoes the server's raw DEFLATE and checks length and CRC.
 func inflate(h header, body []byte) error {
 	r := inflaters.Get().(io.ReadCloser)

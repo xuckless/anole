@@ -21,6 +21,7 @@ WebSockets, UDP 8443 for HTTP/3 and WebTransport. A run uses one transport.
 |---|---|---|
 | `PORT` | `8443` | TCP and UDP port |
 | `CERT`, `KEY` | `/certs/cert.pem`, `/certs/key.pem` | the shared self-signed ECDSA P-256 certificate (mounted read-only) |
+| `MEDIA_DEFLATE` | `on` | `off`: relay media messages unchanged, with no compression and the flag left clear (a pure relay) |
 
 - One process. Whatever the runtime does by default for its thread count:
   Go's GOMAXPROCS, tokio's default multi-thread runtime, Anole's default

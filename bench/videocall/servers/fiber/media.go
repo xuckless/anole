@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"os"
 	"sync"
 )
 
@@ -46,5 +47,13 @@ func (h *Hub) RelayMedia(u *User, msg []byte) {
 	if peer == nil {
 		return
 	}
+	if !mediaDeflate {
+		peer.SendMedia(msg[0], msg)
+		return
+	}
 	peer.SendMedia(msg[0], compressMedia(msg))
 }
+
+// mediaDeflate is off with MEDIA_DEFLATE=off: media is relayed as it came
+// (the benchmark's no-compression pass).
+var mediaDeflate = os.Getenv("MEDIA_DEFLATE") != "off"
