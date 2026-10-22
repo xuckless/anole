@@ -124,6 +124,16 @@ fn bigBody(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = body;
 }
 
+/// GET /bighead: a response head of 90 KiB, in three fields.
+fn bigHead(_: *dusty.Request, res: *dusty.Response) !void {
+    const value = try res.arena.alloc(u8, 30 * 1024);
+    @memset(value, 'h');
+    try res.header("x-big-1", value);
+    try res.header("x-big-2", value);
+    try res.header("x-big-3", value);
+    res.body = "big head";
+}
+
 /// A `no_wait` handler that waits all the same.
 fn slowNoWait(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromMilliseconds(20), .awake);
@@ -188,6 +198,7 @@ const Fixture = struct {
         http.router.post("/early-post", earlyPost);
         http.router.get("/port", port);
         http.router.get("/download", download);
+        http.router.get("/bighead", bigHead);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -477,6 +488,82 @@ test "h3 server: long-header packets with a connection ID over 20 bytes are drop
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+fn headersStatus(conn: *client.ClientConnection, gpa: std.mem.Allocator, extra: []const client.Header) !u16 {
+    var all: std.ArrayList(client.Header) = .empty;
+    defer all.deinit(gpa);
+    try all.appendSlice(gpa, &.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    });
+    try all.appendSlice(gpa, extra);
+    const s = try conn.request(all.items, .{});
+    defer s.release();
+    try s.waitHead();
+    const body = try s.reader().allocRemaining(gpa, .unlimited);
+    gpa.free(body);
+    return s.status;
+}
+
+test "h3 server: a request head past max_field_section_size or max_header_count gets 431, and the connection carries on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // 160 KiB in 20 fields: few enough, but past the 64 KiB section limit.
+    const value = try gpa.alloc(u8, 8 * 1024);
+    defer gpa.free(value);
+    @memset(value, 'v');
+    var names: [40][16]u8 = undefined;
+    var big: [20]client.Header = undefined;
+    for (&big, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-big-{d}", .{i}), .value = value };
+    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, &big));
+
+    // Small, but more fields than request.max_header_count (32).
+    var many: [40]client.Header = undefined;
+    for (&many, 0..) |*hd, i| hd.* = .{ .name = try std.fmt.bufPrint(&names[i], "x-many-{d}", .{i}), .value = "1" };
+    try std.testing.expectEqual(@as(u16, 431), try headersStatus(conn, gpa, &many));
+
+    // Just under both limits: served.
+    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, big[0..6]));
+    try std.testing.expectEqual(@as(u16, 200), try headersStatus(conn, gpa, many[0..30]));
+}
+
+test "h3 client: a response head past max_field_section_size fails the connection" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    {
+        const conn = try f.connect(gpa, io);
+        defer conn.close();
+        const s = try conn.request(&.{
+            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/bighead" },
+            .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+        }, .{});
+        defer s.release();
+        try std.testing.expect(std.meta.isError(s.waitHead()));
+    }
+    // A client that allows it takes the head.
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .max_field_section_size = 128 * 1024,
+    });
+    defer conn.close();
+    const body = try get(conn, "/bighead", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("big head", body);
 }
 
 test "h3 server: Response.abort resets the stream, and the connection carries on" {

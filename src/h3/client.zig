@@ -101,6 +101,12 @@ pub const ConnectOptions = struct {
     /// HTTP/3 only: speak WebTransport (draft-02), for `openWebTransport`: its SETTINGS,
     /// HTTP datagrams, and streams the server may open.
     webtransport: bool = false,
+    /// HTTP/3 only: the largest response head the client takes (decoded
+    /// names and values plus 32 bytes a field, sent to the server as
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE). The trailers get as much again;
+    /// 1xx heads count against the response head's. A server that sends
+    /// more fails the connection.
+    max_field_section_size: u32 = 64 * 1024,
 
     /// The fields of `anole.h2.ConnectOptions.Tls`, with the same defaults.
     pub const Tls = struct {
@@ -240,6 +246,8 @@ pub const ClientConnection = struct {
     wt: ?*webtransport.Core = null,
     /// The server's SETTINGS, once they arrived.
     peer_settings: ?PeerSettings = null,
+    /// `ConnectOptions.max_field_section_size`.
+    max_field_section_size: u32 = 64 * 1024,
 
     /// What the server's SETTINGS allow (`waitSettings`).
     pub const PeerSettings = struct {
@@ -284,6 +292,7 @@ pub const ClientConnection = struct {
             .tx = tx,
             .rx = rx,
             .timeout = timeoutFrom(options.timeout),
+            .max_field_section_size = options.max_field_section_size,
         };
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
@@ -1000,6 +1009,7 @@ pub const ClientConnection = struct {
         nghttp3.settingsDefault(&settings);
         settings.qpack_max_dtable_capacity = 4096;
         settings.qpack_blocked_streams = 100;
+        settings.max_field_section_size = self.max_field_section_size;
         settings.h3_datagram = @intFromBool(self.wt != null);
         var hc: ?*h.nghttp3_conn = null;
         if (nghttp3.connClientNew(&hc, &h3_callbacks, &settings, h.nghttp3_mem_default(), self) != 0) return error.Http3SetupFailed;
@@ -1257,6 +1267,7 @@ pub const ClientConnection = struct {
     fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
         const v = h.nghttp3_rcbuf_get_buf(value);
+        if (!s.countField(&s.head_bytes, name, v.len)) return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         if (token == h.NGHTTP3_QPACK_TOKEN__STATUS) {
             s.status = std.fmt.parseInt(u16, v.base[0..v.len], 10) catch 0;
             return 0;
@@ -1286,6 +1297,7 @@ pub const ClientConnection = struct {
         const s = streamOfUser(sud) orelse return 0;
         const n = h.nghttp3_rcbuf_get_buf(name);
         const v = h.nghttp3_rcbuf_get_buf(value);
+        if (!s.countField(&s.trailer_bytes, name, v.len)) return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         s.addField(&s.trailers, n.base[0..n.len], v.base[0..v.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
         return 0;
     }
@@ -1357,6 +1369,10 @@ pub const Stream = struct {
     status: u16 = 0,
     headers: std.ArrayList(Header) = .empty,
     trailers: std.ArrayList(Header) = .empty,
+    /// Decoded bytes of the heads (1xx ones too) and of the trailers, as
+    /// `max_field_section_size` counts them.
+    head_bytes: u64 = 0,
+    trailer_bytes: u64 = 0,
     head_ready: bool = false,
     /// Why the stream ended early (reset, the connection went, the time
     /// ran out).
@@ -1453,6 +1469,13 @@ pub const Stream = struct {
             nv.* = .{ .name = name.ptr, .namelen = name.len, .value = value.ptr, .valuelen = value.len, .flags = h.NGHTTP3_NV_FLAG_NONE };
         }
         return nva;
+    }
+
+    /// Counts a field the server sent; false past what the client allows
+    /// (nghttp3 only advertises the limit).
+    fn countField(self: *Stream, total: *u64, name: ?*h.nghttp3_rcbuf, value_len: usize) bool {
+        total.* += @as(u64, h.nghttp3_rcbuf_get_buf(name).len) + value_len + 32;
+        return total.* <= self.conn.max_field_section_size;
     }
 
     fn addField(self: *Stream, list: *std.ArrayList(Header), name: []const u8, value: []const u8) !void {

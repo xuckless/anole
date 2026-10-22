@@ -12,6 +12,13 @@ breaking changes are listed anyway.
   are dropped before any lookup. Previously one such datagram could crash
   the process. Every deployment with HTTP/3 on should upgrade; no
   configuration change is needed.
+- HTTP/3 server: the request head's size (64 KiB, as advertised in
+  SETTINGS) and field count (`request.max_header_count`) are enforced as
+  the fields arrive; a larger head is answered 431. Before, the whole head
+  was kept in memory however large it was.
+- HTTP/3 client: response heads and trailers are limited to the new
+  `ConnectOptions.max_field_section_size` (64 KiB by default, also sent to
+  the server); a server that sends more fails the connection.
 
 ### C ABI (ABI 0.1)
 

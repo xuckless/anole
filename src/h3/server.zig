@@ -107,7 +107,10 @@ pub const Options = struct {
     validate_address: bool = false,
     /// How long a drain lets requests finish before closing connections.
     drain_timeout_ms: u32 = 10_000,
-    /// Largest request header section.
+    /// Largest request header section: decoded names and values plus 32
+    /// bytes a field, as SETTINGS_MAX_FIELD_SECTION_SIZE counts them. A
+    /// larger head, or one with more fields than the server's
+    /// `request.max_header_count`, is answered 431 and never kept whole.
     max_field_section_size: u64 = 64 * 1024,
     /// Also speak HTTP/0.9 over QUIC (ALPN "hq-interop"), serving the files
     /// under this directory: what the QUIC interop runner's tests use. Only
@@ -2057,6 +2060,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             early: bool = false,
             /// `:protocol`, on an extended CONNECT (RFC 9220).
             protocol: []const u8 = "",
+            /// The head's decoded size so far (names, values and 32 bytes a
+            /// field, as SETTINGS_MAX_FIELD_SECTION_SIZE counts it).
+            head_bytes: u64 = 0,
+            /// The head went past `max_field_section_size` or the request's
+            /// `max_header_count`: the rest of it is not kept, and the
+            /// request is answered 431 without reaching a handler.
+            head_too_large: bool = false,
             /// Who still holds the stream.
             refs: struct { quic: bool = true, handler: bool = false } = .{},
             /// The connection's flush waits for this request's answer
@@ -2303,6 +2313,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                     response.detach_ctx = ex;
                 }
 
+                if (s.head_too_large) {
+                    response.status = .request_header_fields_too_large;
+                    try response.write();
+                    return .done;
+                }
                 if (s.method.len == 0 or s.path.len == 0) {
                     response.status = .bad_request;
                     {
@@ -3198,9 +3213,17 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
             // Trailers on a request are not passed on.
-            if (s.started) return 0;
+            if (s.started or s.head_too_large) return 0;
             const arena = s.arena.allocator();
             const v = h.nghttp3_rcbuf_get_buf(value);
+            const n = h.nghttp3_rcbuf_get_buf(name);
+            // nghttp3 only advertises the limit; it is enforced here, as
+            // the fields arrive, so nothing past it is kept.
+            s.head_bytes += @as(u64, n.len) + v.len + 32;
+            if (s.head_bytes > s.conn.ep.options.max_field_section_size) {
+                s.head_too_large = true;
+                return 0;
+            }
             const val = arena.dupe(u8, v.base[0..v.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
             switch (token) {
                 h.NGHTTP3_QPACK_TOKEN__PATH => s.path = val,
@@ -3209,7 +3232,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 h.NGHTTP3_QPACK_TOKEN__PROTOCOL => s.protocol = val,
                 h.NGHTTP3_QPACK_TOKEN__SCHEME => {},
                 else => {
-                    const n = h.nghttp3_rcbuf_get_buf(name);
+                    if (s.headers.items.len >= s.conn.ep.http.config.request.max_header_count) {
+                        s.head_too_large = true;
+                        return 0;
+                    }
                     const key = arena.dupe(u8, n.base[0..n.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                     s.headers.append(arena, .{ .name = key, .value = val }) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 },
