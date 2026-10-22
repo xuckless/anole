@@ -994,6 +994,22 @@ pub const Relay = struct {
         defer r.mutex.unlock(r.io);
         for (r.recorded.items) |d| attacker.send(r.io, r.server, null, 0, d, d.len);
     }
+
+    /// As `replay`, with the first two recorded datagrams sent as one (as
+    /// clients that coalesce their first flight send it).
+    fn replayCoalesced(r: *Relay) !void {
+        const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var sender: net.Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }));
+        defer sender.socket.close(r.io);
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        const items = r.recorded.items;
+        if (items.len < 2) return error.TooFewDatagrams;
+        const joined = try std.mem.concat(r.gpa, u8, &.{ items[0], items[1] });
+        defer r.gpa.free(joined);
+        sender.send(r.io, r.server, null, 0, joined, joined.len);
+        for (items[2..]) |d| sender.send(r.io, r.server, null, 0, d, d.len);
+    }
 };
 
 fn request(conn: *client.ClientConnection, method: []const u8, path: []const u8, options: client.ClientConnection.RequestOptions) !*client.Stream {
@@ -1097,6 +1113,51 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     try io.sleep(.fromMilliseconds(300), .awake);
     try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), f.ep.early_served.load(.monotonic));
+}
+
+test "h3: a new connection given up after its first packet started a 0-RTT request is freed safely" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .early_data = true });
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        const b = try finish(try request(conn, "GET", "/early", .{}), gpa);
+        defer gpa.free(b);
+        try eventually(io, 2, hasTicket, &cache);
+    }
+    // A resumed connection whose first flight carries a request that
+    // waits (a POST held for the handshake): recorded.
+    relay.arm(300);
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        const p = try finish(try request(conn, "POST", "/early-post", .{ .early = true }), gpa);
+        gpa.free(p);
+        relay.disarm();
+    }
+    try eventually(io, 10, noConnections, f.ep);
+    // The same flight again, and the server gives the new connection up
+    // right after reading its first packet.
+    f.ep.test_fail_accept = true;
+    try relay.replayCoalesced();
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try std.testing.expect(!f.ep.test_fail_accept);
+    // It did start a request before it was given up.
+    try std.testing.expectEqual(@as(u32, 1), f.ep.test_given_up_with_tasks.load(.monotonic));
+    // The endpoint still serves.
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
 }
 
 test "h3: 0-RTT carries on across a certificate reload" {

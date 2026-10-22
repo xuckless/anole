@@ -332,6 +332,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// Connections that closed with request tasks still running, each
         /// waiting for them in a task of its own (`retire`).
         finishers: std.Io.Group = .init,
+        /// Tests only: the next accepted connection fails after its first
+        /// packet was read, as when its IDs cannot be registered.
+        test_fail_accept: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+        /// Tests only: new connections given up with request tasks
+        /// already running.
+        test_given_up_with_tasks: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
         draining: bool = false,
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
@@ -1157,13 +1163,17 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (rv != 0) {
                 conn.unlock();
                 if (rv == c.NGTCP2_ERR_RETRY) self.sendRetry(&hd, remote, local, data.len * 3);
-                conn.destroy();
+                self.giveUp(conn);
                 return;
             }
             conn.unlock();
 
+            if (builtin.is_test) if (self.test_fail_accept) {
+                self.test_fail_accept = false;
+                return self.giveUp(conn);
+            };
             self.associate(.ofCid(&hd.dcid), conn) catch {
-                conn.destroy();
+                self.giveUp(conn);
                 return;
             };
             var scids: [8]c.ngtcp2_cid = undefined;
@@ -1176,6 +1186,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             conn.driven = true;
             self.queue(conn);
             _ = self.stats.accepted.fetchAdd(1, .monotonic);
+        }
+
+        /// Frees a connection `accept` will not keep. Its first packet may
+        /// already have started request tasks (0-RTT), which hold it: then
+        /// it ends as any other does, once they have.
+        fn giveUp(self: *Self, conn: *Conn) void {
+            if (conn.tasks.load(.acquire) == 0) return conn.destroy();
+            if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .monotonic);
+            conn.retired = true;
+            placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
 
         fn sendVersionNegotiation(self: *Self, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, vc: *const c.ngtcp2_version_cid) void {
