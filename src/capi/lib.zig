@@ -1599,6 +1599,132 @@ export fn anole_webhooks_watch(j: ?*anyopaque, c_: ?*anyopaque, user_data: u64) 
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----
+// ---- Server-sent events -----------------------------------------------------------------
+
+export fn anole_sse_publish(s: ?*anyopaque, topic: Str, event: Str, data: ?*const anyopaque, len: usize, flags: u32) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    if (flags & ~abi.SSE_F_NO_REPLAY != 0) return unknownFlag();
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
+    engine.sse.publish(e, topic.slice(), event.slice(), b, flags) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "NotRunning", 0, "anole_sse_publish: the server is not running", .{}),
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "anole_sse_publish: a topic of 1 to 255 bytes, an event name without CR or LF, data within limits.sse_max_event", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
+
+export fn anole_sse_gap(s: ?*anyopaque, topic: Str, flags: u32) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    if (flags & ~abi.SSE_F_PREFIX != 0) return unknownFlag();
+    engine.sse.gap(e, topic.slice(), flags) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "NotRunning", 0, "anole_sse_gap: the server is not running", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
+
+export fn anole_sse_accept(r: u64, options: ?*const abi.SseAcceptOptions, out: ?*u64) i32 {
+    if (badKind(r, .request)) return wrongKind();
+    const o = out orelse return failCode(abi.E_INVALID);
+    const opts: abi.SseAcceptOptions = if (options) |p| readSized(abi.SseAcceptOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.SseAcceptOptions) };
+    if (opts.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_sse_accept_options.reserved must be 0", .{});
+    const hs = headersOf(opts.headers, opts.nheaders) orelse return failCode(abi.E_INVALID);
+    const strs: []const abi.Str = if (opts.ntopics == 0) &.{} else (opts.topics orelse return failCode(abi.E_INVALID))[0..opts.ntopics];
+    var arena_state = std.heap.ArenaAllocator.init(engine.gpa);
+    defer arena_state.deinit();
+    const topics = engine.sse.acceptTopics(strs, arena_state.allocator()) catch |err| return answer(err);
+    const e = live() orelse return failCode(abi.E_GONE);
+    o.* = 0;
+    o.* = engine.sseAccept(e, r, topics, hs, opts.last) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "NotSse", 0, "not an SSE subscription (anole_sse_accept answers ANOLE_EV_SSE_SUBSCRIBE only)", .{}),
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "a topic of 1 to 255 bytes, or a header the stream writes itself (Content-Type, Cache-Control, Connection, Content-Length, Transfer-Encoding, X-Accel-Buffering), or an invalid one", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
+
+export fn anole_sse_subscribe(h: u64, topic: Str, last: u32) i32 {
+    if (badKind(h, .sse)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    engine.sse.subscribe(e, h, topic.slice(), last) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_sse_unsubscribe(h: u64, topic: Str) i32 {
+    if (badKind(h, .sse)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    engine.sse.unsubscribe(e, h, topic.slice()) catch |err| return cleanup(err);
+    return abi.OK;
+}
+
+export fn anole_sse_send(h: u64, event: Str, data: ?*const anyopaque, len: usize, flags: u32) i32 {
+    if (badKind(h, .sse)) return wrongKind();
+    if (flags != 0) return unknownFlag();
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const busy = engine.sse.send(e, h, event.slice(), b) catch |err| return answer(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_sse_close(h: u64) i32 {
+    if (badKind(h, .sse)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    engine.sse.closeSub(e, h) catch |err| return cleanup(err);
+    return abi.OK;
+}
+
+// ---- watch -----------------------------------------------------------------------------
+
+export fn anole_watch_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const o = out orelse return failCode(abi.E_INVALID);
+    o.* = null;
+    const en = engine.watch.find(e, name.slice()) orelse return named(abi.E_INVALID, "UnknownWatch", 0, "anole_watch_find: no watch of that name in \"watches\"", .{});
+    o.* = en;
+    return abi.OK;
+}
+
+export fn anole_watch_index(w: ?*const anyopaque) u32 {
+    const en: *const engine.watch.Entry = @ptrCast(@alignCast(w orelse return std.math.maxInt(u32)));
+    return en.index;
+}
+
+export fn anole_watch_listen(w: ?*anyopaque, c: ?*anyopaque, options: ?*const abi.WatchListenOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const en: *engine.watch.Entry = @ptrCast(@alignCast(w orelse return failCode(abi.E_INVALID)));
+    const consumer = consumerOf(c) orelse return badPointer(c);
+    const o = out orelse return failCode(abi.E_INVALID);
+    const opts: abi.WatchListenOptions = if (options) |p| readSized(abi.WatchListenOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.WatchListenOptions) };
+    if (opts.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_watch_listen_options.reserved must be 0", .{});
+    const e = live() orelse return failCode(abi.E_STATE);
+    o.* = 0;
+    o.* = engine.watch.listen(e, en, consumer, opts, user_data) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "State", 0, "anole_watch_listen: the server is not running, the watch stopped, or the consumer has no executor", .{}),
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "anole_watch_listen_options: format is ANOLE_WATCH_NATIVE or ANOLE_WATCH_JSON", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
+
+export fn anole_watch_unlisten(l: u64) i32 {
+    if (badKind(l, .watch_sub)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    engine.watch.unlisten(e, l) catch |err| return cleanup(err);
+    return abi.OK;
+}
+
+export fn anole_watch_ack(l: u64, position: Str) i32 {
+    if (badKind(l, .watch_sub)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    engine.watch.ack(e, l, position.slice()) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "WrongWatchKind", 0, "anole_watch_ack: only a Redis stream group with \"ack\": \"manual\" takes it", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----

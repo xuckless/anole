@@ -14,6 +14,8 @@ const Connection = @import("server.zig").Connection;
 const Adopter = @import("server.zig").Adopter;
 pub const Sink = @import("sink.zig").Sink;
 pub const Detached = @import("detach.zig").Detached;
+pub const Parked = @import("parked.zig").Parked;
+const Parked_H1 = @import("parked.zig").H1Parked;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
 const ErrorFormat = @import("config.zig").ErrorFormat;
@@ -138,7 +140,7 @@ pub const EventStream = struct {
 
         /// A CR or LF in either field would close the line early and let
         /// whoever supplied it write the rest of the event itself.
-        fn validate(self: Options) error{InvalidEventField}!void {
+        pub fn validate(self: Options) error{InvalidEventField}!void {
             if (self.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
             if (self.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
         }
@@ -190,29 +192,37 @@ pub const EventStream = struct {
 
     /// The fields that precede the data. Reports the sentinel, as anything
     /// writing to a `std.Io.Writer` does; the public entry points resolve it.
-    fn sendFields(w: *std.Io.Writer, opts: Options) std.Io.Writer.Error!void {
+    pub fn sendFields(w: *std.Io.Writer, opts: Options) std.Io.Writer.Error!void {
         if (opts.event) |e| try w.print("event: {s}\n", .{e});
         if (opts.id) |id| try w.print("id: {s}\n", .{id});
         if (opts.retry) |r| try w.print("retry: {d}\n", .{r});
     }
 
     fn sendEvent(w: *std.Io.Writer, data: []const u8, opts: Options) std.Io.Writer.Error!void {
-        try sendFields(w, opts);
-        // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
-        var rest = data;
-        while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
-            try w.print("data: {s}\n", .{rest[0..idx]});
-            var next = idx + 1;
-            if (rest[idx] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
-            rest = rest[next..];
-        }
-        try w.print("data: {s}\n", .{rest});
-        try w.writeAll("\n");
+        try writeEvent(w, data, opts);
         // One event, one write: an event held back is an event the peer
         // has not had, and the next one may be a long way off.
         return w.flush();
     }
 };
+
+/// One event as bytes: the fields (`event:`, `id:`, `retry:`), a `data:`
+/// line per CR, LF or CRLF in `data`, and the blank line that ends it.
+/// Nothing is flushed. The one encoder, for `EventStream` and `anole.sse`.
+/// The fields must not hold CR or LF (`EventStream.Options.validate`).
+pub fn writeEvent(w: *std.Io.Writer, data: []const u8, opts: EventStream.Options) std.Io.Writer.Error!void {
+    try EventStream.sendFields(w, opts);
+    // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
+    var rest = data;
+    while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
+        try w.print("data: {s}\n", .{rest[0..idx]});
+        var next = idx + 1;
+        if (rest[idx] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
+        rest = rest[next..];
+    }
+    try w.print("data: {s}\n", .{rest});
+    try w.writeAll("\n");
+}
 
 /// A buffered response body: segments of the request arena, each allocated
 /// when the last one fills and never moved. It is collected only so its
@@ -853,6 +863,13 @@ pub const Response = struct {
     _detach_blocked: bool = false,
     /// Set by `detach`.
     detached: ?*Detached = null,
+    /// The engine offers `detach` to `_park` only (an HTTP/2 stream on its
+    /// own task): `canDetach` stays false, so the C ABI's detaching, which
+    /// is for requests on the reader, is unchanged.
+    _detach_park_only: bool = false,
+    /// `_park` ran: the response is a parked stream's, and `write` does
+    /// nothing more.
+    _parked: bool = false,
 
     /// A file body set up by `sendFile`.
     pub const BodyFile = struct {
@@ -1460,7 +1477,85 @@ pub const Response = struct {
     /// Whether `detach` would work: the engine supports it, nothing has
     /// gone out, and every middleware the request passed is detach-safe.
     pub fn canDetach(self: *const Response) bool {
-        return self._detach_engine != null and !self._detach_blocked and self.detached == null and !self._headers_written;
+        return self._detach_engine != null and !self._detach_park_only and !self._detach_blocked and self.detached == null and !self._headers_written;
+    }
+
+    /// Whether `_park` would work: an engine that parks (HTTP/1.1 with a
+    /// connection to adopt, HTTP/2) and no middleware on the way that is
+    /// not detach-safe. Internal.
+    pub fn _canPark(self: *const Response) bool {
+        if (self._detach_blocked or self._parked or self._headers_written or self.detached != null) return false;
+        if (self._sink != null) {
+            const engine = self._detach_engine orelse return false;
+            return engine.park != null;
+        }
+        const conn = self._conn orelse return false;
+        return conn.adopter == null and !conn.upgraded and self.status != .switching_protocols;
+    }
+
+    /// Writes the head (status and headers as set; chunked over HTTP/1.1)
+    /// and parks the response (see `Parked`). The handler returns right
+    /// after; `write` at the handler's end does nothing for a parked
+    /// response. `error.Unsupported` when `_canPark` is false (nothing
+    /// written). Internal.
+    pub fn _park(self: *Response, req: *Request, owner: Parked.Owner) error{ Unsupported, OutOfMemory, WriteFailed }!*Parked {
+        if (!self._canPark()) return error.Unsupported;
+        if (self._sink != null) {
+            const d = try self.detachUnchecked(req, .{ .abort = parkedNoAbort, .ctx = self });
+            // Detached already: on failure the engine ends the stream.
+            return d.response.parkAfterHead(d, owner);
+        }
+        const conn = self._conn.?;
+        // The request buffers' pages go back before anything is written,
+        // as for an upgrade; nothing the handler may still read is lost.
+        conn.shrinkForUpgrade();
+        self.status = .ok;
+        var w = self.stream(&.{}) catch return error.WriteFailed;
+        _ = &w;
+        // The head is out and the writer is the park's from here.
+        self._body_writer_open = false;
+        self._written = true;
+        self._parked = true;
+        conn.finishUpgrade();
+        const chunked = self._chunked;
+        // The connection is the parked stream's: the server hands it to
+        // the adopter instead of waiting for a next request.
+        self.keepalive = false;
+        const h1 = Parked_H1.create(conn, chunked, owner) catch return error.OutOfMemory;
+        conn.adopter = &h1.adopter;
+        return &h1.parked;
+    }
+
+    /// `_park` for a response already detached (`detach`), such as the C
+    /// ABI's requests on HTTP/2: the head goes out and the response parks,
+    /// with `d` still owned by the engine. Internal.
+    pub fn _parkDetached(d: *Detached, owner: Parked.Owner) error{ Unsupported, OutOfMemory, WriteFailed }!*Parked {
+        if (d.response._sink == null or d.engine.park == null) return error.Unsupported;
+        if (d.response._parked or d.response._headers_written) return error.Unsupported;
+        return d.response.parkAfterHead(d, owner);
+    }
+
+    fn parkAfterHead(self: *Response, d: *Detached, owner: Parked.Owner) error{ OutOfMemory, WriteFailed }!*Parked {
+        // The engine routes the body away from its ordinary queue first
+        // (a parked stream has no buffer of its own), then the head is
+        // recorded and goes out.
+        const p = d.engine.park.?(d, owner) catch |err| {
+            d.finish(err);
+            return err;
+        };
+        var w = self.stream(&.{}) catch |err| {
+            d.finish(err);
+            p.release();
+            return error.WriteFailed;
+        };
+        _ = &w;
+        self._body_writer_open = false;
+        self._parked = true;
+        return p;
+    }
+
+    fn parkedNoAbort(ctx: *anyopaque) void {
+        _ = ctx;
     }
 
     /// Whether the handler detached the response (`detach`): a detach-safe
@@ -1480,6 +1575,10 @@ pub const Response = struct {
     /// then answers as usual (waiting, if it must).
     pub fn detach(self: *Response, req: *Request, owner: Detached.Owner) error{ Unsupported, OutOfMemory }!*Detached {
         if (!self.canDetach()) return error.Unsupported;
+        return self.detachUnchecked(req, owner);
+    }
+
+    fn detachUnchecked(self: *Response, req: *Request, owner: Detached.Owner) error{ OutOfMemory }!*Detached {
         const d = try self.arena.create(Detached);
         d.* = .{
             .request = req,
@@ -1515,7 +1614,9 @@ pub const Response = struct {
     /// the handler does, `adopter.release` runs when the connection closes.
     /// The request and this response end with the handler.
     pub fn adopt(self: *Response, adopter: *Adopter) error{Unsupported}!void {
-        if (self._sink != null or self.status != .switching_protocols or !self._headers_written) return error.Unsupported;
+        if (self._sink != null or !self._headers_written) return error.Unsupported;
+        // A 101, or a streamed 200 (a parked event stream).
+        if (self.status != .switching_protocols and !(self._streaming or self._chunked)) return error.Unsupported;
         self._conn.?.adopter = adopter;
     }
 
@@ -1909,7 +2010,7 @@ pub const Response = struct {
     /// out, and the body. The server calls it after the handler; a
     /// second call does nothing.
     pub fn write(self: *Response) WriteError!void {
-        if (self._written) {
+        if (self._written or self._parked) {
             return;
         }
         // An upgrade's 101 went out with it, and the connection is the

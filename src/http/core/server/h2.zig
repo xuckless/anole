@@ -45,6 +45,7 @@ const Request = @import("../request.zig").Request;
 const BodySource = @import("../request.zig").BodySource;
 const Response = @import("../response.zig").Response;
 const Detached = @import("../detach.zig").Detached;
+const Parked = @import("../parked.zig").Parked;
 const Sink = @import("../sink.zig").Sink;
 const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
@@ -150,7 +151,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer r.mutex.unlock(io);
                 var it = r.list.first;
                 while (it) |node| : (it = node.next) {
-                    const conn: *Conn = @fieldParentPtr("node", node);
+                    const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
                     conn.beginDrain();
                 }
                 return r.list.first != null;
@@ -164,7 +165,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer r.mutex.unlock(io);
                 var it = r.list.first;
                 while (it) |node| : (it = node.next) {
-                    const conn: *Conn = @fieldParentPtr("node", node);
+                    const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
                     conn.lock();
                     defer conn.unlock();
                     conn.finishDrainLocked();
@@ -257,6 +258,14 @@ pub fn Engine(comptime Ctx: type) type {
             /// Bumped (under the mutex) whenever the session may have output.
             /// The writer waits on it.
             write_gen: std.atomic.Value(u32) = .init(0),
+
+            /// Parked streams (`H2Parked`) whose owner has not called
+            /// `release`, and the bursts running on them. The connection's
+            /// teardown waits for both to reach zero (`parked_idle`), since
+            /// the owner still touches the stream.
+            parked_open: usize = 0,
+            parked_bursts: usize = 0,
+            parked_idle: std.Io.Condition = .init,
 
             /// Drain, phase one: GOAWAY with the largest stream ID, which
             /// streams already on the way still fit under, and a PING whose
@@ -499,6 +508,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// handler's hold on the stream goes when it is finished or
             /// aborted.
             detached: ?*Exchange = null,
+            /// The response is parked (`Response._park`): bursts of
+            /// DATA from whichever task has something to send.
+            parked: ?*H2Parked = null,
 
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
@@ -722,11 +734,29 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.drain_notice = false;
                 conn.releaseDrainHold();
                 conn.writerGone();
+                // Parked responses: their owners hear that the peer is gone
+                // and release when they have ended their bursts; the stream
+                // stays until then.
+                {
+                    var it = conn.streams.valueIterator();
+                    while (it.next()) |sp| {
+                        const stream = sp.*;
+                        const p = stream.parked orelse continue;
+                        stream.reset = true;
+                        stream.closeBody();
+                        if (stream.outbox_mode) stream.outbox.room.set(conn.io);
+                        stream.cancelHandler();
+                        p.peerGone();
+                        stream.release(.protocol);
+                    }
+                }
                 // The tasks are joined (the group's cancel runs first), so
                 // each release here is the freeing one.
                 while (true) {
                     var it = conn.streams.valueIterator();
-                    const stream = (it.next() orelse break).*;
+                    const stream = while (it.next()) |sp| {
+                        if (sp.*.parked == null) break sp.*;
+                    } else break;
                     stream.reset = true;
                     stream.closeBody();
                     // A detached response nobody finished: its owner hears
@@ -744,6 +774,9 @@ pub fn Engine(comptime Ctx: type) type {
                     stream.handler_done = true;
                     stream.release(.protocol);
                 }
+                // The owners of parked responses touch their streams until
+                // `Parked.release`: wait for them (and for bursts in flight).
+                while (conn.parked_open != 0 or conn.parked_bursts != 0) conn.parked_idle.waitUncancelable(conn.io, &conn.mutex);
                 conn.streams.deinit(conn.allocator);
                 for (conn.spare_streams.items) |stream| stream.destroy(conn.allocator);
                 conn.spare_streams.deinit(conn.allocator);
@@ -799,11 +832,13 @@ pub fn Engine(comptime Ctx: type) type {
                 var gone: std.ArrayList(*Stream) = .empty;
                 defer gone.deinit(conn.allocator);
                 while (it.next()) |stream| {
-                    if (reader_failed or !stream.*.body_done) {
+                    // A parked response has nobody to send to once the peer
+                    // closed its side of the connection.
+                    if (reader_failed or !stream.*.body_done or stream.*.parked != null) {
                         stream.*.reset = true;
                         stream.*.closeBody();
                         stream.*.cancelHandler();
-                        if (stream.*.detached != null) gone.append(conn.allocator, stream.*) catch {};
+                        if (stream.*.detached != null or stream.*.parked != null) gone.append(conn.allocator, stream.*) catch {};
                     }
                 }
                 // Detached responses with nobody left to send them to: let
@@ -1171,12 +1206,17 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.task = task;
                 break :gone stream.reset;
             };
+            // A handler that parked the response (`Response._park`) hands
+            // its hold on the stream to the park: `Parked.release` lets go.
+            var parked = false;
             defer {
                 conn.lock();
                 defer conn.unlock();
                 stream.task = null;
-                if (stream.response_sent and !stream.body_done and !stream.reset) startDiscard(conn, stream);
-                stream.release(.handler);
+                if (!parked) {
+                    if (stream.response_sent and !stream.body_done and !stream.reset) startDiscard(conn, stream);
+                    stream.release(.handler);
+                }
                 conn.kickWriter();
             }
             // Reset before its task got to run: nobody wants the response.
@@ -1184,7 +1224,8 @@ pub fn Engine(comptime Ctx: type) type {
                 log.debug("HTTP/2 stream {d} reset before its handler started", .{stream.id});
                 return;
             }
-            _ = serveStream(conn, stream, false) catch |err| return streamFailed(conn, stream, err);
+            const served = serveStream(conn, stream, false) catch |err| return streamFailed(conn, stream, err);
+            parked = served == .detached;
         }
 
         /// Runs the requests `onFrameRecv` set aside for the reader
@@ -1319,10 +1360,10 @@ pub fn Engine(comptime Ctx: type) type {
             defer if (!detached) response.deinit();
             response._request = request;
             request._response = response;
-            if (inline_mode) {
-                response._detach_engine = &detach_engine;
-                response._detach_ctx = ex;
-            }
+            response._detach_engine = &detach_engine;
+            response._detach_ctx = ex;
+            // On its own task the response may detach only to be parked.
+            response._detach_park_only = !inline_mode;
 
             request.method = parseMethod(stream.method) orelse {
                 response.status = .not_implemented;
@@ -1435,7 +1476,7 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`Detached`).
-        const detach_engine: Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+        const detach_engine: Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter, .park = detachedPark };
 
         /// The exchange, from the reader's stack into the stream's arena,
         /// its pointers into itself moved along.
@@ -1448,6 +1489,9 @@ pub fn Engine(comptime Ctx: type) type {
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
             ex.response._sink = ex.sink_state.sink();
             ex.response._detach_ctx = ex;
+            // A task's request timer lives on the task's stack.
+            ex.request._timeout_context = null;
+            ex.request._set_timeout = null;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;
@@ -1464,6 +1508,22 @@ pub fn Engine(comptime Ctx: type) type {
             const ex = exchangeOf(d);
             const stream = ex.sink_state.stream;
             const conn = stream.conn;
+            if (stream.parked != null) {
+                // The end of a parked response: the last DATA (or the
+                // failure's reset). The hold on the stream stays until the
+                // owner's `Parked.release`.
+                if (result) |_| {
+                    StreamSink.end(@ptrCast(&ex.sink_state), if (ex.response.trailers) |*t| t else null) catch {};
+                } else |err| {
+                    streamFailed(conn, stream, err) catch {};
+                }
+                ex.response.deinit();
+                conn.lock();
+                defer conn.unlock();
+                stream.detached = null;
+                conn.kickWriter();
+                return;
+            }
             if (result) |_| {
                 ex.response.write() catch |err| {
                     streamFailed(conn, stream, err) catch {};
@@ -1506,6 +1566,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// attached): the owner hears of it, and the stream is let go.
         /// Under the mutex.
         fn abortDetached(stream: *Stream) void {
+            if (stream.parked) |p| return p.peerGone();
             const ex = stream.detached orelse return;
             const d = ex.response.detached.?;
             if (d.state != .detached) return;
@@ -1513,6 +1574,159 @@ pub fn Engine(comptime Ctx: type) type {
             d.abort();
             ex.response.deinit();
             stream.release(.handler);
+        }
+
+        /// A parked response (`Response._park`): bursts of DATA from
+        /// whichever task has something to send, no task in between. Its
+        /// owner hears of the peer leaving through `owner.gone`, and the
+        /// stream lives until the owner's `release`.
+        const H2Parked = struct {
+            parked: Parked = .{ .vtable = &vtable },
+            stream: *Stream,
+            ex: *Exchange,
+            d: *Detached,
+            owner: Parked.Owner,
+            /// All under the connection's mutex.
+            bursting: bool = false,
+            gone_pending: bool = false,
+            gone_sent: bool = false,
+            over: bool = false,
+
+            const vtable: Parked.VTable = .{
+                .begin = begin,
+                .write = write,
+                .endBurst = endBurst,
+                .end = end,
+                .abort = abort,
+                .release = release,
+            };
+
+            fn of(p: *Parked) *H2Parked {
+                return @alignCast(@fieldParentPtr("parked", p));
+            }
+
+            fn begin(p: *Parked) bool {
+                const self = of(p);
+                const conn = self.stream.conn;
+                conn.lock();
+                defer conn.unlock();
+                if (self.stream.reset or self.over or self.gone_sent or self.gone_pending) return false;
+                self.bursting = true;
+                self.stream.task = placement.currentTask(conn.io);
+                conn.parked_bursts += 1;
+                return true;
+            }
+
+            fn write(p: *Parked, parts: []const []const u8) Parked.WriteError!void {
+                const self = of(p);
+                const conn = self.stream.conn;
+                conn.lock();
+                const over = self.over or self.stream.reset;
+                conn.unlock();
+                if (over) return error.Gone;
+                StreamSink.appendParts(@ptrCast(&self.ex.sink_state), parts, tunnel_outbox_max, false) catch {
+                    if (self.ex.sink_state.err) |e| switch (e) {
+                        error.Canceled => return error.Canceled,
+                        error.SystemResources => return error.SystemResources,
+                        else => {},
+                    };
+                    return error.Gone;
+                };
+            }
+
+            /// Ends the burst. The caller has the stream's task and
+            /// `bursting` set by `begin`.
+            fn finishBurst(self: *H2Parked) void {
+                const conn = self.stream.conn;
+                conn.lock();
+                self.bursting = false;
+                self.stream.task = null;
+                conn.parked_bursts -= 1;
+                if (conn.parked_bursts == 0) conn.parked_idle.broadcast(conn.io);
+                const deliver = self.gone_pending and !self.gone_sent and !self.over;
+                if (deliver) {
+                    self.gone_pending = false;
+                    self.gone_sent = true;
+                }
+                conn.unlock();
+                if (deliver) self.owner.gone(self.owner.ctx);
+            }
+
+            fn endBurst(p: *Parked) void {
+                const self = of(p);
+                StreamSink.kickOut(@ptrCast(&self.ex.sink_state));
+                self.finishBurst();
+            }
+
+            fn end(p: *Parked) void {
+                const self = of(p);
+                const conn = self.stream.conn;
+                conn.lock();
+                const already = self.over;
+                self.over = true;
+                const reset = self.stream.reset;
+                conn.unlock();
+                if (!already and !reset) self.d.finish({});
+                self.finishBurst();
+            }
+
+            fn abort(p: *Parked) void {
+                const self = of(p);
+                const conn = self.stream.conn;
+                conn.lock();
+                self.over = true;
+                conn.unlock();
+                resetStream(conn, self.stream, c.NGHTTP2_CANCEL);
+                self.finishBurst();
+            }
+
+            /// The stream was reset or the connection is gone. Under the
+            /// connection's mutex; never waits.
+            fn peerGone(self: *H2Parked) void {
+                if (self.gone_sent or self.over) return;
+                // A burst running was canceled by the reset (`cancelHandler`):
+                // `endBurst` tells the owner.
+                if (self.bursting) {
+                    self.gone_pending = true;
+                    return;
+                }
+                self.gone_sent = true;
+                self.owner.gone(self.owner.ctx);
+            }
+
+            fn release(p: *Parked) void {
+                const self = of(p);
+                const stream = self.stream;
+                const conn = stream.conn;
+                self.ex.response.deinit();
+                conn.lock();
+                defer conn.unlock();
+                stream.parked = null;
+                stream.detached = null;
+                conn.parked_open -= 1;
+                if (conn.parked_open == 0) conn.parked_idle.broadcast(conn.io);
+                // The stream may be freed here, with `self` in its arena.
+                stream.release(.handler);
+                conn.kickWriter();
+            }
+        };
+
+        /// `Detached.Engine.park`: the exchange is relocated and the head
+        /// recorded by the caller; the stream's body goes to the outbox
+        /// from now on.
+        fn detachedPark(d: *Detached, owner: Parked.Owner) error{ OutOfMemory, WriteFailed }!*Parked {
+            const ex = exchangeOf(d);
+            const stream = ex.sink_state.stream;
+            const conn = stream.conn;
+            const p = try ex.response.arena.create(H2Parked);
+            p.* = .{ .stream = stream, .ex = ex, .d = d, .owner = owner };
+            conn.lock();
+            defer conn.unlock();
+            if (stream.reset) return error.WriteFailed;
+            stream.outbox_mode = true;
+            stream.parked = p;
+            conn.parked_open += 1;
+            return &p.parked;
         }
 
         fn setTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
@@ -1739,7 +1953,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn body(ptr: *anyopaque) *std.Io.Writer {
                 const self = fromPtr(ptr);
-                if (self.writer.buffer.len == 0) {
+                if (self.writer.buffer.len == 0 and self.stream.parked == null) {
                     // A handler that never writes a body never pays for it.
                     const len: usize = if (self.stream.connect_protocol.len > 0) tunnel_writer_len else body_writer_len;
                     self.writer.buffer = self.stream.arena.allocator().alloc(u8, len) catch &.{};

@@ -26,6 +26,7 @@ const dynamic_mod = @import("dynamic.zig");
 
 const observe = @import("../observe/root.zig");
 const coll_mod = @import("collection.zig");
+const change_stream = @import("change_stream.zig");
 
 const Connection = conn_mod.Connection;
 pub const Database = coll_mod.Database;
@@ -410,6 +411,12 @@ pub const Client = struct {
     }
 
     /// A database: `client.db("app").collection("users")`.
+    /// A change stream over the whole deployment (`allChangesForCluster`);
+    /// see `Collection.watch`.
+    pub fn watch(self: *Client, comptime T: type, c: anytype, pipeline: anytype, opts: change_stream.ChangeStreamOptions) Error!change_stream.ChangeStream(T) {
+        return .{ .raw = try change_stream.open(self, c, .cluster, pipeline, opts) };
+    }
+
     pub fn db(self: *Client, name: []const u8) Database {
         return .{ .client = self, .name = name };
     }

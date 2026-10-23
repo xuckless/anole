@@ -216,6 +216,16 @@
     "lambda": {
       "$ref": "#/$defs/Lambda",
       "description": "AWS Lambda (deployment \"lambda\"): where invocations come from and how answers go back. Ignored by other deployments. docs/lambda.md."
+    },
+    "sse": {
+      "$ref": "#/$defs/Sse"
+    },
+    "watches": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Watch"
+      },
+      "description": "Database changes fed into SSE topics and WebSocket rooms, or read by consumers (anole_watch_*)."
     }
   },
   "$defs": {
@@ -1453,6 +1463,13 @@
           "maximum": 4294967295,
           "default": 16777216,
           "description": "The largest database answer (its record's bytes); past it, ANOLE_E_TOOBIG."
+        },
+        "sse_max_event": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1048576,
+          "description": "The largest event anole_sse_publish and anole_sse_send take."
         }
       }
     },
@@ -2398,6 +2415,16 @@
             }
           ]
         },
+        "sse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SseRoute"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "timeout_ms": {
           "anyOf": [
             {
@@ -2437,7 +2464,7 @@
       "required": [
         "path"
       ],
-      "description": "Exactly one of handler, respond, static, websocket, webtransport; handler and a websocket with \"accept\": \"consumer\" may go together."
+      "description": "Exactly one of handler, respond, static, websocket, webtransport, sse; handler and a websocket with \"accept\": \"consumer\" may go together."
     },
     "Fixed": {
       "type": "object",
@@ -3694,6 +3721,139 @@
       "required": [
         "name"
       ]
+    },
+    "Sse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "heartbeat_ms": { "type": ["integer", "null"], "minimum": 0, "default": 15000, "description": "A comment line to every subscriber idle this long; null: none." },
+        "retry_ms": { "type": ["integer", "null"], "minimum": 0, "default": null, "description": "Sent as retry: at the start of each stream; null: the browser's default." },
+        "replay": { "anyOf": [ { "$ref": "#/$defs/SseReplay" }, { "type": "null" } ], "description": "Null: no ids, no replay, no gap events." },
+        "max_queued_bytes": { "type": "integer", "minimum": 1, "default": 262144, "description": "Bytes waiting for one subscriber (each event counts 64 more)." },
+        "on_full": { "enum": ["close", "drop"], "default": "close", "description": "close: a subscriber that does not keep up is sent what is queued and its stream ends (the browser reconnects and resumes from the replay); drop: the event is skipped for it." },
+        "close_after_ms": { "type": "integer", "minimum": 0, "default": 1000, "description": "close: a sender stuck this long on a full subscriber aborts its stream." },
+        "leave_grace_ms": { "type": "integer", "minimum": 0, "default": 1000, "description": "How long a write under way may finish before it is canceled." },
+        "max_topics_per_subscriber": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 64 },
+        "gap_event": { "type": ["string", "null"], "default": "gap", "description": "The gap event's name; null sends no gap events." },
+        "drain_retry": { "anyOf": [ { "$ref": "#/$defs/SseRetry" }, { "type": "null" } ], "description": "The retry spread at the drain; null: streams just end." }
+      }
+    },
+    "SseReplay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "events": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 256, "description": "Per topic." },
+        "bytes": { "type": "integer", "minimum": 1, "default": 262144, "description": "Per topic." },
+        "total_bytes": { "type": "integer", "minimum": 1, "default": 67108864, "description": "Every topic together; the globally oldest event goes first." },
+        "max_age_ms": { "type": "integer", "minimum": 0, "default": 300000 },
+        "max_per_resume": { "type": "integer", "minimum": 1, "default": 1024, "description": "One resume replays at most this many events, else it is a gap." }
+      }
+    },
+    "SseRetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_ms": { "type": "integer", "minimum": 0, "default": 500 },
+        "max_ms": { "type": "integer", "minimum": 0, "default": 5000 }
+      }
+    },
+    "SseRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "topics": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Topics a subscriber joins; {name} is the path's parameter name." },
+        "last": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0, "description": "Without Last-Event-ID: the newest this-many events of each topic." },
+        "handler": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295, "default": null, "description": "A consumer route id: subscribe requests become ANOLE_EV_SSE_SUBSCRIBE, and the subscriber joins topics plus those of anole_sse_accept." }
+      }
+    },
+    "Watch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "database": { "type": "string", "description": "A databases entry of the matching kind." },
+        "postgres": { "anyOf": [ { "$ref": "#/$defs/WatchPostgres" }, { "type": "null" } ] },
+        "redis": { "anyOf": [ { "$ref": "#/$defs/WatchRedis" }, { "type": "null" } ] },
+        "redis_stream": { "anyOf": [ { "$ref": "#/$defs/WatchStream" }, { "type": "null" } ] },
+        "mongodb": { "anyOf": [ { "$ref": "#/$defs/WatchMongo" }, { "type": "null" } ] },
+        "to": { "type": "array", "items": { "$ref": "#/$defs/WatchTo" }, "default": [] },
+        "data": { "enum": ["auto", "document"], "default": "auto", "description": "MongoDB: document sends fullDocument alone." },
+        "reconnect": { "anyOf": [ { "$ref": "#/$defs/WatchReconnect" }, { "type": "null" } ] }
+      },
+      "required": ["name", "database"],
+      "description": "Exactly one of postgres, redis, redis_stream and mongodb."
+    },
+    "WatchPostgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "channels": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1, "maxLength": 63 } } },
+      "required": ["channels"]
+    },
+    "WatchRedis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channels": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "patterns": { "type": "array", "items": { "type": "string" }, "default": [], "description": "PSUBSCRIBE patterns (room:*); at least one channel or pattern." }
+      }
+    },
+    "WatchStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keys": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string" } },
+        "start": { "description": "\"new\", \"all\" or {\"after\": [\"id\", ...]}, one entry ID per key." },
+        "count": { "type": "integer", "minimum": 1, "default": 128 },
+        "block_ms": { "type": "integer", "minimum": 1, "default": 10000 },
+        "group": { "anyOf": [ { "$ref": "#/$defs/WatchGroup" }, { "type": "null" } ] }
+      },
+      "required": ["keys"]
+    },
+    "WatchGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "consumer": { "type": ["string", "null"], "default": null },
+        "create": { "type": "boolean", "default": true },
+        "ack": { "enum": ["auto", "manual"], "default": "auto" }
+      },
+      "required": ["name"]
+    },
+    "WatchMongo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "database": { "type": ["string", "null"], "default": null },
+        "collection": { "type": ["string", "null"], "default": null },
+        "pipeline": { "description": "An Extended JSON array of stages after $changeStream." },
+        "full_document": { "enum": ["default", "update_lookup", "when_available", "required"], "default": "default" },
+        "full_document_before_change": { "enum": ["off", "when_available", "required"], "default": "off" },
+        "start": { "description": "\"now\", {\"resume_after\": token}, {\"start_after\": token} or {\"at\": {\"t\": n, \"i\": n}}." },
+        "max_await_ms": { "type": ["integer", "null"], "minimum": 0, "default": null },
+        "batch_size": { "type": ["integer", "null"], "minimum": 1, "default": null },
+        "show_expanded_events": { "type": "boolean", "default": false }
+      }
+    },
+    "WatchTo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sse": { "type": ["string", "null"], "default": null, "description": "A topic (a template: {channel}, {op}, {data.<field>}, and for MongoDB {db}, {collection}, {key})." },
+        "ws": { "type": ["string", "null"], "default": null, "description": "A room (a template)." },
+        "event": { "type": ["string", "null"], "default": null, "description": "sse: the event name." },
+        "type": { "enum": ["text", "binary"], "default": "text", "description": "ws: the message type." },
+        "gap_message": { "type": ["string", "null"], "default": null, "description": "ws: broadcast on a gap." }
+      },
+      "description": "Exactly one of sse and ws."
+    },
+    "WatchReconnect": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base_ms": { "type": "integer", "minimum": 0, "default": 100 },
+        "max_ms": { "type": "integer", "minimum": 0, "default": 5000 }
+      }
     },
     "Broker": {
       "type": "object",

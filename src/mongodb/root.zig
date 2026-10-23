@@ -54,6 +54,16 @@ pub const DeleteResult = @import("collection.zig").DeleteResult;
 pub const ReturnDocument = @import("collection.zig").ReturnDocument;
 /// `anole.bson.ObjectId`, the usual `_id`.
 pub const ObjectId = @import("bson").ObjectId;
+/// Change streams: `Collection.watch`, `Database.watch`, `Client.watch`.
+pub const change_stream = @import("change_stream.zig");
+/// A change stream decoding its events into `T` (`Collection.watch`).
+pub const ChangeStream = change_stream.ChangeStream;
+/// What `watch` takes: `full_document`, resume tokens, `max_await`...
+pub const ChangeStreamOptions = change_stream.ChangeStreamOptions;
+/// A typed change event, for `ChangeStream(ChangeEvent)`.
+pub const ChangeEvent = change_stream.ChangeEvent;
+pub const FullDocument = change_stream.FullDocument;
+pub const FullDocumentBeforeChange = change_stream.FullDocumentBeforeChange;
 /// Collection calls named at run time, with BSON arguments (the C ABI).
 pub const dynamic = @import("dynamic.zig");
 
@@ -67,6 +77,8 @@ test {
     _ = @import("client.zig");
     _ = @import("collection.zig");
     _ = @import("dynamic.zig");
+    _ = @import("change_stream.zig");
     _ = @import("fake_test.zig");
+    _ = @import("fake_cs.zig");
     _ = @import("live_test.zig");
 }

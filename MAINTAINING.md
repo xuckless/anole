@@ -223,7 +223,11 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   release or only when the SQL may have changed the session:
   `Pool.Reset.auto`, `session.zig`), and for the C ABI parameters as a
   slice of tagged unions and `QueryOpts.text_results`
-  (branch `capi-dynamic`, generic, not offered upstream yet). The first four are
+  (branch `capi-dynamic`, generic, not offered upstream yet), and
+  `Listener.sendListen`/`sendUnlisten`/`sendPing`/`nextEvent`, which
+  `anole.watch` uses to LISTEN and UNLISTEN on a connection another task
+  waits on (branch `listener-nonblocking`, generic, merged into `anole`;
+  the fork's own test of it needs a PostgreSQL on 127.0.0.1:5432). The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig
@@ -231,7 +235,12 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   swap stays in the fork. On an upstream move: merge master into `anole`,
   run the fork's `tests/run.sh` (a throwaway postgres:17, on std's
   Threaded Io and on zio, with and without TLS), re-pin, and run Anole's
-  `tests/postgres/run.sh` (plain and verify-full TLS).
+  `tests/postgres/run.sh` (plain and verify-full TLS). After a merge, check
+  that `src/listener.zig` still has the four non-blocking calls: `src/pg`
+  and `src/watch/pg.zig` call them, and `zig build test
+  -Dpostgres-test-url=... -Dtest-filter="watch live"` runs the LISTEN
+  hub against a live server (a killed backend, two channels on one
+  connection).
 - **zig-sqlite**: upstream's open Zig 0.17 port (vrischmann/zig-sqlite PR
   #215) plus the fork's build changes: bindings through the translate-c
   package, `sqlite3_initialize` in `Db.init` (Anole builds SQLite with

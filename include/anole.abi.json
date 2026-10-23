@@ -524,6 +524,51 @@
       "obligation": null
     },
     {
+      "type": 112,
+      "name": "ANOLE_EV_SSE_SUBSCRIBE",
+      "record": "anole_request_event",
+      "handles": [
+        "request"
+      ],
+      "obligation": "accept or answer"
+    },
+    {
+      "type": 113,
+      "name": "ANOLE_EV_SSE_CLOSE",
+      "record": "anole_sse_close_event",
+      "handles": [
+        "sse"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 116,
+      "name": "ANOLE_EV_WATCH_EVENT",
+      "record": "anole_watch_event",
+      "handles": [
+        "watch_sub"
+      ],
+      "obligation": "ack (a stream group with manual ack)"
+    },
+    {
+      "type": 117,
+      "name": "ANOLE_EV_WATCH_STATUS",
+      "record": "anole_watch_status_event",
+      "handles": [
+        "watch_sub"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 118,
+      "name": "ANOLE_EV_WATCH_END",
+      "record": "anole_watch_end_event",
+      "handles": [
+        "watch_sub"
+      ],
+      "obligation": null
+    },
+    {
       "type": 124,
       "name": "ANOLE_EV_S3_RESULT",
       "record": "anole_s3_result_event",
@@ -785,6 +830,11 @@
       "ANOLE_EV_JOBS_RESULT": 108,
       "ANOLE_EV_WEBHOOK_PUBLISHED": 109,
       "ANOLE_EV_WEBHOOK_STATUS": 110,
+      "ANOLE_EV_SSE_SUBSCRIBE": 112,
+      "ANOLE_EV_SSE_CLOSE": 113,
+      "ANOLE_EV_WATCH_EVENT": 116,
+      "ANOLE_EV_WATCH_STATUS": 117,
+      "ANOLE_EV_WATCH_END": 118,
       "ANOLE_EV_S3_RESULT": 124,
       "ANOLE_EV_S3_DATA": 125,
       "ANOLE_EV_SMTP_RESULT": 126
@@ -1041,6 +1091,19 @@
     "smtp_flag": {
       "ANOLE_SMTP_F_RETRY": 1
     },
+    "sse_closed": {
+      "ANOLE_SSE_CLOSED_CLIENT_GONE": 0,
+      "ANOLE_SSE_CLOSED_SLOW": 1,
+      "ANOLE_SSE_CLOSED_DRAIN": 2,
+      "ANOLE_SSE_CLOSED_CLOSED": 3,
+      "ANOLE_SSE_CLOSED_SERVER": 4
+    },
+    "sse_gap_flag": {
+      "ANOLE_SSE_F_PREFIX": 1
+    },
+    "sse_publish_flag": {
+      "ANOLE_SSE_F_NO_REPLAY": 1
+    },
     "status": {
       "ANOLE_OK": 0,
       "ANOLE_BUSY": 1,
@@ -1060,6 +1123,46 @@
     },
     "tls_flag": {
       "ANOLE_TLS_F_PEM": 1
+    },
+    "watch_end": {
+      "ANOLE_WATCH_END_UNLISTENED": 1,
+      "ANOLE_WATCH_END_DRAINED": 2,
+      "ANOLE_WATCH_END_FAILED": 3
+    },
+    "watch_format": {
+      "ANOLE_WATCH_FMT_TEXT": 0,
+      "ANOLE_WATCH_FMT_JSON": 1,
+      "ANOLE_WATCH_FMT_BSON": 2,
+      "ANOLE_WATCH_FMT_FIELDS": 3
+    },
+    "watch_listen_format": {
+      "ANOLE_WATCH_NATIVE": 0,
+      "ANOLE_WATCH_JSON": 1
+    },
+    "watch_op": {
+      "ANOLE_WATCH_OP_MESSAGE": 0,
+      "ANOLE_WATCH_OP_ENTRY": 1,
+      "ANOLE_WATCH_OP_INSERT": 2,
+      "ANOLE_WATCH_OP_UPDATE": 3,
+      "ANOLE_WATCH_OP_REPLACE": 4,
+      "ANOLE_WATCH_OP_DELETE": 5,
+      "ANOLE_WATCH_OP_DROP": 6,
+      "ANOLE_WATCH_OP_RENAME": 7,
+      "ANOLE_WATCH_OP_DROP_DATABASE": 8,
+      "ANOLE_WATCH_OP_INVALIDATE": 9,
+      "ANOLE_WATCH_OP_OTHER": 10
+    },
+    "watch_source": {
+      "ANOLE_WATCH_SRC_POSTGRES": 1,
+      "ANOLE_WATCH_SRC_REDIS": 2,
+      "ANOLE_WATCH_SRC_REDIS_STREAM": 3,
+      "ANOLE_WATCH_SRC_MONGODB": 4
+    },
+    "watch_status": {
+      "ANOLE_WATCH_CONNECTED": 1,
+      "ANOLE_WATCH_DISCONNECTED": 2,
+      "ANOLE_WATCH_GAP": 3,
+      "ANOLE_WATCH_INVALIDATED": 4
     },
     "webhook_status": {
       "ANOLE_WEBHOOK_DELIVERY_DEAD": 1,
@@ -3855,6 +3958,250 @@
         }
       ]
     },
+    "anole_sse_accept_options": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "topics",
+          "offset": 8,
+          "type": "ptr"
+        },
+        {
+          "name": "ntopics",
+          "offset": 16,
+          "type": "usize"
+        },
+        {
+          "name": "headers",
+          "offset": 24,
+          "type": "ptr"
+        },
+        {
+          "name": "nheaders",
+          "offset": 32,
+          "type": "usize"
+        },
+        {
+          "name": "last",
+          "offset": 40,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 44,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_sse_close_event": {
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reason",
+          "offset": 20,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_watch_listen_options": {
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "max_events",
+          "offset": 8,
+          "type": "u32"
+        },
+        {
+          "name": "max_bytes",
+          "offset": 12,
+          "type": "u32"
+        },
+        {
+          "name": "format",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_watch_event": {
+      "size": 88,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "watch",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "source",
+          "offset": 28,
+          "type": "u16"
+        },
+        {
+          "name": "op",
+          "offset": 30,
+          "type": "u16"
+        },
+        {
+          "name": "format",
+          "offset": 32,
+          "type": "u32"
+        },
+        {
+          "name": "pg_pid",
+          "offset": 36,
+          "type": "i32"
+        },
+        {
+          "name": "channel",
+          "offset": 40,
+          "type": "anole_span"
+        },
+        {
+          "name": "pattern",
+          "offset": 48,
+          "type": "anole_span"
+        },
+        {
+          "name": "op_name",
+          "offset": 56,
+          "type": "anole_span"
+        },
+        {
+          "name": "position",
+          "offset": 64,
+          "type": "anole_span"
+        },
+        {
+          "name": "data",
+          "offset": 72,
+          "type": "anole_span"
+        },
+        {
+          "name": "nfields",
+          "offset": 80,
+          "type": "u32"
+        },
+        {
+          "name": "fields_off",
+          "offset": 84,
+          "type": "u32"
+        }
+      ],
+      "arrays": [
+        {
+          "name": "fields",
+          "at": "fields_off",
+          "item": "anole_span",
+          "count": "2*nfields"
+        }
+      ]
+    },
+    "anole_watch_status_event": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "watch",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "status",
+          "offset": 28,
+          "type": "u32"
+        },
+        {
+          "name": "dropped",
+          "offset": 32,
+          "type": "u64"
+        },
+        {
+          "name": "detail",
+          "offset": 40,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_watch_end_event": {
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "watch",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "reason",
+          "offset": 28,
+          "type": "u32"
+        },
+        {
+          "name": "detail",
+          "offset": 32,
+          "type": "anole_span"
+        }
+      ]
+    },
     "anole_s3_options": {
       "size": 56,
       "align": 8,
@@ -4820,6 +5167,7 @@
     "NoProtocols",
     "NoTlsListener",
     "NotRunning",
+    "NotSse",
     "OneServerPerProcess",
     "OpenApiNameClash",
     "OpenApiNotBuilt",
@@ -4853,6 +5201,7 @@
     "UnknownKey",
     "UnknownListener",
     "Unsupported",
-    "WrongHandleKind"
+    "WrongHandleKind",
+    "WrongWatchKind"
   ]
 }

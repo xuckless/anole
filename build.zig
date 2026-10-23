@@ -1334,6 +1334,23 @@ pub fn build(b: *std.Build) void {
                 capi_test_step.dependOn(&interop_c.step);
             }
 
+            // The server-sent events suite (tests/capi/sse.c): its own
+            // process, as one anole_server is allowed per process.
+            if (target.result.os.tag != .windows) {
+                const sse_c = b.addExecutable(.{
+                    .name = "capi-sse",
+                    .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+                });
+                sse_c.root_module.addCSourceFile(.{ .file = b.path("tests/capi/sse.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-missing-field-initializers" } });
+                sse_c.root_module.addIncludePath(b.path("include"));
+                sse_c.root_module.linkLibrary(static_lib);
+                const run_sse_c = b.addRunArtifact(sse_c);
+                run_sse_c.stdio = .inherit;
+                run_sse_c.has_side_effects = true;
+                capi_test_step.dependOn(&run_sse_c.step);
+                b.step("capi-sse", "Run the C server-sent events suite (tests/capi/sse.c)").dependOn(&run_sse_c.step);
+            }
+
             // A TLS listener in a program linked with dead-stripping, as
             // bindings and release links are (tests/capi/tls_start.c): the
             // packed object must survive being cut at its symbols. Zig's

@@ -1083,3 +1083,44 @@ test "client: sqlite :memory: connector is started" {
     defer res.deinit();
     try res.expectStatus(.ok);
 }
+
+test "app.sse: a subscriber over the in-memory client sees published events with ids, and closing leaves the topic" {
+    var app = try testApp();
+    defer app.deinit();
+    const live = try app.sseTopics(.{ .heartbeat = null });
+    app.sse("/live", live, .{ .topics = &.{"news"} });
+    var t = try client(&app);
+    defer t.deinit();
+    const stream = try t.open(.get, "/live", .{});
+    defer stream.deinit();
+    try std.testing.expectEqualStrings("text/event-stream", stream.header("content-type").?);
+    try std.testing.expectEqual(@as(usize, 1), live.count("news"));
+    _ = try live.publish("news", .{ .data = "hello", .event = "tick" });
+    // The open line (`id:` alone) comes first.
+    var e = (try stream.nextEvent()).?;
+    if (e.data.len == 0) e = (try stream.nextEvent()).?;
+    try std.testing.expectEqualStrings("hello", e.data);
+    try std.testing.expectEqualStrings("tick", e.event.?);
+    try std.testing.expect(e.id != null);
+    stream.close();
+    try std.testing.expectEqual(@as(usize, 0), live.count("news"));
+}
+
+test "app.sse: the {room} parameter picks the topic" {
+    var app = try testApp();
+    defer app.deinit();
+    const live = try app.sseTopics(.{ .heartbeat = null });
+    app.sse("/rooms/:room/events", live, .{ .topics = &.{"room:{room}"} });
+    var t = try client(&app);
+    defer t.deinit();
+    const stream = try t.open(.get, "/rooms/blue/events", .{});
+    defer stream.deinit();
+    try std.testing.expectEqual(@as(usize, 1), live.count("room:blue"));
+    try std.testing.expectEqual(@as(usize, 0), live.count("room:red"));
+    _ = try live.publish("room:red", .{ .data = "no" });
+    _ = try live.publish("room:blue", .{ .data = "yes" });
+    var e = (try stream.nextEvent()).?;
+    if (e.data.len == 0) e = (try stream.nextEvent()).?;
+    try std.testing.expectEqualStrings("yes", e.data);
+    stream.close();
+}

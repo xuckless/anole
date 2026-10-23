@@ -221,7 +221,7 @@ var next_first_gen: u32 = 1;
 
 pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
-const Reply = enum { respond, fail, abort, fd, ws_accept };
+const Reply = enum { respond, fail, abort, fd, ws_accept, sse_accept };
 
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
@@ -308,6 +308,11 @@ pub const Slot = struct {
     /// the `queued` store and read by `poll` after its CAS).
     ws_upgrade: bool = false,
     ws_slot: u32 = no_slot,
+    /// A server-sent events route the consumer decides
+    /// (ANOLE_EV_SSE_SUBSCRIBE); `ws_slot` is then its SSE slot, and
+    /// `anole_sse_accept` stores the topics after the headers (p3/realtime).
+    sse_subscribe: bool = false,
+    sse_last: u32 = 0,
     /// `anole_ws_accept`: the extra headers are stored as a response's are,
     /// the accepted subprotocol's bytes follow them in `bytes`.
     subprotocol_off: u32 = 0,
@@ -580,6 +585,7 @@ pub const Exec = struct {
         s.body_error = null;
         s.claims = "";
         s.ws_upgrade = false;
+        s.sse_subscribe = false;
         s.ws_slot = no_slot;
         s.subprotocol_off = 0;
         s.subprotocol_len = 0;
@@ -752,6 +758,15 @@ pub const Exec = struct {
         const ev: *abi.Event = @ptrCast(rec.ptr);
         ev.handle = handle;
         x.postRecord(rec, false);
+    }
+
+    /// A record from any thread or task, in the order posted: onto the
+    /// overflow list, never the ring (so a record from the executor's own
+    /// task cannot pass one from another thread). The consumer is woken.
+    pub fn postRemote(x: *Exec, rec: []align(8) u8) void {
+        const c = x.consumer orelse return freeRecord(rec.ptr);
+        x.pushOverflow(rec);
+        c.wake();
     }
 
     pub fn post(x: *Exec, cmd: *Command) void {
@@ -935,6 +950,16 @@ pub const Route = struct {
     ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
     /// A WebTransport endpoint's settings.
     wt: if (features.http3) ?wt.Options else void = if (features.http3) null else {},
+    /// A server-sent events endpoint (p3/realtime): its topic templates.
+    sse: ?SseRoute = null,
+};
+
+/// An `"sse"` route's settings (`sse.handler`, `sse.nativeHandler`).
+pub const SseRoute = struct {
+    topics: []const []const u8,
+    last: u16,
+    /// The consumer decides (`ANOLE_EV_SSE_SUBSCRIBE`).
+    consumer: bool,
 };
 
 // ---------------------------------------------------------------------------
@@ -1553,6 +1578,18 @@ pub const Engine = struct {
                     .data = route,
                     .no_wait = if (plain) |pr| pr.detachable else false,
                 });
+            } else if (rc.sse) |sc| {
+                // p3/realtime: parked event streams; an idle subscriber holds
+                // no task. The consumer decides the subscription (or not).
+                const route = try a.create(Route);
+                route.* = .{
+                    .engine = e,
+                    .id = sc.handler orelse 0,
+                    .list = e.listFor(rc.timeout_ms),
+                    .detachable = false,
+                    .sse = .{ .topics = sc.topics, .last = sc.last, .consumer = sc.handler != null },
+                };
+                group.inner.addRouteWith(.get, rc.path, sse.handler, .{ .data = route });
             } else if (rc.handler) |id| {
                 const route = try a.create(Route);
                 route.* = .{
@@ -2181,7 +2218,13 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
 /// A WebSocket handshake being decided by the consumer: the WebSocket slot
 /// reserved for it, and what the answer was.
 pub const Upgrade = struct {
+    /// A WebSocket slot, or (`sse`) an SSE slot.
     ws_slot: u32,
+    /// An SSE subscription (ANOLE_EV_SSE_SUBSCRIBE), not a WebSocket upgrade.
+    sse: bool = false,
+    /// `sse`, accepted: the topics and `last` the consumer chose.
+    sse_topics: []const []const u8 = &.{},
+    sse_last: u32 = 0,
     accepted: bool = false,
     /// `accepted`: the subprotocol and extra headers the consumer chose,
     /// copied into the request's arena.
@@ -2258,7 +2301,8 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     s.claims = claimsOf(r);
     s.detached = d;
     s.body = "";
-    s.ws_upgrade = up != null;
+    s.ws_upgrade = up != null and !up.?.sse;
+    s.sse_subscribe = up != null and up.?.sse;
     s.ws_slot = if (up) |u| u.ws_slot else no_slot;
     s.event.reset();
     s.pump_event.reset();
@@ -2414,6 +2458,33 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
             if (canceled) io.recancel();
             x.unlink(si);
             defer x.release(si);
+            if (s.reply == .sse_accept) {
+                // The subscription is accepted: the topics (packed after the
+                // headers in `bytes`, `u16` length first), `last` and the
+                // headers the consumer chose, out of the slot before it is
+                // freed.
+                const u = up.?;
+                const bytes = s.bytes.items;
+                const list = try req.arena.alloc(std.http.Header, s.headers.items.len);
+                for (s.headers.items, list) |h, *out| out.* = .{
+                    .name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]),
+                    .value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]),
+                };
+                u.headers = list;
+                var topics: std.ArrayList([]const u8) = .empty;
+                var at: usize = s.subprotocol_off;
+                const end = at + s.subprotocol_len;
+                while (at + 2 <= end) {
+                    const n = std.mem.readInt(u16, bytes[at..][0..2], .little);
+                    at += 2;
+                    try topics.append(req.arena, try req.arena.dupe(u8, bytes[at..][0..n]));
+                    at += n;
+                }
+                u.sse_topics = topics.items;
+                u.sse_last = s.sse_last;
+                u.accepted = true;
+                return;
+            }
             if (s.reply == .ws_accept) {
                 // The handshake is accepted: what the consumer chose, out
                 // of the slot before it is freed.
@@ -2484,7 +2555,7 @@ fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void
             };
             s.fd = -1;
         },
-        .fail, .abort, .ws_accept => unreachable,
+        .fail, .abort, .ws_accept, .sse_accept => unreachable,
     }
 }
 
@@ -3163,6 +3234,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     // ---- p3/net ----
                     if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, len);
                     // ---- end p3/net ----
+                    if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                     freeRecord(rec);
                     x.ring.pop();
                     popped = true;
@@ -3190,7 +3262,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(if (s.ws_upgrade) .ws_upgrade else .request, entry.handle, out[pos..][0..size]);
+                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(if (s.ws_upgrade) .ws_upgrade else if (s.sse_subscribe) .sse_subscribe else .request, entry.handle, out[pos..][0..size]);
                 s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
                 popped = true;
@@ -3215,6 +3287,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                 // ---- p3/net ----
                 if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, ev.len);
                 // ---- end p3/net ----
+                if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                 x.ovf_head = linkOf(rec).*;
                 if (x.ovf_head == null) x.ovf_tail = null;
                 freeRecord(rec);
@@ -3460,6 +3533,44 @@ pub fn wsAccept(e: *Engine, hv: u64, subprotocol: []const u8, headers: []const C
     s.status = 200;
     // Cannot fail: the slot was reserved for this request.
     const handle = ws.openReserved(x, s.ws_slot);
+    handBack(x, s, h, .done);
+    return handle;
+}
+
+/// `anole_sse_accept`: the consumer accepts the subscription `hv` (an
+/// `ANOLE_EV_SSE_SUBSCRIBE`). Returns the subscriber's handle, open at once;
+/// the stream's head goes out from the request's task. `topics` are packed
+/// (`u16` length, bytes) after the headers.
+pub fn sseAccept(e: *Engine, hv: u64, topics: []const []const u8, headers: []const CHeader, last: u32) AnswerError!u64 {
+    _ = try checkHeaders(headers);
+    for (headers) |h| {
+        const n = h.name.slice();
+        // The stream's own framing and type.
+        if (std.ascii.eqlIgnoreCase(n, "content-type") or std.ascii.eqlIgnoreCase(n, "cache-control") or
+            std.ascii.eqlIgnoreCase(n, "connection") or std.ascii.eqlIgnoreCase(n, "x-accel-buffering")) return error.Invalid;
+    }
+    var packed_len: usize = 0;
+    for (topics) |t| {
+        if (t.len == 0 or t.len > 255) return error.Invalid;
+        packed_len += 2 + t.len;
+    }
+    const x, const s, const h = try claim(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    if (!s.sse_subscribe) return error.State;
+    try storeHeaders(&s.headers, &s.bytes, headers, packed_len);
+    s.subprotocol_off = @intCast(s.bytes.items.len);
+    s.subprotocol_len = @intCast(packed_len);
+    for (topics) |t| {
+        var len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len, @intCast(t.len), .little);
+        s.bytes.appendSliceAssumeCapacity(&len);
+        s.bytes.appendSliceAssumeCapacity(t);
+    }
+    s.sse_last = last;
+    s.reply = .sse_accept;
+    s.status = 200;
+    // Cannot fail: the slot was reserved for this request.
+    const handle = sse.openReserved(x, s.ws_slot);
     handBack(x, s, h, .done);
     return handle;
 }

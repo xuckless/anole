@@ -153,8 +153,8 @@
         // bytes the socket accepted (Conn.bytesSent: when a failed call
         // may run again).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#6327fc61f3a3e90aa5b014af21e12bbb073e0fcc",
-            .hash = "pg-0.0.0-Wp_7gU5jCQD89Co7vWWqcTa2s4vhSZ85OldH348fzrP4",
+            .url = "git+https://github.com/xuckless/pg.zig#4abc2caf582dd9965340bd3e4cabcfbb5f74a054",
+            .hash = "pg-0.0.0-Wp_7gVtzCQChogRE8uzrNYv1eqywmg0Vc_7aM7sr6sGT",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON

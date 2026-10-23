@@ -588,6 +588,79 @@ pub const webhook_verify_options = [_]Entry{
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----
+/// `anole.sse.Topics.Options` against `sse`.
+pub const sse_options = [_]Entry{
+    .{ .zig = "heartbeat", .json = "sse.heartbeat_ms", .kind = .ms },
+    .{ .zig = "retry", .json = "sse.retry_ms", .kind = .ms },
+    .{ .zig = "replay.events", .json = "sse.replay.events" },
+    .{ .zig = "replay.bytes", .json = "sse.replay.bytes" },
+    .{ .zig = "replay.total_bytes", .json = "sse.replay.total_bytes" },
+    .{ .zig = "replay.max_age", .json = "sse.replay.max_age_ms", .kind = .ms },
+    .{ .zig = "replay.max_per_resume", .json = "sse.replay.max_per_resume" },
+    .{ .zig = "max_queued_bytes", .json = "sse.max_queued_bytes" },
+    .{ .zig = "on_full", .json = "sse.on_full" },
+    .{ .zig = "close_after", .json = "sse.close_after_ms", .kind = .ms },
+    .{ .zig = "leave_grace", .json = "sse.leave_grace_ms", .kind = .ms },
+    .{ .zig = "max_topics_per_subscriber", .json = "sse.max_topics_per_subscriber" },
+    .{ .zig = "gap_event", .json = "sse.gap_event" },
+    .{ .zig = "drain_retry.min", .json = "sse.drain_retry.min_ms", .kind = .ms },
+    .{ .zig = "drain_retry.max", .json = "sse.drain_retry.max_ms", .kind = .ms },
+    .{ .zig = "_manual_ticks", .omitted = "tests only" },
+};
+
+/// `anole.sse.RouteOptions` against `routes[].sse`.
+pub const sse_route_options = [_]Entry{
+    .{ .zig = "topics", .json = "routes[].sse.topics" },
+    .{ .zig = "last", .json = "routes[].sse.last" },
+};
+
+/// `anole.watch.Options` against `watches[]`.
+pub const watch_options = [_]Entry{
+    .{ .zig = "name", .json = "watches[].name", .kind = .custom, .note = "required in the ABI" },
+    .{ .zig = "to", .json = "watches[].to", .kind = .custom, .note = "each target is {\"sse\": topic, \"event\": name} or {\"ws\": room, \"type\", \"gap_message\"}; the topics and rooms are those of the server" },
+    .{ .zig = "data", .json = "watches[].data" },
+    .{ .zig = "reconnect", .json = "watches[].reconnect", .kind = .custom, .note = "base_ms and max_ms (100 ms, 5 s); multiplier and jitter are the Zig defaults" },
+};
+
+/// `anole.watch.Postgres` against `watches[].postgres`.
+pub const watch_postgres = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "channels", .json = "watches[].postgres.channels" },
+};
+
+/// `anole.watch.Redis` against `watches[].redis`.
+pub const watch_redis = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "channels", .json = "watches[].redis.channels" },
+    .{ .zig = "patterns", .json = "watches[].redis.patterns" },
+};
+
+/// `anole.watch.RedisStream` against `watches[].redis_stream`.
+pub const watch_redis_stream = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "keys", .json = "watches[].redis_stream.keys" },
+    .{ .zig = "start", .json = "watches[].redis_stream.start", .kind = .custom, .note = "\"new\", \"all\" or {\"after\": [ids]}" },
+    .{ .zig = "group.name", .json = "watches[].redis_stream.group.name" },
+    .{ .zig = "group.consumer", .json = "watches[].redis_stream.group.consumer" },
+    .{ .zig = "group.create", .json = "watches[].redis_stream.group.create" },
+    .{ .zig = "group.ack", .json = "watches[].redis_stream.group.ack" },
+    .{ .zig = "count", .json = "watches[].redis_stream.count" },
+    .{ .zig = "block", .json = "watches[].redis_stream.block_ms", .kind = .ms },
+};
+
+/// `anole.watch.MongoDb` against `watches[].mongodb`.
+pub const watch_mongodb = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "database", .json = "watches[].mongodb.database" },
+    .{ .zig = "collection", .json = "watches[].mongodb.collection" },
+    .{ .zig = "pipeline", .json = "watches[].mongodb.pipeline", .kind = .custom, .note = "a JSON array of stages, not text" },
+    .{ .zig = "full_document", .json = "watches[].mongodb.full_document" },
+    .{ .zig = "full_document_before_change", .json = "watches[].mongodb.full_document_before_change" },
+    .{ .zig = "start", .json = "watches[].mongodb.start", .kind = .custom, .note = "\"now\", {\"resume_after\": token}, {\"start_after\": token} or {\"at\": {\"t\", \"i\"}}" },
+    .{ .zig = "max_await", .json = "watches[].mongodb.max_await_ms", .kind = .ms },
+    .{ .zig = "batch_size", .json = "watches[].mongodb.batch_size" },
+    .{ .zig = "show_expanded_events", .json = "watches[].mongodb.show_expanded_events" },
+};
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----

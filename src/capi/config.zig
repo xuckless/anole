@@ -69,6 +69,12 @@ pub const Config = struct {
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
+    /// Server-sent events: the settings of the topics `anole_sse_publish`
+    /// and the "sse" routes use.
+    sse: Sse = .{},
+    /// Database changes fed into topics, or read by consumers
+    /// (`anole_watch_*`).
+    watches: []const Watch = &.{},
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
@@ -210,6 +216,8 @@ pub const Config = struct {
         db_result_max: u32 = 16 << 20,
 
         // ---- p3/realtime ----
+        /// The largest event `anole_sse_publish` and `anole_sse_send` take.
+        sse_max_event: u32 = 1 << 20,
         // ---- end p3/realtime ----
     };
 
@@ -742,6 +750,9 @@ pub const Config = struct {
         middleware: []const Middleware = &.{},
 
         // ---- p3/realtime ----
+        /// a server-sent events endpoint (GET): topics from the path's
+        /// parameters, served natively, or decided by a consumer.
+        sse: ?SseRoute = null,
         // ---- end p3/realtime ----
     };
     pub const Fixed = struct {
@@ -1030,6 +1041,102 @@ pub const Config = struct {
     // ---- end p3/webhooks (types) ----
 
     // ---- p3/realtime (types) ----
+    pub const Sse = struct {
+        /// A comment line to every subscriber idle this long; null: none.
+        heartbeat_ms: ?u32 = 15_000,
+        /// `retry:` at the start of each stream; null: the browser's default.
+        retry_ms: ?u32 = null,
+        /// null: no ids, no replay, no gap events.
+        replay: ?SseReplay = .{},
+        max_queued_bytes: u32 = 256 * 1024,
+        on_full: SseOnFull = .close,
+        close_after_ms: u32 = 1000,
+        leave_grace_ms: u32 = 1000,
+        max_topics_per_subscriber: u16 = 64,
+        gap_event: ?[]const u8 = "gap",
+        drain_retry: ?SseRetry = .{},
+    };
+    pub const SseOnFull = enum { close, drop };
+    pub const SseReplay = struct {
+        events: u32 = 256,
+        bytes: u32 = 256 * 1024,
+        total_bytes: u64 = 64 * 1024 * 1024,
+        max_age_ms: u32 = 300_000,
+        max_per_resume: u32 = 1024,
+    };
+    pub const SseRetry = struct { min_ms: u32 = 500, max_ms: u32 = 5000 };
+    pub const SseRoute = struct {
+        /// Topics a subscriber joins: `{name}` is the path's parameter.
+        topics: []const []const u8 = &.{},
+        /// Without Last-Event-ID: the newest `last` events of each topic.
+        last: u16 = 0,
+        /// A consumer route id: subscribe requests become ANOLE_EV_SSE_SUBSCRIBE
+        /// and the subscriber joins `topics` plus those of `anole_sse_accept`.
+        handler: ?u32 = null,
+    };
+
+    pub const Watch = struct {
+        /// 1-255 bytes, unique; `anole_watch_find` looks it up.
+        name: []const u8,
+        /// A "databases" entry of the matching kind.
+        database: []const u8,
+        /// Exactly one of these.
+        postgres: ?WatchPostgres = null,
+        redis: ?WatchRedis = null,
+        redis_stream: ?WatchStream = null,
+        mongodb: ?WatchMongo = null,
+        to: []const WatchTo = &.{},
+        data: WatchData = .auto,
+        reconnect: ?WatchReconnect = null,
+    };
+    pub const WatchData = enum { auto, document };
+    pub const WatchPostgres = struct { channels: []const []const u8 };
+    pub const WatchRedis = struct {
+        channels: []const []const u8 = &.{},
+        patterns: []const []const u8 = &.{},
+    };
+    pub const WatchStream = struct {
+        keys: []const []const u8,
+        /// "new", "all" or {"after": ["id", ...]}.
+        start: ?std.json.Value = null,
+        count: u32 = 128,
+        block_ms: u32 = 10_000,
+        group: ?WatchGroup = null,
+    };
+    pub const WatchGroup = struct {
+        name: []const u8,
+        consumer: ?[]const u8 = null,
+        create: bool = true,
+        /// "auto" or "manual".
+        ack: []const u8 = "auto",
+    };
+    pub const WatchMongo = struct {
+        database: ?[]const u8 = null,
+        collection: ?[]const u8 = null,
+        /// An Extended JSON array of stages after $changeStream.
+        pipeline: ?std.json.Value = null,
+        /// "default", "update_lookup", "when_available" or "required".
+        full_document: []const u8 = "default",
+        /// "off", "when_available" or "required".
+        full_document_before_change: []const u8 = "off",
+        /// "now", {"resume_after": token}, {"start_after": token} or {"at": {"t": n, "i": n}}.
+        start: ?std.json.Value = null,
+        max_await_ms: ?u32 = null,
+        batch_size: ?u32 = null,
+        show_expanded_events: bool = false,
+    };
+    /// Exactly one of `sse` and `ws`: the topic or room (a template).
+    pub const WatchTo = struct {
+        sse: ?[]const u8 = null,
+        ws: ?[]const u8 = null,
+        /// sse: the event name.
+        event: ?[]const u8 = null,
+        /// ws: "text" or "binary".
+        type: []const u8 = "text",
+        /// ws: broadcast on a gap.
+        gap_message: ?[]const u8 = null,
+    };
+    pub const WatchReconnect = struct { base_ms: u32 = 100, max_ms: u32 = 5000 };
     // ---- end p3/realtime (types) ----
 
     // ---- p3/s3 (types) ----
@@ -1448,12 +1555,12 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     timeouts[0] = cfg.timeouts.request_ms orelse std.math.maxInt(u32);
     for (cfg.routes, 0..) |r, i| {
         const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
-            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null);
+            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null) + @intFromBool(r.sse != null);
         const combined = r.handler != null and r.websocket != null and r.websocket.?.accept == .consumer and kinds == 2;
         if (kinds != 1 and !combined) {
             if (r.handler != null and r.websocket != null and kinds == 2)
                 return fail(why, "routes[{d}]: handler and websocket go together only with \"accept\": \"consumer\"", .{i});
-            return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport", .{i});
+            return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport, sse", .{i});
         }
         if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
         if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
@@ -1489,8 +1596,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
         if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
         if (r.timeout_ms) |t| {
-            const decides = r.websocket != null and r.websocket.?.accept == .consumer;
-            if (r.handler == null and !decides) return fail(why, "routes[{d}].timeout_ms: on handler routes, and websocket routes whose handshakes the consumer decides", .{i});
+            const decides = (r.websocket != null and r.websocket.?.accept == .consumer) or (r.sse != null and r.sse.?.handler != null);
+            if (r.handler == null and !decides) return fail(why, "routes[{d}].timeout_ms: on handler routes, and websocket and sse routes whose handshakes the consumer decides", .{i});
             if (std.mem.indexOfScalar(u32, timeouts[0..ntimeouts], t) == null) {
                 if (ntimeouts == max_timeouts) return fail(why, "routes: at most {d} distinct timeout_ms values", .{max_timeouts});
                 timeouts[ntimeouts] = t;
@@ -1500,7 +1607,80 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         var buf: [32]u8 = undefined;
         try checkMiddleware(r.middleware, std.fmt.bufPrint(&buf, "routes[{d}].middleware", .{i}) catch "routes[].middleware", why);
     }
+    try checkRealtime(cfg, why);
 }
+
+// ---- p3/realtime (checks) ----
+
+/// The SSE settings, the "sse" routes and the "watches".
+fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
+    const s = cfg.sse;
+    if (s.replay) |r| {
+        if (r.events == 0 or r.events > 65535) return fail(why, "sse.replay.events: 1 to 65535", .{});
+        if (r.bytes == 0 or r.total_bytes == 0) return fail(why, "sse.replay: bytes and total_bytes at least 1", .{});
+    }
+    if (s.max_queued_bytes == 0) return fail(why, "sse.max_queued_bytes: at least 1", .{});
+    if (s.max_topics_per_subscriber == 0) return fail(why, "sse.max_topics_per_subscriber: at least 1", .{});
+    if (s.gap_event) |g| if (std.mem.indexOfAny(u8, g, "\r\n") != null) return fail(why, "sse.gap_event: no CR or LF", .{});
+    if (s.drain_retry) |d| if (d.min_ms > d.max_ms) return fail(why, "sse.drain_retry: min_ms above max_ms", .{});
+    if (cfg.limits.sse_max_event == 0 or cfg.limits.sse_max_event > max_record_payload) return fail(why, "limits.sse_max_event: 1 to {d}", .{max_record_payload});
+    for (cfg.routes, 0..) |r, i| {
+        const sr = r.sse orelse continue;
+        if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: an sse route is GET", .{i});
+        if (sr.handler == null and sr.topics.len == 0) return fail(why, "routes[{d}].sse.topics: at least one (or a handler that picks them)", .{i});
+        if (sr.topics.len > s.max_topics_per_subscriber) return fail(why, "routes[{d}].sse.topics: more than sse.max_topics_per_subscriber", .{i});
+        for (sr.topics, 0..) |t, k| {
+            if (t.len == 0 or t.len > 255) return fail(why, "routes[{d}].sse.topics[{d}]: 1-255 bytes", .{ i, k });
+            if (!anole.sse.templatesMatch(r.path, .{ .topics = &.{t} }))
+                return fail(why, "routes[{d}].sse.topics[{d}] \"{s}\": a {{name}} that is not a parameter of the path \"{s}\"", .{ i, k, t, r.path });
+        }
+    }
+    for (cfg.watches, 0..) |w, i| {
+        if (w.name.len == 0 or w.name.len > 255) return fail(why, "watches[{d}].name: 1-255 bytes", .{i});
+        for (cfg.watches[0..i]) |other| if (std.mem.eql(u8, other.name, w.name))
+            return fail(why, "watches[{d}].name \"{s}\" is taken", .{ i, w.name });
+        const kinds = @as(u8, @intFromBool(w.postgres != null)) + @intFromBool(w.redis != null) + @intFromBool(w.redis_stream != null) + @intFromBool(w.mongodb != null);
+        if (kinds != 1) return fail(why, "watches[{d}]: exactly one of postgres, redis, redis_stream, mongodb", .{i});
+        var found: ?Config.Database = null;
+        for (cfg.databases) |d| if (std.mem.eql(u8, d.name, w.database)) {
+            found = d;
+        };
+        const db_cfg = found orelse return fail(why, "watches[{d}]: database \"{s}\" is not in databases", .{ i, w.database });
+        if (w.postgres != null and db_cfg.postgres == null) return fail(why, "watches[{d}]: database \"{s}\" is not PostgreSQL, which a postgres watch needs", .{ i, w.database });
+        if ((w.redis != null or w.redis_stream != null) and db_cfg.redis == null) return fail(why, "watches[{d}]: database \"{s}\" is not Redis, which a redis watch needs", .{ i, w.database });
+        if (w.mongodb != null and db_cfg.mongodb == null) return fail(why, "watches[{d}]: database \"{s}\" is not MongoDB, which a mongodb watch needs", .{ i, w.database });
+        if (db_cfg.sqlite != null) return fail(why, "watches[{d}]: database \"{s}\" is SQLite, which has no change feed", .{ i, w.database });
+        if (w.postgres) |p| {
+            if (p.channels.len == 0) return fail(why, "watches[{d}].postgres.channels: at least one", .{i});
+            for (p.channels) |c| if (c.len == 0 or c.len > 63) return fail(why, "watches[{d}].postgres.channels: 1-63 bytes each", .{i});
+        }
+        if (w.redis) |r| if (r.channels.len + r.patterns.len == 0) return fail(why, "watches[{d}].redis: at least one channel or pattern", .{i});
+        if (w.redis_stream) |r| {
+            if (r.keys.len == 0 or r.keys.len > 16) return fail(why, "watches[{d}].redis_stream.keys: 1 to 16", .{i});
+            if (r.count == 0) return fail(why, "watches[{d}].redis_stream.count: at least 1", .{i});
+            if (r.group) |g| if (!oneOf(g.ack, &.{ "auto", "manual" })) return fail(why, "watches[{d}].redis_stream.group.ack: auto or manual", .{i});
+        }
+        if (w.mongodb) |m| {
+            if (m.collection != null and m.database == null) {}
+            if (!oneOf(m.full_document, &.{ "default", "update_lookup", "when_available", "required" })) return fail(why, "watches[{d}].mongodb.full_document: default, update_lookup, when_available or required", .{i});
+            if (!oneOf(m.full_document_before_change, &.{ "off", "when_available", "required" })) return fail(why, "watches[{d}].mongodb.full_document_before_change: off, when_available or required", .{i});
+            if (m.pipeline) |p| if (p != .array) return fail(why, "watches[{d}].mongodb.pipeline: an array of stage documents", .{i});
+        }
+        for (w.to, 0..) |t, k| {
+            if ((t.sse == null) == (t.ws == null)) return fail(why, "watches[{d}].to[{d}]: exactly one of sse and ws", .{ i, k });
+            if (t.ws != null and !oneOf(t.type, &.{ "text", "binary" })) return fail(why, "watches[{d}].to[{d}].type: text or binary", .{ i, k });
+            const text = t.sse orelse t.ws.?;
+            if (text.len == 0 or text.len > 255) return fail(why, "watches[{d}].to[{d}]: the topic or room is 1-255 bytes", .{ i, k });
+            var scratch: [8192]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+            _ = anole.watch.template.Template.parse(fba.allocator(), text, w.mongodb != null) catch |err| switch (err) {
+                error.OutOfMemory => {},
+                else => return fail(why, "watches[{d}].to[{d}]: the template \"{s}\" is not valid: use {{channel}}, {{op}}, {{data.<field>}} and, for MongoDB, {{db}}, {{collection}} and {{key}}", .{ i, k, text }),
+            };
+        }
+    }
+}
+// ---- end p3/realtime (checks) ----
 
 /// The client certificate and key of a database: files or text, a
 /// certificate with its key, and not with `insecure_skip_verify` and a CA.

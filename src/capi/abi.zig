@@ -163,6 +163,13 @@ pub const EventType = enum(u32) {
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
+    /// A consumer SSE route's request: accept (`anole_sse_accept`) or answer it.
+    sse_subscribe = 112,
+    /// A subscriber the consumer accepted has ended.
+    sse_close = 113,
+    watch_event = 116,
+    watch_status = 117,
+    watch_end = 118,
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
@@ -1073,6 +1080,122 @@ pub const WebhookStatusEvent = extern struct {
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----
+/// `anole_sse_publish`'s flag: not kept for `Last-Event-ID` resume.
+pub const SSE_F_NO_REPLAY: u32 = 1;
+/// `anole_sse_gap`'s flag: every topic starting with the name.
+pub const SSE_F_PREFIX: u32 = 1;
+
+/// `anole_sse_accept`'s options.
+pub const SseAcceptOptions = extern struct {
+    size: usize,
+    topics: ?[*]const Str = null,
+    ntopics: usize = 0,
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    last: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const SSE_CLOSED_CLIENT_GONE: u32 = 0;
+pub const SSE_CLOSED_SLOW: u32 = 1;
+pub const SSE_CLOSED_DRAIN: u32 = 2;
+pub const SSE_CLOSED_CLOSED: u32 = 3;
+pub const SSE_CLOSED_SERVER: u32 = 4;
+
+pub const SseCloseEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    reason: u32,
+};
+
+pub const WATCH_NATIVE: u32 = 0;
+pub const WATCH_JSON: u32 = 1;
+
+pub const WatchListenOptions = extern struct {
+    size: usize,
+    max_events: u32 = 0,
+    max_bytes: u32 = 0,
+    format: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const WATCH_SRC_POSTGRES: u32 = 1;
+pub const WATCH_SRC_REDIS: u32 = 2;
+pub const WATCH_SRC_REDIS_STREAM: u32 = 3;
+pub const WATCH_SRC_MONGODB: u32 = 4;
+
+pub const WATCH_OP_MESSAGE: u32 = 0;
+pub const WATCH_OP_ENTRY: u32 = 1;
+pub const WATCH_OP_INSERT: u32 = 2;
+pub const WATCH_OP_UPDATE: u32 = 3;
+pub const WATCH_OP_REPLACE: u32 = 4;
+pub const WATCH_OP_DELETE: u32 = 5;
+pub const WATCH_OP_DROP: u32 = 6;
+pub const WATCH_OP_RENAME: u32 = 7;
+pub const WATCH_OP_DROP_DATABASE: u32 = 8;
+pub const WATCH_OP_INVALIDATE: u32 = 9;
+pub const WATCH_OP_OTHER: u32 = 10;
+
+pub const WATCH_FMT_TEXT: u32 = 0;
+pub const WATCH_FMT_JSON: u32 = 1;
+pub const WATCH_FMT_BSON: u32 = 2;
+pub const WATCH_FMT_FIELDS: u32 = 3;
+
+/// ANOLE_EV_WATCH_EVENT. FIELDS: `Span fields[2 * nfields]` (name, value)
+/// at `fields_off`; the bytes the spans point into follow.
+pub const WatchEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    watch: u32,
+    source: u16,
+    op: u16,
+    format: u32,
+    pg_pid: i32,
+    channel: Span,
+    pattern: Span,
+    op_name: Span,
+    position: Span,
+    data: Span,
+    nfields: u32,
+    fields_off: u32,
+};
+
+pub const WATCH_CONNECTED: u32 = 1;
+pub const WATCH_DISCONNECTED: u32 = 2;
+pub const WATCH_GAP: u32 = 3;
+pub const WATCH_INVALIDATED: u32 = 4;
+
+pub const WatchStatusEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    watch: u32,
+    status: u32,
+    dropped: u64,
+    detail: Span,
+};
+
+pub const WATCH_END_UNLISTENED: u32 = 1;
+pub const WATCH_END_DRAINED: u32 = 2;
+pub const WATCH_END_FAILED: u32 = 3;
+
+pub const WatchEndEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    watch: u32,
+    reason: u32,
+    detail: Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SseAcceptOptions) == 48);
+    std.debug.assert(@sizeOf(SseCloseEvent) == 24);
+    std.debug.assert(@sizeOf(WatchListenOptions) == 24);
+    std.debug.assert(@sizeOf(WatchEvent) == 88);
+    std.debug.assert(@sizeOf(WatchStatusEvent) == 48);
+    std.debug.assert(@sizeOf(WatchEndEvent) == 40);
+    std.debug.assert(@offsetOf(WatchEvent, "channel") == 40);
+    std.debug.assert(@offsetOf(WatchEvent, "nfields") == 80);
+}
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----
@@ -1571,6 +1694,12 @@ pub const records = .{
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
+    .{ "anole_sse_accept_options", SseAcceptOptions },
+    .{ "anole_sse_close_event", SseCloseEvent },
+    .{ "anole_watch_listen_options", WatchListenOptions },
+    .{ "anole_watch_event", WatchEvent },
+    .{ "anole_watch_status_event", WatchStatusEvent },
+    .{ "anole_watch_end_event", WatchEndEvent },
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
@@ -1635,6 +1764,7 @@ pub const arrays = [_]ArrayInfo{
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
+    .{ .record = "anole_watch_event", .name = "fields", .at = "fields_off", .item = "anole_span", .count = "2*nfields" },
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
@@ -1746,6 +1876,11 @@ pub const events = [_]EventInfo{
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
+    .{ .type = 112, .name = "ANOLE_EV_SSE_SUBSCRIBE", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "accept or answer" },
+    .{ .type = 113, .name = "ANOLE_EV_SSE_CLOSE", .record = "anole_sse_close_event", .handles = &.{"sse"} },
+    .{ .type = 116, .name = "ANOLE_EV_WATCH_EVENT", .record = "anole_watch_event", .handles = &.{"watch_sub"}, .obligation = "ack (a stream group with manual ack)" },
+    .{ .type = 117, .name = "ANOLE_EV_WATCH_STATUS", .record = "anole_watch_status_event", .handles = &.{"watch_sub"} },
+    .{ .type = 118, .name = "ANOLE_EV_WATCH_END", .record = "anole_watch_end_event", .handles = &.{"watch_sub"} },
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
@@ -1858,6 +1993,16 @@ pub const constant_groups = [_]ConstantGroup{
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
+    .{ .prefix = "ANOLE_SSE_F_PREFIX", .group = "sse_gap_flag" },
+    .{ .prefix = "ANOLE_SSE_F_", .group = "sse_publish_flag" },
+    .{ .prefix = "ANOLE_SSE_CLOSED_", .group = "sse_closed" },
+    .{ .prefix = "ANOLE_WATCH_NATIVE", .group = "watch_listen_format" },
+    .{ .prefix = "ANOLE_WATCH_JSON", .group = "watch_listen_format" },
+    .{ .prefix = "ANOLE_WATCH_SRC_", .group = "watch_source" },
+    .{ .prefix = "ANOLE_WATCH_OP_", .group = "watch_op" },
+    .{ .prefix = "ANOLE_WATCH_FMT_", .group = "watch_format" },
+    .{ .prefix = "ANOLE_WATCH_END_", .group = "watch_end" },
+    .{ .prefix = "ANOLE_WATCH_", .group = "watch_status" },
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
@@ -1983,7 +2128,7 @@ const webhooks_error_names = [_][]const u8{};
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----
-const realtime_error_names = [_][]const u8{};
+const realtime_error_names = [_][]const u8{ "NotSse", "WrongWatchKind" };
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----

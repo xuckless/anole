@@ -73,6 +73,12 @@ pub const Detached = struct {
         /// First thing in the attached task: the engine notes the task, to
         /// cancel it when the peer resets the stream.
         enter: *const fn (d: *Detached) void,
+        /// Optional: parks the response (`Response._park`): its head has
+        /// been written to the sink, and from here whichever task has
+        /// something to send writes to it in bursts, with no task holding
+        /// it in between. The engine keeps the stream and the `Detached`
+        /// until the `Parked`'s `release`. On the request's executor.
+        park: ?*const fn (d: *Detached, owner: @import("parked.zig").Parked.Owner) error{ OutOfMemory, WriteFailed }!*@import("parked.zig").Parked = null,
     };
 
     /// The detacher's side.
