@@ -123,6 +123,9 @@ pub const Options = struct {
     /// Connection and per-stream receive windows.
     max_data: u64 = 16 << 20,
     max_stream_data: u64 = 1 << 20,
+    /// What one connection's streams may hold unacknowledged, all together
+    /// (each stream has its own cap too). Internal; tests lower it.
+    send_budget: usize = conn_budget,
     /// How long a connection may sit idle before it is closed.
     idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// Validate every client address with a Retry round trip before
@@ -1442,7 +1445,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .scid = undefined,
                     .local = if (local) |l| .from(l) else ep.local,
                     .remote = remote,
-                    .budget = .init(ep.io, conn_budget),
+                    .budget = .init(ep.io, ep.options.send_budget),
                 };
                 c.ngtcp2_ccerr_default(&conn.last_error);
                 conn.scid.datalen = scid_len;
