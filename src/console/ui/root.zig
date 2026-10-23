@@ -12,7 +12,13 @@ pub const screen = @import("screen.zig");
 pub const stats_window = @import("stats_window.zig");
 pub const restart_plan = @import("restart_plan.zig");
 pub const supervisor = @import("supervisor.zig");
+pub const discover = @import("discover.zig");
+pub const client = @import("client.zig");
+pub const term = @import("term.zig");
+pub const app = @import("app.zig");
+pub const views = @import("views.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("app_test.zig");
 }
