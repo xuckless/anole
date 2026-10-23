@@ -2,6 +2,7 @@
 //! `redis://`, `sqlite:`, read from `DATABASE_URL` and friends, and
 //! printed without their passwords.
 const std = @import("std");
+const env_mod = @import("../env.zig");
 
 /// A connection URL, parsed: `scheme://user:password@host:port,host2/path?key=value`.
 /// Several hosts (MongoDB's seed list, libpq's fallbacks), IPv6 in
@@ -228,6 +229,14 @@ fn decode(arena: std.mem.Allocator, text: []const u8) error{ InvalidUrl, OutOfMe
 /// environment, which Anole always links. On Windows always the C
 /// library's: `Environ` holds UTF-16 there, with nothing to slice.
 pub fn env(environ: ?std.process.Environ, name: []const u8) ?[]const u8 {
+    if (realEnv(environ, name)) |v| return v;
+    // The `.env` files read at startup (development), below the real environment.
+    if (env_mod.loaded()) |files| return files.get(name);
+    return null;
+}
+
+/// `env` without the `.env` entries: the process environment only.
+pub fn realEnv(environ: ?std.process.Environ, name: []const u8) ?[]const u8 {
     if (comptime @import("builtin").os.tag != .windows) if (environ) |e| return e.getPosix(name);
     var buf: [256]u8 = undefined;
     if (name.len >= buf.len) return null;
