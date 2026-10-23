@@ -1418,3 +1418,34 @@ test "HTTP/2: the raised body windows of a connection share one budget" {
     // Eight streams reading at once would raise eight 1 MiB windows.
     try std.testing.expect(live.peak.load(.monotonic) < 4 * 1024 * 1024);
 }
+
+test "HTTP/2: an event stream outlives timeouts.request" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [256]u8 = undefined;
+            var events = try res.startEventStream(&buf);
+            for (0..12) |_| {
+                try events.send("tick", .{});
+                try req.io.sleep(.fromMilliseconds(100), .awake);
+            }
+            try events.end();
+        }
+    }.handle);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/slow", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, client.get(id).body.items, "data: tick"));
+}

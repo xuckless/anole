@@ -78,6 +78,18 @@ fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "too late";
 }
 
+/// An event every 100 ms for 1.2 s: a stream that outlives a short
+/// request timeout.
+fn ticks(req: *dusty.Request, res: *dusty.Response) !void {
+    var buf: [256]u8 = undefined;
+    var events = try res.startEventStream(&buf);
+    for (0..12) |_| {
+        try events.send("tick", .{});
+        try req.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    try events.end();
+}
+
 /// The head and some of the body, then nothing for a while.
 fn stall(req: *dusty.Request, res: *dusty.Response) !void {
     var out_buf: [256]u8 = undefined;
@@ -224,6 +236,7 @@ const Fixture = struct {
         http.router.post("/echo", echo);
         http.router.get("/trailers", withTrailers);
         http.router.get("/slow", slow);
+        http.router.get("/ticks", ticks);
         http.router.get("/stall", stall);
         http.router.get("/peer", peer);
         http.router.get("/abort", aborted);
@@ -726,6 +739,20 @@ test "h3 server: a request that outlives timeout.request is reset" {
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
+}
+
+test "h3 server: an event stream outlives timeouts.request" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) } }, .{});
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const body = try get(conn, "/ticks", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, body, "data: tick"));
 }
 
 test "h3 server: mutual TLS in request mode, and the client certificate in handlers (PEM or files)" {
