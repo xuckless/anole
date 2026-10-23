@@ -68,6 +68,10 @@ test "capi config: every connector option is in the schema or listed" {
         comptime parity.checkCoverage(anole.mongodb.Options, &parity.mongodb_options);
         try parity.checkSchemaAndDefaults(anole.mongodb.Options, config.Config, &parity.mongodb_options, root);
     }
+    if (comptime features.nats) {
+        comptime parity.checkCoverage(anole.nats.Options, &parity.nats_options);
+        try parity.checkSchemaAndDefaults(anole.nats.Options, config.Config, &parity.nats_options, root);
+    }
 }
 
 test "capi config: mongodb max_connections 0 is E_CONFIG; sqlite statement_cache is an unknown key" {

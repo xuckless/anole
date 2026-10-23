@@ -154,7 +154,9 @@ enum {
   ANOLE_E_TOOBIG = -8,      /* anole_poll: the next event does not fit */
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
   ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
-  ANOLE_E_DB = -11          /* a database refused a statement (anole_db_result_event) */
+  ANOLE_E_DB = -11,         /* a database refused a statement (anole_db_result_event) */
+  ANOLE_E_BROKER = -12      /* a message broker refused a call or could not be reached
+                               (anole_nats_reply_event: error_class says why) */
 };
 
 /* The text of the last error on the calling thread, for logs: not API.
@@ -193,6 +195,8 @@ typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL unti
 typedef uint64_t anole_wt;        /* one WebTransport session: from ANOLE_EV_WT_OPEN until ANOLE_EV_WT_CLOSE */
 typedef uint64_t anole_wt_stream; /* one of its streams: until anole_handle_release or the session's close */
 typedef uint64_t anole_db_tx;     /* one database transaction: from the answer to anole_db_begin until commit, rollback or release */
+typedef uint64_t anole_nats_sub;  /* a NATS subscription or JetStream consume: until ANOLE_EV_NATS_SUB_END */
+typedef uint64_t anole_nats_msg;  /* a JetStream message: until acked, nak'd, termed or released */
 typedef struct anole_server anole_server;     /* opaque */
 typedef struct anole_consumer anole_consumer; /* opaque */
 
@@ -1317,6 +1321,192 @@ typedef struct anole_db_result_event {
   anole_span constraint; /* the constraint that failed, when the database names it */
   anole_span table;      /* ABI 0.7: the table (or collection) the error names, when the database says */
 } anole_db_result_event; /* 104 bytes (was 96) */
+
+/* ---- NATS ------------------------------------------------------------------
+   The configuration's "brokers" with a "nats" key. Publishing never waits:
+   a frame is queued and the call returns (a send that blocks on the network
+   stalls whatever lock the caller holds). Deliveries come as events on the
+   consumer given to the call. */
+
+typedef struct anole_nats anole_nats; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a broker by its "name"; ANOLE_E_INVALID when there is none, or it is not a NATS broker. */
+ANOLE_API anole_status anole_nats_find(anole_server *s, anole_str name, anole_nats **out);
+/* The broker's index in the configuration's "brokers": what
+   anole_broker_status_event.broker names. */
+ANOLE_API uint32_t anole_nats_index(const anole_nats *n);
+
+/* A message to publish, or a request to send. Everything is copied. */
+typedef struct anole_nats_out {
+  size_t size;               /* sizeof(anole_nats_out) */
+  anole_str subject;
+  anole_str reply;           /* {NULL,0}: none */
+  const anole_header *headers;
+  size_t nheaders;
+  const void *data;
+  size_t len;
+} anole_nats_out;            /* 72 bytes */
+
+/* Queues a message; copied at once; never blocks. ANOLE_OK; ANOLE_BUSY
+   (taken; the queue is past half its limit: wait for ANOLE_EV_NATS_WRITABLE
+   before sending much more); ANOLE_E_AGAIN (not taken: the queue, or the
+   reconnect buffer while disconnected, is full; ANOLE_EV_NATS_WRITABLE
+   follows to `c`); ANOLE_E_INVALID (subject, header, size over the server's
+   max_payload, a flag); ANOLE_E_STATE (before start, after the stop).
+   flags: 0 (ANOLE_BODY_BORROW is refused: the bytes are always copied). */
+ANOLE_API anole_status anole_nats_publish(anole_nats *n, anole_consumer *c, const anole_nats_out *m, uint32_t flags);
+
+#define ANOLE_NATS_F_RETRY 1u /* anole_nats_request: retry NoResponders with the broker's "retry" */
+
+typedef struct anole_nats_request_options {
+  size_t size;
+  uint32_t flags;      /* ANOLE_NATS_F_* */
+  uint32_t timeout_ms; /* 0: the broker's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint64_t req;        /* the anole_req / anole_grpc_call it serves (as anole_db_options.req), or 0 */
+} anole_nats_request_options; /* 24 bytes */
+
+/* Sends a request; the first reply (or the failure) is ANOLE_EV_NATS_REPLY
+   to `c` (or to req's consumer) with user_data. Returns at once:
+   ANOLE_OK; ANOLE_E_AGAIN (outbound full, nothing sent); ANOLE_E_GONE
+   (stale req); ANOLE_E_INVALID; ANOLE_E_STATE. */
+ANOLE_API anole_status anole_nats_request(anole_nats *n, anole_consumer *c, const anole_nats_out *m,
+                                          const anole_nats_request_options *opts, uint64_t user_data);
+
+/* anole_nats_subscribe_options.overflow */
+#define ANOLE_NATS_DROP_NEWEST 0u
+#define ANOLE_NATS_DROP_OLDEST 1u
+#define ANOLE_NATS_CLOSE 2u
+typedef struct anole_nats_subscribe_options {
+  size_t size;
+  anole_str queue;        /* a queue group; {NULL,0}: none */
+  uint32_t max_messages;  /* held for the consumer before `overflow` drops; 0: limits.subscription_messages */
+  uint32_t max_bytes;     /* 0: limits.subscription_bytes */
+  uint32_t overflow;      /* ANOLE_NATS_DROP_* / ANOLE_NATS_CLOSE */
+  uint32_t reserved;      /* must be 0 */
+} anole_nats_subscribe_options; /* 40 bytes */
+
+/* Subscribes; messages come to `c` as ANOLE_EV_NATS_MSG (handle: *out,
+   user_data as given). Messages wait for room in `c`'s ring; while they
+   wait, `overflow` applies to the subscription's own queue (dropped counts
+   are in the SUB_END record). */
+ANOLE_API anole_status anole_nats_subscribe(anole_nats *n, anole_consumer *c, anole_str subject,
+                                            const anole_nats_subscribe_options *opts, uint64_t user_data,
+                                            anole_nats_sub *out);
+/* Cleanup: unsubscribes (or stops a JetStream consume); then
+   ANOLE_EV_NATS_SUB_END. ANOLE_OK on one that is over.
+   anole_handle_release does the same. */
+ANOLE_API anole_status anole_nats_unsubscribe(anole_nats_sub sub);
+
+/* JetStream publish: waits for the stream's ack (ANOLE_EV_NATS_REPLY with op
+   ANOLE_NATS_OP_JS_PUBLISH: stream, seq, duplicate). */
+#define ANOLE_NATS_OP_REQUEST 0u
+#define ANOLE_NATS_OP_JS_PUBLISH 1u
+#define ANOLE_NATS_JS_F_EXPECT_LAST_SEQ 1u /* check expected_last_seq (allows 0) */
+typedef struct anole_nats_js_publish_options {
+  size_t size;
+  anole_str msg_id;            /* Nats-Msg-Id; {NULL,0}: none */
+  anole_str expected_stream;
+  uint64_t expected_last_seq;  /* 0: not checked */
+  uint32_t timeout_ms;
+  uint32_t flags;              /* ANOLE_NATS_JS_F_* */
+  uint64_t req;
+} anole_nats_js_publish_options; /* 64 bytes */
+ANOLE_API anole_status anole_nats_js_publish(anole_nats *n, anole_consumer *c, const anole_nats_out *m,
+                                             const anole_nats_js_publish_options *opts, uint64_t user_data);
+
+typedef struct anole_nats_js_consume_options {
+  size_t size;
+  uint32_t max_inflight; /* delivered and not yet acked, at most; 0: 64 */
+  uint32_t expires_ms;   /* one pull's wait on the server; 0: 30000 */
+} anole_nats_js_consume_options; /* 16 bytes */
+/* Pull-consumes an existing durable consumer (from "jetstream" in the
+   configuration, or made with anole_nats_request on $JS.API...): each
+   message is ANOLE_EV_NATS_JS_MSG with its own anole_nats_msg handle. */
+ANOLE_API anole_status anole_nats_js_consume(anole_nats *n, anole_consumer *c, anole_str stream, anole_str consumer,
+                                             const anole_nats_js_consume_options *opts, uint64_t user_data,
+                                             anole_nats_sub *out);
+#define ANOLE_NATS_ACK 0u
+#define ANOLE_NATS_NAK 1u
+#define ANOLE_NATS_TERM 2u
+#define ANOLE_NATS_PROGRESS 3u
+/* Acknowledges: ACK, NAK (redeliver after delay_ms; 0: the consumer's
+   backoff), TERM (never again), PROGRESS (more time; the handle stays).
+   The others end the handle. ANOLE_E_GONE on a handle that is over. */
+ANOLE_API anole_status anole_nats_ack(anole_nats_msg m, uint32_t kind, uint32_t delay_ms);
+
+/* ANOLE_EV_NATS_MSG and ANOLE_EV_NATS_JS_MSG. Followed by the headers
+   (headers_off: nheaders name/value anole_span pairs) and the bytes the
+   spans name. */
+typedef struct anole_nats_msg_event {
+  anole_event ev;        /* NATS_MSG: handle the anole_nats_sub; JS_MSG: the anole_nats_msg */
+  uint64_t user_data;    /* the subscribe/consume call's */
+  uint64_t sub;          /* the anole_nats_sub */
+  anole_span subject;
+  anole_span reply;      /* NATS_MSG: where an answer goes; empty when none (JS: empty) */
+  uint32_t headers_off;
+  uint32_t nheaders;
+  anole_span payload;
+  uint16_t status;       /* a status line's code, 0 when none */
+  uint16_t reserved16;
+  uint32_t reserved;
+  uint64_t stream_seq;   /* JetStream only, else 0 */
+  uint64_t consumer_seq;
+  uint64_t delivered;
+  uint64_t pending;
+  int64_t timestamp_ns;
+  anole_span stream;
+  anole_span consumer;
+} anole_nats_msg_event;  /* 128 bytes */
+
+/* ANOLE_EV_NATS_REPLY: the answer to anole_nats_request or anole_nats_js_publish. */
+typedef struct anole_nats_reply_event {
+  anole_event ev;        /* handle 0 */
+  uint64_t user_data;
+  int32_t status;        /* ANOLE_OK; ANOLE_E_TIMEOUT; ANOLE_E_BROKER (error_class: ANOLE_DB_ERR_UNAVAILABLE
+                            for no responders or not connected, ANOLE_DB_ERR_OTHER for a refusal);
+                            ANOLE_E_GONE (its req ended) */
+  uint16_t http_status;  /* what Anole's handlers would answer: 503, 504, 500; 0 on success */
+  uint8_t error_class;   /* ANOLE_DB_ERR_* */
+  uint8_t op;            /* ANOLE_NATS_OP_* */
+  anole_span subject;
+  uint32_t headers_off;
+  uint32_t nheaders;
+  anole_span payload;
+  uint16_t msg_status;   /* the reply's status line, 0 none */
+  uint16_t duplicate;    /* JS_PUBLISH: 1 when the stream had it already */
+  uint32_t reserved;
+  uint64_t seq;          /* JS_PUBLISH: the stream sequence */
+  anole_span stream;     /* JS_PUBLISH */
+  anole_span error;      /* for logs */
+  anole_span error_code; /* "no_responders", "timeout", a JetStream err_code ("10071") */
+} anole_nats_reply_event; /* 96 bytes */
+
+/* ANOLE_EV_NATS_SUB_END: the handle is over. */
+#define ANOLE_BROKER_END_CLOSED 0u
+#define ANOLE_BROKER_END_DRAINED 1u
+#define ANOLE_BROKER_END_SLOW 2u
+#define ANOLE_BROKER_END_DENIED 3u
+#define ANOLE_BROKER_END_FAILED 4u
+typedef struct anole_broker_end_event {
+  anole_event ev;
+  uint64_t user_data;
+  uint32_t reason;       /* ANOLE_BROKER_END_* */
+  uint32_t reserved;
+  uint64_t dropped;      /* messages the overflow policy dropped */
+  anole_span error;
+} anole_broker_end_event; /* 48 bytes */
+
+/* ANOLE_EV_NATS_WRITABLE. */
+#define ANOLE_BROKER_CONNECTED 0u
+#define ANOLE_BROKER_DISCONNECTED 1u
+#define ANOLE_BROKER_RECONNECTED 2u
+#define ANOLE_BROKER_LAME_DUCK 3u
+#define ANOLE_BROKER_WRITABLE 4u
+typedef struct anole_broker_status_event {
+  anole_event ev;        /* handle 0 */
+  uint32_t broker;       /* anole_nats_index */
+  uint32_t status;       /* ANOLE_BROKER_WRITABLE */
+} anole_broker_status_event; /* 24 bytes */
 
 #ifdef __cplusplus
 }

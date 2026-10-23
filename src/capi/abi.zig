@@ -21,6 +21,7 @@ pub const E_TOOBIG: Status = -8;
 pub const E_SYSTEM: Status = -9;
 pub const E_TIMEOUT: Status = -10;
 pub const E_DB: Status = -11;
+pub const E_BROKER: Status = -12;
 
 pub const Str = extern struct {
     ptr: ?[*]const u8 = null,
@@ -112,6 +113,11 @@ pub const EventType = enum(u32) {
     ws_upgrade = 40,
     /// http-realtime: the drain started.
     draining = 41,
+    nats_msg = 64,
+    nats_reply = 65,
+    nats_js_msg = 66,
+    nats_sub_end = 67,
+    nats_writable = 69,
 };
 
 pub const Event = extern struct {
@@ -394,6 +400,150 @@ pub const DbCell = extern struct {
     v: extern union { i: i64, f: f64, s: Span },
 };
 
+// ---- Brokers (NATS) --------------------------------------------------------
+
+/// `anole_nats_request_options.flags`: retry NoResponders with the broker's "retry".
+pub const NATS_F_RETRY: u32 = 1;
+/// `anole_nats_js_publish_options.flags`: check `expected_last_seq` (allows 0).
+pub const NATS_JS_F_EXPECT_LAST_SEQ: u32 = 1;
+
+/// `anole_nats_subscribe_options.overflow`.
+pub const NATS_DROP_NEWEST: u32 = 0;
+pub const NATS_DROP_OLDEST: u32 = 1;
+pub const NATS_CLOSE: u32 = 2;
+
+/// `anole_nats_ack`'s kind.
+pub const NATS_ACK: u32 = 0;
+pub const NATS_NAK: u32 = 1;
+pub const NATS_TERM: u32 = 2;
+pub const NATS_PROGRESS: u32 = 3;
+
+/// `anole_nats_reply_event.op`.
+pub const NATS_OP_REQUEST: u8 = 0;
+pub const NATS_OP_JS_PUBLISH: u8 = 1;
+
+/// `anole_broker_end_event.reason`.
+pub const BROKER_END_CLOSED: u32 = 0;
+pub const BROKER_END_DRAINED: u32 = 1;
+pub const BROKER_END_SLOW: u32 = 2;
+pub const BROKER_END_DENIED: u32 = 3;
+pub const BROKER_END_FAILED: u32 = 4;
+
+/// `anole_broker_status_event.status`.
+pub const BROKER_CONNECTED: u32 = 0;
+pub const BROKER_DISCONNECTED: u32 = 1;
+pub const BROKER_RECONNECTED: u32 = 2;
+pub const BROKER_LAME_DUCK: u32 = 3;
+pub const BROKER_WRITABLE: u32 = 4;
+
+/// A message to publish or a request to send (`anole_nats_out`).
+pub const NatsOut = extern struct {
+    size: usize,
+    subject: Str = .{},
+    /// Empty: none.
+    reply: Str = .{},
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    data: ?[*]const u8 = null,
+    len: usize = 0,
+};
+
+pub const NatsRequestOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    /// 0: the broker's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none.
+    timeout_ms: u32 = 0,
+    /// The request or gRPC call this serves, or 0.
+    req: u64 = 0,
+};
+
+pub const NatsSubscribeOptions = extern struct {
+    size: usize,
+    queue: Str = .{},
+    max_messages: u32 = 0,
+    max_bytes: u32 = 0,
+    overflow: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const NatsJsPublishOptions = extern struct {
+    size: usize,
+    msg_id: Str = .{},
+    expected_stream: Str = .{},
+    expected_last_seq: u64 = 0,
+    timeout_ms: u32 = 0,
+    flags: u32 = 0,
+    req: u64 = 0,
+};
+
+pub const NatsJsConsumeOptions = extern struct {
+    size: usize,
+    max_inflight: u32 = 0,
+    expires_ms: u32 = 0,
+};
+
+/// ANOLE_EV_NATS_MSG and ANOLE_EV_NATS_JS_MSG. Followed by the headers
+/// (`headers_off`: `nheaders` name/value `anole_span` pairs) and the bytes
+/// the spans name.
+pub const NatsMsgEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    sub: u64,
+    subject: Span,
+    reply: Span,
+    headers_off: u32,
+    nheaders: u32,
+    payload: Span,
+    status: u16,
+    reserved16: u16,
+    reserved: u32,
+    stream_seq: u64,
+    consumer_seq: u64,
+    delivered: u64,
+    pending: u64,
+    timestamp_ns: i64,
+    stream: Span,
+    consumer: Span,
+};
+
+/// ANOLE_EV_NATS_REPLY: the answer to anole_nats_request or anole_nats_js_publish.
+pub const NatsReplyEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    op: u8,
+    subject: Span,
+    headers_off: u32,
+    nheaders: u32,
+    payload: Span,
+    msg_status: u16,
+    duplicate: u16,
+    reserved: u32,
+    seq: u64,
+    stream: Span,
+    @"error": Span,
+    error_code: Span,
+};
+
+/// ANOLE_EV_NATS_SUB_END.
+pub const BrokerEndEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    reason: u32,
+    reserved: u32,
+    dropped: u64,
+    @"error": Span,
+};
+
+/// ANOLE_EV_NATS_WRITABLE.
+pub const BrokerStatusEvent = extern struct {
+    ev: Event,
+    broker: u32,
+    status: u32,
+};
+
 pub const POLL_F_NOARM: u32 = 1;
 pub const BODY_BORROW: u32 = 1;
 
@@ -497,6 +647,15 @@ comptime {
     std.debug.assert(@sizeOf(WtCodeEvent) == 24);
     std.debug.assert(@sizeOf(WtDatagramEvent) == 32);
     std.debug.assert(@sizeOf(WtCloseEvent) == 40);
+    std.debug.assert(@sizeOf(NatsOut) == 72);
+    std.debug.assert(@sizeOf(NatsRequestOptions) == 24);
+    std.debug.assert(@sizeOf(NatsSubscribeOptions) == 40);
+    std.debug.assert(@sizeOf(NatsJsPublishOptions) == 64);
+    std.debug.assert(@sizeOf(NatsJsConsumeOptions) == 16);
+    std.debug.assert(@sizeOf(NatsMsgEvent) == 128);
+    std.debug.assert(@sizeOf(NatsReplyEvent) == 96);
+    std.debug.assert(@sizeOf(BrokerEndEvent) == 48);
+    std.debug.assert(@sizeOf(BrokerStatusEvent) == 24);
 }
 
 /// Records are padded to this.
@@ -540,6 +699,15 @@ pub const records = .{
     .{ "anole_db_tx_options", DbTxOptions },
     .{ "anole_db_cell", DbCell },
     .{ "anole_db_result_event", DbResultEvent },
+    .{ "anole_nats_out", NatsOut },
+    .{ "anole_nats_request_options", NatsRequestOptions },
+    .{ "anole_nats_subscribe_options", NatsSubscribeOptions },
+    .{ "anole_nats_js_publish_options", NatsJsPublishOptions },
+    .{ "anole_nats_js_consume_options", NatsJsConsumeOptions },
+    .{ "anole_nats_msg_event", NatsMsgEvent },
+    .{ "anole_nats_reply_event", NatsReplyEvent },
+    .{ "anole_broker_end_event", BrokerEndEvent },
+    .{ "anole_broker_status_event", BrokerStatusEvent },
 };
 
 /// A variable part of a record, reached through an offset or a span in it.
@@ -561,12 +729,14 @@ pub const arrays = [_]ArrayInfo{
     .{ .record = "anole_grpc_call_event", .name = "metadata", .at = "metadata_off", .item = "anole_span", .count = "2*nmetadata" },
     .{ .record = "anole_db_result_event", .name = "columns", .span = "columns", .item = "anole_span", .count = "ncolumns" },
     .{ .record = "anole_db_result_event", .name = "cells", .span = "cells", .item = "anole_db_cell", .count = "nrows*ncolumns" },
+    .{ .record = "anole_nats_msg_event", .name = "headers", .at = "headers_off", .item = "anole_span", .count = "2*nheaders" },
+    .{ .record = "anole_nats_reply_event", .name = "headers", .at = "headers_off", .item = "anole_span", .count = "2*nheaders" },
 };
 
 pub const HandleKindInfo = struct { kind: u8, name: []const u8, c_type: []const u8 };
 
 /// The kind lives in bits 28-31 of a handle (`engine.Handle`). 7 is
-/// reserved for a per-query handle; 8-15 are reserved.
+/// reserved for a per-query handle; 10-15 are reserved.
 pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 1, .name = "request", .c_type = "anole_req" },
     .{ .kind = 2, .name = "websocket", .c_type = "anole_ws" },
@@ -574,6 +744,8 @@ pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 4, .name = "wt_session", .c_type = "anole_wt" },
     .{ .kind = 5, .name = "wt_stream", .c_type = "anole_wt_stream" },
     .{ .kind = 6, .name = "db_tx", .c_type = "anole_db_tx" },
+    .{ .kind = 8, .name = "broker_sub", .c_type = "anole_nats_sub" },
+    .{ .kind = 9, .name = "broker_msg", .c_type = "anole_nats_msg" },
 };
 
 pub const EventInfo = struct {
@@ -611,6 +783,11 @@ pub const events = [_]EventInfo{
     .{ .type = 27, .name = "ANOLE_EV_WT_DATAGRAM", .record = "anole_wt_datagram_event", .handles = &.{"wt_session"} },
     .{ .type = 40, .name = "ANOLE_EV_WS_UPGRADE", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "accept or answer" },
     .{ .type = 41, .name = "ANOLE_EV_DRAINING", .record = "anole_event" },
+    .{ .type = 64, .name = "ANOLE_EV_NATS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_sub"} },
+    .{ .type = 65, .name = "ANOLE_EV_NATS_REPLY", .record = "anole_nats_reply_event" },
+    .{ .type = 66, .name = "ANOLE_EV_NATS_JS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_msg"}, .obligation = "ack" },
+    .{ .type = 67, .name = "ANOLE_EV_NATS_SUB_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
+    .{ .type = 69, .name = "ANOLE_EV_NATS_WRITABLE", .record = "anole_broker_status_event" },
 };
 
 pub const EventRange = struct { from: u32, to: u32, use: []const u8 };
@@ -664,6 +841,14 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_DB_TX_", .group = "db_tx_flag" },
     .{ .prefix = "ANOLE_DB_ISOLATION_", .group = "db_isolation" },
     .{ .prefix = "ANOLE_DB_TIMEOUT_", .group = "db_timeout" },
+    .{ .prefix = "ANOLE_NATS_F_", .group = "nats_flag" },
+    .{ .prefix = "ANOLE_NATS_JS_F_", .group = "nats_js_flag" },
+    .{ .prefix = "ANOLE_NATS_DROP_", .group = "nats_overflow" },
+    .{ .prefix = "ANOLE_NATS_CLOSE", .group = "nats_overflow" },
+    .{ .prefix = "ANOLE_NATS_OP_", .group = "nats_op" },
+    .{ .prefix = "ANOLE_NATS_", .group = "nats_ack" },
+    .{ .prefix = "ANOLE_BROKER_END_", .group = "broker_end" },
+    .{ .prefix = "ANOLE_BROKER_", .group = "broker_status" },
     .{ .prefix = "ANOLE_ABI_", .group = "abi" },
 };
 
@@ -675,6 +860,7 @@ pub const error_names = [_][]const u8{
     "AddressInUse",
     "AddressNotAvailable",
     "Again",
+    "Broker",
     "Canceled",
     "CertificateFileUnreadable",
     "ClientCaFileUnreadable",

@@ -78,6 +78,13 @@
         "$ref": "#/$defs/Database"
       },
       "description": "Databases for anole_db_*, opened at start."
+    },
+    "brokers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Broker"
+      },
+      "description": "Message brokers for anole_nats_*, opened at start."
     }
   },
   "$defs": {
@@ -2447,6 +2454,673 @@
       "required": [
         "name"
       ]
+    },
+    "Broker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "What anole_nats_find looks it up by: unique, 1-255 bytes."
+        },
+        "nats": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "url": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "token": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "user": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "password": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "nkey_seed": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "nkey_seed_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "creds": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "creds_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ca_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ca_pem": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_cert_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_key_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_cert_pem": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_key_pem": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "insecure_skip_verify": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "tls_first": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "tls_required": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "connections": {
+                  "enum": [
+                    "one",
+                    "per_executor"
+                  ],
+                  "default": "one"
+                },
+                "connect_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295,
+                  "default": 5000
+                },
+                "connect_at_start": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "ping_interval_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295,
+                  "default": 30000
+                },
+                "max_outstanding_pings": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 255,
+                  "default": 2
+                },
+                "no_echo": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "reconnect": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean",
+                      "default": true
+                    },
+                    "max_attempts": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 4294967295
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "min_delay_ms": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "default": 500
+                    },
+                    "max_delay_ms": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "default": 10000
+                    },
+                    "jitter": {
+                      "type": "boolean",
+                      "default": true
+                    },
+                    "buffer_bytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "default": 8388608
+                    },
+                    "abort_on_auth_error": {
+                      "type": "boolean",
+                      "default": true
+                    }
+                  }
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "outbound_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "default": 8388608
+                    },
+                    "subscription_messages": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 1024
+                    },
+                    "subscription_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "default": 8388608
+                    },
+                    "max_pending_requests": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 65536
+                    },
+                    "max_subscriptions": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 65536
+                    },
+                    "max_control_line_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65536,
+                      "default": 4096
+                    },
+                    "max_inbound_frame_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 67108864
+                    },
+                    "max_header_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 65536
+                    },
+                    "max_event_queue": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 1024
+                    }
+                  }
+                },
+                "jetstream": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "domain": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "streams": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "name"
+                        ],
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "subjects": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "retention": {
+                            "enum": [
+                              "limits",
+                              "interest",
+                              "workqueue"
+                            ],
+                            "default": "limits"
+                          },
+                          "storage": {
+                            "enum": [
+                              "file",
+                              "memory"
+                            ],
+                            "default": "file"
+                          },
+                          "replicas": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 255,
+                            "default": 1
+                          },
+                          "max_age_ms": {
+                            "anyOf": [
+                              {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "max_bytes": {
+                            "anyOf": [
+                              {
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "max_msgs": {
+                            "anyOf": [
+                              {
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "duplicate_window_ms": {
+                            "anyOf": [
+                              {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "extra": {
+                            "description": "Any other keys of the stream configuration the server takes."
+                          }
+                        }
+                      }
+                    },
+                    "consumers": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "stream",
+                          "durable"
+                        ],
+                        "properties": {
+                          "stream": {
+                            "type": "string"
+                          },
+                          "durable": {
+                            "type": "string"
+                          },
+                          "filter_subjects": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "deliver_policy": {
+                            "enum": [
+                              "all",
+                              "last",
+                              "new",
+                              "last_per_subject"
+                            ],
+                            "default": "all"
+                          },
+                          "ack_wait_ms": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 4294967295,
+                            "default": 30000
+                          },
+                          "max_deliver": {
+                            "type": "integer",
+                            "default": -1
+                          },
+                          "max_ack_pending": {
+                            "type": "integer",
+                            "default": 1000
+                          },
+                          "backoff_ms": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 4294967295
+                            }
+                          },
+                          "extra": {
+                            "description": "Any other keys of the consumer configuration the server takes."
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A NATS server or cluster (exactly one of the kind keys)."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on requests and JetStream calls that have no timeout_ms of their own. 0: none."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
+        },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 5,
+              "description": "Attempts in all, the first included."
+            },
+            "base_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 100
+            },
+            "max_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 2000
+            },
+            "multiplier": {
+              "type": "number",
+              "minimum": 1,
+              "default": 2.0
+            },
+            "attempt_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 0,
+              "description": "A bound on each attempt; 0: none."
+            },
+            "max_retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000
+            }
+          },
+          "description": "What queries with ANOLE_DB_F_RETRY are retried with, on a transient failure (the server unreachable, a connection lost). Ignored for SQLite and MongoDB."
+        }
+      }
     }
   }
 }

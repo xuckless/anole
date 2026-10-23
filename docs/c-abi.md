@@ -255,6 +255,12 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_WT_STREAM_STOP` | `anole_wt_code_event`: the peer asked this side to stop sending | `anole_wt_stream` | none |
 | `ANOLE_EV_WT_DATAGRAM` | `anole_wt_datagram_event`, then the bytes | `anole_wt` | none |
 | `ANOLE_EV_WS_UPGRADE` (40) | `anole_request_event`: a WebSocket handshake the consumer accepts (`anole_ws_accept`) or refuses (any request answer); only on routes with `"accept": "consumer"` | `anole_req` | accept or a refusing answer |
+| `ANOLE_EV_NATS_MSG` (64) | `anole_nats_msg_event`, then header spans and bytes: a message of a subscription | `anole_nats_sub` | none (answer with `anole_nats_publish` to its `reply` if wanted) |
+| `ANOLE_EV_NATS_REPLY` (65) | `anole_nats_reply_event`: the answer to `anole_nats_request` or `anole_nats_js_publish` | 0 (`user_data`) | none |
+| `ANOLE_EV_NATS_JS_MSG` (66) | `anole_nats_msg_event` with the JetStream fields set | `anole_nats_msg` | `anole_nats_ack` (any kind) or `anole_handle_release` (= NAK) |
+| `ANOLE_EV_NATS_SUB_END` (67) | `anole_broker_end_event`: the subscription is over (`reason`, `dropped`) | `anole_nats_sub` | ends it |
+| (68) | reserved for NATS connection status | | |
+| `ANOLE_EV_NATS_WRITABLE` (69) | `anole_broker_status_event`: a publish refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
@@ -355,6 +361,7 @@ when it did not come from the OS):
 | `ANOLE_E_SYSTEM` | the OS refused (a port in use, a certificate that will not load) |
 | `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
 | `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
+| `ANOLE_E_BROKER` | in a broker call's answer: the broker refused it or could not be reached (`error_class`) |
 
 ### Error tokens
 
@@ -1131,6 +1138,70 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
   `ANOLE_DB_ERR_UNAVAILABLE` (503). Retryable reads and writes are retried
   once, as the drivers do.
 - Transactions (`anole_db_begin`) are SQLite and PostgreSQL only; change streams are not part of the ABI yet.
+
+## Brokers
+
+Brokers are configured under `"brokers"` (one object per broker, with a
+`"name"` and exactly one kind key; `"nats"` is the one built so far) and used
+through `anole_nats_*` calls. They are built with `-Dnats` (`anole_has_feature("nats")`).
+
+```json
+"brokers": [
+  { "name": "events",
+    "nats": { "url": "tls://nats.internal:4222", "creds_file": "/run/secrets/app.creds",
+              "connections": "one",
+              "jetstream": { "streams": [ { "name": "ORDERS", "subjects": ["orders.>"] } ],
+                             "consumers": [ { "stream": "ORDERS", "durable": "billing" } ] } },
+    "timeout_ms": 30000, "retry": { "attempts": 5 } }
+]
+```
+
+`nats` takes `url` (`nats://`, `tls://`, a comma-separated list; `user:password@`
+or `token@` in it log in), `name`, one login (`token`, `user` and `password`,
+`nkey_seed` or `nkey_seed_file`, `creds` or `creds_file`), TLS (`ca_file` or
+`ca_pem`, `client_cert_file` and `client_key_file` or their `_pem` forms,
+`insecure_skip_verify`, `tls_first`, `tls_required`), `connections` (`"one"`,
+the default, keeps publishes ordered across the app; `"per_executor"`),
+`connect_timeout_ms`, `connect_at_start`, `ping_interval_ms`,
+`max_outstanding_pings`, `no_echo`, `reconnect`, `limits` and `jetstream`
+(`domain`, `streams`, `consumers`, created or updated when the server starts).
+`timeout_ms` bounds requests that have none of their own; `retry` is what
+`ANOLE_NATS_F_RETRY` requests retry with (only on no-responders: the request
+was never delivered).
+
+**Publishing never waits.** `anole_nats_publish` copies the message and
+returns: `ANOLE_OK`, `ANOLE_BUSY` (taken, but the queue is past half its
+limit), or `ANOLE_E_AGAIN` (not taken: the queue is full; the consumer gets
+`ANOLE_EV_NATS_WRITABLE` when there is room). A send that blocks on the
+network would stall whatever lock the caller holds.
+
+**Requests and JetStream publishes** return at once; the answer is one
+`ANOLE_EV_NATS_REPLY` to the consumer given, with the caller's `user_data`:
+`status` is `ANOLE_OK`, `ANOLE_E_TIMEOUT`, `ANOLE_E_BROKER` (`error_class`
+`UNAVAILABLE` for no responders or a lost connection, `OTHER` for a refusal;
+`error_code` says which: `no_responders`, `timeout`, `outbound_full`, a
+JetStream `err_code`) or `ANOLE_E_GONE` (the request it served ended first).
+`http_status` is what Anole's own handlers would answer (503, 504, 500).
+
+**Subscriptions** (`anole_nats_subscribe`, with a queue group when several
+processes share the work) deliver `ANOLE_EV_NATS_MSG` records on the consumer
+given. Delivery waits for room in the consumer's ring; meanwhile the
+subscription's own queue applies its `overflow` policy (`ANOLE_NATS_DROP_*`,
+`ANOLE_NATS_CLOSE`), and the drops are counted in the
+`ANOLE_EV_NATS_SUB_END` record (`dropped`). `anole_nats_unsubscribe` (or
+`anole_handle_release`) ends one.
+
+**JetStream consumption** (`anole_nats_js_consume`) pulls with credit: it
+asks for more only while fewer than `max_inflight` messages are unacked, so
+nothing is dropped. Each message is an `ANOLE_EV_NATS_JS_MSG` with its own
+`anole_nats_msg` handle, owing `anole_nats_ack` (`ANOLE_NATS_ACK`,
+`ANOLE_NATS_NAK` with a delay, `ANOLE_NATS_TERM`, `ANOLE_NATS_PROGRESS`) or
+`anole_handle_release`, which is a NAK. An unanswered message is redelivered
+by the server after the consumer's `ack_wait`.
+
+At the stop, subscriptions end without events (the consumer's last event is
+`ANOLE_EV_STOPPED`). `anole_nats_find` looks a broker up by name and
+`anole_nats_index` gives its place in `"brokers"`.
 
 ## gRPC
 
