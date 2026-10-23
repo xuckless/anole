@@ -24,7 +24,13 @@ pub const SessionData = @import("middleware/Session.zig").SessionData;
 /// `Request.locals` (`setLocal`, `local`).
 pub const Locals = @import("locals.zig").Locals;
 
-const log = std.log.scoped(.anole);
+const bind_mod = @import("bind.zig");
+const bind_strings = @import("bind_strings.zig");
+const bind_violations = @import("bind_violations.zig");
+const validate = @import("validate");
+const anole_log = @import("anole_log");
+
+const scope_log = std.log.scoped(.anole);
 
 const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
 
@@ -167,6 +173,10 @@ pub const Request = struct {
     /// Values a middleware hands to the handler for this request: see
     /// `setLocal` and `local`.
     locals: Locals = .{},
+
+    /// The violations `bind*` and `addViolation` recorded (see `violations`).
+    _violations: std.ArrayList(http.Violation) = .empty,
+    _violations_truncated: bool = false,
 
     // 100-continue support
     _response: ?*Response = null,
@@ -386,38 +396,175 @@ pub const Request = struct {
         return self.query.get(name);
     }
 
-    /// The JSON body as a `T` (`std.json`), allocated in the request's
-    /// arena: `const in = try req.bind(NewUser);`. Fields the body has and
-    /// `T` does not are ignored. A request without a body fails with
-    /// `error.MissingBody`, and one that is not JSON or does not fit `T`
-    /// (a missing field, a string for a number) with `error.InvalidJsonBody`;
-    /// the server answers both with 400. The `Content-Type` is not checked.
+    /// The JSON body as a `T` in the request's arena, mapped field by field
+    /// and checked by `T`'s `field_rules` (`anole.validate`):
+    /// `const in = try req.bind(NewUser);`. A request without a body fails
+    /// with `error.MissingBody` and one that is not JSON with
+    /// `error.InvalidJsonBody` (both 400); lists past 4 x `max_body_size`
+    /// with `error.BodyTooBig` (413). A value that does not fit `T` (a wrong
+    /// type, a missing required field, an unknown field in a type that says
+    /// `pub const unknown_fields = .reject;`) or breaks a rule fails with
+    /// `error.ValidationFailed` (422), every problem in `violations()`.
+    /// Unknown fields are ignored otherwise. The `Content-Type` is not
+    /// checked.
     pub fn bind(self: *Request, comptime T: type) !T {
-        return self.bindWith(T, lenient_json);
+        return try self.json(T) orelse error.MissingBody;
     }
 
-    /// `bind` with `std.json`'s parse options as given. Their default
-    /// refuses fields `T` lacks, which `bind` ignores.
+    /// `bind` with `std.json`'s parse options as given, and no mapping or
+    /// rules (the opt-out): any mismatch is `error.InvalidJsonBody` (400).
+    /// Their default refuses fields `T` lacks, which `bind` ignores.
     pub fn bindWith(self: *Request, comptime T: type, options: std.json.ParseOptions) !T {
         return try self.jsonWith(T, options) orelse error.MissingBody;
     }
 
     /// `bind`, with null for a request without a body.
     pub fn json(self: *Request, comptime T: type) !?T {
-        return self.jsonWith(T, lenient_json);
+        const b = try self.body() orelse return null;
+        const result = bind_mod.bindJson(T, self.arena, b, .{ .max_list_bytes = self._config.max_body_size *| 4 }) catch |err| {
+            scope_log.debug("request body is not the JSON expected: {t}", .{err});
+            return err;
+        };
+        switch (result) {
+            .ok => |value| return value,
+            .invalid => |found| {
+                self.recordViolations(found);
+                return error.ValidationFailed;
+            },
+        }
     }
-
-    const lenient_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
     fn jsonWith(self: *Request, comptime T: type, options: std.json.ParseOptions) !?T {
         const b = try self.body() orelse return null;
         return std.json.parseFromSliceLeaky(T, self.arena, b, options) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => {
-                log.debug("request body is not the JSON expected: {t}", .{err});
+                scope_log.debug("request body is not the JSON expected: {t}", .{err});
                 return error.InvalidJsonBody;
             },
         };
+    }
+
+    /// The query string as a `T`: names by outside names, `?tag=a&tag=b`
+    /// into `[]const T`, defaults for absent fields, unknown names ignored.
+    /// A problem is a violation (`in = query`) and `error.ValidationFailed`
+    /// (422); a broken percent-escape or invalid UTF-8 is `error.BadRequest`
+    /// (400). The rules of `T` run after the mapping.
+    pub fn bindQuery(self: *Request, comptime T: type) !T {
+        comptime bind_strings.check(T, .query);
+        const raw = if (std.mem.indexOfScalar(u8, self.url, '?')) |q| self.url[q + 1 ..] else "";
+        var pairs: std.ArrayList(bind_strings.Pair) = .empty;
+        var it = std.mem.splitScalar(u8, raw, '&');
+        while (it.next()) |piece| {
+            if (piece.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, piece, '=');
+            const name = try http.percentDecode(self.arena, piece[0 .. eq orelse piece.len], true);
+            const value = try http.percentDecode(self.arena, if (eq) |e| piece[e + 1 ..] else "", true);
+            if (!std.unicode.utf8ValidateSlice(name) or !std.unicode.utf8ValidateSlice(value)) return error.BadRequest;
+            try pairs.append(self.arena, .{ .name = name, .value = value });
+        }
+        return self.mapStrings(T, .query, pairs.items, .query);
+    }
+
+    /// The route's parameters as a `T` (`%2F` decoded, `+` kept). Any
+    /// problem, an absent or ill-fitting value or a broken rule, is
+    /// `error.NotFound` (404) and records no violation: a value that does
+    /// not fit the route names no resource.
+    pub fn bindPath(self: *Request, comptime T: type) !T {
+        comptime bind_strings.check(T, .path);
+        var pairs: std.ArrayList(bind_strings.Pair) = .empty;
+        var it = self.params.iterator();
+        while (it.next()) |entry| {
+            const value = http.percentDecode(self.arena, entry.value, false) catch return error.NotFound;
+            if (!std.unicode.utf8ValidateSlice(value)) return error.NotFound;
+            try pairs.append(self.arena, .{ .name = entry.key, .value = value });
+        }
+        return self.mapStrings(T, .path, pairs.items, .body) catch |err| switch (err) {
+            error.ValidationFailed => {
+                self._violations.clearRetainingCapacity();
+                self._violations_truncated = false;
+                return error.NotFound;
+            },
+            error.BadRequest => return error.NotFound,
+            else => |e| return e,
+        };
+    }
+
+    /// The request headers as a `T`: a field `x_request_id` reads
+    /// `X-Request-Id` (any case; `v.rename` names the header otherwise),
+    /// `?T` for optional ones, defaults when absent. Problems are
+    /// violations with `in = header` and `field` the header's name, and
+    /// `error.ValidationFailed` (422).
+    pub fn bindHeaders(self: *Request, comptime T: type) !T {
+        comptime bind_strings.check(T, .headers);
+        var pairs: std.ArrayList(bind_strings.Pair) = .empty;
+        for (self.headers.keys[0..self.headers.len], self.headers.values[0..self.headers.len]) |k, val| {
+            try pairs.append(self.arena, .{ .name = k, .value = val });
+        }
+        return self.mapStrings(T, .headers, pairs.items, .header);
+    }
+
+    fn mapStrings(self: *Request, comptime T: type, comptime source: bind_strings.Source, pairs: []const bind_strings.Pair, in: http.Violation.Source) !T {
+        var sink: bind_violations.Collector = .init(self.arena);
+        const mapped = bind_strings.map(T, source, self.arena, pairs, bind_strings.unknownPolicy(T, .ignore), &sink) catch |err| switch (err) {
+            error.InvalidRequest => return error.BadRequest,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        var value = mapped orelse {
+            self.recordViolations(try bind_mod.toViolations(self.arena, &sink, in));
+            return error.ValidationFailed;
+        };
+        const bad = bind_mod.applyRules(T, self.arena, &value, in) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TransformFailed => return error.BadRequest,
+        };
+        if (bad) |found| {
+            self.recordViolations(found);
+            return error.ValidationFailed;
+        }
+        return value;
+    }
+
+    fn recordViolations(self: *Request, found: http.Violations) void {
+        for (found.items) |item| self.pushViolation(item);
+        if (found.truncated) self._violations_truncated = true;
+    }
+
+    fn pushViolation(self: *Request, item: http.Violation) void {
+        if (self._violations.items.len >= validate.max_report_violations) {
+            self._violations_truncated = true;
+            return;
+        }
+        self._violations.append(self.arena, item) catch {
+            self._violations_truncated = true;
+        };
+    }
+
+    /// The violations of this request's failed binds and `invalid` /
+    /// `addViolation` calls, in the order they were found.
+    pub fn violations(self: *const Request) http.Violations {
+        return .{ .items = self._violations.items, .truncated = self._violations_truncated };
+    }
+
+    /// Adds a violation (`in = body`) without failing; at most 100 are kept.
+    /// `field` must live as long as the request (a literal or the arena);
+    /// `code` follows `v.custom`'s grammar (`users.email_taken`).
+    pub fn addViolation(self: *Request, field: ?[]const u8, comptime code: []const u8, comptime message: []const u8) void {
+        comptime validate.checkCode("req.addViolation", code);
+        comptime if (validate.messageProblem(message)) |p| @compileError("anole: req.addViolation: " ++ validate.describeMessageProblem(p));
+        self.pushViolation(.{ .in = .body, .field = field, .code = code, .message = message });
+    }
+
+    /// `addViolation`, then `error.ValidationFailed`:
+    /// `return req.invalid("email", "users.email_taken", "is already taken");`
+    pub fn invalid(self: *Request, field: ?[]const u8, comptime code: []const u8, comptime message: []const u8) error{ValidationFailed} {
+        self.addViolation(field, code, message);
+        return error.ValidationFailed;
+    }
+
+    /// A logger whose records carry this request's id, trace id and span id.
+    pub fn log(self: *const Request) anole_log.Logger {
+        return .{ .context = .{ .request_id = self.id, .trace_id = self.trace_id, .span_id = self.span_id } };
     }
 
     /// The JSON body as a generic value; null without a body, and
@@ -1778,4 +1925,274 @@ test "Request.paramDecoded: %C3%BC, %2F, a lone %, no escapes returns the same s
     try std.testing.expect((try req.paramDecoded("missing")) == null);
     // The raw text is what `params` keeps.
     try std.testing.expectEqualStrings("J%C3%BCrgen", req.params.get("name").?);
+}
+
+// ------------------------------------------------------------------ bind, bindQuery, bindPath
+
+const BindBody = struct {
+    reader: std.Io.Reader = undefined,
+
+    fn noError(_: *std.Io.Reader) ?Transport.ReadError {
+        return null;
+    }
+
+    fn request(self: *BindBody, arena: std.mem.Allocator, bytes: []const u8) Request {
+        self.reader = .fixed(bytes);
+        return .{
+            .arena = arena,
+            ._parser = undefined,
+            ._transport = undefined,
+            ._body_source = .{ .reader = &self.reader, .err = noError },
+        };
+    }
+};
+
+const rules = @import("validate");
+
+const Todo = struct {
+    title: []const u8,
+    due: ?[]const u8 = null,
+    tags: []const []const u8 = &.{},
+
+    pub const field_rules = .{
+        .title = .{ rules.trim, rules.notBlank, rules.maxLength(10) },
+        .tags = .{ rules.maxItems(2), rules.each(rules.notEmpty) },
+    };
+};
+
+fn expectViolationAt(req: *const Request, index: usize, in: http.Violation.Source, field: ?[]const u8, code: []const u8) !void {
+    const found = req.violations().items;
+    try std.testing.expect(index < found.len);
+    try std.testing.expectEqual(in, found[index].in);
+    try std.testing.expectEqualStrings(code, found[index].code);
+    if (field) |f| try std.testing.expectEqualStrings(f, found[index].field.?) else try std.testing.expect(found[index].field == null);
+}
+
+test "bind: a plain DTO with a wrong type is ValidationFailed with every violation (in = body)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Plain = struct { name: []const u8, age: u8, ok: bool };
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "{\"name\":1,\"age\":\"x\"}");
+    try std.testing.expectError(error.ValidationFailed, req.bind(Plain));
+    try std.testing.expectEqual(@as(usize, 3), req.violations().items.len);
+    try expectViolationAt(&req, 0, .body, "name", "http.invalid_type");
+    try expectViolationAt(&req, 1, .body, "age", "http.invalid_type");
+    try expectViolationAt(&req, 2, .body, "ok", "http.missing_field");
+}
+
+test "bind: field_rules run after mapping; all violations, paths by outside names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "{\"title\":\"   \",\"tags\":[\"a\",\"\",\"c\"]}");
+    try std.testing.expectError(error.ValidationFailed, req.bind(Todo));
+    try expectViolationAt(&req, 0, .body, "title", "validation.not_blank");
+    try expectViolationAt(&req, 1, .body, "tags", "validation.max_items");
+}
+
+test "bind: transforms run before rules (trim then notBlank)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "{\"title\":\"  hello  \"}");
+    const todo = try req.bind(Todo);
+    try std.testing.expectEqualStrings("hello", todo.title);
+}
+
+test "bind: unknown fields ignored by default, reported with unknown_fields = .reject" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Strict = struct {
+        a: u8,
+        pub const unknown_fields = .reject;
+    };
+    const Loose = struct { a: u8 };
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "{\"a\":1,\"extra\":true}");
+    try std.testing.expectEqual(@as(u8, 1), (try req.bind(Loose)).a);
+    var body2: BindBody = .{};
+    var req2 = body2.request(arena.allocator(), "{\"a\":1,\"extra\":true}");
+    try std.testing.expectError(error.ValidationFailed, req2.bind(Strict));
+    try expectViolationAt(&req2, 0, .body, "extra", "http.unknown_field");
+}
+
+test "bind: not JSON is InvalidJsonBody; no body is MissingBody; json() is null without a body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Plain = struct { a: u8 };
+    var b1: BindBody = .{};
+    var r1 = b1.request(arena.allocator(), "not json");
+    try std.testing.expectError(error.InvalidJsonBody, r1.bind(Plain));
+    var b2: BindBody = .{};
+    var r2 = b2.request(arena.allocator(), "");
+    try std.testing.expectError(error.MissingBody, r2.bind(Plain));
+    var b3: BindBody = .{};
+    var r3 = b3.request(arena.allocator(), "");
+    try std.testing.expect((try r3.json(Plain)) == null);
+    var b4: BindBody = .{};
+    var r4 = b4.request(arena.allocator(), "{\"a\":1,\"a\":2}");
+    try std.testing.expectError(error.InvalidJsonBody, r4.bind(Plain));
+}
+
+test "bind: lists past 4 x max_body_size are BodyTooBig" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "[1,2,3,4]");
+    req._config.max_body_size = 1;
+    // Four u64 items take 32 bytes, past 4 x 1.
+    try std.testing.expectError(error.BodyTooBig, req.bind([]const u64));
+}
+
+test "bind: a fallback type (with [2]i32) maps with std.json and still runs rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Fallback = struct {
+        pair: [2]i32,
+        name: []const u8,
+        pub const field_rules = .{ .name = rules.notBlank };
+    };
+    var b1: BindBody = .{};
+    var r1 = b1.request(arena.allocator(), "{\"pair\":[3,4],\"name\":\"x\"}");
+    try std.testing.expectEqual(@as(i32, 4), (try r1.bind(Fallback)).pair[1]);
+    var b2: BindBody = .{};
+    var r2 = b2.request(arena.allocator(), "{\"pair\":[3,4],\"name\":\" \"}");
+    try std.testing.expectError(error.ValidationFailed, r2.bind(Fallback));
+    var b3: BindBody = .{};
+    var r3 = b3.request(arena.allocator(), "{\"pair\":\"no\",\"name\":\"x\"}");
+    try std.testing.expectError(error.InvalidJsonBody, r3.bind(Fallback));
+}
+
+test "bindWith: std.json options, no rules (an invalid DTO passes)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "{\"title\":\"   \",\"extra\":1}");
+    const todo = try req.bindWith(Todo, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("   ", todo.title);
+}
+
+const Search = struct {
+    q: []const u8 = "",
+    page: u32 = 1,
+    tag: []const []const u8 = &.{},
+    pub const field_rules = .{ .page = rules.range(1, 100) };
+};
+
+test "bindQuery: ?tag=a&tag=b into []const []const u8, %20 and + decoded, defaults kept, 422 with in = query" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "");
+    req.url = "/search?q=a%20b+c&tag=x&tag=y&unknown=1";
+    const s = try req.bindQuery(Search);
+    try std.testing.expectEqualStrings("a b c", s.q);
+    try std.testing.expectEqual(@as(u32, 1), s.page);
+    try std.testing.expectEqual(@as(usize, 2), s.tag.len);
+    try std.testing.expectEqualStrings("y", s.tag[1]);
+
+    var body2: BindBody = .{};
+    var bad = body2.request(arena.allocator(), "");
+    bad.url = "/search?page=x";
+    try std.testing.expectError(error.ValidationFailed, bad.bindQuery(Search));
+    try expectViolationAt(&bad, 0, .query, "page", "http.invalid_type");
+    var body3: BindBody = .{};
+    var rule = body3.request(arena.allocator(), "");
+    rule.url = "/search?page=500";
+    try std.testing.expectError(error.ValidationFailed, rule.bindQuery(Search));
+    try expectViolationAt(&rule, 0, .query, "page", "validation.range");
+}
+
+test "bindQuery: a broken percent-escape is BadRequest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "");
+    req.url = "/search?q=%zz";
+    try std.testing.expectError(error.BadRequest, req.bindQuery(Search));
+}
+
+fn fuzzQuery(bytes: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "");
+    const url = try std.fmt.allocPrint(arena.allocator(), "/q?{s}", .{bytes});
+    req.url = url;
+    if (req.bindQuery(Search)) |s| {
+        try std.testing.expect(s.page >= 1 and s.page <= 100);
+    } else |_| {
+        try std.testing.expect(req.violations().items.len <= rules.max_report_violations);
+    }
+}
+
+test "fuzz: bindQuery decoding" {
+    try @import("fuzz.zig").bytes(fuzzQuery, &.{ "q=a&page=2", "tag=x&tag=y", "page=%00", "q=%e2%82", "&&=&=" });
+}
+
+test "bindPath: a value that does not fit, or breaks a rule, is NotFound and records no violation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Path = struct {
+        id: u64,
+        slug: []const u8 = "x",
+        pub const field_rules = .{ .id = rules.positive };
+    };
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "");
+    try req.params.map.put(arena.allocator(), "id", "42");
+    try req.params.map.put(arena.allocator(), "slug", "a%2Fb");
+    const p = try req.bindPath(Path);
+    try std.testing.expectEqual(@as(u64, 42), p.id);
+    try std.testing.expectEqualStrings("a/b", p.slug);
+
+    var b2: BindBody = .{};
+    var r2 = b2.request(arena.allocator(), "");
+    try r2.params.map.put(arena.allocator(), "id", "abc");
+    try std.testing.expectError(error.NotFound, r2.bindPath(Path));
+    try std.testing.expectEqual(@as(usize, 0), r2.violations().items.len);
+    var b3: BindBody = .{};
+    var r3 = b3.request(arena.allocator(), "");
+    try r3.params.map.put(arena.allocator(), "id", "0");
+    try std.testing.expectError(error.NotFound, r3.bindPath(Path));
+    try std.testing.expectEqual(@as(usize, 0), r3.violations().items.len);
+}
+
+test "bindHeaders: x_request_id reads X-Request-Id, optional ones are null, problems are in = header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Hdrs = struct {
+        x_request_id: []const u8,
+        x_retries: ?u8 = null,
+    };
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "");
+    req.headers = try http.Headers.init(arena.allocator(), 8);
+    try req.headers.add("x-request-id", "r-1");
+    const h = try req.bindHeaders(Hdrs);
+    try std.testing.expectEqualStrings("r-1", h.x_request_id);
+    try std.testing.expect(h.x_retries == null);
+
+    var b2: BindBody = .{};
+    var r2 = b2.request(arena.allocator(), "");
+    r2.headers = try http.Headers.init(arena.allocator(), 8);
+    try r2.headers.add("X-Retries", "many");
+    try std.testing.expectError(error.ValidationFailed, r2.bindHeaders(Hdrs));
+    try expectViolationAt(&r2, 0, .header, "X-Retries", "http.invalid_type");
+    try expectViolationAt(&r2, 1, .header, "X-Request-Id", "http.missing_field");
+}
+
+test "invalid/addViolation: appended in order, at most 100, ValidationFailed returned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var body: BindBody = .{};
+    var req = body.request(arena.allocator(), "");
+    req.addViolation("a", "users.first", "one");
+    try std.testing.expectEqual(error.ValidationFailed, req.invalid("b", "users.second", "two"));
+    try expectViolationAt(&req, 0, .body, "a", "users.first");
+    try expectViolationAt(&req, 1, .body, "b", "users.second");
+    for (0..150) |_| req.addViolation(null, "users.many", "m");
+    try std.testing.expectEqual(@as(usize, 100), req.violations().items.len);
+    try std.testing.expect(req.violations().truncated);
 }

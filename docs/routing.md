@@ -44,7 +44,69 @@ app.get("/count", count);
 
 Conflicts panic at registration, not on a request: the same route twice, two
 `:params` with different names at one position, or an `any` route that
-overlaps a method route without either being more specific.
+overlaps a method route without either being more specific. In a test build
+the router records the first conflict instead of panicking: `run`, `listen`
+and `anole.testing.client` fail with `error.RouteConflict` and
+`app.routeConflict()` has the message.
+
+### Paths are checked when you compile
+
+The route methods (`get`, `post`, ..., `any`, `ws`, `webtransport`, and the
+same on groups) take their `path` at compile time and refuse a malformed
+pattern with a compile error that names the route:
+
+```
+error: anole: route GET /a/*x/b: a wildcard (*x) must be the last segment
+```
+
+The rules: the path starts with `/`; a `:` or `*` is followed by a name that
+holds neither; a wildcard is the last segment; a parameter name appears once
+in a path; no `?` or `#` (a route matches the path only: read the query with
+`req.query`, `req.bindQuery` or `anole.In`). For a path known only at run
+time (read from configuration), use `app.addRoute(method, path, handler)`
+(`null` is every method), which checks the same way when it registers: a
+panic, or a recorded conflict in test builds. Static prefixes, group
+prefixes and the C ABI's routes get the same check at startup
+(`ANOLE_E_CONFIG` naming the route).
+
+## Typed handlers
+
+A handler can name what it reads and what it returns, and Anole does the
+binding and the answer:
+
+```zig
+fn update(req: *anole.Request, in: anole.In(.{ .path = struct { id: u64 }, .body = UpdateUser })) !User {
+    return store.update(req, in.path.id, in.body);
+}
+app.put("/users/:id", update); // 200 with the User as JSON
+```
+
+The shape is `fn ([ctx: *Ctx,] req: *anole.Request, [res: *anole.Response,]
+[in: anole.In(...)]) [E!]Out`. A handler that is exactly `(req, res)` or
+`(ctx, req, res)` returning `void` is *plain*: it answers itself, as always.
+Any other handler of this shape is typed:
+
+- **Inputs.** `anole.In(.{ .path, .query, .headers, .body })` is bound before
+  the handler runs: the path first (a mismatch is a 404), then query, headers
+  and body, whose violations come back together as one 422
+  ([validation.md](validation.md)). Compile-time checks: the spec's keys and
+  types, a path field that is not a parameter of the route, `.body` on a
+  GET or HEAD.
+- **Output.** A result other than `void` is written with `res.json`, with
+  status 200 or the type's own: `anole.Created(T)` (201, with an optional
+  `Location`: `return .{ .value = todo, .location = "/todos/7" }`),
+  `anole.Accepted(T)` (202) and `anole.WithStatus(.status, T)` for any 2xx. A
+  handler that takes `res` and changed `res.status` keeps its status.
+- **Void.** A typed handler that takes `res` answers itself; one that does
+  not, answers 204.
+- **Errors.** Returned errors map as for any handler (`error.NotFound`, a
+  status-named error, `error.ValidationFailed` for a 422).
+
+`anole.routeInfo(handler)` reads a handler's signature (inputs, output,
+declared errors, `takes_res`, `typed`, `no_wait`, `cached`), also through
+`anole.noWait` and `anole.cached`; tools that describe routes (OpenAPI) use
+it. `anole.cached` is only for GET and HEAD routes: on another method it is a
+compile error.
 
 ## Path parameters and the query string
 

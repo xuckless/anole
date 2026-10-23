@@ -12,6 +12,7 @@
 //! builds of the core used to the current ones (`anole`, `access`,
 //! `anole_h2`) and passes everything else through.
 const std = @import("std");
+const anole_log = @import("anole_log");
 
 pub const std_options: std.Options = .{
     .logFn = logFn,
@@ -30,7 +31,15 @@ pub fn logFn(
     args: anytype,
 ) void {
     const renamed = comptime rename(scope);
-    std.log.defaultLog(level, renamed, format, args);
+    anole_log.fromStd(level, renamed, format, args);
+}
+
+/// Whether the program's root file sets `std_options.logFn` to `logFn`
+/// (`pub const std_options = anole.std_options;`), so that std.log lines
+/// become JSON records in the JSON format. Comptime-known.
+pub fn usesAnoleLogFn() bool {
+    const root = @import("root");
+    return comptime @hasDecl(root, "std_options") and root.std_options.logFn == logFn;
 }
 
 fn rename(comptime scope: @EnumLiteral()) @EnumLiteral() {
@@ -60,4 +69,9 @@ test "std_options: debug from the runtime and the loops quieted, the access log 
         }
         std.debug.assert(zio_seen);
     }
+}
+
+test "usesAnoleLogFn is a comptime bool" {
+    _ = comptime usesAnoleLogFn();
+    try std.testing.expect(@TypeOf(usesAnoleLogFn()) == bool);
 }

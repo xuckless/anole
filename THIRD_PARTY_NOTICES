@@ -392,10 +392,27 @@ src/config/ (typed configuration: anole.config, anole.Secret, the .env parser)
   Source:   https://github.com/vkiryakov/zefir, commit dbcc9677
 
 
+src/validate/ (the validator), src/logging/escape.zig, timestamp.zig,
+redact.zig, value.zig, src/http/core/bind.zig, bind_strings.zig,
+bind_violations.zig, json_out.zig
+  Copied or adapted from zefir: the validator verbatim (src/validator/, with
+  three exports added at the end of root.zig), the log escaping, timestamps,
+  redaction and value writer (src/log/), and the request mapping and JSON
+  output of its HTTP module (src/http/input/, src/http/output/). Every file
+  carries an attribution header; zefir's licence is src/LICENSE.zefir.
+  Licence:  MIT (text in part C). Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit
+            dbcc9677e6364997d1c897dc813985d76504e2b0 (branch dev)
+  Linked:   always (the validator only as far as a program uses it)
+
+src/testing/root.zig
+  Its request, response and stream API follows the shape of zefir's
+  src/http/testing/Backend.zig (no code copied).
+
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------
 
-zefir (src/config, src/nats/core, src/openapi): Copyright (c) 2026 vkiryakov
+zefir (src/config, src/nats/core, src/openapi, src/validate, src/logging, src/http/core/bind*.zig, json_out.zig): Copyright (c) 2026 vkiryakov
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -53,6 +53,41 @@
       "default": "auto",
       "description": "How the server writes its own error answers (404, 405, the status an error maps to)."
     },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "text",
+            "json"
+          ],
+          "default": "auto",
+          "description": "auto: JSON Lines when environment is production, else text. In json, the log callback's msg is the whole record as one JSON object."
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Written as \"service\" in every JSON record; at most 64 bytes."
+        }
+      },
+      "description": "Logging, process-wide (docs/logging.md)."
+    },
+    "banner": {
+      "type": "boolean",
+      "default": false,
+      "description": "Print the startup banner (the anole, the version, the address) to stderr when it is a terminal and log.format resolves to text. Never under systemd. ANOLE_NO_BANNER=1 turns it off."
+    },
     "environment": {
       "anyOf": [
         {
@@ -889,9 +924,12 @@
               "properties": {
                 "format": {
                   "enum": [
+                    "auto",
                     "text",
                     "json"
-                  ]
+                  ],
+                  "default": "auto",
+                  "description": "auto follows the log format (log.format)."
                 },
                 "exclude": {
                   "type": "array",

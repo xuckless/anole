@@ -23,11 +23,11 @@ pub const panic = std.debug.FullPanic(panicFn);
 
 fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
-    if (log_target.load(.acquire) != null) anole.logPanic(msg, first_trace_addr orelse @returnAddress());
+    if (anole.log.hasSink()) anole.logPanic(msg, first_trace_addr orelse @returnAddress());
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 pub const std_options: std.Options = .{
-    .logFn = logFn,
+    .logFn = anole.logFn,
     .log_level = if (builtin.mode == .debug) .debug else .info,
     .log_scope_levels = &.{
         .{ .scope = .zio, .level = .info },
@@ -44,7 +44,6 @@ pub const std_options: std.Options = .{
 const LogTarget = struct { f: abi.LogFn, ud: ?*anyopaque };
 
 var log_target: std.atomic.Value(?*const LogTarget) = .init(null);
-var log_max: std.atomic.Value(u32) = .init(abi.LOG_INFO);
 
 fn levelOf(l: std.log.Level) u32 {
     return switch (l) {
@@ -55,18 +54,24 @@ fn levelOf(l: std.log.Level) u32 {
     };
 }
 
-fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
-    if (levelOf(level) > log_max.load(.monotonic)) return;
-    const t = log_target.load(.acquire) orelse return anole.logFn(level, scope, format, args);
-    var buf: [2048]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    w.print(format, args) catch {
-        // Cut short: what fits, marked.
-        @memcpy(buf[buf.len - 3 ..], "...");
-        w.end = buf.len;
+fn stdLevel(abi_level: u32) std.log.Level {
+    return switch (abi_level) {
+        abi.LOG_ERROR => .err,
+        abi.LOG_WARN => .warn,
+        abi.LOG_DEBUG => .debug,
+        else => .info,
     };
-    t.f(t.ud, levelOf(level), Str.of(@tagName(scope)), Str.of(w.buffered()));
 }
+
+/// Every log record (a std.log line, `anole.log`, the access log) goes to
+/// the binding's callback: in the JSON format the whole record, else the
+/// message.
+fn logSink(_: ?*anyopaque, level: std.log.Level, scope: []const u8, line: []const u8) void {
+    const t = log_target.load(.acquire) orelse return;
+    t.f(t.ud, levelOf(level), Str.of(scope), Str.of(line));
+}
+
+var log_callback: anole.log.Callback = .{ .func = logSink };
 
 // ---- the last error, per thread --------------------------------------------------
 
@@ -290,6 +295,7 @@ var atfork_registered: std.atomic.Value(bool) = .init(false);
 /// in the child by design).
 fn afterForkInChild() callconv(.c) void {
     engine.global = null;
+    anole.log.setSink(null);
     log_target.store(null, .release);
 }
 
@@ -316,24 +322,40 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
         // The modes: ANOLE_ENV, ANOLE_DEPLOYMENT, PORT, ANOLE_PROXY_TRUSTED, "deployment": "lambda".
         else => |other| return named(abi.E_CONFIG, engine.errorName(other), 0, "{s}", .{if (why.buffered().len > 0) why.buffered() else @errorName(other)}),
     };
-    log_max.store(if (o.log_level == 0) abi.LOG_INFO else o.log_level, .monotonic);
+    anole.log.setLevel(stdLevel(if (o.log_level == 0) abi.LOG_INFO else o.log_level));
     // This server's log callback, or stderr (a later server without one
     // does not inherit an earlier one's).
     if (o.log) |f| {
         if (std.heap.c_allocator.create(LogTarget)) |t| {
             t.* = .{ .f = f, .ud = o.log_ud };
             log_target.store(t, .release);
-        } else |_| log_target.store(null, .release);
-    } else log_target.store(null, .release);
+            anole.log.setSink(&log_callback);
+        } else |_| {
+            log_target.store(null, .release);
+            anole.log.setSink(null);
+        }
+    } else {
+        log_target.store(null, .release);
+        anole.log.setSink(null);
+    }
     dst.* = e;
     return abi.OK;
 }
 
 /// A start or open that failed, as an answer.
 fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
+    const explained = e.explained[0..e.explained_len];
     // Which listener could not be bound, in the text.
     if (e.failed_listener) |i| if (i < e.listeners.len) {
         const l = &e.listeners[i];
+        // The log's own words: what could not be done, why, and the way out.
+        if (explained.len > 0) return named(
+            if (l.error_errno != 0) abi.E_SYSTEM else abi.E_CONFIG,
+            l.error_name,
+            l.error_errno,
+            "{s}",
+            .{explained},
+        );
         return named(
             if (l.error_errno != 0) abi.E_SYSTEM else abi.E_CONFIG,
             l.error_name,
@@ -350,7 +372,10 @@ fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
         // such as metrics) that the router cannot tell apart.
         error.RouteConflict => return named(abi.E_CONFIG, "RouteConflict", 0, "routes: {s}", .{e.start_why[0..e.start_why_len]}),
         error.OutOfMemory => return fail(abi.E_NOMEM, what, err),
-        error.DatabaseUnavailable => return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err}),
+        error.DatabaseUnavailable => {
+            if (explained.len > 0) return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), "{s}", .{explained});
+            return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err});
+        },
         else => {},
     }
     const token = engine.errorName(err);
@@ -539,6 +564,7 @@ export fn anole_server_destroy(s: ?*anyopaque) void {
     const e = engineOf(s) orelse return;
     e.destroy();
     // No log callback runs again.
+    anole.log.setSink(null);
     if (log_target.swap(null, .acq_rel)) |t| std.heap.c_allocator.destroy(@constCast(t));
 }
 

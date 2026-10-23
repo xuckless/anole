@@ -259,7 +259,6 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_NATS_REPLY` (65) | `anole_nats_reply_event`: the answer to `anole_nats_request` or `anole_nats_js_publish` | 0 (`user_data`) | none |
 | `ANOLE_EV_NATS_JS_MSG` (66) | `anole_nats_msg_event` with the JetStream fields set | `anole_nats_msg` | `anole_nats_ack` (any kind) or `anole_handle_release` (= NAK) |
 | `ANOLE_EV_NATS_SUB_END` (67) | `anole_broker_end_event`: the subscription is over (`reason`, `dropped`) | `anole_nats_sub` | ends it |
-| (68) | reserved for NATS connection status | | |
 | `ANOLE_EV_NATS_STATUS` (68) | `anole_broker_status_event`: the connection came up (`ANOLE_BROKER_CONNECTED`), was lost (`DISCONNECTED`), came back (`RECONNECTED`) or the server announced lame duck mode (`LAME_DUCK`); sent to every consumer | 0 | none |
 | `ANOLE_EV_NATS_WRITABLE` (69) | `anole_broker_status_event`: a publish refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_KAFKA_RECORDS` (80) | `anole_kafka_records_event`, then `anole_kafka_record`s, header spans and bytes: the next records of one partition | `anole_kafka_batch` | `anole_kafka_batch_done`, `anole_kafka_batch_retry`, or `anole_handle_release` (= retry now) |
@@ -1487,6 +1486,24 @@ threads; it must not block or enter the language), filtered by `log_level`.
 The callback belongs to its server: it is set by `anole_server_create`,
 cleared by `anole_server_destroy`, and a later server without one logs to
 stderr.
+
+`"log": {"format": "auto" | "text" | "json", "service": "..."}` picks the
+format of every record (`auto`: JSON when `environment` is production, which
+is what a binding that leaves it out gets). In `json` the callback's `msg` is
+the complete record as one JSON object with no newline, byte for byte what
+stderr would get; in `text` it is the message, with structured fields
+appended as ` key=value`. Access log lines (the `access_log` middleware, whose
+`format` defaults to `"auto"`, following `log.format`) reach the callback too,
+with scope `access`. Records can be up to 16 KiB; a binding that parses them
+should expect `time`, `level`, `scope`, `message`, `service`, `request_id`,
+`trace_id` and `span_id`, then the record's fields ([logging.md](logging.md)).
+
+`"banner": true` prints the startup banner to stderr (when it is a terminal
+and the format is text); it is off by default under the ABI.
+
+Validation stays in the binding's language (zod, pydantic): the 422
+problem document is described in [validation.md](validation.md#the-422-document)
+for bindings that want the same shape.
 
 ## Testing
 

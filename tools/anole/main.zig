@@ -13,6 +13,7 @@
 const std = @import("std");
 const options = @import("cli_options");
 const index = @import("templates");
+const banner = @import("banner");
 
 const Io = std.Io;
 
@@ -23,9 +24,26 @@ pub const exit_zig_failed = 4;
 
 const repo_url = "git+https://github.com/xuckless/anole";
 
+/// The process environment, for NO_COLOR and the like.
+var environ: ?std.process.Environ = null;
+
+fn getEnv(name: []const u8) ?[]const u8 {
+    if (comptime @import("builtin").os.tag == .windows) return null;
+    const e = environ orelse return null;
+    return e.getPosix(name);
+}
+
+/// `banner.show` and `banner.styleFor` read the environment through this.
+const EnvReader = struct {
+    pub fn get(_: EnvReader, name: []const u8) ?[]const u8 {
+        return getEnv(name);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    environ = init.minimal.environ;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const code = run(gpa, io, args[1..]) catch |err| {
         std.debug.print("anole: {s}\n", .{@errorName(err)});
@@ -219,9 +237,22 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
         }
     }
 
-    // 6. Next steps.
+    // 6. Next steps, after the anole when a person is looking.
+    printBanner(io);
     try say(io, "created {s} (template: {s}, anole v{s})\n  cd {s}\n{s}", .{ parsed.dir, template.name, options.version, parsed.dir, template.next_steps });
     return 0;
+}
+
+/// The anole, when stdout is a terminal (not under NO_COLOR's colour, nor
+/// with ANOLE_NO_BANNER=1).
+fn printBanner(io: Io) void {
+    const tty = Io.File.stdout().isTty(io) catch false;
+    const env: EnvReader = .{};
+    if (!banner.show(true, true, tty, env)) return;
+    var buf: [1024]u8 = undefined;
+    var w = Io.File.stdout().writer(io, &buf);
+    banner.write(&w.interface, .{ .version = options.version }, banner.styleFor(null, env)) catch return;
+    w.interface.flush() catch {};
 }
 
 fn findTemplate(name: []const u8) ?index.Template {

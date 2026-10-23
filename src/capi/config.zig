@@ -22,6 +22,11 @@ pub const Config = struct {
     /// A 500 answer for an error with no status names the error. Null: on in
     /// development.
     error_detail: ?bool = null,
+    /// Logging, process-wide: the format and a service name.
+    log: Log = .{},
+    /// Print the startup banner when stderr is a terminal and the logs are
+    /// text. Off by default under the ABI: a binding opts in.
+    banner: bool = false,
     listeners: []const Listener = &.{.{}},
     timeouts: Timeouts = .{},
     limits: Limits = .{},
@@ -48,6 +53,13 @@ pub const Config = struct {
     databases: []const Database = &.{},
     /// Message brokers for `anole_nats_*`, opened at start.
     brokers: []const Broker = &.{},
+
+    pub const Log = struct {
+        /// "auto" (JSON Lines in production, else text), "text" or "json".
+        format: anole.log.Format = .auto,
+        /// Written as "service" in every JSON record; at most 64 bytes.
+        service: ?[]const u8 = null,
+    };
 
     pub const Listener = struct {
         /// Unique; "http-<port>" / "https-<port>" when left out. Requests
@@ -562,7 +574,8 @@ pub const Config = struct {
         trust_incoming: bool = false,
     };
     pub const AccessLog = struct {
-        format: enum { text, json } = .text,
+        /// "auto" follows `log.format`.
+        format: enum { auto, text, json } = .auto,
         /// Paths not logged: exact, or a prefix ending in "*".
         exclude: []const []const u8 = &.{},
     };
@@ -1155,6 +1168,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
         .request_id => |c| return app.middleware(http.middleware.RequestId.init(.{ .header = c.header, .trust_incoming = c.trust_incoming })),
         .access_log => |c| return app.middleware(anole.observe.AccessLog.init(.{
             .format = switch (c.format) {
+                .auto => null,
                 .text => .text,
                 .json => .json,
             },
@@ -1497,4 +1511,25 @@ test "config: modes keys" {
     const d = try parse(a, "{}", &why);
     try std.testing.expect(d.environment == null and d.deployment == null and d.error_detail == null);
     try std.testing.expectEqual(@as(?u32, 75_000), d.timeouts.keepalive_ms);
+}
+
+test "config: log.format and log.service parse; the access log's format defaults to auto" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a,
+        \\{"log": {"format": "json", "service": "api"}, "banner": true,
+        \\ "middleware": [{"access_log": {}}, {"access_log": {"format": "text"}}]}
+    , &why);
+    try std.testing.expectEqual(anole.log.Format.json, c.log.format);
+    try std.testing.expectEqualStrings("api", c.log.service.?);
+    try std.testing.expect(c.banner);
+    try std.testing.expect(c.middleware[0].access_log.format == .auto);
+    try std.testing.expect(c.middleware[1].access_log.format == .text);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expectEqual(anole.log.Format.auto, d.log.format);
+    try std.testing.expect(d.log.service == null and !d.banner);
+    try std.testing.expect(std.mem.indexOf(u8, @import("anole_capi_schema").text, "\"log\"") != null);
 }

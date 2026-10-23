@@ -32,6 +32,7 @@ export default defineConfig({
 					items: [
 						'getting-started',
 						'routing',
+						'validation',
 						'server',
 						'config',
 						'websocket',
@@ -43,6 +44,8 @@ export default defineConfig({
 						'resilience',
 						'auth',
 						'observability',
+						'logging',
+						'testing',
 						'from-fiber',
 						'migrating',
 						'c-abi',

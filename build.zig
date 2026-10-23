@@ -496,6 +496,53 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
+    // The validator's and the logger's own tests: each is its own module
+    // (no imports), so the anole test binary does not collect them.
+    for ([_]struct { name: []const u8, mod: *std.Build.Module }{
+        .{ .name = "validate-test", .mod = core.validate },
+        .{ .name = "log-test", .mod = core.anole_log },
+    }) |t| {
+        const sub_tests = b.addTest(.{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
+        const run_sub = b.addRunArtifact(sub_tests);
+        run_sub.skip_foreign_checks = true;
+        test_step.dependOn(&run_sub.step);
+        compile_tests_step.dependOn(&sub_tests.step);
+        b.step(t.name, "Run the tests of the module alone").dependOn(&run_sub.step);
+    }
+
+    // test-compile-errors: routes and calls the compiler must refuse, each a
+    // tiny file in tests/compile_errors with the message it must give.
+    {
+        const cases = [_]struct { file: []const u8, contains: []const u8 }{
+            .{ .file = "01_wildcard_not_last", .contains = "anole: route GET /a/*x/b: a wildcard (*x) must be the last segment" },
+            .{ .file = "02_duplicate_param", .contains = "names the parameter \"id\" twice" },
+            .{ .file = "03_query_in_path", .contains = "read the query with req.query, req.bindQuery or anole.In(.{ .query = T }))" },
+            .{ .file = "04_in_path_not_a_param", .contains = "is not a parameter of the route (parameters: id)" },
+            .{ .file = "05_in_optional_path_field", .contains = "a route parameter is always there" },
+            .{ .file = "06_in_body_on_get", .contains = "(use .query, or app.query for the QUERY method)" },
+            .{ .file = "07_in_unknown_key", .contains = "anole.In: unknown key .bdy; the keys are .path, .query, .headers and .body (did you mean .body?)" },
+            .{ .file = "08_cached_on_post", .contains = "it cannot wrap a POST route" },
+            .{ .file = "09_log_tuple_fields", .contains = "for a format string use std.log" },
+            .{ .file = "10_log_reserved_field", .contains = "rename it, e.g. 'user_level'" },
+            .{ .file = "11_invalid_code_grammar", .contains = "e.g. 'users.name_taken'" },
+            .{ .file = "12_rename_on_fallback_type", .contains = "structs, ?T and []const T" },
+        };
+        const ce_step = b.step("test-compile-errors", "Check that bad routes and calls are compile errors with the right message");
+        for (cases) |c| {
+            const obj = b.addObject(.{
+                .name = c.file,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("tests/compile_errors/{s}.zig", .{c.file})),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                }),
+            });
+            obj.expect_errors = .{ .contains = c.contains };
+            ce_step.dependOn(&obj.step);
+        }
+        test_step.dependOn(ce_step);
+    }
 
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
@@ -735,6 +782,21 @@ pub fn build(b: *std.Build) void {
             const run_rest_test = b.addRunArtifact(rest_test);
             run_rest_test.skip_foreign_checks = true;
             test_step.dependOn(&run_rest_test.step);
+            compile_tests_step.dependOn(&rest_test.step);
+            // The same scenario through anole.testing, no socket.
+            const rest_memory_test = b.addTest(.{
+                .name = "rest-memory-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/rest_memory_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "rest", .module = ex_mod } },
+                }),
+            });
+            const run_rest_memory_test = b.addRunArtifact(rest_memory_test);
+            run_rest_memory_test.skip_foreign_checks = true;
+            test_step.dependOn(&run_rest_memory_test.step);
+            compile_tests_step.dependOn(&rest_memory_test.step);
         }
         if (std.mem.eql(u8, ex.name, "sqlite")) {
             const sqlite_test = b.addTest(.{
@@ -1241,6 +1303,8 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "cli_options", .module = opts.createModule() },
                         .{ .name = "templates", .module = tmpl },
+                        // The startup banner (src/banner.zig, std only).
+                        .{ .name = "banner", .module = bb.createModule(.{ .root_source_file = bb.path("src/banner.zig") }) },
                     },
                 });
             }
@@ -1433,6 +1497,12 @@ const Core = struct {
     /// src/resilience/core.zig (retries, breakers): imported as
     /// `resilience_core` by every HTTP core instance and by anole.
     resilience: *std.Build.Module,
+    /// src/validate (the validator, no imports): `validate` in the HTTP core
+    /// (`req.bind`) and in anole.
+    validate: *std.Build.Module,
+    /// src/logging (the JSON Lines logger, no imports): `anole_log` in the
+    /// HTTP core (`req.log()`) and in anole.
+    anole_log: *std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
@@ -1449,7 +1519,9 @@ const Core = struct {
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
         const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
-        var core: Core = .{ .resilience = resilience, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
+        const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
+        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -1471,6 +1543,8 @@ const Core = struct {
                             optimize,
                         );
                         dusty_mod.addImport("resilience_core", resilience);
+                        dusty_mod.addImport("validate", validate);
+                        dusty_mod.addImport("anole_log", anole_log);
                         core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
                         if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
                             b,
@@ -1826,6 +1900,8 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
     mod.addImport("resilience_core", o.core.resilience);
+    mod.addImport("validate", o.core.validate);
+    mod.addImport("anole_log", o.core.anole_log);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));

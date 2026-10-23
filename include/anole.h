@@ -224,7 +224,11 @@ typedef struct anole_server_options {
      possibly several at once; `scope` and `msg` are valid during the call
      only. Must not block and must not enter the language (append to a
      buffer the consumer flushes). NULL: stderr. Belongs to this server: a
-     later server without one logs to stderr. */
+     later server without one logs to stderr. With the configuration's
+     log.format "json" (the default when environment is production), `msg`
+     is the whole record as one JSON object with no newline, byte for byte
+     what stderr would get; in "text", the message. Access log lines (the
+     access_log middleware) come here too, with scope "access". */
   void (*log)(void *ud, uint32_t level, anole_str scope, anole_str msg);
   void *log_ud;
 } anole_server_options;

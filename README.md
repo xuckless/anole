@@ -160,7 +160,12 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   - sessions (memory, Redis or sealed cookies), CSRF, Argon2id, API keys,
     RBAC and rate limiting.
 - **Observability:** Prometheus `/metrics`, OpenTelemetry traces, structured
-  access logs, `/healthz` and `/readyz`.
+  access logs, `/healthz` and `/readyz`; JSON Lines logs by default in
+  production, `req.log()` with request and trace ids, and readable startup
+  errors.
+- **Input and tests:** validation with 422 `application/problem+json` that
+  names every field, typed handlers (`anole.In`) checked at compile time,
+  and in-memory tests (`anole.testing`) with no socket.
 - **Operations:**
   - graceful drain;
   - zero-downtime restart on SIGUSR2, where the new process inherits every

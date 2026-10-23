@@ -72,6 +72,25 @@ pub const Ca = dusty.Ca;
 /// Mutual TLS on a listener (`anole.ClientAuth`).
 pub const ClientAuth = dusty.ClientAuth;
 
+/// One problem found in a request's input (`req.violations()`): where
+/// (`in`), which field, a machine-readable `code`, a `message`.
+pub const Violation = dusty.Violation;
+/// The violations of one request, as `req.violations()` returns them.
+pub const Violations = dusty.Violations;
+/// An RFC 9457 problem document (`res.problem`).
+pub const Problem = dusty.Problem;
+/// JSON bytes as a `T` checked by its `field_rules`, without a request:
+/// what `req.bind` is built on (broker messages use it too).
+pub const bindJson = dusty.bindJson;
+/// `bindJson`'s settings.
+pub const BindOptions = dusty.BindOptions;
+/// `bindJson`'s result: `.ok` or `.invalid` with the violations.
+pub const BindResult = dusty.BindResult;
+/// `pub const unknown_fields = .reject;` on a DTO refuses unknown keys.
+pub const UnknownFields = dusty.UnknownFields;
+/// The syntax check of a route pattern.
+pub const route_pattern = dusty.route_pattern;
+
 /// Using a request or response out of order (a second `req.reader()`,
 /// `res.stream` after `res.body` was set): a named error, answered 500.
 pub const MisuseError = dusty.MisuseError;

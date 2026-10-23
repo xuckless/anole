@@ -235,10 +235,14 @@ test "bind: unknown fields ignored, a missing or malformed body is 400" {
     const empty = try running.send("POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, empty, "HTTP/1.1 400 "));
 
+    // A body that is JSON but does not fit is 422 with the violations;
+    // one that is not JSON is 400.
     for ([_][]const u8{ "{\"age\":3}", "{\"name\":7}", "{\"name\":\"a\",\"age\":300}", "not json" }) |bad| {
         const sent = try std.fmt.bufPrint(&req_buf, "POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ bad.len, bad });
         const r = try running.send(sent, &out);
-        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 400 "));
+        const expected = if (std.mem.eql(u8, bad, "not json")) "HTTP/1.1 400 " else "HTTP/1.1 422 ";
+        try std.testing.expect(std.mem.startsWith(u8, r, expected));
+        if (!std.mem.eql(u8, bad, "not json")) try std.testing.expect(has(r, "Content-Type: application/problem+json"));
     }
 }
 

@@ -61,10 +61,17 @@ test "examples/rest: create, list, get, update, delete, the API key and JSON err
             try expectReply(.ok, "{\"id\":1,\"name\":\"Ada L.\",\"email\":\"ada@example.com\"}", try call(io, arena, .put, one, key, "{\"name\":\"Ada L.\",\"email\":\"ada@example.com\"}"));
             try expectReply(.ok, "{\"id\":1,\"name\":\"Ada L.\",\"email\":\"ada@example.com\"}", try call(io, arena, .get, one, key, null));
 
-            // Bodies that do not fit, and ids that do not exist.
-            try expectReply(.bad_request, "{\"error\":\"Bad Request\"}", try call(io, arena, .post, base, key, "{\"name\":1}"));
+            // Bodies that do not fit (422 problem+json naming every field),
+            // none at all (400), and rules (name not blank, email an address).
+            const wrong_type = try call(io, arena, .post, base, key, "{\"name\":1}");
+            try std.testing.expectEqual(anole.http.Status.unprocessable_entity, wrong_type.status);
+            try std.testing.expect(std.mem.indexOf(u8, wrong_type.body, "{\"in\":\"body\",\"field\":\"name\",\"code\":\"http.invalid_type\",\"message\":\"must be a string\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, wrong_type.body, "\"field\":\"email\",\"code\":\"http.missing_field\"") != null);
             try expectReply(.bad_request, "{\"error\":\"Bad Request\"}", try call(io, arena, .post, base, key, null));
-            try expectReply(.unprocessable_entity, "{\"error\":\"Unprocessable Content\"}", try call(io, arena, .post, base, key, "{\"name\":\"\",\"email\":\"x\"}"));
+            const rules = try call(io, arena, .post, base, key, "{\"name\":\"  \",\"email\":\"x\"}");
+            try std.testing.expectEqual(anole.http.Status.unprocessable_entity, rules.status);
+            try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"field\":\"name\",\"code\":\"validation.not_blank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"field\":\"email\",\"code\":\"validation.email\"") != null);
             const missing = try std.fmt.allocPrint(arena, "{s}/99", .{base});
             try expectReply(.not_found, "{\"error\":\"Not Found\"}", try call(io, arena, .put, missing, key, "{\"name\":\"X\",\"email\":\"x\"}"));
             const not_a_number = try std.fmt.allocPrint(arena, "{s}/abc", .{base});
