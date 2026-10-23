@@ -185,6 +185,16 @@ pub const Exporter = struct {
     task: ?std.Io.Future(void) = null,
     /// Set by `deinit`: wakes the task from its pause between batches.
     closing: std.Io.Event = .unset,
+    /// Set by `flush` and `deinit`: cuts the task's pause short. Only the
+    /// task waits on it and resets it.
+    kick: std.Io.Event = .unset,
+    /// Set by the task after each batch; `flush` waits on it.
+    progress: std.Io.Event = .unset,
+    flush_lock: std.Io.Mutex = .init,
+    /// Spans queued, and spans the task has finished with (sent or
+    /// dropped): `flush` waits until `finished` reaches what `queued` was.
+    queued: std.atomic.Value(u64) = .init(0),
+    finished: std.atomic.Value(u64) = .init(0),
     /// Spans dropped: the queue was full, or the collector did not take
     /// them.
     dropped: std.atomic.Value(u64) = .init(0),
@@ -207,9 +217,30 @@ pub const Exporter = struct {
     /// Sends what is queued and stops the task.
     pub fn deinit(self: *Exporter) void {
         self.closing.set(self.io);
+        self.kick.set(self.io);
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
         self.gpa.free(self.buffer);
+    }
+
+    /// Sends the spans queued so far and waits until the collector has
+    /// answered for them, or `timeout` passes (they are not lost then; the
+    /// task keeps going). For a process that may be frozen after this call
+    /// (AWS Lambda between invocations). One caller at a time; others wait
+    /// their turn. Does nothing before `start`.
+    pub fn flush(self: *Exporter, timeout: std.Io.Duration) void {
+        if (self.task == null) return;
+        self.flush_lock.lockUncancelable(self.io);
+        defer self.flush_lock.unlock(self.io);
+        const target = self.queued.load(.acquire);
+        const deadline = std.Io.Timeout{ .deadline = .{ .raw = std.Io.Clock.awake.now(self.io).addDuration(timeout), .clock = .awake } };
+        while (self.finished.load(.acquire) < target) {
+            self.progress.reset();
+            self.kick.set(self.io);
+            // The task may have finished between the check and the reset.
+            if (self.finished.load(.acquire) >= target) return;
+            self.progress.waitTimeout(self.io, deadline) catch return;
+        }
     }
 
     /// Queues a client span for a call made while serving `req` (a
@@ -239,7 +270,7 @@ pub const Exporter = struct {
 
     fn submit(self: *Exporter, span: Span) void {
         const n = self.queue.putUncancelable(self.io, &.{span}, 0) catch 0;
-        if (n == 0) _ = self.dropped.fetchAdd(1, .monotonic);
+        if (n == 0) _ = self.dropped.fetchAdd(1, .monotonic) else _ = self.queued.fetchAdd(1, .release);
     }
 
     fn run(self: *Exporter) void {
@@ -254,14 +285,18 @@ pub const Exporter = struct {
                 return;
             };
             self.send(batch[0..n]);
-            // A pause before the next batch, cut short by `deinit`.
-            if (n < batch.len) self.closing.waitTimeout(self.io, .{ .duration = .{
+            _ = self.finished.fetchAdd(n, .release);
+            self.progress.set(self.io);
+            // A pause before the next batch, cut short by `deinit` and
+            // `flush`.
+            if (n < batch.len) self.kick.waitTimeout(self.io, .{ .duration = .{
                 .raw = self.options.interval,
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => {},
                 error.Canceled => return,
             };
+            if (!self.closing.isSet()) self.kick.reset();
         }
     }
 

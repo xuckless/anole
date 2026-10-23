@@ -40,9 +40,14 @@ pub const detach_safe = true;
 pub const no_wait = true;
 
 pub fn execute(self: *const RequestId, req: *Request, res: *Response, next: anytype) !void {
-    req.id = if (self.trust_incoming) incoming(req, self.header) orelse try generate(req) else try generate(req);
+    req.id = if (self.trust_incoming) incoming(req, self.header) orelse preset(req) orelse try generate(req) else preset(req) orelse try generate(req);
     try res.header(self.header, req.id);
     return next.call();
+}
+
+/// An ID the engine set already (AWS Lambda's request ID) is kept.
+fn preset(req: *const Request) ?[]const u8 {
+    return if (req.id.len != 0) req.id else null;
 }
 
 /// An incoming ID worth keeping: one that `validIncoming` accepts.
@@ -78,4 +83,12 @@ test "incoming: only IDs made of letters, digits and . _ : -" {
     try std.testing.expect(!validIncoming("a b"));
     try std.testing.expect(!validIncoming("<script>"));
     try std.testing.expect(!validIncoming(&@as([129]u8, @splat('a'))));
+}
+
+test "preset: an ID the engine set is kept, an empty one is replaced" {
+    var req: Request = undefined;
+    req.id = "abc-123";
+    try std.testing.expectEqualStrings("abc-123", preset(&req).?);
+    req.id = "";
+    try std.testing.expect(preset(&req) == null);
 }
