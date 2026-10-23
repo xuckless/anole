@@ -188,7 +188,7 @@ fn Hooks(comptime Ctx: type, comptime handler: anytype, comptime framing: Framin
         }
 
         fn arity(comptime f: anytype, comptime plain: usize, comptime name: []const u8) bool {
-            const n = @typeInfo(@TypeOf(f)).@"fn".params.len;
+            const n = @typeInfo(@TypeOf(f)).@"fn".param_types.len;
             if (n == plain) return false;
             if (n == plain + 1 and Ctx != void) return true;
             @compileError("anole.net callback " ++ name ++ " has the wrong parameters: " ++ @typeName(@TypeOf(f)));
@@ -667,7 +667,7 @@ const TcpConn = struct {
     id: u64,
     next: ?*TcpConn = null,
     drain_hook: dusty.DrainHooks.Hook,
-    state_buf: []u8 = &.{},
+    state_buf: []align(16) u8 = &.{},
     task_form: bool,
     local_cache: ?std.Io.net.IpAddress = null,
 

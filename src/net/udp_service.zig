@@ -118,7 +118,7 @@ fn Hooks(comptime Ctx: type, comptime Handler: type, comptime with_sessions: boo
         }
 
         fn arity(comptime f: anytype, comptime plain: usize, comptime name: []const u8) bool {
-            const n = @typeInfo(@TypeOf(f)).@"fn".params.len;
+            const n = @typeInfo(@TypeOf(f)).@"fn".param_types.len;
             if (n == plain) return false;
             if (n == plain + 1 and Ctx != void) return true;
             @compileError("anole.net UDP callback " ++ name ++ " has the wrong parameters: " ++ @typeName(@TypeOf(f)));
@@ -189,7 +189,7 @@ pub const Session = struct {
     last_local: ?std.Io.net.IpAddress = null,
     end_reason: EndReason = .idle,
     close_requested: bool = false,
-    state_buf: []u8 = &.{},
+    state_buf: []align(16) u8 = &.{},
 
     pub fn contextAs(s: *const Session, comptime T: type) *T {
         return @ptrCast(@alignCast(s.context.?));

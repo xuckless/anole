@@ -146,6 +146,7 @@ pub fn posixErrno(name: anyerror) i32 {
 }
 
 test "errors: TlsLoadError is a subset of ServerError" {
+    @setEvalBranchQuota(100_000);
     inline for (@typeInfo(TlsLoadError).error_set.error_names.?) |m| {
         comptime var found = false;
         inline for (@typeInfo(ServerError).error_set.error_names.?) |s| {
