@@ -519,6 +519,34 @@ jobs:
       - name: grpc HTTP/2 server checks
         run: tests/grpc/interop/run-http2.sh ./zig-out/bin/grpc-interop-server
 
+  # ---- p3/grpc-h3 ----
+  grpc-h3-interop:
+    name: gRPC over HTTP/3 interop (grpc-dotnet v2.84.0 client and server, Anole native and C ABI servers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: grpc-h3-interop
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then, so the fetch is retried.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The image (.NET 10 SDK, libmsquic, grpc-dotnet's interop programs)
+      # takes about 4-6 minutes to build; run.sh builds Anole's side for it.
+      - name: gRPC over HTTP/3 against grpc-dotnet
+        env:
+          ANOLE_GRPC_H3_WORK: ${{ runner.temp }}/grpc-h3
+        run: tests/grpc/h3/run.sh
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
+        with:
+          name: grpc-h3-logs
+          path: ${{ runner.temp }}/grpc-h3/logs
+  # ---- end p3/grpc-h3 ----
+
   redis:
     name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS; the C ABI's suite)
     runs-on: ubuntu-latest

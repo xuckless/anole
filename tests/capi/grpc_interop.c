@@ -367,7 +367,7 @@ int main(int argc, char **argv) {
   out_buf = malloc(4 << 20);
   CHECK(out_buf);
   char tls[1024] = "";
-  if (argc >= 4) snprintf(tls, sizeof tls, ", \"tls\": {\"cert_file\": \"%s\", \"key_file\": \"%s\"}", argv[2], argv[3]);
+  if (argc >= 4) snprintf(tls, sizeof tls, ", \"tls\": {\"cert_file\": \"%s\", \"key_file\": \"%s\"}, \"http3\": true", argv[2], argv[3]);
   char json[4096];
   snprintf(json, sizeof json,
            "{\"listeners\": [{\"address\": \"127.0.0.1\", \"port\": %d%s}],"
@@ -387,7 +387,7 @@ int main(int argc, char **argv) {
   anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
   CHECK(anole_consumer_attach(s, &co, &consumer) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  fprintf(stderr, "capi grpc interop server on 127.0.0.1:%s (%s)\n", argv[1], argc >= 4 ? "TLS" : "h2c");
+  fprintf(stderr, "capi grpc interop server on 127.0.0.1:%s (%s)\n", argv[1], argc >= 4 ? "TLS + HTTP/3" : "h2c");
   static _Alignas(8) unsigned char buf[2 << 20];
   for (;;) {
     int64_t n = anole_poll_wait(consumer, buf, sizeof buf, 1000);
