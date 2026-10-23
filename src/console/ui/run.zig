@@ -85,6 +85,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
     app.wedge_ms = opts.wedge_timeout_ms;
     app.have_launch_info = opts.have_launch_info;
     app.exec_supported = sys.supported;
+    app.color = t.color;
 
     var size = t.querySize();
     var scr = try screen.Screen.init(gpa, size.cols, size.rows);

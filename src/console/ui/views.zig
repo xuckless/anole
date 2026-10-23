@@ -7,6 +7,7 @@ const screen = @import("screen.zig");
 const app_mod = @import("app.zig");
 const stats_window = @import("stats_window.zig");
 const width_of = @import("width.zig").width;
+const banner = @import("anole_banner");
 
 const App = app_mod.App;
 const Screen = screen.Screen;
@@ -236,6 +237,34 @@ fn contains(hay: []const u8, needle: []const u8) bool {
 
 // -------------------------------------------------------------------- logs
 
+/// The splash while no log line has come yet: the small anole (the half
+/// blocks) centred in the panel with `msg` under it, when it fits with room
+/// to spare; false when it doesn't (the caller prints `msg` alone).
+fn drawSplash(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16, msg: []const u8) bool {
+    const pic = banner.picture(.halfblock, app.color).?;
+    const pic_h: u16 = @intCast(pic.lines.len);
+    const pic_w: u16 = @intCast(pic.width);
+    if (h < pic_h + 4 or w < pic_w + 4) return false;
+    const top = y + (h - pic_h - 2) / 2;
+    const left = x + (w - pic_w) / 2;
+    for (pic.lines, 0..) |line, i| {
+        var cx = left;
+        for (line) |seg| {
+            const st: Style = switch (seg.ink) {
+                .none => .{},
+                .green => .{ .fg = .bright_green },
+                .yellow => .{ .fg = .bright_yellow },
+                .green_over_yellow => .{ .fg = .bright_green, .bg = .bright_yellow },
+                .yellow_over_green => .{ .fg = .bright_yellow, .bg = .bright_green },
+            };
+            cx = scr.print(cx, top + @as(u16, @intCast(i)), x + w, seg.text, st);
+        }
+    }
+    const mw = screen.textWidth(msg);
+    _ = scr.print(x + (w -| mw) / 2, top + pic_h + 1, x + w, msg, s_dim);
+    return true;
+}
+
 fn drawLogs(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     const a = app.draw_arena.allocator();
     const all = app.logLines();
@@ -246,7 +275,9 @@ fn drawLogs(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     }
     if (idx.items.len == 0) {
         const f = app.logFilter();
-        const msg = if (filter.len > 0) "no log lines match the filter" else if (f.level != null or f.scope != null or f.route != null or f.request_id != null or f.grep != null) "no log lines match yet" else "waiting for log lines...";
+        const filtered = filter.len > 0 or f.level != null or f.scope != null or f.route != null or f.request_id != null or f.grep != null;
+        const msg = if (filter.len > 0) "no log lines match the filter" else if (filtered) "no log lines match yet" else "waiting for log lines...";
+        if (!filtered and drawSplash(app, scr, x, y, w, h, msg)) return;
         _ = scr.print(x + 1, y, x + w, msg, s_dim);
         return;
     }

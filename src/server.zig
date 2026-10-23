@@ -85,7 +85,7 @@ const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
 const typed = @import("typed.zig");
 const openapi_mod = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
-const banner_mod = @import("banner.zig");
+const banner_mod = @import("anole_banner");
 const console = @import("console/root.zig");
 const console_host = @import("console/host.zig");
 const anole_log = @import("anole_log");
@@ -3915,29 +3915,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .unix => {},
                 }
             }
-            var buf: [1024]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&buf);
-            banner_mod.write(&w, info, banner_mod.styleFor(terminalColumns(dbg_io), env)) catch return;
+            const style = banner_mod.styleFor(banner_mod.terminalColumns(dbg_io, std.Io.File.stderr()), env, banner_mod.coin(dbg_io));
             const prev = dbg_io.swapCancelProtection(.blocked);
             defer _ = dbg_io.swapCancelProtection(prev);
-            var lock_buf: [64]u8 = undefined;
+            // Straight to stderr under its lock: the blocks are ~5 KiB.
+            var lock_buf: [1024]u8 = undefined;
             const t = std.debug.lockStderr(&lock_buf).terminal();
             defer std.debug.unlockStderr();
-            t.writer.writeAll(w.buffered()) catch return;
+            banner_mod.write(t.writer, info, style) catch return;
             t.writer.flush() catch {};
-        }
-
-        /// The width of the terminal on stderr, or null when unknown.
-        fn terminalColumns(dbg_io: std.Io) ?usize {
-            if (comptime builtin.os.tag == .windows) return null;
-            var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-            const result = (dbg_io.operate(.{ .device_io_control = .{
-                .file = std.Io.File.stderr(),
-                .code = std.posix.T.IOCGWINSZ,
-                .arg = &size,
-            } }) catch return null).device_io_control;
-            if (result < 0 or size.col == 0) return null;
-            return size.col;
         }
 
         /// The startup lines about the environment and deployment
