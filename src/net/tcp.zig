@@ -804,10 +804,10 @@ const TcpConn = struct {
         const reason = t.finalReason();
         const stats = &t.listener.stats;
         _ = stats.open.fetchSub(1, .monotonic);
-        _ = stats.closes[@intFromEnum(reason)].fetchAdd(1, .monotonic);
+        _ = stats.closes[@backingInt(reason)].fetchAdd(1, .monotonic);
         if (t.listener.series) |m| {
             m.open.add(-1);
-            m.closes[@intFromEnum(reason)].inc();
+            m.closes[@backingInt(reason)].inc();
         }
         _ = stats.bytes_in.fetchAdd(t.bytes_in, .monotonic);
         const out = t.bytes_out.load(.monotonic);
@@ -844,12 +844,12 @@ const TcpConn = struct {
     }
 
     fn setReason(t: *TcpConn, r: CloseReason) void {
-        _ = t.reason.cmpxchgStrong(0, @intFromEnum(r) + 1, .acq_rel, .acquire);
+        _ = t.reason.cmpxchgStrong(0, @backingInt(r) + 1, .acq_rel, .acquire);
     }
 
     fn finalReason(t: *TcpConn) CloseReason {
         const v = t.reason.load(.acquire);
-        if (v != 0) return @enumFromInt(v - 1);
+        if (v != 0) return @fromBackingInt(@intCast(v - 1));
         const now = std.Io.Clock.Timestamp.now(t.io, .awake);
         if (t.lifetimeAt()) |d| if (now.compare(.gte, d)) return .lifetime;
         if (t.idleAt()) |d| if (now.compare(.gte, d)) return .idle;
@@ -1171,7 +1171,7 @@ const TcpConn = struct {
                 .INTR => continue,
                 .AGAIN => return .would_block,
                 else => |e| {
-                    t.errno_value.store(@intFromEnum(e), .release);
+                    t.errno_value.store(@backingInt(e), .release);
                     return .failed;
                 },
             };
@@ -1258,7 +1258,7 @@ const TcpConn = struct {
 
     fn failWrite(t: *TcpConn, reason: CloseReason) void {
         const e = t.errno_value.load(.acquire);
-        t.abort(if (reason == .reset and e != 0 and e != @intFromEnum(std.posix.E.PIPE) and e != @intFromEnum(std.posix.E.CONNRESET)) .failed else reason);
+        t.abort(if (reason == .reset and e != 0 and e != @backingInt(std.posix.E.PIPE) and e != @backingInt(std.posix.E.CONNRESET)) .failed else reason);
     }
 
     /// The local end is finished (FIN sent): the connection is over when

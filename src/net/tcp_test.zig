@@ -64,7 +64,7 @@ const Echo = struct {
         _ = try conn.send(bytes);
     }
     pub fn close(_: *net.Conn, reason: net.CloseReason) void {
-        last_reason.store(@intFromEnum(reason), .release);
+        last_reason.store(@backingInt(reason), .release);
         _ = closed.fetchAdd(1, .release);
     }
 };
@@ -95,7 +95,7 @@ test "net tcp: callbacks echo; open, data, close in order, close reason peer" {
             try expectEnd(s);
             try waitFor(a.io(), &Echo.closed, 1);
             try std.testing.expectEqual(@as(u32, 1), Echo.opened.load(.acquire));
-            try std.testing.expectEqual(@intFromEnum(net.CloseReason.peer), Echo.last_reason.load(.acquire));
+            try std.testing.expectEqual(@backingInt(net.CloseReason.peer), Echo.last_reason.load(.acquire));
         }
     }.run);
 }
@@ -250,7 +250,7 @@ const Resetter = struct {
         conn.reset();
     }
     pub fn close(_: *net.Conn, r: net.CloseReason) void {
-        reason.store(@intFromEnum(r), .release);
+        reason.store(@backingInt(r), .release);
         _ = closed.fetchAdd(1, .release);
     }
 };
@@ -271,7 +271,7 @@ test "net tcp: reset() resets the peer; reason local" {
             const n = s.reader().readSliceShort(&buf) catch 0;
             try std.testing.expectEqual(@as(usize, 0), n);
             try waitFor(a.io(), &Resetter.closed, 1);
-            try std.testing.expectEqual(@intFromEnum(net.CloseReason.local), Resetter.reason.load(.acquire));
+            try std.testing.expectEqual(@backingInt(net.CloseReason.local), Resetter.reason.load(.acquire));
         }
     }.run);
 }
@@ -510,7 +510,7 @@ const Idle = struct {
     var closed: std.atomic.Value(u32) = .init(0);
     pub fn data(_: *net.Conn, _: []const u8) !void {}
     pub fn close(_: *net.Conn, r: net.CloseReason) void {
-        reason.store(@intFromEnum(r), .release);
+        reason.store(@backingInt(r), .release);
         _ = closed.fetchAdd(1, .release);
     }
 };
@@ -525,7 +525,7 @@ test "net tcp: idle_timeout closes with reason idle" {
             const s = try connect(a, portOf(a));
             defer s.close();
             try waitFor(a.io(), &Idle.closed, 1);
-            try std.testing.expectEqual(@intFromEnum(net.CloseReason.idle), Idle.reason.load(.acquire));
+            try std.testing.expectEqual(@backingInt(net.CloseReason.idle), Idle.reason.load(.acquire));
             try expectEnd(s);
         }
     }.run);
@@ -578,7 +578,7 @@ const Goodbye = struct {
         if (conn.id() % 2 == 1) conn.close();
     }
     pub fn close(_: *net.Conn, r: net.CloseReason) void {
-        last.store(@intFromEnum(r), .release);
+        last.store(@backingInt(r), .release);
         _ = closed.fetchAdd(1, .release);
     }
 };

@@ -125,7 +125,7 @@ const Game = struct {
         try d.reply(try std.fmt.bufPrint(&b, "{s}#{d}", .{ d.data, st.seq }));
     }
     pub fn close(s: *net.Session) void {
-        close_reason.store(@intFromEnum(s.endReason()), .release);
+        close_reason.store(@backingInt(s.endReason()), .release);
         _ = closed.fetchAdd(1, .release);
     }
 };
@@ -150,7 +150,7 @@ test "net udp: sessions open, carry state, and close on idle" {
             try std.testing.expectEqual(@as(u32, 1), Game.opened.load(.acquire));
             // Silent: the session ends by idle (waits for the event).
             while (Game.closed.load(.acquire) < 1) try io.sleep(.fromMilliseconds(5), .awake);
-            try std.testing.expectEqual(@intFromEnum(net.Session.EndReason.idle), Game.close_reason.load(.acquire));
+            try std.testing.expectEqual(@backingInt(net.Session.EndReason.idle), Game.close_reason.load(.acquire));
             // A new datagram opens a new session, with fresh state.
             try c.send(io, &to, "m");
             try expectDatagram(io, c, "m#1");

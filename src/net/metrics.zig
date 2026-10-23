@@ -56,6 +56,6 @@ pub const UdpSeries = struct {
     }
 
     pub fn drop(s: *UdpSeries, why: DropReason, n: u64) void {
-        s.dropped[@intFromEnum(why)].add(n);
+        s.dropped[@backingInt(why)].add(n);
     }
 };
