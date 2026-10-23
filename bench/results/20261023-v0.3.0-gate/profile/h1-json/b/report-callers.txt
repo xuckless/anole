@@ -1,0 +1,124 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 15K of event 'cpu_core/cycles/P'
+# Event count (approx.): 26263239513
+#
+# Overhead  Symbol                                                         
+# ........  ...............................................................
+#
+    10.71%  [k] nft_do_chain
+            |          
+             --10.43%--nft_do_chain
+                       |          
+                       |--7.77%--nft_do_chain_inet
+                       |          nf_hook_slow
+                       |          |          
+                       |           --6.65%--ip_rcv
+                       |                     __netif_receive_skb_one_core
+                       |                     process_backlog
+                       |                     __napi_poll
+                       |                     net_rx_action
+                       |                     handle_softirqs
+                       |                     do_softirq.part.0
+                       |                     __local_bh_enable_ip
+                       |                     __dev_queue_xmit
+                       |                     ip_finish_output2
+                       |                     ip_output
+                       |                     __ip_queue_xmit
+                       |                     __tcp_transmit_skb
+                       |                     tcp_write_xmit
+                       |                     __tcp_push_pending_frames
+                       |                     tcp_sendmsg_locked
+                       |                     tcp_sendmsg
+                       |                     __sys_sendto
+                       |                     __x64_sys_sendto
+                       |                     do_syscall_64
+                       |                     entry_SYSCALL_64_after_hwframe
+                       |                     os.net.send
+                       |                     ev.backends.linux.epoll.checkCompletion
+                       |                     ev.sockreg.submitIo__func_1346
+                       |                     common.waitForIo
+                       |                     io.netWriteOpImpl
+                       |                     io.operateInner
+                       |                     io.operateImpl
+                       |                     Io.net.Stream.Writer.drain
+                       |                     Io.Writer.defaultFlush
+                       |                     response.Response.write
+                       |                     server.Server(main.App).handleRequests
+                       |                     server.Server(main.App).handleConnectionWrapper
+                       |                     group.Group.spawnInto__func_1870.Wrapper.start
+                       |                     task.AnyTask.startFn
+                       |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |                     0
+                       |          
+                        --1.83%--nft_do_chain_ipv4
+                                  nf_hook_slow
+
+     2.44%  [.] server.Server(main.App).handleRequests
+            |          
+             --2.31%--server.Server(main.App).handleRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_1870.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     1.97%  [k] nft_meta_get_eval
+            |          
+             --1.73%--nft_meta_get_eval
+                       nft_do_chain
+
+     1.95%  [k] __raw_spin_lock_irqsave
+            |          
+             --1.95%--__raw_spin_lock_irqsave
+
+     1.74%  [k] sized_strscpy
+     1.73%  [k] __nf_conntrack_find_get
+            |          
+             --1.72%--__nf_conntrack_find_get
+                       resolve_normal_ct
+                       nf_conntrack_in
+                       nf_hook_slow
+                       __ip_local_out
+                       ip_local_out
+                       __ip_queue_xmit
+                       __tcp_transmit_skb
+                       tcp_write_xmit
+                       __tcp_push_pending_frames
+                       tcp_sendmsg_locked
+                       tcp_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1346
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       Io.Writer.defaultFlush
+                       response.Response.write
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_1870.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     1.71%  [k] nft_meta_store_ifname
+     1.51%  [k] skb_defer_free_flush
+     1.51%  [k] skb_release_data
+            |          
+             --1.50%--skb_release_data
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

@@ -1,0 +1,36 @@
+# started on Fri Oct 23 15:00:17 2026
+
+
+ Performance counter stats for process id '1190253':
+
+           5001.04 msec task-clock                                                            
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+       26415829848      cpu_core/cycles/                                                      
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+       41763514852      cpu_core/instructions/                                                
+     <not counted>      cpu_atom/branch-misses/                                                 (0.00%)
+          83292655      cpu_core/branch-misses/                                               
+     <not counted>      cpu_atom/L1-icache-load-misses/                                         (0.00%)
+        2339489957      cpu_core/L1-icache-load-misses/                                       
+     <not counted>      cpu_atom/iTLB-load-misses/                                              (0.00%)
+          35264265      cpu_core/iTLB-load-misses/                                            
+     <not counted>      cpu_atom/dTLB-load-misses/                                              (0.00%)
+          11602427      cpu_core/dTLB-load-misses/                                            
+                49      context-switches                                                      
+                 0      page-faults                                                           
+           2164644      raw_syscalls:sys_enter                                                
+                 0      syscalls:sys_enter_read                                               
+           1062409      syscalls:sys_enter_recvfrom                                           
+                 0      syscalls:sys_enter_write                                              
+                 0      syscalls:sys_enter_writev                                             
+           1062434      syscalls:sys_enter_sendto                                             
+                 0      syscalls:sys_enter_sendmsg                                            
+                 0      syscalls:sys_enter_epoll_wait                                         
+                 0      syscalls:sys_enter_epoll_pwait                                        
+                 9      syscalls:sys_enter_epoll_ctl                                          
+                 0      syscalls:sys_enter_futex                                              
+                 0      syscalls:sys_enter_clock_gettime                                      
+                 0      syscalls:sys_enter_io_uring_enter                                      
+
+       5.001687087 seconds time elapsed
+

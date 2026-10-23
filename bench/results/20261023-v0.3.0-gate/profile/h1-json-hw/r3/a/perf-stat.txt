@@ -1,0 +1,21 @@
+# started on Fri Oct 23 15:35:31 2026
+
+
+ Performance counter stats for process id '1219991':
+
+           9999.07 msec task-clock                                                            
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+       52800437571      cpu_core/cycles/                                                      
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+       86353745304      cpu_core/instructions/                                                
+     <not counted>      cpu_atom/branch-misses/                                                 (0.00%)
+         127920433      cpu_core/branch-misses/                                               
+     <not counted>      cpu_atom/L1-icache-load-misses/                                         (0.00%)
+        4851114453      cpu_core/L1-icache-load-misses/                                       
+     <not counted>      cpu_atom/iTLB-load-misses/                                              (0.00%)
+          31992678      cpu_core/iTLB-load-misses/                                            
+     <not counted>      cpu_atom/dTLB-load-misses/                                              (0.00%)
+          23093034      cpu_core/dTLB-load-misses/                                            
+
+      10.000858798 seconds time elapsed
+
