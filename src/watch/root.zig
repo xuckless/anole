@@ -1127,6 +1127,7 @@ pub const Listener = struct {
 test {
     _ = template;
     _ = @import("watch_test.zig");
+    _ = @import("live_test.zig");
     if (features.redis) _ = @import("redis.zig");
 }
 

@@ -417,6 +417,10 @@ const StreamReader = struct {
     acks: std.ArrayList(PendingAck) = .empty,
     /// The first read of a group: this consumer's pending entries.
     pending_phase: bool = true,
+    /// The pending phase reads after these IDs (one per key, owned): the
+    /// entries still pending are returned for any ID before them, so
+    /// without moving on the same ones would come back forever.
+    pend: [][]u8 = &.{},
 
     const PendingAck = struct { key: []u8, id: []u8 };
 
@@ -424,12 +428,45 @@ const StreamReader = struct {
         for (self.last) |l| self.gpa.free(l);
         self.gpa.free(self.last);
         if (self.consumer.len > 0) self.gpa.free(self.consumer);
+        self.freePend();
         for (self.acks.items) |a| {
             self.gpa.free(a.key);
             self.gpa.free(a.id);
         }
         self.acks.deinit(self.gpa);
         self.gpa.destroy(self);
+    }
+
+    fn freePend(self: *StreamReader) void {
+        for (self.pend) |p| self.gpa.free(p);
+        if (self.pend.len > 0) self.gpa.free(self.pend);
+        self.pend = &.{};
+    }
+
+    /// The pending phase starts over: after "0" for every key.
+    fn restartPending(self: *StreamReader) !void {
+        self.freePend();
+        const list = try self.gpa.alloc([]u8, self.cfg.keys.len);
+        var made: usize = 0;
+        errdefer {
+            for (list[0..made]) |p| self.gpa.free(p);
+            self.gpa.free(list);
+        }
+        for (list) |*p| {
+            p.* = try self.gpa.dupe(u8, "0");
+            made += 1;
+        }
+        self.pend = list;
+        self.pending_phase = true;
+    }
+
+    fn setPend(self: *StreamReader, key: []const u8, id: []const u8) void {
+        for (self.cfg.keys, 0..) |k, i| if (std.mem.eql(u8, k, key)) {
+            const copy = self.gpa.dupe(u8, id) catch return;
+            self.gpa.free(self.pend[i]);
+            self.pend[i] = copy;
+            return;
+        };
     }
 
     fn ackCall(ctx: *anyopaque, key: []const u8, id: []const u8) error{ OutOfMemory, Unsupported }!void {
@@ -557,7 +594,7 @@ fn streamSession(r: *StreamReader, first: bool) !void {
             const pid: i64 = if (builtin.os.tag == .windows) 0 else std.c.getpid();
             r.consumer = if (g.consumer) |c| try r.gpa.dupe(u8, c) else try std.fmt.allocPrint(r.gpa, "{s}-{d}", .{ host, pid });
         }
-        r.pending_phase = true;
+        try r.restartPending();
     }
     // Entries the stream deleted after our position are lost.
     if (!first or cfg.start == .after) try checkDeleted(r, &conn, &ctx, &arena_state);
@@ -600,7 +637,7 @@ fn readLoop(r: *StreamReader, conn: *redis.Conn, ctx: *db.Ctx, arena_state: *std
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         try flushAcks(r, conn, ctx);
-        args.clearRetainingCapacity();
+        args = .empty;
         var count_buf: [16]u8 = undefined;
         var block_buf: [24]u8 = undefined;
         const count_s = try std.fmt.bufPrint(&count_buf, "{d}", .{cfg.count});
@@ -611,7 +648,7 @@ fn readLoop(r: *StreamReader, conn: *redis.Conn, ctx: *db.Ctx, arena_state: *std
             if (!r.pending_phase) try args.appendSlice(a, &.{ "BLOCK", block_s });
             try args.append(a, "STREAMS");
             try args.appendSlice(a, cfg.keys);
-            for (cfg.keys) |_| try args.append(a, if (r.pending_phase) "0" else ">");
+            for (cfg.keys, 0..) |_, i| try args.append(a, if (r.pending_phase) r.pend[i] else ">");
         } else {
             try args.appendSlice(a, &.{ "XREAD", "COUNT", count_s, "BLOCK", block_s, "STREAMS" });
             try args.appendSlice(a, cfg.keys);
@@ -643,6 +680,7 @@ fn readLoop(r: *StreamReader, conn: *redis.Conn, ctx: *db.Ctx, arena_state: *std
                 .fields = e.fields,
             });
             r.setLast(e.key, e.id);
+            if (cfg.group != null and r.pending_phase) r.setPend(e.key, e.id);
             w.setPosition(try r.position(a));
             if (cfg.group) |g| {
                 if (g.ack == .auto and outcome == .ok) {
