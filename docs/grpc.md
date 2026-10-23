@@ -687,3 +687,8 @@ the test service on that ABI (`tests/capi/grpc_interop.c`).
 - Server reflection.
 - Canceling the handler of a gRPC-Web or Connect call over HTTP/1.1 when the
   client goes away (check `call.cancelled()`).
+
+
+## Client retries and redial
+
+`Channel.retry`, `Channel.retry_codes` (default `UNAVAILABLE`) and `Channel.breaker` apply to unary calls: each retry sends `grpc-previous-rpc-attempts` and the remaining `grpc-timeout`, and a `grpc-retry-pushback-ms` trailer is obeyed. `Channel.connect(gpa, io, connect_options, .{})` makes a channel that owns its connection and redials it after a GOAWAY or a failure. See [resilience.md](resilience.md).

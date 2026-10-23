@@ -157,13 +157,15 @@ pub const Call = struct {
         }
         const exporter = o.tracer orelse return;
         const req = internal.requestOf(c) orelse return;
-        exporter.child(req, self.real_ns, std.Io.Clock.real.now(c.io).nanoseconds, .init(
+        var span_db: observe.trace.Span.Db = .init(
             @tagName(o.system),
             o.name,
             operation,
             target,
             if (err) |e| @errorName(e) else null,
-        ));
+        );
+        span_db.messaging = o.system.isMessaging();
+        exporter.child(req, self.real_ns, std.Io.Clock.real.now(c.io).nanoseconds, span_db);
     }
 };
 

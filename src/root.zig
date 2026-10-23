@@ -267,6 +267,11 @@ pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 /// metrics and tracing hooks.
 pub const db = @import("db/root.zig");
 
+/// Retries with backoff, retry throttling and circuit breakers: the
+/// policies the HTTP and gRPC clients, the database connectors and the
+/// brokers share.
+pub const resilience = @import("resilience/root.zig");
+
 /// PostgreSQL (`-Dpostgres`): `state.db = try app.postgres(.{})`
 /// (DATABASE_URL), then `state.db.all(Post, req, sql, .{args})` and the other `anole.db` verbs,
 /// on Anole's fork of pg.zig with a pool per executor.
@@ -281,6 +286,11 @@ pub const sqlite = if (features.sqlite) @import("sqlite/root.zig") else struct {
 /// sets, a pool per executor, CRUD, aggregation and cursors, retryable
 /// reads and writes. `app.mongodb(.{})` connects from `MONGODB_URI`.
 pub const mongodb = if (features.mongodb) @import("mongodb/root.zig") else struct {};
+
+/// A NATS client on std.Io (`-Dnats`): publish, request/reply, handlers,
+/// queue groups, TLS, token/NKey/creds auth and JetStream.
+/// `app.nats(.{})` connects from `NATS_URL`.
+pub const nats = if (features.nats) @import("nats/root.zig") else struct {};
 
 /// BSON (`-Dmongodb`): documents, the struct mapping, ObjectId, Decimal128
 /// and Extended JSON, as the MongoDB client reads and writes them.
@@ -335,6 +345,7 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = http;
+    _ = resilience;
     _ = tls;
     _ = h2;
     _ = h3;
@@ -348,6 +359,7 @@ test {
     _ = db;
     _ = pg;
     _ = mongodb;
+    _ = nats;
     _ = @import("net/client_stream.zig");
     _ = session;
     _ = early_data;

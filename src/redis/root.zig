@@ -85,6 +85,7 @@ const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
+const resilience = @import("../resilience/root.zig");
 const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
 
@@ -153,6 +154,11 @@ pub const Options = struct {
     connect_at_start: bool = false,
     /// What `/readyz` waits for the server's PONG.
     ping_timeout: Duration = .fromSeconds(2),
+    /// Fails calls fast (503, `lastError` code "circuit_open") after the
+    /// server could not be reached repeatedly; null: never.
+    breaker: ?resilience.Breaker.Options = .{},
+    /// What `with(.{ .retry = true })` retries with.
+    retry: resilience.Retry = .{ .attempts = 3, .backoff = .{ .base = .fromMilliseconds(50), .max = .fromSeconds(1) } },
     /// A bound on every call that has no `QueryOptions.timeout` of its own,
     /// in a request or not; past it the call is canceled and fails with
     /// `error.GatewayTimeout`. A request's deadline applies too, whichever
@@ -403,6 +409,8 @@ pub const Client = struct {
     login: Batch,
     pools: internal.PerExecutor(Pool),
     errors: db.ErrorMap,
+    /// The breaker and the retry policy (`Options.breaker`, `Options.retry`).
+    guard: internal.Guard,
     observer: db.Observer,
     readiness: db.Readiness,
     acquire_timeout: Duration,
@@ -443,6 +451,7 @@ pub const Client = struct {
             .login = .{},
             .pools = undefined,
             .errors = opts.errors,
+            .guard = try .init(.redis, name, opts.breaker, opts.retry),
             .observer = .{ .system = .redis, .name = name },
             .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
@@ -521,6 +530,7 @@ pub const Client = struct {
         const gpa = self.gpa;
         // First: a read still running for the cache holds a connection.
         self.cache.deinit();
+        self.guard.deinit();
         for (self.pools.pools) |*p| {
             for (p.idle[0..p.idle_len]) |conn| conn.close();
             if (p.open > p.idle_len) log.warn("redis \"{s}\": {d} connections were still taken at deinit", .{ self.name, p.open - p.idle_len });
@@ -538,6 +548,7 @@ pub const Client = struct {
     /// executor and fails if one cannot.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.redis, self.name, registry, tracer);
+        try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
         if (!self.connect_at_start) return;
@@ -663,13 +674,17 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(context));
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
-        const quiet: Ctx = .{ .io = io, .arena = arena.allocator(), .any = self, .record = keep, .request = null };
+        const quiet: Ctx = .{ .io = io, .arena = arena.allocator(), .any = self, .record = keep, .last = noLast, .request = null };
         var b = Builder.init(quiet.arena) catch return false;
         b.add(.{"PING"}) catch return false;
         const batch = b.finish();
         // Not a call of the app's: no metrics, no span.
         const replies = self.bounded(&quiet, self.ping_timeout, null, &batch) catch return false;
         return replies[0] == .status;
+    }
+
+    fn noLast(_: *anyopaque) ?db.ErrorDetail {
+        return null;
     }
 
     /// A context's `record` that keeps the failure to itself.
@@ -742,16 +757,28 @@ pub const Client = struct {
     /// or one of the executor's pool, observed (metrics, a span), bounded
     /// by `timeout`, the reply read as `mode` says, the error narrowed to
     /// `Error`.
-    fn call(self: *Client, c: anytype, timeout: ?Duration, held: ?*Connection, comptime T: type, comptime mode: Mode, commands: anytype) Error!Out(T, mode) {
+    fn call(self: *Client, c: anytype, timeout: ?Duration, retry: bool, held: ?*Connection, comptime T: type, comptime mode: Mode, commands: anytype) Error!Out(T, mode) {
         const ctx = erase(c);
         var b = Builder.init(ctx.arena) catch return error.OutOfMemory;
         (if (mode == .replies) b.addAll(commands) else b.add(commands)) catch |err| return self.narrow(&ctx, err);
         const batch = b.finish();
         const observed = self.observer.start(&ctx);
-        const result: Error!Out(T, mode) = if (self.callOn(&ctx, timeout, held, &batch, T, mode)) |out| out else |err| self.narrow(&ctx, err);
+        const attempt = if (held == null)
+            internal.guarded(&ctx, &self.guard, self.errors, retry, null, callOnFn(T, mode), .{ self, &ctx, timeout, held, &batch })
+        else
+            self.callOn(&ctx, timeout, held, &batch, T, mode);
+        const result: Error!Out(T, mode) = if (attempt) |out| out else |err| self.narrow(&ctx, err);
         const failure: ?anyerror = if (result) |_| null else |e| e;
         if (ctx.request) |req| observed.end(req, batch.operation(), null, failure) else observed.end(&ctx, batch.operation(), null, failure);
         return result;
+    }
+
+    fn callOnFn(comptime T: type, comptime mode: Mode) fn (*Client, *const Ctx, ?Duration, ?*Connection, *const Batch) anyerror!Out(T, mode) {
+        return struct {
+            fn run(self: *Client, ctx: *const Ctx, timeout: ?Duration, held: ?*Connection, batch: *const Batch) anyerror!Out(T, mode) {
+                return self.callOn(ctx, timeout, held, batch, T, mode);
+            }
+        }.run;
     }
 
     fn callOn(self: *Client, ctx: *const Ctx, timeout: ?Duration, held: ?*Connection, batch: *const Batch, comptime T: type, comptime mode: Mode) anyerror!Out(T, mode) {
@@ -870,7 +897,7 @@ pub const Client = struct {
                 pool.mutex.unlock(io);
                 return switch (err) {
                     error.Canceled => error.Canceled,
-                    error.Timeout => ctx.failf(self.errors, .unavailable, "no connection within {d} ms: all {d} of this executor's connections were busy", .{ self.acquire_timeout.toMilliseconds(), pool.max }),
+                    error.Timeout => ctx.fail(self.errors, .{ .system = .redis, .class = .unavailable, .code = "pool_timeout", .message = std.fmt.allocPrint(ctx.arena, "no connection within {d} ms: all {d} of this executor's connections were busy", .{ self.acquire_timeout.toMilliseconds(), pool.max }) catch "no connection within the acquire timeout" }),
                 };
             };
             self.observer.waiting(-1);
@@ -955,7 +982,7 @@ pub const Query = struct {
 
     /// `Client.command`, with the options.
     pub fn command(self: Query, c: anytype, args: anytype) Error!Reply {
-        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), null, Reply, .reply, args);
+        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), self.opts.retry, null, Reply, .reply, args);
     }
 
     // The reads go through the cache, which shares them when `opts` asks
@@ -989,7 +1016,7 @@ pub const Query = struct {
 
     /// `Client.pipeline`, with the options.
     pub fn pipeline(self: Query, c: anytype, commands: anytype) Error![]Reply {
-        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), null, Reply, .replies, commands);
+        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), self.opts.retry, null, Reply, .replies, commands);
     }
 
     /// Through the cache when `opts` asks for sharing and `args` is a
@@ -1005,7 +1032,7 @@ pub const Query = struct {
     }
 
     fn plain(self: Query, comptime T: type, comptime mode: Mode, c: anytype, args: anytype) Error!Out(T, mode) {
-        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), null, T, mode, args);
+        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), self.opts.retry, null, T, mode, args);
     }
 
     /// `Client.get`, with the options.
@@ -1186,27 +1213,27 @@ pub const Conn = struct {
 
     /// `Client.command`, on this connection.
     pub fn command(self: *Conn, c: anytype, args: anytype) Error!Reply {
-        return self.client.call(c, null, self.conn, Reply, .reply, args);
+        return self.client.call(c, null, false, self.conn, Reply, .reply, args);
     }
 
     /// `Client.one`, on this connection.
     pub fn one(self: *Conn, comptime T: type, c: anytype, args: anytype) Error!T {
-        return self.client.call(c, null, self.conn, T, .one, args);
+        return self.client.call(c, null, false, self.conn, T, .one, args);
     }
 
     /// `Client.optional`, on this connection.
     pub fn optional(self: *Conn, comptime T: type, c: anytype, args: anytype) Error!?T {
-        return self.client.call(c, null, self.conn, T, .optional, args);
+        return self.client.call(c, null, false, self.conn, T, .optional, args);
     }
 
     /// `Client.all`, on this connection.
     pub fn all(self: *Conn, comptime T: type, c: anytype, args: anytype) Error![]T {
-        return self.client.call(c, null, self.conn, T, .all, args);
+        return self.client.call(c, null, false, self.conn, T, .all, args);
     }
 
     /// `Client.pipeline`, on this connection.
     pub fn pipeline(self: *Conn, c: anytype, commands: anytype) Error![]Reply {
-        return self.client.call(c, null, self.conn, Reply, .replies, commands);
+        return self.client.call(c, null, false, self.conn, Reply, .replies, commands);
     }
 
     /// `Client.get`, on this connection.
@@ -1921,9 +1948,15 @@ const Ctx = struct {
     any: *anyopaque,
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
+    last: *const fn (any: *anyopaque) ?db.ErrorDetail,
+
+    /// The last error recorded on the context it stands for.
+    pub fn lastDetail(self: *const Ctx) ?db.ErrorDetail {
+        return self.last(self.any);
+    }
 
     /// `internal.fail` on the context it stands for.
-    fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
+    pub fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
 
@@ -1940,8 +1973,11 @@ fn erase(c: anytype) Ctx {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
             return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
+        fn last(any: *anyopaque) ?db.ErrorDetail {
+            return internal.lastError(@as(C, @ptrCast(@alignCast(any))));
+        }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .last = R.last, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------

@@ -111,6 +111,14 @@ pub const System = enum {
     sqlite,
     mongodb,
     redis,
+    nats,
+    kafka,
+
+    /// NATS and Kafka are brokers: their spans are OpenTelemetry
+    /// *messaging* spans.
+    pub fn isMessaging(self: System) bool {
+        return self == .nats or self == .kafka;
+    }
 };
 
 /// A call's context outside a handler (startup, a background task, a
@@ -190,6 +198,12 @@ pub const QueryOptions = struct {
     /// `cache.invalidate`; `lastSource` says whether a call was answered
     /// from memory. See `QueryCache`.
     cache: ?Cache = null,
+    /// The call may run again on a transient failure (the server
+    /// unreachable, a connection lost mid-call), with the connector's
+    /// `Options.retry`. Only for statements that are safe to repeat.
+    /// MongoDB has the spec's retryable reads and writes already and
+    /// ignores it; SQLite ignores it.
+    retry: bool = false,
 
     /// `QueryOptions.cache`: how long a result is kept, a tag to drop it
     /// by, and whether an empty one is kept.

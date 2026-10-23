@@ -72,6 +72,11 @@ const mongodb_mod = if (features.mongodb) @import("mongodb/root.zig") else struc
     pub const Options = struct {};
     pub const Client = void;
 };
+const nats_mod = if (features.nats) @import("nats/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = struct {};
+};
+const resilience_mod = @import("resilience/root.zig");
 const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
     pub const Options = struct {};
     pub const Client = void;
@@ -677,6 +682,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             routes_added: bool = false,
             grpc_health: ?*grpc_mod.Health = null,
             exporter: ?*observe.trace.Exporter = null,
+            /// The breaker and retry series of the outbound client, when it has a policy.
+            resilience: ?*resilience_mod.Binding = null,
             dirs: std.ArrayList(std.Io.Dir) = .empty,
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
@@ -1395,6 +1402,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 i -= 1;
                 self.owned_middleware.items[i].deinit();
             }
+            if (extras.resilience) |b| {
+                b.deinit();
+                self.gpa.destroy(b);
+            }
             if (extras.metrics) |r| r.deinit();
             if (comptime features.grpc) if (extras.grpc_health) |h| h.deinit();
             if (extras.client_registered) client_mod.unregister(&extras.client_entry);
@@ -2034,6 +2045,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.connectors_started) return;
             extras.connectors_started = true;
             for (extras.connectors.items) |c| try c.start(c.context, extras.metrics, extras.exporter, extras.health);
+            if (extras.metrics) |registry| {
+                const cfg = extras.client.config;
+                if (cfg.breaker != null or cfg.retry != null) {
+                    const binding = try self.gpa.create(resilience_mod.Binding);
+                    errdefer self.gpa.destroy(binding);
+                    binding.* = try .init(self.gpa, registry);
+                    extras.resilience = binding;
+                    extras.client.observeResilience(binding.metricsHooks());
+                }
+            }
         }
 
         /// The routes `metrics` and `health` left for when serving starts.
@@ -2241,6 +2262,25 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer r.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(redis_mod.Client, r));
             return r;
+        }
+
+        /// A NATS client for the handlers, owned by the server: `NATS_URL`
+        /// (or `config.url`), else nats://127.0.0.1:4222. It connects when
+        /// serving starts, feeds `app.metrics`, `app.tracing` and
+        /// `app.health` (readiness = connected) when the app has them, and
+        /// is drained and closed with the server. Register handlers with
+        /// `nc.handle(&app, subject, opts, fn)` before `run`. See
+        /// `anole.nats`.
+        pub fn nats(self: *Self, config: nats_mod.Options) !*nats_mod.Client {
+            if (comptime !features.nats) @compileError("app.nats needs NATS (-Dnats, on in the full profile)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const n = try nats_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer n.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(nats_mod.Client, n));
+            return n;
         }
 
         /// Loads every TLS listener's certificate and key again (from their

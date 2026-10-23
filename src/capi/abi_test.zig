@@ -138,10 +138,11 @@ test "abi.zig: the allocation table holds" {
             try std.testing.expect(known);
         }
     }
-    // Handle kinds 1-6 named, no duplicates.
-    try std.testing.expectEqual(@as(usize, 6), abi.handle_kinds.len);
+    // Handle kinds named, ascending, no duplicates (7 is reserved).
+    try std.testing.expectEqual(@as(usize, 8), abi.handle_kinds.len);
     for (abi.handle_kinds, 0..) |k, i| {
-        try std.testing.expectEqual(@as(u8, @intCast(i + 1)), k.kind);
+        try std.testing.expect(k.kind != 7);
+        if (i > 0) try std.testing.expect(k.kind > abi.handle_kinds[i - 1].kind);
         for (abi.handle_kinds[0..i]) |other| try std.testing.expect(!std.mem.eql(u8, other.name, k.name));
     }
     // Error tokens are unique and sorted.

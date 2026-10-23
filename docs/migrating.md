@@ -17,6 +17,14 @@ changed; the table lists what reads differently.
 | `timeouts.keepalive` 60 s | 75 s (set `.timeouts = .{ .keepalive = .fromSeconds(60) }` for the old value) |
 
 ## 0.1 to 0.2
+# Migrating from 0.2 to 0.3
+
+## Resilience
+
+- Database connectors now have a circuit breaker (on by default): after repeated connection failures calls fail at once with 503 (`lastError` code `circuit_open`). Opt out with `.breaker = null` (`"breaker": null` in the C ABI).
+- `anole.db.System` gained `nats` and `kafka`; add the cases to an exhaustive `switch`.
+
+# Migrating from 0.1 to 0.2
 
 0.2 batches the breaking changes of the API review. Each area has its section
 below; the changelog lists the rest. Before 1.0 there is no stability promise,

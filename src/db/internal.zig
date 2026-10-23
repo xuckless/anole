@@ -7,6 +7,8 @@ const std = @import("std");
 const dusty = @import("dusty");
 const placement = dusty.placement;
 const db = @import("root.zig");
+const resilience = @import("../resilience/root.zig");
+const obs = @import("../observe/root.zig");
 
 const ErrorDetail = db.ErrorDetail;
 const ErrorMap = db.ErrorMap;
@@ -155,6 +157,117 @@ pub fn bounded(c: anytype, system: System, timeout: ?std.Io.Duration, func: anyt
         },
         else => |e| return e,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Breaker and retry
+
+/// What a connector keeps for breaking and retrying. Pin it (the metrics
+/// hooks point into it): a connector makes it in `init`, on the heap.
+pub const Guard = struct {
+    system: System,
+    breaker: ?resilience.Breaker,
+    retry: resilience.Retry,
+    throttle: resilience.Throttle,
+    binding: ?resilience.Binding = null,
+
+    /// SQLite has no network to fail: its breaker is always off.
+    pub fn init(system: System, name: []const u8, breaker: ?resilience.Breaker.Options, retry: resilience.Retry) error{InvalidOptions}!Guard {
+        try retry.validate();
+        if (breaker) |o| try o.validate();
+        const kind: resilience.Kind = switch (system) {
+            .postgresql => .postgresql,
+            .mongodb => .mongodb,
+            .redis => .redis,
+            .nats => .nats,
+            .kafka => .kafka,
+            .sqlite => .postgresql,
+        };
+        return .{
+            .system = system,
+            .breaker = if (breaker != null and system != .sqlite) resilience.Breaker.init(breaker.?, kind, name) else null,
+            .retry = retry,
+            .throttle = .init(retry.throttle orelse .{}),
+        };
+    }
+
+    /// Reports the breaker and the retries to `registry`; once serving
+    /// has started the guard must not move.
+    pub fn observe(g: *Guard, gpa: std.mem.Allocator, registry: ?*obs.metrics.Registry) !void {
+        const r = registry orelse return;
+        g.binding = try resilience.Binding.init(gpa, r);
+        if (g.breaker) |*b| b.observe(g.binding.?.metricsHooks());
+    }
+
+    pub fn deinit(g: *Guard) void {
+        if (g.binding) |*b| b.deinit();
+    }
+};
+
+/// A connector's own context type (pg's erased `Ctx`) may carry `fail` and
+/// `lastDetail`; a request or `db.Ctx` goes through `fail`/`lastError`.
+fn failIn(c: anytype, map: ErrorMap, detail: ErrorDetail) Error {
+    if (comptime @hasDecl(Pointee(@TypeOf(c)), "lastDetail")) return c.fail(map, detail);
+    return fail(c, map, detail);
+}
+
+fn lastIn(c: anytype) ?ErrorDetail {
+    if (comptime @hasDecl(Pointee(@TypeOf(c)), "lastDetail")) return c.lastDetail();
+    return lastError(c);
+}
+
+/// What a guarded call returns: what `func` returns.
+pub fn Guarded(comptime func: anytype) type {
+    return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+}
+
+/// Runs `func(args)` (a connector's call, already `bounded`) under the
+/// guard: breaker gate, and with `retry` the policy. A rejected call fails
+/// with `fail(c, map, ...)`: class `unavailable`, code "circuit_open".
+/// The verdict comes from `lastError(c)` after a failure: class
+/// `unavailable` with a code other than "pool_timeout" is transient
+/// (retried only when `retry`), anything else is neutral (the server
+/// answered). A success is a success.
+pub fn guarded(c: anytype, g: *Guard, map: ErrorMap, retry: bool, deadline: ?std.Io.Clock.Timestamp, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Guarded(func) {
+    if (g.breaker == null and !retry) return @call(.auto, func, args);
+    const io = c.io;
+    var n: u32 = 1;
+    while (true) : (n += 1) {
+        const now = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+        var permit: ?resilience.Breaker.Permit = null;
+        if (g.breaker) |*b| {
+            permit = b.allow(now) orelse {
+                var buf: [160]u8 = undefined;
+                const left: i96 = if (b.openUntil()) |u| @max(0, u - now) else 0;
+                const msg = std.fmt.bufPrint(&buf, "circuit breaker open after repeated connection failures; next try in {d} s", .{@divTrunc(left + std.time.ns_per_s - 1, std.time.ns_per_s)}) catch "circuit breaker open";
+                return failIn(c, map, .{ .system = g.system, .class = .unavailable, .code = "circuit_open", .message = msg });
+            };
+        }
+        const r = @call(.auto, func, args);
+        const transient = if (r) |_| false else |_| blk: {
+            const d = lastIn(c) orelse break :blk false;
+            break :blk d.class == .unavailable and !std.mem.eql(u8, d.code, "pool_timeout") and !std.mem.eql(u8, d.code, "circuit_open");
+        };
+        const failed = if (r) |_| false else |_| transient;
+        if (permit) |p| g.breaker.?.record(p, if (failed) .failure else if (r) |_| .success else |_| .neutral, std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds);
+        if (retry) {
+            if (failed) g.throttle.onFailure() else if (r) |_| g.throttle.onSuccess() else |_| {}
+        }
+        if (!failed or !retry or n >= g.retry.attempts or !g.throttle.allowRetry()) return r;
+        var rb: [8]u8 = undefined;
+        io.random(&rb);
+        const wait = g.retry.backoff.delay(n, std.mem.readInt(u64, &rb, .little));
+        const after = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+        if (deadline) |d| if (after + wait.nanoseconds >= d.raw.nanoseconds) return r;
+        if (g.binding) |*bd| {
+            const h = bd.metricsHooks();
+            h.on_retry(h.context, if (g.breaker) |b| b.kind else .postgresql, if (g.breaker) |*b| b.name() else "", "transport");
+        }
+        io.sleep(wait, .awake) catch {
+            io.recancel();
+            return r;
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,4 +490,80 @@ test "PerExecutor: one pool off zio" {
     try testing.expectEqual(@as(usize, 1), pools.pools.len);
     try testing.expectEqual(@as(usize, 25), pools.share(25, 0));
     try testing.expect(pools.get(testing.io) == &pools.pools[0]);
+}
+
+const guard_test = struct {
+    var calls: u32 = 0;
+    var mode: enum { down, pool, unique, flaky } = .down;
+
+    fn run(c: *db.Ctx) db.Error!u8 {
+        calls += 1;
+        switch (mode) {
+            .down => return fail(c, .{}, .{ .system = .redis, .class = .unavailable, .code = "conn", .message = "down" }),
+            .pool => return fail(c, .{}, .{ .system = .redis, .class = .unavailable, .code = "pool_timeout", .message = "busy" }),
+            .unique => return fail(c, .{}, .{ .system = .redis, .class = .unique, .code = "23505", .message = "dup" }),
+            .flaky => {
+                if (calls < 3) return fail(c, .{}, .{ .system = .redis, .class = .unavailable, .code = "conn", .message = "down" });
+                return 7;
+            },
+        }
+    }
+};
+
+fn guardCtx(arena: *std.heap.ArenaAllocator) db.Ctx {
+    return .{ .io = testing.io, .arena = arena.allocator() };
+}
+
+test "guarded: unavailable failures open the breaker; the next call is ServiceUnavailable with code circuit_open and no call" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = guardCtx(&arena);
+    var g: Guard = try .init(.redis, "t", .{ .consecutive_failures = 3 }, .{});
+    defer g.deinit();
+    guard_test.calls = 0;
+    guard_test.mode = .down;
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    for (0..3) |_| try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 3), guard_test.calls);
+    try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 3), guard_test.calls);
+    try testing.expectEqualStrings("circuit_open", lastError(&ctx).?.code);
+}
+
+test "guarded: pool_timeout and answers from a live server never open it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = guardCtx(&arena);
+    var g: Guard = try .init(.redis, "t", .{ .consecutive_failures = 2 }, .{});
+    defer g.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    guard_test.calls = 0;
+    guard_test.mode = .pool;
+    for (0..5) |_| try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    guard_test.mode = .unique;
+    for (0..5) |_| try testing.expectError(error.Conflict, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 10), guard_test.calls);
+    try testing.expectEqual(resilience.Breaker.State.closed, g.breaker.?.state());
+}
+
+test "guarded: with retry a transient failure is run again until it succeeds; without it, once" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = guardCtx(&arena);
+    var g: Guard = try .init(.redis, "t", null, .{ .attempts = 5, .backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1), .jitter = .none } });
+    defer g.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    guard_test.mode = .flaky;
+    guard_test.calls = 0;
+    try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 1), guard_test.calls);
+    guard_test.calls = 0;
+    try testing.expectEqual(@as(u8, 7), try guarded(&ctx, &g, .{}, true, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 3), guard_test.calls);
 }

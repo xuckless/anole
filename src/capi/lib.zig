@@ -108,6 +108,7 @@ fn genericName(code: i32) []const u8 {
         abi.E_SYSTEM => "System",
         abi.E_TIMEOUT => "Timeout",
         abi.E_DB => "Database",
+        abi.E_BROKER => "Broker",
         else => "Unexpected",
     };
 }
@@ -127,6 +128,7 @@ fn failCode(code: i32) i32 {
         abi.E_SYSTEM => "the OS refused",
         abi.E_TIMEOUT => "the timeout passed",
         abi.E_DB => "the database refused the statement",
+        abi.E_BROKER => "the message broker refused the call or could not be reached",
         else => "error",
     }});
     last_error_name = genericName(code);
@@ -271,6 +273,8 @@ export fn anole_has_feature(name: Str) i32 {
         .{ "postgres", f.postgres },
         .{ "redis", f.redis },
         .{ "mongodb", f.mongodb },
+        .{ "nats", f.nats },
+        .{ "kafka", f.kafka },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;
@@ -705,7 +709,7 @@ export fn anole_req_abort(r: u64) i32 {
 export fn anole_handle_release(h: u64) i32 {
     const kind = Handle.decode(h).kind;
     const valid = h != 0 and Handle.decode(h).gen != 0 and switch (kind) {
-        .request, .websocket, .grpc_call, .wt_session, .wt_stream, .db_tx => true,
+        .request, .websocket, .grpc_call, .wt_session, .wt_stream, .db_tx, .broker_sub, .broker_msg => true,
         else => false,
     };
     if (!valid) return wrongKind();
@@ -919,6 +923,109 @@ export fn anole_wt_close(w: u64, code: u32, reason: Str) i32 {
     return abi.OK;
 }
 
+// ---- NATS ---------------------------------------------------------------------------
+
+const nats_mod = engine.nats;
+
+fn natsOf(n: ?*const anyopaque) ?*nats_mod.Broker {
+    const b: *nats_mod.Broker = @ptrCast(@alignCast(@constCast(n orelse return null)));
+    return if (engine.global == b.engine) b else null;
+}
+
+fn natsFailure(err: nats_mod.CallError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a subject, header, size, flag, or a consumer of another server or other than the request's)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open, the broker is not connected, or no executor feeds this consumer", .{}),
+        error.Again => failCode(abi.E_AGAIN),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the request, message or subscription it served is over", .{});
+        },
+    };
+}
+
+export fn anole_nats_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const b = nats_mod.find(e, name.slice()) orelse {
+        return named(abi.E_INVALID, "Invalid", 0, "no NATS broker \"{s}\" in the configuration", .{name.slice()});
+    };
+    dst.* = b;
+    return abi.OK;
+}
+
+export fn anole_nats_index(n: ?*const anyopaque) u32 {
+    const b = natsOf(n) orelse return 0;
+    return b.index;
+}
+
+export fn anole_nats_publish(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.NatsOut, flags: u32) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const busy = nats_mod.publish(b, c, out, flags) catch |err| return natsFailure(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_nats_request(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.NatsOut, opts: ?*const abi.NatsRequestOptions, user_data: u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const o: abi.NatsRequestOptions = if (opts) |p| readSized(abi.NatsRequestOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsRequestOptions) };
+    nats_mod.request(b, c, out, o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_subscribe(n: ?*anyopaque, c_: ?*anyopaque, subject: Str, opts: ?*const abi.NatsSubscribeOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const o: abi.NatsSubscribeOptions = if (opts) |p| readSized(abi.NatsSubscribeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsSubscribeOptions) };
+    dst.* = nats_mod.subscribe(b, c, subject.slice(), o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_unsubscribe(sub: u64) i32 {
+    if (badKind(sub, .broker_sub)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    nats_mod.unsubscribe(e, sub);
+    return abi.OK;
+}
+
+export fn anole_nats_js_publish(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.NatsOut, opts: ?*const abi.NatsJsPublishOptions, user_data: u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const o: abi.NatsJsPublishOptions = if (opts) |p| readSized(abi.NatsJsPublishOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsPublishOptions) };
+    nats_mod.jsPublish(b, c, out, o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_js_consume(n: ?*anyopaque, c_: ?*anyopaque, stream: Str, consumer: Str, opts: ?*const abi.NatsJsConsumeOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const o: abi.NatsJsConsumeOptions = if (opts) |p| readSized(abi.NatsJsConsumeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsConsumeOptions) };
+    dst.* = nats_mod.consume(b, c, stream.slice(), consumer.slice(), o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_ack(m: u64, kind: u32, delay_ms: u32) i32 {
+    clearError();
+    if (badKind(m, .broker_msg)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    nats_mod.ack(e, m, kind, delay_ms) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
 // ---- databases ---------------------------------------------------------------------
 
 const db_mod = engine.db;
@@ -947,7 +1054,7 @@ fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, param
     const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return failCode(abi.E_INVALID))[0..nparams];
     for (ps) |p| if (p.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_value.reserved must be 0", .{});
     const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.DbOptions) };
-    if (o.flags & ~(abi.DB_F_WRITE | abi.DB_F_COALESCE | abi.DB_F_NO_PREPARE | abi.DB_F_DROP_EMPTY) != 0) return unknownFlag();
+    if (o.flags & ~(abi.DB_F_WRITE | abi.DB_F_COALESCE | abi.DB_F_NO_PREPARE | abi.DB_F_DROP_EMPTY | abi.DB_F_RETRY) != 0) return unknownFlag();
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_options.reserved must be 0", .{});
     db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return dbFailure(err);
     return abi.OK;
