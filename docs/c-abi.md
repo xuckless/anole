@@ -586,6 +586,7 @@ none.
 | `http2.*` | 250 streams, ... | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
 | `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 100, false, 30000, true, false, true, null, true, true | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
+| `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
 
 Keys with no Zig option: `limits.inline_body_max`, `max_inflight`, `queue`,
@@ -606,6 +607,8 @@ Zig options with no key, and why:
 | `process`, `restart_timeout` | embedded mode: no hand-off, SIGUSR2, LISTEN_FDS or sd_notify |
 | `blocking` | the ABI starts a pool when SQLite is configured |
 | `client` | no outbound client in the ABI |
+| `websocket.UpgradeOptions.max_message_size`, `timeout`, `deflate`, `drain_reason` | `limits.ws_max_message` applies to every socket; sockets have no deadline of their own; permessage-deflate runs on its defaults; the drain's close carries the default reason |
+| `websocket.UpgradeOptions.headers` | Zig only: the consumer passes headers per `anole_ws_accept` |
 
 The middleware keys follow the same rule for durations: `jwt.leeway_ms`
 (60000) and `cors.max_age_ms` (600000).
