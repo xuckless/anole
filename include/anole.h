@@ -536,6 +536,12 @@ enum anole_event_type {
   /* ---- end p3/realtime ---- */
 
   /* ---- p3/s3 ---- */
+  ANOLE_EV_S3_RESULT = 124,  /* anole_s3_result_event: the answer of an anole_s3_* call. Handle: 0, or
+                                the anole_s3_transfer it opens (anole_s3_upload_open, a streamed
+                                anole_s3_get: owes write/finish/read_more until done, or
+                                anole_handle_release) or ends (UPLOAD_FINISH) */
+  ANOLE_EV_S3_DATA = 125,    /* anole_s3_data_event: the next bytes of a streamed download
+                                (handle: the download; its FIN ends the handle) */
   /* ---- end p3/s3 ---- */
 
   /* ---- p3/smtp ---- */
@@ -2212,6 +2218,273 @@ typedef struct anole_webhook_status_event {
 /* ---- end p3/realtime ---- */
 
 /* ---- p3/s3 ---- */
+/* ---- p3/s3 ---- */
+/* ---- Object storage (S3, R2, MinIO, B2, Supabase) --------------------------- */
+
+typedef struct anole_s3 anole_s3; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a store by its "name" in the configuration's "storage". */
+ANOLE_API anole_status anole_s3_find(anole_server *s, anole_str name, anole_s3 **out);
+/* Its place in "storage". */
+ANOLE_API uint32_t anole_s3_index(const anole_s3 *s3);
+
+/* Call flags (a flag a call does not take: ANOLE_E_INVALID). */
+#define ANOLE_S3_F_STREAM 1u            /* anole_s3_get: stream the body (ANOLE_EV_S3_DATA) */
+#define ANOLE_S3_F_RANGE 2u             /* get, serve: range_start..range_end */
+#define ANOLE_S3_F_NO_RETRY 4u          /* any call: tried once */
+#define ANOLE_S3_F_IF_ABSENT 8u         /* put, upload_open, put_body, copy: create only (If-None-Match: *) */
+#define ANOLE_S3_F_REPLACE_METADATA 16u /* copy: use these options' metadata */
+#define ANOLE_S3_F_LENGTH 32u           /* upload_open: content_length is the total */
+#define ANOLE_S3_F_PASS_NOT_FOUND 64u   /* serve: on 404 leave the request unanswered and report */
+#define ANOLE_S3_F_REPORT 128u          /* serve: post ANOLE_EV_S3_RESULT (op SERVE) when done */
+
+/* anole_s3_result_event.op. */
+enum {
+  ANOLE_S3_OP_GET = 1,
+  ANOLE_S3_OP_HEAD = 2,
+  ANOLE_S3_OP_PUT = 3,
+  ANOLE_S3_OP_PUT_BODY = 4,
+  ANOLE_S3_OP_DELETE = 5,
+  ANOLE_S3_OP_DELETE_MANY = 6,
+  ANOLE_S3_OP_LIST = 7,
+  ANOLE_S3_OP_COPY = 8,
+  ANOLE_S3_OP_UPLOAD_OPEN = 9,
+  ANOLE_S3_OP_UPLOAD_FINISH = 10,
+  ANOLE_S3_OP_SERVE = 11,
+  ANOLE_S3_OP_MULTIPART_CREATE = 12,
+  ANOLE_S3_OP_MULTIPART_COMPLETE = 13,
+  ANOLE_S3_OP_MULTIPART_ABORT = 14
+};
+
+/* anole_s3_result_event.flags. */
+#define ANOLE_S3_RES_F_TRUNCATED 1u    /* LIST: more pages (next is set) */
+#define ANOLE_S3_RES_F_DELETE_MARKER 2u
+
+/* anole_s3_data_event.flags. */
+#define ANOLE_S3_DATA_F_FIN 1u
+
+/* head, delete, delete_many, multipart_complete and multipart_abort. */
+typedef struct anole_s3_options {
+  size_t size;          /* sizeof(anole_s3_options) */
+  uint32_t flags;       /* ANOLE_S3_F_NO_RETRY */
+  uint32_t timeout_ms;  /* 0: the storage's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint64_t req;         /* the anole_req / anole_grpc_call it serves (as anole_db_options.req), or 0 */
+  anole_str bucket;     /* {NULL,0}: the configured bucket */
+  anole_str version_id;
+} anole_s3_options; /* 56 bytes */
+
+typedef struct anole_s3_get_options {
+  size_t size;
+  uint32_t flags;          /* ANOLE_S3_F_STREAM, _RANGE, _NO_RETRY; serve: _PASS_NOT_FOUND, _REPORT */
+  uint32_t timeout_ms;
+  uint64_t req;
+  anole_str bucket;
+  anole_str version_id;
+  uint64_t range_start;
+  uint64_t range_end;      /* inclusive; UINT64_MAX: to the end */
+  anole_str if_none_match;
+  anole_str if_match;
+  int64_t if_modified_since_ms; /* 0: none */
+  uint32_t max_bytes;      /* whole get: a larger body answers ANOLE_E_TOOBIG; 0: max_object_bytes */
+  uint32_t window;         /* STREAM: bytes delivered before anole_s3_read_more is needed; 0: 262144 */
+  anole_str response_content_type;        /* serve: overrides the object's */
+  anole_str response_cache_control;
+  anole_str response_content_disposition;
+} anole_s3_get_options; /* 168 bytes */
+
+typedef struct anole_s3_put_options {
+  size_t size;
+  uint32_t flags;          /* ANOLE_S3_F_IF_ABSENT, _NO_RETRY, _REPLACE_METADATA (copy), _LENGTH (upload_open) */
+  uint32_t timeout_ms;
+  uint64_t req;
+  anole_str bucket;
+  anole_str content_type;  /* {NULL,0}: from the key's extension */
+  anole_str cache_control;
+  anole_str content_disposition;
+  anole_str content_encoding;
+  const anole_header *metadata; /* x-amz-meta-<name>, name without the prefix; copied */
+  size_t nmetadata;
+  anole_str storage_class;
+  anole_str if_match;
+  uint64_t content_length; /* upload_open with ANOLE_S3_F_LENGTH: the total */
+} anole_s3_put_options; /* 160 bytes */
+
+typedef struct anole_s3_list_options {
+  size_t size;
+  uint32_t flags;          /* ANOLE_S3_F_NO_RETRY */
+  uint32_t timeout_ms;
+  uint64_t req;
+  anole_str bucket;
+  anole_str prefix;
+  anole_str delimiter;
+  anole_str start_after;
+  anole_str continuation;  /* the previous answer's `next` */
+  uint32_t max_keys;       /* 1..1000; 0: 1000 */
+  uint32_t reserved;
+} anole_s3_list_options; /* 112 bytes */
+
+#define ANOLE_S3_PRESIGN_F_CONTENT_LENGTH 1u /* sign content_length (PUT) */
+enum {
+  ANOLE_S3_PRESIGN_GET = 0,
+  ANOLE_S3_PRESIGN_PUT = 1,
+  ANOLE_S3_PRESIGN_HEAD = 2,
+  ANOLE_S3_PRESIGN_DELETE = 3,
+  ANOLE_S3_PRESIGN_UPLOAD_PART = 4
+};
+
+typedef struct anole_s3_presign_options {
+  size_t size;
+  uint32_t flags;
+  uint32_t expires_s;      /* 0: 900; at most 604800 */
+  anole_str bucket;
+  anole_str version_id;
+  anole_str content_type;  /* PUT: signed */
+  uint64_t content_length; /* PUT with ANOLE_S3_PRESIGN_F_CONTENT_LENGTH */
+  anole_str response_content_type;
+  anole_str response_content_disposition;
+  anole_str upload_id;     /* UPLOAD_PART */
+  uint32_t part_number;    /* UPLOAD_PART: 1..10000 */
+  uint32_t reserved;
+} anole_s3_presign_options; /* 128 bytes */
+
+typedef struct anole_s3_part {
+  uint32_t number;
+  uint32_t reserved;
+  anole_str etag;
+} anole_s3_part; /* 24 bytes */
+
+/* ANOLE_EV_S3_RESULT. */
+typedef struct anole_s3_result_event {
+  anole_event ev;          /*   0 */
+  uint64_t user_data;      /*  16 */
+  int32_t status;          /*  24 ANOLE_OK; ANOLE_E_SERVICE (error_class says why); ANOLE_E_TIMEOUT;
+                                  ANOLE_E_GONE (its req ended); ANOLE_E_TOOBIG (whole GET over
+                                  max_bytes); ANOLE_E_NOMEM */
+  uint16_t http_status;    /*  28 what Anole's handlers answer for this failure (404, 409, 400, 503,
+                                  504, 500); 0 on success */
+  uint8_t error_class;     /*  30 ANOLE_DB_ERR_* */
+  uint8_t op;              /*  31 ANOLE_S3_OP_* */
+  uint16_t s3_status;      /*  32 the service's HTTP status (200, 206, 304, 404, ...) */
+  uint16_t flags;          /*  34 ANOLE_S3_RES_F_* */
+  uint32_t nentries;       /*  36 LIST: anole_s3_entry; DELETE_MANY: anole_s3_failure */
+  uint64_t content_length; /*  40 GET/HEAD: of this answer (a range's length); PUT/UPLOAD_FINISH/COPY: stored */
+  uint64_t object_size;    /*  48 the whole object (from Content-Range on a 206) */
+  uint64_t range_start;    /*  56 */
+  int64_t last_modified_ms;/*  64 0: unknown */
+  anole_span etag;         /*  72 */
+  anole_span version_id;   /*  80 */
+  anole_span content_type; /*  88 */
+  anole_span cache_control;        /*  96 */
+  anole_span content_disposition;  /* 104 */
+  anole_span content_encoding;     /* 112 */
+  uint32_t metadata_off;   /* 120 nmetadata (name, value) anole_span pairs */
+  uint32_t nmetadata;      /* 124 */
+  anole_span body;         /* 128 whole GET */
+  uint32_t entries_off;    /* 136 LIST: nentries anole_s3_entry; DELETE_MANY: nentries anole_s3_failure */
+  uint32_t prefixes_off;   /* 140 nprefixes anole_span (LIST with a delimiter) */
+  uint32_t nprefixes;      /* 144 */
+  uint32_t parts;          /* 148 PUT/UPLOAD_FINISH: parts used (0: one PUT) */
+  anole_span next;         /* 152 LIST: the continuation token */
+  anole_span upload_id;    /* 160 MULTIPART_CREATE */
+  anole_span error;        /* 168 for logs */
+  anole_span error_code;   /* 176 S3's Code ("NoSuchKey") or Anole's ("object_too_large") */
+  anole_span request_id;   /* 184 x-amz-request-id */
+} anole_s3_result_event; /* 192 bytes */
+
+typedef struct anole_s3_entry {
+  anole_span key;
+  anole_span etag;
+  anole_span storage_class;
+  uint64_t size;
+  int64_t last_modified_ms;
+} anole_s3_entry; /* 40 bytes */
+
+typedef struct anole_s3_failure {
+  anole_span key;
+  anole_span code;
+  anole_span message;
+} anole_s3_failure; /* 24 bytes */
+
+/* ANOLE_EV_S3_DATA: the next bytes of a download (at most 64 KiB), in order. */
+typedef struct anole_s3_data_event {
+  anole_event ev;          /*  0 the download */
+  uint64_t user_data;      /* 16 the get call's */
+  int32_t status;          /* 24 ANOLE_OK; else the download failed here (ANOLE_E_SERVICE,
+                                 ANOLE_E_TIMEOUT), always with FIN */
+  uint32_t flags;          /* 28 ANOLE_S3_DATA_F_FIN: the last; the handle is over */
+  uint64_t offset;         /* 32 of these bytes in the answer's body */
+  anole_span data;         /* 40 */
+  anole_span error;        /* 48 */
+} anole_s3_data_event; /* 56 bytes */
+
+/* Reads an object. Without ANOLE_S3_F_STREAM: one ANOLE_EV_S3_RESULT (op GET) with the head and the
+   whole body (up to max_bytes). With it: the RESULT carries the head and, in ev.handle, a download;
+   then ANOLE_EV_S3_DATA records in order, up to `window` bytes ahead of the consumer, the last one
+   with ANOLE_S3_DATA_F_FIN. A 304 (if_none_match) is status ANOLE_OK with s3_status 304 and no
+   handle. `c` and `req` as for anole_db_query. Returns at once: ANOLE_OK; ANOLE_E_INVALID (key,
+   options); ANOLE_E_GONE (stale req); ANOLE_E_STATE (before start, after the stop). */
+ANOLE_API anole_status anole_s3_get(anole_s3 *s3, anole_consumer *c, anole_str key, const anole_s3_get_options *opts,
+                                    uint64_t user_data);
+/* More credit for a download: Anole delivers up to `bytes` more. ANOLE_E_GONE when it is over. */
+ANOLE_API anole_status anole_s3_read_more(anole_s3_transfer t, uint32_t bytes);
+ANOLE_API anole_status anole_s3_head(anole_s3 *s3, anole_consumer *c, anole_str key, const anole_s3_get_options *opts,
+                                     uint64_t user_data);
+/* Answers the request r from the object: Range and If-* from r unless the options set them, status
+   and headers passed through, the body streamed by Anole. Finishes r (an answer call) unless
+   ANOLE_S3_F_PASS_NOT_FOUND and the object does not exist: then r stays owed and an
+   ANOLE_EV_S3_RESULT (op SERVE, error_class NOT_FOUND) goes to r's consumer. ANOLE_E_GONE (r is
+   over); ANOLE_E_STATE (r is already answering). */
+ANOLE_API anole_status anole_s3_serve(anole_s3 *s3, anole_req r, anole_str key, const anole_s3_get_options *opts,
+                                      uint64_t user_data);
+/* Stores `data` (copied before return) as one object: one PUT up to multipart_threshold, else
+   multipart. Answer: ANOLE_EV_S3_RESULT op PUT (etag, version_id). */
+ANOLE_API anole_status anole_s3_put(anole_s3 *s3, anole_consumer *c, anole_str key, const void *data, size_t len,
+                                    const anole_s3_put_options *opts, uint64_t user_data);
+/* Stores the body of request r (unread, ANOLE_REQ_BODY_STREAM, or an inline body) without it passing
+   through the consumer. r stays owed: the answer is an ANOLE_EV_S3_RESULT (op PUT_BODY) to r's
+   consumer, after which the consumer answers r. ANOLE_E_STATE when r's body was already read. */
+ANOLE_API anole_status anole_s3_put_body(anole_s3 *s3, anole_req r, anole_str key, const anole_s3_put_options *opts,
+                                         uint64_t user_data);
+/* Opens a push upload: answered by ANOLE_EV_S3_RESULT (op UPLOAD_OPEN) whose ev.handle is the upload. */
+ANOLE_API anole_status anole_s3_upload_open(anole_s3 *s3, anole_consumer *c, anole_str key,
+                                            const anole_s3_put_options *opts, uint64_t user_data);
+/* Copies bytes into the upload; never blocks. ANOLE_OK; ANOLE_BUSY (taken; more than
+   concurrency * part_size is buffered: wait for ANOLE_EV_WRITABLE on t); ANOLE_E_AGAIN (nothing
+   taken: a part more is buffered, or the storage's upload_memory is used up; ANOLE_EV_WRITABLE on t
+   follows); ANOLE_E_INVALID (len over part_size, or a flag: ANOLE_BODY_BORROW is refused, the bytes
+   are always copied); ANOLE_E_GONE (the upload failed or was released: its ANOLE_EV_S3_RESULT says why). */
+ANOLE_API anole_status anole_s3_upload_write(anole_s3_transfer t, const void *data, size_t len, uint32_t flags);
+/* Sends the rest and completes. Answered by ANOLE_EV_S3_RESULT (op UPLOAD_FINISH, ev.handle t,
+   user_data this call's). */
+ANOLE_API anole_status anole_s3_upload_finish(anole_s3_transfer t, uint64_t user_data);
+ANOLE_API anole_status anole_s3_delete(anole_s3 *s3, anole_consumer *c, anole_str key, const anole_s3_options *opts,
+                                       uint64_t user_data);
+/* Any number of keys (copied), sent 1000 per request. Answer: op DELETE_MANY, `nentries` failures as
+   anole_s3_failure. */
+ANOLE_API anole_status anole_s3_delete_many(anole_s3 *s3, anole_consumer *c, const anole_str *keys, size_t n,
+                                            const anole_s3_options *opts, uint64_t user_data);
+/* One page: op LIST, entries (anole_s3_entry), prefixes (anole_span), `next` (empty on the last page). */
+ANOLE_API anole_status anole_s3_list(anole_s3 *s3, anole_consumer *c, const anole_s3_list_options *opts,
+                                     uint64_t user_data);
+/* CopyObject (up to 5 GiB): src_bucket {NULL,0} is opts->bucket. */
+ANOLE_API anole_status anole_s3_copy(anole_s3 *s3, anole_consumer *c, anole_str src_bucket, anole_str src_key,
+                                     anole_str dst_key, const anole_s3_put_options *opts, uint64_t user_data);
+/* A presigned URL, computed at once (no request). Writes it into buf when it fits and returns its
+   length (> cap: nothing written; call again with a larger buf), or a negative status:
+   ANOLE_E_INVALID, ANOLE_E_STATE (before start, or no credentials yet: name "NoCredentials"). */
+ANOLE_API int64_t anole_s3_presign(anole_s3 *s3, uint32_t method, anole_str key, const anole_s3_presign_options *opts,
+                                   char *buf, size_t cap);
+/* Multipart for browser uploads with presigned UPLOAD_PART URLs. Answers: op MULTIPART_CREATE
+   (upload_id), MULTIPART_COMPLETE (etag), MULTIPART_ABORT. */
+ANOLE_API anole_status anole_s3_multipart_create(anole_s3 *s3, anole_consumer *c, anole_str key,
+                                                 const anole_s3_put_options *opts, uint64_t user_data);
+ANOLE_API anole_status anole_s3_multipart_complete(anole_s3 *s3, anole_consumer *c, anole_str key, anole_str upload_id,
+                                                   const anole_s3_part *parts, size_t nparts,
+                                                   const anole_s3_options *opts, uint64_t user_data);
+ANOLE_API anole_status anole_s3_multipart_abort(anole_s3 *s3, anole_consumer *c, anole_str key, anole_str upload_id,
+                                                const anole_s3_options *opts, uint64_t user_data);
+/* anole_handle_release(t): an upload aborts (AbortMultipartUpload), parts in flight canceled, not
+   answered; a download stops reading and closes the connection, no more DATA. A cleanup call. */
 /* ---- end p3/s3 ---- */
 
 /* ---- p3/smtp ---- */

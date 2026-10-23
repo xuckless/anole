@@ -72,6 +72,8 @@ pub const Config = struct {
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
+    /// S3-compatible object stores for `anole_s3_*`, opened at start.
+    storage: []const Storage = &.{},
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
@@ -1026,6 +1028,69 @@ pub const Config = struct {
     // ---- end p3/realtime (types) ----
 
     // ---- p3/s3 (types) ----
+    /// An object store (`anole.s3.Options` and the call defaults).
+    pub const Storage = struct {
+        /// What `anole_s3_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        s3: S3,
+        /// A bound on every call that has no timeout_ms of its own; a call
+        /// that moves a body gets this plus bytes / min_throughput. 0: none.
+        timeout_ms: u32 = 30_000,
+        /// What status each class of error becomes, as `anole.db.ErrorMap`.
+        errors: anole.db.ErrorMap = .{},
+        /// What calls are retried with (all of S3's are idempotent, so on by
+        /// default); null: tried once.
+        retry: ?S3Retry = .{},
+        breaker: ?Breaker = .{},
+    };
+
+    /// `Retry` with S3's defaults (100 ms to 2 s).
+    pub const S3Retry = struct {
+        attempts: u8 = 3,
+        base_ms: u32 = 100,
+        max_ms: u32 = 2_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
+    };
+
+    pub const S3 = struct {
+        /// "https://<account>.r2.cloudflarestorage.com", "http://127.0.0.1:9000".
+        /// Null: AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, else AWS.
+        endpoint: ?[]const u8 = null,
+        /// Null: AWS_REGION, AWS_DEFAULT_REGION, else the provider's.
+        region: ?[]const u8 = null,
+        /// The default bucket; null: S3_BUCKET.
+        bucket: ?[]const u8 = null,
+        /// Keys: both or neither (neither takes the AWS credential chain).
+        access_key_id: ?[]const u8 = null,
+        secret_access_key: ?[]const u8 = null,
+        session_token: ?[]const u8 = null,
+        /// Unsigned requests, for public buckets.
+        anonymous: bool = false,
+        /// "auto", "aws", "r2", "b2", "supabase", "minio" or "generic".
+        provider: []const u8 = "auto",
+        /// "auto", "path" or "virtual_host".
+        addressing: []const u8 = "auto",
+        /// "auto" (hash the body over plain HTTP only), "signed" or "unsigned".
+        payload_signing: []const u8 = "auto",
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        min_throughput: u64 = 1024 * 1024,
+        connect_timeout_ms: u32 = 10_000,
+        max_idle_connections: u16 = 64,
+        part_size: u64 = 8 * 1024 * 1024,
+        multipart_threshold: ?u64 = null,
+        concurrency: u8 = 2,
+        upload_memory: u64 = 256 * 1024 * 1024,
+        max_object_bytes: u64 = 16 * 1024 * 1024,
+        readiness: bool = false,
+    };
     // ---- end p3/s3 (types) ----
 
     // ---- p3/smtp (types) ----
@@ -1146,6 +1211,28 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     }
     if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
     if (cfg.grpc) |g| try checkGrpc(g, why);
+    // ---- p3/s3 (check) ----
+    for (cfg.storage, 0..) |st, i| {
+        if (st.name.len == 0 or st.name.len > 255) return fail(why, "storage[{d}].name: 1-255 bytes", .{i});
+        for (cfg.storage[0..i]) |other| if (std.mem.eql(u8, st.name, other.name))
+            return fail(why, "storage[{d}].name \"{s}\" is taken", .{ i, st.name });
+        if (comptime !features.s3) return fail(why, "storage[{d}]: S3 is not built in (-Ds3)", .{i});
+        const c = st.s3;
+        if ((c.access_key_id == null) != (c.secret_access_key == null)) return fail(why, "storage[{d}].s3: access_key_id, secret_access_key: both or neither", .{i});
+        if (c.session_token != null and c.access_key_id == null) return fail(why, "storage[{d}].s3: session_token goes with access_key_id and secret_access_key", .{i});
+        if (c.anonymous and c.access_key_id != null) return fail(why, "storage[{d}].s3: anonymous or keys, not both", .{i});
+        if (!oneOf(c.provider, &.{ "auto", "aws", "r2", "b2", "supabase", "minio", "generic" })) return fail(why, "storage[{d}].s3.provider: auto, aws, r2, b2, supabase, minio or generic", .{i});
+        if (!oneOf(c.addressing, &.{ "auto", "path", "virtual_host" })) return fail(why, "storage[{d}].s3.addressing: auto, path or virtual_host", .{i});
+        if (!oneOf(c.payload_signing, &.{ "auto", "signed", "unsigned" })) return fail(why, "storage[{d}].s3.payload_signing: auto, signed or unsigned", .{i});
+        if (c.part_size < 5 * 1024 * 1024 or c.part_size > 5 * 1024 * 1024 * 1024) return fail(why, "storage[{d}].s3: part_size: 5 MiB .. 5 GiB", .{i});
+        if (c.concurrency < 1 or c.concurrency > 16) return fail(why, "storage[{d}].s3.concurrency: 1 .. 16", .{i});
+        if (c.upload_memory < c.part_size) return fail(why, "storage[{d}].s3.upload_memory: at least one part", .{i});
+        if (c.ca_file != null and c.ca_pem != null) return fail(why, "storage[{d}].s3: ca_file or ca_pem, not both", .{i});
+        try checkClientCert(c, "storage", "s3", i, why);
+        if (c.endpoint) |e| if (!(std.mem.startsWith(u8, e, "http://") or std.mem.startsWith(u8, e, "https://")))
+            return fail(why, "storage[{d}].s3.endpoint: an http:// or https:// URL", .{i});
+    }
+    // ---- end p3/s3 (check) ----
     for (cfg.databases, 0..) |d, i| {
         if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
         for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))

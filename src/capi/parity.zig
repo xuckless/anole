@@ -583,6 +583,34 @@ pub const webhook_verify_options = [_]Entry{
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----
+const s3_tls_note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify";
+
+/// `anole.s3.Options` against `storage[]`.
+pub const s3_options = [_]Entry{
+    .{ .zig = "endpoint", .json = "storage[].s3.endpoint" },
+    .{ .zig = "region", .json = "storage[].s3.region" },
+    .{ .zig = "bucket", .json = "storage[].s3.bucket" },
+    .{ .zig = "credentials", .json = "storage[].s3.access_key_id", .kind = .custom, .note = "access_key_id + secret_access_key (+ session_token), or anonymous; neither takes the AWS credential chain" },
+    .{ .zig = "provider", .json = "storage[].s3.provider", .kind = .custom, .note = "by name: \"auto\", \"aws\", \"r2\", \"b2\", \"supabase\", \"minio\", \"generic\"" },
+    .{ .zig = "addressing", .json = "storage[].s3.addressing", .kind = .custom, .note = "\"auto\", \"path\" or \"virtual_host\"" },
+    .{ .zig = "payload_signing", .json = "storage[].s3.payload_signing", .kind = .custom, .note = "\"auto\", \"signed\" or \"unsigned\"" },
+    .{ .zig = "name", .json = "storage[].name", .kind = .custom, .note = "the store's name" },
+    .{ .zig = "tls", .json = "storage[].s3.ca_file", .kind = .custom, .note = s3_tls_note },
+    .{ .zig = "timeout", .json = "storage[].timeout_ms", .kind = .ms, .note = "0 is none" },
+    .{ .zig = "min_throughput", .json = "storage[].s3.min_throughput" },
+    .{ .zig = "connect_timeout", .json = "storage[].s3.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "max_idle_connections", .json = "storage[].s3.max_idle_connections" },
+    .{ .zig = "part_size", .json = "storage[].s3.part_size" },
+    .{ .zig = "multipart_threshold", .json = "storage[].s3.multipart_threshold" },
+    .{ .zig = "concurrency", .json = "storage[].s3.concurrency" },
+    .{ .zig = "upload_memory", .json = "storage[].s3.upload_memory" },
+    .{ .zig = "max_object_bytes", .json = "storage[].s3.max_object_bytes" },
+    .{ .zig = "errors", .json = "storage[].errors", .kind = .same },
+    .{ .zig = "retry", .json = "storage[].retry", .kind = .custom, .note = "an object (attempts, base_ms, max_ms, multiplier, attempt_timeout_ms, max_retry_after_ms), or null for none; on by default (every S3 call is idempotent); ANOLE_S3_F_NO_RETRY tries one call once" },
+    .{ .zig = "breaker", .json = "storage[].breaker", .kind = .custom, .note = "an object (consecutive_failures, failure_ratio, min_calls, window_ms, open_ms, max_open_ms, half_open_calls), or null for none" },
+    .{ .zig = "readiness", .json = "storage[].s3.readiness" },
+    .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
+};
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----

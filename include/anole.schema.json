@@ -198,9 +198,543 @@
         }
       ],
       "description": "Webhooks out (needs jobs)."
+    },
+    "storage": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Storage"
+      },
+      "description": "S3-compatible object stores for anole_s3_*, opened at start."
     }
   },
   "$defs": {
+    "Storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "What anole_s3_find looks it up by: unique, 1-255 bytes."
+        },
+        "s3": {
+          "$ref": "#/$defs/S3"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on every call that has no timeout_ms of its own. 0: none."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "attempts": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10,
+                  "default": 3,
+                  "description": "Attempts in all, the first included."
+                },
+                "base_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 100
+                },
+                "max_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 2000
+                },
+                "multiplier": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 2.0
+                },
+                "attempt_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 0,
+                  "description": "A bound on each attempt; 0: none."
+                },
+                "max_retry_after_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "breaker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "consecutive_failures": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5,
+                  "description": "Open after this many failures in a row; 0: not this rule."
+                },
+                "failure_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.5,
+                  "description": "Open when failures / calls reaches this over window_ms, once min_calls calls are in it; 0: not this rule."
+                },
+                "min_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 20
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000,
+                  "description": "The failure ratio's sliding window."
+                },
+                "open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5000,
+                  "description": "The first open period; it doubles after each failed probe."
+                },
+                "max_open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 60000
+                },
+                "half_open_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255,
+                  "default": 1,
+                  "description": "Calls let through at once while half-open."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A circuit breaker: after repeated connection failures calls fail fast with ANOLE_E_DB, class UNAVAILABLE, error_code \"circuit_open\" and http_status 503. null: none. Ignored for SQLite."
+        }
+      }
+    },
+    "S3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "\"https://<account>.r2.cloudflarestorage.com\", \"http://127.0.0.1:9000\". Null: AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, else AWS."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "region": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "Null: AWS_REGION, AWS_DEFAULT_REGION, else the provider's."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bucket": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The default bucket; null: S3_BUCKET."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "access_key_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "Keys: both or neither (neither takes the AWS credential chain)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "secret_access_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "anonymous": {
+          "type": "boolean",
+          "default": false,
+          "description": "Unsigned requests, for public buckets."
+        },
+        "provider": {
+          "enum": [
+            "auto",
+            "aws",
+            "r2",
+            "b2",
+            "supabase",
+            "minio",
+            "generic"
+          ],
+          "default": "auto"
+        },
+        "addressing": {
+          "enum": [
+            "auto",
+            "path",
+            "virtual_host"
+          ],
+          "default": "auto"
+        },
+        "payload_signing": {
+          "enum": [
+            "auto",
+            "signed",
+            "unsigned"
+          ],
+          "default": "auto",
+          "description": "auto hashes the body over plain HTTP only."
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false
+        },
+        "min_throughput": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1048576,
+          "description": "Bytes per second a call that moves a body is given on top of timeout_ms."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000
+        },
+        "max_idle_connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 64
+        },
+        "part_size": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 8388608,
+          "description": "Multipart part size, 5 MiB .. 5 GiB."
+        },
+        "multipart_threshold": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "description": "A body of known length up to this size goes up as one PUT; null: part_size."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255,
+          "default": 2,
+          "description": "Parts of one upload in flight at once, 1..16."
+        },
+        "upload_memory": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 268435456,
+          "description": "Part buffers of every upload together."
+        },
+        "max_object_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 16777216,
+          "description": "A whole-body get larger than this fails with ANOLE_E_TOOBIG."
+        },
+        "readiness": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add a HeadBucket check to /readyz."
+        }
+      }
+    },
     "Listener": {
       "type": "object",
       "additionalProperties": false,

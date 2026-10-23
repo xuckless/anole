@@ -1552,6 +1552,46 @@ admin routes would send. Operations (`"op"`): `jobs.get` and `jobs.retry`,
 (`{"name": ...}`), and the `webhooks.*` operations when the configuration has
 webhooks.
 
+<!-- p3/s3 -->
+## Object storage (S3)
+
+Object stores are configured under `"storage"` (one object per store, with a `"name"` and an `"s3"` object that has `anole.s3.Options`' keys in snake_case) and used through `anole_s3_*` calls. Built with `-Ds3` (`anole_has_feature("s3")`); see [storage.md](storage.md) for what the calls mean.
+
+```json
+"storage": [
+  { "name": "files",
+    "s3": { "endpoint": "https://acct.r2.cloudflarestorage.com", "bucket": "uploads",
+            "access_key_id": "...", "secret_access_key": "...",
+            "part_size": 8388608, "concurrency": 2 },
+    "timeout_ms": 30000, "retry": { "attempts": 3 }, "breaker": {} }
+]
+```
+
+Without `access_key_id` and `secret_access_key` the AWS credential chain runs when the server starts; a start that finds no credentials fails with `ANOLE_E_CONFIG`, name `NoCredentials`, and the sources tried in `anole_last_error`. `retry` is on by default (every S3 call is idempotent; `null` turns it off, `ANOLE_S3_F_NO_RETRY` tries one call once); `readiness` is off by default.
+
+`anole_s3_find` looks a store up by name and `anole_s3_index` gives its place in `"storage"`. Every call returns at once; the answer is one `ANOLE_EV_S3_RESULT` (event 124, `anole_s3_result_event`) to the consumer named in the call, or to the consumer of `opts->req`'s request, with the call's `user_data`. A failure is `ANOLE_E_SERVICE` (-13) with `error_class` (`ANOLE_DB_ERR_NOT_FOUND` 11, `_PRECONDITION` 12, `_INVALID` 13, `_UNAVAILABLE`, `_TIMEOUT`, `_OTHER`), `http_status` (what Anole's handlers answer), S3's code in `error_code` and its message in `error`. `ANOLE_E_TIMEOUT` is a call past its bound; `ANOLE_E_TOOBIG` a whole `anole_s3_get` over `max_bytes`; `ANOLE_E_GONE` a call tied to a request (`opts->req`) that ended first.
+
+| Call | Op in the result | Notes |
+| --- | --- | --- |
+| `anole_s3_get`, `anole_s3_head` | `GET`, `HEAD` | the head and (get) the whole body; a 304 is `ANOLE_OK` with `s3_status` 304 |
+| `anole_s3_get` with `ANOLE_S3_F_STREAM` | `GET`, then `ANOLE_EV_S3_DATA` | see below |
+| `anole_s3_put` | `PUT` | `data` is copied; one PUT or multipart |
+| `anole_s3_delete`, `anole_s3_delete_many` | `DELETE`, `DELETE_MANY` | failures in `entries_off` as `anole_s3_failure` |
+| `anole_s3_list` | `LIST` | `anole_s3_entry` records, `prefixes_off` spans, `next`; `ANOLE_S3_RES_F_TRUNCATED` |
+| `anole_s3_copy` | `COPY` | up to 5 GiB |
+| `anole_s3_multipart_create`, `anole_s3_multipart_complete`, `anole_s3_multipart_abort` | `MULTIPART_CREATE`, `MULTIPART_COMPLETE`, `MULTIPART_ABORT` | for browsers uploading parts with presigned URLs |
+| `anole_s3_presign` | none | synchronous; returns the URL's length, written into `buf` when it fits |
+| `anole_s3_serve`, `anole_s3_put_body` | `SERVE`, `PUT_BODY` | the request's body or answer never enters the language |
+
+**Uploads (push).** `anole_s3_upload_open` answers with a result (op `UPLOAD_OPEN`) whose `ev.handle` is an `anole_s3_transfer` (handle kind 16). `anole_s3_upload_write(t, data, len, 0)` copies the bytes (`len` at most `part_size`; `ANOLE_BODY_BORROW` is refused) and **never blocks**: `ANOLE_OK`; `ANOLE_BUSY` (taken, but more than `concurrency * part_size` is buffered); `ANOLE_E_AGAIN` (nothing taken: a part more is buffered, or `upload_memory` is used up). After BUSY or AGAIN an `ANOLE_EV_WRITABLE` arrives on the handle once the buffered bytes fall to half of `concurrency * part_size`. `anole_s3_upload_finish(t, user_data)` sends the rest; the answer is a result with op `UPLOAD_FINISH`, `ev.handle` = `t` and the finish call's `user_data`. A failed upload (a part past its retries) answers the same event with the error, and later writes are `ANOLE_E_GONE`. `anole_handle_release(t)` aborts it.
+
+**Downloads (streamed).** `anole_s3_get` with `ANOLE_S3_F_STREAM` answers with a result that carries the head and a transfer handle in `ev.handle`; `ANOLE_EV_S3_DATA` records (event 125, `anole_s3_data_event`, at most 64 KiB each) follow in order, up to `window` bytes (default 256 KiB) ahead of what the consumer has credited. `anole_s3_read_more(t, bytes)` adds credit. The last record has `ANOLE_S3_DATA_F_FIN`; a failure is a record with a non-zero `status` and FIN. `anole_handle_release(t)` stops it.
+
+**serve and put_body.** `anole_s3_serve(s3, req, key, opts, user_data)` answers the request itself (Range and `If-*` from the request, status and headers passed through, the body streamed by Anole). With `ANOLE_S3_F_PASS_NOT_FOUND` a missing key leaves the request owed and posts a result (op `SERVE`, class NOT_FOUND) so the consumer can answer with its own 404; `ANOLE_S3_F_REPORT` posts a result when the serve is done. `anole_s3_put_body(s3, req, key, opts, user_data)` stores the request's body (inline or streamed) without it passing through the consumer; the request stays owed and the consumer answers it after the `PUT_BODY` result.
+
+Records: `anole_s3_options`, `anole_s3_get_options`, `anole_s3_put_options`, `anole_s3_list_options`, `anole_s3_presign_options` and `anole_s3_part` take a leading `size` like the database options; `anole_s3_result_event`, `anole_s3_entry`, `anole_s3_failure` and `anole_s3_data_event` are in [anole.h](../include/anole.h). Server drain stops new uploads; those in flight finish. The stop aborts every upload and ends no more events.
+<!-- end p3/s3 -->
+
 ## gRPC
 
 A `"grpc"` section serves gRPC services whose methods the consumer

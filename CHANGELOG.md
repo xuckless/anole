@@ -30,7 +30,6 @@ breaking changes are listed anyway.
   `ANOLE_EV_NET_OPEN` (96) to `ANOLE_EV_NET_DATAGRAMS` (100); handle kinds
   `anole_net_conn` and `anole_net_udp`; `anole_stats` net fields; listener
   flags `ANOLE_LISTENER_F_TCP` and `_UDP`.
-
 - `anole.jobs` (`-Djobs`, on in the web and full profiles): background jobs
   with retries and backoff, delays, priorities, unique jobs, leases with
   heartbeats, an admin API and JSON routes, on the memory and SQLite stores
@@ -49,7 +48,6 @@ breaking changes are listed anyway.
   `anole_db_tx`), `anole_jobs_work` and `anole_jobs_stop`, `anole_job_finish`,
   `anole_job_complete_in` and `anole_jobs_admin`; events 104-108, handle kinds
   12 and 13.
-
 - Webhooks (`-Dwebhooks`, on in the web and full profiles; needs `-Djobs`):
   `app.webhooks(.{ .jobs = jobs })` keeps endpoints, messages and a delivery
   log in the jobs store, and `publish` sends an event to the owner's matching
@@ -66,6 +64,20 @@ breaking changes are listed anyway.
   `anole.webhooks.standard` has the signing and verifying functions.
 - C ABI: `anole_webhooks_publish` and `anole_webhooks_watch`, events 109 and
   110, the `"webhooks"` configuration and the `webhook_verify` middleware.
+- `anole.s3` (`-Ds3`, in the `web` and `full` profiles): an S3-compatible
+  object storage client for AWS S3, Cloudflare R2, MinIO, Backblaze B2 and
+  Supabase Storage, in pure Zig on Anole's HTTP client with its own SigV4
+  signer. Streaming uploads (a pull form from a reader, a file or the
+  request, and a push form whose writes never wait for the network) and
+  downloads, multipart uploads with bounded memory, `serve` for answering a
+  request from an object, presigned URLs, listing, copying, and the AWS
+  credential chain (environment, shared file, web identity, ECS/EKS, EC2).
+  Retries are on by default (every call is idempotent). `app.s3(.{})`,
+  `anole.s3.testing.FakeServer` (verifies signatures), docs/storage.md.
+- C ABI: `"storage"` in the configuration and `anole_s3_*` (events 124 and
+  125, handle kind 16 for uploads and downloads, `ANOLE_E_SERVICE`, error
+  classes `NOT_FOUND`, `PRECONDITION` and `INVALID`). `serve` and `put_body`
+  move an object to and from a request without it entering the language.
 
 ### Changed
 
