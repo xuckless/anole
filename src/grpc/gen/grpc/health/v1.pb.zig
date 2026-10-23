@@ -223,6 +223,11 @@ pub const HealthListRequest = struct {
 pub const HealthListResponse = struct {
     statuses: std.ArrayList(HealthListResponse.StatusesEntry) = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .statuses = "statuses contains all the services and their respective status.",
+    };
+
     pub const _desc_table = .{
         .statuses = fd(1, .{ .repeated = .submessage }),
     };
@@ -376,6 +381,15 @@ pub fn Health(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "grpc.health.v1";
         pub const service_name = "Health";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Health is gRPC's mechanism for checking whether a server is able to handle\nRPCs. Its semantics are documented in\nhttps://github.com/grpc/grpc/blob/master/doc/health-checking.md.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .Check = "Check gets the health of the specified service. If the requested service\nis unknown, the call will fail with status NOT_FOUND. If the caller does\nnot specify a service name, the server should respond with its overall\nhealth status.\n\nClients should set a deadline when calling Check, and can declare the\nserver unhealthy if they do not receive a timely response.",
+            .List = "List provides a non-atomic snapshot of the health of all the available\nservices.\n\nThe server may respond with a RESOURCE_EXHAUSTED error if too many services\nexist.\n\nClients should set a deadline when calling List, and can declare the server\nunhealthy if they do not receive a timely response.\n\nClients should keep in mind that the list of health services exposed by an\napplication can change over the lifetime of the process.",
+            .Watch = "Performs a watch for the serving status of the requested service.\nThe server will immediately send back a message indicating the current\nserving status.  It will then subsequently send a new message whenever\nthe service's serving status changes.\n\nIf the requested service is unknown when the call is received, the\nserver will send a message setting the serving status to\nSERVICE_UNKNOWN but will *not* terminate the call.  If at some\nfuture point, the serving status of the service becomes known, the\nserver will send a new message with the service's serving status.\n\nIf the call terminates with status UNIMPLEMENTED, then clients\nshould assume this method is not supported and should not retry the\ncall.  If the call terminates with any other status (including OK),\nclients should retry the call with appropriate exponential backoff.",
+        };
         /// Check gets the health of the specified service. If the requested service
         /// is unknown, the call will fail with status NOT_FOUND. If the caller does
         /// not specify a service name, the server should respond with its overall

@@ -647,6 +647,23 @@ pub fn Library(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "transcode";
         pub const service_name = "Library";
 
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .GetBook = "Two bindings: a resource name with literals, and a short form.",
+            .CreateBook = "body: a named field; the rest from the query.",
+            .UpdateBook = "A nested field in the path, inside the body field.",
+            .ListBooks = "response_body: the repeated field alone, as a JSON array. The second\nbinding has a variable where another route has one of another name.",
+            .PublishBook = "A custom verb, after a variable; body \"*\".",
+            .StatBook = "A custom verb after a variable, on the route of GetBook's /v1/books/{name}.",
+            .BatchGet = "A custom verb after a literal.",
+            .GetFile = "** in a variable, and an anonymous *.",
+            .GetFileInfo = "** with a verb after it.",
+            .SearchBooks = "A custom HTTP method.",
+            .WatchBooks = "Server streaming: one JSON array.",
+            .UploadBooks = "Client streaming is not transcoded: 501.",
+            .Plain = "Not annotated: no REST route.",
+        };
+
         /// Options of the methods that have some (`google.protobuf.MethodOptions`).
         pub const _method_options = .{
             .GetBook = .{

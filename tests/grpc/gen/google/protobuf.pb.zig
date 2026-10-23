@@ -22,6 +22,20 @@ pub const Edition = enum(i32) {
     EDITION_99998_TEST_ONLY = 99998,
     EDITION_99999_TEST_ONLY = 99999,
     EDITION_MAX = 2147483647,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "The full set of known editions.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _value_docs = .{
+        .EDITION_UNKNOWN = "A placeholder for an unknown edition value.",
+        .EDITION_LEGACY = "A placeholder edition for specifying default behaviors *before* a feature\nwas first introduced.  This is effectively an \"infinite past\".",
+        .EDITION_PROTO2 = "Legacy syntax \"editions\".  These pre-date editions, but behave much like\ndistinct editions.  These can't be used to specify the edition of proto\nfiles, but feature definitions must supply proto2/proto3 defaults for\nbackwards compatibility.",
+        .EDITION_2023 = "Editions that have been released.  The specific values are arbitrary and\nshould not be depended on, but they will always be time-ordered for easy\ncomparison.",
+        .EDITION_UNSTABLE = "A placeholder edition for developing and testing unscheduled features.",
+        .EDITION_1_TEST_ONLY = "Placeholder editions for testing feature resolution.  These should not be\nused or relied on outside of tests.",
+        .EDITION_MAX = "Placeholder for specifying unbounded edition support.  This should only\never be used by plugins that can expect to never require any changes to\nsupport a new edition.",
+    };
 };
 
 /// Describes the 'visibility' of a symbol with respect to the proto import
@@ -33,6 +47,9 @@ pub const SymbolVisibility = enum(i32) {
     VISIBILITY_UNSET = 0,
     VISIBILITY_LOCAL = 1,
     VISIBILITY_EXPORT = 2,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes the 'visibility' of a symbol with respect to the proto import\nsystem. Symbols can only be imported when the visibility rules do not prevent\nit (ex: local symbols cannot be imported).  Visibility modifiers can only set\non `message` and `enum` as they are the only types available to be referenced\nfrom other files.";
 };
 
 /// The protocol compiler can output a FileDescriptorSet containing the .proto
@@ -40,6 +57,9 @@ pub const SymbolVisibility = enum(i32) {
 pub const FileDescriptorSet = struct {
     file: std.ArrayList(FileDescriptorProto) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "The protocol compiler can output a FileDescriptorSet containing the .proto\nfiles it parses.";
 
     pub const _desc_table = .{
         .file = fd(1, .{ .repeated = .submessage }),
@@ -131,6 +151,21 @@ pub const FileDescriptorProto = struct {
     source_code_info: ?SourceCodeInfo = null,
     syntax: ?[]const u8 = null,
     edition: ?Edition = null,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a complete .proto file.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .dependency = "Names of files imported by this file.",
+        .public_dependency = "Indexes of the public imported files in the dependency list above.",
+        .weak_dependency = "Indexes of the weak imported files in the dependency list.\nFor Google-internal migration only. Do not use.",
+        .option_dependency = "Names of files imported by this file purely for the purpose of providing\noption extensions. These are excluded from the dependency list above.",
+        .message_type = "All top-level definitions in this file.",
+        .source_code_info = "This field contains optional information about the original source code.\nYou may safely remove this entire field without harming runtime\nfunctionality of the descriptors -- the information is needed only by\ndevelopment tools.",
+        .syntax = "The syntax of the proto file.\nThe supported values are \"proto2\", \"proto3\", and \"editions\".\n\nIf `edition` is present, this value must be \"editions\".\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .edition = "The edition of the proto file.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+    };
 
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
@@ -226,6 +261,15 @@ pub const DescriptorProto = struct {
     reserved_name: std.ArrayList([]const u8) = .empty,
     visibility: ?SymbolVisibility = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a message type.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .reserved_name = "Reserved field names, which may not be used by fields in the same message.\nA given name may only be reserved once.",
+        .visibility = "Support for `export` and `local` keywords on enums.",
+    };
+
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
         .field = fd(2, .{ .repeated = .submessage }),
@@ -320,6 +364,9 @@ pub const DescriptorProto = struct {
     pub const ReservedRange = struct {
         start: ?i32 = null,
         end: ?i32 = null,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Range of reserved tag numbers. Reserved tag numbers may not be used by\nfields or extension ranges in the same message. Reserved ranges may\nnot overlap.";
 
         pub const _desc_table = .{
             .start = fd(1, .{ .scalar = .int32 }),
@@ -459,6 +506,14 @@ pub const ExtensionRangeOptions = struct {
     verification: ?ExtensionRangeOptions.VerificationState = null,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+        .declaration = "For external users: DO NOT USE. We are in the process of open sourcing\nextension declaration and executing internal cleanups before it can be\nused externally.",
+        .features = "Any features defined in the specific edition.",
+        .verification = "The verification state of the range.\nTODO: flip the default to DECLARATION once all empty ranges\nare marked as UNVERIFIED.",
+    };
+
     pub const _desc_table = .{
         .uninterpreted_option = fd(999, .{ .repeated = .submessage }),
         .declaration = fd(2, .{ .repeated = .submessage }),
@@ -483,6 +538,14 @@ pub const ExtensionRangeOptions = struct {
     pub const VerificationState = enum(i32) {
         DECLARATION = 0,
         UNVERIFIED = 1,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "The verification state of the extension range.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .DECLARATION = "All the extensions of the range must be declared.",
+        };
     };
 
     pub const Declaration = struct {
@@ -491,6 +554,15 @@ pub const ExtensionRangeOptions = struct {
         type: ?[]const u8 = null,
         reserved: ?bool = null,
         repeated: ?bool = null,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .number = "The extension number declared within the extension range.",
+            .full_name = "The fully-qualified name of the extension field. There must be a leading\ndot in front of the full name.",
+            .type = "The fully-qualified type name of the extension field. Unlike\nMetadata.type, Declaration.type must have a leading dot for messages\nand enums.",
+            .reserved = "If true, indicates that the number is reserved in the extension range,\nand any extension field with the number will fail to compile. Set this\nwhen a declared extension field is deleted.",
+            .repeated = "If true, indicates that the extension must be defined as repeated.\nOtherwise the extension must be defined as optional.",
+        };
 
         pub const _desc_table = .{
             .number = fd(1, .{ .scalar = .int32 }),
@@ -640,6 +712,20 @@ pub const FieldDescriptorProto = struct {
     options: ?FieldOptions = null,
     proto3_optional: ?bool = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a field within a message.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .type = "If type_name is set, this need not be set.  If both this and type_name\nare set, this must be one of TYPE_ENUM, TYPE_MESSAGE or TYPE_GROUP.",
+        .type_name = "For message and enum types, this is the name of the type.  If the name\nstarts with a '.', it is fully-qualified.  Otherwise, C++-like scoping\nrules are used to find the type (i.e. first the nested types within this\nmessage are searched, then within the parent, on up to the root\nnamespace).",
+        .extendee = "For extensions, this is the name of the type being extended.  It is\nresolved in the same manner as type_name.",
+        .default_value = "For numeric types, contains the original text representation of the value.\nFor booleans, \"true\" or \"false\".\nFor strings, contains the default text contents (not escaped in any way).\nFor bytes, contains the C escaped value.  All bytes >= 128 are escaped.",
+        .oneof_index = "If set, gives the index of a oneof in the containing type's oneof_decl\nlist.  This field is a member of that oneof.",
+        .json_name = "JSON name of this field. The value is set by protocol compiler. If the\nuser has set a \"json_name\" option on this field, that option's value\nwill be used. Otherwise, it's deduced from the field's name by converting\nit to camelCase.",
+        .proto3_optional = "If true, this is a proto3 \"optional\". When a proto3 field is optional, it\ntracks presence regardless of field type.\n\nWhen proto3_optional is true, this field must belong to a oneof to signal\nto old proto3 clients that presence is tracked for this field. This oneof\nis known as a \"synthetic\" oneof, and this field must be its sole member\n(each proto3 optional field gets its own synthetic oneof). Synthetic oneofs\nexist in the descriptor only, and do not generate any API. Synthetic oneofs\nmust be ordered after all \"real\" oneofs.\n\nFor message fields, proto3_optional doesn't create any semantic change,\nsince non-repeated message fields always track presence. However it still\nindicates the semantic detail of whether the user wrote \"optional\" or not.\nThis can be useful for round-tripping the .proto file. For consistency we\ngive message fields a synthetic oneof also, even though it is not required\nto track presence. This is especially important because the parser can't\ntell if a field is a message or an enum, so it must always create a\nsynthetic oneof.\n\nProto2 optional fields do not set this flag, because they already indicate\noptional with `LABEL_OPTIONAL`.",
+    };
+
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
         .number = fd(3, .{ .scalar = .int32 }),
@@ -673,12 +759,27 @@ pub const FieldDescriptorProto = struct {
         TYPE_SFIXED64 = 16,
         TYPE_SINT32 = 17,
         TYPE_SINT64 = 18,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .TYPE_DOUBLE = "0 is reserved for errors.\nOrder is weird for historical reasons.",
+            .TYPE_INT64 = "Not ZigZag encoded.  Negative numbers take 10 bytes.  Use TYPE_SINT64 if\nnegative values are likely.",
+            .TYPE_INT32 = "Not ZigZag encoded.  Negative numbers take 10 bytes.  Use TYPE_SINT32 if\nnegative values are likely.",
+            .TYPE_GROUP = "Tag-delimited aggregate.\nGroup type is deprecated and not supported after google.protobuf. However, Proto3\nimplementations should still be able to parse the group wire format and\ntreat group fields as unknown fields.  In Editions, the group wire format\ncan be enabled via the `message_encoding` feature.",
+            .TYPE_BYTES = "New in version 2.",
+        };
     };
 
     pub const Label = enum(i32) {
         LABEL_OPTIONAL = 1,
         LABEL_REPEATED = 3,
         LABEL_REQUIRED = 2,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .LABEL_OPTIONAL = "0 is reserved for errors",
+            .LABEL_REQUIRED = "The required label is only allowed in google.protobuf.  In proto3 and Editions\nit's explicitly prohibited.  In Editions, the `field_presence` feature\ncan be used to get this behavior.",
+        };
     };
 
     /// Encodes the message to the writer
@@ -748,6 +849,9 @@ pub const FieldDescriptorProto = struct {
 pub const OneofDescriptorProto = struct {
     name: ?[]const u8 = null,
     options: ?OneofOptions = null,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a oneof.";
 
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
@@ -826,6 +930,16 @@ pub const EnumDescriptorProto = struct {
     reserved_name: std.ArrayList([]const u8) = .empty,
     visibility: ?SymbolVisibility = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes an enum type.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .reserved_range = "Range of reserved numeric values. Reserved numeric values may not be used\nby enum values in the same enum declaration. Reserved ranges may not\noverlap.",
+        .reserved_name = "Reserved enum value names, which may not be reused. A given name may only\nbe reserved once.",
+        .visibility = "Support for `export` and `local` keywords on enums.",
+    };
+
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
         .value = fd(2, .{ .repeated = .submessage }),
@@ -844,6 +958,9 @@ pub const EnumDescriptorProto = struct {
     pub const EnumReservedRange = struct {
         start: ?i32 = null,
         end: ?i32 = null,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Range of reserved numeric values. Reserved values may not be used by\nentries in the same enum. Reserved ranges may not overlap.\n\nNote that this is distinct from DescriptorProto.ReservedRange in that it\nis inclusive such that it can appropriately represent the entire int32\ndomain.";
 
         pub const _desc_table = .{
             .start = fd(1, .{ .scalar = .int32 }),
@@ -982,6 +1099,9 @@ pub const EnumValueDescriptorProto = struct {
     number: ?i32 = null,
     options: ?EnumValueOptions = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a value within an enum.";
+
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
         .number = fd(2, .{ .scalar = .int32 }),
@@ -1056,6 +1176,9 @@ pub const ServiceDescriptorProto = struct {
     name: ?[]const u8 = null,
     method: std.ArrayList(MethodDescriptorProto) = .empty,
     options: ?ServiceOptions = null,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a service.";
 
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
@@ -1134,6 +1257,16 @@ pub const MethodDescriptorProto = struct {
     options: ?MethodOptions = null,
     client_streaming: ?bool = null,
     server_streaming: ?bool = null,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes a method of a service.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .input_type = "Input and output type names.  These are resolved in the same way as\nFieldDescriptorProto.type_name, but must refer to a message type.",
+        .client_streaming = "Identifies if client streams multiple client messages",
+        .server_streaming = "Identifies if server streams multiple server messages",
+    };
 
     pub const _desc_table = .{
         .name = fd(1, .{ .scalar = .string }),
@@ -1237,6 +1370,28 @@ pub const FileOptions = struct {
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .java_package = "Sets the Java package where classes generated from this .proto will be\nplaced.  By default, the proto package is used, but this is often\ninappropriate because proto packages do not normally start with backwards\ndomain names.",
+        .java_outer_classname = "Controls the name of the wrapper Java class generated for the .proto file.\nThat class will always contain the .proto file's getDescriptor() method as\nwell as any top-level extensions defined in the .proto file.\nIf java_multiple_files is disabled, then all the other classes from the\n.proto file will be nested inside the single wrapper outer class.",
+        .java_multiple_files = "If enabled, then the Java code generator will generate a separate .java\nfile for each top-level message, enum, and service defined in the .proto\nfile.  Thus, these types will *not* be nested inside the wrapper class\nnamed by java_outer_classname.  However, the wrapper class will still be\ngenerated to contain the file's getDescriptor() method as well as any\ntop-level extensions defined in the file.",
+        .java_generate_equals_and_hash = "This option does nothing.",
+        .java_string_check_utf8 = "A proto2 file can set this to true to opt in to UTF-8 checking for Java,\nwhich will throw an exception if invalid UTF-8 is parsed from the wire or\nassigned to a string field.\n\nTODO: clarify exactly what kinds of field types this option\napplies to, and update these docs accordingly.\n\nProto3 files already perform these checks. Setting the option explicitly to\nfalse has no effect: it cannot be used to opt proto3 files out of UTF-8\nchecks.",
+        .go_package = "Sets the Go package where structs generated from this .proto will be\nplaced. If omitted, the Go package will be derived from the following:\n- The basename of the package import path, if provided.\n- Otherwise, the package statement in the .proto file, if present.\n- Otherwise, the basename of the .proto file, without extension.",
+        .cc_generic_services = "Should generic services be generated in each language?  \"Generic\" services\nare not specific to any particular RPC system.  They are generated by the\nmain code generators in each language (without additional plugins).\nGeneric services were the only kind of service generation supported by\nearly versions of google.protobuf.\n\nGeneric services are now considered deprecated in favor of using plugins\nthat generate code specific to your particular RPC system.  Therefore,\nthese default to false.  Old code which depends on generic services should\nexplicitly set them to true.",
+        .deprecated = "Is this file deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor everything in the file, or it will be completely ignored; in the very\nleast, this is a formalization for deprecating files.",
+        .cc_enable_arenas = "Enables the use of arenas for the proto messages in this file. This applies\nonly to generated classes for C++.",
+        .objc_class_prefix = "Sets the objective c class prefix which is prepended to all objective c\ngenerated classes from this .proto. There is no default.",
+        .csharp_namespace = "Namespace for generated classes; defaults to the package.",
+        .swift_prefix = "By default Swift generators will take the proto package and CamelCase it\nreplacing '.' with underscore and use that to prefix the types/symbols\ndefined. When this options is provided, they will use this value instead\nto prefix the types/symbols defined.",
+        .php_class_prefix = "Sets the php class prefix which is prepended to all php generated classes\nfrom this .proto. Default is empty.",
+        .php_namespace = "Use this option to change the namespace of php generated classes. Default\nis empty. When this option is empty, the package name will be used for\ndetermining the namespace.",
+        .php_metadata_namespace = "Use this option to change the namespace of php generated metadata classes.\nDefault is empty. When this option is empty, the proto file name will be\nused for determining the namespace.",
+        .ruby_package = "Use this option to change the package of ruby generated classes. Default\nis empty. When this option is not set, the package name will be used for\ndetermining the ruby package.",
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here.\nSee the documentation for the \"Options\" section above.",
+    };
+
     pub const _desc_table = .{
         .java_package = fd(1, .{ .scalar = .string }),
         .java_outer_classname = fd(8, .{ .scalar = .string }),
@@ -1286,6 +1441,14 @@ pub const FileOptions = struct {
         SPEED = 1,
         CODE_SIZE = 2,
         LITE_RUNTIME = 3,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Generated classes can be optimized for speed or code size.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .CODE_SIZE = "etc.",
+        };
     };
 
     /// Encodes the message to the writer
@@ -1360,6 +1523,17 @@ pub const MessageOptions = struct {
     features: ?FeatureSet = null,
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .message_set_wire_format = "Set true to use the old proto1 MessageSet wire format for extensions.\nThis is provided for backwards-compatibility with the MessageSet wire\nformat.  You should not use this for any other reason:  It's less\nefficient, has fewer features, and is more complicated.\n\nThe message must be defined exactly as follows:\nmessage Foo {\noption message_set_wire_format = true;\nextensions 4 to max;\n}\nNote that the message cannot have any defined fields; MessageSets only\nhave extensions.\n\nAll extensions of your type must be singular messages; e.g. they cannot\nbe int32s, enums, or repeated messages.\n\nBecause this is an option, the above two restrictions are not enforced by\nthe protocol compiler.",
+        .no_standard_descriptor_accessor = "Disables the generation of the standard \"descriptor()\" accessor, which can\nconflict with a field of the same name.  This is meant to make migration\nfrom proto1 easier; new code should avoid fields named \"descriptor\".",
+        .deprecated = "Is this message deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor the message, or it will be completely ignored; in the very least,\nthis is a formalization for deprecating messages.",
+        .map_entry = "Whether the message is an automatically generated map entry type for the\nmaps field.\n\nFor maps fields:\nmap<KeyType, ValueType> map_field = 1;\nThe parsed descriptor looks like:\nmessage MapFieldEntry {\noption map_entry = true;\noptional KeyType key = 1;\noptional ValueType value = 2;\n}\nrepeated MapFieldEntry map_field = 1;\n\nImplementations may choose not to generate the map_entry=true message, but\nuse a native map in the target language to hold the keys and values.\nThe reflection APIs in such implementations still need to work as\nif the field is a repeated message field.\n\nNOTE: Do not set the option in .proto files. Always use the maps syntax\ninstead. The option should only be implicitly set by the proto compiler\nparser.",
+        .deprecated_legacy_json_field_conflicts = "Enable the legacy handling of JSON field name conflicts.  This lowercases\nand strips underscored from the fields before comparison in proto3 only.\nThe new behavior takes `json_name` into account and applies to proto2 as\nwell.\n\nThis should only be used as a temporary measure against broken builds due\nto the change in behavior for JSON field name conflicts.\n\nTODO This is legacy behavior we plan to remove once downstream\nteams have had time to migrate.",
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
 
     pub const _desc_table = .{
         .message_set_wire_format = fd(1, .{ .scalar = .bool }),
@@ -1466,6 +1640,20 @@ pub const FieldOptions = struct {
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .ctype = "NOTE: ctype is deprecated. Use `features.(pb.cpp).string_type` instead.\nThe ctype option instructs the C++ code generator to use a different\nrepresentation of the field than it normally would.  See the specific\noptions below.  This option is only implemented to support use of\n[ctype=CORD] and [ctype=STRING] (the default) on non-repeated fields of\ntype \"bytes\" in the open source release.\nTODO: make ctype actually deprecated.",
+        .@"packed" = "The packed option can be enabled for repeated primitive fields to enable\na more efficient representation on the wire. Rather than repeatedly\nwriting the tag and type for each element, the entire array is encoded as\na single length-delimited blob. In proto3, only explicit setting it to\nfalse will avoid using packed encoding.  This option is prohibited in\nEditions, but the `repeated_field_encoding` feature can be used to control\nthe behavior.",
+        .jstype = "The jstype option determines the JavaScript type used for values of the\nfield.  The option is permitted only for 64 bit integral and fixed types\n(int64, uint64, sint64, fixed64, sfixed64).  A field with jstype JS_STRING\nis represented as JavaScript string, which avoids loss of precision that\ncan happen when a large value is converted to a floating point JavaScript.\nSpecifying JS_NUMBER for the jstype causes the generated JavaScript code to\nuse the JavaScript \"number\" type.  The behavior of the default option\nJS_NORMAL is implementation dependent.\n\nThis option is an enum to permit additional types to be added, e.g.\ngoog.math.Integer.",
+        .lazy = "Should this field be parsed lazily?  Lazy applies only to message-type\nfields.  It means that when the outer message is initially parsed, the\ninner message's contents will not be parsed but instead stored in encoded\nform.  The inner message will actually be parsed when it is first accessed.\n\nThis is only a hint.  Implementations are free to choose whether to use\neager or lazy parsing regardless of the value of this option.  However,\nsetting this option true suggests that the protocol author believes that\nusing lazy parsing on this field is worth the additional bookkeeping\noverhead typically needed to implement it.\n\nThis option does not affect the public interface of any generated code;\nall method signatures remain the same.  Furthermore, thread-safety of the\ninterface is not affected by this option; const methods remain safe to\ncall from multiple threads concurrently, while non-const methods continue\nto require exclusive access.\n\nNote that lazy message fields are still eagerly verified to check\nill-formed wireformat or missing required fields. Calling IsInitialized()\non the outer message would fail if the inner message has missing required\nfields. Failed verification would result in parsing failure (except when\nuninitialized messages are acceptable).",
+        .unverified_lazy = "unverified_lazy does no correctness checks on the byte stream. This should\nonly be used where lazy with verification is prohibitive for performance\nreasons.",
+        .deprecated = "Is this field deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor accessors, or it will be completely ignored; in the very least, this\nis a formalization for deprecating fields.",
+        .weak = "DEPRECATED. DO NOT USE!\nFor Google-internal migration only. Do not use.",
+        .debug_redact = "Indicate that the field value should not be printed out when using debug\nformats, e.g. when the field contains sensitive credentials.",
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
+
     pub const _desc_table = .{
         .ctype = fd(1, .@"enum"),
         .@"packed" = fd(2, .{ .scalar = .bool }),
@@ -1506,12 +1694,25 @@ pub const FieldOptions = struct {
         STRING = 0,
         CORD = 1,
         STRING_PIECE = 2,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .STRING = "Default mode.",
+            .CORD = "The option [ctype=CORD] may be applied to a non-repeated field of type\n\"bytes\". It indicates that in C++, the data should be stored in a Cord\ninstead of a string.  For very large strings, this may reduce memory\nfragmentation. It may also allow better performance when parsing from a\nCord, or when parsing with aliasing enabled, as the parsed Cord may then\nalias the original buffer.",
+        };
     };
 
     pub const JSType = enum(i32) {
         JS_NORMAL = 0,
         JS_STRING = 1,
         JS_NUMBER = 2,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .JS_NORMAL = "Use the default type.",
+            .JS_STRING = "Use JavaScript strings.",
+            .JS_NUMBER = "Use JavaScript numbers.",
+        };
     };
 
     /// If set to RETENTION_SOURCE, the option will be omitted from the binary.
@@ -1519,6 +1720,9 @@ pub const FieldOptions = struct {
         RETENTION_UNKNOWN = 0,
         RETENTION_RUNTIME = 1,
         RETENTION_SOURCE = 2,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "If set to RETENTION_SOURCE, the option will be omitted from the binary.";
     };
 
     /// This indicates the types of entities that the field may apply to when used
@@ -1535,6 +1739,9 @@ pub const FieldOptions = struct {
         TARGET_TYPE_ENUM_ENTRY = 7,
         TARGET_TYPE_SERVICE = 8,
         TARGET_TYPE_METHOD = 9,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "This indicates the types of entities that the field may apply to when used\nas an option. If it is unset, then the field may be freely used as an\noption on any kind of entity.";
     };
 
     pub const EditionDefault = struct {
@@ -1616,6 +1823,18 @@ pub const FieldOptions = struct {
         deprecation_warning: ?[]const u8 = null,
         edition_removed: ?Edition = null,
         removal_error: ?[]const u8 = null,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Information about the support window of a feature.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .edition_introduced = "The edition that this feature was first available in.  In editions\nearlier than this one, the default assigned to EDITION_LEGACY will be\nused, and proto files will not be able to override it.",
+            .edition_deprecated = "The edition this feature becomes deprecated in.  Using this after this\nedition may trigger warnings.",
+            .deprecation_warning = "The deprecation warning text if this feature is used after the edition it\nwas marked deprecated in.",
+            .edition_removed = "The edition this feature is no longer available in.  In editions after\nthis one, the last default assigned will be used, and proto files will\nnot be able to override it.",
+            .removal_error = "The removal error text if this feature is used after the edition it was\nremoved in.",
+        };
 
         pub const _desc_table = .{
             .edition_introduced = fd(1, .@"enum"),
@@ -1756,6 +1975,12 @@ pub const OneofOptions = struct {
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
+
     pub const _desc_table = .{
         .features = fd(1, .submessage),
         .uninterpreted_option = fd(999, .{ .repeated = .submessage }),
@@ -1839,6 +2064,15 @@ pub const EnumOptions = struct {
     features: ?FeatureSet = null,
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .allow_alias = "Set this option to true to allow mapping different tag names to the same\nvalue.",
+        .deprecated = "Is this enum deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor the enum, or it will be completely ignored; in the very least, this\nis a formalization for deprecating enums.",
+        .deprecated_legacy_json_field_conflicts = "Enable the legacy handling of JSON field name conflicts.  This lowercases\nand strips underscored from the fields before comparison in proto3 only.\nThe new behavior takes `json_name` into account and applies to proto2 as\nwell.\nTODO Remove this legacy behavior once downstream teams have\nhad time to migrate.",
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
 
     pub const _desc_table = .{
         .allow_alias = fd(2, .{ .scalar = .bool }),
@@ -1932,6 +2166,15 @@ pub const EnumValueOptions = struct {
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .deprecated = "Is this enum value deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor the enum value, or it will be completely ignored; in the very least,\nthis is a formalization for deprecating enum values.",
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .debug_redact = "Indicate that fields annotated with this enum value should not be printed\nout when using debug formats, e.g. when the field contains sensitive\ncredentials.",
+        .feature_support = "Information about the support window of a feature value.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
+
     pub const _desc_table = .{
         .deprecated = fd(1, .{ .scalar = .bool }),
         .features = fd(2, .submessage),
@@ -2023,6 +2266,13 @@ pub const ServiceOptions = struct {
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .deprecated = "Is this service deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor the service, or it will be completely ignored; in the very least,\nthis is a formalization for deprecating services.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
+
     pub const _desc_table = .{
         .features = fd(34, .submessage),
         .deprecated = fd(33, .{ .scalar = .bool }),
@@ -2112,6 +2362,13 @@ pub const MethodOptions = struct {
     uninterpreted_option: std.ArrayList(UninterpretedOption) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .deprecated = "Is this method deprecated?\nDepending on the target platform, this can emit Deprecated annotations\nfor the method, or it will be completely ignored; in the very least,\nthis is a formalization for deprecating methods.",
+        .features = "Any features defined in the specific edition.\nWARNING: This field should only be used by protobuf plugins or special\ncases like the proto compiler. Other uses are discouraged and\ndevelopers should rely on the protoreflect APIs for their client language.",
+        .uninterpreted_option = "The parser stores options it doesn't recognize here. See above.",
+    };
+
     pub const _desc_table = .{
         .deprecated = fd(33, .{ .scalar = .bool }),
         .idempotency_level = fd(34, .@"enum"),
@@ -2140,6 +2397,9 @@ pub const MethodOptions = struct {
         IDEMPOTENCY_UNKNOWN = 0,
         NO_SIDE_EFFECTS = 1,
         IDEMPOTENT = 2,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Is this method side-effect-free (or safe in HTTP parlance), or idempotent,\nor neither? HTTP based RPC implementation may choose GET verb for safe\nmethods, and PUT verb for idempotent methods instead of the default POST.";
     };
 
     /// Encodes the message to the writer
@@ -2220,6 +2480,14 @@ pub const UninterpretedOption = struct {
     string_value: ?[]const u8 = null,
     aggregate_value: ?[]const u8 = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "A message representing a option the parser does not recognize. This only\nappears in options protos created by the compiler::Parser class.\nDescriptorPool resolves these when building Descriptor objects. Therefore,\noptions protos in descriptor objects (e.g. returned by Descriptor::options(),\nor produced by Descriptor::CopyTo()) will never have UninterpretedOptions\nin them.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .identifier_value = "The value of the uninterpreted option, in whatever type the tokenizer\nidentified it as during parsing. Exactly one of these should be set.",
+    };
+
     pub const _desc_table = .{
         .name = fd(2, .{ .repeated = .submessage }),
         .identifier_value = fd(3, .{ .scalar = .string }),
@@ -2238,6 +2506,9 @@ pub const UninterpretedOption = struct {
     pub const NamePart = struct {
         name_part: []const u8,
         is_extension: bool,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "The name of the uninterpreted option.  Each string represents a segment in\na dot-separated name.  is_extension is true iff a segment represents an\nextension (denoted with parentheses in options specs in .proto files).\nE.g.,{ [\"foo\", false], [\"bar.baz\", true], [\"moo\", false] } represents\n\"foo.(bar.baz).moo\".";
 
         pub const _desc_table = .{
             .name_part = fdf(1, .{ .scalar = .string }, .{ .legacy_required = true }),
@@ -2388,6 +2659,9 @@ pub const FeatureSet = struct {
     enforce_proto_limits: ?FeatureSet.ProtoLimitsFeature.EnforceProtoLimits = null,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "TODO Enums in C++ gencode (and potentially other languages) are\nnot well scoped.  This means that each of the feature enums below can clash\nwith each other.  The short names we've chosen maximize call-site\nreadability, but leave us very open to this scenario.  A future feature will\nbe designed and implemented to handle this, hopefully before we ever hit a\nconflict here.";
+
     pub const _desc_table = .{
         .field_presence = fd(1, .@"enum"),
         .enum_type = fd(2, .@"enum"),
@@ -2462,6 +2736,14 @@ pub const FeatureSet = struct {
             EXPORT_TOP_LEVEL = 2,
             LOCAL_ALL = 3,
             STRICT = 4,
+
+            /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+            pub const _value_docs = .{
+                .EXPORT_ALL = "Default pre-EDITION_2024, all UNSET visibility are export.",
+                .EXPORT_TOP_LEVEL = "All top-level symbols default to export, nested default to local.",
+                .LOCAL_ALL = "All symbols default to local.",
+                .STRICT = "All symbols local by default. Nested types cannot be exported.\nWith special case caveat for message { enum {} reserved 1 to max; }\nThis is the recommended setting for new protos.",
+            };
         };
 
         /// Encodes the message to the writer
@@ -2534,6 +2816,12 @@ pub const FeatureSet = struct {
             PROTO_LIMITS_UNKNOWN = 0,
             LEGACY_NO_EXPLICIT_LIMITS = 1,
             PROTO_LIMITS2026 = 2,
+
+            /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+            pub const _value_docs = .{
+                .LEGACY_NO_EXPLICIT_LIMITS = "Default pre-EDITION_2026: there are no limit enforcement at the protoc\nlevel. Practical limits still exist, but they will tend to fail while\ncompiling protoc-generated code, and these limits tend to be language\nor toolchain specific.",
+                .PROTO_LIMITS2026 = "A set of limits enforced by Edition 2026 by default. For a detailed\nlist of all the limits please consult the Edition 2026 documentation.",
+            };
         };
 
         /// Encodes the message to the writer
@@ -2671,6 +2959,15 @@ pub const FeatureSetDefaults = struct {
     minimum_edition: ?Edition = null,
     maximum_edition: ?Edition = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "A compiled specification for the defaults of a set of features.  These\nmessages are generated from FeatureSet extensions and can be used to seed\nfeature resolution. The resolution with this object becomes a simple search\nfor the closest matching edition, followed by proto merges.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .minimum_edition = "The minimum supported edition (inclusive) when this was constructed.\nEditions before this will not have defaults.",
+        .maximum_edition = "The maximum known edition (inclusive) when this was constructed. Editions\nafter this will not have reliable defaults.",
+    };
+
     pub const _desc_table = .{
         .defaults = fd(1, .{ .repeated = .submessage }),
         .minimum_edition = fd(4, .@"enum"),
@@ -2685,6 +2982,15 @@ pub const FeatureSetDefaults = struct {
         edition: ?Edition = null,
         overridable_features: ?FeatureSet = null,
         fixed_features: ?FeatureSet = null,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A map from every known edition with a unique set of defaults to its\ndefaults. Not all editions may be contained here.  For a given edition,\nthe defaults at the closest matching edition ordered at or before it should\nbe used.  This field must be in strict ascending order by edition.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .overridable_features = "Defaults of features that can be overridden in this edition.",
+            .fixed_features = "Defaults of features that can't be overridden in this edition.",
+        };
 
         pub const _desc_table = .{
             .edition = fd(3, .@"enum"),
@@ -2824,6 +3130,14 @@ pub const SourceCodeInfo = struct {
     location: std.ArrayList(SourceCodeInfo.Location) = .empty,
     _extensions: protobuf.ExtensionSet = .empty,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Encapsulates information about the original source file from which a\nFileDescriptorProto was generated.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .location = "A Location identifies a piece of source code in a .proto file which\ncorresponds to a particular definition.  This information is intended\nto be useful to IDEs, code indexers, documentation generators, and similar\ntools.\n\nFor example, say we have a file like:\nmessage Foo {\noptional string foo = 1;\n}\nLet's look at just the field definition:\noptional string foo = 1;\n^       ^^     ^^  ^  ^^^\na       bc     de  f  ghi\nWe have the following locations:\nspan   path               represents\n[a,i)  [ 4, 0, 2, 0 ]     The whole field definition.\n[a,b)  [ 4, 0, 2, 0, 4 ]  The label (optional).\n[c,d)  [ 4, 0, 2, 0, 5 ]  The type (string).\n[e,f)  [ 4, 0, 2, 0, 1 ]  The name (foo).\n[g,h)  [ 4, 0, 2, 0, 3 ]  The number (1).\n\nNotes:\n- A location may refer to a repeated field itself (i.e. not to any\nparticular index within it).  This is used whenever a set of elements are\nlogically enclosed in a single code segment.  For example, an entire\nextend block (possibly containing multiple extension definitions) will\nhave an outer location whose path refers to the \"extensions\" repeated\nfield without an index.\n- Multiple locations may have the same path.  This happens when a single\nlogical declaration is spread out across multiple places.  The most\nobvious example is the \"extend\" block again -- there may be multiple\nextend blocks in the same scope, each of which will have the same path.\n- A location's span is not always a subset of its parent's span.  For\nexample, the \"extendee\" of an extension declaration appears at the\nbeginning of the \"extend\" block and is shared by all extensions within\nthe block.\n- Just because a location's span is a subset of some other location's span\ndoes not mean that it is a descendant.  For example, a \"group\" defines\nboth a type and a field in a single declaration.  Thus, the locations\ncorresponding to the type and field and their components will overlap.\n- Code which tries to interpret locations should probably be designed to\nignore those that it doesn't understand, as more types of locations could\nbe recorded in the future.",
+    };
+
     pub const _desc_table = .{
         .location = fd(1, .{ .repeated = .submessage }),
     };
@@ -2841,6 +3155,13 @@ pub const SourceCodeInfo = struct {
         leading_comments: ?[]const u8 = null,
         trailing_comments: ?[]const u8 = null,
         leading_detached_comments: std.ArrayList([]const u8) = .empty,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .path = "Identifies which part of the FileDescriptorProto was defined at this\nlocation.\n\nEach element is a field number or an index.  They form a path from\nthe root FileDescriptorProto to the place where the definition appears.\nFor example, this path:\n[ 4, 3, 2, 7, 1 ]\nrefers to:\nfile.message_type(3)  // 4, 3\n.field(7)         // 2, 7\n.name()           // 1\nThis is because FileDescriptorProto.message_type has field number 4:\nrepeated DescriptorProto message_type = 4;\nand DescriptorProto.field has field number 2:\nrepeated FieldDescriptorProto field = 2;\nand FieldDescriptorProto.name has field number 1:\noptional string name = 1;\n\nThus, the above path gives the location of a field name.  If we removed\nthe last element:\n[ 4, 3, 2, 7 ]\nthis path refers to the whole field declaration (from the beginning\nof the label to the terminating semicolon).\n\nFor options, the path refers to the interpreted option in the descriptor.\nE.g., for a custom option `(my_opt) = \"foo\"` on a message using extension\nnumber 10101, the path is:\n[ 4, 3, 7, 10101 ]\nrefers to:\nfile.message_type(3)     // 4, 3\n.options()           // 7\n.my_opt()            // 10101\n\nSub-locations corresponding to the interpreted option's corresponding\n`UninterpretedOption` are also appended to the interpreted option, which\ndeviates from the actual FileDescriptorProto path. E.g.:\n[ 4, 3, 7, 10101, 2 ]\nrefers to the option name `(my_opt)`, and:\n[ 4, 3, 7, 10101, 7 ]\nrefers to the \"foo\" string value of the option.",
+            .span = "Always has exactly three or four elements: start line, start column,\nend line (optional, otherwise assumed same as start line), end column.\nThese are packed into a single field for efficiency.  Note that line\nand column numbers are zero-based -- typically you will want to add\n1 to each before displaying to a user.",
+            .leading_comments = "If this SourceCodeInfo represents a complete declaration, these are any\ncomments appearing before and after the declaration which appear to be\nattached to the declaration.\n\nA series of line comments appearing on consecutive lines, with no other\ntokens appearing on those lines, will be treated as a single comment.\n\nleading_detached_comments will keep paragraphs of comments that appear\nbefore (but not connected to) the current element. Each paragraph,\nseparated by empty lines, will be one comment element in the repeated\nfield.\n\nOnly the comment content is provided; comment markers (e.g. //) are\nstripped out.  For block comments, leading whitespace and an asterisk\nwill be stripped from the beginning of each line other than the first.\nNewlines are included in the output.\n\nExamples:\n\noptional int32 foo = 1;  // Comment attached to foo.\nComment attached to bar.\noptional int32 bar = 2;\n\noptional string baz = 3;\nComment attached to baz.\nAnother line attached to baz.\n\nComment attached to moo.\n\nAnother line attached to moo.\noptional double moo = 4;\n\nDetached comment for corge. This is not leading or trailing comments\nto moo or corge because there are blank lines separating it from\nboth.\n\nDetached comment for corge paragraph 2.\n\noptional string corge = 5;\n* Block comment attached\n* to corge.  Leading asterisks\n* will be removed. */\n* Block comment attached to\n* grault. */\noptional int32 grault = 6;\n\nignored detached comments.",
+        };
 
         pub const _desc_table = .{
             .path = fd(1, .{ .packed_repeated = .{ .scalar = .int32 } }),
@@ -2982,6 +3303,14 @@ pub const SourceCodeInfo = struct {
 pub const GeneratedCodeInfo = struct {
     annotation: std.ArrayList(GeneratedCodeInfo.Annotation) = .empty,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Describes the relationship between generated code and its original source\nfile. A GeneratedCodeInfo message is associated with only one generated\nsource file, but may contain references to different source .proto files.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .annotation = "An Annotation connects some span of text in generated code to an element\nof its generating .proto file.",
+    };
+
     pub const _desc_table = .{
         .annotation = fd(1, .{ .repeated = .submessage }),
     };
@@ -2992,6 +3321,14 @@ pub const GeneratedCodeInfo = struct {
         begin: ?i32 = null,
         end: ?i32 = null,
         semantic: ?GeneratedCodeInfo.Annotation.Semantic = null,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .path = "Identifies the element in the original source .proto file. This field\nis formatted the same as SourceCodeInfo.Location.path.",
+            .source_file = "Identifies the filesystem path to the original source .proto.",
+            .begin = "Identifies the starting offset in bytes in the generated code\nthat relates to the identified object.",
+            .end = "Identifies the ending offset in bytes in the generated code that\nrelates to the identified object. The end offset should be one past\nthe last relevant byte (so the length of the text = end - begin).",
+        };
 
         pub const _desc_table = .{
             .path = fd(1, .{ .packed_repeated = .{ .scalar = .int32 } }),
@@ -3007,6 +3344,16 @@ pub const GeneratedCodeInfo = struct {
             NONE = 0,
             SET = 1,
             ALIAS = 2,
+
+            /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+            pub const _doc = "Represents the identified object's effect on the element in the original\n.proto file.";
+
+            /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+            pub const _value_docs = .{
+                .NONE = "There is no effect or the effect is indescribable.",
+                .SET = "The element is set or otherwise mutated.",
+                .ALIAS = "An alias to the element is returned.",
+            };
         };
 
         /// Encodes the message to the writer
@@ -3136,3 +3483,25 @@ pub const GeneratedCodeInfo = struct {
 };
 
 pub const Timestamp = protobuf.wkt.Timestamp;
+
+pub const Duration = protobuf.wkt.Duration;
+
+pub const Empty = protobuf.wkt.Empty;
+
+pub const DoubleValue = protobuf.wkt.DoubleValue;
+
+pub const FloatValue = protobuf.wkt.FloatValue;
+
+pub const Int64Value = protobuf.wkt.Int64Value;
+
+pub const UInt64Value = protobuf.wkt.UInt64Value;
+
+pub const Int32Value = protobuf.wkt.Int32Value;
+
+pub const UInt32Value = protobuf.wkt.UInt32Value;
+
+pub const BoolValue = protobuf.wkt.BoolValue;
+
+pub const StringValue = protobuf.wkt.StringValue;
+
+pub const BytesValue = protobuf.wkt.BytesValue;

@@ -1,0 +1,88 @@
+// Anole's OpenAPI test service: the proto forms the document maps (field
+// behavior, comments, deprecated, oneof, maps, well-known types) and the
+// method forms (Connect, transcoded, streaming).
+syntax = "proto3";
+
+package openapitest;
+
+import "google/api/annotations.proto";
+import "google/api/field_behavior.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// Paint colours.
+enum Color {
+  // Not set.
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  GREEN = 2;
+}
+
+// A widget.
+message Widget {
+  // The widget's resource name.
+  string name = 1 [(google.api.field_behavior) = REQUIRED];
+  string etag = 2 [(google.api.field_behavior) = OUTPUT_ONLY];
+  string secret = 3 [(google.api.field_behavior) = INPUT_ONLY];
+  string old = 4 [deprecated = true];
+  int32 count = 5;
+  uint32 ucount = 6;
+  int64 big = 7;
+  uint64 ubig = 8;
+  double ratio = 9;
+  bytes blob = 10;
+  bool on = 11;
+  Color color = 12;
+  repeated string labels = 13;
+  map<string, int32> scores = 14;
+  google.protobuf.Timestamp created = 15;
+  google.protobuf.Duration ttl = 16;
+  google.protobuf.StringValue nick = 17;
+  oneof pick {
+    string a = 18;
+    int32 b = 19;
+  }
+  optional int32 maybe = 20;
+}
+
+message GetWidgetRequest {
+  string name = 1;
+}
+
+message ListWidgetsRequest {
+  int32 page_size = 1;
+  repeated string filter = 2;
+}
+
+message ListWidgetsResponse {
+  repeated Widget widgets = 1;
+}
+
+// Widgets of the shop.
+service Widgets {
+  // Gets a widget.
+  //
+  // It must exist.
+  rpc GetWidget(GetWidgetRequest) returns (Widget) {
+    option (google.api.http) = {
+      get: "/v1/{name=widgets/*}"
+    };
+  }
+  rpc ListWidgets(ListWidgetsRequest) returns (ListWidgetsResponse) {
+    option (google.api.http) = {
+      get: "/v1/widgets"
+    };
+  }
+  rpc Peek(GetWidgetRequest) returns (Widget) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc Make(Widget) returns (Widget);
+  rpc Watch(GetWidgetRequest) returns (stream Widget) {
+    option (google.api.http) = {
+      get: "/v1/watch/{name}"
+    };
+  }
+  rpc Upload(stream Widget) returns (google.protobuf.Empty);
+}
