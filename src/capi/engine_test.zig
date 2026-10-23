@@ -1418,7 +1418,7 @@ const WsDecider = struct {
                 const r: *const abi.RequestEvent = @ptrCast(@alignCast(rec.ptr));
                 const query = str(rec, r.query);
                 if (std.mem.eql(u8, query, "accept") or r.route_id == 12) {
-                    const ws = try engine.wsAccept(e, h, "b", &.{.{ .name = .of("Set-Cookie"), .value = .of("s=1") }});
+                    const ws = try engine.wsAccept(e, h, if (r.route_id == 12) "" else "b", &.{.{ .name = .of("Set-Cookie"), .value = .of("s=1") }});
                     // Queued before the handshake's answer is out: it must
                     // arrive first, and the request handle is stale.
                     _ = try engine.ws.send(e, ws, abi.WS_TEXT, "first", false);
