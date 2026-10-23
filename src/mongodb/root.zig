@@ -79,5 +79,6 @@ test {
     _ = @import("dynamic.zig");
     _ = @import("change_stream.zig");
     _ = @import("fake_test.zig");
+    _ = @import("fake_cs.zig");
     _ = @import("live_test.zig");
 }

@@ -172,3 +172,57 @@ test "watch: init refuses what cannot work" {
         .to = &.{.{ .sse = .{ .topics = &topics, .topic = "{nope" } }},
     }));
 }
+
+test "watch mongo: history lost -> a gap, then the stream reopens from now" {
+    if (comptime !@import("build_options").mongodb) return error.SkipZigTest;
+    const zio = @import("zio");
+    const fake_cs = @import("../mongodb/fake_cs.zig");
+    const mongodb = @import("../mongodb/root.zig");
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const rio = rt.io();
+    var fake: fake_cs.Fake = undefined;
+    try fake.init(rio, &.{
+        .{ .batch = .{ .ids = &.{1}, .pbrt = "p1" } },
+        .{ .fail = .{ .code = 286, .name = "ChangeStreamHistoryLost" } },
+        .{ .batch = .{ .ids = &.{2} } },
+    });
+    defer fake.deinit(rio);
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
+    const client = try mongodb.Client.init(gpa, rio, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+    defer client.deinit();
+
+    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true, .replay = null });
+    defer topics.deinit();
+    var out: sse.out_mod.Fake = .init(gpa, rio);
+    defer out.deinit();
+    const w = try Watch.init(gpa, rio, .{ .mongodb = .{
+        .client = client,
+        .collection = "users",
+        .max_await = .fromMilliseconds(20),
+    } }, .{
+        .to = &.{.{ .sse = .{ .topics = &topics, .topic = "users" } }},
+        .reconnect = .{ .base = .fromMilliseconds(5), .max = .fromMilliseconds(20) },
+    });
+    defer w.deinit();
+    const sub = try topics._attach(rio, out.out(), .{ .topics = &.{"users"} }, null);
+    try w.start(null, null, null);
+    defer sse.Topics._gone(sub);
+    defer w.stop();
+
+    while (true) {
+        out.mutex.lockUncancelable(rio);
+        const have = std.mem.indexOf(u8, out.bytes.items, "event: gap") != null and std.mem.indexOf(u8, out.bytes.items, "\"x\":20") != null;
+        out.mutex.unlock(rio);
+        if (have) break;
+        try rio.sleep(.fromMilliseconds(2), .awake);
+    }
+    // Aggregate, getMore (history lost), aggregate again: from now.
+    try std.testing.expect(fake.commandCount(rio) >= 3);
+    const again = fake.command(rio, 2);
+    var it = again.get("pipeline").?.array.iterator();
+    const stage = it.next().?.document.get("$changeStream").?.document;
+    try std.testing.expect(stage.get("resumeAfter") == null);
+    try std.testing.expect(stage.get("startAfter") == null);
+}
