@@ -1254,6 +1254,8 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "cli_options", .module = opts.createModule() },
                         .{ .name = "templates", .module = tmpl },
+                        // The startup banner (src/banner.zig, std only).
+                        .{ .name = "banner", .module = bb.createModule(.{ .root_source_file = bb.path("src/banner.zig") }) },
                     },
                 });
             }
