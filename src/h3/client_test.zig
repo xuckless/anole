@@ -1461,6 +1461,8 @@ test "h3 server: a ClientHello resent before the client acted on our Retry gets 
     // connection, the one the client's token led to.
     try std.testing.expect(f.ep.stats.retries.load(.monotonic) >= 2);
     try std.testing.expectEqual(@as(u64, 1), f.ep.stats.accepted.load(.monotonic));
+    // The console's gauge: the one connection, still open.
+    try std.testing.expectEqual(@as(u64, 1), f.ep.stats.connections_open.load(.monotonic));
 }
 
 test "h3 server: a NAT rebinding during the handshake: the server follows the client to its new port" {

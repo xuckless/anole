@@ -308,6 +308,8 @@ pub const Stats = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Connections accepted.
     accepted: std.atomic.Value(u64) = .init(0),
+    /// Connections accepted and not yet freed (a gauge; the console's /h3).
+    connections_open: std.atomic.Value(u64) = .init(0),
     /// Retry packets sent: to validate an address (`validate_address`),
     /// for a ClientHello whose start was missing, and again to a client
     /// that has not yet acted on one (`Endpoint.retried`).
@@ -1274,6 +1276,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             conn.driven = true;
             self.queue(conn);
             _ = self.stats.accepted.fetchAdd(1, .monotonic);
+            _ = self.stats.connections_open.fetchAdd(1, .monotonic);
         }
 
         /// Frees a connection `accept` will not keep. Its first packet may
@@ -1531,6 +1534,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Frees everything. Nothing may reach the connection anymore.
             fn destroy(conn: *Conn) void {
                 const gpa = conn.ep.gpa;
+                if (conn.driven) _ = conn.ep.stats.connections_open.fetchSub(1, .monotonic);
                 for (conn.hq_streams.values()) |hs| hs.free(gpa);
                 conn.hq_streams.deinit(gpa);
                 gauges.add(conn.ep.io, .h3_streams, -@as(i64, @intCast(conn.streams.count())));
