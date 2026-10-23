@@ -111,9 +111,9 @@ p.lead { color: var(--muted); margin: 0 0 20px; max-width: 760px; }
 .users { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 112px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .card h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-.card canvas { width: 100%; height: 160px; }
+.plot { position: relative; height: 160px; width: 100%; }
 .lines { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
-.lines canvas { width: 100%; height: 230px; }
+.lines .plot { height: 230px; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 600; font-size: 13px; }
@@ -209,7 +209,7 @@ function build() {
   for (const m of METRICS) {
     const card = document.createElement("div");
     card.className = "panel card";
-    card.innerHTML = `<h3>${m.label}${m.unit ? " (" + m.unit + ")" : ""}</h3><canvas></canvas>`;
+    card.innerHTML = `<h3>${m.label}${m.unit ? " (" + m.unit + ")" : ""}</h3><div class="plot"><canvas></canvas></div>`;
     bars.appendChild(card);
     const bar = new Chart(card.querySelector("canvas"), {
       type: "bar",
@@ -222,7 +222,7 @@ function build() {
 
     const lc = document.createElement("div");
     lc.className = "panel card";
-    lc.innerHTML = `<h3>${m.label}${m.unit ? " (" + m.unit + ")" : ""} vs users</h3><canvas></canvas>`;
+    lc.innerHTML = `<h3>${m.label}${m.unit ? " (" + m.unit + ")" : ""} vs users</h3><div class="plot"><canvas></canvas></div>`;
     lines.appendChild(lc);
     const line = new Chart(lc.querySelector("canvas"), {
       type: "line",
