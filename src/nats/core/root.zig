@@ -91,6 +91,9 @@ pub const Error = error{
     UnsupportedFeature,
     /// The server broke the protocol, or reports that this client did.
     ProtocolError,
+    /// The socket or the TLS layer failed in a way std.Io has no error
+    /// for (the log says how).
+    TransportFailed,
     /// The `std.Io` cannot run the client's tasks.
     ConcurrencyUnavailable,
     OutOfMemory,

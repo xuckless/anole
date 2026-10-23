@@ -309,14 +309,15 @@ pub fn tryPut(q: *Outbound, io: Io, kind: Kind, len: usize, encode: anytype, arg
     return if (q.mode == .live and q.queued > q.limit / 2) .busy else .ok;
 }
 
-/// Whether a publish now would be taken: room in a live queue, or in the
-/// reconnect buffer.
+/// Whether a publish now would be taken and not be `.busy`: a live queue
+/// at most half full (as `tryPut` judges it, so a limit of 1 has room when
+/// empty), or room in the reconnect buffer.
 pub fn hasRoom(q: *Outbound, io: Io) bool {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
     return switch (q.mode) {
         .closed => false,
-        .live => q.queued < q.limit / 2 and q.room_line.first == null,
+        .live => q.queued <= q.limit / 2 and q.room_line.first == null,
         .buffering => q.buffer_limit -| q.buffered -| q.reserved > record_cost,
     };
 }

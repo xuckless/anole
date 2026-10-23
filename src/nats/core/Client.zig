@@ -1272,7 +1272,7 @@ const one_server: []const []const u8 = &.{"nats://127.0.0.1:4222"};
 
 test "init refuses bad options" {
     try testing.expectError(error.InvalidOptions, Client.init(testing.allocator, testing.io, .{ .servers = &.{} }));
-    try testing.expectError(error.InvalidOptions, Client.init(testing.allocator, testing.io, .{ .servers = &.{"tls://a"} }));
+    try testing.expectError(error.InvalidOptions, Client.init(testing.allocator, testing.io, .{ .servers = &.{"ws://a"} }));
 }
 
 test "before connect the client has no server" {
