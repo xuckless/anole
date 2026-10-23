@@ -12,7 +12,6 @@
 //! builds of the core used to the current ones (`anole`, `access`,
 //! `anole_h2`) and passes everything else through.
 const std = @import("std");
-const builtin = @import("builtin");
 const anole_log = @import("anole_log");
 
 pub const std_options: std.Options = .{

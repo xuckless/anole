@@ -845,6 +845,36 @@ fn hexValue(digit: u8) u8 {
 /// Answered 500.
 pub const MisuseError = error{ BodyReaderTaken, BodyAlreadySet, BodyWriterOpen, HeadersAlreadySent };
 
+/// One problem found in a request: a body, query or header field that does
+/// not fit or breaks a rule. `req.bind`, `req.bindQuery` and `req.invalid`
+/// record them; the 422 answer lists them.
+pub const Violation = struct {
+    pub const Source = enum { body, query, header };
+    in: Source = .body,
+    /// Dotted path by outside names (`items[2].name`); the canonical name
+    /// for headers; null for the root value.
+    field: ?[]const u8 = null,
+    code: []const u8,
+    message: []const u8,
+};
+
+/// The violations of one request (at most 100 are kept).
+pub const Violations = struct { items: []const Violation = &.{}, truncated: bool = false };
+
+/// An RFC 9457 problem document (`res.problem`).
+pub const Problem = struct {
+    status: Status = .unprocessable_entity,
+    type: []const u8 = "about:blank",
+    /// Null: the status's reason phrase.
+    title: ?[]const u8 = null,
+    /// Null: a count of `errors` when there are any ("2 fields are invalid."), else left out.
+    detail: ?[]const u8 = null,
+    instance: ?[]const u8 = null,
+    errors: []const Violation = &.{},
+    /// More violations existed than `errors` holds (changes the default detail).
+    truncated: bool = false,
+};
+
 pub const ContentType = enum(u32) {
     text,
     html,
@@ -887,6 +917,8 @@ pub const ContentType = enum(u32) {
     event_stream,
     form,
     multipart_form,
+    /// `application/problem+json` (RFC 9457), `res.problem`.
+    problem_json,
     unknown,
 
     /// The type a `Content-Type` value names, parameters ignored.
@@ -1053,6 +1085,7 @@ pub const ContentType = enum(u32) {
             .event_stream => "text/event-stream",
             .form => "application/x-www-form-urlencoded",
             .multipart_form => "multipart/form-data",
+            .problem_json => "application/problem+json",
             .unknown => "application/octet-stream",
         };
     }
