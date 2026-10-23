@@ -262,32 +262,13 @@ pub const Stats = struct {
 /// What the installed hook records into. Set by `Console.start`.
 pub var global: ?*Stats = null;
 
-const Later = struct {
-    finisher: dusty.Detached.Finisher = .{ .func = run },
-    start_ns: u64,
-
-    fn run(f: *dusty.Detached.Finisher, req: *dusty.Request, res: *dusty.Response, result: anyerror!void) void {
-        const later: *Later = @alignCast(@fieldParentPtr("finisher", f));
-        finish(req, res, result, later.start_ns);
-    }
-};
-
-/// `dusty.hooks.request_end`.
+/// `dusty.hooks.request_end`: when the answer is known (a detached
+/// response's at its finish). `start_ns` is non-zero only while a console
+/// collects; with 0 the answer may be a 5xx (the core calls nothing else
+/// while nobody collects).
 pub fn requestEnd(req: *dusty.Request, res: *dusty.Response, err: ?anyerror, start_ns: u64) void {
-    const result: anyerror!void = if (err) |e| e else {};
-    if (res.isDetached()) {
-        // The answer is not known yet: record it when the response finishes
-        // (one arena allocation, only when collecting or for the 5xx ring).
-        const later = req.arena.create(Later) catch return;
-        later.* = .{ .start_ns = start_ns };
-        res.onFinish(&later.finisher);
-        return;
-    }
-    finish(req, res, result, start_ns);
-}
-
-fn finish(req: *dusty.Request, res: *dusty.Response, result: anyerror!void, start_ns: u64) void {
     const st = global orelse return;
+    const result: anyerror!void = if (err) |e| e else {};
     const status = observe_common.statusOf(req, res, result);
     const dur: u64 = if (start_ns != 0) dusty.hooks.now(req.io) -% start_ns else 0;
     if (status >= 500) {
