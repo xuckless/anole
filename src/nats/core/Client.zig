@@ -301,6 +301,40 @@ fn publishUntil(client: *Client, message: PublishMessage, deadline: ?Io.Clock.Ti
     client.countOut(header_len + message.payload.len);
 }
 
+pub const PublishNowError = PublishError || error{
+    /// The outbound queue is at its limit: nothing was queued and nothing
+    /// waited.
+    Full,
+};
+
+/// Queues `message` if there is room now and never waits (the write rule:
+/// a send returns once the data is buffered). `.busy` says the queue is
+/// past half its limit. See `limits.outbound_bytes`.
+pub fn publishNow(client: *Client, message: PublishMessage) PublishNowError!enum { ok, busy } {
+    client.checkHome();
+    const header_len = try client.prepare(message, .publish);
+    try client.checkLine(message, header_len);
+    const io = client.io;
+    const result = (if (message.headers.len > 0)
+        client.outbound.tryPut(io, .publish, encoder.hpubLen(message.subject, message.reply_to, header_len, message.payload.len), encoder.writeHpub, .{
+            message.subject, message.reply_to, message.headers, message.payload,
+        })
+    else
+        client.outbound.tryPut(io, .publish, encoder.pubLen(message.subject, message.reply_to, message.payload.len), encoder.writePub, .{
+            message.subject, message.reply_to, message.payload,
+        })) catch |err| switch (err) {
+        error.Closed => return error.ConnectionClosed,
+        else => |e| return e,
+    };
+    client.countOut(header_len + message.payload.len);
+    return result;
+}
+
+/// Whether `publishNow` would take a message now.
+pub fn writable(client: *Client) bool {
+    return client.outbound.hasRoom(client.io);
+}
+
 fn putPublish(client: *Client, message: PublishMessage, header_len: usize, deadline: ?Io.Clock.Timestamp) Outbound.PutUntilError!void {
     const io = client.io;
     if (message.headers.len > 0) {

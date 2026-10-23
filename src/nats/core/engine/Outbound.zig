@@ -290,6 +290,35 @@ fn putTicketed(q: *Outbound, io: Io, deadline: ?Io.Clock.Timestamp, kind: Kind, 
     return q.admit(io, kind, ticket, len, encode, args);
 }
 
+pub const TryPutError = PutError || error{
+    /// The queue is at its limit: nothing was queued, nothing waited.
+    Full,
+};
+
+/// Queues a frame only if there is room now; it never waits. `.busy` says
+/// the queue is past half its limit (the caller should slow down). A
+/// reconnect buffer that is full is BufferFull, as for `put`.
+pub fn tryPut(q: *Outbound, io: Io, kind: Kind, len: usize, encode: anytype, args: anytype) TryPutError!enum { ok, busy } {
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    if (q.stopped(kind)) return error.ConnectionDraining;
+    if (q.mode == .live and (q.queued >= q.limit or q.room_line.first != null)) return error.Full;
+    try q.admit(io, kind, null, len, encode, args);
+    return if (q.mode == .live and q.queued > q.limit / 2) .busy else .ok;
+}
+
+/// Whether a publish now would be taken: room in a live queue, or in the
+/// reconnect buffer.
+pub fn hasRoom(q: *Outbound, io: Io) bool {
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    return switch (q.mode) {
+        .closed => false,
+        .live => q.queued < q.limit / 2 and q.room_line.first == null,
+        .buffering => q.buffer_limit -| q.buffered -| q.reserved > record_cost,
+    };
+}
+
 pub const PutNowError = error{ Closed, Disconnected, BufferFull, OutOfMemory, ProtocolError };
 
 /// Like `put`, but the frame goes in at once, full queue or not; it still
