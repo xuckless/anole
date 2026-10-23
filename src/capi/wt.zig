@@ -321,7 +321,7 @@ fn runKick(cmd: *Command, _: *Exec) void {
     spin(&s.lock);
     s.kick_pending = false;
     s.lock.unlock();
-    if (s.session) |session| session.wake();
+    if (s.session) |session| Session.Driver.wake(session);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +377,7 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
     const high = e.stream_high_water;
     var buf: [32 * 1024]u8 = undefined;
     while (true) {
-        const change = session.generation();
+        const change = Session.Driver.generation(session);
         var progress = false;
 
         // What consumers asked of the session.
@@ -405,7 +405,7 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
         opens_list.deinit(gpa);
         var sent: usize = 0;
         for (datagrams.items) |d| {
-            const ok = session.trySendDatagram(d) catch |err| switch (err) {
+            const ok = Session.Driver.trySendDatagram(session, d) catch |err| switch (err) {
                 error.DatagramTooLarge, error.OutOfMemory => blk: {
                     _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic);
                     break :blk true;
@@ -438,16 +438,16 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
         datagrams.deinit(gpa);
 
         // The peer's new streams.
-        inline for (.{ Session.Direction.bidi, Session.Direction.uni }) |dir| {
-            while (session.tryAccept(dir)) |stream| {
+        inline for (.{ Session.Driver.Direction.bidi, Session.Driver.Direction.uni }) |dir| {
+            while (Session.Driver.tryAccept(session, dir)) |stream| {
                 progress = true;
                 adopt(s, g, stream, if (dir == .bidi) .bidi else .uni_in);
             }
         }
 
         // Datagrams in.
-        while (session.takeDatagram()) |d| {
-            defer session.freeDatagram(d);
+        while (Session.Driver.takeDatagram(session)) |d| {
+            defer Session.Driver.freeDatagram(session, d);
             progress = true;
             const size = @sizeOf(abi.WtDatagramEvent) + d.len;
             const rec = newRecord(size, .wt_datagram, s.handle(g)) catch continue;
@@ -479,7 +479,7 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
         spin(&s.lock);
         s.max_datagram = max;
         s.lock.unlock();
-        if (!progress) try session.waitChange(change);
+        if (!progress) try Session.Driver.waitChange(session, change);
         try std.Io.checkCancel(e.io);
     }
 }
@@ -521,7 +521,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
             st.free();
             return false;
         }
-        const stream = session.tryOpen(if (st.dir == .bidi) .bidi else .uni) catch {
+        const stream = Session.Driver.tryOpen(session, if (st.dir == .bidi) .bidi else .uni) catch {
             // The session is over: it ends with it.
             return true;
         } orelse return true;
@@ -570,7 +570,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
         var wrote: usize = 0;
         var failed = false;
         while (st.sent_off < st.sending.items.len) {
-            const n = stream.tryWrite(st.sending.items[st.sent_off..]) catch {
+            const n = Stream.Driver.tryWrite(stream, st.sending.items[st.sent_off..]) catch {
                 failed = true;
                 break;
             };
@@ -595,7 +595,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
             st.send_done = true;
             progress.* = true;
         }
-        const send_err = stream.sendError();
+        const send_err = Stream.Driver.sendError(stream);
         if (!st.fin_done and (failed or send_err != null)) {
             // Stopped by the peer, or the session went.
             st.send_done = true;
@@ -621,7 +621,7 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
 
     // In: a chunk per round, so one stream does not hold up the others.
     if (!st.recv_done) {
-        const r = stream.tryRead(buf);
+        const r = Stream.Driver.tryRead(stream, buf);
         if (r.n > 0 or r.fin) {
             progress.* = true;
             const size = @sizeOf(abi.WtDataEvent) + r.n;

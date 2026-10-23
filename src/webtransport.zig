@@ -107,7 +107,7 @@ pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions)
         try res.header("sec-webtransport-http3-draft", "draft02");
     self.out = try res.stream(&self.out_buf);
     self.body = try req.reader(&self.in_buf);
-    try self.session.start(connect.core, connect.session_id, .{
+    try Session.Driver.start(&self.session, connect.core, connect.session_id, .{
         .reader = &self.body.interface,
         .writer = &self.out.interface,
         .ctx = self,

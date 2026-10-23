@@ -625,7 +625,7 @@ pub const Session = struct {
     /// Starts the session: it takes the streams that arrived for it, and
     /// a task reads the peer's capsules. `self` must stay put until
     /// `deinit`.
-    pub fn start(self: *Session, core: *Core, id: i64, channel: Channel, options: Options) !void {
+    fn start(self: *Session, core: *Core, id: i64, channel: Channel, options: Options) !void {
         self.* = .{ .core = core, .id = id, .channel = channel };
         const host = core.host;
         host.lock();
@@ -801,26 +801,86 @@ pub const Session = struct {
     // the `try` calls, and `waitChange` only when none had anything.
 
     /// The connection's change count: read it before looking.
-    pub fn generation(self: *Session) u32 {
+    fn generation(self: *Session) u32 {
         return self.core.host.gen.load(.acquire);
     }
 
     /// Waits until something on the connection changes after `gen`.
-    pub fn waitChange(self: *Session, gen: u32) std.Io.Cancelable!void {
+    fn waitChange(self: *Session, gen: u32) std.Io.Cancelable!void {
         return self.core.wait(gen);
     }
 
     /// Wakes `waitChange` (and the connection's other waiters). From a
     /// task of the runtime on the connection's executor.
-    pub fn wake(self: *Session) void {
+    fn wake(self: *Session) void {
         self.core.host.kick();
     }
 
-    pub const Direction = enum { bidi, uni };
+    /// The calls Anole's own drivers make (the C ABI's session driver, the
+    /// tests): they never wait. Not for handlers; they change without
+    /// notice. For a caller that runs a session from one task and does its
+    /// own waiting: read `generation`, look with the `try` calls, and
+    /// `waitChange` only when none had anything.
+    pub const Driver = struct {
+        pub const Direction = enum { bidi, uni };
+
+        /// Starts the session: it takes the streams that arrived for it,
+        /// and a task reads the peer's capsules. `s` must stay put until
+        /// `deinit`.
+        pub fn start(s: *Session, core: *Core, id: i64, channel: Channel, options: Options) !void {
+            return s.start(core, id, channel, options);
+        }
+        /// The connection's change count: read it before looking.
+        pub fn generation(s: *Session) u32 {
+            return s.generation();
+        }
+        /// Waits until something on the connection changes after `gen`.
+        pub fn waitChange(s: *Session, gen: u32) std.Io.Cancelable!void {
+            return s.waitChange(gen);
+        }
+        /// Wakes `waitChange` (and the connection's other waiters). From a
+        /// task of the runtime on the connection's executor.
+        pub fn wake(s: *Session) void {
+            s.wake();
+        }
+        /// The next stream the peer opened, if any: both ways (`.bidi`) or
+        /// read-only (`.uni`).
+        pub fn tryAccept(s: *Session, dir: Direction) ?*Stream {
+            return s.tryAccept(dir);
+        }
+        /// Opens a stream (`.uni`: write-only), or null while the peer's
+        /// stream limit is reached.
+        pub fn tryOpen(s: *Session, dir: Direction) (Error || error{OutOfMemory})!?*Stream {
+            return s.tryOpen(dir);
+        }
+        /// The next datagram received, if any; give it back with
+        /// `freeDatagram`.
+        pub fn takeDatagram(s: *Session) ?[]u8 {
+            return s.takeDatagram();
+        }
+        pub fn freeDatagram(s: *Session, d: []u8) void {
+            s.freeDatagram(d);
+        }
+        /// Queues `data` as one datagram; false, with nothing queued, while
+        /// the connection's queue is full.
+        pub fn trySendDatagram(s: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+            return s.trySendDatagram(data);
+        }
+        /// Tests only: opens a stream of `kind` that starts with `head`
+        /// instead of a whole prefix, held by nobody. Returns its ID, for
+        /// `testReset`.
+        pub fn testOpenRaw(s: *Session, kind: Stream.Kind, head: []const u8) !i64 {
+            return s.testOpenRaw(kind, head);
+        }
+        /// Tests only: resets a `testOpenRaw` stream's sending side.
+        pub fn testReset(s: *Session, id: i64) void {
+            s.testReset(id);
+        }
+    };
 
     /// The next stream the peer opened, if any: both ways (`.bidi`) or
     /// read-only (`.uni`).
-    pub fn tryAccept(self: *Session, dir: Direction) ?*Stream {
+    fn tryAccept(self: *Session, dir: Driver.Direction) ?*Stream {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
@@ -831,7 +891,7 @@ pub const Session = struct {
 
     /// Opens a stream (`.uni`: write-only), or null while the peer's
     /// stream limit is reached.
-    pub fn tryOpen(self: *Session, dir: Direction) (Error || error{OutOfMemory})!?*Stream {
+    fn tryOpen(self: *Session, dir: Driver.Direction) (Error || error{OutOfMemory})!?*Stream {
         const core = self.core;
         core.host.lock();
         if (self.state != .open or core.closed) {
@@ -863,7 +923,7 @@ pub const Session = struct {
 
     /// The next datagram received, if any; give it back with
     /// `freeDatagram`.
-    pub fn takeDatagram(self: *Session) ?[]u8 {
+    fn takeDatagram(self: *Session) ?[]u8 {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
@@ -873,13 +933,13 @@ pub const Session = struct {
         return d;
     }
 
-    pub fn freeDatagram(self: *Session, d: []u8) void {
+    fn freeDatagram(self: *Session, d: []u8) void {
         self.core.gpa.free(d);
     }
 
     /// Queues `data` as one datagram; false, with nothing queued, while
     /// the connection's queue is full.
-    pub fn trySendDatagram(self: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+    fn trySendDatagram(self: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
         const d = try self.prefixDatagram(data);
         const queued = self.queueDatagram(d, data.len) catch |err| {
             self.core.gpa.free(d);
@@ -927,7 +987,7 @@ pub const Session = struct {
     /// Tests only: opens a stream of `kind` that starts with `head`
     /// instead of a whole prefix, held by nobody. Returns its ID, for
     /// `testReset`.
-    pub fn testOpenRaw(self: *Session, kind: Stream.Kind, head: []const u8) !i64 {
+    fn testOpenRaw(self: *Session, kind: Stream.Kind, head: []const u8) !i64 {
         if (!@import("builtin").is_test) @compileError("tests only");
         const core = self.core;
         core.host.lock();
@@ -948,7 +1008,7 @@ pub const Session = struct {
     }
 
     /// Tests only: resets a `testOpenRaw` stream's sending side.
-    pub fn testReset(self: *Session, id: i64) void {
+    fn testReset(self: *Session, id: i64) void {
         if (!@import("builtin").is_test) @compileError("tests only");
         const core = self.core;
         core.host.lock();
@@ -1451,15 +1511,40 @@ pub const Stream = struct {
     /// What `tryRead` found: `n` bytes; `fin` when the peer's end has
     /// been read (with them or before); `err` when the stream ended early
     /// (`resetCode` for the peer's code). All empty: nothing yet.
-    pub const Poll = struct { n: usize = 0, fin: bool = false, err: ?Error = null };
+
+    /// The calls Anole's own drivers make on a stream: they never wait.
+    /// Not for handlers; they change without notice.
+    pub const Driver = struct {
+        /// What `tryRead` found: `n` bytes; `fin` when the peer's end has
+        /// been read (with them or before); `err` when the stream ended
+        /// early (`resetCode` for the peer's code). All empty: nothing yet.
+        pub const Poll = struct { n: usize = 0, fin: bool = false, err: ?Error = null };
+
+        /// Reads what has arrived into `buf`, without waiting.
+        pub fn tryRead(s: *Stream, buf: []u8) Poll {
+            return s.tryRead(buf);
+        }
+        /// Copies what fits of `bytes` into the stream's send buffer
+        /// without waiting: 0 while it is full (until the peer acknowledges
+        /// more). Bypasses `writer`'s buffer: use one or the other.
+        pub fn tryWrite(s: *Stream, bytes: []const u8) Error!usize {
+            return s.tryWrite(bytes);
+        }
+        /// Why the sending side ended early (`StreamStopped`, with
+        /// `stopCode`; `StreamReset`; `SessionClosed`...), or null while it
+        /// can send.
+        pub fn sendError(s: *Stream) ?Error {
+            return s.sendError();
+        }
+    };
 
     /// Reads what has arrived into `buf`, without waiting.
-    pub fn tryRead(s: *Stream, buf: []u8) Poll {
+    fn tryRead(s: *Stream, buf: []u8) Driver.Poll {
         const core = s.core;
         if (s.kind == .uni_out) return .{ .fin = true };
         core.host.lock();
         const n = s.takeLocked(buf);
-        const out: Poll = .{
+        const out: Driver.Poll = .{
             .n = n,
             .fin = s.in_fin and s.in_start == s.in.items.len,
             .err = if (n == 0 and !s.in_fin) s.recv_err else null,
@@ -1472,7 +1557,7 @@ pub const Stream = struct {
     /// Copies what fits of `bytes` into the stream's send buffer without
     /// waiting: 0 while it is full (until the peer acknowledges more).
     /// Bypasses `writer`'s buffer: use one or the other.
-    pub fn tryWrite(s: *Stream, bytes: []const u8) Error!usize {
+    fn tryWrite(s: *Stream, bytes: []const u8) Error!usize {
         const core = s.core;
         if (s.kind == .uni_in) return error.StreamReset;
         core.host.lock();
@@ -1493,7 +1578,7 @@ pub const Stream = struct {
 
     /// Why the sending side ended early (`StreamStopped`, with `stopCode`;
     /// `StreamReset`; `SessionClosed`...), or null while it can send.
-    pub fn sendError(s: *Stream) ?Error {
+    fn sendError(s: *Stream) ?Error {
         const host = s.core.host;
         host.lock();
         defer host.unlock();

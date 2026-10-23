@@ -740,7 +740,7 @@ pub const ClientConnection = struct {
         const holder = try self.gpa.create(ClientSession);
         errdefer self.gpa.destroy(holder);
         holder.* = .{ .session = undefined, .stream = stream, .gpa = self.gpa };
-        try holder.session.start(core, stream.id, .{
+        try webtransport.Session.Driver.start(&holder.session, core, stream.id, .{
             .reader = stream.reader(),
             .writer = stream.writer(),
             .ctx = holder,
