@@ -1,0 +1,13 @@
+Running 30s test @ http://127.0.0.1:8080/async-db?min=10&max=50&limit=20
+  8 threads and 256 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    19.40ms   31.09ms 417.48ms   87.04%
+    Req/Sec     6.44k   805.14     9.52k    68.50%
+  Latency Distribution
+     50%  798.00us
+     75%   27.52ms
+     90%   59.44ms
+     99%  139.97ms
+  1538236 requests in 30.04s, 4.82GB read
+Requests/sec:  51214.19
+Transfer/sec:    164.21MB

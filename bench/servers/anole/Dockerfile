@@ -19,12 +19,14 @@ COPY src/ src/
 COPY tests/ tests/
 COPY examples/ examples/
 COPY bench/servers/anole/build.zig bench/servers/anole/build.zig.zon bench/servers/anole/
+# Extra flags for the bench server's build (e.g. -Dslim=true).
+ARG BENCH_BUILD_FLAGS=
 COPY bench/servers/anole/src/ bench/servers/anole/src/
 # Baseline x86-64, as Go (GOAMD64=v1) and Rust build by default; Zig's own
 # default, the build host's CPU, would give Anole an edge the others lack.
 RUN --mount=type=cache,target=/root/.cache/zig \
     cd bench/servers/anole && for i in 1 2 3; do zig build --fetch && break; sleep 2; done \
- && zig build -Doptimize=ReleaseFast -Dcpu=baseline \
+ && zig build -Doptimize=ReleaseFast -Dcpu=baseline $BENCH_BUILD_FLAGS \
  && cd /src && for i in 1 2 3; do zig build --fetch && break; sleep 2; done \
  && zig build grpc-interop-server -Doptimize=ReleaseFast -Dcpu=baseline \
  && mkdir /out && cp bench/servers/anole/zig-out/bin/anole-bench zig-out/bin/grpc-interop-server /out/

@@ -6,6 +6,7 @@ const std = @import("std");
 const anole = @import("anole");
 const websocket = anole.websocket;
 const twelve = @import("twelve.zig");
+const asyncdb = @import("asyncdb.zig");
 
 pub const zio_options = anole.zio_options;
 pub const std_options = anole.std_options;
@@ -17,6 +18,7 @@ pub const App = struct {
     positions_mutex: std.Io.Mutex = .init,
     positions: std.StringHashMapUnmanaged(i64) = .empty,
     twelve: ?twelve.State = null,
+    asyncdb: ?asyncdb.State = null,
 
     pub fn notFound(_: *App, _: *anole.Request, res: *anole.Response) !void {
         res.status = .not_found;
@@ -279,6 +281,12 @@ pub fn main(init: std.process.Init) !void {
     if (database_url.len > 0) {
         state.twelve = try twelve.State.init(&app, database_url, envInt(u32, "PG_POOL", 20), env("JWT_SECRET", "twelve-dollar-challenge"));
         twelve.routes(&app);
+    }
+    // HttpArena's async-db profile, on its seeded items table.
+    const arena_url = env("ARENA_DATABASE_URL", "");
+    if (arena_url.len > 0) {
+        state.asyncdb = try asyncdb.State.init(&app, arena_url, envInt(u32, "PG_POOL", 20));
+        asyncdb.routes(&app);
     }
 
     const hz = envInt(u32, "TICK_HZ", 1000);

@@ -1,0 +1,3 @@
+info(anole): postgres "postgres": postgres://bench@127.0.0.1:5432/benchmark (sslmode=prefer, the default for this host), up to 20 connections over 1 executors
+warning(anole): built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production
+info(anole): listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)
