@@ -81,8 +81,14 @@ const anole = @import("anole");
 pub const std_options = anole.std_options;
 pub const panic = anole.panic;
 
+const v = anole.validate;
+
 const Todo = struct { id: usize, title: []const u8, done: bool = false };
-const NewTodo = struct { title: []const u8 };
+const NewTodo = struct {
+    title: []const u8,
+
+    pub const field_rules = .{ .title = .{ v.trim, v.notBlank, v.maxLength(200) } };
+};
 
 const App = struct {
     gpa: std.mem.Allocator,
@@ -112,12 +118,10 @@ fn get(app: *App, req: *anole.Request, res: *anole.Response) !void {
     try res.json(app.todos.items[id - 1]);
 }
 
-fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    const in = try req.bind(NewTodo);
-    if (in.title.len == 0) return res.fail(.unprocessable_entity, "the title is empty");
+fn create(app: *App, req: *anole.Request, res: *anole.Response, in: anole.In(.{ .body = NewTodo })) !void {
     try app.mutex.lock(req.io);
     defer app.mutex.unlock(req.io);
-    const title = try app.gpa.dupe(u8, in.title);
+    const title = try app.gpa.dupe(u8, in.body.title);
     errdefer app.gpa.free(title);
     const todo: Todo = .{ .id = app.todos.items.len + 1, .title = title };
     try app.todos.append(app.gpa, todo);
@@ -177,9 +181,13 @@ What each piece does:
   waits for it; `std.Thread.Mutex` would block the whole thread.
 - **Input.** `req.params` and `req.query` have `get` (a string) and
   `getInt`/`getFloat`, which return null when the value is missing or does
-  not parse. `req.bind(T)` parses a JSON body into a `T`, ignoring fields
-  `T` does not have; no body, or one that does not fit, is answered 400.
-  `req.headers.get` reads a header.
+  not parse. `anole.In(.{ .body = T })` as a handler's last parameter parses
+  the JSON body into a `T` before the handler runs, ignoring fields `T` does
+  not have, and checks the rules in `T`'s `field_rules`: a body that is not
+  JSON, or missing, is answered 400; one that is JSON but does not fit or
+  breaks a rule is a 422 that names every field
+  ([validation.md](validation.md)). `req.bind(T)` does the same from inside a
+  handler. `req.headers.get` reads a header.
 - **Memory.** What `bind` returns lives in the request's arena, freed once
   the response is sent, so `create` copies the title into the state's
   allocator. Allocate anything for this request alone from `req.arena`.
@@ -204,6 +212,25 @@ What each piece does:
   middleware for every request (before the routes), and `app.group(prefix,
   .{...})` for the routes under a prefix. `app.with(.{...})` does the same
   without a prefix, for single routes.
+
+- **Tests.** `anole.testing` runs requests in memory, with no socket
+  ([testing.md](testing.md)):
+
+  ```zig
+  test "a blank title is a 422 that names the field" {
+      var state: App = .{ .gpa = std.testing.allocator, .api_key_digest = sha256("k") };
+      defer state.deinit();
+      var app = try anole.Server(App).init(std.testing.allocator, .{ .executors = .exact(1) }, &state);
+      defer app.deinit();
+      app.post("/todos", create);
+      var t = try anole.testing.client(&app);
+      defer t.deinit();
+      var res = try t.post("/todos", .{ .json = .{ .title = "   " } });
+      defer res.deinit();
+      try res.expectStatus(.unprocessable_entity);
+      try res.expectViolation("title", "validation.not_blank");
+  }
+  ```
 
 `examples/rest` is the same API with update and delete
 (`zig build run-rest` in Anole's repository), and

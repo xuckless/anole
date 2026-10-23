@@ -77,13 +77,61 @@ OpenAPI documents and the `anole` command line.
 
 - `anole_dotenv_read`; JSON keys `environment`, `deployment`,
   `error_detail` and `proxy.trusted`.
+- `"log": {"format", "service"}` and `"banner"` in the configuration;
+  `"access_log"`'s `"format"` gains `"auto"` (the default). With
+  `log.format` `"json"` (the default when `environment` is production) the
+  log callback's `msg` is the whole JSON record; access lines reach the
+  callback with scope `access`. A malformed route pattern is
+  `ANOLE_E_CONFIG` naming the route.
 - `"brokers"` in the configuration, `anole_nats_*`, events
   `ANOLE_EV_NATS_MSG`, `_REPLY`, `_JS_MSG`, `_SUB_END` and `_WRITABLE`
   (64-69), handle kinds for subscriptions and messages, `ANOLE_E_BROKER`,
   `ANOLE_DB_F_RETRY`, `"breaker"` and `"retry"` on databases.
 
+### Validation, typed handlers, logs and tests
+
+- `anole.validate`: field rules on structs (`pub const field_rules`), about
+  190 rules, transforms and `v.rename`; the whole of zefir's validator.
+  `req.bind` checks them and answers 422 `application/problem+json` naming
+  every invalid field; `req.bindQuery`, `req.bindPath`, `req.bindHeaders`,
+  `req.invalid`, `res.problem`, and `anole.bindJson` for bytes without a
+  request ([validation.md](docs/validation.md)).
+- `anole.In(.{ .path, .query, .headers, .body })`: typed handler inputs, bound
+  before the handler runs and checked at compile time; typed outputs (a
+  result written as JSON, `anole.Created`, `anole.Accepted`,
+  `anole.WithStatus`) and `anole.routeInfo` for tools
+  ([routing.md](docs/routing.md#typed-handlers)).
+- Route paths are checked at compile time (a wildcard that is not last, a
+  parameter named twice, an empty name, `?` or `#`); `app.addRoute` for a
+  path known at run time.
+- JSON Lines logs (`ServerOptions.log`, `anole.log`, `req.log()`), JSON by
+  default in production; redaction by field name and by `anole_sensitive`
+  ([logging.md](docs/logging.md)).
+- `anole.testing`: an in-memory client for routes and middleware, with
+  server-sent event streams and log capture
+  ([testing.md](docs/testing.md)).
+- Startup errors are two readable lines (what could not be done, why, the
+  way out), also in the C ABI's `anole_last_error`; the startup banner (the
+  anole, version, address) when a person is looking, off with
+  `ServerOptions.banner = false` or `ANOLE_NO_BANNER=1`; `anole new` shows it
+  too.
+- NATS `Msg.bind(T)`.
+
 ### Breaking
 
+- A JSON body that is valid JSON but whose values do not fit the type is now
+  422 with the violations, not 400. `req.bindWith` keeps the old behaviour.
+- Route methods (`get`, `post`, `ws`, `webtransport`... and the same on
+  groups) take `path` at compile time; `app.addRoute(method, path, handler)`
+  for a run-time path. Malformed patterns are refused. `anole.cached` on a
+  method other than GET or HEAD is a compile error.
+- The access log's JSON lines are the shared log record: `time` (RFC 3339)
+  replaces `ts`, and `level`, `scope` and `message` are added;
+  `AccessLog.Options.format` is null by default and follows the log format.
+  Without a `.file`, access lines go through the log sink (stderr, or the C
+  ABI's callback).
+- In test builds a route conflict is `error.RouteConflict` instead of a
+  panic.
 - `ServerOptions.listen_tls_http3`, `http.address`, `http.port`,
   `http.proxy_protocol`, `https.address`, `https.proxy_protocol`,
   `Listener.address`, `Listener.port` and `Listener.proxy_protocol` are

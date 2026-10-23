@@ -184,6 +184,8 @@ interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 | `environment`, `deployment` | null | `development` or `production`, and what sits in front (`standalone`, `behind_proxy`, `anole_lb`, `platform`). Null: `ANOLE_ENV` / `ANOLE_DEPLOYMENT`, else the build and `standalone`. See [config.md](config.md). |
 | `env_files` | null | The `.env` files read at `init`. Null: the environment's (development: four files in the working directory; production: none); `&.{}`: none. |
 | `error_detail` | null | A 500 for an error with no status of its own names the error. Null: on in development. |
+| `log` | `.{}` | Logging, process-wide: `format` (`.auto`: JSON Lines in production, else text), `level` and `service`; see [logging.md](logging.md). |
+| `banner` | true | The startup banner (the anole, the version and the address), only when stderr is a terminal, the logs are text and the process is not run by systemd; `ANOLE_NO_BANNER=1` turns it off. |
 | `timeouts` | see below | The request, head, write, keep-alive and drain deadlines. |
 | `limits` | see below | Body, head and connection limits. |
 | `proxy` | none trusted | Trust in proxies in front: `trusted`, `X-Forwarded-*`. |
@@ -527,6 +529,17 @@ address of the same port (`127.0.0.1:8080` beside `0.0.0.0:8080`) is still
 allowed: the kernel treats those as different addresses.
 
 ### When it does not start
+
+A start that fails is logged once at `err` in two lines: what could not be
+done and why, then the way out indented under it.
+
+```
+error(anole): can't listen on 0.0.0.0:3000: the port is already in use.
+  Another process holds it (`lsof -i :3000` shows which); stop it or use app.listen(":3001").
+```
+
+The C ABI's `anole_last_error` shows the same text. A connector that does
+not start says which one, and a password in its URL is never printed.
 
 `init`, `listen`, `listenTls`, `run` and `waitReady` fail with an
 `anole.ServerError`, a named set you can switch on; the certificate reloads

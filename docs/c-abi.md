@@ -1420,6 +1420,24 @@ The callback belongs to its server: it is set by `anole_server_create`,
 cleared by `anole_server_destroy`, and a later server without one logs to
 stderr.
 
+`"log": {"format": "auto" | "text" | "json", "service": "..."}` picks the
+format of every record (`auto`: JSON when `environment` is production, which
+is what a binding that leaves it out gets). In `json` the callback's `msg` is
+the complete record as one JSON object with no newline, byte for byte what
+stderr would get; in `text` it is the message, with structured fields
+appended as ` key=value`. Access log lines (the `access_log` middleware, whose
+`format` defaults to `"auto"`, following `log.format`) reach the callback too,
+with scope `access`. Records can be up to 16 KiB; a binding that parses them
+should expect `time`, `level`, `scope`, `message`, `service`, `request_id`,
+`trace_id` and `span_id`, then the record's fields ([logging.md](logging.md)).
+
+`"banner": true` prints the startup banner to stderr (when it is a terminal
+and the format is text); it is off by default under the ABI.
+
+Validation stays in the binding's language (zod, pydantic): the 422
+problem document is described in [validation.md](validation.md#the-422-document)
+for bindings that want the same shape.
+
 ## Testing
 
 `zig build capi-test` (part of `zig build test`) checks `anole.h` through

@@ -18,6 +18,13 @@ table lists what reads or behaves differently.
 | `timeouts.keepalive` 60 s | 75 s (set `.timeouts = .{ .keepalive = .fromSeconds(60) }` for the old value) |
 | PostgreSQL, Redis and MongoDB calls tried to connect every time while the database was down | a circuit breaker is on by default: after 5 connection failures in a row calls fail at once with 503 (`lastError` code `circuit_open`); `.breaker = null` (`"breaker": null` in the C ABI) keeps 0.2's behaviour |
 | An exhaustive `switch` on `anole.db.System` | add the cases `.nats` and `.kafka` |
+| `req.bind(T)` on a body that is JSON but does not fit: 400 `{"error":"Bad Request"}` | 422 `application/problem+json` with `errors` naming each field; not JSON or no body stays 400. `req.bindWith(T, .{ .ignore_unknown_fields = true })` is the old behaviour |
+| `app.get(path, ...)` with a run-time `path` | the route methods take `comptime path`; use `app.addRoute(.get, path, handler)` |
+| A pattern with a wildcard before the end, a parameter named twice, an empty parameter name, or `?`/`#` | refused: a compile error, or a startup conflict (`ANOLE_E_CONFIG` through the C ABI) |
+| `anole.cached` on a POST route | a compile error (the cache keeps GET and HEAD answers only) |
+| Access log JSON: `{"ts":1792333306429,"method":...}` | the shared record: `{"time":"2026-10-23T09:41:07.415Z","level":"info","scope":"access","message":"GET /users/7 200",...,"method":...}`; `AccessLog.init(.{})` follows the log format (JSON in production), `.format = .text` keeps text |
+| A route conflict in a test build crashed the test binary | `run`, `listen` and `anole.testing.client` fail with `error.RouteConflict`; `app.routeConflict()` has the message |
+| C ABI: the log callback's `msg` was the message | with `log.format` `"json"` (the default when `environment` is production, which is what an unset `environment` gets) it is a whole JSON record; `"log": {"format": "text"}` keeps messages. Access log lines now reach the callback (scope `access`); `"access_log".format` defaults to `"auto"` |
 
 ## 0.1 to 0.2
 

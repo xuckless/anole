@@ -59,7 +59,7 @@ builds a whole API step by step.
 | `jwtware.New(jwtware.Config{...})` (contrib/jwt) | `anole.auth.RequireJwt.init(keys, policy, .{})` and `anole.auth.claims(req)` |
 | `healthcheck.New()` | `_ = app.health(.{});` (`/healthz`, `/readyz`) |
 | `client.Get(url)` | `anole.client(req).fetch(url, .{})` |
-| `app.Test(req)` | `app.listen("127.0.0.1:0")` with the checks in a task on `app.io()` (`tests/rest_test.zig`) |
+| `app.Test(req)` | `anole.testing.client(&app)`, in memory ([testing.md](testing.md)); `app.listen("127.0.0.1:0")` with the checks in a task on `app.io()` for a real socket (`tests/rest_test.zig`) |
 | `Prefork: true` | the default: an accept loop on every core (one `SO_REUSEPORT` socket each on Linux) |
 
 What Fiber cannot do and Anole does: HTTP/2 and HTTP/3 without a proxy in
@@ -69,13 +69,15 @@ front, and gRPC (`app.grpc(pb.Greeter, .{ .SayHello = sayHello })`, see
 ## A handler
 
 ```go
+type NewUser struct {
+    Name  string `json:"name"  validate:"required"`
+    Email string `json:"email" validate:"required,email"`
+}
+
 app.Post("/users", func(c fiber.Ctx) error {
     var in NewUser
-    if err := c.Bind().Body(&in); err != nil {
+    if err := c.Bind().Body(&in); err != nil { // go-playground/validator inside
         return err
-    }
-    if in.Name == "" {
-        return fiber.NewError(fiber.StatusUnprocessableEntity, "name is empty")
     }
     u := store.Add(in)
     return c.Status(fiber.StatusCreated).JSON(u)
@@ -83,16 +85,33 @@ app.Post("/users", func(c fiber.Ctx) error {
 ```
 
 ```zig
-fn createUser(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    const in = try req.bind(NewUser);
-    if (in.name.len == 0) return res.fail(.unprocessable_entity, "name is empty");
-    const user = try app.store.add(in);
+const v = anole.validate;
+
+const NewUser = struct {
+    name: []const u8,
+    email: []const u8,
+
+    pub const field_rules = .{
+        .name = .{ v.trim, v.notBlank },
+        .email = v.email,
+    };
+};
+
+fn createUser(app: *App, _: *anole.Request, res: *anole.Response, in: anole.In(.{ .body = NewUser })) !User {
+    const user = try app.store.add(in.body);
     res.status = .created;
-    try res.json(user);
+    return user; // written as JSON, with the status you set
 }
 
 app.post("/users", createUser);
 ```
+
+`anole.In(.{ .body = T })` is `c.Bind().Body` plus the validator in one
+step: it binds before the handler runs and answers a body that breaks a rule
+with a 422 that names every field (`validation.not_blank`,
+`validation.email`...), not only the first. A handler that returns a value
+has it written as JSON; one that wants to answer itself keeps `res`. Inside a
+handler, `req.bind(T)` does the same. See [validation.md](validation.md).
 
 Fiber's one `c` is two values here, the request and the response, and the
 handler is a named function: Zig has no closures. Shared state (`store`

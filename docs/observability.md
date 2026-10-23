@@ -129,7 +129,8 @@ anything else gets a fresh ID. The JSON access log escapes IDs either way.
 `anole.observe.AccessLog` writes one line per request after the handler
 returns. Options:
 
-- `.format`: `.text` (default) or `.json`, one object per line.
+- `.format`: `.text` or `.json`, one object per line. Null by default: it
+  follows the log format (`ServerOptions.log.format`; JSON in production).
 - `.file`: a `std.Io.File` to write to; stderr when null.
 - `.exclude`: paths not logged (see [Wiring](#wiring)).
 - `.log_query`: also log the query string (false). Off by default, because
@@ -138,8 +139,9 @@ returns. Options:
   (`Logger.init(.{ .log_query = true })`).
 
 Each line is a single write, so lines from concurrent requests do not
-interleave. The line is written straight to the file, not through
-`std.log`, so log levels do not filter it.
+interleave. Without a `.file`, lines go where the logs go (stderr, or the C
+ABI's log callback, scope `access`), filtered by the runtime log level;
+with a `.file`, straight to the file.
 
 Text, from the example:
 
@@ -150,10 +152,12 @@ GET /users/7 200 123us 127.0.0.1:64505 id=c643e5d771c29ce8cc77181de02d0b2a trace
 JSON, from the example:
 
 ```json
-{"ts":1792333306429,"method":"GET","path":"/users/7","status":200,"duration_us":124,"client":"127.0.0.1:64388","route":"/users/:id","request_id":"9045897231062d793bd832ff5459f9e3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"3d4c9f621d6f31cc"}
+{"time":"2026-10-23T09:41:07.415Z","level":"info","scope":"access","message":"GET /users/7 200","request_id":"9045897231062d793bd832ff5459f9e3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"3d4c9f621d6f31cc","method":"GET","path":"/users/7","route":"/users/:id","status":200,"duration_us":124,"client":"127.0.0.1:64388"}
 ```
 
-`ts` is Unix time in milliseconds. `path` is the raw target's path, the
+The line is the shared log record ([logging.md](logging.md)): `time`
+(RFC 3339 UTC; 0.2's `ts`, Unix milliseconds, is gone), `level`, `scope`
+and `message`, then the request's ids. `path` is the raw target's path, the
 query left out unless `log_query` is set. `route` appears only when a route matched. `request_id`,
 `trace_id` and `span_id` appear only when the RequestId and tracing
 middleware are installed. A handler that returns `error.NotFound` is logged
