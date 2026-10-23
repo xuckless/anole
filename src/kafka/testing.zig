@@ -95,6 +95,10 @@ pub const FakeBroker = struct {
     commits: std.atomic.Value(u32) = .init(0),
     /// Every Metadata request answers with the topic missing.
     hide_topics: std.atomic.Value(bool) = .init(false),
+    /// The next N Metadata answers for a topic that does not exist yet say
+    /// UNKNOWN_TOPIC_OR_PARTITION, as Kafka 4.x does while it auto-creates
+    /// one; the answer after them creates it.
+    creating_answers: std.atomic.Value(u32) = .init(0),
 
     pub fn start(gpa: std.mem.Allocator, io: std.Io, config: Config) !*FakeBroker {
         const b = try gpa.create(FakeBroker);
@@ -381,6 +385,15 @@ pub const FakeBroker = struct {
         try out.arrayLen(names.items.len);
         for (names.items) |name| {
             const hidden = b.hide_topics.load(.acquire);
+            const exists = b.topics.get(name) != null;
+            if (!hidden and !exists and auto_create and takeOne(&b.creating_answers)) {
+                try out.i16_(protocol.unknown_topic_or_partition);
+                try out.string(name);
+                try out.bool_(false);
+                try out.arrayLen(0);
+                try out.i32_(0);
+                continue;
+            }
             const t: ?*Topic = if (hidden) null else if (b.topics.get(name)) |t| t else if (auto_create) try b.topicOf(name) else null;
             if (t) |tp| {
                 try out.i16_(0);

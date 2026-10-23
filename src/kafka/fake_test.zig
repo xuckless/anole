@@ -103,6 +103,34 @@ test "fake broker: a retriable error is retried, a lost reply is not duplicated"
     try testing.expectEqual(@as(usize, 1), n);
 }
 
+test "fake broker: a topic being auto-created is waited for; one that never appears fails" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 2 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+
+    broker.creating_answers.store(3, .release);
+    const d = try client.produce(&c, .{ .topic = "fresh", .key = "k", .value = "v" });
+    try testing.expectEqualStrings("fresh", d.topic);
+    try testing.expectEqual(@as(u32, 0), broker.creating_answers.load(.acquire));
+    try testing.expectEqual(@as(i64, 1), broker.count("fresh", @intCast(d.partition)));
+
+    // A topic that never appears fails once the call's timeout has passed.
+    broker.hide_topics.store(true, .release);
+    var o = opts(broker, .{});
+    o.timeout = .fromMilliseconds(200);
+    const short = try kafka.Client.init(gpa, io, o);
+    defer short.deinit();
+    try testing.expectError(error.Database, short.produce(&c, .{ .topic = "absent", .value = "v" }));
+    try testing.expectEqualStrings("UNKNOWN_TOPIC_OR_PARTITION", db.lastError(&c).?.code);
+}
+
 test "fake broker: errors are anole.db errors with the code in lastError" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();

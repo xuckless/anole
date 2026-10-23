@@ -384,6 +384,46 @@ pub const Cluster = struct {
         return self.lookupCount(topic);
     }
 
+    /// `partitionCount`, but a topic that may still be on its way is asked
+    /// for again until it has partitions, at most `max_wait`. A Metadata
+    /// request for an unknown topic asks the broker to auto-create it, and
+    /// until the topic exists the answers say UNKNOWN_TOPIC_OR_PARTITION
+    /// (Kafka 4.x), LEADER_NOT_AVAILABLE (older brokers) or list no
+    /// partitions; a topic just created by an admin call looks the same on a
+    /// broker the creation has not reached yet. A broker without auto-create
+    /// gives the same answer, so those wait the whole `max_wait` too, as
+    /// librdkafka's topic.metadata.propagation.max.ms and the Java
+    /// producer's max.block.ms do. Any other topic error (authorization, an
+    /// invalid name) is null after one refresh.
+    pub fn partitionCountWait(self: *Cluster, topic: []const u8, max_wait: std.Io.Duration) ConnError!?u32 {
+        if (self.lookupCount(topic)) |n| return n;
+        const started: std.Io.Clock.Timestamp = .now(self.io, .awake);
+        var pause: std.Io.Duration = .fromMilliseconds(10);
+        while (true) {
+            try self.refresh(&.{topic}, true);
+            if (self.lookupCount(topic)) |n| return n;
+            if (!self.mayAppear(topic)) return null;
+            const elapsed = started.durationTo(.now(self.io, .awake)).raw.nanoseconds;
+            if (elapsed >= max_wait.nanoseconds) return null;
+            const left: i96 = max_wait.nanoseconds - elapsed;
+            try self.io.sleep(.{ .nanoseconds = @min(pause.nanoseconds, left) }, .awake);
+            pause = .{ .nanoseconds = @min(pause.nanoseconds * 2, std.Io.Duration.fromMilliseconds(500).nanoseconds) };
+        }
+    }
+
+    /// Whether the cached answer for `topic` is one a topic being created
+    /// gives.
+    fn mayAppear(self: *Cluster, topic: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const t = self.topics.get(topic) orelse return false;
+        return switch (t.error_code) {
+            protocol.unknown_topic_or_partition, protocol.leader_not_available => true,
+            0 => t.partitions.len == 0,
+            else => false,
+        };
+    }
+
     fn lookupCount(self: *Cluster, topic: []const u8) ?u32 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -189,7 +189,8 @@ pub const Producer = struct {
     }
 
     /// Queues one record. `slot`, when given, receives the outcome (the
-    /// producer then owns one reference to it).
+    /// producer then owns one reference to it). A topic the cluster is
+    /// still creating is waited for, at most `delivery_timeout`.
     pub fn append(
         self: *Producer,
         topic: []const u8,
@@ -200,9 +201,23 @@ pub const Producer = struct {
         timestamp_ms: i64,
         slot: ?*Slot,
     ) AppendError!void {
+        return self.appendWithin(topic, key, value, headers, explicit_partition, timestamp_ms, slot, self.cfg.delivery_timeout);
+    }
+
+    fn appendWithin(
+        self: *Producer,
+        topic: []const u8,
+        key: ?[]const u8,
+        value: ?[]const u8,
+        headers: []const records.Header,
+        explicit_partition: ?i32,
+        timestamp_ms: i64,
+        slot: ?*Slot,
+        metadata_wait: Duration,
+    ) AppendError!void {
         const size = recordBytes(key, value, headers);
         if (size + records.header_len > self.cfg.max_request_bytes) return error.TooLarge;
-        const count = (try self.cluster.partitionCount(topic)) orelse return error.UnknownTopic;
+        const count = (try self.cluster.partitionCountWait(topic, metadata_wait)) orelse return error.UnknownTopic;
         const now: Timestamp = .now(self.io, .awake);
 
         var wake_id: ?i32 = null;
@@ -272,14 +287,19 @@ pub const Producer = struct {
         timeout: ?Duration,
     ) AppendError!Outcome {
         const slot = try Slot.create(self.gpa);
-        self.append(topic, key, value, headers, partition, timestamp_ms, slot) catch |err| {
+        const started: Timestamp = .now(self.io, .awake);
+        const wait = if (timeout) |t| (if (t.nanoseconds < self.cfg.delivery_timeout.nanoseconds) t else self.cfg.delivery_timeout) else self.cfg.delivery_timeout;
+        self.appendWithin(topic, key, value, headers, partition, timestamp_ms, slot, wait) catch |err| {
             slot.release();
             slot.release();
             return err;
         };
         defer slot.release();
         if (timeout) |t| {
-            slot.event.waitTimeout(self.io, .{ .duration = .{ .raw = t, .clock = .awake } }) catch |err| switch (err) {
+            // The time spent waiting for a new topic's metadata counts.
+            const spent = started.durationTo(.now(self.io, .awake)).raw.nanoseconds;
+            const left: Duration = .{ .nanoseconds = @max(0, t.nanoseconds - spent) };
+            slot.event.waitTimeout(self.io, .{ .duration = .{ .raw = left, .clock = .awake } }) catch |err| switch (err) {
                 error.Timeout => return .timeout,
                 error.Canceled => return error.Canceled,
             };
