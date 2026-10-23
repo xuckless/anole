@@ -2179,8 +2179,10 @@ test "bindHeaders: x_request_id reads X-Request-Id, optional ones are null, prob
     r2.headers = try http.Headers.init(arena.allocator(), 8);
     try r2.headers.add("X-Retries", "many");
     try std.testing.expectError(error.ValidationFailed, r2.bindHeaders(Hdrs));
-    try expectViolationAt(&r2, 0, .header, "X-Retries", "http.invalid_type");
-    try expectViolationAt(&r2, 1, .header, "X-Request-Id", "http.missing_field");
+    // In the DTO's field order: x_request_id (absent), then x_retries
+    // (present, not a number).
+    try expectViolationAt(&r2, 0, .header, "X-Request-Id", "http.missing_field");
+    try expectViolationAt(&r2, 1, .header, "X-Retries", "http.invalid_type");
 }
 
 test "invalid/addViolation: appended in order, at most 100, ValidationFailed returned" {

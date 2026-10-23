@@ -342,12 +342,15 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
 /// The compile-time checks of one route registered with a comptime path:
 /// the pattern, the handler's `In` against the route, and `cached` against
 /// the method. `whole_path` is false under a group (its prefix is a
-/// run-time string; `required_params` covers it at startup).
+/// run-time string; `required_params` covers it at startup), where an
+/// empty `path` is the group's own path.
 pub fn checkRoute(comptime method: ?dusty.Method, comptime path: []const u8, comptime handler: anytype, comptime whole_path: bool) void {
     const handlers = @import("handlers.zig");
     const name = comptime (if (method) |m| upper(@tagName(m)) else "ANY");
     const where = "anole: route " ++ name ++ " " ++ path ++ ": ";
-    if (comptime route_pattern.problem(path)) |p| @compileError(where ++ route_pattern.comptimeMessage(p));
+    // Under a group, "" is the group's own path (`admin.post("", ..)`).
+    const group_root = !whole_path and path.len == 0;
+    if (comptime !group_root) if (comptime route_pattern.problem(path)) |p| @compileError(where ++ route_pattern.comptimeMessage(p));
     if (comptime handlers.isCached(@TypeOf(handler))) {
         if (method) |m| if (m != .get and m != .head)
             @compileError(where ++ "anole.cached keeps GET and HEAD answers only; it cannot wrap a " ++ name ++ " route");

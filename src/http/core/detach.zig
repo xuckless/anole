@@ -20,6 +20,7 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const hooks = @import("hooks.zig");
 
 pub const Detached = struct {
     request: *Request,
@@ -33,6 +34,9 @@ pub const Detached = struct {
     first: ?*Finisher = null,
     last: ?*Finisher = null,
     state: State = .detached,
+    /// When the handler started, for the live console (`hooks.begin`); 0
+    /// when no console collected then.
+    console_start_ns: u64 = 0,
 
     pub const State = enum {
         /// Waiting for `finish`, with no task.
@@ -99,6 +103,7 @@ pub const Detached = struct {
             it = f.next;
             f.func(f, d.request, d.response, result);
         }
+        hooks.finished(d, result);
         d.engine.end(d, result);
     }
 

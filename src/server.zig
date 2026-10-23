@@ -1362,7 +1362,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
                     .socket_per_acceptor = per_core_sockets and address == .ip,
                     .ipv6_only = ipv6_only,
-                    .proxy_protocol = l.proxy_protocol.?,
+                    // Null only on a unix socket: the modes' default is for TCP listeners.
+                    .proxy_protocol = l.proxy_protocol orelse false,
                     .proxy_protocol_from = from: {
                         const nets = try a.alloc(http.ProxyNetwork, l.proxy_protocol_from.len);
                         for (l.proxy_protocol_from, nets) |text, *net| net.* = http.ProxyNetwork.parse(text) catch return error.InvalidProxyNetwork;
@@ -2145,7 +2146,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// `Server.wsWith` under this group.
             pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                comptime checkPattern("GET", path);
+                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
             }
             /// `Server.wsCallbacks` under this group.
@@ -2155,7 +2156,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// `Server.wsCallbacksWith` under this group.
             pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
-                comptime checkPattern("GET", path);
+                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
                 g.inner.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
             }
             /// `Server.webtransport` under this group.
@@ -2165,7 +2166,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// `Server.webtransportWith` under this group.
             pub fn webtransportWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
                 if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
-                comptime checkPattern("GET", path);
+                if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
@@ -4384,6 +4385,9 @@ test "anole.Server: behind_proxy over a real connection reads X-Forwarded-For fr
 }
 
 test "anole.Server: error_detail names the error in a 500, in development only" {
+    // GET /boom logs its unhandled error, once per environment.
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     const gpa = std.testing.allocator;
     inline for (.{ modes.Environment.development, modes.Environment.production }) |environment| {
         var app = try Server(void).init(gpa, .{
@@ -4416,6 +4420,8 @@ test "anole.Server: error_detail names the error in a 500, in development only" 
 }
 
 test "anole.Server: proxy_protocol with an empty proxy.trusted is ProxyProtocolNoPeers" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.ProxyProtocolNoPeers, Server(void).init(gpa, .{
         .proxy = .{ .trusted = &.{} },
@@ -4425,6 +4431,8 @@ test "anole.Server: proxy_protocol with an empty proxy.trusted is ProxyProtocolN
 }
 
 test "anole.Server: a .env file with a problem is InvalidEnvFile" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

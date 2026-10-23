@@ -31,11 +31,15 @@ fn stripDeleted(exe: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, exe, deleted_suffix)) exe[0 .. exe.len - deleted_suffix.len] else exe;
 }
 
-/// Variables of a hand-off or socket activation, which a plain restart must
-/// not carry over.
+/// Socket activation's variables: kept when the process was socket-activated
+/// (same PID, the same descriptors kept open), dropped otherwise.
+fn isActivationVar(kv: []const u8) bool {
+    return std.mem.startsWith(u8, kv, "LISTEN_");
+}
+
+/// A SIGUSR2 hand-off's pipes, which a plain restart never carries over.
 fn isHandoffVar(kv: []const u8) bool {
-    return std.mem.startsWith(u8, kv, "LISTEN_") or
-        std.mem.startsWith(u8, kv, "ANOLE_READY_FD=") or
+    return std.mem.startsWith(u8, kv, "ANOLE_READY_FD=") or
         std.mem.startsWith(u8, kv, "ANOLE_H3_SECRET_FD=");
 }
 
@@ -51,7 +55,8 @@ pub fn build(a: std.mem.Allocator, info: *const LaunchInfo) !Plan {
     // A rebuilt binary is the one that starts: argv[0] stays as typed.
     var env: std.ArrayList(?[*:0]const u8) = .empty;
     for (info.env) |kv| {
-        if (isHandoffVar(kv) and !info.socket_activated) continue;
+        if (isHandoffVar(kv)) continue;
+        if (isActivationVar(kv) and !info.socket_activated) continue;
         try env.append(a, (try a.dupeSentinel(u8, kv, 0)).ptr);
     }
     try env.append(a, null);

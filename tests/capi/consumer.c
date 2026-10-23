@@ -2412,7 +2412,8 @@ static void test_tls(void) {
       "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
       "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
       "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_file\": \"ca.pem\"}}]}",
-      "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+      /* proxy_protocol null with a list passes: the deployment decides (on under anole_lb). */
+      "{\"listeners\": [{\"proxy_protocol\": false, \"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
   };
   for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
     anole_server_options o = {sizeof o, {bad[i], strlen(bad[i])}, 0, 0, on_log, NULL};

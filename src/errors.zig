@@ -289,7 +289,7 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try fix(w, "The log names both. Name one with pub const openapi: anole.openapi.Doc(@This()) = .{ .name = \"...\" }, or with app.openapi(.{ .rename = ... }).");
         },
         error.OpenApiOutOfDate => {
-            try w.writeAll("the OpenAPI file ");
+            try w.writeAll("can't go on: the OpenAPI file ");
             if (ctx.path) |p| {
                 try w.writeAll(p);
                 try w.writeAll(" ");

@@ -39,6 +39,19 @@ fn isString(comptime T: type) bool {
     };
 }
 
+/// Whether the last segment of `name` is a token (`token`, `bot_token`,
+/// `tokens`): secret in options, though the logger leaves a bare `token`
+/// alone (lexers and pagination use the word in log fields).
+fn isTokenName(comptime name: []const u8) bool {
+    const seg = if (std.mem.findScalarLast(u8, name, '.')) |i| name[i + 1 ..] else name;
+    for ([_][]const u8{ "token", "tokens" }) |word| {
+        if (std.ascii.eqlIgnoreCase(seg, word)) return true;
+        if (seg.len > word.len and std.ascii.endsWithIgnoreCase(seg, word) and
+            (seg[seg.len - word.len - 1] == '_' or seg[seg.len - word.len - 1] == '-')) return true;
+    }
+    return false;
+}
+
 /// One value at `name` (with its dotted prefix), recursing into structs.
 pub fn writeField(w: *std.Io.Writer, comptime name: []const u8, value: anytype, comptime depth: u8) std.Io.Writer.Error!void {
     const T = @TypeOf(value);
@@ -49,7 +62,7 @@ pub fn writeField(w: *std.Io.Writer, comptime name: []const u8, value: anytype, 
         }
         return w.print("{s} = (in memory)\n", .{name});
     }
-    if (comptime redact.isSensitiveType(T) or redact.isSensitiveName(name)) {
+    if (comptime redact.isSensitiveType(T) or redact.isSensitiveName(name) or isTokenName(name)) {
         // A secret that is unset or empty is not worth hiding.
         return w.print("{s} = {s}\n", .{ name, redacted });
     }

@@ -1,7 +1,9 @@
 //! Seams the live console (src/console) installs into the request path. The
 //! core imports nothing of it: a function pointer and one counter. Nothing
-//! installed (or no console attached) costs one load and a predicted branch
-//! per request.
+//! installed, or no console collecting, costs one relaxed load and a status
+//! compare per request, and no call: only an answer that may be a 5xx (an
+//! error result, or a status of 500 or more) reaches the console then, for
+//! its 5xx ring (design D10).
 const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
@@ -26,8 +28,30 @@ pub inline fn begin(io: std.Io) u64 {
     return now(io);
 }
 
-/// After the handler chain ran: `result` is what it returned.
+/// After the handler chain ran: `result` is what it returned. `start_ns`
+/// is `begin`'s: non-zero only while a console collects.
 pub inline fn end(req: *Request, res: *Response, result: anytype, start_ns: u64) void {
+    // A detached response has no answer yet: `finished` reports it.
+    if (res.detached) |d| {
+        d.console_start_ns = start_ns;
+        return;
+    }
+    // Nobody collecting: a possible 5xx only.
+    if (start_ns == 0 and !mayBe5xx(res, result)) return;
     const f = request_end orelse return;
     f(req, res, if (result) |_| null else |e| e, start_ns);
+}
+
+/// A detached response's answer is known (`Detached.finish`, after its
+/// `onFinish` work): as `end` would have reported it.
+pub inline fn finished(d: anytype, result: anyerror!void) void {
+    const start_ns: u64 = d.console_start_ns;
+    if (start_ns == 0 and !mayBe5xx(d.response, result)) return;
+    const f = request_end orelse return;
+    f(d.request, d.response, if (result) |_| null else |e| e, start_ns);
+}
+
+inline fn mayBe5xx(res: *const Response, result: anytype) bool {
+    if (result) |_| {} else |_| return true;
+    return @backingInt(res.status) >= 500;
 }
