@@ -268,7 +268,7 @@ pub const Exporter = struct {
         self.submit(span);
     }
 
-    fn submit(self: *Exporter, span: Span) void {
+    pub fn submit(self: *Exporter, span: Span) void {
         const n = self.queue.putUncancelable(self.io, &.{span}, 0) catch 0;
         if (n == 0) _ = self.dropped.fetchAdd(1, .monotonic) else _ = self.queued.fetchAdd(1, .release);
     }
