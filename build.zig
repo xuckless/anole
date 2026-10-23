@@ -679,11 +679,12 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
-    // The validator's and the logger's own tests: each is its own module
-    // (no imports), so the anole test binary does not collect them.
+    // The validator's, the logger's and the banner's own tests: each is its
+    // own module (no imports), so the anole test binary does not collect them.
     for ([_]struct { name: []const u8, mod: *std.Build.Module }{
         .{ .name = "validate-test", .mod = core.validate },
         .{ .name = "log-test", .mod = core.anole_log },
+        .{ .name = "banner-test", .mod = core.banner },
     }) |t| {
         const sub_tests = b.addTest(.{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
         const run_sub = b.addRunArtifact(sub_tests);
@@ -763,7 +764,10 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .link_libc = true,
-                .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
+                .imports = &.{
+                    .{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) },
+                    .{ .name = "anole_banner", .module = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize }) },
+                },
             }),
             .use_llvm = use_llvm,
         });
@@ -1564,6 +1568,7 @@ pub fn build(b: *std.Build) void {
         const templates_mod = b.createModule(.{ .root_source_file = b.path("templates/index.zig") });
         const CliBuild = struct {
             fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+                const banner = bb.createModule(.{ .root_source_file = bb.path("src/banner/root.zig"), .target = tgt, .optimize = opt });
                 return bb.createModule(.{
                     .root_source_file = bb.path("tools/anole/main.zig"),
                     .target = tgt,
@@ -1571,10 +1576,10 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "cli_options", .module = opts.createModule() },
                         .{ .name = "templates", .module = tmpl },
-                        // The startup banner (src/banner.zig, std only).
-                        .{ .name = "banner", .module = bb.createModule(.{ .root_source_file = bb.path("src/banner.zig") }) },
+                        // The startup banner (src/banner, std only).
+                        .{ .name = "banner", .module = banner },
                         // The live console's client and terminal UI (src/console/ui, std only).
-                        .{ .name = "anole_console_ui", .module = bb.createModule(.{ .root_source_file = bb.path("src/console/ui/root.zig"), .target = tgt, .optimize = opt, .link_libc = true }) },
+                        .{ .name = "anole_console_ui", .module = bb.createModule(.{ .root_source_file = bb.path("src/console/ui/root.zig"), .target = tgt, .optimize = opt, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} }) },
                     },
                 });
             }
@@ -1793,6 +1798,9 @@ const Core = struct {
     /// src/console/ui (the live console's std-only protocol, client, terminal
     /// UI and restart logic): `anole_console_ui` in anole.
     console_ui: *std.Build.Module,
+    /// src/banner (the startup banner and the anole art, std only):
+    /// `anole_banner` in anole and in the console UI.
+    banner: *std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
@@ -1811,8 +1819,9 @@ const Core = struct {
         const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
         const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
-        const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
-        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
+        const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
+        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -2208,6 +2217,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("validate", o.core.validate);
     mod.addImport("anole_log", o.core.anole_log);
     mod.addImport("anole_console_ui", o.core.console_ui);
+    mod.addImport("anole_banner", o.core.banner);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));

@@ -73,7 +73,9 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
-        try say(io, "anole {s}\n", .{options.version});
+        // The art with "anole x.y.z" under it at a terminal; the plain line
+        // for scripts.
+        if (!printBanner(io)) try say(io, "anole {s}\n", .{options.version});
         return 0;
     }
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -283,7 +285,7 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, mode: 
     }
 
     // 6. Next steps, after the anole when a person is looking.
-    printBanner(io);
+    _ = printBanner(io);
     if (mode == .new) {
         try say(io, "created {s} (template: {s}, anole v{s})\n  cd {s}\n{s}", .{ parsed.dir, template.name, options.version, parsed.dir, template.next_steps });
     } else {
@@ -311,16 +313,18 @@ fn exists(io: Io, dir: Io.Dir, path: []const u8) bool {
     return true;
 }
 
-/// The anole, when stdout is a terminal (not under NO_COLOR's colour, nor
-/// with ANOLE_NO_BANNER=1).
-fn printBanner(io: Io) void {
-    const tty = Io.File.stdout().isTty(io) catch false;
+/// The anole art and "anole x.y.z", when stdout is a terminal (uncoloured
+/// under NO_COLOR, none with ANOLE_NO_BANNER=1); whether it was shown.
+fn printBanner(io: Io) bool {
+    const out = Io.File.stdout();
+    const tty = out.isTty(io) catch false;
     const env: EnvReader = .{};
-    if (!banner.show(true, true, tty, env)) return;
-    var buf: [1024]u8 = undefined;
-    var w = Io.File.stdout().writer(io, &buf);
-    banner.write(&w.interface, .{ .version = options.version }, banner.styleFor(null, env)) catch return;
-    w.interface.flush() catch {};
+    if (!banner.show(true, true, tty, env)) return false;
+    var buf: [4096]u8 = undefined;
+    var w = out.writer(io, &buf);
+    banner.write(&w.interface, .{ .version = options.version }, banner.styleFor(banner.terminalColumns(io, out), env, banner.coin(io))) catch return false;
+    w.interface.flush() catch return false;
+    return true;
 }
 
 fn findTemplate(name: []const u8) ?index.Template {

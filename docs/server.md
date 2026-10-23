@@ -185,7 +185,7 @@ interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 | `env_files` | null | The `.env` files read at `init`. Null: the environment's (development: four files in the working directory; production: none); `&.{}`: none. |
 | `error_detail` | null | A 500 for an error with no status of its own names the error. Null: on in development. |
 | `log` | `.{}` | Logging, process-wide: `format` (`.auto`: JSON Lines in production, else text), `level` and `service`; see [logging.md](logging.md). |
-| `banner` | true | The startup banner (the anole, the version and the address), only when stderr is a terminal, the logs are text and the process is not run by systemd; `ANOLE_NO_BANNER=1` turns it off. |
+| `banner` | true | The startup banner (the word "anole" drawn large, the version and the address), only when stderr is a terminal, the logs are text and the process is not run by systemd; `ANOLE_NO_BANNER=1` turns it off. A terminal of 110 columns or more gets one of two full-size drawings at random, a narrower one (55 or more) a half-height one, a narrower one still only the version line. 24-bit colour when `COLORTERM` is `truecolor` or `24bit`, else the nearest 256 colours; `NO_COLOR` draws it uncoloured. |
 | `timeouts` | see below | The request, head, write, keep-alive and drain deadlines. |
 | `limits` | see below | Body, head and connection limits. |
 | `proxy` | none trusted | Trust in proxies in front: `trusted`, `X-Forwarded-*`. |

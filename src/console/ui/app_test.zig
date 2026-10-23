@@ -273,6 +273,30 @@ test "app golden: /routes" {
     try expectGolden("routes", &f.app);
 }
 
+test "app golden: the splash before the first log line, coloured or plain" {
+    var app = App.init(gpa, .attach, hello(true));
+    defer app.deinit();
+    app.start();
+    app.clearOutgoing();
+    app.tick(100_000, started_ms + 252_000);
+    app.heard(100_000);
+    try expectGolden("splash", &app);
+    // Without colour the O's yellow inside is left out, so the O stays an O.
+    var scr = try screen.Screen.init(gpa, cols, rows);
+    defer scr.deinit(gpa);
+    app.draw(&scr);
+    var colored: std.Io.Writer.Allocating = .init(gpa);
+    defer colored.deinit();
+    try scr.text(&colored.writer);
+    app.color = false;
+    app.draw(&scr);
+    var plain: std.Io.Writer.Allocating = .init(gpa);
+    defer plain.deinit();
+    try scr.text(&plain.writer);
+    try std.testing.expect(!std.mem.eql(u8, colored.written(), plain.written()));
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "waiting for log lines...") != null);
+}
+
 test "app golden: /help and /tasks" {
     const f = try fixture(.attach, true);
     defer {

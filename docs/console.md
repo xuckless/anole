@@ -24,6 +24,9 @@ info(anole): press c + Enter for the live console
   itself sets `console.keys = false`.
 - **Windows:** not yet. `anole console` says so; use WSL2 or Docker.
 
+Until the first log line arrives, the log view shows a small anole logo
+(when the window has room for it).
+
 `anole console --list` lists the apps, `--snapshot <view>` prints one view
 (`conns`, `db`, `ws`, `h3`, `runtime`, `config`, `routes`, `errors`) as JSON
 without a terminal, `--wedge-timeout <s>` sets when an app counts as stuck.

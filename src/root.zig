@@ -435,7 +435,6 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = @import("typed.zig");
-    _ = @import("banner.zig");
     _ = testing;
     _ = http;
     _ = resilience;

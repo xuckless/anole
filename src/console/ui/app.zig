@@ -109,6 +109,9 @@ pub const App = struct {
     restarting: ?[]const u8 = null,
     have_launch_info: bool = false,
     exec_supported: bool = true,
+    /// The terminal shows colour (not NO_COLOR): picks the coloured or the
+    /// plain anole for the splash.
+    color: bool = true,
 
     // Subscriptions.
     logs_sub: ?u32 = null,

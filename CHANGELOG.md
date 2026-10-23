@@ -131,6 +131,14 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- A new startup banner: the word "anole" drawn large in green with a yellow
+  O, replacing the lizard. Terminals of 110 columns or more get one of two
+  full-size drawings at random, narrower ones (55 or more) a half-height
+  version, narrower still only the version line. 24-bit colour when
+  `COLORTERM` says so, else the nearest 256 colours; uncoloured under
+  `NO_COLOR`. The rules for when it shows are unchanged. `anole version` and
+  `anole new` print it at a terminal, and the live console shows the small
+  version until the first log line.
 - A server that names only raw TCP/UDP listeners opens no HTTP listener.
 - `handoff.max_listeners` is 64 TCP listeners and 1024 UDP sockets.
 - `anole.http.Client`: `ClientOptions.http2` is on by default. Requests to a
