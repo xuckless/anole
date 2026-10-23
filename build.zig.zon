@@ -113,8 +113,8 @@
             .lazy = true,
         },
         .protobuf = .{
-            // TEMPORARY: local fork clone, branch doc-comments (e6de363); the lead pushes it to xuckless/zig-protobuf `anole` and re-pins by url + hash.
-            .path = "../../anole-forks/zig-protobuf",
+            .url = "git+https://github.com/xuckless/zig-protobuf#e6de363eb44854f453280875169d063eb077639e",
+            .hash = "protobuf-7.0.0-0e82aujmNgDEMIIEm-NBypMzOKX8l0fZK0gyCpbF1tmE",
             .lazy = true,
         },
         // -Dgrpc: upb, protobuf's C runtime, from the protobuf 36.2 release
