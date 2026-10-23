@@ -93,13 +93,13 @@ pub const Tied = struct {
     cut: *const fn (*Tied) void,
 };
 
-fn linkTied(x: *Exec, i: u32, t: *Tied) void {
+pub fn linkTied(x: *Exec, i: u32, t: *Tied) void {
     t.next = x.slots[i].db_tied;
     x.slots[i].db_tied = t;
     t.linked = true;
 }
 
-fn unlinkTied(x: *Exec, i: u32, t: *Tied) void {
+pub fn unlinkTied(x: *Exec, i: u32, t: *Tied) void {
     if (!t.linked) return;
     t.linked = false;
     var link = &x.slots[i].db_tied;
@@ -130,7 +130,7 @@ pub fn endTied(x: *Exec, i: u32, cut: bool) void {
 }
 
 /// Whether the request or call `h` is still there to serve.
-fn slotLive(x: *Exec, h: Handle) bool {
+pub fn slotLive(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
     if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;

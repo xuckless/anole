@@ -260,6 +260,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_NATS_JS_MSG` (66) | `anole_nats_msg_event` with the JetStream fields set | `anole_nats_msg` | `anole_nats_ack` (any kind) or `anole_handle_release` (= NAK) |
 | `ANOLE_EV_NATS_SUB_END` (67) | `anole_broker_end_event`: the subscription is over (`reason`, `dropped`) | `anole_nats_sub` | ends it |
 | (68) | reserved for NATS connection status | | |
+| `ANOLE_EV_NATS_STATUS` (68) | `anole_broker_status_event`: the connection came up (`ANOLE_BROKER_CONNECTED`), was lost (`DISCONNECTED`), came back (`RECONNECTED`) or the server announced lame duck mode (`LAME_DUCK`); sent to every consumer | 0 | none |
 | `ANOLE_EV_NATS_WRITABLE` (69) | `anole_broker_status_event`: a publish refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 

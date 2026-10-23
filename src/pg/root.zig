@@ -860,7 +860,16 @@ pub const Client = struct {
     fn boundedRun(comptime J: type) fn (*Client, *Ctx, ?dusty.Deadline, *J, ?*Tx, []const u8) internal.Bounded(J.run) {
         return struct {
             fn run(self: *Client, ctx: *Ctx, deadline: ?dusty.Deadline, j: *J, tx: ?*Tx, sql: []const u8) internal.Bounded(J.run) {
-                return self.guarded(ctx, deadline, J.run, .{ j, self, ctx, tx, sql });
+                const first = self.guarded(ctx, deadline, J.run, .{ j, self, ctx, tx, sql });
+                // A statement outside a transaction whose write failed on a
+                // pooled connection (the server closed it while idle) did not
+                // run: once more on another, outside the retry policy.
+                if (tx == null) if (first) |_| {} else |_| {
+                    const d = ctx.lastDetail() orelse return first;
+                    if (!std.mem.eql(u8, d.code, write_failed_code)) return first;
+                    return self.guarded(ctx, deadline, J.run, .{ j, self, ctx, tx, sql });
+                };
+                return first;
             }
         }.run;
     }
@@ -987,7 +996,17 @@ pub const Client = struct {
                     .message = "current transaction is aborted, commands ignored until end of transaction block",
                 });
                 if (tx) |t| t.state = .broken;
-                if (brokenConnection(err)) return ctx.failf(self.errors, .unavailable, "the connection to {f} broke: {t}", .{ self.settings, err });
+                if (brokenConnection(err)) {
+                    // A write that failed: nothing of the statement reached the
+                    // server (`boundedRun` runs it once more, transparently).
+                    const code: []const u8 = if (err == error.BrokenPipe or err == error.TlsWriteFailed) write_failed_code else "";
+                    return ctx.fail(self.errors, .{
+                        .system = .postgresql,
+                        .class = .unavailable,
+                        .code = code,
+                        .message = std.fmt.allocPrint(ctx.arena, "the connection to {f} broke: {t}", .{ self.settings, err }) catch "the connection broke",
+                    });
+                }
                 return ctx.failf(self.errors, .other, "{t}", .{err});
             },
         }
@@ -1048,6 +1067,9 @@ fn sendCancel(io: std.Io, conn: *pg.Conn) void {
     const deadline: dusty.Deadline = .init(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
     deadline.run(pg.Conn.cancel, .{conn}) catch |err| log.debug("postgres: CancelRequest: {t}", .{err});
 }
+
+/// The error code of a call whose write failed (see `Client.failed`).
+const write_failed_code = "connection_write_failed";
 
 fn brokenConnection(err: anyerror) bool {
     return switch (err) {

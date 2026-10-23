@@ -200,6 +200,43 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     }
 }
 
+/// Starts the status watchers (one per core client), after the executors'
+/// tasks are spawned: `ANOLE_EV_NATS_STATUS` to every consumer.
+pub fn watchStatus(e: *Engine, io: std.Io) void {
+    if (comptime !features.nats) return;
+    for (e.brokers) |*b| {
+        const cl = b.client orelse continue;
+        for (cl.cores, 0..) |*core, i| {
+            placement.concurrent(&e.tasks, io, .{ .executor = core.executor }, statusTask, .{ b, core }) catch |err|
+                log.warn("nats status watcher {d} of broker {s} not started: {t}", .{ i, b.config.name, err });
+        }
+    }
+}
+
+fn statusTask(b: *Broker, core: *anole.nats.core.Client) std.Io.Cancelable!void {
+    while (true) {
+        const ev = core.nextEvent(.{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return,
+        } orelse return;
+        const status: u32 = switch (ev) {
+            .connected => abi.BROKER_CONNECTED,
+            .disconnected => abi.BROKER_DISCONNECTED,
+            .reconnected => abi.BROKER_RECONNECTED,
+            .lame_duck => abi.BROKER_LAME_DUCK,
+            else => continue,
+        };
+        for (b.engine.consumers.items) |c| {
+            if (c.execs.items.len == 0) continue;
+            const rec = engine.newRecord(@sizeOf(abi.BrokerStatusEvent), .nats_status, 0) catch continue;
+            const out: *abi.BrokerStatusEvent = @ptrCast(rec.ptr);
+            out.broker = b.index;
+            out.status = status;
+            c.execs.items[0].postRecord(rec, false);
+        }
+    }
+}
+
 pub fn close(e: *Engine) void {
     for (e.brokers) |*b| b.open.store(false, .release);
 }
@@ -566,7 +603,20 @@ const Req = struct {
     msg_id: []const u8 = "",
     expected_stream: []const u8 = "",
     expected_last_seq: ?u64 = null,
+    /// The request or gRPC call this serves (0: none), and what ties it
+    /// to that request's end.
+    req: u64 = 0,
+    tied: db_cap.Tied = .{ .cut = cutReq },
+    end_request: bool = false,
+    task: ?placement.Task = null,
     arena: std.heap.ArenaAllocator,
+
+    /// The request ended unanswered (on its executor).
+    fn cutReq(t: *db_cap.Tied) void {
+        const q: *Req = @fieldParentPtr("tied", t);
+        q.end_request = true;
+        if (q.task) |tk| placement.cancelTask(tk);
+    }
 
     fn free(q: *Req) void {
         var arena = q.arena;
@@ -576,9 +626,31 @@ const Req = struct {
     fn run(cmd: *Command, x: *Exec) void {
         const q: *Req = @fieldParentPtr("cmd", cmd);
         if (x.engine.phase.load(.acquire) == .stopped) return q.free();
-        placement.concurrent(&x.nats.work, x.engine.io, .local, task, .{ x, q }) catch q.free();
+        if (q.req != 0) {
+            const h = Handle.decode(q.req);
+            if (!db_cap.slotLive(x, h)) {
+                postReqGone(x, q);
+                return q.free();
+            }
+            db_cap.linkTied(x, h.slot, &q.tied);
+        }
+        placement.concurrent(&x.nats.work, x.engine.io, .local, task, .{ x, q }) catch {
+            if (q.req != 0) db_cap.unlinkTied(x, Handle.decode(q.req).slot, &q.tied);
+            q.free();
+        };
     }
 };
+
+/// The answer of a request whose `req` ended first: `ANOLE_E_GONE`.
+fn postReqGone(x: *Exec, q: *const Req) void {
+    const rec = replyRecord(.{
+        .user_data = q.user_data,
+        .op = if (q.op == .request) abi.NATS_OP_REQUEST else abi.NATS_OP_JS_PUBLISH,
+        .status = abi.E_GONE,
+        .message = "the request it served ended (aborted or past its deadline)",
+    }) catch return;
+    x.postRecord(rec, false);
+}
 
 /// Copies the call's pieces into a command's arena.
 fn newReq(b: *Broker, op: Op, m: abi.NatsOut, user_data: u64) CallError!*Req {
@@ -635,6 +707,7 @@ pub fn request(b: *Broker, c: ?*Consumer, m: abi.NatsOut, opts: abi.NatsRequestO
     const q = try newReq(b, .request, m, user_data);
     q.flags = opts.flags;
     q.timeout_ms = opts.timeout_ms;
+    q.req = opts.req;
     x.post(&q.cmd);
 }
 
@@ -647,6 +720,7 @@ pub fn jsPublish(b: *Broker, c: ?*Consumer, m: abi.NatsOut, opts: abi.NatsJsPubl
     errdefer q.free();
     const a = q.arena.allocator();
     q.timeout_ms = opts.timeout_ms;
+    q.req = opts.req;
     q.msg_id = try a.dupe(u8, opts.msg_id.slice());
     q.expected_stream = try a.dupe(u8, opts.expected_stream.slice());
     q.expected_last_seq = if (opts.flags & abi.NATS_JS_F_EXPECT_LAST_SEQ != 0 or opts.expected_last_seq != 0) opts.expected_last_seq else null;
@@ -654,7 +728,12 @@ pub fn jsPublish(b: *Broker, c: ?*Consumer, m: abi.NatsOut, opts: abi.NatsJsPubl
 }
 
 fn task(x: *Exec, q: *Req) std.Io.Cancelable!void {
-    defer q.free();
+    defer {
+        if (q.req != 0) db_cap.unlinkTied(x, Handle.decode(q.req).slot, &q.tied);
+        q.free();
+    }
+    q.task = placement.currentTask(x.engine.io);
+    if (q.end_request) return postReqGone(x, q);
     if (comptime !features.nats) return;
     const b = q.b;
     if (!b.open.load(.acquire)) return;
@@ -695,7 +774,12 @@ fn task(x: *Exec, q: *Req) std.Io.Cancelable!void {
         },
     }
     if (failed) |err| {
-        if (err == error.Canceled) return error.Canceled;
+        if (err == error.Canceled) {
+            // Cut with its request: the answer is GONE. Canceled at the
+            // stop, it answers nothing.
+            if (q.end_request) return postReqGone(x, q);
+            return error.Canceled;
+        }
         data.status = abi.E_BROKER;
         data.http_status = switch (err) {
             error.ServiceUnavailable => 503,
@@ -856,7 +940,6 @@ fn subTask(x: *Exec, s: *SubRun) std.Io.Cancelable!void {
     var reason: u32 = abi.BROKER_END_CLOSED;
     var dropped: u64 = 0;
     var message: []const u8 = "";
-    var stopped_by_engine = false;
     if (comptime features.nats) {
         const cl = s.b.client.?;
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -877,7 +960,7 @@ fn subTask(x: *Exec, s: *SubRun) std.Io.Cancelable!void {
                     while (!s.stop.load(.acquire)) {
                         const got = sub.inner.next(.{}) catch |err| {
                             switch (err) {
-                                error.Canceled => stopped_by_engine = !s.stop.load(.acquire),
+                                error.Canceled => {},
                                 error.SlowConsumer => reason = abi.BROKER_END_SLOW,
                                 error.PermissionDenied => reason = abi.BROKER_END_DENIED,
                                 else => reason = abi.BROKER_END_FAILED,
@@ -887,7 +970,6 @@ fn subTask(x: *Exec, s: *SubRun) std.Io.Cancelable!void {
                         var m = got orelse break;
                         defer m.deinit();
                         deliver(x, s, &m) catch {
-                            stopped_by_engine = !s.stop.load(.acquire);
                             break;
                         };
                     }
@@ -895,7 +977,6 @@ fn subTask(x: *Exec, s: *SubRun) std.Io.Cancelable!void {
                 } else |err| {
                     reason = if (err == error.Database) abi.BROKER_END_DENIED else abi.BROKER_END_FAILED;
                     if (db.lastError(&ctx)) |d| message = d.message else message = @errorName(err);
-                    if (err == error.Canceled) stopped_by_engine = !s.stop.load(.acquire);
                 }
             },
             .consume => {
@@ -907,9 +988,7 @@ fn subTask(x: *Exec, s: *SubRun) std.Io.Cancelable!void {
                     s.puller = p;
                     // Until unsubscribed (a cancel), or the stop.
                     var never: std.Io.Event = .unset;
-                    never.wait(e.io) catch {
-                        stopped_by_engine = !s.stop.load(.acquire);
-                    };
+                    never.wait(e.io) catch {};
                     p.stop();
                 } else |err| {
                     reason = abi.BROKER_END_FAILED;
@@ -920,9 +999,9 @@ fn subTask(x: *Exec, s: *SubRun) std.Io.Cancelable!void {
     }
     const h = s.handle;
     const user_data = s.user_data;
-    if (!stopped_by_engine) {
-        if (endRecord(h, user_data, reason, dropped, message)) |rec| x.postRecord(rec, false) else |_| {}
-    }
+    // Also at the server's stop: every live subscription and consume ends
+    // with its SUB_END (queued without waiting, before ANOLE_EV_STOPPED).
+    if (endRecord(h, user_data, reason, dropped, message)) |rec| x.postRecord(rec, false) else |_| {}
     s.release();
 }
 

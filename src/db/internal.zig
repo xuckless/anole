@@ -221,6 +221,25 @@ pub fn Guarded(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
 }
 
+/// Whether `Retry.attempt_timeout` can bound `func`'s attempts: its errors
+/// include GatewayTimeout (the bound's error) and `record` can name the
+/// failure (a connector with its own context type records itself).
+fn canBoundAttempt(comptime func: anytype) bool {
+    const R = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+    const eu = switch (@typeInfo(R)) {
+        .error_union => |e| e,
+        else => return false,
+    };
+    const names = @typeInfo(eu.error_set).error_set.error_names orelse return true;
+    var timeout = false;
+    var canceled = false;
+    inline for (names) |n| {
+        if (comptime std.mem.eql(u8, n, "GatewayTimeout")) timeout = true;
+        if (comptime std.mem.eql(u8, n, "Canceled")) canceled = true;
+    }
+    return timeout and canceled;
+}
+
 /// Runs `func(args)` (a connector's call, already `bounded`) under the
 /// guard: breaker gate, and with `retry` the policy. A rejected call fails
 /// with `fail(c, map, ...)`: class `unavailable`, code "circuit_open".
@@ -243,8 +262,20 @@ pub fn guarded(c: anytype, g: *Guard, map: ErrorMap, retry: bool, deadline: ?std
                 return failIn(c, map, .{ .system = g.system, .class = .unavailable, .code = "circuit_open", .message = msg });
             };
         }
-        const r = @call(.auto, func, args);
+        var attempt_timed_out = false;
+        const r = if (comptime canBoundAttempt(func)) blk: {
+            const at = (if (retry) g.retry.attempt_timeout else null) orelse break :blk @call(.auto, func, args);
+            const dl: dusty.Deadline = .init(io, .{ .duration = .{ .raw = at, .clock = .awake } });
+            break :blk dl.run(func, args) catch |err| switch (err) {
+                error.Timeout => {
+                    attempt_timed_out = true;
+                    break :blk failIn(c, map, .{ .system = g.system, .class = .timeout, .message = "the attempt ran past its attempt_timeout" });
+                },
+                else => |e| break :blk e,
+            };
+        } else @call(.auto, func, args);
         const transient = if (r) |_| false else |_| blk: {
+            if (attempt_timed_out) break :blk true;
             const d = lastIn(c) orelse break :blk false;
             break :blk d.class == .unavailable and !std.mem.eql(u8, d.code, "pool_timeout") and !std.mem.eql(u8, d.code, "circuit_open");
         };

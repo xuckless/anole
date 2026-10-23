@@ -1606,3 +1606,35 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
         try io.sleep(.fromMilliseconds(10), .awake);
     }
 }
+
+test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request the GOAWAY did not reach" {
+    const h = @import("anole_nghttp3_c");
+    var conn: client.ClientConnection = undefined;
+    var s: client.Stream = undefined;
+    s.conn = &conn;
+    s.id = 4;
+    s.status = 0;
+    s.reset_code = 0;
+    conn.goaway_id = std.math.maxInt(i64);
+    // Nothing happened to it.
+    try std.testing.expect(!s.unprocessed());
+    // Rejected by the server (RFC 9114 H3_REQUEST_REJECTED).
+    s.reset_code = h.NGHTTP3_H3_REQUEST_REJECTED;
+    try std.testing.expect(s.unprocessed());
+    // Another error code is not "unprocessed".
+    s.reset_code = h.NGHTTP3_H3_REQUEST_CANCELLED;
+    try std.testing.expect(!s.unprocessed());
+    s.reset_code = 0;
+    // GOAWAY(8): streams at or above 8 were not processed, those below were
+    // (unless they have no head, below it they carry on).
+    conn.goaway_id = 8;
+    s.id = 4;
+    try std.testing.expect(!s.unprocessed());
+    s.id = 8;
+    try std.testing.expect(s.unprocessed());
+    s.id = 12;
+    try std.testing.expect(s.unprocessed());
+    // A request that already has its answer ran.
+    s.status = 200;
+    try std.testing.expect(!s.unprocessed());
+}

@@ -794,3 +794,56 @@ test "h2 client: informational responses before the final one, up to a limit" {
         try std.testing.expectError(error.TooManyInterimResponses, s.waitHead());
     }
 }
+
+test "h2 client: a stream refused with REFUSED_STREAM is unprocessed; one reset with CANCEL is not" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const refused = try request(conn, "/", .{});
+    defer refused.release();
+    const canceled = try request(conn, "/", .{});
+    defer canceled.release();
+    try std.testing.expectEqual(@as(i32, 1), refused.id);
+    try std.testing.expectEqual(@as(i32, 3), canceled.id);
+    // RST_STREAM: REFUSED_STREAM (7) for stream 1, CANCEL (8) for stream 3.
+    try peer.send(&frame(3, 0, 1, &.{ 0, 0, 0, 7 }));
+    try peer.send(&frame(3, 0, 3, &.{ 0, 0, 0, 8 }));
+    try std.testing.expect(std.meta.isError(refused.waitHead()));
+    try std.testing.expect(std.meta.isError(canceled.waitHead()));
+    try std.testing.expect(refused.unprocessed());
+    try std.testing.expect(!canceled.unprocessed());
+}
+
+test "h2 client: after GOAWAY(last=1) stream 3 is unprocessed and stream 1, which is answered, is not" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const first = try request(conn, "/", .{});
+    defer first.release();
+    const second = try request(conn, "/", .{});
+    defer second.release();
+    try std.testing.expectEqual(@as(i32, 1), first.id);
+    try std.testing.expectEqual(@as(i32, 3), second.id);
+    // GOAWAY: last stream 1, NO_ERROR; then stream 1's answer (:status 200).
+    try peer.send(&frame(7, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }));
+    try peer.send(&frame(1, 0x5, 1, &.{0x88}));
+    try first.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try std.testing.expect(std.meta.isError(second.waitHead()));
+    try std.testing.expect(second.unprocessed());
+    try std.testing.expect(!first.unprocessed());
+}
