@@ -73,7 +73,7 @@ pub fn writePacket(side: Side, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, 
     // WebTransport: datagrams first (they are small and go stale), then
     // its streams and nghttp3's take turns at leading a packet.
     var datagrams = side.wt != null;
-    const wt_first = if (side.wt) |w| w.takeTurn() else false;
+    const wt_first = if (side.wt) |w| w.leads() else false;
     while (true) {
         if (side.wt) |w| {
             if (datagrams) if (w.writeDatagram(p, pi, dest[0..dest_len], ts)) |wrote| switch (wrote) {
@@ -623,7 +623,7 @@ test "send queue: the cap and the budget stop a write, force passes both and sti
     var budget = Budget.init(testIo(), 150);
     var q: SendQueue = .{};
     defer q.deinit(&pool, &budget);
-    const data = [_]u8{1} ** 400;
+    const data: [400]u8 = @splat(1);
     try std.testing.expectEqual(@as(usize, 100), try q.write(&pool, &budget, &data, 100, false));
     try std.testing.expectEqual(@as(usize, 0), try q.write(&pool, &budget, &data, 100, false));
     // The cap is 300 now, but the budget has 50 left.
@@ -642,7 +642,7 @@ test "send queue take hands nghttp3 the same runs and marks them sent" {
     var budget = Budget.init(testIo(), 1 << 20);
     var q: SendQueue = .{};
     defer q.deinit(&pool, &budget);
-    const data = [_]u8{9} ** (block_data + 100);
+    const data: [block_data + 100]u8 = @splat(9);
     _ = try q.write(&pool, &budget, &data, 1 << 20, false);
     var vec: [16]h.nghttp3_vec = undefined;
     try std.testing.expectEqual(@as(usize, 2), q.take(&vec, vec.len));
@@ -699,106 +699,4 @@ test "signal: a notify between epoch and wait makes wait return at once; no slee
     try std.testing.expect(s.epoch() != seen);
     try s.wait(std.testing.io, seen);
     try std.testing.expectEqual(@as(u32, 1), s.returns.load(.monotonic));
-}
-
-/// A body ring: [acked, sent) handed to nghttp3 and not yet acknowledged,
-/// [sent, written) not yet handed over. nghttp3 does not copy body data, so
-/// bytes stay here until the peer acknowledges them. Counters only grow;
-/// positions are taken modulo the ring.
-pub const Ring = struct {
-    buf: []u8 = &.{},
-    acked: u64 = 0,
-    sent: u64 = 0,
-    written: u64 = 0,
-
-    pub const len = 64 * 1024;
-
-    pub fn deinit(r: *Ring, gpa: std.mem.Allocator) void {
-        if (r.buf.len > 0) gpa.free(r.buf);
-        r.* = undefined;
-    }
-
-    /// Makes the buffer at least `size` bytes, before anything is written
-    /// (a stream from a pool may bring one of another size).
-    pub fn reserve(r: *Ring, gpa: std.mem.Allocator, size: usize) error{OutOfMemory}!void {
-        std.debug.assert(r.written == 0);
-        if (r.buf.len >= size) return;
-        if (r.buf.len > 0) gpa.free(r.buf);
-        r.buf = &.{};
-        r.buf = try gpa.alloc(u8, size);
-    }
-
-    /// Copies in what fits; returns how much did.
-    pub fn write(r: *Ring, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!usize {
-        if (r.buf.len == 0) r.buf = try gpa.alloc(u8, len);
-        const free = r.buf.len - @as(usize, @intCast(r.written - r.acked));
-        const n = @min(free, bytes.len);
-        var i: usize = 0;
-        while (i < n) {
-            const pos: usize = @intCast((r.written + i) % r.buf.len);
-            const k = @min(n - i, r.buf.len - pos);
-            @memcpy(r.buf[pos..][0..k], bytes[i..][0..k]);
-            i += k;
-        }
-        r.written += n;
-        return n;
-    }
-
-    /// Everything written has been handed to nghttp3.
-    pub fn allSent(r: *const Ring) bool {
-        return r.sent == r.written;
-    }
-
-    /// Hands what is written and not yet sent to nghttp3, in one or two
-    /// runs (the ring may wrap). Returns the vector count.
-    pub fn take(r: *Ring, vec: [*c]h.nghttp3_vec, veccnt: usize) usize {
-        var count: usize = 0;
-        var from = r.sent;
-        while (from < r.written and count < veccnt) {
-            const pos: usize = @intCast(from % r.buf.len);
-            const k: usize = @min(@as(usize, @intCast(r.written - from)), r.buf.len - pos);
-            vec[count] = .{ .base = r.buf[pos..].ptr, .len = k };
-            count += 1;
-            from += k;
-        }
-        r.sent = from;
-        return count;
-    }
-
-    /// What is written and not yet sent, in one or two runs (the ring may
-    /// wrap), leaving `sent` where it is: for a writer that learns only
-    /// afterwards how much went (`ngtcp2_conn_writev_stream`). Returns the
-    /// run count.
-    pub fn unsent(r: *const Ring, runs: *[2][]const u8) usize {
-        var count: usize = 0;
-        var from = r.sent;
-        while (from < r.written and count < runs.len) {
-            const pos: usize = @intCast(from % r.buf.len);
-            const k: usize = @min(@as(usize, @intCast(r.written - from)), r.buf.len - pos);
-            runs[count] = r.buf[pos..][0..k];
-            count += 1;
-            from += k;
-        }
-        return count;
-    }
-};
-
-test "ring wraps and keeps unacknowledged bytes" {
-    const gpa = std.testing.allocator;
-    var r: Ring = .{};
-    defer r.deinit(gpa);
-    const big = try gpa.alloc(u8, Ring.len + 10);
-    defer gpa.free(big);
-    for (big, 0..) |*b, i| b.* = @truncate(i);
-    try std.testing.expectEqual(@as(usize, Ring.len), try r.write(gpa, big));
-    try std.testing.expectEqual(@as(usize, 0), try r.write(gpa, big[Ring.len..]));
-    var vec: [2]h.nghttp3_vec = undefined;
-    try std.testing.expectEqual(@as(usize, 1), r.take(&vec, vec.len));
-    try std.testing.expectEqual(@as(usize, Ring.len), vec[0].len);
-    r.acked += 100;
-    try std.testing.expectEqual(@as(usize, 10), try r.write(gpa, big[Ring.len..]));
-    try std.testing.expectEqual(@as(usize, 1), r.take(&vec, vec.len));
-    try std.testing.expectEqual(@as(usize, 10), vec[0].len);
-    try std.testing.expectEqual(big[Ring.len], vec[0].base[0]);
-    try std.testing.expect(r.allSent());
 }
