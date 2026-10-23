@@ -4047,8 +4047,14 @@ static void test_net(void) {
   CHECK(anole_net_udp_find(s, NET_STR("nope"), &found) == ANOLE_E_INVALID && name_is("UnknownListener"));
   close(ufd);
 
+  /* The out counter moves once the send returns on the executor, which can
+     be after the peer already has the datagram: wait for it. */
   anole_stats st = {.size = sizeof st};
-  CHECK(anole_server_stats(s, &st) == ANOLE_OK);
+  for (int i = 0; i < 1000; i++) {
+    CHECK(anole_server_stats(s, &st) == ANOLE_OK);
+    if (st.udp_datagrams_in >= 1 && st.udp_datagrams_out >= 1) break;
+    usleep(2000);
+  }
   CHECK(st.udp_datagrams_in >= 1 && st.udp_datagrams_out >= 1);
   stop_polled(s);
   printf("ok raw TCP and UDP: framed lines, FIN, stale handles, datagrams, addresses\n");
