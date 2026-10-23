@@ -17,7 +17,7 @@ const resilience = @import("../resilience/root.zig");
 
 const Watch = root.Watch;
 const Raw = root.Raw;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 const builtin = @import("builtin");
 /// A command as the client takes it.
 const S = []const []const u8;

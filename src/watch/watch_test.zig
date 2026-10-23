@@ -160,6 +160,8 @@ test "watch: a handler runs events in order; a failing one is logged and the nex
 }
 
 test "watch: init refuses what cannot work" {
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
     var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
     defer topics.deinit();
     try std.testing.expectError(error.InvalidWatch, Watch.init(gpa, io, .{ .postgres = .{ .client = stubClient(), .channels = &.{} } }, .{}));

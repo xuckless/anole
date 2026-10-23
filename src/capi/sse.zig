@@ -29,7 +29,7 @@ const AnswerError = engine.AnswerError;
 const gpa = engine.gpa;
 const sse = anole.sse;
 
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 const chunk_len = 256;
 const max_chunks = 4096;

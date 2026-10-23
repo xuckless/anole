@@ -15,7 +15,7 @@ const db = @import("../db/root.zig");
 const root = @import("root.zig");
 
 const Watch = root.Watch;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 pub fn startStream(w: *Watch) !void {
     try placement.concurrent(&w.group, w.io, .local, streamTask, .{w});

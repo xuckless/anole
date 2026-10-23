@@ -27,7 +27,7 @@ const AnswerError = engine.AnswerError;
 const gpa = engine.gpa;
 const aw = anole.watch;
 
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 /// A configured watch (`anole_watch *` in C).
 pub const Entry = struct {
@@ -67,6 +67,9 @@ const Sub = struct {
 pub const State = struct {
     lock: std.atomic.Mutex = .unlocked,
     entries: []Entry = &.{},
+    /// The allocation behind `entries` (which `close` empties), freed by
+    /// `deinit`.
+    owned: []Entry = &.{},
     /// By slot: the live listener, and the generation the next one gets.
     subs: std.ArrayList(?*Sub) = .empty,
     gens: std.ArrayList(u32) = .empty,
@@ -93,8 +96,9 @@ pub const State = struct {
         s.subs.deinit(gpa);
         s.gens.deinit(gpa);
         s.free.deinit(gpa);
-        for (s.entries) |en| if (en.keys.len > 0) gpa.free(en.keys);
-        if (s.entries.len > 0) gpa.free(s.entries);
+        for (s.owned) |en| if (en.keys.len > 0) gpa.free(en.keys);
+        if (s.owned.len > 0) gpa.free(s.owned);
+        s.owned = &.{};
         s.entries = &.{};
     }
 
@@ -217,10 +221,13 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     if (cfgs.len == 0) return;
     const a = e.arena.allocator();
     const entries = try gpa.alloc(Entry, cfgs.len);
-    e.watch_state.entries = entries;
     var made: usize = 0;
     errdefer {
-        for (entries[0..made]) |en| en.w.deinit();
+        for (entries[0..made]) |en| {
+            en.w.deinit();
+            if (en.keys.len > 0) gpa.free(en.keys);
+        }
+        gpa.free(entries);
     }
     for (cfgs, entries, 0..) |cfg, *en, i| {
         var manual = false;
@@ -246,6 +253,8 @@ pub fn open(e: *Engine, app: *anole.App) !void {
                 }
             }
         }
+        const keys: []const []const u8 = if (cfg.redis_stream) |r| try gpa.dupe([]const u8, r.keys) else &.{};
+        errdefer if (keys.len > 0) gpa.free(keys);
         const w = aw.Watch.init(gpa, app.io(), source, .{
             .name = cfg.name,
             .to = targets.items,
@@ -268,10 +277,12 @@ pub fn open(e: *Engine, app: *anole.App) !void {
                 .mongodb => abi.WATCH_SRC_MONGODB,
             },
             .manual_ack = manual,
-            .keys = if (cfg.redis_stream) |r| try gpa.dupe([]const u8, r.keys) else &.{},
+            .keys = keys,
         };
         made += 1;
     }
+    e.watch_state.entries = entries;
+    e.watch_state.owned = entries;
 }
 
 /// `anole_server_start`: serving begins.

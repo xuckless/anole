@@ -41,7 +41,7 @@ const resilience = @import("../resilience/root.zig");
 const observe_metrics = @import("../observe/metrics.zig");
 pub const template = @import("template.zig");
 
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 const websocket = if (features.websocket) @import("../websocket/root.zig") else struct {
     const Kind_ = enum { text, binary };

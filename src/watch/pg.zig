@@ -13,7 +13,7 @@ const root = @import("root.zig");
 const resilience = @import("../resilience/root.zig");
 
 const Watch = root.Watch;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 /// How often the hub asks the server whether the connection is alive.
 const keepalive_interval: std.Io.Duration = .fromSeconds(30);
