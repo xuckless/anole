@@ -392,6 +392,19 @@ and docs/c-abi.md ("From ABI 0.6").
   `anole_last_error` names the routes. Zig's `app.get` and friends still
   panic on a conflict, at registration.
 
+### Fixed
+
+- A server busy with many thousands of connections on one executor let new
+  ones in slowly: its accept loop took 128 connections per pass over the
+  busy ones (64 once spawn backpressure applied), and a pass takes about
+  200 ms at 25,000 connections. The clients still in the backlog waited
+  10 s or more for their first answer while those already in were served
+  every pass (HTTP/1.1 at 25,000 connections on one CPU: p99 6.3 s, about
+  3,800 timeouts). Idle connections waking from parking queued behind the
+  same limit (p50 1.6 s). zio's accept and spawn budgets now grow to the
+  number of tasks that ran during the last trip to the back of the run
+  queue (zio `fast_accept`, which Anole turns on).
+
 ## 0.1.2 (2026-10-22)
 
 ### Breaking

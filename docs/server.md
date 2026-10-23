@@ -68,7 +68,7 @@ Both are optional. `zio_options` in your executable's root file sets zio's
 configuration:
 
 ```zig
-pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned }
+pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned, .fast_accept = true }
 ```
 
 zio reads it at compile time, as std reads `std_options`. Pinned scheduling
@@ -78,7 +78,13 @@ on one thread, so nghttp2 sessions, BoringSSL's per-thread error queue and
 zig-protobuf's thread-locals need no locking. Anole builds zio with pinned
 scheduling as the default, so the declaration can be left out; a root file
 that declares work stealing fails to compile, with a message that says what
-to write instead. To set other zio options, keep `.pinned`:
+to write instead. `fast_accept` lets an executor busy with thousands of
+connections still take new ones quickly: the accept loop takes connections
+waiting in the backlog directly, and it (and anything else that starts
+tasks, such as idle connections waking) gets a turn sized to the run queue
+rather than a fixed 128 or 64. Anole's build turns it on too, so leaving it
+out of your own declaration keeps it. To set other zio options, keep
+`.pinned`:
 
 ```zig
 pub const zio_options: anole.zio.Options = .{ .scheduling = .pinned, .debug_cancel = true };
