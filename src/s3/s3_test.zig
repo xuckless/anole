@@ -10,7 +10,28 @@ const fake_ = @import("testing.zig");
 const credentials = @import("credentials.zig");
 const util = @import("util.zig");
 
+const zio = @import("zio");
+
 const testing = std.testing;
+
+/// The runtime the current test runs on (dusty's server and the zio-aware
+/// client want zio's `Io`, not `std.tio()`).
+var current_rt: ?*zio.Runtime = null;
+
+fn tio() std.Io {
+    return current_rt.?.io();
+}
+
+const Rt = struct {
+    fn start() !void {
+        std.debug.assert(current_rt == null);
+        current_rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(2) });
+    }
+    fn stop() void {
+        current_rt.?.deinit();
+        current_rt = null;
+    }
+};
 const FakeServer = fake_.FakeServer;
 const mib: usize = 1024 * 1024;
 
@@ -27,19 +48,21 @@ const Env = struct {
     ctx: db.Ctx,
 
     fn init(overrides: s3.Options) !*Env {
+        try Rt.start();
+        errdefer Rt.stop();
         const self = try testing.allocator.create(Env);
         errdefer testing.allocator.destroy(self);
-        self.fake = try FakeServer.start(testing.allocator, testing.io);
+        self.fake = try FakeServer.start(testing.allocator, tio());
         errdefer self.fake.stop();
         var o = overrides;
         o.endpoint = o.endpoint orelse self.fake.url();
         o.bucket = o.bucket orelse "b";
         if (o.credentials == .chain) o.credentials = self.fake.credentials();
         if (o.retry != null and o.retry.?.attempts == 3 and o.retry.?.backoff.base.nanoseconds == std.time.ns_per_ms * 100) o.retry = fast_retry;
-        self.client = try s3.Client.init(testing.allocator, testing.io, o);
+        self.client = try s3.Client.init(testing.allocator, tio(), o);
         errdefer self.client.deinit();
         self.arena_state = .init(testing.allocator);
-        self.ctx = .{ .io = testing.io, .arena = self.arena_state.allocator() };
+        self.ctx = .{ .io = tio(), .arena = self.arena_state.allocator() };
         return self;
     }
 
@@ -48,6 +71,7 @@ const Env = struct {
         self.fake.stop();
         self.arena_state.deinit();
         testing.allocator.destroy(self);
+        Rt.stop();
     }
 
     fn c(self: *Env) *db.Ctx {
@@ -302,7 +326,7 @@ test "s3: deinit before finish aborts the multipart upload" {
     const data = try pattern(env.ctx.arena, 6 * mib, 4);
     _ = try up.write(env.c(), data);
     // A part request means the server knows the upload and so do we.
-    while (env.fake.count("PUT", "partNumber=") == 0) try testing.io.sleep(.fromMilliseconds(5), .awake);
+    while (env.fake.count("PUT", "partNumber=") == 0) try tio().sleep(.fromMilliseconds(5), .awake);
     up.deinit();
     try testing.expectEqual(@as(usize, 0), env.fake.openUploads());
     try testing.expectEqual(@as(usize, 1), env.fake.count("DELETE", "uploadId="));
@@ -348,7 +372,7 @@ test "s3: RequestTimeTooSkewed teaches the clock and the call is repeated once" 
     const env = try Env.init(.{});
     defer env.deinit();
     var buf: [29]u8 = undefined;
-    const ahead = util.formatHttpDate(&buf, util.nowSeconds(testing.io) + 3600);
+    const ahead = util.formatHttpDate(&buf, util.nowSeconds(tio()) + 3600);
     try env.fake.addFault(.{ .remaining = 1, .status = 403, .code = "RequestTimeTooSkewed", .date = ahead });
     _ = try env.client.put(env.c(), "skew", .{ .bytes = "v" }, .{});
     try testing.expectEqual(@as(usize, 2), env.fake.count("PUT", "/b/skew"));
@@ -424,7 +448,7 @@ test "s3: copy keeps the metadata unless replace_metadata is set" {
 }
 
 fn rawPut(url: []const u8, headers: []const [2][]const u8, body: []const u8) !u16 {
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     var keys: [8][]const u8 = undefined;
     var values: [8][]const u8 = undefined;
@@ -452,7 +476,7 @@ test "s3: a presigned GET is usable by anyone; a zero expiry is refused" {
     defer env.deinit();
     _ = try env.client.put(env.c(), "pub.txt", .{ .bytes = "public" }, .{});
     const url = try env.client.presign(env.c(), .get, "pub.txt", .{ .expires = .fromSeconds(60), .response_content_type = "text/x-test" });
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     var resp = try http.fetch(url, .{});
     defer resp.deinit();
@@ -473,7 +497,7 @@ test "s3: multipart for browsers: create, presigned upload_part URLs, complete" 
     var parts: [2]s3.Part = undefined;
     for ([_][]const u8{ part1, part2 }, 0..) |data, i| {
         const url = try env.client.presign(env.c(), .upload_part, "browser.bin", .{ .upload_id = id, .part_number = @intCast(i + 1) });
-        var http = dusty.Client.init(testing.allocator, testing.io, .{});
+        var http = dusty.Client.init(testing.allocator, tio(), .{});
         defer http.deinit();
         var resp = try http.fetch(url, .{ .method = .put, .body = data, .decompress = false });
         defer resp.deinit();
@@ -512,7 +536,7 @@ test "s3: the bound of a call that moves a body is timeout + bytes / min_through
 test "s3: drain: a new upload is ServiceUnavailable (draining)" {
     const env = try Env.init(.{});
     defer env.deinit();
-    env.client.drain(std.Io.Clock.Timestamp.now(testing.io, .awake));
+    env.client.drain(std.Io.Clock.Timestamp.now(tio(), .awake));
     const q = Quiet.on();
     defer q.done();
     try testing.expectError(error.ServiceUnavailable, env.client.upload(env.c(), "k", .{}));
@@ -520,13 +544,15 @@ test "s3: drain: a new upload is ServiceUnavailable (draining)" {
 }
 
 test "s3: a call without a bucket is a BadRequest with a clear code; bucket(name) works" {
-    const fake = try FakeServer.start(testing.allocator, testing.io);
+    try Rt.start();
+    defer Rt.stop();
+    const fake = try FakeServer.start(testing.allocator, tio());
     defer fake.stop();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const client = try s3.Client.init(testing.allocator, testing.io, .{ .endpoint = fake.url(), .credentials = fake.credentials() });
+    const client = try s3.Client.init(testing.allocator, tio(), .{ .endpoint = fake.url(), .credentials = fake.credentials() });
     defer client.deinit();
-    var c: db.Ctx = .{ .io = testing.io, .arena = arena.allocator() };
+    var c: db.Ctx = .{ .io = tio(), .arena = arena.allocator() };
     const q = Quiet.on();
     defer q.done();
     try testing.expectError(error.BadRequest, client.get(&c, "k", .{}));
@@ -536,11 +562,13 @@ test "s3: a call without a bucket is a BadRequest with a clear code; bucket(name
 }
 
 test "s3: bad options are refused at init" {
+    try Rt.start();
+    defer Rt.stop();
     const q = Quiet.on();
     defer q.done();
-    try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, testing.io, .{ .part_size = 1024 }));
-    try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, testing.io, .{ .concurrency = 0 }));
-    try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, testing.io, .{ .endpoint = "ftp://x" }));
+    try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, tio(), .{ .part_size = 1024 }));
+    try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, tio(), .{ .concurrency = 0 }));
+    try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, tio(), .{ .endpoint = "ftp://x" }));
 }
 
 // ---- Through a running HTTP server: serve and put(.request) -------------------
@@ -577,15 +605,15 @@ test "s3: serve answers from the object: headers, Range, If-None-Match, HEAD and
 
     var gw: Gateway = .{ .files = env.client };
     const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
-    var server = dusty.Server(Gateway).init(testing.allocator, testing.io, .{ .listeners = loopback }, &gw);
+    var server = dusty.Server(Gateway).init(testing.allocator, tio(), .{ .listeners = loopback }, &gw);
     defer server.deinit();
     server.router.get("/f/*rest", Gateway.serve);
     server.router.head("/f/*rest", Gateway.serve);
-    var fut = try testing.io.concurrent(runGateway, .{&server});
-    defer _ = fut.cancel(testing.io) catch {};
-    try server.waitReady(testing.io);
+    var fut = try tio().concurrent(runGateway, .{&server});
+    defer _ = fut.cancel(tio()) catch {};
+    try server.waitReady(tio());
 
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     const base = try std.fmt.allocPrint(env.ctx.arena, "http://127.0.0.1:{d}/f/pics/cat.png", .{server.address.ip.getPort()});
 
@@ -638,15 +666,15 @@ test "s3: put(.request) sends the request body to the object without the handler
     defer env.deinit();
     var gw: Gateway = .{ .files = env.client };
     const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
-    var server = dusty.Server(Gateway).init(testing.allocator, testing.io, .{ .listeners = loopback, .request = .{ .max_body_size = 64 * mib } }, &gw);
+    var server = dusty.Server(Gateway).init(testing.allocator, tio(), .{ .listeners = loopback, .request = .{ .max_body_size = 64 * mib } }, &gw);
     defer server.deinit();
     server.router.post("/upload", Gateway.upload);
-    var fut = try testing.io.concurrent(runGateway, .{&server});
-    defer _ = fut.cancel(testing.io) catch {};
-    try server.waitReady(testing.io);
+    var fut = try tio().concurrent(runGateway, .{&server});
+    defer _ = fut.cancel(tio()) catch {};
+    try server.waitReady(tio());
 
     const body = try pattern(env.ctx.arena, 12 * mib, 11);
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     const url = try std.fmt.allocPrint(env.ctx.arena, "http://127.0.0.1:{d}/upload", .{server.address.ip.getPort()});
     var resp = try http.fetch(url, .{ .method = .post, .body = body, .decompress = false });
@@ -670,7 +698,7 @@ const MapEnv = struct {
 fn provider(http: *dusty.Client, envp: *const MapEnv) credentials.Provider {
     return .{
         .gpa = testing.allocator,
-        .io = testing.io,
+        .io = tio(),
         .http = http,
         .label = "t",
         .environ = null,
@@ -682,10 +710,12 @@ fn provider(http: *dusty.Client, envp: *const MapEnv) credentials.Provider {
 }
 
 test "s3: credentials: the container endpoint with an authorization token" {
-    const fake = try FakeServer.start(testing.allocator, testing.io);
+    try Rt.start();
+    defer Rt.stop();
+    const fake = try FakeServer.start(testing.allocator, tio());
     defer fake.stop();
     try fake.answer(.{ .path = "/creds", .body = "{\"AccessKeyId\":\"AKCONT\",\"SecretAccessKey\":\"scont\",\"Token\":\"tcont\",\"Expiration\":\"2099-01-01T00:00:00Z\"}" });
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     const full = try std.fmt.allocPrint(testing.allocator, "{s}/creds", .{fake.url()});
     defer testing.allocator.free(full);
@@ -697,16 +727,18 @@ test "s3: credentials: the container endpoint with an authorization token" {
     defer p.release(s);
     try testing.expectEqualStrings("AKCONT", s.access_key_id);
     try testing.expectEqualStrings("tcont", s.token.?);
-    try testing.expect(s.expires.? > util.nowSeconds(testing.io));
+    try testing.expect(s.expires.? > util.nowSeconds(tio()));
 }
 
 test "s3: credentials: IMDSv2 asks for a token, then the role, then its credentials" {
-    const fake = try FakeServer.start(testing.allocator, testing.io);
+    try Rt.start();
+    defer Rt.stop();
+    const fake = try FakeServer.start(testing.allocator, tio());
     defer fake.stop();
     try fake.answer(.{ .method = "PUT", .path = "/latest/api/token", .body = "imds-token" });
     try fake.answer(.{ .method = "GET", .path = "/latest/meta-data/iam/security-credentials/", .body = "my-role\n" });
     try fake.answer(.{ .method = "GET", .path = "/latest/meta-data/iam/security-credentials/my-role", .body = "{\"Code\":\"Success\",\"AccessKeyId\":\"AKIMDS\",\"SecretAccessKey\":\"simds\",\"Token\":\"timds\",\"Expiration\":\"2099-01-01T00:00:00Z\"}" });
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     const envp: MapEnv = .{ .pairs = &.{} };
     var p = provider(&http, &envp);
@@ -720,7 +752,9 @@ test "s3: credentials: IMDSv2 asks for a token, then the role, then its credenti
 }
 
 test "s3: credentials: web identity calls STS with the token file's content" {
-    const fake = try FakeServer.start(testing.allocator, testing.io);
+    try Rt.start();
+    defer Rt.stop();
+    const fake = try FakeServer.start(testing.allocator, tio());
     defer fake.stop();
     try fake.answer(.{ .method = "POST", .path = "/sts", .body = "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>AKSTS</AccessKeyId><SecretAccessKey>ssts</SecretAccessKey><SessionToken>tsts</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>" });
     var tmp = testing.tmpDir(.{});
@@ -728,7 +762,7 @@ test "s3: credentials: web identity calls STS with the token file's content" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "token", .data = "jwt-from-kubernetes\n" });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPathFile(testing.io, "token", &buf);
-    var http = dusty.Client.init(testing.allocator, testing.io, .{});
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
     defer http.deinit();
     const envp: MapEnv = .{ .pairs = &.{ .{ "AWS_WEB_IDENTITY_TOKEN_FILE", buf[0..n] }, .{ "AWS_ROLE_ARN", "arn:aws:iam::123:role/r" } } };
     var p = provider(&http, &envp);
@@ -744,13 +778,15 @@ test "s3: credentials: web identity calls STS with the token file's content" {
 }
 
 test "s3: anonymous credentials send unsigned requests (the fake refuses them)" {
-    const fake = try FakeServer.start(testing.allocator, testing.io);
+    try Rt.start();
+    defer Rt.stop();
+    const fake = try FakeServer.start(testing.allocator, tio());
     defer fake.stop();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const client = try s3.Client.init(testing.allocator, testing.io, .{ .endpoint = fake.url(), .bucket = "b", .credentials = .anonymous, .retry = null });
+    const client = try s3.Client.init(testing.allocator, tio(), .{ .endpoint = fake.url(), .bucket = "b", .credentials = .anonymous, .retry = null });
     defer client.deinit();
-    var c: db.Ctx = .{ .io = testing.io, .arena = arena.allocator() };
+    var c: db.Ctx = .{ .io = tio(), .arena = arena.allocator() };
     const q = Quiet.on();
     defer q.done();
     try testing.expectError(error.Database, client.get(&c, "k", .{}));
