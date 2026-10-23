@@ -17,8 +17,10 @@ page on `/` that you can open in two browser tabs.
 
 - RFC 6455 over HTTP/1.1 (the `Upgrade: websocket` handshake), on plain and
   TLS listeners. The Autobahn test suite passes all 517 cases.
-- RFC 8441 over HTTP/2 (extended CONNECT), over h2c and over TLS. The HTTP/2
-  engine advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` by default.
+- RFC 8441 over HTTP/2 (extended CONNECT), over h2c and over TLS, when you
+  turn it on with `.http2 = .{ .enable_connect_protocol = true }` (off by
+  default since 0.3.0; see [WebSocket over HTTP/2 is
+  opt-in](#websocket-over-http2-is-opt-in)).
 - RFC 9220 over HTTP/3 (extended CONNECT again), on the HTTP/3 listener. It
   too advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` by default. Checked
   against aioquic's client (`tests/h3/run.sh`): text, binary, ping, close
@@ -138,17 +140,25 @@ so do not keep a pointer to it after the handler returns. Always
 
 Always open a socket with `anole.websocket.upgrade` (or `app.ws`,
 `app.wsCallbacks`): it covers all three versions, checks `Origin` and
-negotiates the extensions. A server that must not accept RFC 8441 or
-RFC 9220 handshakes turns them off in the server options (keep the stream
+negotiates the extensions.
+
+### WebSocket over HTTP/2 is opt-in
+
+RFC 8441 handshakes are off by default since 0.3.0: the HTTP/2 engine does
+not advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so clients open their
+WebSockets over HTTP/1.1, on a connection of their own. Measured on an x86
+Linux box (a video-call relay, #91), WebSocket over HTTP/2 served 38% fewer
+users than over HTTP/1.1, at 2.1 times the CPU per message, and Firefox
+uses it whenever a server offers it. To accept it anyway (keep the stream
 limit, which this field replaces):
 
 ```zig
-.http2 = .{ .max_concurrent_streams = 250, .enable_connect_protocol = false },
+.http2 = .{ .max_concurrent_streams = 250, .enable_connect_protocol = true },
 ```
 
-Over HTTP/3, `.http3 = .{ .enable_connect_protocol = false }` does the same.
-A plain CONNECT, without `:protocol`, gets 501 over HTTP/3: Anole is no
-proxy.
+RFC 9220 over HTTP/3 stays on; `.http3 = .{ .enable_connect_protocol =
+false }` turns it off. A plain CONNECT, without `:protocol`, gets 501 over
+HTTP/3: Anole is no proxy.
 
 ### Upgrade options
 
@@ -447,7 +457,7 @@ sent to once it has left or been released.
 Browsers use RFC 8441 only over TLS (h2), never over h2c. As of 2026-10:
 
 - Firefox opens WebSockets over HTTP/2 when the server advertises extended
-  CONNECT.
+  CONNECT (Anole does only with `http2.enable_connect_protocol = true`).
 - Chrome added it behind a flag; whether it is on by default now is not
   confirmed.
 - Safari shows no support and uses HTTP/1.1.

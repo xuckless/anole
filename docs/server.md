@@ -719,7 +719,9 @@ connection; past it a stream keeps `stream_window`), `connection_window`
 `stream_reset_rate` (rapid-reset protection), `refused_stream_burst` (100)
 and `refused_stream_rate` (10 a second: streams refused before a handler,
 past which the connection is closed), `max_continuations` (8) and
-`enable_connect_protocol` (on, for RFC 8441 WebSockets).
+`enable_connect_protocol` (off since 0.3.0: true accepts RFC 8441
+WebSockets over HTTP/2, which cost about twice the CPU per message of
+HTTP/1.1; see [WebSocket](websocket.md#websocket-over-http2-is-opt-in)).
 
 Memory per HTTP/2 connection is per stream, too: besides the raised
 windows, each of up to `max_concurrent_streams` streams may hold a

@@ -53,10 +53,11 @@
 //! other tasks (`Rooms.broadcast`) go out at once. the core's
 //! `WebSocketBatch` has the rule.
 //!
-//! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
-//! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
-//! upgrades with `upgrade` here, or turn `http2.enable_connect_protocol`
-//! (and `http3.enable_connect_protocol`) off.
+//! The HTTP/3 engine advertises extended CONNECT (RFC 9220); the HTTP/2
+//! engine does only with `http2.enable_connect_protocol = true` (off by
+//! default: about twice the CPU per message of HTTP/1.1). A client that
+//! sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
+//! upgrades with `upgrade` here, which covers every version.
 //!
 //! permessage-deflate (RFC 7692) is accepted when offered and
 //! `-Dcompression` is on (`UpgradeOptions.compression`), on either version.

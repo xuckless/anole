@@ -36,6 +36,14 @@ handlers, JSON Lines logs, OpenAPI documents, project templates and the
   sits above the idle timeout of nginx and AWS load balancers.
 - `anole.db.System` has `nats` and `kafka`; an exhaustive `switch` on it
   needs the two new cases.
+- WebSocket over HTTP/2 (RFC 8441) is off by default:
+  `http2.enable_connect_protocol` (Zig and the C ABI) defaults to false, so
+  the HTTP/2 engine no longer advertises extended CONNECT and clients open
+  WebSockets over HTTP/1.1. Measured on the x86 box, WebSocket over HTTP/2
+  served 38% fewer video-call users than HTTP/1.1 at 2.1x the CPU per
+  message (#91), and Firefox used it whenever it was offered. Set
+  `http2.enable_connect_protocol = true` to accept it again. RFC 9220 over
+  HTTP/3 (`http3.enable_connect_protocol`) stays on.
 
 ### Config and modes
 

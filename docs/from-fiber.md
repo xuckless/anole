@@ -213,7 +213,7 @@ app.ws("/ws", echo);
 
 No upgrade-check middleware is needed: a request that is not a WebSocket
 handshake gets 426. The same route serves WebSockets over HTTP/2 (RFC
-8441). `anole.websocket.Rooms` broadcasts to groups of sockets
+8441) once `http2.enable_connect_protocol` is on. `anole.websocket.Rooms` broadcasts to groups of sockets
 ([websocket.md](websocket.md)).
 
 ## Rate limits, sessions and JWT

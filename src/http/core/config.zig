@@ -366,8 +366,10 @@ pub const ServerConfig = struct {
         /// client may open a WebSocket, or another protocol, on a stream
         /// with an extended CONNECT. Such a request reaches the router as a
         /// GET, as the HTTP/1.1 upgrade it replaces does, with
-        /// `Request.protocol` set.
-        enable_connect_protocol: bool = true,
+        /// `Request.protocol` set. Off by default: measured, a WebSocket
+        /// over HTTP/2 cost about twice the CPU per message of one over
+        /// HTTP/1.1, and Firefox takes it whenever it is offered.
+        enable_connect_protocol: bool = false,
         /// Requests for routes registered `no_wait` (`RouteOptions`) that
         /// arrive whole (their end, body included, in the read that brought
         /// their HEADERS) run on the

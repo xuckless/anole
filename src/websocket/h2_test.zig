@@ -275,6 +275,7 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
     var http = try observe.metrics.HttpMetrics.init(&registry, .{});
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.use(dusty.Middleware(void).init(&http));
@@ -346,6 +347,7 @@ test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.get("/chat", echo);
@@ -397,6 +399,7 @@ test "WebSocket over HTTP/2: traffic far past the tunnel window keeps flowing, b
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.get("/chat", echo);
@@ -445,6 +448,7 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
         .timeout = .{ .shutdown = .fromSeconds(20) },
     }, {});
     defer server.deinit();
@@ -508,6 +512,7 @@ test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 ans
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
         .timeout = .{ .shutdown = .fromSeconds(20) },
     }, {});
     defer server.deinit();
@@ -578,6 +583,7 @@ test "WebSocket over HTTP/2: callbacks(): open, echo, ping, close" {
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.get("/chat", websocket.callbacks(void, CallbackEcho, .{}));
@@ -631,6 +637,7 @@ test "WebSocket over HTTP/2: pipelined messages are answered in one DATA frame, 
     const io = rt.io();
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     var server_future = try startEcho(&server, io);
@@ -669,6 +676,7 @@ test "WebSocket over HTTP/2: an answer held for a batch goes out while the handl
     const io = rt.io();
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     var server_future = try startEcho(&server, io);
@@ -694,6 +702,7 @@ test "WebSocket over HTTP/2: a page from another origin gets 403, one from the s
     const io = rt.io();
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     var future = try startEcho(&server, io);
@@ -732,6 +741,7 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.get("/chat", websocket.route(void, joinLobby, .{}));
@@ -790,6 +800,7 @@ test "WebSocket over HTTP/2: the selected subprotocol and extra headers ride on 
     const io = rt.io();
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.get("/sp", subprotocolSocket);
@@ -864,6 +875,7 @@ test "WebSocket over HTTP/2: a message from another connection's task goes out w
 
     var server = dusty.Server(void).init(gpa, io, .{
         .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
     }, {});
     defer server.deinit();
     server.router.get("/park", park);

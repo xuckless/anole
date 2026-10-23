@@ -894,8 +894,8 @@
         },
         "enable_connect_protocol": {
           "type": "boolean",
-          "default": true,
-          "description": "Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441): WebSockets over HTTP/2."
+          "default": false,
+          "description": "Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441): WebSockets over HTTP/2. Off by default: browsers then open WebSockets over HTTP/1.1, which costs about half the CPU per message."
         },
         "inline_no_wait": {
           "type": "boolean",

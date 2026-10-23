@@ -17,6 +17,7 @@ table lists what reads or behaves differently.
 | A Debug build read no `.env` | a Debug build is `development` and reads `.env` files from the working directory; `ANOLE_ENV=production` or `.env_files = &.{}` turns that off |
 | A Debug build's 500s said `Internal Server Error` | they name the error (`error_detail`, development); `.error_detail = false` keeps 0.2's |
 | `timeouts.keepalive` 60 s | 75 s (set `.timeouts = .{ .keepalive = .fromSeconds(60) }` for the old value) |
+| WebSockets over HTTP/2 (RFC 8441) accepted by default: Firefox opened them on the h2 connection | off: the HTTP/2 engine no longer advertises extended CONNECT, so clients open WebSockets over HTTP/1.1 (38% more video-call users, half the CPU per message, #91); `.http2 = .{ .enable_connect_protocol = true }` turns it back on. RFC 9220 over HTTP/3 is unchanged |
 | PostgreSQL, Redis and MongoDB calls tried to connect every time while the database was down | a circuit breaker is on by default: after 5 connection failures in a row calls fail at once with 503 (`lastError` code `circuit_open`); `.breaker = null` (`"breaker": null` in the C ABI) keeps 0.2's behaviour |
 | An exhaustive `switch` on `anole.db.System` | add the cases `.nats` and `.kafka` |
 | `req.bind(T)` on a body that is JSON but does not fit: 400 `{"error":"Bad Request"}` | 422 `application/problem+json` with `errors` naming each field; not JSON or no body stays 400. `req.bindWith(T, .{ .ignore_unknown_fields = true })` is the old behaviour |
@@ -35,6 +36,7 @@ The C ABI moves to 0.9; rebuild against the new `anole.h` (`ANOLE_ABI_COMPATIBLE
 | --- | --- |
 | `listeners[].address`, `port`, `proxy_protocol` defaulted to `"127.0.0.1"`, 8080, `false` | default `null`: the deployment's value (the same three under `standalone`) |
 | `timeouts.keepalive_ms` 60000 | 75000 |
+| `http2.enable_connect_protocol` true | false (`"http2": {"enable_connect_protocol": true}` for 0.8's behaviour) |
 | `proxy_protocol_from` empty: any peer | empty: `proxy.trusted` when set, else any peer |
 | the log callback's `msg` was the message | a whole JSON record when `log.format` resolves to `"json"` (an unset `environment` is production); `"log": {"format": "text"}` keeps messages; access lines reach the callback (scope `access`) |
 | a malformed route pattern was accepted | `ANOLE_E_CONFIG` naming the route |

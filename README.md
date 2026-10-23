@@ -159,8 +159,8 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
 - **TLS on BoringSSL:**
   - TLS 1.3 and 1.2, ALPN, mutual TLS (over HTTP/3 too), session tickets;
   - hot certificate reload on SIGHUP.
-- **WebSockets:** over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220),
-  with permessage-deflate and a rooms helper for broadcast. It passes all
+- **WebSockets:** over HTTP/1.1, HTTP/2 (RFC 8441, opt-in) and HTTP/3
+  (RFC 9220), with permessage-deflate and a rooms helper for broadcast. It passes all
   517 Autobahn cases.
 - **WebTransport (draft-02):** streams both ways, datagrams, close codes and
   drain, on the same router, plus a client. It's checked against aioquic and
