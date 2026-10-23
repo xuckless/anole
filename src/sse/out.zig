@@ -169,6 +169,9 @@ pub const Fake = struct {
     gate: std.Io.Event = .unset,
     /// The next `write` fails with this.
     fail_with: ?WriteError = null,
+    /// Called once from inside the next `endBurst`, before it returns
+    /// (what another task does while the sender ends its burst).
+    on_end_burst: ?struct { f: *const fn (ctx: *anyopaque) void, ctx: *anyopaque } = null,
     writes_done: std.atomic.Value(u32) = .init(0),
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Fake {
@@ -248,8 +251,11 @@ pub const Fake = struct {
     fn endBurst(ptr: *anyopaque) void {
         const self = of(ptr);
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         self.open_bursts -= 1;
+        const hook = self.on_end_burst;
+        self.on_end_burst = null;
+        self.mutex.unlock(self.io);
+        if (hook) |h| h.f(h.ctx);
     }
 
     fn end(ptr: *anyopaque) void {

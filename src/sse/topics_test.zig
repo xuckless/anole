@@ -390,6 +390,36 @@ test "sse: on_full=drop: the full subscriber misses the event, the others get it
     try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, Harness.text(fast), "data: more"));
 }
 
+test "sse: an event queued while the sender ends its burst still goes out" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const f = try h.add(&.{"t"}, null);
+    // The open line's burst: while it ends, another task sends. The
+    // sender is still marked running then, so the send starts no sender;
+    // the running one must take it before it stops.
+    const Late = struct {
+        fn send(ctx: *anyopaque) void {
+            const sub: *Subscriber = @ptrCast(@alignCast(ctx));
+            sub.send(.{ .data = "late" }) catch unreachable;
+        }
+    };
+    f.mutex.lockUncancelable(io);
+    f.on_end_burst = .{ .f = Late.send, .ctx = h.subAt(0) };
+    const already = f.open_bursts == 0 and f.bursts > 0;
+    f.mutex.unlock(io);
+    // The open line was written before the hook was set: one more event
+    // makes a burst whose end runs the hook.
+    if (already) try h.subAt(0).send(.{ .data = "first" });
+    for (0..5000) |_| {
+        f.mutex.lockUncancelable(io);
+        const sent = std.mem.indexOf(u8, Harness.text(f), "data: late\n\n") != null;
+        f.mutex.unlock(io);
+        if (sent) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.LateEventNeverSent;
+}
+
 test "sse: Subscriber.send reaches one subscriber, with no id; Full past the cap" {
     const h = try Harness.init(.{ .max_queued_bytes = 300 });
     defer h.deinit();

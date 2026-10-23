@@ -929,81 +929,91 @@ pub const Topics = struct {
         var aborted = false;
         self.mutex.lockUncancelable(io);
         sub.task = placement.currentTask(io);
-        while (!sub.left and !sub.broken) {
-            var round: [send_round]*Payload = undefined;
-            var n: usize = 0;
-            while (n < round.len) {
-                round[n] = sub.pop() orelse break;
-                n += 1;
-            }
-            if (n == 0) break;
-            sub.sending_since_ms = self.nowMs();
-            self.mutex.unlock(io);
-            var ok = true;
-            if (!in_burst) {
-                if (sub.out.begin()) in_burst = true else ok = false;
-            }
-            var has_end = false;
-            if (ok) {
-                var parts: [send_round * 2][]const u8 = undefined;
-                var np: usize = 0;
-                var sent_bytes: usize = 0;
-                for (round[0..n]) |p| {
-                    switch (p.kind) {
-                        .end => {
-                            has_end = true;
-                            break;
-                        },
-                        .event => {
-                            if (p.id_len > 0) {
-                                parts[np] = p.idLine();
+        // Each pass: send until the queue is empty, end the burst. Events
+        // queued while the burst ended (unlocked) found `running` set and
+        // started no sender: a further pass takes them.
+        pass: while (true) {
+            while (!sub.left and !sub.broken) {
+                var round: [send_round]*Payload = undefined;
+                var n: usize = 0;
+                while (n < round.len) {
+                    round[n] = sub.pop() orelse break;
+                    n += 1;
+                }
+                if (n == 0) break;
+                sub.sending_since_ms = self.nowMs();
+                self.mutex.unlock(io);
+                var ok = true;
+                if (!in_burst) {
+                    if (sub.out.begin()) in_burst = true else ok = false;
+                }
+                var has_end = false;
+                if (ok) {
+                    var parts: [send_round * 2][]const u8 = undefined;
+                    var np: usize = 0;
+                    var sent_bytes: usize = 0;
+                    for (round[0..n]) |p| {
+                        switch (p.kind) {
+                            .end => {
+                                has_end = true;
+                                break;
+                            },
+                            .event => {
+                                if (p.id_len > 0) {
+                                    parts[np] = p.idLine();
+                                    np += 1;
+                                }
+                                parts[np] = p.body();
                                 np += 1;
-                            }
-                            parts[np] = p.body();
-                            np += 1;
-                            if (p.seq == 0) sent_bytes += p.cost();
-                        },
-                        else => {
-                            parts[np] = p.body();
-                            np += 1;
-                        },
+                                if (p.seq == 0) sent_bytes += p.cost();
+                            },
+                            else => {
+                                parts[np] = p.body();
+                                np += 1;
+                            },
+                        }
                     }
+                    if (np > 0) {
+                        sub.out.write(parts[0..np]) catch |err| {
+                            if (err == error.Canceled) canceled = true;
+                            ok = false;
+                        };
+                    }
+                    if (ok and sent_bytes > 0) if (self.written_hook) |hook| hook(sub, sent_bytes);
                 }
-                if (np > 0) {
-                    sub.out.write(parts[0..np]) catch |err| {
-                        if (err == error.Canceled) canceled = true;
-                        ok = false;
-                    };
+                for (round[0..n]) |p| p.release(self.gpa);
+                self.mutex.lockUncancelable(io);
+                sub.sending_since_ms = null;
+                sub.last_write_ms = self.nowMs();
+                if (!ok) {
+                    sub.broken = true;
+                    sub.dropQueue(self.gpa);
+                    if (canceled and sub.ending and sub.abort_requested) aborted = true;
+                    break;
                 }
-                if (ok and sent_bytes > 0) if (self.written_hook) |hook| hook(sub, sent_bytes);
+                if (has_end) {
+                    ended = true;
+                    sub.dropQueue(self.gpa);
+                    break;
+                }
             }
-            for (round[0..n]) |p| p.release(self.gpa);
+            self.mutex.unlock(io);
+            if (in_burst) {
+                if (ended) {
+                    sub.out.end();
+                } else if (aborted) {
+                    sub.out.abort();
+                } else {
+                    sub.out.endBurst();
+                }
+            }
             self.mutex.lockUncancelable(io);
-            sub.sending_since_ms = null;
-            sub.last_write_ms = self.nowMs();
-            if (!ok) {
-                sub.broken = true;
-                sub.dropQueue(self.gpa);
-                if (canceled and sub.ending and sub.abort_requested) aborted = true;
-                break;
+            if (!ended and !aborted and !canceled and !sub.left and !sub.broken and sub.head < sub.queue.items.len) {
+                in_burst = false;
+                continue :pass;
             }
-            if (has_end) {
-                ended = true;
-                sub.dropQueue(self.gpa);
-                break;
-            }
+            break :pass;
         }
-        self.mutex.unlock(io);
-        if (in_burst) {
-            if (ended) {
-                sub.out.end();
-            } else if (aborted) {
-                sub.out.abort();
-            } else {
-                sub.out.endBurst();
-            }
-        }
-        self.mutex.lockUncancelable(io);
         if (ended or aborted) sub.over = true;
         sub.running = false;
         sub.task = null;
@@ -1040,7 +1050,7 @@ pub const Topics = struct {
         sub.dropQueue(self.gpa);
         const canceled = self.awaitSender(io, sub);
         self.mutex.unlock(io);
-        _ = self.closed_by[@intFromEnum(reason)].fetchAdd(1, .monotonic);
+        _ = self.closed_by[@backingInt(reason)].fetchAdd(1, .monotonic);
         if (self.metrics != null) self.syncMetrics(null, null);
         if (sub.has_out) sub.out.release();
         sub.sender.cancel(io);
