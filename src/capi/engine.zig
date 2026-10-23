@@ -3408,6 +3408,7 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
 test {
     _ = config_mod;
     _ = @import("engine_test.zig");
+    _ = @import("nats_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
 }
