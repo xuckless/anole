@@ -180,9 +180,22 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   continuations); keep it on every rebase.
 - **zig-protobuf**: upstream e9e18c7 plus security patches in the decoder
   (nesting depth bound, length-delimited fields checked against the input
-  before allocating, Timestamp validation). On an upstream move: merge it
-  into `anole`, run the fork's tests and conformance suite, re-pin, and
-  run Anole's gRPC tests and fuzz targets.
+  before allocating, Timestamp validation) plus the comment patch for the
+  OpenAPI document: the generator also emits a .proto comment as comptime
+  `_doc` (messages, enums, services), `_field_docs`, `_value_docs` and
+  `_method_docs` (about 90 lines in `bootstrapped-generator/main.zig`, test
+  in `tests/test_services.zig`). On an upstream move: merge it into
+  `anole`, re-apply that patch if the merge dropped it, run the fork's tests
+  and conformance suite, re-pin, regenerate the committed code with
+  `zig build gen-proto`, and run Anole's gRPC tests and fuzz targets.
+- **Scalar** (the OpenAPI page, `src/openapi/page.zig`): loaded by the
+  browser from jsDelivr, never bundled. To bump it, change `scalar.version`
+  and `scalar.integrity` together (the SRI hash of
+  `@scalar/api-reference@<version>/dist/browser/standalone.js`: fetch the
+  file and compute `sha384`).
+- **The `anole` CLI** (`tools/anole`): after tagging, `zig build cli-dist`
+  builds the five binaries and SHA256SUMS in `zig-out/dist`; attach them with
+  `gh release upload vX.Y.Z zig-out/dist/*`.
 - **pg.zig** (PostgreSQL, `-Dpostgres`): upstream master 4d63344 plus a
   read timeout, `Conn.cancel()` (CancelRequest), the automatic statement
   cache, pool `max_lifetime`/`idle_timeout`, `Pool.acquireOpts` keeping a

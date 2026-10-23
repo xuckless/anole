@@ -113,8 +113,8 @@
             .lazy = true,
         },
         .protobuf = .{
-            .url = "git+https://github.com/xuckless/zig-protobuf#ef23c279af0dcb12cce9eee39838c14f5955c75f",
-            .hash = "protobuf-7.0.0-0e82aj2WNAAZimii5Crz-Ce8fLdCHUW-Ra-95-3lLMnw",
+            .url = "git+https://github.com/xuckless/zig-protobuf#e6de363eb44854f453280875169d063eb077639e",
+            .hash = "protobuf-7.0.0-0e82aujmNgDEMIIEm-NBypMzOKX8l0fZK0gyCpbF1tmE",
             .lazy = true,
         },
         // -Dgrpc: upb, protobuf's C runtime, from the protobuf 36.2 release

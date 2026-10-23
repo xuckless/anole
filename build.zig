@@ -2,7 +2,7 @@
 //!
 //! Features are chosen with `-Dprofile=minimal|web|full` (default `full`) and
 //! overridden one by one with `-Dtls=boringssl|none`, `-Dhttp2`, `-Dhttp3`,
-//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and
+//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb`, `-Dopenapi` and
 //! the rest below. The result is exposed to Zig code as the `build_options`
 //! module (re-exported as `anole.features`).
 //!
@@ -85,13 +85,16 @@ pub const Features = struct {
     nats: bool,
     /// The Kafka client (`anole.kafka`); needs `compression`.
     kafka: bool,
+    /// OpenAPI 3.1 documents (`anole.openapi`, `app.openapi`). Pure Zig:
+    /// no C library. libanole is always built without it.
+    openapi: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false, .openapi = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false, .openapi = true },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true, .openapi = true },
         };
     }
 
@@ -154,6 +157,12 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
     .{ .name = "http2-no-grpc", .features = blk: {
         var f = Features.preset(.full);
         f.grpc = false;
+        break :blk f;
+    } },
+    // No OpenAPI: `anole.openapi` is the declaration stubs only.
+    .{ .name = "full-no-openapi", .features = blk: {
+        var f = Features.preset(.full);
+        f.openapi = false;
         break :blk f;
     } },
     // Everything but the database connectors.
@@ -784,6 +793,10 @@ pub fn build(b: *std.Build) void {
     // capi: libanole, the C ABI (include/anole.h) as a static and a shared
     // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
     {
+        // libanole never carries OpenAPI: the bindings use their ecosystems' generators.
+        var capi_features = features;
+        capi_features.openapi = false;
+        const capi_anole_mod = anoleModule(b, .{ .features = capi_features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize });
         const capi_mod = b.createModule(.{
             .root_source_file = b.path("src/capi/lib.zig"),
             .target = target,
@@ -791,7 +804,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             // Linked into shared objects (a Node addon, a Python extension).
             .pic = true,
-            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            .imports = &.{.{ .name = "anole", .module = capi_anole_mod }},
         });
         const capi_opts = b.addOptions();
         capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
@@ -1208,6 +1221,64 @@ pub fn build(b: *std.Build) void {
         };
     }
 
+    // `anole`, the command line (tools/anole): `anole new <dir>` makes a
+    // project from the templates in templates/. Std-only, so it depends on no
+    // C library and no feature flag.
+    //   cli        build and install it (zig-out/bin/anole)
+    //   cli-test   its unit tests
+    //   cli-dist   the release binaries for five targets and SHA256SUMS in zig-out/dist
+    {
+        const cli_options = b.addOptions();
+        cli_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+        const templates_mod = b.createModule(.{ .root_source_file = b.path("templates/index.zig") });
+        const CliBuild = struct {
+            fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+                return bb.createModule(.{
+                    .root_source_file = bb.path("tools/anole/main.zig"),
+                    .target = tgt,
+                    .optimize = opt,
+                    .imports = &.{
+                        .{ .name = "cli_options", .module = opts.createModule() },
+                        .{ .name = "templates", .module = tmpl },
+                    },
+                });
+            }
+        };
+        const cli = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize) });
+        const install_cli = b.addInstallArtifact(cli, .{});
+        b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
+
+        const cli_tests = b.addTest(.{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize) });
+        b.step("cli-test", "Run the anole command line's unit tests").dependOn(&b.addRunArtifact(cli_tests).step);
+
+        const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
+        const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/anole/sums.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }) });
+        const sums = b.addRunArtifact(sums_exe);
+        const sums_out = sums.addOutputFileArg("SHA256SUMS");
+        const dist_targets = [_]struct { query: std.Target.Query, name: []const u8 }{
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .name = "anole-x86_64-linux" },
+            .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .name = "anole-aarch64-linux" },
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "anole-x86_64-macos" },
+            .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "anole-aarch64-macos" },
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows }, .name = "anole-x86_64-windows.exe" },
+        };
+        for (dist_targets) |dt| {
+            const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe) });
+            const installed = b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "dist" }, dt.name);
+            dist.dependOn(&installed.step);
+            // The sums are over the built files, named as they are installed.
+            const named = b.addWriteFiles();
+            const copy = named.addCopyFile(exe.getEmittedBin(), dt.name);
+            sums.addFileArg(copy);
+        }
+        const install_sums = b.addInstallFileWithDir(sums_out, .{ .custom = "dist" }, "SHA256SUMS");
+        dist.dependOn(&install_sums.step);
+    }
+
     // tests/grpc/interop: grpc.testing.TestService for grpc-go's interop
     // client (tests/grpc/interop/run.sh).
     if (features.grpc) {
@@ -1284,6 +1355,7 @@ fn resolveFeatures(b: *std.Build) Features {
     const mongodb = b.option(bool, "mongodb", "MongoDB client (overrides the profile)");
     const nats = b.option(bool, "nats", "NATS client (overrides the profile)");
     const kafka = b.option(bool, "kafka", "Kafka client; needs -Dcompression=true (overrides the profile)");
+    const openapi = b.option(bool, "openapi", "OpenAPI 3.1 document generation (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -1301,6 +1373,7 @@ fn resolveFeatures(b: *std.Build) Features {
     if (mongodb) |v| f.mongodb = v;
     if (nats) |v| f.nats = v;
     if (kafka) |v| f.kafka = v;
+    if (openapi) |v| f.openapi = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
@@ -1721,6 +1794,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "mongodb", f.mongodb);
     options.addOption(bool, "nats", f.nats);
     options.addOption(bool, "kafka", f.kafka);
+    options.addOption(bool, "openapi", f.openapi);
     // Live servers for tests (`-Dredis-test-port=6379` or
     // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),

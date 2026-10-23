@@ -324,6 +324,12 @@ pub const observe = @import("observe/root.zig");
 /// transcoding; `Call` for metadata, deadlines and status; and a client.
 pub const grpc = if (features.grpc) @import("grpc/root.zig") else struct {};
 
+/// OpenAPI 3.1 documents (`-Dopenapi`, on in the web and full profiles). In a
+/// build without it, only the declaration types are present, so
+/// `pub const openapi: anole.openapi.Doc(@This()) = ...` compiles in every
+/// profile. Types: `Doc`, `FieldDoc`, `Example`, `MiddlewareDoc`, `RouteDoc`.
+pub const openapi = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
+
 /// Auth (`-Dauth`): JWT/JWKS verification and signing, OIDC, CSRF,
 /// passwords, API keys, roles.
 pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
@@ -353,6 +359,7 @@ test {
     _ = webtransport;
     _ = compression;
     _ = grpc;
+    _ = openapi;
     _ = json;
     _ = redis;
     _ = sqlite;

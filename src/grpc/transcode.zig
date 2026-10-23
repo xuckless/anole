@@ -459,7 +459,7 @@ fn nameIs(comptime name: []const u8, asked: []const u8) bool {
 }
 
 /// protobuf's ToJsonName: each `_` dropped and the next character upper-cased.
-fn jsonName(comptime name: []const u8) []const u8 {
+pub fn jsonName(comptime name: []const u8) []const u8 {
     comptime {
         var out: []const u8 = "";
         var upper = false;

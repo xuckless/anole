@@ -14,6 +14,9 @@ const fdf = protobuf.fdf;
 /// rpc Bar (grpc.testing.Empty) returns (grpc.testing.Empty) { };
 /// };
 pub const Empty = struct {
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "An empty message that you can re-use to avoid defining duplicated empty\nmessages in your project. A typical example is to use it as argument or the\nreturn value of a service API. For instance:\n\nservice Foo {\nrpc Bar (grpc.testing.Empty) returns (grpc.testing.Empty) { };\n};";
+
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer
@@ -83,6 +86,14 @@ pub const Empty = struct {
 pub const PayloadType = enum(i32) {
     COMPRESSABLE = 0,
     _,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "The type of payload that should be returned.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _value_docs = .{
+        .COMPRESSABLE = "Compressable text format.",
+    };
 };
 
 /// The type of route that a client took to reach a server w.r.t. gRPCLB.
@@ -96,6 +107,16 @@ pub const GrpclbRouteType = enum(i32) {
     GRPCLB_ROUTE_TYPE_FALLBACK = 1,
     GRPCLB_ROUTE_TYPE_BACKEND = 2,
     _,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "The type of route that a client took to reach a server w.r.t. gRPCLB.\nThe server must fill in \"fallback\" if it detects that the RPC reached\nthe server via the \"gRPCLB fallback\" path, and \"backend\" if it detects\nthat the RPC reached the server via \"gRPCLB backend\" path (i.e. if it got\nthe address of this server from the gRPCLB server BalanceLoad RPC). Exactly\nhow this detection is done is context and server dependent.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _value_docs = .{
+        .GRPCLB_ROUTE_TYPE_UNKNOWN = "Server didn't detect the route that a client took to reach it.",
+        .GRPCLB_ROUTE_TYPE_FALLBACK = "Indicates that a client reached a server via gRPCLB fallback.",
+        .GRPCLB_ROUTE_TYPE_BACKEND = "Indicates that a client reached a server as a gRPCLB-given backend.",
+    };
 };
 
 /// TODO(dgq): Go back to using well-known types once
@@ -103,6 +124,14 @@ pub const GrpclbRouteType = enum(i32) {
 /// import "google/protobuf/wrappers.proto";
 pub const BoolValue = struct {
     value: bool = false,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "TODO(dgq): Go back to using well-known types once\nhttps://github.com/grpc/grpc/issues/6980 has been fixed.\nimport \"google/protobuf/wrappers.proto\";";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .value = "The bool value.",
+    };
 
     pub const _desc_table = .{
         .value = fd(1, .{ .scalar = .bool }),
@@ -175,6 +204,15 @@ pub const BoolValue = struct {
 pub const Payload = struct {
     type: PayloadType = @fromBackingInt(0),
     body: []const u8 = &.{},
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "A block of data, to simply increase gRPC message size.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .type = "The type of data in body.",
+        .body = "Primary contents of payload.",
+    };
 
     pub const _desc_table = .{
         .type = fd(1, .@"enum"),
@@ -249,6 +287,9 @@ pub const Payload = struct {
 pub const EchoStatus = struct {
     code: i32 = 0,
     message: []const u8 = &.{},
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "A protobuf representation for grpc status. This is used by test\nclients to specify a status that the server should attempt to return.";
 
     pub const _desc_table = .{
         .code = fd(1, .{ .scalar = .int32 }),
@@ -331,6 +372,24 @@ pub const SimpleRequest = struct {
     fill_server_id: bool = false,
     fill_grpclb_route_type: bool = false,
     orca_per_query_report: ?TestOrcaReport = null,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Unary request.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .response_type = "Desired payload type in the response from the server.\nIf response_type is RANDOM, server randomly chooses one from other formats.",
+        .response_size = "Desired payload size in the response from the server.",
+        .payload = "Optional input payload sent along with the request.",
+        .fill_username = "Whether SimpleResponse should include username.",
+        .fill_oauth_scope = "Whether SimpleResponse should include OAuth scope.",
+        .response_compressed = "Whether to request the server to compress the response. This field is\n\"nullable\" in order to interoperate seamlessly with clients not able to\nimplement the full compression tests by introspecting the call to verify\nthe response's compression status.",
+        .response_status = "Whether server should return a given status",
+        .expect_compressed = "Whether the server should expect this request to be compressed.",
+        .fill_server_id = "Whether SimpleResponse should include server_id.",
+        .fill_grpclb_route_type = "Whether SimpleResponse should include grpclb_route_type.",
+        .orca_per_query_report = "If set the server should record this metrics report data for the current RPC.",
+    };
 
     pub const _desc_table = .{
         .response_type = fd(1, .@"enum"),
@@ -418,6 +477,19 @@ pub const SimpleResponse = struct {
     grpclb_route_type: GrpclbRouteType = @fromBackingInt(0),
     hostname: []const u8 = &.{},
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Unary response, as configured by the request.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .payload = "Payload to increase message size.",
+        .username = "The user the request came from, for verifying authentication was\nsuccessful when the client expected it.",
+        .oauth_scope = "OAuth scope.",
+        .server_id = "Server ID. This must be unique among different server instances,\nbut the same across all RPC's made to a particular server instance.",
+        .grpclb_route_type = "gRPCLB Path.",
+        .hostname = "Server hostname.",
+    };
+
     pub const _desc_table = .{
         .payload = fd(1, .submessage),
         .username = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
@@ -495,6 +567,15 @@ pub const StreamingInputCallRequest = struct {
     payload: ?Payload = null,
     expect_compressed: ?BoolValue = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Client-streaming request.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .payload = "Optional input payload sent along with the request.",
+        .expect_compressed = "Whether the server should expect this request to be compressed. This field\nis \"nullable\" in order to interoperate seamlessly with servers not able to\nimplement the full compression tests by introspecting the call to verify\nthe request's compression status.",
+    };
+
     pub const _desc_table = .{
         .payload = fd(1, .submessage),
         .expect_compressed = fd(2, .submessage),
@@ -566,6 +647,14 @@ pub const StreamingInputCallRequest = struct {
 /// Client-streaming response.
 pub const StreamingInputCallResponse = struct {
     aggregated_payload_size: i32 = 0,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Client-streaming response.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .aggregated_payload_size = "Aggregated size of payloads received from the client.",
+    };
 
     pub const _desc_table = .{
         .aggregated_payload_size = fd(1, .{ .scalar = .int32 }),
@@ -640,6 +729,17 @@ pub const ResponseParameters = struct {
     interval_us: i32 = 0,
     compressed: ?BoolValue = null,
     fill_peer_socket_address: ?BoolValue = null,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Configuration for a particular response.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .size = "Desired payload sizes in responses from the server.",
+        .interval_us = "Desired interval between consecutive responses in the response stream in\nmicroseconds.",
+        .compressed = "Whether to request the server to compress the response. This field is\n\"nullable\" in order to interoperate seamlessly with clients not able to\nimplement the full compression tests by introspecting the call to verify\nthe response's compression status.",
+        .fill_peer_socket_address = "Whether to request the server to send the requesting peer's socket\naddress in the response.",
+    };
 
     pub const _desc_table = .{
         .size = fd(1, .{ .scalar = .int32 }),
@@ -719,6 +819,18 @@ pub const StreamingOutputCallRequest = struct {
     response_status: ?EchoStatus = null,
     orca_oob_report: ?TestOrcaReport = null,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Server-streaming request.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .response_type = "Desired payload type in the response from the server.\nIf response_type is RANDOM, the payload from each response in the stream\nmight be of different types. This is to simulate a mixed type of payload\nstream.",
+        .response_parameters = "Configuration for each expected response message.",
+        .payload = "Optional input payload sent along with the request.",
+        .response_status = "Whether server should return a given status",
+        .orca_oob_report = "If set the server should update this metrics report data at the OOB server.",
+    };
+
     pub const _desc_table = .{
         .response_type = fd(1, .@"enum"),
         .response_parameters = fd(2, .{ .repeated = .submessage }),
@@ -795,6 +907,15 @@ pub const StreamingOutputCallResponse = struct {
     payload: ?Payload = null,
     peer_socket_address: []const u8 = &.{},
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Server-streaming response, as configured by the request and parameters.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .payload = "Payload to increase response size.",
+        .peer_socket_address = "The peer's socket address if requested.",
+    };
+
     pub const _desc_table = .{
         .payload = fd(1, .submessage),
         .peer_socket_address = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
@@ -867,6 +988,9 @@ pub const StreamingOutputCallResponse = struct {
 /// Client tells server what reconnection parameters it used.
 pub const ReconnectParams = struct {
     max_reconnect_backoff_ms: i32 = 0,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "For reconnect interop test only.\nClient tells server what reconnection parameters it used.";
 
     pub const _desc_table = .{
         .max_reconnect_backoff_ms = fd(1, .{ .scalar = .int32 }),
@@ -942,6 +1066,9 @@ pub const ReconnectInfo = struct {
     passed: bool = false,
     backoff_ms: std.ArrayList(i32) = .empty,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "For reconnect interop test only.\nServer tells client whether its reconnects are following the spec and the\nreconnect backoffs it saw.";
+
     pub const _desc_table = .{
         .passed = fd(1, .{ .scalar = .bool }),
         .backoff_ms = fd(2, .{ .packed_repeated = .{ .scalar = .int32 } }),
@@ -1014,6 +1141,13 @@ pub const LoadBalancerStatsRequest = struct {
     num_rpcs: i32 = 0,
     timeout_sec: i32 = 0,
     metadata_keys: std.ArrayList([]const u8) = .empty,
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .num_rpcs = "Request stats for the next num_rpcs sent by client.",
+        .timeout_sec = "If num_rpcs have not completed within timeout_sec, return partial results.",
+        .metadata_keys = "Response header + trailer metadata entries we want the values of.\nMatching of the keys is case-insensitive as per rfc7540#section-8.1.2\n* (asterisk) is a special value that will return all metadata entries",
+    };
 
     pub const _desc_table = .{
         .num_rpcs = fd(1, .{ .scalar = .int32 }),
@@ -1090,6 +1224,13 @@ pub const LoadBalancerStatsResponse = struct {
     rpcs_by_method: std.ArrayList(LoadBalancerStatsResponse.RpcsByMethodEntry) = .empty,
     metadatas_by_peer: std.ArrayList(LoadBalancerStatsResponse.MetadatasByPeerEntry) = .empty,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .rpcs_by_peer = "The number of completed RPCs for each peer.",
+        .num_failures = "The number of RPCs that failed to record a remote peer.",
+        .metadatas_by_peer = "All the metadata of all RPCs for each peer.",
+    };
+
     pub const _desc_table = .{
         .rpcs_by_peer = fd(1, .{ .repeated = .submessage }),
         .num_failures = fd(2, .{ .scalar = .int32 }),
@@ -1108,6 +1249,13 @@ pub const LoadBalancerStatsResponse = struct {
         key: []const u8 = &.{},
         value: []const u8 = &.{},
         type: LoadBalancerStatsResponse.MetadataType = @fromBackingInt(0),
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .key = "Key, exactly as received from the server. Case may be different from what\nwas requested in the LoadBalancerStatsRequest)",
+            .value = "Value, exactly as received from the server.",
+            .type = "Metadata type",
+        };
 
         pub const _desc_table = .{
             .key = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
@@ -1181,6 +1329,11 @@ pub const LoadBalancerStatsResponse = struct {
     pub const RpcMetadata = struct {
         metadata: std.ArrayList(LoadBalancerStatsResponse.MetadataEntry) = .empty,
 
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .metadata = "metadata values for each rpc for the keys specified in\nLoadBalancerStatsRequest.metadata_keys.",
+        };
+
         pub const _desc_table = .{
             .metadata = fd(1, .{ .repeated = .submessage }),
         };
@@ -1251,6 +1404,11 @@ pub const LoadBalancerStatsResponse = struct {
     pub const MetadataByPeer = struct {
         rpc_metadata: std.ArrayList(LoadBalancerStatsResponse.RpcMetadata) = .empty,
 
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .rpc_metadata = "List of RpcMetadata in for each RPC with a given peer",
+        };
+
         pub const _desc_table = .{
             .rpc_metadata = fd(1, .{ .repeated = .submessage }),
         };
@@ -1320,6 +1478,11 @@ pub const LoadBalancerStatsResponse = struct {
 
     pub const RpcsByPeer = struct {
         rpcs_by_peer: std.ArrayList(LoadBalancerStatsResponse.RpcsByPeer.RpcsByPeerEntry) = .empty,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .rpcs_by_peer = "The number of completed RPCs for each peer.",
+        };
 
         pub const _desc_table = .{
             .rpcs_by_peer = fd(1, .{ .repeated = .submessage }),
@@ -1741,6 +1904,9 @@ pub const LoadBalancerStatsResponse = struct {
 
 /// Request for retrieving a test client's accumulated stats.
 pub const LoadBalancerAccumulatedStatsRequest = struct {
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Request for retrieving a test client's accumulated stats.";
+
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer
@@ -1812,6 +1978,17 @@ pub const LoadBalancerAccumulatedStatsResponse = struct {
     num_rpcs_succeeded_by_method: std.ArrayList(LoadBalancerAccumulatedStatsResponse.NumRpcsSucceededByMethodEntry) = .empty,
     num_rpcs_failed_by_method: std.ArrayList(LoadBalancerAccumulatedStatsResponse.NumRpcsFailedByMethodEntry) = .empty,
     stats_per_method: std.ArrayList(LoadBalancerAccumulatedStatsResponse.StatsPerMethodEntry) = .empty,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Accumulated stats for RPCs sent by a test client.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .num_rpcs_started_by_method = "The total number of RPCs have ever issued for each type.\nDeprecated: use stats_per_method.rpcs_started instead.",
+        .num_rpcs_succeeded_by_method = "The total number of RPCs have ever completed successfully for each type.\nDeprecated: use stats_per_method.result instead.",
+        .num_rpcs_failed_by_method = "The total number of RPCs have ever failed for each type.\nDeprecated: use stats_per_method.result instead.",
+        .stats_per_method = "Per-method RPC statistics.  The key is the RpcType in string form; e.g.\n'EMPTY_CALL' or 'UNARY_CALL'",
+    };
 
     pub const _desc_table = .{
         .num_rpcs_started_by_method = fd(1, .{ .repeated = .submessage }),
@@ -2039,6 +2216,12 @@ pub const LoadBalancerAccumulatedStatsResponse = struct {
     pub const MethodStats = struct {
         rpcs_started: i32 = 0,
         result: std.ArrayList(LoadBalancerAccumulatedStatsResponse.MethodStats.ResultEntry) = .empty,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _field_docs = .{
+            .rpcs_started = "The number of RPCs that were started for this method.",
+            .result = "The number of RPCs that completed with each status for this method.  The\nkey is the integral value of a google.rpc.Code; the value is the count.",
+        };
 
         pub const _desc_table = .{
             .rpcs_started = fd(1, .{ .scalar = .int32 }),
@@ -2321,6 +2504,16 @@ pub const ClientConfigureRequest = struct {
     metadata: std.ArrayList(ClientConfigureRequest.Metadata) = .empty,
     timeout_sec: i32 = 0,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Configurations for a test client.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .types = "The types of RPCs the client sends.",
+        .metadata = "The collection of custom metadata to be attached to RPCs sent by the client.",
+        .timeout_sec = "The deadline to use, in seconds, for all RPCs.  If unset or zero, the\nclient will use the default from the command-line.",
+    };
+
     pub const _desc_table = .{
         .types = fd(1, .{ .packed_repeated = .@"enum" }),
         .metadata = fd(2, .{ .repeated = .submessage }),
@@ -2332,6 +2525,9 @@ pub const ClientConfigureRequest = struct {
         EMPTY_CALL = 0,
         UNARY_CALL = 1,
         _,
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Type of RPCs to send.";
     };
 
     /// Metadata to be attached for the given type of RPCs.
@@ -2339,6 +2535,9 @@ pub const ClientConfigureRequest = struct {
         type: ClientConfigureRequest.RpcType = @fromBackingInt(0),
         key: []const u8 = &.{},
         value: []const u8 = &.{},
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Metadata to be attached for the given type of RPCs.";
 
         pub const _desc_table = .{
             .type = fd(1, .@"enum"),
@@ -2474,6 +2673,9 @@ pub const ClientConfigureRequest = struct {
 
 /// Response for updating a test client's configuration.
 pub const ClientConfigureResponse = struct {
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Response for updating a test client's configuration.";
+
     pub const _desc_table = .{};
 
     /// Encodes the message to the writer
@@ -2617,6 +2819,9 @@ pub const TestOrcaReport = struct {
     memory_utilization: f64 = 0,
     request_cost: std.ArrayList(TestOrcaReport.RequestCostEntry) = .empty,
     utilization: std.ArrayList(TestOrcaReport.UtilizationEntry) = .empty,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Metrics data the server will update and send to the client. It mirrors orca load report\nhttps://github.com/cncf/xds/blob/eded343319d09f30032952beda9840bbd3dcf7ac/xds/data/orca/v3/orca_load_report.proto#L15,\nbut avoids orca dependency. Used by both per-query and out-of-band reporting tests.";
 
     pub const _desc_table = .{
         .cpu_utilization = fd(1, .{ .scalar = .double }),
@@ -2837,6 +3042,9 @@ pub const SetReturnStatusRequest = struct {
     grpc_code_to_return: i32 = 0,
     grpc_status_description: []const u8 = &.{},
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Status that will be return to callers of the Hook method";
+
     pub const _desc_table = .{
         .grpc_code_to_return = fd(1, .{ .scalar = .int32 }),
         .grpc_status_description = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
@@ -2911,6 +3119,11 @@ pub const HookRequest = struct {
     grpc_status_description: []const u8 = &.{},
     server_port: i32 = 0,
 
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .server_port = "Server port to listen to",
+    };
+
     pub const _desc_table = .{
         .command = fd(1, .@"enum"),
         .grpc_code_to_return = fd(2, .{ .scalar = .int32 }),
@@ -2924,6 +3137,14 @@ pub const HookRequest = struct {
         STOP = 2,
         RETURN = 3,
         _,
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _value_docs = .{
+            .UNSPECIFIED = "Default value",
+            .START = "Start the HTTP endpoint",
+            .STOP = "Stop",
+            .RETURN = "Return from HTTP GET/POST",
+        };
     };
 
     /// Encodes the message to the writer
@@ -3062,6 +3283,20 @@ pub fn TestService(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "grpc.testing";
         pub const service_name = "TestService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A simple service to test the various types of RPCs and experiment with\nperformance with various types of payload.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .EmptyCall = "One empty request followed by one empty response.",
+            .UnaryCall = "One request followed by one response.",
+            .CacheableUnaryCall = "One request followed by one response. Response has cache control\nheaders set such that a caching HTTP proxy (such as GFE) can\nsatisfy subsequent requests.",
+            .StreamingOutputCall = "One request followed by a sequence of responses (streamed download).\nThe server returns the payload with client desired type and sizes.",
+            .StreamingInputCall = "A sequence of requests followed by one response (streamed upload).\nThe server returns the aggregated size of client payload as the result.",
+            .FullDuplexCall = "A sequence of requests with each request served by the server immediately.\nAs one request could lead to multiple responses, this interface\ndemonstrates the idea of full duplexing.",
+            .HalfDuplexCall = "A sequence of requests followed by a sequence of responses.\nThe server buffers all the client requests and then serves them in order. A\nstream of responses are returned to the client when the server starts with\nfirst request.",
+            .UnimplementedCall = "The test server will not implement this method. It will be used\nto test the behavior when clients call unimplemented methods.",
+        };
         /// One empty request followed by one empty response.
         EmptyCall: *const fn (userdata: *UserDataType, request: Empty) ErrorSet!Empty,
         /// One request followed by one response.
@@ -3098,6 +3333,13 @@ pub fn UnimplementedService(comptime UserDataType: type, comptime ErrorSet: type
         pub const package = "grpc.testing";
         pub const service_name = "UnimplementedService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A simple service NOT implemented at servers so clients can test for\nthat case.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .UnimplementedCall = "A call that no server should implement",
+        };
         /// A call that no server should implement
         UnimplementedCall: *const fn (userdata: *UserDataType, request: Empty) ErrorSet!Empty,
     };
@@ -3109,6 +3351,8 @@ pub fn ReconnectService(comptime UserDataType: type, comptime ErrorSet: type) ty
         pub const package = "grpc.testing";
         pub const service_name = "ReconnectService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A service used to control reconnect server.";
         Start: *const fn (userdata: *UserDataType, request: ReconnectParams) ErrorSet!Empty,
         Stop: *const fn (userdata: *UserDataType, request: Empty) ErrorSet!ReconnectInfo,
     };
@@ -3120,6 +3364,14 @@ pub fn LoadBalancerStatsService(comptime UserDataType: type, comptime ErrorSet: 
         pub const package = "grpc.testing";
         pub const service_name = "LoadBalancerStatsService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A service used to obtain stats for verifying LB behavior.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .GetClientStats = "Gets the backend distribution for RPCs sent by a test client.",
+            .GetClientAccumulatedStats = "Gets the accumulated stats for RPCs sent by a test client.",
+        };
         /// Gets the backend distribution for RPCs sent by a test client.
         GetClientStats: *const fn (userdata: *UserDataType, request: LoadBalancerStatsRequest) ErrorSet!LoadBalancerStatsResponse,
         /// Gets the accumulated stats for RPCs sent by a test client.
@@ -3133,6 +3385,15 @@ pub fn HookService(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "grpc.testing";
         pub const service_name = "HookService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Hook service. Used to keep Kubernetes from shutting the pod down.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .Hook = "Sends a request that will \"hang\" until the return status is set by a call\nto a SetReturnStatus",
+            .SetReturnStatus = "Sets a return status for pending and upcoming calls to Hook",
+            .ClearReturnStatus = "Clears the return status. Incoming calls to Hook will \"hang\"",
+        };
         /// Sends a request that will "hang" until the return status is set by a call
         /// to a SetReturnStatus
         Hook: *const fn (userdata: *UserDataType, request: Empty) ErrorSet!Empty,
@@ -3149,6 +3410,8 @@ pub fn XdsUpdateHealthService(comptime UserDataType: type, comptime ErrorSet: ty
         pub const package = "grpc.testing";
         pub const service_name = "XdsUpdateHealthService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A service to remotely control health status of an xDS test server.";
         SetServing: *const fn (userdata: *UserDataType, request: Empty) ErrorSet!Empty,
         SetNotServing: *const fn (userdata: *UserDataType, request: Empty) ErrorSet!Empty,
         SendHookRequest: *const fn (userdata: *UserDataType, request: HookRequest) ErrorSet!HookResponse,
@@ -3161,6 +3424,13 @@ pub fn XdsUpdateClientConfigureService(comptime UserDataType: type, comptime Err
         pub const package = "grpc.testing";
         pub const service_name = "XdsUpdateClientConfigureService";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "A service to dynamically update the configuration of an xDS test client.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .Configure = "Update the tes client's configuration.",
+        };
         /// Update the tes client's configuration.
         Configure: *const fn (userdata: *UserDataType, request: ClientConfigureRequest) ErrorSet!ClientConfigureResponse,
     };

@@ -15,6 +15,15 @@ pub const Http = struct {
     rules: std.ArrayList(HttpRule) = .empty,
     fully_decode_reserved_expansion: bool = false,
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Defines the HTTP configuration for an API service. It contains a list of\n[HttpRule][google.api.HttpRule], each specifying the mapping of an RPC method\nto one or more HTTP REST API methods.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .rules = "A list of HTTP configuration rules that apply to individual API methods.\n\n**NOTE:** All service configuration rules follow \"last one wins\" order.",
+        .fully_decode_reserved_expansion = "When set to true, URL path parameters will be fully URI-decoded except in\ncases of single segment matches in reserved expansion, where \"%2F\" will be\nleft encoded.\n\nThe default behavior is to not decode RFC 6570 reserved characters in multi\nsegment matches.",
+    };
+
     pub const _desc_table = .{
         .rules = fd(1, .{ .repeated = .submessage }),
         .fully_decode_reserved_expansion = fd(2, .{ .scalar = .bool }),
@@ -379,6 +388,23 @@ pub const HttpRule = struct {
         };
     };
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "gRPC Transcoding\n\ngRPC Transcoding is a feature for mapping between a gRPC method and one or\nmore HTTP REST endpoints. It allows developers to build a single API service\nthat supports both gRPC APIs and REST APIs. Many systems, including [Google\nAPIs](https://github.com/googleapis/googleapis),\n[Cloud Endpoints](https://cloud.google.com/endpoints), [gRPC\nGateway](https://github.com/grpc-ecosystem/grpc-gateway),\nand [Envoy](https://github.com/envoyproxy/envoy) proxy support this feature\nand use it for large scale production services.\n\n`HttpRule` defines the schema of the gRPC/REST mapping. The mapping specifies\nhow different portions of the gRPC request message are mapped to the URL\npath, URL query parameters, and HTTP request body. It also controls how the\ngRPC response message is mapped to the HTTP response body. `HttpRule` is\ntypically specified as an `google.api.http` annotation on the gRPC method.\n\nEach mapping specifies a URL path template and an HTTP method. The path\ntemplate may refer to one or more fields in the gRPC request message, as long\nas each field is a non-repeated field with a primitive (non-message) type.\nThe path template controls how fields of the request message are mapped to\nthe URL path.\n\nExample:\n\nservice Messaging {\nrpc GetMessage(GetMessageRequest) returns (Message) {\noption (google.api.http) = {\nget: \"/v1/{name=messages/*}\"\n};\n}\n}\nmessage GetMessageRequest {\nstring name = 1; // Mapped to URL path.\n}\nmessage Message {\nstring text = 1; // The resource content.\n}\n\nThis enables an HTTP REST to gRPC mapping as below:\n\n- HTTP: `GET /v1/messages/123456`\n- gRPC: `GetMessage(name: \"messages/123456\")`\n\nAny fields in the request message which are not bound by the path template\nautomatically become HTTP query parameters if there is no HTTP request body.\nFor example:\n\nservice Messaging {\nrpc GetMessage(GetMessageRequest) returns (Message) {\noption (google.api.http) = {\nget:\"/v1/messages/{message_id}\"\n};\n}\n}\nmessage GetMessageRequest {\nmessage SubMessage {\nstring subfield = 1;\n}\nstring message_id = 1; // Mapped to URL path.\nint64 revision = 2;    // Mapped to URL query parameter `revision`.\nSubMessage sub = 3;    // Mapped to URL query parameter `sub.subfield`.\n}\n\nThis enables a HTTP JSON to RPC mapping as below:\n\n- HTTP: `GET /v1/messages/123456?revision=2&sub.subfield=foo`\n- gRPC: `GetMessage(message_id: \"123456\" revision: 2 sub:\nSubMessage(subfield: \"foo\"))`\n\nNote that fields which are mapped to URL query parameters must have a\nprimitive type or a repeated primitive type or a non-repeated message type.\nIn the case of a repeated type, the parameter can be repeated in the URL\nas `...?param=A&param=B`. In the case of a message type, each field of the\nmessage is mapped to a separate parameter, such as\n`...?foo.a=A&foo.b=B&foo.c=C`.\n\nFor HTTP methods that allow a request body, the `body` field\nspecifies the mapping. Consider a REST update method on the\nmessage resource collection:\n\nservice Messaging {\nrpc UpdateMessage(UpdateMessageRequest) returns (Message) {\noption (google.api.http) = {\npatch: \"/v1/messages/{message_id}\"\nbody: \"message\"\n};\n}\n}\nmessage UpdateMessageRequest {\nstring message_id = 1; // mapped to the URL\nMessage message = 2;   // mapped to the body\n}\n\nThe following HTTP JSON to RPC mapping is enabled, where the\nrepresentation of the JSON in the request body is determined by\nprotos JSON encoding:\n\n- HTTP: `PATCH /v1/messages/123456 { \"text\": \"Hi!\" }`\n- gRPC: `UpdateMessage(message_id: \"123456\" message { text: \"Hi!\" })`\n\nThe special name `*` can be used in the body mapping to define that\nevery field not bound by the path template should be mapped to the\nrequest body.  This enables the following alternative definition of\nthe update method:\n\nservice Messaging {\nrpc UpdateMessage(Message) returns (Message) {\noption (google.api.http) = {\npatch: \"/v1/messages/{message_id}\"\nbody: \"*\"\n};\n}\n}\nmessage Message {\nstring message_id = 1;\nstring text = 2;\n}\n\n\nThe following HTTP JSON to RPC mapping is enabled:\n\n- HTTP: `PATCH /v1/messages/123456 { \"text\": \"Hi!\" }`\n- gRPC: `UpdateMessage(message_id: \"123456\" text: \"Hi!\")`\n\nNote that when using `*` in the body mapping, it is not possible to\nhave HTTP parameters, as all fields not bound by the path end in\nthe body. This makes this option more rarely used in practice when\ndefining REST APIs. The common usage of `*` is in custom methods\nwhich don't use the URL at all for transferring data.\n\nIt is possible to define multiple HTTP methods for one RPC by using\nthe `additional_bindings` option. Example:\n\nservice Messaging {\nrpc GetMessage(GetMessageRequest) returns (Message) {\noption (google.api.http) = {\nget: \"/v1/messages/{message_id}\"\nadditional_bindings {\nget: \"/v1/users/{user_id}/messages/{message_id}\"\n}\n};\n}\n}\nmessage GetMessageRequest {\nstring message_id = 1;\nstring user_id = 2;\n}\n\nThis enables the following two alternative HTTP JSON to RPC mappings:\n\n- HTTP: `GET /v1/messages/123456`\n- gRPC: `GetMessage(message_id: \"123456\")`\n\n- HTTP: `GET /v1/users/me/messages/123456`\n- gRPC: `GetMessage(user_id: \"me\" message_id: \"123456\")`\n\nRules for HTTP mapping\n\n1. Leaf request fields (recursive expansion nested messages in the request\nmessage) are classified into three categories:\n- Fields referred by the path template. They are passed via the URL path.\n- Fields referred by the [HttpRule.body][google.api.HttpRule.body]. They\nare passed via the HTTP\nrequest body.\n- All other fields are passed via the URL query parameters, and the\nparameter name is the field path in the request message. A repeated\nfield can be represented as multiple query parameters under the same\nname.\n2. If [HttpRule.body][google.api.HttpRule.body] is \"*\", there is no URL\nquery parameter, all fields\nare passed via URL path and HTTP request body.\n3. If [HttpRule.body][google.api.HttpRule.body] is omitted, there is no HTTP\nrequest body, all\nfields are passed via URL path and URL query parameters.\n\nPath template syntax\n\nTemplate = \"/\" Segments [ Verb ] ;\nSegments = Segment { \"/\" Segment } ;\nSegment  = \"*\" | \"**\" | LITERAL | Variable ;\nVariable = \"{\" FieldPath [ \"=\" Segments ] \"}\" ;\nFieldPath = IDENT { \".\" IDENT } ;\nVerb     = \":\" LITERAL ;\n\nThe syntax `*` matches a single URL path segment. The syntax `**` matches\nzero or more URL path segments, which must be the last part of the URL path\nexcept the `Verb`.\n\nThe syntax `Variable` matches part of the URL path as specified by its\ntemplate. A variable template must not contain other variables. If a variable\nmatches a single path segment, its template may be omitted, e.g. `{var}`\nis equivalent to `{var=*}`.\n\nThe syntax `LITERAL` matches literal text in the URL path. If the `LITERAL`\ncontains any reserved character, such characters should be percent-encoded\nbefore the matching.\n\nIf a variable contains exactly one path segment, such as `\"{var}\"` or\n`\"{var=*}\"`, when such a variable is expanded into a URL path on the client\nside, all characters except `[-_.~0-9a-zA-Z]` are percent-encoded. The\nserver side does the reverse decoding. Such variables show up in the\n[Discovery\nDocument](https://developers.google.com/discovery/v1/reference/apis) as\n`{var}`.\n\nIf a variable contains multiple path segments, such as `\"{var=foo/*}\"`\nor `\"{var=**}\"`, when such a variable is expanded into a URL path on the\nclient side, all characters except `[-_.~/0-9a-zA-Z]` are percent-encoded.\nThe server side does the reverse decoding, except \"%2F\" and \"%2f\" are left\nunchanged. Such variables show up in the\n[Discovery\nDocument](https://developers.google.com/discovery/v1/reference/apis) as\n`{+var}`.\n\nUsing gRPC API Service Configuration\n\ngRPC API Service Configuration (service config) is a configuration language\nfor configuring a gRPC service to become a user-facing product. The\nservice config is simply the YAML representation of the `google.api.Service`\nproto message.\n\nAs an alternative to annotating your proto file, you can configure gRPC\ntranscoding in your service config YAML files. You do this by specifying a\n`HttpRule` that maps the gRPC method to a REST endpoint, achieving the same\neffect as the proto annotation. This can be particularly useful if you\nhave a proto that is reused in multiple services. Note that any transcoding\nspecified in the service config will override any matching transcoding\nconfiguration in the proto.\n\nThe following example selects a gRPC method and applies an `HttpRule` to it:\n\nhttp:\nrules:\n- selector: example.v1.Messaging.GetMessage\nget: /v1/messages/{message_id}/{sub.subfield}\n\nSpecial notes\n\nWhen gRPC Transcoding is used to map a gRPC to JSON REST endpoints, the\nproto to JSON conversion must follow the [proto3\nspecification](https://developers.google.com/protocol-buffers/docs/proto3#json).\n\nWhile the single segment variable follows the semantics of\n[RFC 6570](https://tools.ietf.org/html/rfc6570) Section 3.2.2 Simple String\nExpansion, the multi segment variable **does not** follow RFC 6570 Section\n3.2.3 Reserved Expansion. The reason is that the Reserved Expansion\ndoes not expand special characters like `?` and `#`, which would lead\nto invalid URLs. As the result, gRPC Transcoding uses a custom encoding\nfor multi segment variables.\n\nThe path variables **must not** refer to any repeated or mapped field,\nbecause client libraries are not capable of handling such variable expansion.\n\nThe path variables **must not** capture the leading \"/\" character. The reason\nis that the most common use case \"{var}\" does not capture the leading \"/\"\ncharacter. For consistency, all path variables must share the same behavior.\n\nRepeated message fields must not be mapped to URL query parameters, because\nno client library can support such complicated mapping.\n\nIf an API needs to use a JSON array for request or response body, it can map\nthe request or response body to a repeated field. However, some gRPC\nTranscoding implementations may not support this feature.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .selector = "Selects a method to which this rule applies.\n\nRefer to [selector][google.api.DocumentationRule.selector] for syntax\ndetails.",
+        .get = "Maps to HTTP GET. Used for listing and getting information about\nresources.",
+        .put = "Maps to HTTP PUT. Used for replacing a resource.",
+        .post = "Maps to HTTP POST. Used for creating a resource or performing an action.",
+        .delete = "Maps to HTTP DELETE. Used for deleting a resource.",
+        .patch = "Maps to HTTP PATCH. Used for updating a resource.",
+        .custom = "The custom pattern is used for specifying an HTTP method that is not\nincluded in the `pattern` field, such as HEAD, or \"*\" to leave the\nHTTP method unspecified for this rule. The wild-card rule is useful\nfor services that provide content to Web (HTML) clients.",
+        .body = "The name of the request field whose value is mapped to the HTTP request\nbody, or `*` for mapping all request fields not captured by the path\npattern to the HTTP body, or omitted for not having any HTTP request body.\n\nNOTE: the referred field must be present at the top-level of the request\nmessage type.",
+        .response_body = "Optional. The name of the response field whose value is mapped to the HTTP\nresponse body. When omitted, the entire response message will be used\nas the HTTP response body.\n\nNOTE: The referred field must be present at the top-level of the response\nmessage type.",
+        .additional_bindings = "Additional HTTP bindings for the selector. Nested bindings must\nnot contain an `additional_bindings` field themselves (that is,\nthe nesting may only be one level deep).",
+    };
+
     pub const _desc_table = .{
         .selector = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .body = fdf(7, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
@@ -455,6 +481,15 @@ pub const CustomHttpPattern = struct {
     kind: []const u8 = &.{},
     path: []const u8 = &.{},
 
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "A custom pattern is used for defining custom HTTP verb.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .kind = "The name of this custom HTTP verb.",
+        .path = "The path matched by this custom verb.",
+    };
+
     pub const _desc_table = .{
         .kind = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .path = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
@@ -525,5 +560,42 @@ pub const CustomHttpPattern = struct {
 
 pub const http = protobuf.Extension(google_protobuf.MethodOptions, ?HttpRule, fd(72295728, .submessage), "google.api.http", null, .{});
 
+/// An indicator of the behavior of a given field (for example, that a field
+/// is required in requests, or given as output but ignored as input).
+/// This **does not** change the behavior in protocol buffers itself; it only
+/// denotes the behavior and may affect how API tooling handles the field.
+///
+/// Note: This enum **may** receive new values in the future.
+pub const FieldBehavior = enum(i32) {
+    FIELD_BEHAVIOR_UNSPECIFIED = 0,
+    OPTIONAL = 1,
+    REQUIRED = 2,
+    OUTPUT_ONLY = 3,
+    INPUT_ONLY = 4,
+    IMMUTABLE = 5,
+    UNORDERED_LIST = 6,
+    NON_EMPTY_DEFAULT = 7,
+    IDENTIFIER = 8,
+    _,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "An indicator of the behavior of a given field (for example, that a field\nis required in requests, or given as output but ignored as input).\nThis **does not** change the behavior in protocol buffers itself; it only\ndenotes the behavior and may affect how API tooling handles the field.\n\nNote: This enum **may** receive new values in the future.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _value_docs = .{
+        .FIELD_BEHAVIOR_UNSPECIFIED = "Conventional default for enums. Do not use this.",
+        .OPTIONAL = "Specifically denotes a field as optional.\nWhile all fields in protocol buffers are optional, this may be specified\nfor emphasis if appropriate.",
+        .REQUIRED = "Denotes a field as required.\nThis indicates that the field **must** be provided as part of the request,\nand failure to do so will cause an error (usually `INVALID_ARGUMENT`).",
+        .OUTPUT_ONLY = "Denotes a field as output only.\nThis indicates that the field is provided in responses, but including the\nfield in a request does nothing (the server *must* ignore it and\n*must not* throw an error as a result of the field's presence).",
+        .INPUT_ONLY = "Denotes a field as input only.\nThis indicates that the field is provided in requests, and the\ncorresponding field is not included in output.",
+        .IMMUTABLE = "Denotes a field as immutable.\nThis indicates that the field may be set once in a request to create a\nresource, but may not be changed thereafter.",
+        .UNORDERED_LIST = "Denotes that a (repeated) field is an unordered list.\nThis indicates that the service may provide the elements of the list\nin any arbitrary  order, rather than the order the user originally\nprovided. Additionally, the list's order may or may not be stable.",
+        .NON_EMPTY_DEFAULT = "Denotes that this field returns a non-empty default value if not set.\nThis indicates that if the user provides the empty value in a request,\na non-empty value will be returned. The user will not be aware of what\nnon-empty value to expect.",
+        .IDENTIFIER = "Denotes that the field in a resource (a message annotated with\ngoogle.api.resource) is used in the resource name to uniquely identify the\nresource. For AIP-compliant APIs, this should only be applied to the\n`name` field on the resource.\n\nThis behavior should not be applied to references to other resources within\nthe message.\n\nThe identifier field of resources often have different field behavior\ndepending on the request it is embedded in (e.g. for Create methods name\nis optional and unused, while for Update methods it is required). Instead\nof method-specific annotations, only `IDENTIFIER` is required.",
+    };
+};
+
+pub const field_behavior = protobuf.Extension(google_protobuf.FieldOptions, std.ArrayList(FieldBehavior), fd(1052, .{ .packed_repeated = .@"enum" }), "google.api.field_behavior", null, .{});
+
 /// Extensions declared in this package, for `protobuf.ExtensionRegistry.init`.
-pub const extensions = .{http};
+pub const extensions = .{ http, field_behavior };

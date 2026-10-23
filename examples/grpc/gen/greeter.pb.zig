@@ -153,6 +153,11 @@ pub fn Greeter(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "greeter";
         pub const service_name = "Greeter";
 
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .SayHello = "Also a REST route, by JSON transcoding: GET /v1/hello/Ada, or a POST\nwith the request as its JSON body.",
+        };
+
         /// Options of the methods that have some (`google.protobuf.MethodOptions`).
         pub const _method_options = .{
             .SayHello = .{
