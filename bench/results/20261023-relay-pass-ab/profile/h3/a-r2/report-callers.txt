@@ -1,0 +1,35 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 15K of event 'cpu_core/cycles/P'
+# Event count (approx.): 25986849159
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                     
+# ........  ...........................................................................................................................................................................................................................................................................................................................................
+#
+     5.53%  [.] heap.ArenaAllocator.alloc
+            |          
+             --5.45%--heap.ArenaAllocator.alloc
+
+     3.05%  [k] nft_do_chain
+            |          
+             --2.98%--nft_do_chain
+                       |          
+                        --2.25%--nft_do_chain_inet
+                                  nf_hook_slow
+
+     2.51%  [.] compiler_rt.memcpy.memcpyFast
+            |          
+             --2.18%--compiler_rt.memcpy.memcpyFast
+
+     2.45%  [.] sync.Futex.wake
+            |          
+             --2.39%--sync.Futex.wake
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

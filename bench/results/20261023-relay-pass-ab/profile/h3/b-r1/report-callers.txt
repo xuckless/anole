@@ -1,0 +1,45 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 15K of event 'cpu_core/cycles/P'
+# Event count (approx.): 26170758990
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                     
+# ........  ...........................................................................................................................................................................................................................................................................................................................................
+#
+     6.32%  [.] heap.ArenaAllocator.alloc
+            |          
+             --6.21%--heap.ArenaAllocator.alloc
+
+     2.79%  [.] malloc
+            |          
+             --2.69%--malloc
+
+     2.75%  [k] nft_do_chain
+            |          
+             --2.69%--nft_do_chain
+
+     2.18%  [.] heap.ArenaAllocator.reset
+            |          
+             --2.16%--heap.ArenaAllocator.reset
+                       h3.server.Endpoint(main.App).Stream.free
+                       h3.server.Endpoint(main.App).onStreamClose
+                       ngtcp2_conn_close_stream
+                       ngtcp2_rtb_recv_ack
+                       conn_recv_ack
+                       conn_recv_pkt
+                       ngtcp2_conn_read_pkt_versioned
+                       h3.server.Endpoint(main.App).onPacket
+                       h3.server.Endpoint(main.App).serve
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     2.15%  [.] compiler_rt.memcpy.memcpyFast
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

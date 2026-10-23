@@ -1,0 +1,48 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 15K of event 'cpu_core/cycles/P'
+# Event count (approx.): 26136692544
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                     
+# ........  ...........................................................................................................................................................................................................................................................................................................................................
+#
+     5.77%  [.] heap.ArenaAllocator.alloc
+            |          
+             --5.68%--heap.ArenaAllocator.alloc
+
+     2.95%  [k] nft_do_chain
+            |          
+             --2.87%--nft_do_chain
+                       |          
+                        --2.18%--nft_do_chain_inet
+                                  nf_hook_slow
+
+     2.45%  [.] malloc
+            |          
+             --2.37%--malloc
+
+     2.11%  [.] compiler_rt.memcpy.memcpyFast
+     2.08%  [.] heap.ArenaAllocator.reset
+            |          
+             --2.04%--heap.ArenaAllocator.reset
+                       h3.server.Endpoint(main.App).Stream.free
+                       h3.server.Endpoint(main.App).onStreamClose
+                       ngtcp2_conn_close_stream
+                       ngtcp2_rtb_recv_ack
+                       conn_recv_ack
+                       conn_recv_pkt
+                       ngtcp2_conn_read_pkt_versioned
+                       h3.server.Endpoint(main.App).onPacket
+                       h3.server.Endpoint(main.App).serve
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

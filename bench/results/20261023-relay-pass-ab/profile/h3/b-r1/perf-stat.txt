@@ -1,0 +1,26 @@
+# started on Fri Oct 23 10:15:25 2026
+
+
+ Performance counter stats for process id '948123':
+
+           4999.98 msec task-clock                                                            
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+       26226724644      cpu_core/cycles/                                                      
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+       59948126911      cpu_core/instructions/                                                
+                58      context-switches                                                      
+                 0      cpu-migrations                                                        
+              1114      page-faults                                                           
+             30664      raw_syscalls:sys_enter                                                
+                 0      syscalls:sys_enter_sendmsg                                            
+              6212      syscalls:sys_enter_sendmmsg                                           
+                 0      syscalls:sys_enter_recvmsg                                            
+             11917      syscalls:sys_enter_recvmmsg                                           
+                 0      syscalls:sys_enter_epoll_wait                                         
+                 0      syscalls:sys_enter_epoll_pwait                                        
+                 0      syscalls:sys_enter_futex                                              
+                 0      syscalls:sys_enter_write                                              
+                 0      syscalls:sys_enter_read                                               
+
+       5.001096885 seconds time elapsed
+
