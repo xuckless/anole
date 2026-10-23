@@ -161,6 +161,8 @@ static void on_call(const anole_grpc_call_event *ev) {
   anole_str method = anole_event_str(ev, ev->method);
   anole_str msg = anole_event_str(ev, ev->message);
   CHECK(ev->route_id == 1);
+  /* Plain text: no client certificate (mutual TLS sets the flag and span). */
+  CHECK(ev->peer_cert.len == 0 && !(ev->flags & ANOLE_GRPC_CALL_PEER_CERT));
   /* The metadata spans start where metadata_off says (and today that is
      right after the fixed part). */
   CHECK(ev->metadata_off == sizeof *ev && ev->ev.len >= ev->metadata_off);
@@ -203,6 +205,9 @@ static void on_call(const anole_grpc_call_event *ev) {
         CHECK(anole_grpc_send_headers(c, bad, 1) == ANOLE_E_INVALID);
         anole_header reserved[1] = {{S("grpc-status"), S("0")}};
         CHECK(anole_grpc_send_headers(c, reserved, 1) == ANOLE_E_INVALID);
+        /* One rule for Zig and the ABI: grpc-status-details-bin is a trailer, not a header. */
+        anole_header details[1] = {{S("grpc-status-details-bin"), S("x")}};
+        CHECK(anole_grpc_send_headers(c, details, 1) == ANOLE_E_INVALID);
         anole_header ctl[1] = {{S("x-a"), S("line\r\nbreak")}};
         CHECK(anole_grpc_send_headers(c, ctl, 1) == ANOLE_E_INVALID);
         /* OK without the message: refused for a unary call. */

@@ -108,4 +108,8 @@ done
 if [ "${CAPI:-1}" != 0 ]; then
     echo "== the C ABI (TLS)"
     "$zig" build capi-test --summary line "-Dmongodb-test-url=$base&tls=true&tlsCAFile=$work/ca.pem"
+    # A library built with MongoDB and neither SQLite nor PostgreSQL still
+    # answers anole_db_query.
+    echo "== the C ABI in a MongoDB-only build (-Dprofile=minimal -Dmongodb=true)"
+    "$zig" build capi-test --summary line -Dprofile=minimal -Dmongodb=true "-Dmongodb-test-url=$base&tls=true&tlsCAFile=$work/ca.pem"
 fi
