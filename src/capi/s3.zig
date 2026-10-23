@@ -741,6 +741,7 @@ fn commonOptions(c: *Call, flags: u32, timeout_ms: u32, bucket: abi.Str) std.mem
 
 /// `anole_s3_get` and `anole_s3_head`.
 pub fn get(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3GetOptions, user_data: u64, head: bool) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, if (head) .head else .get, user_data);
     errdefer call.free();
@@ -760,6 +761,7 @@ pub fn get(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3GetOptions, user_da
 
 /// `anole_s3_put`: `data` is copied.
 pub fn put(st: *Store, c: ?*Consumer, key: abi.Str, data: []const u8, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .put, user_data);
     errdefer call.free();
@@ -788,6 +790,7 @@ fn fillPut(call: *Call, key: abi.Str, o: abi.S3PutOptions) QueryError!void {
 }
 
 pub fn uploadOpen(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .upload_open, user_data);
     errdefer call.free();
@@ -796,6 +799,7 @@ pub fn uploadOpen(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, 
 }
 
 pub fn multipartCreate(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .multipart_create, user_data);
     errdefer call.free();
@@ -804,6 +808,7 @@ pub fn multipartCreate(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3PutOpti
 }
 
 pub fn delete(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3Options, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, c, o.req, .delete, user_data);
     errdefer call.free();
@@ -815,6 +820,7 @@ pub fn delete(st: *Store, c: ?*Consumer, key: abi.Str, o: abi.S3Options, user_da
 }
 
 pub fn deleteMany(st: *Store, c: ?*Consumer, keys: []const abi.Str, o: abi.S3Options, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     for (keys) |k| try checkKey(k);
     const call, const x = try startCall(st, c, o.req, .delete_many, user_data);
     errdefer call.free();
@@ -827,6 +833,7 @@ pub fn deleteMany(st: *Store, c: ?*Consumer, keys: []const abi.Str, o: abi.S3Opt
 }
 
 pub fn listObjects(st: *Store, c: ?*Consumer, o: abi.S3ListOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     if (o.max_keys > 1000) return error.Invalid;
     const call, const x = try startCall(st, c, o.req, .list, user_data);
     errdefer call.free();
@@ -841,6 +848,7 @@ pub fn listObjects(st: *Store, c: ?*Consumer, o: abi.S3ListOptions, user_data: u
 }
 
 pub fn copy(st: *Store, c: ?*Consumer, src_bucket: abi.Str, src_key: abi.Str, dst_key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(src_key);
     try checkKey(dst_key);
     const call, const x = try startCall(st, c, o.req, .copy, user_data);
@@ -853,6 +861,7 @@ pub fn copy(st: *Store, c: ?*Consumer, src_bucket: abi.Str, src_key: abi.Str, ds
 }
 
 pub fn multipartComplete(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.Str, parts: []const abi.S3Part, o: abi.S3Options, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     if (upload_id.len == 0 or parts.len == 0 or parts.len > 10000) return error.Invalid;
     const call, const x = try startCall(st, c, o.req, .multipart_complete, user_data);
@@ -871,6 +880,7 @@ pub fn multipartComplete(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi
 }
 
 pub fn multipartAbort(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.Str, o: abi.S3Options, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     if (upload_id.len == 0) return error.Invalid;
     const call, const x = try startCall(st, c, o.req, .multipart_abort, user_data);
@@ -884,6 +894,7 @@ pub fn multipartAbort(st: *Store, c: ?*Consumer, key: abi.Str, upload_id: abi.St
 
 /// `anole_s3_serve`.
 pub fn serve(st: *Store, req: u64, key: abi.Str, o: abi.S3GetOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, null, req, .serve, user_data);
     errdefer call.free();
@@ -903,6 +914,7 @@ pub fn serve(st: *Store, req: u64, key: abi.Str, o: abi.S3GetOptions, user_data:
 
 /// `anole_s3_put_body`.
 pub fn putBody(st: *Store, req: u64, key: abi.Str, o: abi.S3PutOptions, user_data: u64) QueryError!void {
+    if (comptime !features.s3) return error.Unsupported;
     try checkKey(key);
     const call, const x = try startCall(st, null, req, .put_body, user_data);
     errdefer call.free();
@@ -1118,6 +1130,7 @@ fn scratchCtx(buf: []u8, fba: *std.heap.FixedBufferAllocator) db.Ctx {
 
 /// `anole_s3_upload_write`: true is `ANOLE_BUSY`.
 pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool {
+    if (comptime !features.s3) return error.Unsupported;
     if (flags != 0) return error.Invalid;
     const t, const h = transferOf(e, hv) orelse return e.gone();
     if (t.kind != .upload) return error.WrongKind;
@@ -1154,6 +1167,7 @@ pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerErro
 
 /// `anole_s3_upload_finish`.
 pub fn uploadFinish(e: *Engine, hv: u64, user_data: u64) AnswerError!void {
+    if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return e.gone();
     if (t.kind != .upload) return error.WrongKind;
     var buf: [2048]u8 = undefined;
@@ -1178,6 +1192,7 @@ pub fn uploadFinish(e: *Engine, hv: u64, user_data: u64) AnswerError!void {
 
 /// `anole_s3_read_more`.
 pub fn readMore(e: *Engine, hv: u64, bytes: u32) AnswerError!void {
+    if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return e.gone();
     if (t.kind != .download) return error.WrongKind;
     _ = t.credit.fetchAdd(bytes, .acq_rel);
@@ -1186,6 +1201,7 @@ pub fn readMore(e: *Engine, hv: u64, bytes: u32) AnswerError!void {
 
 /// `anole_handle_release` on a transfer (a cleanup call: over is OK).
 pub fn release(e: *Engine, hv: u64) AnswerError!void {
+    if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return error.Over;
     t.released.store(true, .release);
     kick(t, h);
