@@ -18,7 +18,89 @@ pub const POLLHUP: c_short = 0x10;
 
 pub const Winsize = extern struct { row: u16 = 0, col: u16 = 0, xpixel: u16 = 0, ypixel: u16 = 0 };
 
-const c = struct {
+const c = if (supported) posix else stubs;
+
+/// Windows: nothing is available (D15); every call fails.
+const stubs = struct {
+    fn write(_: c_int, _: [*]const u8, _: usize) isize {
+        return -1;
+    }
+    fn read(_: c_int, _: [*]u8, _: usize) isize {
+        return -1;
+    }
+    fn close(_: c_int) c_int {
+        return -1;
+    }
+    fn open(_: [*:0]const u8, _: c_int, _: anytype) c_int {
+        return -1;
+    }
+    fn poll(_: [*]PollFd, _: c_ulong, _: c_int) c_int {
+        return -1;
+    }
+    fn ioctl(_: c_int, _: c_ulong, _: anytype) c_int {
+        return -1;
+    }
+    fn isatty(_: c_int) c_int {
+        return 0;
+    }
+    fn fcntl(_: c_int, _: c_int, _: anytype) c_int {
+        return -1;
+    }
+    fn pipe(_: *[2]c_int) c_int {
+        return -1;
+    }
+    fn kill(_: c_int, _: c_int) c_int {
+        return -1;
+    }
+    fn raise(_: c_int) c_int {
+        return -1;
+    }
+    fn getpid() c_int {
+        return 0;
+    }
+    fn geteuid() c_uint {
+        return 0;
+    }
+    fn tcgetattr(_: c_int, _: *std.c.termios) c_int {
+        return -1;
+    }
+    fn tcsetattr(_: c_int, _: c_int, _: *const std.c.termios) c_int {
+        return -1;
+    }
+    fn cfmakeraw(_: *std.c.termios) void {}
+    fn clock_gettime(_: c_int, _: *std.c.timespec) c_int {
+        return -1;
+    }
+    fn getenv(_: [*:0]const u8) ?[*:0]const u8 {
+        return null;
+    }
+    fn _exit(_: c_int) noreturn {
+        std.process.exit(1);
+    }
+    fn signal(_: c_int, _: usize) usize {
+        return 0;
+    }
+    fn fork() c_int {
+        return -1;
+    }
+    fn setsid() c_int {
+        return -1;
+    }
+    fn chdir(_: [*:0]const u8) c_int {
+        return -1;
+    }
+    fn dup2(_: c_int, _: c_int) c_int {
+        return -1;
+    }
+    fn execve(_: [*:0]const u8, _: [*:null]const ?[*:0]const u8, _: [*:null]const ?[*:0]const u8) c_int {
+        return -1;
+    }
+    fn waitpid(_: c_int, _: *c_int, _: c_int) c_int {
+        return -1;
+    }
+};
+
+const posix = struct {
     extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
     extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
     extern "c" fn close(fd: c_int) c_int;
@@ -39,6 +121,12 @@ const c = struct {
     extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
     extern "c" fn _exit(code: c_int) noreturn;
     extern "c" fn signal(sig: c_int, handler: usize) usize;
+    extern "c" fn fork() c_int;
+    extern "c" fn setsid() c_int;
+    extern "c" fn chdir(path: [*:0]const u8) c_int;
+    extern "c" fn dup2(a: c_int, b: c_int) c_int;
+    extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+    extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 };
 
 pub const Error = error{ Io, WouldBlock, Closed };
@@ -92,7 +180,7 @@ pub fn close(fd: fd_t) void {
 /// Waits for the descriptors; returns how many are ready (0 on timeout or
 /// signal).
 pub fn poll(fds: []PollFd, timeout_ms: i32) usize {
-    const n = c.poll(fds.ptr, fds.len, timeout_ms);
+    const n = c.poll(fds.ptr, @intCast(fds.len), timeout_ms);
     return if (n < 0) 0 else @intCast(n);
 }
 
@@ -191,7 +279,16 @@ pub fn windowSize(fd: fd_t) ?Winsize {
     return ws;
 }
 
+/// Milliseconds since the Unix epoch.
+pub fn wallMs() i64 {
+    if (!supported) return 0;
+    var ts: std.c.timespec = undefined;
+    if (c.clock_gettime(0, &ts) != 0) return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
 pub fn monotonicMs() i64 {
+    if (!supported) return 0;
     var ts: std.c.timespec = undefined;
     const clk: c_int = if (is_linux) 1 else 6;
     if (c.clock_gettime(clk, &ts) != 0) return 0;
@@ -199,5 +296,47 @@ pub fn monotonicMs() i64 {
 }
 
 fn errno() c_int {
+    if (!supported) return 0;
     return std.c._errno().*;
+}
+
+/// Opens (creating, appending) a file for the relaunched app's output, 0600.
+pub fn openAppend(path: [:0]const u8) ?fd_t {
+    const flags: c_int = if (is_linux) (1 | 0o100 | 0o2000) else (1 | 0x200 | 8);
+    const fd = c.open(path.ptr, flags, @as(c_uint, 0o600));
+    if (fd < 0) return null;
+    setCloexec(fd);
+    return fd;
+}
+
+pub fn openRead(path: [:0]const u8) ?fd_t {
+    const fd = c.open(path.ptr, @as(c_int, 0));
+    if (fd < 0) return null;
+    setCloexec(fd);
+    return fd;
+}
+
+/// Starts `argv[0]` (a path) detached from this process: new session, stdin
+/// from /dev/null, stdout and stderr to `out_fd`, in `cwd`. Everything is
+/// prepared by the caller; the child only makes async-signal-safe calls.
+/// Returns the child's pid.
+pub fn spawnDetached(exe: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, cwd: [*:0]const u8, out_fd: fd_t, null_fd: fd_t) Error!i32 {
+    const pid = c.fork();
+    if (pid < 0) return error.Io;
+    if (pid == 0) {
+        _ = c.setsid();
+        _ = c.dup2(null_fd, 0);
+        _ = c.dup2(out_fd, 1);
+        _ = c.dup2(out_fd, 2);
+        _ = c.chdir(cwd);
+        _ = c.execve(exe, argv, envp);
+        c._exit(127);
+    }
+    return pid;
+}
+
+/// Reaps `pid` if it is our child and has exited. True when it was reaped.
+pub fn reap(pid: i32) bool {
+    var status: c_int = 0;
+    return c.waitpid(pid, &status, 1) == pid; // WNOHANG
 }

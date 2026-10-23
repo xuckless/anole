@@ -20,7 +20,12 @@ var restore_termios: std.c.termios = undefined;
 pub var after_restore: ?*const fn () void = null;
 
 pub const Terminal = struct {
+    /// Where output goes (and, normally, where input comes from).
     fd: sys.fd_t,
+    /// Where input comes from; the same descriptor except in tests.
+    read_fd: sys.fd_t,
+    /// false for a pair of plain descriptors standing in for a terminal.
+    tty: bool = true,
     saved: std.c.termios,
     /// false with NO_COLOR non-empty.
     color: bool,
@@ -37,7 +42,7 @@ pub const Terminal = struct {
         errdefer sys.close(fd);
         const saved = sys.getTermios(fd) orelse return error.NotATerminal;
         const no_color = sys.getenv("NO_COLOR") orelse "";
-        var t: Terminal = .{ .fd = fd, .saved = saved, .color = no_color.len == 0, .size = .{ .cols = 80, .rows = 24 } };
+        var t: Terminal = .{ .fd = fd, .read_fd = fd, .saved = saved, .color = no_color.len == 0, .size = .{ .cols = 80, .rows = 24 } };
         t.size = t.querySize();
         return t;
     }
@@ -47,11 +52,13 @@ pub const Terminal = struct {
     /// process's restore target.
     pub fn enter(self: *Terminal) !void {
         if (self.entered) return;
-        var raw = self.saved;
-        sys.makeRaw(&raw);
-        restore_termios = self.saved;
-        restore_fd = self.fd;
-        sys.setTermios(self.fd, &raw);
+        if (self.tty) {
+            var raw = self.saved;
+            sys.makeRaw(&raw);
+            restore_termios = self.saved;
+            restore_fd = self.fd;
+            sys.setTermios(self.fd, &raw);
+        }
         self.entered = true;
         try sys.writeAll(self.fd, seq.smcup ++ seq.hide_cursor ++ seq.bp_set ++ seq.home ++ seq.erase_below_cursor);
     }
@@ -61,10 +68,21 @@ pub const Terminal = struct {
     pub fn leave(self: *Terminal) void {
         if (!self.entered) return;
         self.entered = false;
-        restoreNow();
+        if (self.tty) {
+            restoreNow();
+        } else {
+            _ = sys.write(self.fd, seq.sgr_reset ++ seq.bp_reset ++ seq.show_cursor ++ seq.rmcup) catch {};
+        }
+    }
+
+    /// Plain descriptors standing in for a terminal (tests, pipes): no
+    /// termios, a fixed size.
+    pub fn fromFds(read_fd: sys.fd_t, write_fd: sys.fd_t, size: Size, color: bool) Terminal {
+        return .{ .fd = write_fd, .read_fd = read_fd, .tty = false, .saved = undefined, .color = color, .size = size };
     }
 
     pub fn querySize(self: *Terminal) Size {
+        if (!self.tty) return self.size;
         if (sys.windowSize(self.fd)) |ws| return .{ .cols = ws.col, .rows = ws.row };
         return .{ .cols = 80, .rows = 24 };
     }
@@ -75,7 +93,7 @@ pub const Terminal = struct {
 
     pub fn close(self: *Terminal) void {
         self.leave();
-        sys.close(self.fd);
+        if (self.tty) sys.close(self.fd);
     }
 };
 

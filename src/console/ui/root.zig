@@ -17,6 +17,8 @@ pub const client = @import("client.zig");
 pub const term = @import("term.zig");
 pub const app = @import("app.zig");
 pub const views = @import("views.zig");
+pub const run = @import("run.zig");
+pub const relaunch = @import("relaunch.zig");
 
 test {
     std.testing.refAllDecls(@This());

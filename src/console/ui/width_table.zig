@@ -1,7 +1,8 @@
 //! Character width data: ranges of code points that take two columns
 //! (East Asian Wide and Fullwidth, and Emoji_Presentation) or none (marks and
-//! format characters). Derived from Unicode 16.0 EastAsianWidth.txt and
-//! emoji-data.txt, condensed to the ranges that matter for terminal output.
+//! format characters). Condensed from Unicode 16.0 EastAsianWidth.txt and
+//! emoji-data.txt to the ranges that matter for terminal output; approximate,
+//! and a wrong width only misaligns a row (the screen clips and pads every row).
 //! Unicode License v3: see THIRD_PARTY_NOTICES part C.
 
 pub const Range = struct { lo: u21, hi: u21 };
