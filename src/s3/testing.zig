@@ -19,6 +19,9 @@ const util = @import("util.zig");
 
 const Md5 = std.crypto.hash.Md5;
 
+const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
+
 pub const access_key_id = "AKIAFAKEFAKEFAKE0001";
 pub const secret_access_key = "fake/secret/access/key+for+tests";
 
@@ -96,7 +99,6 @@ pub const FakeServer = struct {
     pub fn start(gpa: std.mem.Allocator, io: std.Io) !*FakeServer {
         const self = try gpa.create(FakeServer);
         errdefer gpa.destroy(self);
-        const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
         self.* = .{
             .gpa = gpa,
             .io = io,
@@ -107,7 +109,7 @@ pub const FakeServer = struct {
             .arena = .init(gpa),
         };
         self.server.router.any("/", handle);
-        self.server.router.any("/*", handle);
+        self.server.router.any("/*rest", handle);
         self.future = try io.concurrent(runServer, .{self});
         try self.server.waitReady(io);
         return self;
@@ -122,7 +124,13 @@ pub const FakeServer = struct {
         self.stall_gate.set(self.io);
         if (self.future) |*f| _ = f.cancel(self.io) catch {};
         self.server.deinit();
+        for (self.objects.values()) |o| self.freeObject(o);
         self.objects.deinit(self.gpa);
+        for (self.uploads.values()) |*u| {
+            for (u.parts.values()) |p| self.gpa.free(p);
+            u.parts.deinit(self.gpa);
+            self.gpa.free(u.content_type);
+        }
         self.uploads.deinit(self.gpa);
         self.faults.deinit(self.gpa);
         self.canned.deinit(self.gpa);
@@ -205,6 +213,15 @@ pub const FakeServer = struct {
         self.mutex.unlock(self.io);
     }
 
+    fn freeObject(self: *FakeServer, o: Object) void {
+        self.gpa.free(o.bytes);
+        self.gpa.free(o.etag);
+        self.gpa.free(o.content_type);
+        if (o.cache_control) |v| self.gpa.free(v);
+        if (o.content_disposition) |v| self.gpa.free(v);
+        if (o.content_encoding) |v| self.gpa.free(v);
+    }
+
     fn dupe(self: *FakeServer, bytes: []const u8) ![]u8 {
         return self.gpa.dupe(u8, bytes);
     }
@@ -225,6 +242,7 @@ pub const FakeServer = struct {
             .modified = util.nowSeconds(self.io),
         };
         const gop = try self.objects.getOrPut(self.gpa, k);
+        if (gop.found_existing) self.freeObject(gop.value_ptr.*);
         gop.value_ptr.* = obj;
     }
 
@@ -241,7 +259,7 @@ pub const FakeServer = struct {
         try self.lock();
         defer self.unlock();
         try self.log.append(self.gpa, .{
-            .method = try self.arena.allocator().dupe(u8, @tagName(req.method)),
+            .method = util.methodName(req.method),
             .target = try self.arena.allocator().dupe(u8, req.url),
             .status = @intCast(@intFromEnum(res.status)),
         });
@@ -280,7 +298,7 @@ pub const FakeServer = struct {
         const raw_path = if (qmark) |i| target[0..i] else target;
         const raw_query = if (qmark) |i| target[i + 1 ..] else "";
         const query = try parseQuery(arena, raw_query);
-        const method = @tagName(req.method);
+        const method = util.methodName(req.method);
 
         // Canned answers, then scripted failures.
         {
@@ -393,7 +411,7 @@ pub const FakeServer = struct {
             var k = keys;
             if (queryGet(query, "X-Amz-Security-Token")) |t| k.token = t else k.token = null;
             try signer.presign(k, now_s, .{
-                .method = @tagName(req.method),
+                .method = util.methodName(req.method),
                 .host = host,
                 .canonical_uri = raw_path,
                 .query = plain.items,
@@ -436,7 +454,7 @@ pub const FakeServer = struct {
         var k = keys;
         k.token = req.headers.get("x-amz-security-token");
         try signer.sign(k, now_s, .{
-            .method = @tagName(req.method),
+            .method = util.methodName(req.method),
             .host = host,
             .canonical_uri = raw_path,
             .query = query,
@@ -797,6 +815,7 @@ pub const FakeServer = struct {
         self.objects.getPtr(k).?.etag = etag;
         for (up.parts.values()) |p| self.gpa.free(p);
         up.parts.deinit(self.gpa);
+        self.gpa.free(up.content_type);
         _ = self.uploads.swapRemove(id);
         res.status = .ok;
         try res.header("Content-Type", "application/xml");
@@ -809,6 +828,7 @@ pub const FakeServer = struct {
         const up = self.uploads.getPtr(id) orelse return errorXml(res, .not_found, "NoSuchUpload", "The specified upload does not exist.");
         for (up.parts.values()) |p| self.gpa.free(p);
         up.parts.deinit(self.gpa);
+        self.gpa.free(up.content_type);
         _ = self.uploads.swapRemove(id);
         res.status = .no_content;
     }

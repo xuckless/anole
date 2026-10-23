@@ -660,7 +660,7 @@ pub fn build(b: *std.Build) void {
     // storage tests ("capi s3: ..."); with -Ds3-test-url, also against that
     // server (tests/s3/run.sh).
     if (features.s3) {
-        const s3_tests = b.addTest(.{ .name = "anole-test-s3", .root_module = tests.root_module, .filters = &.{ "s3: ", "capi s3: " }, .use_llvm = use_llvm });
+        const s3_tests = b.addTest(.{ .name = "anole-test-s3", .root_module = tests.root_module, .filters = if (test_filters.len > 0) test_filters else &.{ "s3: ", "capi s3: " }, .use_llvm = use_llvm });
         const run_s3_tests = b.addRunArtifact(s3_tests);
         run_s3_tests.has_side_effects = s3_test_url != null;
         b.step("test-s3", "Run the S3 tests (live with -Ds3-test-url=http://...)").dependOn(&run_s3_tests.step);

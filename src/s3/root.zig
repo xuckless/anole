@@ -1030,7 +1030,7 @@ pub const Client = struct {
             const snap = self.creds.acquire() orelse return self.failOur(c, .other, "no_credentials", "no credentials");
             defer self.creds.release(snap);
             self.signer.sign(snap.keys(), self.nowSeconds(), .{
-                .method = @tagName(op.method),
+                .method = util.methodName(op.method),
                 .host = target.host,
                 .canonical_uri = target.uri,
                 .query = op.query,

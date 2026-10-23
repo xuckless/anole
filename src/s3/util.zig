@@ -53,6 +53,19 @@ pub fn contentMd5(buf: *[24]u8, bytes: []const u8) []const u8 {
     return std.base64.standard.Encoder.encode(buf, &d);
 }
 
+/// The method as it is signed and written: upper case.
+pub fn methodName(m: anytype) []const u8 {
+    return switch (m) {
+        .get => "GET",
+        .head => "HEAD",
+        .put => "PUT",
+        .post => "POST",
+        .delete => "DELETE",
+        .options => "OPTIONS",
+        else => "GET",
+    };
+}
+
 /// Current wall-clock seconds.
 pub fn nowSeconds(io: std.Io) i64 {
     return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));

@@ -78,6 +78,11 @@ const Env = struct {
         return &self.ctx;
     }
 
+    /// Prints the last error (for a failing test's output).
+    fn why(self: *Env) void {
+        if (db.lastError(&self.ctx)) |d| std.debug.print("last error: {f}\n", .{d});
+    }
+
     fn lastCode(self: *Env) []const u8 {
         return if (db.lastError(&self.ctx)) |d| d.code else "";
     }
@@ -109,6 +114,7 @@ fn code(resp: anytype) u16 {
 test "s3: put, get, head, delete round trip; content type from the extension; metadata comes back" {
     const env = try Env.init(.{});
     defer env.deinit();
+    errdefer env.why();
     const stored = try env.client.put(env.c(), "docs/readme.txt", .{ .bytes = "hello s3" }, .{ .metadata = &.{.{ "Owner", "ada" }} });
     try testing.expect(stored.etag.len > 2);
     const obj = try env.client.get(env.c(), "docs/readme.txt", .{});
@@ -259,7 +265,7 @@ test "s3: put from a reader of unknown length streams it as parts" {
     try testing.expectEqualSlices(u8, data, env.fake.getObject("b", "stream.bin").?);
 }
 
-test "s3: push upload: ok to one part, busy past it, upload_full a part more, writable again after a part completes" {
+test "s3: push upload: ok to one part, busy past it, upload_full a part more" {
     const env = try Env.init(.{ .part_size = 5 * mib, .concurrency = 1 });
     defer env.deinit();
     env.fake.hold_parts = true;
@@ -278,11 +284,27 @@ test "s3: push upload: ok to one part, busy past it, upload_full a part more, wr
     try testing.expectError(error.ServiceUnavailable, up.write(env.c(), chunk));
     try testing.expectEqualStrings("upload_full", env.lastCode());
     env.fake.releaseParts();
+    const stored = try up.finish(env.c());
+    try testing.expectEqual(@as(u32, 2), stored.parts);
+    try testing.expectEqual(10 * mib, env.fake.getObject("b", "push.bin").?.len);
+}
+
+test "s3: push upload: waitWritable returns after a part completes" {
+    const env = try Env.init(.{ .part_size = 5 * mib, .concurrency = 1 });
+    defer env.deinit();
+    env.fake.hold_parts = true;
+    var up = try env.client.upload(env.c(), "push2.bin", .{});
+    defer up.deinit();
+    const chunk = try pattern(env.ctx.arena, mib, 5);
+    for (0..5) |_| _ = try up.write(env.c(), chunk);
+    try testing.expectEqual(s3.Upload.Written.busy, try up.write(env.c(), chunk));
+    try testing.expect(!up.writable());
+    env.fake.releaseParts();
     try up.waitWritable(env.c(), null);
     try testing.expect(up.writable());
     const stored = try up.finish(env.c());
     try testing.expectEqual(@as(u32, 2), stored.parts);
-    try testing.expectEqual(10 * mib, env.fake.getObject("b", "push.bin").?.len);
+    try testing.expectEqual(6 * mib, env.fake.getObject("b", "push2.bin").?.len);
 }
 
 test "s3: a part failing three times aborts the upload; later writes fail with its error" {
