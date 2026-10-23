@@ -890,6 +890,27 @@ pub const Client = struct {
         return self.dflt().multipart();
     }
 
+    // ---- Upload memory -----------------------------------------------------
+
+    /// Takes `n` bytes of the upload memory; false when it is used up.
+    pub fn takeMemory(self: *Client, n: u64) bool {
+        var cur = self.memory_used.load(.acquire);
+        while (true) {
+            if (cur + n > self.upload_memory) return false;
+            cur = self.memory_used.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) orelse {
+                if (self.memory_gauge) |g| g.add(@intCast(n));
+                return true;
+            };
+        }
+    }
+
+    pub fn giveMemory(self: *Client, n: u64) void {
+        if (n == 0) return;
+        _ = self.memory_used.fetchSub(n, .acq_rel);
+        if (self.memory_gauge) |g| g.add(-@as(i64, @intCast(n)));
+        self.bell.ring(self.io);
+    }
+
     // ---- Errors ----------------------------------------------------------
 
     /// One of our own failures (no request was made).
