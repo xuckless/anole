@@ -485,7 +485,7 @@ pub const WebSocket = struct {
         // A task in the middle of a batch of its own sending here: the frame
         // waits in this socket's buffer for this socket's backstop, so
         // several messages from that batch leave in one write.
-        if (batching_task != 0 and batching_task == placement.taskId(self.io)) return .batch;
+        if (Batch.sendingFromBatch(self.io)) return .batch;
         return .now;
     }
 
@@ -985,6 +985,13 @@ pub const Batch = struct {
             self.owner.store(0, .monotonic);
             if (batching_task != 0 and batching_task == placement.taskId(io)) batching_task = 0;
         }
+    }
+
+    /// Whether the calling task is inside a batch of some socket's (it read
+    /// a message with another buffered behind it), so a frame it sends to
+    /// another socket may wait for that socket's backstop.
+    pub fn sendingFromBatch(io: std.Io) bool {
+        return batching_task != 0 and batching_task == placement.taskId(io);
     }
 
     /// No batch: a read failed, or the reader is done.

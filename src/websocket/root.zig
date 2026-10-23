@@ -388,6 +388,34 @@ pub const Socket = struct {
         };
     }
 
+    /// `send` that leaves the frame in the write buffer: follow a run of
+    /// them with one `flushOut`, so they leave together (a room's sender, the
+    /// C ABI's). Internal.
+    pub fn sendDeferred(self: *Socket, msg_type: MessageType, data: []const u8) !void {
+        try self._send_mutex.lock(self.io);
+        defer self._send_mutex.unlock(self.io);
+        if (comptime features.compression) {
+            if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
+                const packed_data = try d.compress(data);
+                return switch (self._conn) {
+                    .h1 => |ws| ws.sendCompressedNoFlush(msg_type, packed_data),
+                    .stream => |ws| ws.sendNoFlush(msg_type, packed_data, true),
+                };
+            };
+        }
+        return switch (self._conn) {
+            .h1 => |ws| ws.sendNoFlush(msg_type, data),
+            .stream => |ws| ws.sendNoFlush(msg_type, data, false),
+        };
+    }
+
+    /// Sends what `sendDeferred` left. Internal.
+    pub fn flushOut(self: *Socket) !void {
+        return switch (self._conn) {
+            inline else => |ws| ws.flush(),
+        };
+    }
+
     /// Sends a ping with `data`: at most 125 bytes, else
     /// `error.LargeControlFrame`. The pong is dropped inside `receive`.
     pub fn ping(self: *Socket, data: []const u8) !void {
@@ -984,12 +1012,12 @@ pub const Rooms = struct {
     };
 
     /// One copy of a broadcast message, shared by every queue it is in.
-    const Payload = struct {
+    pub const Payload = struct {
         refs: std.atomic.Value(u32),
         type: MessageType,
         len: usize,
 
-        fn create(allocator: std.mem.Allocator, msg_type: MessageType, message: []const u8) !*Payload {
+        pub fn create(allocator: std.mem.Allocator, msg_type: MessageType, message: []const u8) !*Payload {
             const block = try allocator.alignedAlloc(u8, .of(Payload), @sizeOf(Payload) + message.len);
             const p: *Payload = @ptrCast(block.ptr);
             p.* = .{ .refs = .init(1), .type = msg_type, .len = message.len };
@@ -997,7 +1025,7 @@ pub const Rooms = struct {
             return p;
         }
 
-        fn bytes(p: *const Payload) []const u8 {
+        pub fn bytes(p: *const Payload) []const u8 {
             const base: [*]const u8 = @ptrCast(p);
             return base[@sizeOf(Payload)..][0..p.len];
         }
@@ -1006,7 +1034,7 @@ pub const Rooms = struct {
             return p.len + 64;
         }
 
-        fn release(p: *Payload, allocator: std.mem.Allocator) void {
+        pub fn release(p: *Payload, allocator: std.mem.Allocator) void {
             if (p.refs.fetchSub(1, .acq_rel) != 1) return;
             const base: [*]align(@alignOf(Payload)) u8 = @ptrCast(p);
             allocator.free(base[0 .. @sizeOf(Payload) + p.len]);
@@ -1076,6 +1104,9 @@ pub const Rooms = struct {
             if (m.running) if (m.task) |t| placement.cancelTask(t);
         }
     };
+
+    /// The most queued messages a member's sender writes before one flush.
+    const send_round = 64;
 
     /// Members a broadcast notes on the stack for starting their senders; a
     /// bigger room borrows from the allocator.
@@ -1312,10 +1343,16 @@ pub const Rooms = struct {
     /// returns for how many. It does not wait for any of them to be sent
     /// (see `Rooms`). Members joining meanwhile do not get it.
     pub fn broadcast(self: *Rooms, room: []const u8, msg_type: MessageType, data: []const u8, except: ?*Socket) usize {
-        const io = self.bound() orelse return 0;
         const payload = Payload.create(self.allocator, msg_type, data) catch return 0;
-        // The broadcast's own reference; each queue holds one more.
         defer payload.release(self.allocator);
+        return self.broadcastPayload(room, payload, except);
+    }
+
+    /// `broadcast` for a message already in a `Payload` (made with
+    /// `Payload.create`, one reference of the caller's, which it keeps):
+    /// each queue takes a reference of its own. Internal.
+    pub fn broadcastPayload(self: *Rooms, room: []const u8, payload: *Payload, except: ?*Socket) usize {
+        const io = self.bound() orelse return 0;
 
         var stack: [stack_snapshot]*Member = undefined;
         var heap: []*Member = &.{};
@@ -1380,14 +1417,33 @@ pub const Rooms = struct {
         self.mutex.lockUncancelable(io);
         m.task = placement.currentTask(io);
         while (!m.left and !m.broken) {
-            const p = m.pop() orelse break;
+            // Everything queued, up to a round's worth, goes out in one
+            // flush: the member's socket gets one write for a run of
+            // messages, not one each.
+            var round: [send_round]*Payload = undefined;
+            var n: usize = 0;
+            while (n < round.len) {
+                round[n] = m.pop() orelse break;
+                n += 1;
+            }
+            if (n == 0) break;
             m.sending_since = .now(io, .awake);
             self.mutex.unlock(io);
-            const sent = if (m.socket.send(p.type, p.bytes())) |_| true else |err| blk: {
+            var sent = true;
+            for (round[0..n]) |p| {
+                if (!sent) break;
+                m.socket.sendDeferred(p.type, p.bytes()) catch |err| {
+                    if (err == error.Canceled) canceled = true;
+                    sent = false;
+                };
+            }
+            // Whatever was written goes out, or is dropped with the
+            // connection: nothing stays in the buffer unannounced.
+            m.socket.flushOut() catch |err| {
                 if (err == error.Canceled) canceled = true;
-                break :blk false;
+                sent = false;
             };
-            p.release(self.allocator);
+            for (round[0..n]) |p| p.release(self.allocator);
             self.mutex.lockUncancelable(io);
             m.sending_since = null;
             if (!sent) {
