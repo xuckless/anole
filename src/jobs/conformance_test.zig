@@ -401,3 +401,15 @@ test "jobs: the background runner claims and runs an enqueued job, and drains" {
     const info = (try client.get(&ctx, e.id)).?;
     try std.testing.expectEqual(root.State.completed, info.state);
 }
+
+test "jobs: adminRoutes registers on a group" {
+    const gpa = std.testing.allocator;
+    const anole = @import("../root.zig");
+    var state: struct {} = .{};
+    var app = try anole.Server(@TypeOf(state)).init(gpa, .{}, &state);
+    defer app.deinit();
+    var fx: Fx = undefined;
+    try setup(&fx);
+    defer fx.deinit();
+    fx.client.adminRoutes(app.group("/admin", .{}));
+}
