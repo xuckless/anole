@@ -19,7 +19,10 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Client = @import("../Client.zig");
 const ServerAddress = @import("../ServerAddress.zig");
+const ClientStream = @import("../../../net/client_stream.zig").ClientStream;
+const ConnectOptions = @import("../../../net/client_stream.zig").ConnectOptions;
 const Options = @import("../Options.zig");
+const placement = @import("dusty").placement;
 const ServerInfo = @import("../ServerInfo.zig");
 const Message = @import("../Message.zig");
 const Parser = @import("../protocol/Parser.zig");
@@ -123,8 +126,8 @@ fn serve(client: *Client, opened: Opened) Exit {
     // connection finds the client connected. A client that closed
     // meanwhile takes the connection down at once.
     _ = connected(client, opened.server) orelse return .closed;
-    client.connection_tasks.concurrent(io, readLoop, .{client}) catch return .no_tasks;
-    client.connection_tasks.concurrent(io, writeLoop, .{client}) catch return .no_tasks;
+    placement.concurrent(&client.connection_tasks, io, .local, readLoop, .{client}) catch return .no_tasks;
+    placement.concurrent(&client.connection_tasks, io, .local, writeLoop, .{client}) catch return .no_tasks;
     log.debug("connected to {f}", .{opened.server});
     // A server already going away when the handshake ended.
     if (lame_duck) lameDuck(client);
@@ -246,7 +249,8 @@ const Opened = struct {
     gpa: Allocator,
 
     fn release(io: Io, opened: Opened) void {
-        opened.connection.stream.close(io);
+        _ = io;
+        opened.connection.cs.close();
         opened.gpa.free(opened.greeting.info_json);
     }
 };
@@ -286,7 +290,7 @@ fn openFirst(client: *Client) Client.ConnectError!Opened {
 /// the socket for good. The mutex keeps shutdown off a closed socket.
 pub const AttemptState = struct {
     mutex: Io.Mutex = .init,
-    stream: ?Io.net.Stream = null,
+    stream: ?*ClientStream = null,
     aborted: bool = false,
     /// How the server refused the credentials, when it did.
     refused: ?server_error.Refusal = null,
@@ -306,7 +310,7 @@ pub const AttemptState = struct {
 
     /// Registers the attempt's stream; false when the attempt was aborted
     /// already.
-    fn hold(state: *AttemptState, io: Io, stream: Io.net.Stream) bool {
+    fn hold(state: *AttemptState, io: Io, stream: *ClientStream) bool {
         state.mutex.lockUncancelable(io);
         defer state.mutex.unlock(io);
         if (state.aborted) return false;
@@ -325,16 +329,26 @@ pub const AttemptState = struct {
 /// DNS, TCP and the handshake with one server.
 fn attempt(client: *Client, server: *const ServerAddress, state: *AttemptState) (dialer.DialError || Connection.HandshakeError)!Opened {
     const io = client.io;
-    const stream = try dialer.dial(io, server);
+    const options = &client.options.options;
+    // TLS from the first byte: `Options.Tls.first`, or a `tls://` address
+    // with nothing else asked.
+    const first_tls: ?ConnectOptions.Tls = if (options.tls) |t| (if (t.first) t.settings else null) else null;
+    const stream = try dialer.dialWith(io, client.gpa, server, first_tls);
     if (!state.hold(io, stream)) {
-        stream.close(io);
+        stream.close();
         return error.Timeout;
     }
-    var connection: Connection = .init(stream, io, client.read_buffer, client.parser_limits);
-    const greeting = connection.handshake(io, client.gpa, .init(&client.options.options)) catch |err| {
+    var connection: Connection = .init(stream, client.read_buffer, client.parser_limits);
+    var hello: Connection.Hello = .init(options);
+    hello.want_tls = hello.want_tls or server.tls;
+    if (server.tls and hello.tls == null) {
+        // tls:// with no TLS settings given: the defaults (system CAs).
+        hello.tls = &default_tls;
+    }
+    const greeting = connection.handshake(io, client.gpa, hello) catch |err| {
         state.refused = connection.refused;
         state.release(io);
-        stream.close(io);
+        stream.close();
         return err;
     };
     state.release(io);
@@ -344,11 +358,13 @@ fn attempt(client: *Client, server: *const ServerAddress, state: *AttemptState) 
 /// Shuts `stream` down both ways: a read blocked on it returns the end of
 /// the stream and a blocked write fails, whether or not their tasks still
 /// see cancellation. The socket stays open for its owner to close.
-fn shutdown(io: Io, stream: Io.net.Stream) void {
-    const protection = io.swapCancelProtection(.blocked);
-    defer _ = io.swapCancelProtection(protection);
-    stream.shutdown(io, .both) catch {};
+fn shutdown(io: Io, stream: *ClientStream) void {
+    _ = io;
+    stream.shutdown();
 }
+
+/// `tls://` without TLS settings of the options.
+const default_tls: Options.Tls = .{};
 
 /// Sends a PING every `ping_interval` until the connection must end. After
 /// `max_outstanding_pings` PINGs written without a PONG the connection is
@@ -423,9 +439,9 @@ fn teardown(client: *Client, server: ServerAddress, exit: Exit) bool {
         if (closeReason(client) == .drained) client.inbox.endDrained(io) else client.inbox.end(io, if (exit == .closed) .closed else .disconnected);
         client.outbound.close(io);
     }
-    shutdown(io, client.connection.stream);
+    shutdown(io, client.connection.cs);
     client.connection_tasks.cancel(io);
-    client.connection.stream.close(io);
+    client.connection.cs.close();
     if (!again) {
         disconnected(client);
         noteDropped(client, client.outbound.discard(io));

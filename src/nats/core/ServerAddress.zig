@@ -2,7 +2,8 @@
 // commit dbcc967. See src/LICENSE.zefir and THIRD_PARTY_NOTICES.
 //! A server address: a host of up to 255 bytes and a port,
 //! stored inline, so the value can be copied and returned without an
-//! allocator. An IPv6 host is stored without its brackets.
+//! allocator. An IPv6 host is stored without its brackets. `tls://` sets
+//! `tls`.
 
 const std = @import("std");
 const ServerAddress = @This();
@@ -13,18 +14,24 @@ pub const max_host_len = 255;
 host_buffer: [max_host_len]u8,
 host_len: u8,
 port: u16,
+/// The URL said `tls://`: TLS from the server's INFO on (or from the first
+/// byte with `Options.Tls.first`).
+tls: bool = false,
 
 pub const ParseError = error{InvalidOptions};
 
 /// Parses `nats://host:port`, `host:port`, `[::1]:4222` or a bare host; the
 /// port defaults to 4222. The `connect_urls` of INFO use the same forms
-/// without a scheme. Other schemes (`tls://`, `ws://`, `wss://`), user and
+/// without a scheme. Other schemes (`ws://`, `wss://`), user and
 /// password in the URL, paths and whitespace are InvalidOptions, the error
 /// of such a server in the client's options.
 pub fn parse(text: []const u8) ParseError!ServerAddress {
     var rest = text;
+    var secure = false;
     if (std.mem.find(u8, rest, "://")) |scheme_end| {
-        if (!std.ascii.eqlIgnoreCase(rest[0..scheme_end], "nats")) return error.InvalidOptions;
+        if (std.ascii.eqlIgnoreCase(rest[0..scheme_end], "tls")) {
+            secure = true;
+        } else if (!std.ascii.eqlIgnoreCase(rest[0..scheme_end], "nats")) return error.InvalidOptions;
         rest = rest[scheme_end + 3 ..];
     }
     if (rest.len == 0) return error.InvalidOptions;
@@ -62,6 +69,7 @@ pub fn parse(text: []const u8) ParseError!ServerAddress {
         .host_buffer = undefined,
         .host_len = @intCast(name.len),
         .port = if (port_text) |p| try parsePort(p) else default_port,
+        .tls = secure,
     };
     @memcpy(address.host_buffer[0..name.len], name);
     return address;
@@ -123,7 +131,7 @@ test "accepted forms" {
 test "rejected forms" {
     const too_long: [256]u8 = @splat('h');
     for ([_][]const u8{
-        "",                    "nats://",                    "tls://host:4222", "ws://host",           "wss://host",
+        "",                    "nats://",                    "tls://",          "ws://host",           "wss://host",
         "http://host",         "nats://user:pass@host:4222", "user@host",       "host:",               "host:0",
         "host:65536",          "host:12a",                   "host:-1",         "::1",                 "::1:4222",
         "[::1",                "[::1]x",                     "[::1]:",          "[127.0.0.1]:4222",    "host:4222/path",
@@ -143,6 +151,13 @@ test "format writes the connect_urls form and round-trips" {
         try w.print("{f}", .{try parse(text)});
         try testing.expectEqualStrings(text, w.buffered());
     }
+}
+
+test "tls:// sets the flag" {
+    const a = try parse("tls://nats.internal:4222");
+    try testing.expect(a.tls);
+    try testing.expectEqualStrings("nats.internal", a.host());
+    try testing.expect(!(try parse("nats://nats.internal")).tls);
 }
 
 test "eql ignores the case of the host" {

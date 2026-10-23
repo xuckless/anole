@@ -16,6 +16,9 @@
 const std = @import("std");
 const Duration = std.Io.Duration;
 const ServerAddress = @import("ServerAddress.zig");
+const ClientStream = @import("../../net/client_stream.zig").ClientStream;
+const ConnectOptions = @import("../../net/client_stream.zig").ConnectOptions;
+const nkeys = @import("../nkeys.zig");
 const encoder = @import("protocol/encoder.zig");
 const Options = @This();
 
@@ -59,16 +62,38 @@ retry_initial_connect: bool = false,
 reconnect: ReconnectOptions = .{},
 /// Bounds on what the client holds in memory.
 limits: Limits = .{},
+/// TLS (`tls://` addresses, a server that requires it, or `required`);
+/// null: plain only. Held by reference: it must outlive the client.
+tls: ?*const Tls = null,
 
 pub const Auth = union(enum) {
     none,
     /// Sent in plaintext: use it only on a trusted network.
     user_password: UserPassword,
+    /// An authentication token.
+    token: []const u8,
+    /// An NKey seed ("SU..."): the server's nonce is signed with it.
+    nkey: NKey,
+    /// A user JWT and its NKey seed (a `.creds` file's two parts).
+    creds: Creds,
+
+    pub const NKey = struct { seed: []const u8 };
+    pub const Creds = struct { jwt: []const u8, seed: []const u8 };
 
     pub const UserPassword = struct {
         username: []const u8,
         password: []const u8,
     };
+};
+
+/// How TLS is set up; `settings` is `ClientStream`'s (CAs, client
+/// certificate, verification).
+pub const Tls = struct {
+    settings: ConnectOptions.Tls = .{},
+    /// TLS before the server's INFO (nats-server `handshake_first`).
+    first: bool = false,
+    /// TLS even for `nats://` addresses.
+    required: bool = false,
 };
 
 pub const ReconnectOptions = struct {
@@ -165,6 +190,12 @@ pub fn validate(options: Options) Error!void {
                 if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return error.InvalidOptions;
             }
         },
+        .token => |t| if (t.len == 0 or !std.unicode.utf8ValidateSlice(t)) return error.InvalidOptions,
+        .nkey => |k| _ = nkeys.decodeSeed(k.seed) catch return error.InvalidOptions,
+        .creds => |c| {
+            if (c.jwt.len == 0 or !std.unicode.utf8ValidateSlice(c.jwt)) return error.InvalidOptions;
+            _ = nkeys.decodeSeed(c.seed) catch return error.InvalidOptions;
+        },
     }
     if (options.connect_timeout.nanoseconds <= 0 or options.ping_interval.nanoseconds <= 0) return error.InvalidOptions;
     if (options.max_outstanding_pings == 0) return error.InvalidOptions;
@@ -187,6 +218,9 @@ pub fn validate(options: Options) Error!void {
     if (connect_len > max_connect_json or connect_len > limits.max_control_line_bytes) return error.InvalidOptions;
 }
 
+const nkey_placeholder: [56]u8 = @splat('U');
+const sig_placeholder: [86]u8 = @splat('A');
+
 /// The CONNECT JSON as long as it can get: as if the server supported headers.
 fn longestConnectJson(options: Options) usize {
     return encoder.connectJsonLen(.{
@@ -197,12 +231,28 @@ fn longestConnectJson(options: Options) usize {
         .no_responders = options.no_responders,
         .name = options.name,
         .user = switch (options.auth) {
-            .none => null,
             .user_password => |credentials| credentials.username,
+            else => null,
         },
         .pass = switch (options.auth) {
-            .none => null,
             .user_password => |credentials| credentials.password,
+            else => null,
+        },
+        .auth_token = switch (options.auth) {
+            .token => |t| t,
+            else => null,
+        },
+        .jwt = switch (options.auth) {
+            .creds => |c| c.jwt,
+            else => null,
+        },
+        .nkey = switch (options.auth) {
+            .nkey, .creds => &nkey_placeholder,
+            else => null,
+        },
+        .sig = switch (options.auth) {
+            .nkey, .creds => &sig_placeholder,
+            else => null,
         },
     });
 }

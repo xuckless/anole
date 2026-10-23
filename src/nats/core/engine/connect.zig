@@ -11,24 +11,34 @@ const net = Io.net;
 const ServerAddress = @import("../ServerAddress.zig");
 const time = @import("time.zig");
 
-pub const DialError = net.IpAddress.ConnectError || net.HostName.ConnectError ||
-    net.HostName.ValidateError || net.Ip6Address.ResolveError;
+const ClientStream = @import("../../../net/client_stream.zig").ClientStream;
+const ConnectOptions = @import("../../../net/client_stream.zig").ConnectOptions;
 
-/// Resolves `address` and opens a TCP connection to it. It has no time
-/// limit of its own: run it under `race`.
-pub fn dial(io: Io, address: *const ServerAddress) DialError!net.Stream {
-    const host = address.host();
-    if (net.IpAddress.parse(host, address.port)) |ip| {
-        return ip.connect(io, .{ .mode = .stream });
-    } else |_| {}
-    if (std.mem.findScalar(u8, host, ':') != null) {
-        // An IPv6 literal with a zone, such as fe80::1%en0: the OS looks
-        // the interface up.
-        const ip: net.IpAddress = .{ .ip6 = try .resolve(io, host, address.port) };
-        return ip.connect(io, .{ .mode = .stream });
+pub const DialError = net.IpAddress.ConnectError || net.HostName.ConnectError ||
+    net.HostName.ValidateError || net.Ip6Address.ResolveError || error{OutOfMemory};
+
+/// Resolves `address` and opens a TCP connection to it (TLS from the first
+/// byte when `tls` is given). It has no time limit of its own: run it
+/// under `race`.
+pub fn dial(io: Io, gpa: std.mem.Allocator, address: *const ServerAddress) DialError!*ClientStream {
+    return dialWith(io, gpa, address, null);
+}
+
+pub fn dialWith(io: Io, gpa: std.mem.Allocator, address: *const ServerAddress, tls: ?ConnectOptions.Tls) DialError!*ClientStream {
+    return ClientStream.connect(gpa, io, .{
+        .host = address.host(),
+        .port = address.port,
+        .tls = tls,
+        .connect_timeout = null,
+    }) catch |err| return narrow(err);
+}
+
+fn narrow(err: anyerror) DialError {
+    inline for (@typeInfo(DialError).error_set.error_names.?) |name| {
+        if (err == @field(DialError, name)) return @field(DialError, name);
     }
-    const name: net.HostName = try .init(host);
-    return name.connect(io, address.port, .{ .mode = .stream });
+    std.log.scoped(.nats).debug("dial failed: {t}", .{err});
+    return error.NetworkDown;
 }
 
 /// The errors of `race(function, ...)`: those of `function`, plus Timeout
@@ -132,8 +142,8 @@ test "dial reaches a listener by IP address and by name" {
         var peer = try io.concurrent(acceptOne, .{ io, &server });
         defer if (peer.cancel(io)) |stream| stream.close(io) else |_| {};
         const address = try addressOf(&server, host);
-        const stream = try dial(io, &address);
-        stream.close(io);
+        const stream = try dial(io, testing.allocator, &address);
+        stream.close();
     }
 }
 
@@ -142,7 +152,7 @@ test "dial to a closed port is refused" {
     var server = try listen(io);
     const address = try addressOf(&server, "127.0.0.1");
     server.deinit(io);
-    try testing.expectError(error.ConnectionRefused, dial(io, &address));
+    try testing.expectError(error.ConnectionRefused, dial(io, testing.allocator, &address));
 }
 
 fn sleepThenAnswer(io: Io, duration: Io.Duration) error{Canceled}!u32 {

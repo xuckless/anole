@@ -36,6 +36,16 @@ pub fn init(gpa: Allocator, options: Options) (Options.Error || Allocator.Error)
             const password = try gpa.dupe(u8, credentials.password);
             copy.auth = .{ .user_password = .{ .username = username, .password = password } };
         },
+        .token => |t| copy.auth = .{ .token = try gpa.dupe(u8, t) },
+        .nkey => |k| copy.auth = .{ .nkey = .{ .seed = try gpa.dupe(u8, k.seed) } },
+        .creds => |c| {
+            const seed = try gpa.dupe(u8, c.seed);
+            errdefer {
+                std.crypto.secureZero(u8, seed);
+                gpa.free(seed);
+            }
+            copy.auth = .{ .creds = .{ .jwt = try gpa.dupe(u8, c.jwt), .seed = seed } };
+        },
     }
     return .{ .options = copy, .servers = servers };
 }
@@ -47,6 +57,12 @@ pub fn deinit(owned: *OwnedOptions, gpa: Allocator) void {
         .user_password => |credentials| {
             gpa.free(credentials.password);
             gpa.free(credentials.username);
+        },
+        .token => |t| gpa.free(t),
+        .nkey => |k| gpa.free(k.seed),
+        .creds => |c| {
+            gpa.free(c.jwt);
+            gpa.free(c.seed);
         },
     }
     if (owned.options.name) |name| gpa.free(name);
@@ -63,6 +79,9 @@ fn wipeCredentials(owned: *OwnedOptions) void {
             std.crypto.secureZero(u8, @constCast(credentials.username));
             std.crypto.secureZero(u8, @constCast(credentials.password));
         },
+        .token => |t| std.crypto.secureZero(u8, @constCast(t)),
+        .nkey => |k| std.crypto.secureZero(u8, @constCast(k.seed)),
+        .creds => |c| std.crypto.secureZero(u8, @constCast(c.seed)),
     }
 }
 

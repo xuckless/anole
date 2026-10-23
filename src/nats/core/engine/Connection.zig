@@ -11,6 +11,9 @@ const net = Io.net;
 const Allocator = std.mem.Allocator;
 const Writer = Io.Writer;
 const Options = @import("../Options.zig");
+const ClientStream = @import("../../../net/client_stream.zig").ClientStream;
+const transport = @import("../../transport.zig");
+const nkeys = @import("../../nkeys.zig");
 const ServerInfo = @import("../ServerInfo.zig");
 const Parser = @import("../protocol/Parser.zig");
 const encoder = @import("../protocol/encoder.zig");
@@ -18,8 +21,8 @@ const server_error = @import("../protocol/server_error.zig");
 const log = std.log.scoped(.nats);
 const Connection = @This();
 
-stream: net.Stream,
-reader: net.Stream.Reader,
+cs: *ClientStream,
+reader: transport.Reader,
 parser: Parser,
 /// How the server refused the credentials, when the handshake failed with
 /// AuthenticationFailed.
@@ -30,8 +33,26 @@ sent: std.atomic.Value(u64) = .init(0),
 
 /// `buffer` holds at least `Parser.bufferLen(limits)` bytes and outlives
 /// the connection.
-pub fn init(stream: net.Stream, io: Io, buffer: []u8, limits: Parser.Limits) Connection {
-    return .{ .stream = stream, .reader = stream.reader(io, buffer), .parser = .init(limits) };
+pub fn init(cs: *ClientStream, buffer: []u8, limits: Parser.Limits) Connection {
+    return .{ .cs = cs, .reader = .init(cs, buffer), .parser = .init(limits) };
+}
+
+/// What a failed read or write on the stream (plain or TLS) comes to.
+pub const TransportError = error{
+    Canceled,
+    ConnectionResetByPeer,
+    BrokenPipe,
+    Unexpected,
+    /// The socket or the TLS layer failed (the log says how).
+    TransportFailed,
+};
+
+fn transportError(err: anyerror) TransportError {
+    inline for (@typeInfo(TransportError).error_set.error_names.?) |name| {
+        if (err == @field(TransportError, name)) return @field(TransportError, name);
+    }
+    log.warn("connection failed: {t}", .{err});
+    return error.TransportFailed;
 }
 
 /// What the client says in CONNECT.
@@ -43,6 +64,16 @@ pub const Hello = struct {
     name: ?[]const u8 = null,
     user: ?[]const u8 = null,
     pass: ?[]const u8 = null,
+    auth_token: ?[]const u8 = null,
+    /// A user JWT (`.creds`).
+    jwt: ?[]const u8 = null,
+    /// An NKey seed: the handshake signs the server's nonce with it.
+    seed: ?[]const u8 = null,
+    /// How to secure the connection when the server or the address asks
+    /// for TLS; null: plain only (a server that requires TLS is refused).
+    tls: ?*const Options.Tls = null,
+    /// The server's address said `tls://`, or `Options.Tls.required`.
+    want_tls: bool = false,
 
     pub fn init(options: *const Options) Hello {
         return .{
@@ -52,13 +83,28 @@ pub const Hello = struct {
             .no_responders = options.no_responders,
             .name = options.name,
             .user = switch (options.auth) {
-                .none => null,
                 .user_password => |credentials| credentials.username,
+                else => null,
             },
             .pass = switch (options.auth) {
-                .none => null,
                 .user_password => |credentials| credentials.password,
+                else => null,
             },
+            .auth_token = switch (options.auth) {
+                .token => |t| t,
+                else => null,
+            },
+            .jwt = switch (options.auth) {
+                .creds => |c| c.jwt,
+                else => null,
+            },
+            .seed = switch (options.auth) {
+                .nkey => |k| k.seed,
+                .creds => |c| c.seed,
+                else => null,
+            },
+            .tls = options.tls,
+            .want_tls = if (options.tls) |t| t.required or t.first else false,
         };
     }
 };
@@ -73,10 +119,19 @@ pub const Greeting = struct {
     /// The largest message the server takes, headers included; 0 when it
     /// did not say.
     max_payload: i64,
+    /// The server requires TLS, or the address or options ask for it.
+    tls_wanted: bool = false,
+    nonce_buf: [64]u8 = undefined,
+    nonce_len: u8 = 0,
+
+    /// The server's nonce, to sign for an NKey login.
+    pub fn nonce(self: *const Greeting) []const u8 {
+        return self.nonce_buf[0..self.nonce_len];
+    }
 };
 
-pub const ReadError = Parser.Error || error{EndOfStream} || net.Stream.Reader.Error;
-pub const WriteError = net.Stream.Writer.Error;
+pub const ReadError = Parser.Error || error{EndOfStream} || TransportError;
+pub const WriteError = TransportError;
 pub const HandshakeError = error{
     /// The server wants TLS.
     UnsupportedSecurityFeature,
@@ -91,8 +146,10 @@ pub const HandshakeError = error{
     Timeout,
     /// The server takes no more connections.
     ConnectionRefused,
+    /// The seed or creds of the login do not decode.
+    InvalidOptions,
     OutOfMemory,
-} || net.Stream.Reader.Error || net.Stream.Writer.Error;
+} || TransportError;
 
 /// INFO, then CONNECT and PING in one write, then frames until PONG. A
 /// PING from the server is answered at once; INFO replaces the one before.
@@ -107,7 +164,21 @@ pub fn handshake(conn: *Connection, io: Io, gpa: Allocator, hello: Hello) Handsh
     var greeting = try greet(gpa, first, hello);
     errdefer gpa.free(greeting.info_json);
 
-    try conn.sendConnect(io, hello, greeting.headers);
+    // TLS: the server asks for it, the address says so, or the options
+    // insist. The INFO line is consumed; anything else already read would
+    // be plaintext slipped in ahead of the encrypted stream.
+    if (greeting.tls_wanted and !conn.cs.isTls()) {
+        const settings = hello.tls orelse return error.UnsupportedSecurityFeature;
+        if (conn.reader.interface.bufferedLen() != 0) return error.ProtocolError;
+        conn.cs.startTls(settings.settings) catch |err| {
+            if (err == error.TlsNotBuilt) {
+                log.warn("the NATS server requires TLS, which this build leaves out (-Dtls=none)", .{});
+                return error.UnsupportedSecurityFeature;
+            }
+            return transportError(err);
+        };
+    }
+    try conn.sendConnect(io, hello, greeting);
     while (true) switch (try conn.handshakeFrame()) {
         .pong => {
             while (try conn.bufferedInfo()) |json| {
@@ -141,20 +212,33 @@ pub fn handshake(conn: *Connection, io: Io, gpa: Allocator, hello: Hello) Handsh
 /// within `Options.max_connect_json`.
 const max_connect_frame = "CONNECT ".len + Options.max_connect_json + 2 + encoder.ping.len;
 
-fn sendConnect(conn: *Connection, io: Io, hello: Hello, headers: bool) HandshakeError!void {
+fn sendConnect(conn: *Connection, io: Io, hello: Hello, greeting: Greeting) HandshakeError!void {
     var buffer: [max_connect_frame]u8 = undefined;
     // The frame holds the password.
     defer std.crypto.secureZero(u8, &buffer);
     var w: Writer = .fixed(&buffer);
+    var key_buf: [56]u8 = undefined;
+    var sig_buf: [86]u8 = undefined;
+    var nkey: ?[]const u8 = null;
+    var sig: ?[]const u8 = null;
+    if (hello.seed) |text| {
+        const seed = nkeys.decodeSeed(text) catch return error.InvalidOptions;
+        nkey = seed.publicKey(&key_buf);
+        sig = seed.signNonce(greeting.nonce(), &sig_buf) catch return error.InvalidOptions;
+    }
     encoder.writeConnect(&w, .{
         .verbose = hello.verbose,
         .pedantic = hello.pedantic,
         .echo = hello.echo,
-        .headers = headers,
+        .headers = greeting.headers,
         .no_responders = hello.no_responders,
         .name = hello.name,
         .user = hello.user,
         .pass = hello.pass,
+        .auth_token = hello.auth_token,
+        .jwt = hello.jwt,
+        .nkey = nkey,
+        .sig = sig,
     }) catch return error.ProtocolError;
     w.writeAll(encoder.ping) catch return error.ProtocolError;
     var sent: usize = 0;
@@ -167,14 +251,19 @@ fn greet(gpa: Allocator, json: []const u8, hello: ?Hello) HandshakeError!Greetin
     const info = try parseInfo(gpa, json);
     defer info.deinit();
     if (hello) |h| {
-        if (info.value.tls_required) return error.UnsupportedSecurityFeature;
+        if (info.value.tls_required and h.tls == null) return error.UnsupportedSecurityFeature;
         if (!h.echo and info.value.proto < 1) return error.UnsupportedFeature;
     }
-    return .{
+    var greeting: Greeting = .{
         .info_json = try gpa.dupe(u8, json),
         .headers = info.value.headers,
         .max_payload = info.value.max_payload,
+        .tls_wanted = if (hello) |h| info.value.tls_required or h.want_tls else false,
     };
+    const n = @min(info.value.nonce.len, greeting.nonce_buf.len);
+    @memcpy(greeting.nonce_buf[0..n], info.value.nonce[0..n]);
+    greeting.nonce_len = @intCast(n);
+    return greeting;
 }
 
 fn parseInfo(gpa: Allocator, json: []const u8) HandshakeError!std.json.Parsed(ServerInfo) {
@@ -232,7 +321,7 @@ pub fn next(conn: *Connection) ReadError!Parser.Frame {
         // with it full.
         r.fillMore() catch |err| switch (err) {
             error.EndOfStream => return error.EndOfStream,
-            error.ReadFailed => return conn.reader.err orelse error.Unexpected,
+            error.ReadFailed => return transportError(conn.cs.readError() orelse error.Unexpected),
         };
     }
 }
@@ -245,6 +334,7 @@ pub const max_write = 256 * 1024;
 /// Writes all of `slices`, adding to `written` what the socket took, also
 /// when it fails half way.
 pub fn writeAll(conn: *Connection, io: Io, slices: []const []const u8, written: *usize) WriteError!void {
+    if (conn.cs.isTls()) return conn.writeAllTls(slices, written);
     var window: [16][]const u8 = undefined;
     var index: usize = 0;
     while (index < slices.len) {
@@ -268,8 +358,8 @@ pub fn writeAll(conn: *Connection, io: Io, slices: []const []const u8, written: 
                 parts += 1;
                 total += take;
             }
-            const result = try io.operate(.{ .net_write = .{ .socket_handle = conn.stream.socket.handle, .data = part[0..parts] } });
-            var n = try result.net_write;
+            const result = io.operate(.{ .net_write = .{ .socket_handle = conn.cs.socket.socket.handle, .data = part[0..parts] } }) catch |err| return transportError(err);
+            var n = result.net_write catch |err| return transportError(err);
             // A blocking socket takes at least one byte or fails.
             if (n == 0) return error.Unexpected;
             written.* += n;
@@ -285,6 +375,33 @@ pub fn writeAll(conn: *Connection, io: Io, slices: []const []const u8, written: 
             }
         }
     }
+}
+
+/// Over TLS the socket's progress is not visible: the whole batch counts
+/// as sent when a write fails, so nothing is ever sent twice.
+fn writeAllTls(conn: *Connection, slices: []const []const u8, written: *usize) WriteError!void {
+    const w = conn.cs.writer();
+    var total: usize = 0;
+    for (slices) |s| total += s.len;
+    var done: usize = 0;
+    for (slices) |s| {
+        var rest = s;
+        while (rest.len > 0) {
+            const part = rest[0..@min(rest.len, max_write)];
+            w.writeAll(part) catch {
+                written.* += total;
+                return transportError(conn.cs.writeError() orelse error.Unexpected);
+            };
+            done += part.len;
+            rest = rest[part.len..];
+            _ = conn.sent.fetchAdd(part.len, .monotonic);
+        }
+    }
+    w.flush() catch {
+        written.* += total;
+        return transportError(conn.cs.writeError() orelse error.Unexpected);
+    };
+    written.* += done;
 }
 
 const testing = std.testing;
@@ -306,8 +423,8 @@ const TestClient = struct {
         const buffer = try testing.allocator.alloc(u8, Parser.bufferLen(.{}));
         errdefer testing.allocator.free(buffer);
         const address = try FakeServer.address(listener);
-        const stream = try connect.dial(io, &address);
-        return .{ .buffer = buffer, .conn = .init(stream, io, buffer, .{}), .open = true };
+        const stream = try connect.dial(io, testing.allocator, &address);
+        return .{ .buffer = buffer, .conn = .init(stream, buffer, .{}), .open = true };
     }
 
     fn handshake(client: *TestClient, io: Io, hello: Hello) !Greeting {
@@ -324,7 +441,8 @@ const TestClient = struct {
 
     /// Closes the socket: the server reads the end of the stream.
     fn hangUp(client: *TestClient, io: Io) void {
-        if (client.open) client.conn.stream.close(io);
+        _ = io;
+        if (client.open) client.conn.cs.close();
         client.open = false;
     }
 

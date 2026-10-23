@@ -42,6 +42,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Options = @import("Options.zig");
+const placement = @import("dusty").placement;
 const ServerAddress = @import("ServerAddress.zig");
 const ServerInfo = @import("ServerInfo.zig");
 const Message = @import("Message.zig");
@@ -92,6 +93,9 @@ events: EventQueue,
 counters: Counters = .{},
 /// The manager task.
 tasks: Io.Group = .init,
+/// The executor the manager (and so the connection's tasks) runs on; set
+/// by Anole's layer (`anole.nats`), 0 elsewhere.
+executor: usize = 0,
 /// The reader and writer of the current connection.
 connection_tasks: Io.Group = .init,
 /// The current connection; only the manager opens and closes it.
@@ -905,7 +909,7 @@ pub fn connect(client: *Client) ConnectError!void {
         client.mutex.unlock(io);
         switch (status) {
             .disconnected => {
-                client.tasks.concurrent(io, manager.run, .{client}) catch |err| {
+                placement.concurrent(&client.tasks, io, .{ .executor = client.executor }, manager.run, .{client}) catch |err| {
                     manager.connectFailed(client, err);
                     return err;
                 };

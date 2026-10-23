@@ -33,6 +33,12 @@ pub const Connect = struct {
     name: ?[]const u8 = null,
     user: ?[]const u8 = null,
     pass: ?[]const u8 = null,
+    /// An authentication token.
+    auth_token: ?[]const u8 = null,
+    /// A user JWT, with `nkey` and `sig` (a signed nonce).
+    jwt: ?[]const u8 = null,
+    nkey: ?[]const u8 = null,
+    sig: ?[]const u8 = null,
 };
 
 /// The CONNECT object, fields in the order they are written. `verbose`
@@ -49,6 +55,10 @@ const ConnectJson = struct {
     name: ?[]const u8,
     user: ?[]const u8,
     pass: ?[]const u8,
+    auth_token: ?[]const u8,
+    jwt: ?[]const u8,
+    nkey: ?[]const u8,
+    sig: ?[]const u8,
 };
 
 const json_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
@@ -63,6 +73,10 @@ fn connectJson(c: Connect) ConnectJson {
         .name = c.name,
         .user = c.user,
         .pass = c.pass,
+        .auth_token = c.auth_token,
+        .jwt = c.jwt,
+        .nkey = c.nkey,
+        .sig = c.sig,
     };
 }
 
