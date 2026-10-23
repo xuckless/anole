@@ -39,7 +39,9 @@ pub const Reader = struct {
     /// The next token, or null at the end of a balanced document.
     pub fn next(self: *Reader) Error!?Token {
         if (self.pending_end) |name| {
+            // A self-closing element stays open (on the path) until its end.
             self.pending_end = null;
+            self.depth -= 1;
             return .{ .end = name };
         }
         while (true) {
@@ -106,10 +108,7 @@ pub const Reader = struct {
             if (self.depth >= max_depth) return error.TooDeep;
             self.stack[self.depth] = name;
             self.depth += 1;
-            if (self_closing) {
-                self.depth -= 1;
-                self.pending_end = name;
-            }
+            if (self_closing) self.pending_end = name;
             return .{ .start = name };
         }
     }
@@ -471,6 +470,30 @@ test "xml: a DOCTYPE or an entity declaration is refused; unbalanced tags are an
     try testing.expectError(error.Malformed, walkAll(arena, "<a>"));
     try testing.expectError(error.Malformed, walkAll(arena, "<a>&bogus;</a>"));
     try walkAll(arena, "<a><![CDATA[<x>]]><b/></a>");
+}
+
+test "xml: a self-closing element is on the path while it is open, at the top level too" {
+    var a: std.heap.ArenaAllocator = undefined;
+    const arena = arenaFor(&a);
+    defer a.deinit();
+    const Seen = struct {
+        log: std.ArrayList(u8) = .empty,
+        gpa: std.mem.Allocator,
+        fn cb(c: *@This(), path: []const []const u8, ev: Event) !void {
+            try c.log.appendSlice(c.gpa, @tagName(ev));
+            for (path) |n| {
+                try c.log.append(c.gpa, '/');
+                try c.log.appendSlice(c.gpa, n);
+            }
+            try c.log.append(c.gpa, ' ');
+        }
+    };
+    var top: Seen = .{ .gpa = arena };
+    try walk(arena, "<a/>", &top, Seen.cb);
+    try testing.expectEqualStrings("open/a leaf/a close/a ", top.log.items);
+    var nested: Seen = .{ .gpa = arena };
+    try walk(arena, "<r><IsTruncated/><k>v</k></r>", &nested, Seen.cb);
+    try testing.expectEqualStrings("open/r open/r/IsTruncated leaf/r/IsTruncated close/r/IsTruncated open/r/k leaf/r/k close/r/k close/r ", nested.log.items);
 }
 
 fn walkAll(arena: std.mem.Allocator, src: []const u8) Error!void {
