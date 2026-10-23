@@ -319,3 +319,106 @@ test "app.sse over h2c: the drain ends the parked stream after a retry" {
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
+
+test "app.sse over HTTP/3: the stream parks with no task; events arrive; a reset leaves the topic; the drain ends a subscriber after a retry" {
+    if (comptime !features.http3 or features.tls != .boringssl) return error.SkipZigTest;
+    const h3 = @import("../h3/root.zig");
+    var app = try App.init(alloc, .{ .executors = .exact(1), .http3 = .{ .alt_svc = false } });
+    defer app.deinit();
+    const live = try app.sseTopics(.{ .heartbeat = .fromSeconds(10), ._manual_ticks = true });
+    app.sse("/live", live, .{ .topics = &.{"news"} });
+    app.get("/ping", struct {
+        fn h(_: *@import("../http/root.zig").Request, res: *@import("../http/root.zig").Response) !void {
+            res.body = "pong";
+        }
+    }.h);
+
+    const Check = struct {
+        fn hdrs(path: []const u8) [4]h3.Header {
+            return .{
+                .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
+                .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+            };
+        }
+
+        fn ping(conn: *h3.ClientConnection) !void {
+            const st = try conn.request(&hdrs("/ping"), .{});
+            defer st.release();
+            try st.waitHead();
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(alloc);
+            try readToEnd(st.reader(), &body);
+            try std.testing.expectEqualStrings("pong", body.items);
+        }
+
+        fn run(a: *App, hub: *sse.Topics) !void {
+            var stopped = false;
+            defer if (!stopped) a.stop();
+            const io = a.io();
+            try a.waitReady();
+            const q = a.http3Address().?;
+            const h: Hub = .{ .live = hub };
+            const conn = try h3.ClientConnection.connect(alloc, io, .{
+                .host = "localhost",
+                .address = q,
+                .port = q.getPort(),
+                .tls = .{ .insecure_skip_verify = true },
+                .connect_timeout = .fromSeconds(3),
+            });
+            defer conn.close();
+            // A round trip first, so the endpoint's tasks have settled.
+            try ping(conn);
+            try io.sleep(.fromMilliseconds(20), .awake);
+            const baseline = liveTasks(io);
+
+            const st = try conn.request(&hdrs("/live"), .{});
+            var released = false;
+            defer if (!released) st.release();
+            try st.waitHead();
+            try std.testing.expectEqual(@as(u16, 200), st.status);
+            var acc: std.ArrayList(u8) = .empty;
+            defer acc.deinit(alloc);
+            try readUntil(st.reader(), &acc, "id: ");
+            try eventually(io, &h, Hub.oneSubscriber);
+
+            // Parked: neither the handler's task nor a sender is left.
+            try std.testing.expect(baseline > 0);
+            {
+                const tw: TaskWatch = .{ .io = io, .want = baseline };
+                try eventually(io, &tw, TaskWatch.back);
+            }
+
+            try std.testing.expectEqual(@as(usize, 1), try hub.publish("news", .{ .data = "hello", .event = "tick" }));
+            try readUntil(st.reader(), &acc, "event: tick\ndata: hello\n\n");
+            _ = try hub.publish("news", .{ .data = "second" });
+            try readUntil(st.reader(), &acc, "data: second\n\n");
+            _ = hub._tick(0, 1 << 50);
+            try readUntil(st.reader(), &acc, ":\n\n");
+
+            // The client resets the stream: the subscriber leaves.
+            st.cancel();
+            st.release();
+            released = true;
+            try eventually(io, &h, Hub.noSubscribers);
+            try std.testing.expectEqual(@as(usize, 0), hub.count("news"));
+            try ping(conn);
+
+            // Another subscriber; the drain gives it a retry, then FIN.
+            const st2 = try conn.request(&hdrs("/live"), .{});
+            defer st2.release();
+            try st2.waitHead();
+            var acc2: std.ArrayList(u8) = .empty;
+            defer acc2.deinit(alloc);
+            try readUntil(st2.reader(), &acc2, "id: ");
+            try eventually(io, &h, Hub.oneSubscriber);
+            a.stop();
+            stopped = true;
+            try readToEnd(st2.reader(), &acc2);
+            try std.testing.expect(std.mem.indexOf(u8, acc2.items, "retry: ") != null);
+            try eventually(io, &h, Hub.noSubscribers);
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{ &app, live });
+    try app.listenTls("127.0.0.1:0", .dev_self_signed);
+    try checking.await(app.io());
+}

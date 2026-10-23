@@ -863,7 +863,7 @@ pub const Response = struct {
     _detach_blocked: bool = false,
     /// Set by `detach`.
     detached: ?*Detached = null,
-    /// The engine offers `detach` to `_park` only (an HTTP/2 stream on its
+    /// The engine offers `detach` to `_park` only (an HTTP/2 or HTTP/3 stream on its
     /// own task): `canDetach` stays false, so the C ABI's detaching, which
     /// is for requests on the reader, is unchanged.
     _detach_park_only: bool = false,
@@ -1481,7 +1481,7 @@ pub const Response = struct {
     }
 
     /// Whether `_park` would work: an engine that parks (HTTP/1.1 with a
-    /// connection to adopt, HTTP/2) and no middleware on the way that is
+    /// connection to adopt, HTTP/2, HTTP/3) and no middleware on the way that is
     /// not detach-safe. Internal.
     pub fn _canPark(self: *const Response) bool {
         if (self._detach_blocked or self._parked or self._headers_written or self.detached != null) return false;

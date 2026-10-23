@@ -21,5 +21,7 @@ pub const Config = struct {
     redis_url: ?anole.Secret = null,
     nats_url: ?anole.Secret = null,
     kafka_bootstrap_servers: ?[]const u8 = null,
+    s3_bucket: ?[]const u8 = null, // S3 or compatible; the AWS_* variables say where and who
+    smtp_url: ?anole.Secret = null, // outgoing mail
     otel_exporter_otlp_endpoint: ?[]const u8 = null, // OpenTelemetry traces
 };

@@ -6,11 +6,13 @@
 //!   zig build openapi      # writes openapi.json
 //!
 //! Areas, in order: typed routes with validation (todos on SQLite), a
-//! WebSocket chat, server-sent events, sessions with CSRF, bearer tokens
-//! (JWT), API keys and roles, a gRPC service that also answers REST and
-//! Connect, an outbound client with retry and a breaker, and metrics, health
-//! and tracing. `main` ends with the connectors that need a service
-//! (PostgreSQL, Redis, NATS, Kafka): each starts when its URL is set.
+//! WebSocket chat, server-sent event topics, background jobs and a cron
+//! schedule (stored in SQLite), sessions with CSRF, bearer tokens (JWT), API
+//! keys and roles, a gRPC service that also answers REST and Connect, an
+//! outbound client with retry and a breaker, and metrics, health and
+//! tracing. `main` ends with the connectors that need a service
+//! (PostgreSQL, Redis, NATS, Kafka, S3, SMTP): each starts when its URL is
+//! set.
 const std = @import("std");
 const anole = @import("anole");
 const pb = @import("greeter_pb");
@@ -29,6 +31,10 @@ pub const panic = anole.panic;
 pub const App = struct {
     db: *anole.sqlite.Client,
     rooms: websocket.Rooms,
+    /// Server-sent event topics: GET /events streams the todos as they change.
+    live: *anole.sse.Topics,
+    /// Background jobs, stored in the SQLite database (they survive a restart).
+    jobs: *anole.jobs.Client,
     /// The bearer tokens' key, by `kid`.
     jwt_keys: [1]auth.Key,
     /// The SHA-256 of the one API key; a real app looks digests up in its database.
@@ -74,6 +80,10 @@ fn getTodo(app: *App, req: *anole.Request, in: anole.In(.{ .path = struct { id: 
 fn createTodo(app: *App, req: *anole.Request, in: anole.In(.{ .body = NewTodo })) !anole.Created(Todo) {
     // The same title twice breaks UNIQUE: error.Conflict, a 409.
     const todo = try app.db.one(Todo, req, "INSERT INTO todos (title) VALUES (?) RETURNING id, title, done", .{in.body.title});
+    // Every open /events stream gets it; nothing waits for the subscribers.
+    _ = try app.live.publishJson("todos", "created", todo);
+    // The slow part (an email, a webhook) runs later, retried if it fails.
+    _ = try app.jobs.enqueue(req, Announce{ .id = todo.id }, .{});
     return .{ .value = todo, .location = try std.fmt.allocPrint(req.arena, "/todos/{d}", .{todo.id}) };
 }
 
@@ -93,22 +103,44 @@ fn chat(app: *App, ws: *websocket.Socket, req: *anole.Request) !void {
     }
 }
 
-// ------------------------------------------------------------------ server-sent events
+// ------------------------------------------------------------------ server-sent events, jobs and cron
 
-/// `count` events, `interval_ms` apart; a browser's EventSource reconnects
-/// by itself when the stream ends.
-fn events(_: *App, req: *anole.Request, res: *anole.Response) !void {
-    const count = req.query.getInt(u32, "count") orelse 3;
-    const interval_ms = req.query.getInt(i64, "interval_ms") orelse 1000;
-    req.setTimeout(null); // a stream, not a request with a deadline
-    var buf: [256]u8 = undefined;
-    var stream = try res.startEventStream(&buf);
-    for (0..count) |i| {
-        var line: [32]u8 = undefined;
-        try stream.send(try std.fmt.bufPrint(&line, "{d}", .{i}), .{ .event = "tick" });
-        if (interval_ms > 0) try req.io.sleep(.fromMilliseconds(interval_ms), .awake);
-    }
-    try stream.body.end();
+// GET /events (`app.sse` in `routes`): `new EventSource("/events")` gets a
+// `created` event for every new todo. An idle subscriber holds no task; a
+// browser that reconnects gets what it missed (`Last-Event-ID`).
+
+/// Runs after a todo is created, outside the request. Here it only logs;
+/// sending an email or calling a webhook goes here. An error retries it with
+/// backoff.
+const Announce = struct {
+    id: i64,
+    pub const job: anole.jobs.Kind = .{ .name = "todos.announce" };
+};
+
+fn announce(_: *App, job: *anole.jobs.Job, args: Announce) !void {
+    std.log.info("{s}: todo {d} created", .{ job.id_text, args.id });
+}
+
+/// Every night at 03:00 UTC the done todos go: one run per tick, however
+/// many instances run.
+const Sweep = struct {
+    pub const job: anole.jobs.Kind = .{ .name = "todos.sweep" };
+};
+
+fn sweep(app: *App, job: *anole.jobs.Job, _: Sweep) !void {
+    const removed = try app.db.exec(job, "DELETE FROM todos WHERE done = 1", .{});
+    _ = try app.live.publishJson("todos", "swept", .{ .removed = removed });
+}
+
+/// The event topics and the job queue, with its handlers and schedule. After
+/// the database, before `routes`; apart from `main` so that src/main_test.zig
+/// has them too.
+pub fn services(app: *anole.Server(App), state: *App) !void {
+    state.live = try app.sseTopics(.{});
+    state.jobs = try app.jobs(.{ .store = .{ .sqlite = state.db } });
+    try state.jobs.handle(app, Announce, .{}, announce);
+    try state.jobs.handle(app, Sweep, .{}, sweep);
+    try state.jobs.cron("todos.sweep", "0 3 * * *", Sweep{}, .{});
 }
 
 // ------------------------------------------------------------------ sessions and CSRF
@@ -212,7 +244,7 @@ pub fn routes(app: *anole.Server(App), state: *App) !void {
     app.delete("/todos/:id", deleteTodo);
 
     app.wsWith("/ws", chat, .{ .max_message_size = 4096 });
-    app.get("/events", events);
+    app.sse("/events", state.live, .{ .topics = &.{"todos"} });
     app.get("/upstream", upstream);
 
     // Sessions are sealed cookies; CSRF protects every unsafe method behind it
@@ -241,6 +273,8 @@ pub fn main(init: std.process.Init) !void {
     var state: App = .{
         .db = undefined,
         .rooms = .init(init.gpa, .{}),
+        .live = undefined,
+        .jobs = undefined,
         .jwt_keys = .{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = cfg.jwt_secret.expose() } }},
         .api_key_digest = undefined,
         .session_key = undefined,
@@ -280,12 +314,15 @@ pub fn main(init: std.process.Init) !void {
     defer setup_arena.deinit();
     var setup: anole.db.Ctx = .{ .io = io, .arena = setup_arena.allocator() };
     try state.db.execScript(&setup, schema);
+    try services(&app, &state);
 
     // Connectors that need a service start when their URL is set.
     if (cfg.database_url) |url| _ = try app.postgres(.{ .url = url.expose() });
     if (cfg.redis_url) |url| _ = try app.redis(.{ .url = url.expose() });
     if (cfg.nats_url) |url| _ = try app.nats(.{ .url = url.expose() });
     if (cfg.kafka_bootstrap_servers != null) _ = try app.kafka(.{}); // reads KAFKA_BOOTSTRAP_SERVERS
+    if (cfg.s3_bucket != null) _ = try app.s3(.{}); // reads S3_BUCKET and the AWS_* variables
+    if (cfg.smtp_url != null) _ = try app.smtp(.{}); // reads SMTP_URL
 
     try routes(&app, &state);
     try app.staticDir("/static", "public", .{});

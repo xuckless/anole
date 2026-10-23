@@ -36,8 +36,8 @@ new EventSource("/orders/live").onmessage = (e) => render(JSON.parse(e.data));
 - `topics.publish(topic, .{ .data = ..., .event = "name" })` queues the event
   for every subscriber and returns the number reached. It never waits for a
   subscriber. `publishJson` encodes a value.
-- An idle subscriber holds no task over HTTP/1.1 and HTTP/2 (its stream is
-  parked); a task exists only while it has events to write, and writes up to
+- An idle subscriber holds no task over HTTP/1.1, HTTP/2 and HTTP/3 (its
+  stream is parked); a task exists only while it has events to write, and writes up to
   64 of them in one write. A middleware that is not detach-safe, or the
   in-memory test client, makes the handler's own task serve the stream
   instead, with the same behaviour.

@@ -1388,8 +1388,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             timer_at: u64 = 0,
             /// Over: out of the heap, and finishing (`Endpoint.retire`).
             retired: bool = false,
-            /// Request tasks running.
+            /// Request tasks running, and parked responses not released
+            /// (`H3Parked`): while any, the connection ends on a finisher
+            /// task.
             tasks: std.atomic.Value(u32) = .init(0),
+            /// Parked responses whose owner has not called `release`;
+            /// `finish` waits for none (`parked_idle`). Locked.
+            parked_open: u32 = 0,
+            parked_idle: std.Io.Condition = .init,
             state: State = .open,
             /// ngtcp2's keep-alive is armed: a request stream is open.
             keep_alive_on: bool = false,
@@ -2022,7 +2028,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 while (i < conn.streams.count()) {
                     const s = conn.streams.values()[i];
                     const before = conn.streams.count();
-                    if (s.detached != null) {
+                    if (s.detached != null or s.parked != null) {
                         s.reset = true;
                         s.wakeAll();
                         abortDetached(s);
@@ -2033,6 +2039,11 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 conn.unlock();
                 conn.group.cancel(io);
+                // The owners of parked responses touch their streams until
+                // `Parked.release` (they heard of the end above): wait.
+                conn.lock();
+                while (conn.parked_open != 0) conn.parked_idle.waitUncancelable(io, &conn.mutex);
+                conn.unlock();
                 conn.forget();
                 conn.unref();
             }
@@ -2303,7 +2314,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// request is answered 431 without reaching a handler.
             head_too_large: bool = false,
             /// Who still holds the stream.
-            refs: struct { quic: bool = true, handler: bool = false } = .{},
+            refs: struct { quic: bool = true, handler: bool = false, parked: bool = false } = .{},
             /// The connection's flush waits for this request's answer
             /// (`Conn.holding`), counted in receive round `round`. Only the
             /// stream's task changes it once the task runs.
@@ -2321,6 +2332,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// handler's hold on the stream goes when it is finished or
             /// aborted.
             detached: ?*Exchange = null,
+            /// The response is parked (`Response._park`): bursts of body
+            /// from whichever task has something to send, no task holding
+            /// it in between (`H3Parked`).
+            parked: ?*H3Parked = null,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2382,12 +2397,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// Drops one holder; the last frees the stream. Locked.
-            fn release(s: *Stream, who: enum { quic, handler }) void {
+            fn release(s: *Stream, who: enum { quic, handler, parked }) void {
                 switch (who) {
                     .quic => s.refs.quic = false,
                     .handler => s.refs.handler = false,
+                    .parked => s.refs.parked = false,
                 }
-                if (s.refs.quic or s.refs.handler) return;
+                if (s.refs.quic or s.refs.handler or s.refs.parked) return;
                 const conn = s.conn;
                 if (conn.streams.swapRemove(s.id)) {
                     gauges.add(conn.ep.io, .h3_streams, -1);
@@ -2431,7 +2447,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer {
                     s.unhold();
                     conn.lock();
-                    s.task = null;
+                    // A burst of the response this handler parked may be
+                    // under way on another task, which owns `task` now.
+                    if (s.parked == null or !s.parked.?.bursting) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
                     if (!s.body_done and !s.reset)
@@ -2441,6 +2459,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.kick();
                 }
                 if (gone) return;
+                // A parked response (`.detached`, the only detach a task's
+                // handler may do) holds the stream itself (`refs.parked`):
+                // the handler's hold goes as for any other.
                 _ = s.serve(false) catch |err| return s.failed(err);
             }
 
@@ -2562,11 +2583,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer if (!detached) response.deinit();
                 response._request = request;
                 request._response = response;
-                if (inline_mode) {
-                    ex.attached = false;
-                    response._detach_engine = &detach_engine;
-                    response._detach_ctx = ex;
-                }
+                // On the endpoint task the response may detach; on its own
+                // task only to be parked (an event stream, `Response._park`).
+                ex.attached = false;
+                response._detach_engine = &detach_engine;
+                response._detach_ctx = ex;
+                response._detach_park_only = !inline_mode;
 
                 if (s.head_too_large) {
                     response.status = .request_header_fields_too_large;
@@ -2697,6 +2719,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (response.detached) |d| {
                     // Finished later, from the moved copy.
                     detached = true;
+                    // On a task the detach was a park (or a failed one,
+                    // already finished): the park holds the stream, and the
+                    // task's hold goes as usual.
+                    if (!inline_mode) return .detached;
+                    // A park that failed has finished the exchange and let
+                    // go of the stream already.
+                    if (d.state == .ended) return .detached;
                     conn.lock();
                     s.detached = exchangeOf(d);
                     conn.unlock();
@@ -2780,7 +2809,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// How a detached response is finished, attached to a task, or let
         /// go (`dusty.Detached`).
-        const detach_engine: dusty.Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter };
+        const detach_engine: dusty.Detached.Engine = .{ .relocate = detachedRelocate, .end = detachedEnd, .attach = detachedAttach, .enter = detachedEnter, .park = detachedPark };
 
         /// The exchange, from the endpoint's stack into the stream's
         /// arena, its pointers into itself moved along.
@@ -2793,6 +2822,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
             ex.response._sink = ex.sink_state.sink();
             ex.response._detach_ctx = ex;
+            // A task's request timer lives on the task's stack.
+            ex.request._timeout_context = null;
+            ex.request._set_timeout = null;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;
@@ -2809,10 +2841,30 @@ pub fn Endpoint(comptime Ctx: type) type {
             const ex = exchangeOf(d);
             const s = ex.sink_state.stream;
             const conn = s.conn;
+            if (s.parked != null) {
+                // The end of a parked response: FIN after what was queued
+                // (or the failure's reset). The park keeps the stream until
+                // the owner's `Parked.release`.
+                if (result) |_| {
+                    StreamSink.end(@ptrCast(&ex.sink_state), if (ex.response.trailers) |*t| t else null) catch {};
+                } else |err| s.failed(err) catch {};
+                ex.response.deinit();
+                conn.lock();
+                s.detached = null;
+                conn.unlock();
+                conn.kick();
+                return;
+            }
             if (result) |_| {
                 ex.response.write() catch |err| s.failed(err) catch {};
             } else |err| s.failed(err) catch {};
             ex.response.deinit();
+            // A park that failed on a handler's task: that task still holds
+            // the stream and lets go when it ends.
+            if (ex.response._detach_park_only) {
+                conn.kick();
+                return;
+            }
             conn.lock();
             s.detached = null;
             if (!s.body_done and !s.reset)
@@ -2844,6 +2896,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// detached (not attached): the owner hears of it, and the stream
         /// is let go. Locked.
         fn abortDetached(s: *Stream) void {
+            if (s.parked) |p| return p.peerGone();
             const ex = s.detached orelse return;
             const d = ex.response.detached.?;
             if (d.state != .detached) return;
@@ -2851,6 +2904,188 @@ pub fn Endpoint(comptime Ctx: type) type {
             d.abort();
             ex.response.deinit();
             s.release(.handler);
+        }
+
+        /// A parked response (`Response._park`; design-realtime §3.4): its
+        /// head is out, its handler has returned, and whichever task has
+        /// something to send (an SSE subscriber's sender, say) writes to it
+        /// in bursts. Between bursts it costs this object and the stream,
+        /// no task: what a burst queues goes out through the endpoint's
+        /// driver (`Conn.kick`), and the peer leaving reaches the owner
+        /// from the QUIC callbacks (`peerGone`). The stream and the
+        /// connection live until the owner's `release`.
+        const H3Parked = struct {
+            parked: dusty.Parked = .{ .vtable = &vtable },
+            s: *Stream,
+            ex: *Exchange,
+            d: *dusty.Detached,
+            owner: dusty.Parked.Owner,
+            /// Parked after the response was detached on the endpoint task
+            /// (a `no_wait` route, the C ABI's requests): the detach's hold
+            /// on the stream (`.handler`) is the park's to let go too.
+            holds_handler: bool,
+            /// All under the connection's lock.
+            bursting: bool = false,
+            gone_pending: bool = false,
+            gone_sent: bool = false,
+            over: bool = false,
+
+            const vtable: dusty.Parked.VTable = .{
+                .begin = begin,
+                .write = write,
+                .endBurst = endBurst,
+                .end = end,
+                .abort = abort,
+                .release = release,
+            };
+
+            fn of(p: *dusty.Parked) *H3Parked {
+                return @alignCast(@fieldParentPtr("parked", p));
+            }
+
+            fn begin(p: *dusty.Parked) bool {
+                const self = of(p);
+                const conn = self.s.conn;
+                conn.lock();
+                defer conn.unlock();
+                if (self.s.reset or self.over or self.gone_sent or self.gone_pending) return false;
+                self.bursting = true;
+                // A reset cancels the burst's task (`cancelHandler`).
+                self.s.task = placement.currentTask(conn.ep.io);
+                return true;
+            }
+
+            /// Copies `parts` into the stream's send queue (waiting past
+            /// `response_cap` for acknowledgments), then one kick.
+            fn write(p: *dusty.Parked, parts: []const []const u8) dusty.Parked.WriteError!void {
+                const self = of(p);
+                const conn = self.s.conn;
+                conn.lock();
+                const over = self.over or self.s.reset;
+                conn.unlock();
+                if (over) return error.Gone;
+                const sink_state = &self.ex.sink_state;
+                sink_state.putParts(parts) catch {
+                    if (sink_state.err) |e| switch (e) {
+                        error.Canceled => return error.Canceled,
+                        error.SystemResources => return error.SystemResources,
+                        else => {},
+                    };
+                    return error.Gone;
+                };
+            }
+
+            /// Ends the burst `begin` started; a `gone` that came during
+            /// it is delivered now.
+            fn finishBurst(self: *H3Parked) void {
+                const conn = self.s.conn;
+                conn.lock();
+                self.bursting = false;
+                self.s.task = null;
+                const deliver = self.gone_pending and !self.gone_sent and !self.over;
+                if (deliver) {
+                    self.gone_pending = false;
+                    self.gone_sent = true;
+                }
+                conn.unlock();
+                if (deliver) self.owner.gone(self.owner.ctx);
+            }
+
+            fn endBurst(p: *dusty.Parked) void {
+                of(p).finishBurst();
+            }
+
+            fn end(p: *dusty.Parked) void {
+                const self = of(p);
+                const conn = self.s.conn;
+                conn.lock();
+                const already = self.over;
+                self.over = true;
+                const reset = self.s.reset;
+                conn.unlock();
+                // The middleware finishers, then FIN (`detachedEnd`).
+                if (!already and !reset) self.d.finish({});
+                self.finishBurst();
+            }
+
+            fn abort(p: *dusty.Parked) void {
+                const self = of(p);
+                const conn = self.s.conn;
+                conn.lock();
+                self.over = true;
+                conn.unlock();
+                self.s.resetStream(h.NGHTTP3_H3_REQUEST_CANCELLED);
+                self.finishBurst();
+            }
+
+            /// The stream was reset or the connection is gone. Locked;
+            /// never waits.
+            fn peerGone(self: *H3Parked) void {
+                if (self.gone_sent or self.over) return;
+                // A burst running was canceled with the stream
+                // (`cancelHandler`): `endBurst` tells the owner.
+                if (self.bursting) {
+                    self.gone_pending = true;
+                    return;
+                }
+                self.gone_sent = true;
+                self.owner.gone(self.owner.ctx);
+            }
+
+            fn release(p: *dusty.Parked) void {
+                const self = of(p);
+                const s = self.s;
+                const conn = s.conn;
+                const holds_handler = self.holds_handler;
+                self.ex.response.deinit();
+                conn.lock();
+                defer conn.unlock();
+                // Let go before it ended (the owner gave up on a stream the
+                // peer still has open): reset it, so QUIC closes it.
+                if (!s.ended and s.refs.quic) {
+                    s.reset = true;
+                    s.wakeAll();
+                    _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
+                } else if (!s.body_done and !s.reset and s.refs.quic) {
+                    _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+                }
+                s.parked = null;
+                s.detached = null;
+                conn.parked_open -= 1;
+                _ = conn.tasks.fetchSub(1, .acq_rel);
+                // One release for both holds: the stream may be freed
+                // here, with `self` in its arena.
+                if (holds_handler) s.refs.handler = false;
+                s.release(.parked);
+                conn.kick();
+                if (conn.parked_open == 0) conn.parked_idle.broadcast(conn.ep.io);
+            }
+        };
+
+        /// `Detached.Engine.park`: the exchange is relocated, the head is
+        /// recorded by the caller next; the body goes to the stream's queue
+        /// in bursts from now on.
+        fn detachedPark(d: *dusty.Detached, parked_owner: dusty.Parked.Owner) error{ OutOfMemory, WriteFailed }!*dusty.Parked {
+            const ex = exchangeOf(d);
+            const s = ex.sink_state.stream;
+            const conn = s.conn;
+            const p = try ex.response.arena.create(H3Parked);
+            p.* = .{ .s = s, .ex = ex, .d = d, .owner = parked_owner, .holds_handler = !ex.response._detach_park_only };
+            conn.lock();
+            defer conn.unlock();
+            if (s.reset) return error.WriteFailed;
+            s.parked = p;
+            s.refs.parked = true;
+            // Bursts run on tasks, which may wait for the peer: the stream's
+            // cap applies (not a `no_wait` request's queue past it).
+            s.inline_mode = false;
+            // Its handler has answered as far as the flush is concerned.
+            s.unhold();
+            conn.parked_open += 1;
+            // The connection ends on a finisher task, which waits for the
+            // release (`Conn.finish`).
+            _ = conn.tasks.fetchAdd(1, .acq_rel);
+            return &p.parked;
         }
 
         fn isWebTransport(protocol: []const u8) bool {
@@ -3087,6 +3322,53 @@ pub fn Endpoint(comptime Ctx: type) type {
                     // connection's epoch on and, with the wait below,
                     // would spin the handler.
                     if (n > 0) conn.kick() else s.wait(&s.tx, seen) catch return self.fail(error.Canceled);
+                }
+            }
+
+            /// `put` for a parked response's burst (`H3Parked.write`): every
+            /// part in order, one kick for what was queued (and one before
+            /// each wait, so the driver sends what the acknowledgments
+            /// waited for are about).
+            fn putParts(self: *StreamSink, parts: []const []const u8) std.Io.Writer.Error!void {
+                const s = self.stream;
+                const conn = s.conn;
+                var queued = false;
+                defer if (queued) conn.kick();
+                for (parts) |part| {
+                    var rest = part;
+                    while (rest.len > 0) {
+                        const seen = s.tx.epoch();
+                        conn.lock();
+                        if (s.reset) {
+                            conn.unlock();
+                            return self.fail(error.ConnectionResetByPeer);
+                        }
+                        self.submit() catch |err| {
+                            conn.unlock();
+                            return err;
+                        };
+                        const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, s.sendCap(), false) catch {
+                            conn.unlock();
+                            return self.fail(error.SystemResources);
+                        };
+                        if (n > 0) {
+                            rest = rest[n..];
+                            s.resume_();
+                        } else {
+                            s.waiter.signal = &s.tx;
+                            conn.budget.link(&s.waiter);
+                        }
+                        conn.unlock();
+                        if (n > 0) {
+                            queued = true;
+                        } else {
+                            if (queued) {
+                                queued = false;
+                                conn.kick();
+                            }
+                            s.wait(&s.tx, seen) catch return self.fail(error.Canceled);
+                        }
+                    }
                 }
             }
 
@@ -3339,6 +3621,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.wakeAll();
                 s.cancelHandler();
                 if (s.wt_session) |session| session.onChannelEnd(.connection);
+                // A parked response's owner hears of it now.
+                if (s.parked) |p| p.peerGone();
             }
             conn.kick();
             return 0;
@@ -3353,6 +3637,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.reset = true;
                 s.wakeAll();
                 if (code != h.NGHTTP3_H3_NO_ERROR) s.cancelHandler();
+                if (s.parked) |p| p.peerGone();
             }
             conn.kick();
             return 0;

@@ -9,7 +9,8 @@
 //! hours.
 //!
 //! The engines implement it: HTTP/1.1 here (`H1Parked`, on the `Adopter`
-//! machinery a WebSocket with callbacks uses) and HTTP/2 in server/h2.zig.
+//! machinery a WebSocket with callbacks uses), HTTP/2 in server/h2.zig and
+//! HTTP/3 in Anole's src/h3/server.zig (`H3Parked`).
 //! `Response._park` writes the head and hands out the `Parked`.
 
 const std = @import("std");

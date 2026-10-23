@@ -35,7 +35,7 @@ zig build cli -Dprofile=minimal       # zig-out/bin/anole
 | `rest-postgres` | `web` | a todo API on PostgreSQL: typed CRUD, rules as 422, a missing row as 404, a duplicate as 409, `/readyz` pings the database, `compose.yaml` and `db/schema.sql`, typed config |
 | `realtime` | `web` | a WebSocket chat with rooms, a browser page as static files, a typed `GET /rooms`, a test with two clients |
 | `grpc` | `full` | a `.proto` service that answers gRPC, gRPC-Web, Connect and REST, with the comments in the OpenAPI document |
-| `full` | `full` | most of Anole in one app that needs no outside service: typed routes with rules on SQLite, WebSocket rooms, server-sent events, sessions with CSRF, JWT and roles, API keys, gRPC with transcoding, an outbound client with retry and a breaker, rate limit, metrics, health, tracing, typed config and `.env`, an OpenAPI page. PostgreSQL, Redis, NATS and Kafka start when their URL is set in `.env` |
+| `full` | `full` | most of Anole in one app that needs no outside service: typed routes with rules on SQLite, WebSocket rooms, server-sent event topics, background jobs and a cron schedule on SQLite, sessions with CSRF, JWT and roles, API keys, gRPC with transcoding, an outbound client with retry and a breaker, rate limit, metrics, health, tracing, typed config and `.env`, an OpenAPI page. PostgreSQL, Redis, NATS, Kafka, S3 and SMTP start when their URL is set in `.env` |
 
 Every template has `src/main.zig` with a `routes` function separate from
 `main` (so `src/main_test.zig` serves the same routes through `anole.testing`),

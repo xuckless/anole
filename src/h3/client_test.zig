@@ -1770,3 +1770,182 @@ test "h3 server: a peer RESET_STREAM cancels a REST handler's wait" {
     s.cancel();
     try wait_canceled.wait(io);
 }
+
+/// A parked response (`Response._park`, design-realtime §3.4): the handler
+/// returns, and bursts from a task on the request's executor write to the
+/// stream.
+const H3Park = struct {
+    var parked: ?*dusty.Parked = null;
+    var exec: usize = 0;
+    var io_: std.Io = undefined;
+    var opened: std.Io.Event = .unset;
+    var gone: std.Io.Event = .unset;
+    var gone_calls: std.atomic.Value(u32) = .init(0);
+    var dummy: u8 = 0;
+
+    fn reset() void {
+        parked = null;
+        opened = .unset;
+        gone = .unset;
+        gone_calls.store(0, .monotonic);
+    }
+
+    fn onGone(_: *anyopaque) void {
+        _ = gone_calls.fetchAdd(1, .monotonic);
+        gone.set(io_);
+    }
+
+    fn park(req: *dusty.Request, res: *dusty.Response) !void {
+        try res.header("Content-Type", "text/event-stream");
+        io_ = req.io;
+        exec = dusty.placement.currentExecutor(req.io) orelse 0;
+        parked = try res._park(req, .{ .gone = onGone, .ctx = &dummy });
+        opened.set(req.io);
+    }
+
+    /// Waits first, as a handler that talks to a database before it parks:
+    /// on its own task.
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.io.sleep(.fromMilliseconds(1), .awake);
+        return park(req, res);
+    }
+
+    const Op = union(enum) {
+        burst: struct { parts: []const []const u8, end: bool },
+        begin_fails,
+        release,
+    };
+
+    fn opTask(op: Op, result: *anyerror!void) std.Io.Cancelable!void {
+        const p = parked.?;
+        result.* = switch (op) {
+            .burst => |b| blk: {
+                if (!p.begin()) break :blk error.NoBurst;
+                p.write(b.parts) catch |err| {
+                    p.endBurst();
+                    break :blk err;
+                };
+                if (b.end) p.end() else p.endBurst();
+                break :blk {};
+            },
+            .begin_fails => if (p.begin()) blk: {
+                p.endBurst();
+                break :blk error.BurstStarted;
+            } else {},
+            .release => p.release(),
+        };
+    }
+
+    /// Runs `op` on the request's executor and waits for it.
+    fn on(io: std.Io, op: Op) !void {
+        var group: std.Io.Group = .init;
+        var result: anyerror!void = {};
+        try dusty.placement.concurrent(&group, io, .{ .executor = exec }, opTask, .{ op, &result });
+        try group.await(io);
+        return result;
+    }
+};
+
+/// Request streams the server still holds, on its one connection.
+fn serverStreams(ep: *Endpoint) usize {
+    ep.map_mutex.lockUncancelable(ep.io);
+    defer ep.map_mutex.unlock(ep.io);
+    var it = ep.conns.valueIterator();
+    const conn = (it.next() orelse return 0).*;
+    conn.mutex.lockUncancelable(ep.io);
+    defer conn.mutex.unlock(ep.io);
+    return conn.streams.count();
+}
+
+fn noServerStreams(ep: *Endpoint) bool {
+    return serverStreams(ep) == 0;
+}
+
+test "parked h3: a handler that waited first parks; bursts arrive; end finishes the stream and release frees it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Park.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.get("/live", H3Park.handle);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const s = try request(conn, "GET", "/live", .{});
+    try H3Park.opened.wait(io);
+    try H3Park.on(io, .{ .burst = .{ .parts = &.{ "id: 1\n", "data: a\n\n" }, .end = false } });
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    try H3Park.on(io, .{ .burst = .{ .parts = &.{"data: b\n\n"}, .end = true } });
+    const body = try finish(s, gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("id: 1\ndata: a\n\ndata: b\n\n", body);
+    try H3Park.on(io, .begin_fails);
+    try H3Park.on(io, .release);
+    try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
+
+    // The stream is freed, and the connection carries on.
+    const hello_body = try get(conn, "/hello", gpa);
+    defer gpa.free(hello_body);
+    try std.testing.expectEqualStrings("hello over h3", hello_body);
+    try eventually(io, 10, noServerStreams, f.ep);
+}
+
+test "parked h3: a stream reset tells the owner once; release frees the stream" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Park.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.get("/live", H3Park.handle);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const s = try request(conn, "GET", "/live", .{});
+    try H3Park.opened.wait(io);
+    try H3Park.on(io, .{ .burst = .{ .parts = &.{"data: a\n\n"}, .end = false } });
+    try s.waitHead();
+    s.cancel();
+    s.release();
+    try H3Park.gone.wait(io);
+    try std.testing.expectEqual(@as(u32, 1), H3Park.gone_calls.load(.monotonic));
+    try H3Park.on(io, .begin_fails);
+    try H3Park.on(io, .release);
+
+    const hello_body = try get(conn, "/hello", gpa);
+    defer gpa.free(hello_body);
+    try std.testing.expectEqualStrings("hello over h3", hello_body);
+    try eventually(io, 10, noServerStreams, f.ep);
+    try std.testing.expectEqual(@as(u32, 1), H3Park.gone_calls.load(.monotonic));
+}
+
+test "parked h3: a no_wait route parks on the endpoint task; the connection closing tells the owner, and its end waits for release" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Park.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.addRouteWith(.get, "/nw/live", H3Park.park, .{ .no_wait = true });
+    const conn = try f.connect(gpa, io);
+
+    const s = try request(conn, "GET", "/nw/live", .{});
+    try H3Park.opened.wait(io);
+    try H3Park.on(io, .{ .burst = .{ .parts = &.{"data: a\n\n"}, .end = false } });
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    s.release();
+    conn.close();
+    try H3Park.gone.wait(io);
+    try std.testing.expectEqual(@as(u32, 1), H3Park.gone_calls.load(.monotonic));
+    // The connection is not freed before the owner lets go.
+    try std.testing.expect(!noConnections(f.ep));
+    try H3Park.on(io, .begin_fails);
+    try H3Park.on(io, .release);
+    try eventually(io, 10, noConnections, f.ep);
+}

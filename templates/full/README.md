@@ -14,7 +14,8 @@ zig build openapi      # writes openapi.json
 | --- | --- |
 | typed routes, validation, 422, SQLite (`data/app.db`) | `todos` |
 | WebSocket rooms | `/ws?room=lobby` |
-| server-sent events | `/events?count=3` |
+| server-sent event topics (a `created` event per new todo) | `/events` |
+| background jobs and a nightly cron schedule, stored in SQLite | `Announce`, `Sweep` |
 | sessions + CSRF | `/session` |
 | JWT bearer tokens, roles (RBAC) | `/api/me`, `/api/notes` |
 | API keys | `/service/stats` |
@@ -25,7 +26,7 @@ zig build openapi      # writes openapi.json
 | typed settings and `.env` | `src/config.zig`, `.env` |
 
 In development the log prints a demo bearer token and API key. PostgreSQL,
-Redis, NATS and Kafka start when their URL is set in `.env` (see
+Redis, NATS, Kafka, S3 and SMTP start when their URL is set in `.env` (see
 `.env.example`). `.env` is read in development only; a release build
 (`-Doptimize=ReleaseSafe`) runs in production mode and needs `JWT_SECRET` in
 the real environment. See
