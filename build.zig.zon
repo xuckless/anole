@@ -26,9 +26,9 @@
         // net.ReadyWatch is gone (Anole parks through CompletionQueue). The
         // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
+        // TEMPORARY (dx/gauges): local fork branch `diagnostics` 88f6d69; the lead re-pins by url+hash after pushing.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#b4974873565677327cb45f8731b4f393ff637bad",
-            .hash = "zio-0.19.0-xHbVVCTMLQD1ucYoMOJfO8bzSuHnrjjXYubniBKtnu8F",
+            .path = "../../anole-forks/zio",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

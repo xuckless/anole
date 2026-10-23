@@ -59,6 +59,7 @@ const wallClock = net.wallClock;
 const c = ngtcp2.c;
 const h = nghttp3.c;
 const placement = dusty.placement;
+const gauges = dusty.gauges;
 
 const log = std.log.scoped(.anole_h3);
 
@@ -1514,6 +1515,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gpa = conn.ep.gpa;
                 for (conn.hq_streams.values()) |hs| hs.free(gpa);
                 conn.hq_streams.deinit(gpa);
+                gauges.add(conn.ep.io, .h3_streams, -@as(i64, @intCast(conn.streams.count())));
                 for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
                 conn.ready.deinit(gpa);
@@ -2330,7 +2332,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (s.refs.quic or s.refs.handler) return;
                 const conn = s.conn;
-                _ = conn.streams.swapRemove(s.id);
+                if (conn.streams.swapRemove(s.id)) gauges.add(conn.ep.io, .h3_streams, -1);
                 // The client may open another request only now: one it
                 // reset still counts while its handler runs.
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
@@ -3209,6 +3211,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.free();
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
             };
+            gauges.add(conn.ep.io, .h3_streams, 1);
             return 0;
         }
 

@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const gauges = @import("gauges.zig");
 const builtin = @import("builtin");
 const tls = @import("tls");
 /// See client.zig: the TLS module's trust store, loaded once per listener.
@@ -1976,6 +1977,7 @@ pub fn Server(comptime Ctx: type) type {
         fn reserveConnectionSlot(self: *Self) std.Io.Cancelable!void {
             const max = self.config.max_connections orelse {
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
+                gauges.add(self.io, .connections, 1);
                 return;
             };
             var active = self.active_connections.load(.acquire);
@@ -1986,7 +1988,10 @@ pub fn Server(comptime Ctx: type) type {
                     active = self.active_connections.load(.acquire);
                     continue;
                 }
-                active = self.active_connections.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) orelse return;
+                active = self.active_connections.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) orelse {
+                    gauges.add(self.io, .connections, 1);
+                    return;
+                };
             }
         }
 
@@ -1999,6 +2004,7 @@ pub fn Server(comptime Ctx: type) type {
         /// never exceeds it, and every waiter sleeps on it being there.
         fn releaseConnectionSlot(self: *Self) void {
             const was = self.active_connections.fetchSub(1, .acq_rel);
+            gauges.add(self.io, .connections, -1);
             const max = self.config.max_connections orelse return;
             if (was >= max) self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
         }

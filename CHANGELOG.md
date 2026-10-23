@@ -63,6 +63,9 @@ OpenAPI documents and the `anole` command line.
   PLAIN/SCRAM. `send` queues and never waits; `produce` waits for the
   acknowledgement. `app.kafka(.{})` reads `KAFKA_BOOTSTRAP_SERVERS`.
 
+### Runtime gauges
+- `/metrics` gains `anole_runtime_tasks`, `anole_runtime_run_queue`, `anole_runtime_stack_committed_bytes`, `anole_connections` and `anole_streams`, per executor, from zio's new `diagnostics` option.
+
 ### OpenAPI and CLI
 
 - `-Dopenapi` (on in `web` and `full`) and `anole.openapi`, the building
