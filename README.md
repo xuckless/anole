@@ -225,7 +225,7 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
 - **AWS Lambda:** the same app served from the Lambda Runtime API with
   `deployment = .lambda` ([lambda](docs/lambda.md)).
 
-**Status: pre-1.0; the latest release is 0.1.3** ([CHANGELOG.md](CHANGELOG.md)).
+**Status: pre-1.0; the latest release is 0.3.1** ([CHANGELOG.md](CHANGELOG.md)).
 The API may still change before 1.0. Known issues and limitations are tracked in
 [Issues](https://github.com/xuckless/anole/issues). Next: a C ABI, then
 bindings for Python (ASGI) and Node (TypeScript).
