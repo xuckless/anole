@@ -518,7 +518,7 @@ pub const Watch = struct {
         self.group.cancel(self.io);
         const gpa = self.gpa;
         while (self.inbox.popFirst()) |n| {
-            const o: *Owned = @fieldParentPtr("node", n);
+            const o: *Owned = @alignCast(@fieldParentPtr("node", n));
             o.destroy(gpa);
         }
         for (self.targets) |t| freeTarget(gpa, t);
@@ -692,7 +692,7 @@ pub const Watch = struct {
         defer self.mutex.unlock(self.io);
         var it = self.sinks.first;
         while (it) |n| : (it = n.next) {
-            const s: *Sink = @fieldParentPtr("node", n);
+            const s: *Sink = @alignCast(@fieldParentPtr("node", n));
             s.status(s.ctx, connected, detail);
         }
     }
@@ -702,7 +702,7 @@ pub const Watch = struct {
         defer self.mutex.unlock(self.io);
         var it = self.sinks.first;
         while (it) |n| : (it = n.next) {
-            const s: *Sink = @fieldParentPtr("node", n);
+            const s: *Sink = @alignCast(@fieldParentPtr("node", n));
             s.ended(s.ctx, failed, detail);
         }
     }
@@ -816,7 +816,7 @@ pub const Watch = struct {
         defer self.mutex.unlock(self.io);
         var it = self.sinks.first;
         while (it) |n| : (it = n.next) {
-            const s: *Sink = @fieldParentPtr("node", n);
+            const s: *Sink = @alignCast(@fieldParentPtr("node", n));
             s.deliver(s.ctx, ev);
         }
     }
@@ -836,7 +836,7 @@ pub const Watch = struct {
         self.mutex.lockUncancelable(self.io);
         var it = self.sinks.first;
         while (it) |n| : (it = n.next) {
-            const s: *Sink = @fieldParentPtr("node", n);
+            const s: *Sink = @alignCast(@fieldParentPtr("node", n));
             s.gap(s.ctx, detail);
         }
         self.mutex.unlock(self.io);
@@ -916,7 +916,7 @@ pub const Watch = struct {
         if (self.inbox_len >= inbox_max) {
             // The oldest goes; the handler learns of it as a gap.
             if (self.inbox.popFirst()) |old| {
-                const o: *Owned = @fieldParentPtr("node", old);
+                const o: *Owned = @alignCast(@fieldParentPtr("node", old));
                 o.destroy(self.gpa);
                 self.inbox_len -= 1;
                 self.inbox_gap = true;
@@ -947,7 +947,7 @@ pub const Watch = struct {
                     _ = self.runHandler(h, &ev);
                 }
                 const n = node orelse break;
-                const o: *Owned = @fieldParentPtr("node", n);
+                const o: *Owned = @alignCast(@fieldParentPtr("node", n));
                 _ = self.runHandler(h, &o.ev);
                 o.destroy(self.gpa);
             }
@@ -1012,7 +1012,7 @@ pub const Listener = struct {
             // The newest is never the one dropped.
             if (first == &o.node) break;
             self.queue.remove(first);
-            const old: *Owned = @fieldParentPtr("node", first);
+            const old: *Owned = @alignCast(@fieldParentPtr("node", first));
             self.len -= 1;
             self.bytes -|= old.ev.cost();
             self.dropped += 1;
@@ -1061,7 +1061,7 @@ pub const Listener = struct {
                 return try gapEvent(w, c);
             }
             if (self.queue.popFirst()) |n| {
-                const o: *Owned = @fieldParentPtr("node", n);
+                const o: *Owned = @alignCast(@fieldParentPtr("node", n));
                 self.len -= 1;
                 self.bytes -|= o.ev.cost();
                 self.mutex.unlock(w.io);
@@ -1101,7 +1101,7 @@ pub const Listener = struct {
         w.removeSink(&self.sink);
         if (self.hooks) |h| h.remove(w.io, &self.hook);
         while (self.queue.popFirst()) |n| {
-            const o: *Owned = @fieldParentPtr("node", n);
+            const o: *Owned = @alignCast(@fieldParentPtr("node", n));
             o.destroy(w.gpa);
         }
         w.gpa.destroy(self);

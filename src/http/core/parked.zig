@@ -140,7 +140,7 @@ pub const H1Parked = struct {
     }
 
     fn fromParked(p: *Parked) *H1Parked {
-        return @fieldParentPtr("parked", p);
+        return @alignCast(@fieldParentPtr("parked", p));
     }
 
     fn lockFlags(self: *H1Parked) void {
@@ -304,7 +304,7 @@ pub const H1Parked = struct {
     /// one each time the parked connection has input. There is nothing to
     /// serve, only the peer to notice leaving.
     fn serve(a: *Adopter, b: *Burst) anyerror!Burst.End {
-        const self: *H1Parked = @fieldParentPtr("adopter", a);
+        const self: *H1Parked = @alignCast(@fieldParentPtr("adopter", a));
         const r = self.connection.reader;
         var window: [window_len]u8 = undefined;
         if (r.buffer.len == 0) {
@@ -342,7 +342,7 @@ pub const H1Parked = struct {
     /// or after `end`): tells the owner if it is not told yet, and waits
     /// for its `release`, so nothing the owner still touches is freed.
     fn release(a: *Adopter) void {
-        const self: *H1Parked = @fieldParentPtr("adopter", a);
+        const self: *H1Parked = @alignCast(@fieldParentPtr("adopter", a));
         self.deliverGone();
         // A burst running: its write fails now (the socket is closing).
         self.shutdownBoth();

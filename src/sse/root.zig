@@ -256,7 +256,7 @@ pub const Topics = struct {
             .resumes_exact = resumes_fam.with(&.{"exact"}),
             .resumes_gap = resumes_fam.with(&.{"gap"}),
         };
-        inline for (@typeInfo(CloseReason).@"enum".fields, 0..) |f, i| m.closed[i] = closed_fam.with(&.{f.name});
+        inline for (std.enums.values(CloseReason), 0..) |v, i| m.closed[i] = closed_fam.with(&.{@tagName(v)});
         self.metrics = m;
     }
 
@@ -1136,7 +1136,7 @@ pub const Topics = struct {
             const hb_ms: ?i64 = if (self.options.heartbeat) |h| h.toMilliseconds() else null;
             var node = list.subscribers.first;
             while (node) |nd| : (node = nd.next) {
-                const sub: *Subscriber = @fieldParentPtr("exec_node", nd);
+                const sub: *Subscriber = @alignCast(@fieldParentPtr("exec_node", nd));
                 if (sub.gone.load(.acquire) and !sub.end_started.load(.acquire)) {
                     if (ne < ends.len) {
                         ends[ne] = sub;
@@ -1234,7 +1234,7 @@ pub const Topics = struct {
         for (self.execs) |*list| {
             var node = list.subscribers.first;
             while (node) |nd| : (node = nd.next) {
-                const sub: *Subscriber = @fieldParentPtr("exec_node", nd);
+                const sub: *Subscriber = @alignCast(@fieldParentPtr("exec_node", nd));
                 if (sub.ending or sub.left or sub.broken) continue;
                 self.queueDrainEnd(sub) catch continue;
                 if (!sub.running and sub.armed) {
@@ -1392,8 +1392,15 @@ pub const Subscriber = struct {
             else => error.OutOfMemory,
         };
         defer p.release(hub.gpa);
+        return sub._sendPayload(p);
+    }
+
+    /// `send` for a payload already encoded (`Topics._encode`; the caller
+    /// keeps its reference).
+    pub fn _sendPayload(sub: *Subscriber, p: *Payload) SendError!void {
+        const hub = sub.hub;
         const io = hub.io;
-        var start = false;
+        var launch = false;
         {
             hub.mutex.lockUncancelable(io);
             defer hub.mutex.unlock(io);
@@ -1404,10 +1411,10 @@ pub const Subscriber = struct {
             sub.queued_bytes += p.cost();
             if (!sub.running and sub.armed) {
                 sub.running = true;
-                start = true;
+                launch = true;
             }
         }
-        if (start) hub.startSender(io, sub);
+        if (launch) hub.startSender(io, sub);
     }
 
     /// Bytes queued for this subscriber (the C ABI's accounting).

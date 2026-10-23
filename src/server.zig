@@ -130,6 +130,7 @@ const nats_mod = if (features.nats) @import("nats/root.zig") else struct {
 };
 const resilience_mod = @import("resilience/root.zig");
 const sse_mod = @import("sse/root.zig");
+const watch_mod = @import("watch/root.zig");
 const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
     pub const Options = struct {};
     pub const Client = void;
@@ -2784,6 +2785,28 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn sseNote(self: *const Self) void {
             if (self.extras.sse_routes == 0 or self.certs.len > 0 or self.mode.environment != .development) return;
             std.log.scoped(.anole).info("server-sent events are served over plain HTTP/1.1 here: browsers use HTTP/2 only over TLS (listenTls), and HTTP/1.1 allows six connections per host, one per open tab's stream", .{});
+        }
+
+        /// Watches `source` for changes (PostgreSQL LISTEN/NOTIFY, Redis
+        /// pub/sub or a stream, MongoDB change streams) and feeds SSE and
+        /// WebSocket topics with them, with no handler in between. The
+        /// server starts it when serving starts, after the database clients
+        /// it reads, stops it at the drain, and frees it. See `anole.watch`.
+        ///
+        ///     _ = try app.watch(.{ .postgres = .{ .client = db, .channels = &.{"orders"} } }, .{
+        ///         .to = &.{.{ .sse = .{ .topics = live, .topic = "orders" } }},
+        ///     });
+        pub fn watch(self: *Self, source: watch_mod.Source, watch_options: watch_mod.Options) !*watch_mod.Watch {
+            const w = try watch_mod.Watch.init(self.gpa, self.rt.io(), source, watch_options);
+            errdefer w.deinit();
+            if (self.mode.deployment == .lambda) {
+                w.disabled = true;
+                std.log.scoped(.anole).info("watch \"{s}\": not started under the lambda deployment (a function holds no long-lived connection to a database)", .{w.name});
+            }
+            try self.extras.connectors.append(self.arena.allocator(), .of(watch_mod.Watch, w));
+            w._registerDrain(&self.server.drain_hooks);
+            if (self.extras.connectors_started) try w.start(self.extras.metrics, null, null);
+            return w;
         }
         // ---- end p3/realtime ----
 

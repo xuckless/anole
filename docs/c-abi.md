@@ -464,6 +464,7 @@ Bindings may switch on it; tokens are only ever added.
 | `NoConsumer`, `ConsumerWithoutExecutor` | `ANOLE_E_STATE` | `anole_server_open` / `anole_server_start` |
 | `NotRunning`, `NoTlsListener` | `ANOLE_E_STATE` | reload, publish |
 | `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
+| `NotSse`, `WrongWatchKind`, `UnknownWatch` | `ANOLE_E_STATE`, `ANOLE_E_STATE`, `ANOLE_E_INVALID` | `anole_sse_accept` on a request that is no SSE subscription; `anole_watch_ack` on a watch that is not a Redis stream group with manual acks; `anole_watch_find` | 
 | `InvalidEnvironmentVariable`, `DeploymentUnavailable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`; `deployment` lambda; `proxy_protocol` with an empty `proxy.trusted`) |
 | `UnknownEnvironment`, `InvalidEnvFile` | `ANOLE_E_INVALID`, `ANOLE_E_CONFIG` | `anole_dotenv_read` |
 | `AddressInUse`, `AddressNotAvailable`, `AccessDenied`, `TooManyOpenFiles`, `SystemResources` | `ANOLE_E_SYSTEM` | binds, threads, files (errno set) |
@@ -516,6 +517,15 @@ marked (C): they answer `ANOLE_OK` on an object that is already over.
 | `anole_ws_subscribe` | `ANOLE_E_INVALID` (topic), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_ws_unsubscribe` (C) | `ANOLE_E_INVALID` (topic), `ANOLE_E_NOMEM` |
 | `anole_ws_publish` | `ANOLE_E_INVALID`, `ANOLE_E_AGAIN`, `ANOLE_E_STATE` (`NotRunning`), `ANOLE_E_NOMEM` |
+| `anole_sse_publish`, `anole_sse_gap` | `ANOLE_E_INVALID` (topic, event name, size, flags), `ANOLE_E_AGAIN` (publish only), `ANOLE_E_STATE` (`NotRunning`), `ANOLE_E_NOMEM` |
+| `anole_sse_accept` | `ANOLE_E_STATE` (`NotSse`), `ANOLE_E_INVALID` (topic, header, reserved, size), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_sse_subscribe` | `ANOLE_E_INVALID` (topic), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_sse_unsubscribe`, `anole_sse_close` (C) | `ANOLE_E_INVALID` (topic, handle kind) |
+| `anole_sse_send` | `ANOLE_BUSY`, `ANOLE_E_AGAIN` (the queue is full; `ANOLE_EV_WRITABLE` follows), `ANOLE_E_INVALID` (event name, size, flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_watch_find` | `ANOLE_E_INVALID` (`UnknownWatch`) |
+| `anole_watch_listen` | `ANOLE_E_STATE` (not running, the watch stopped), `ANOLE_E_INVALID` (format, reserved, size), `ANOLE_E_NOMEM` |
+| `anole_watch_unlisten` (C) | `ANOLE_E_INVALID` (handle kind) |
+| `anole_watch_ack` | `ANOLE_E_STATE` (`WrongWatchKind`), `ANOLE_E_INVALID` (position), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_grpc_send_headers` | `ANOLE_E_INVALID` (metadata), `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_grpc_send` | `ANOLE_BUSY`, `ANOLE_E_INVALID`, `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_grpc_send_wait` | `ANOLE_E_TIMEOUT`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
@@ -887,6 +897,84 @@ and the larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`
 bytes): past the bound `anole_ws_publish` answers `ANOLE_E_AGAIN` and sends
 nothing (a caller that retries the refused publish before the next keeps
 the order). A drain closes sockets with 1001.
+
+## Server-sent events
+
+An `sse` route is a GET endpoint whose responses are event streams. Anole
+parks each stream: an idle subscriber holds no task, only a small object, and
+a publish fans out on Anole's threads without entering the language
+(`anole_sse_publish`). Every event gets an ID, `<epoch>-<seq>`, one sequence
+across all topics; a browser that reconnects sends the last one it saw as
+`Last-Event-ID`, and Anole replays what it missed from the topics' replay
+buffers (`sse.replay`: 256 events or 256 KiB per topic, 64 MiB in all, five
+minutes), or sends one `gap` event (`sse.gap_event`) when the buffers no
+longer cover it. A heartbeat comment goes to every subscriber idle for
+`sse.heartbeat_ms`. A subscriber that does not keep up (`sse.max_queued_bytes`)
+gets its stream ended (`sse.on_full` `"close"`; the browser reconnects and
+resumes from the replay) or misses the event (`"drop"`). At the drain every
+subscriber is told when to come back (`retry:`, spread over
+`sse.drain_retry`), then its stream ends.
+
+```json
+{ "sse": { "heartbeat_ms": 15000, "replay": { "events": 256 }, "on_full": "close" },
+  "limits": { "sse_max_event": 1048576 },
+  "routes": [
+    { "path": "/news", "sse": { "topics": ["news"] } },
+    { "path": "/rooms/:room/events", "sse": { "topics": ["news", "room:{room}"], "last": 0 } },
+    { "path": "/me/events", "sse": { "handler": 7 } } ] }
+```
+
+`{name}` in a route's `topics` is replaced by the path parameter `name`
+(percent-decoded); a name the path lacks is a configuration error. With
+`"handler"`, the subscription is the consumer's to decide: it arrives as
+`ANOLE_EV_SSE_SUBSCRIBE` (an `anole_request_event` with the request's
+headers, `Last-Event-ID` among them, and the claims of the authentication
+middleware), and `anole_sse_accept` answers it (any other answer to a request
+refuses it). The accept returns the subscriber's handle at once;
+`anole_sse_subscribe`, `anole_sse_unsubscribe`, `anole_sse_send` and
+`anole_sse_close` act on it, and `ANOLE_EV_SSE_CLOSE` says when it is over.
+
+`anole_sse_send` sends one event to one subscriber (no ID, never replayed).
+Like every send it returns once the event is queued: `ANOLE_BUSY` when more
+than half of `sse.max_queued_bytes` waits, `ANOLE_E_AGAIN` (nothing taken)
+past the whole of it, and `ANOLE_EV_WRITABLE` when the queue has drained
+below a quarter. `anole_sse_gap` tells the subscribers of a topic that the
+application lost events it would have published.
+
+## Watches
+
+A watch turns a database's changes into events: PostgreSQL `LISTEN`/`NOTIFY`,
+Redis pub/sub, a Redis stream (with or without a consumer group) or a MongoDB
+change stream (a replica set is needed). Each is declared in `"watches"` and
+read from `anole_server_start` until the drain; all watches of one database
+share one connection (PostgreSQL, Redis pub/sub).
+
+```json
+{ "databases": [ { "name": "main", "postgres": { "url": "postgres://..." } } ],
+  "watches": [
+    { "name": "orders", "database": "main", "postgres": { "channels": ["orders"] },
+      "to": [ { "sse": "orders" }, { "ws": "orders", "type": "text", "gap_message": null } ] } ] }
+```
+
+`to` feeds topics and rooms natively: `sse` names a topic (or a template) and
+`ws` a room; templates take `{channel}`, `{op}`, `{data.<field>}` (a top-level
+member of a JSON payload) and, for MongoDB, `{db}`, `{collection}` and
+`{key}`; an event a template cannot be filled for is skipped for that target.
+PostgreSQL and Redis pub/sub are at most once, so a reconnect is a **gap**;
+a Redis stream resumes from the last entry it read; a MongoDB stream resumes
+by its resume token. A gap reaches the SSE topics as the `gap` event, and a
+listener as an `ANOLE_EV_WATCH_STATUS` with `ANOLE_WATCH_GAP`.
+
+A consumer that wants the events too listens with `anole_watch_find` and
+`anole_watch_listen`; every event arrives as `ANOLE_EV_WATCH_EVENT` (the
+channel, the operation, the data as text, as JSON or as BSON, a stream entry's
+fields, the position to resume from), and `anole_watch_unlisten` (or
+`anole_handle_release`) ends it with `ANOLE_EV_WATCH_END`. A listener holds at
+most `max_events` / `max_bytes` waiting for the consumer; past that events are
+dropped, and one status with how many follows. A Redis stream group with
+`"ack": "manual"` owes `anole_watch_ack` for each entry.
+`anole_watch_index` is the watch's index in `"watches"` (the `watch` field of
+its records).
 
 ## WebTransport
 

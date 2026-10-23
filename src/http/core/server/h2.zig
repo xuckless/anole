@@ -151,7 +151,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer r.mutex.unlock(io);
                 var it = r.list.first;
                 while (it) |node| : (it = node.next) {
-                    const conn: *Conn = @fieldParentPtr("node", node);
+                    const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
                     conn.beginDrain();
                 }
                 return r.list.first != null;
@@ -165,7 +165,7 @@ pub fn Engine(comptime Ctx: type) type {
                 defer r.mutex.unlock(io);
                 var it = r.list.first;
                 while (it) |node| : (it = node.next) {
-                    const conn: *Conn = @fieldParentPtr("node", node);
+                    const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
                     conn.lock();
                     defer conn.unlock();
                     conn.finishDrainLocked();
@@ -1598,7 +1598,7 @@ pub fn Engine(comptime Ctx: type) type {
             };
 
             fn of(p: *Parked) *H2Parked {
-                return @fieldParentPtr("parked", p);
+                return @alignCast(@fieldParentPtr("parked", p));
             }
 
             fn begin(p: *Parked) bool {

@@ -504,6 +504,15 @@ enum anole_event_type {
   /* ---- end p3/webhooks ---- */
 
   /* ---- p3/realtime ---- */
+  ANOLE_EV_SSE_SUBSCRIBE = 112,  /* anole_request_event; handle: anole_req. A subscription on a route
+                                    with "sse": {"handler": ...}: answer it with anole_sse_accept, or
+                                    refuse it with any answer to a request (anole_req_respond,
+                                    anole_req_fail, anole_req_abort) */
+  ANOLE_EV_SSE_CLOSE = 113,      /* anole_sse_close_event; handle: anole_sse, now over */
+  ANOLE_EV_WATCH_EVENT = 116,    /* anole_watch_event; handle: anole_watch_sub. A stream group with
+                                    "ack": "manual" owes anole_watch_ack for it */
+  ANOLE_EV_WATCH_STATUS = 117,   /* anole_watch_status_event; handle: anole_watch_sub */
+  ANOLE_EV_WATCH_END = 118,      /* anole_watch_end_event; handle: anole_watch_sub, now over */
   /* ---- end p3/realtime ---- */
 
   /* ---- p3/s3 ---- */
@@ -1796,6 +1805,166 @@ typedef struct anole_kafka_assign_event {
 /* ---- end p3/webhooks ---- */
 
 /* ---- p3/realtime ---- */
+/* ---- Server-Sent Events ---------------------------------------------------- */
+
+typedef uint64_t anole_sse;       /* one subscriber a consumer accepted: until ANOLE_EV_SSE_CLOSE */
+typedef uint64_t anole_watch_sub; /* one watch listener: until ANOLE_EV_WATCH_END */
+typedef struct anole_watch anole_watch; /* opaque; lives until anole_server_destroy */
+
+enum {
+  ANOLE_SSE_F_NO_REPLAY = 1 /* anole_sse_publish: not kept for Last-Event-ID resume */
+};
+enum {
+  ANOLE_SSE_F_PREFIX = 1 /* anole_sse_gap: every topic starting with `topic` */
+};
+
+/* Queues one event for every subscriber of `topic` (1-255 bytes, copied),
+   fanned out on Anole's threads; returns at once. `event`: the event name,
+   {NULL,0} for none (no CR or LF); `data`: UTF-8, CR/LF/CRLF split it into
+   data lines; copied (ANOLE_BODY_BORROW is refused). Publishes to one topic
+   reach every subscriber in the order they were taken (from one thread: call
+   order); one subscriber sees all its events in one order. Each event gets
+   the ID "<epoch>-<seq>", one sequence across topics, which a browser sends
+   back as Last-Event-ID to get what it missed from the topic's replay
+   buffer ("sse.replay"). ANOLE_E_INVALID: topic length, a CR/LF in event,
+   len > limits.sse_max_event, unknown flags. ANOLE_E_AGAIN: too many
+   publishes still being fanned out (64 per executor, and the larger of
+   16 x sse.max_queued_bytes and 2 x limits.sse_max_event bytes); nothing
+   queued, no event follows. ANOLE_E_STATE ("NotRunning"): the server is not
+   running. */
+ANOLE_API anole_status anole_sse_publish(anole_server *s, anole_str topic, anole_str event, const void *data,
+                                         size_t len, uint32_t flags);
+/* Sends the gap event ("sse.gap_event") to the topic's subscribers
+   (ANOLE_SSE_F_PREFIX: to every topic starting with `topic`) and starts its
+   replay afresh: call it when the application lost events it would have
+   published. */
+ANOLE_API anole_status anole_sse_gap(anole_server *s, anole_str topic, uint32_t flags);
+
+typedef struct anole_sse_accept_options {
+  size_t size;                 /* sizeof(anole_sse_accept_options) */
+  const anole_str *topics;     /* joined besides the route's "topics"; copied */
+  size_t ntopics;
+  const anole_header *headers; /* extra response headers (Set-Cookie...); not Content-Type,
+                                  Cache-Control, Content-Length, Transfer-Encoding, Connection */
+  size_t nheaders;
+  uint32_t last;               /* without Last-Event-ID: the newest `last` events per topic */
+  uint32_t reserved;           /* must be 0 */
+} anole_sse_accept_options;    /* 48 bytes */
+
+/* Accepts the subscription r (an ANOLE_EV_SSE_SUBSCRIBE): Anole answers 200
+   with an event stream, replays what Last-Event-ID missed, and *out is the
+   subscriber's handle, usable at once; r is stale from here.
+   ANOLE_EV_SSE_CLOSE follows when it ends. If the client left meanwhile,
+   ANOLE_EV_SSE_CLOSE (CLIENT_GONE) follows alone. ANOLE_E_STATE ("NotSse"):
+   r is not an SSE subscription. ANOLE_E_INVALID: a bad topic or header,
+   reserved != 0, NULL out. Nothing is taken on a negative answer (r is still
+   owed one). */
+ANOLE_API anole_status anole_sse_accept(anole_req r, const anole_sse_accept_options *options, anole_sse *out);
+/* Joins a topic (copied); `last` as in the accept options. A publish called
+   after this returns reaches it. ANOLE_E_GONE once the subscriber is over. */
+ANOLE_API anole_status anole_sse_subscribe(anole_sse s, anole_str topic, uint32_t last);
+/* Leaves a topic. A cleanup call. */
+ANOLE_API anole_status anole_sse_unsubscribe(anole_sse s, anole_str topic);
+/* One event to this subscriber only (no id; never replayed); copied.
+   ANOLE_OK; ANOLE_BUSY (taken; more than half of sse.max_queued_bytes
+   waits: wait for ANOLE_EV_WRITABLE); ANOLE_E_AGAIN (not taken: the queue is
+   full; ANOLE_EV_WRITABLE follows); ANOLE_E_GONE once it ended. flags: 0. */
+ANOLE_API anole_status anole_sse_send(anole_sse s, anole_str event, const void *data, size_t len, uint32_t flags);
+/* Ends the stream after what is queued; ANOLE_EV_SSE_CLOSE (CLOSED) follows.
+   A cleanup call. */
+ANOLE_API anole_status anole_sse_close(anole_sse s);
+
+enum {
+  ANOLE_SSE_CLOSED_CLIENT_GONE = 0,
+  ANOLE_SSE_CLOSED_SLOW = 1,   /* it did not keep up (sse.on_full "close") */
+  ANOLE_SSE_CLOSED_DRAIN = 2,  /* the server's drain; the browser was told when to come back */
+  ANOLE_SSE_CLOSED_CLOSED = 3, /* anole_sse_close or anole_handle_release */
+  ANOLE_SSE_CLOSED_SERVER = 4  /* the stream could not be set up */
+};
+typedef struct anole_sse_close_event {
+  anole_event ev;    /* handle: the anole_sse, now stale */
+  uint32_t route_id; /* the route's "handler" */
+  uint32_t reason;   /* ANOLE_SSE_CLOSED_* */
+} anole_sse_close_event; /* 24 bytes */
+
+/* ---- watch ------------------------------------------------------------------ */
+
+/* The watch named `name` in "watches" (after anole_server_create);
+   ANOLE_E_INVALID when there is none. */
+ANOLE_API anole_status anole_watch_find(anole_server *s, anole_str name, anole_watch **out);
+ANOLE_API uint32_t anole_watch_index(const anole_watch *w);
+
+enum { ANOLE_WATCH_NATIVE = 0, ANOLE_WATCH_JSON = 1 }; /* anole_watch_listen_options.format */
+typedef struct anole_watch_listen_options {
+  size_t size;         /* sizeof(anole_watch_listen_options) */
+  uint32_t max_events; /* held for the consumer, at most; 0: 1024 */
+  uint32_t max_bytes;  /* 0: 4 MiB */
+  uint32_t format;     /* ANOLE_WATCH_NATIVE: PostgreSQL/Redis text, stream fields, MongoDB BSON;
+                          ANOLE_WATCH_JSON: stream entries and MongoDB events as JSON */
+  uint32_t reserved;   /* 0 */
+} anole_watch_listen_options; /* 24 bytes */
+
+/* Events of the watch from now on, to `c` as ANOLE_EV_WATCH_EVENT (handle
+   *out, user_data). Never holds the watch up: past max_events/max_bytes
+   waiting for the consumer, events are dropped and one ANOLE_EV_WATCH_STATUS
+   (GAP, with how many) comes before the next. ANOLE_E_STATE before the
+   server runs or after the watch stopped. */
+ANOLE_API anole_status anole_watch_listen(anole_watch *w, anole_consumer *c, const anole_watch_listen_options *opts,
+                                          uint64_t user_data, anole_watch_sub *out);
+/* Stops listening; events already queued still come, then ANOLE_EV_WATCH_END
+   (UNLISTENED). A cleanup call. */
+ANOLE_API anole_status anole_watch_unlisten(anole_watch_sub l);
+/* Redis stream group with "ack": "manual": XACK the entry `position` (as the
+   event carried it). ANOLE_E_STATE ("WrongWatchKind") on another kind of
+   watch. Never blocks. */
+ANOLE_API anole_status anole_watch_ack(anole_watch_sub l, anole_str position);
+
+enum { ANOLE_WATCH_SRC_POSTGRES = 1, ANOLE_WATCH_SRC_REDIS = 2, ANOLE_WATCH_SRC_REDIS_STREAM = 3,
+       ANOLE_WATCH_SRC_MONGODB = 4 };
+enum { ANOLE_WATCH_OP_MESSAGE = 0, ANOLE_WATCH_OP_ENTRY = 1, ANOLE_WATCH_OP_INSERT = 2,
+       ANOLE_WATCH_OP_UPDATE = 3, ANOLE_WATCH_OP_REPLACE = 4, ANOLE_WATCH_OP_DELETE = 5,
+       ANOLE_WATCH_OP_DROP = 6, ANOLE_WATCH_OP_RENAME = 7, ANOLE_WATCH_OP_DROP_DATABASE = 8,
+       ANOLE_WATCH_OP_INVALIDATE = 9, ANOLE_WATCH_OP_OTHER = 10 };
+enum { ANOLE_WATCH_FMT_TEXT = 0, ANOLE_WATCH_FMT_JSON = 1, ANOLE_WATCH_FMT_BSON = 2,
+       ANOLE_WATCH_FMT_FIELDS = 3 };
+/* ANOLE_EV_WATCH_EVENT. FIELDS: `anole_span fields[2 * nfields]` (name, value)
+   at fields_off; the bytes the spans point into follow. */
+typedef struct anole_watch_event {
+  anole_event ev;       /*  0 handle: the anole_watch_sub */
+  uint64_t user_data;   /* 16 */
+  uint32_t watch;       /* 24 the watch's index in "watches" */
+  uint16_t source;      /* 28 ANOLE_WATCH_SRC_* */
+  uint16_t op;          /* 30 ANOLE_WATCH_OP_* */
+  uint32_t format;      /* 32 ANOLE_WATCH_FMT_* of `data` */
+  int32_t pg_pid;       /* 36 PostgreSQL: the notifying backend; else 0 */
+  anole_span channel;   /* 40 channel, stream key, or "db.collection" */
+  anole_span pattern;   /* 48 Redis: the pattern matched; else empty */
+  anole_span op_name;   /* 56 as the source named it */
+  anole_span position;  /* 64 entry ID or resume token (canonical Extended JSON); else empty */
+  anole_span data;      /* 72 */
+  uint32_t nfields;     /* 80 */
+  uint32_t fields_off;  /* 84 */
+} anole_watch_event;    /* 88 bytes */
+
+enum { ANOLE_WATCH_CONNECTED = 1, ANOLE_WATCH_DISCONNECTED = 2, ANOLE_WATCH_GAP = 3,
+       ANOLE_WATCH_INVALIDATED = 4 };
+typedef struct anole_watch_status_event {
+  anole_event ev;      /*  0 */
+  uint64_t user_data;  /* 16 */
+  uint32_t watch;      /* 24 */
+  uint32_t status;     /* 28 ANOLE_WATCH_CONNECTED... */
+  uint64_t dropped;    /* 32 GAP: events this listener lost to its own limits (0: the source's gap) */
+  anole_span detail;   /* 40 text for logs */
+} anole_watch_status_event; /* 48 bytes */
+
+enum { ANOLE_WATCH_END_UNLISTENED = 1, ANOLE_WATCH_END_DRAINED = 2, ANOLE_WATCH_END_FAILED = 3 };
+typedef struct anole_watch_end_event {
+  anole_event ev;      /*  0 */
+  uint64_t user_data;  /* 16 */
+  uint32_t watch;      /* 24 */
+  uint32_t reason;     /* 28 ANOLE_WATCH_END_* */
+  anole_span detail;   /* 32 FAILED: why (anole_last_error-style text) */
+} anole_watch_end_event; /* 40 bytes */
 /* ---- end p3/realtime ---- */
 
 /* ---- p3/s3 ---- */

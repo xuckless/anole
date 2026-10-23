@@ -1510,10 +1510,7 @@ pub const Response = struct {
         // as for an upgrade; nothing the handler may still read is lost.
         conn.shrinkForUpgrade();
         self.status = .ok;
-        var w = self.stream(&.{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.WriteFailed,
-        };
+        var w = self.stream(&.{}) catch return error.WriteFailed;
         _ = &w;
         // The head is out and the writer is the park's from here.
         self._body_writer_open = false;
@@ -1549,7 +1546,7 @@ pub const Response = struct {
         var w = self.stream(&.{}) catch |err| {
             d.finish(err);
             p.release();
-            return if (err == error.OutOfMemory) error.OutOfMemory else error.WriteFailed;
+            return error.WriteFailed;
         };
         _ = &w;
         self._body_writer_open = false;

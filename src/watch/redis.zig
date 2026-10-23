@@ -750,10 +750,10 @@ fn buildReply(a: std.mem.Allocator, input: []const u8, pos: *usize, depth: u32) 
         1 => {
             const len = if (pos.* < input.len) input[pos.*] % 8 else 0;
             pos.* += 1;
-            const end = @min(input.len, pos.* + len);
-            const s = input[pos.*..end];
+            const from = @min(pos.*, input.len);
+            const end = @min(input.len, from + len);
             pos.* = end;
-            return .{ .string = s };
+            return .{ .string = input[from..end] };
         },
         2, 3 => {
             const n = if (pos.* < input.len) input[pos.*] % 5 else 0;
