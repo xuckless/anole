@@ -20,6 +20,16 @@ const console_cmd = @import("console.zig");
 
 const Io = std.Io;
 
+/// A panic while `anole console` owns the terminal restores it (cooked mode,
+/// main screen, cursor) before Zig's handler prints the message.
+pub const panic = std.debug.FullPanic(panicRestoringTerminal);
+
+fn panicRestoringTerminal(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    @import("anole_console_ui").term.restoreNow();
+    std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
+}
+
 pub const exit_usage = 1;
 pub const exit_exists = 2;
 pub const exit_no_zig = 3;

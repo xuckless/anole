@@ -83,6 +83,14 @@ jobs:
           fi
           echo "$out"
           grep -F "invalid Anole feature flags" <<<"$out"
+      # `anole console` and the in-process console (`c` + Enter) driven in a
+      # real pseudo-terminal: keys reach the TUI, every way out restores
+      # the terminal. (macOS: poll(2) cannot wait on /dev/tty.)
+      - name: Live console in a pseudo-terminal
+        timeout-minutes: 10
+        run: |
+          zig build cli rest --summary all
+          python3 -I tests/console/pty_test.py zig-out/bin/anole zig-out/bin/rest
 
   cross:
     name: cross (${{ matrix.target }}, compile and link only)

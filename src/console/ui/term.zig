@@ -31,6 +31,9 @@ pub const Terminal = struct {
     color: bool,
     size: Size,
     entered: bool = false,
+    /// poll(2) cannot wait on `read_fd` (macOS /dev/tty when no standard
+    /// descriptor names the terminal): the run loop waits with select.
+    select_wait: bool = false,
 
     /// Opens /dev/tty, checks TERM (unset or "dumb": DumbTerminal), saves the
     /// termios.
@@ -42,7 +45,7 @@ pub const Terminal = struct {
         errdefer sys.close(fd);
         const saved = sys.getTermios(fd) orelse return error.NotATerminal;
         const no_color = sys.getenv("NO_COLOR") orelse "";
-        var t: Terminal = .{ .fd = fd, .read_fd = fd, .saved = saved, .color = no_color.len == 0, .size = .{ .cols = 80, .rows = 24 } };
+        var t: Terminal = .{ .fd = fd, .read_fd = fd, .saved = saved, .color = no_color.len == 0, .size = .{ .cols = 80, .rows = 24 }, .select_wait = !sys.pollable(fd) };
         t.size = t.querySize();
         return t;
     }
@@ -85,6 +88,11 @@ pub const Terminal = struct {
         if (!self.tty) return self.size;
         if (sys.windowSize(self.fd)) |ws| return .{ .cols = ws.col, .rows = ws.row };
         return .{ .cols = 80, .rows = 24 };
+    }
+
+    /// Waits on `fds` (the terminal's `read_fd` among them) as poll(2) does.
+    pub fn poll(self: *const Terminal, fds: []sys.PollFd, timeout_ms: i32) usize {
+        return if (self.select_wait) sys.pollSelect(fds, timeout_ms) else sys.poll(fds, timeout_ms);
     }
 
     pub fn write(self: *Terminal, bytes: []const u8) !void {

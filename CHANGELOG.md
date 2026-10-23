@@ -176,6 +176,19 @@ breaking changes are listed anyway.
   (-13); events 96-126 and handle kinds 10-16 as listed above
   (docs/c-abi.md, "From ABI 0.9").
 
+### Fixed
+
+- Live console on macOS: no key reached it, Ctrl-C included, so the only way
+  out was killing the terminal. macOS's poll(2) does not support devices and
+  answers POLLNVAL for /dev/tty, which the console waited on; the run loop
+  ignored that and spun. The console now opens the terminal by its own name
+  (/dev/ttysNNN) when stdin, stderr or stdout is that terminal, and waits
+  with select(2) otherwise; a terminal that cannot be read ends the console
+  instead of spinning. Both `anole console` and `c` + Enter in a development
+  app are affected. `anole console` also restores the terminal on SIGINT
+  and on a panic. A pseudo-terminal test (tests/console/pty_test.py) runs in
+  CI on Linux and macOS.
+
 ## 0.3.1 (2026-10-23)
 
 ### Fixed
