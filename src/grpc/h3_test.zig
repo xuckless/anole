@@ -355,7 +355,11 @@ test "grpc over h3: no_wait unary calls run inline" {
                 const r = try client.unary("Unary", arena, .{ .message = "inline" }, .{});
                 try std.testing.expectEqual(grpc.Code.ok, r.status.code);
             }
-            try std.testing.expect(env.app.h3.?.stats.served_inline.load(.monotonic) > 0);
+            // Linux binds one endpoint per executor and steers the
+            // connection to any of them: count every endpoint's.
+            var inline_total: u64 = 0;
+            for (env.app.h3.?.shared.endpoints) |ep| inline_total += ep.stats.served_inline.load(.monotonic);
+            try std.testing.expect(inline_total > 0);
         }
     }.run);
 }
