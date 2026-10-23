@@ -1187,8 +1187,11 @@ pub const ClientConnection = struct {
     }
 
     fn onExtendMaxLocalStreamsBidi(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
-        // A request waiting for a stream may go on.
-        connOf(user_data).kick();
+        // A request, or a WebTransport session, waiting for a stream may go
+        // on.
+        const self = connOf(user_data);
+        if (self.wt) |w| w.onStreamCredit();
+        self.kick();
         return 0;
     }
 

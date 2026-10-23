@@ -463,6 +463,9 @@ pub const SendQueue = struct {
     pub fn ack(q: *SendQueue, pool: *BlockPool, budget: *Budget, n: u64) void {
         const m = @min(n, q.written - q.acked);
         q.acked += m;
+        // Acknowledged counts as sent: `sent` never falls behind `acked`,
+        // whose blocks may be freed below.
+        q.sent = @max(q.sent, q.acked);
         if (q.acked == q.written) {
             q.freeAll(pool);
             q.head_base = q.written;
