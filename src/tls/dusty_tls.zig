@@ -505,6 +505,16 @@ pub const Connection = struct {
         return block + sh.pending.mem.len + sh.sending.mem.len;
     }
 
+    /// Whether ciphertext is buffered beneath the plaintext reader, here or
+    /// inside BoringSSL: the next read does not wait for the socket. The
+    /// reading side only.
+    pub fn bufferedBelow(self: *const Connection) bool {
+        const sh = self.shared orelse return false;
+        sh.lock();
+        defer sh.unlock();
+        return sh.input.bufferedLen() != 0 or c.SSL_has_pending(sh.ssl) != 0;
+    }
+
     /// Whether nothing is in flight in either direction: no ciphertext
     /// buffered here or inside BoringSSL (a partial record included), and
     /// nothing queued to send. A server can then set the connection aside
