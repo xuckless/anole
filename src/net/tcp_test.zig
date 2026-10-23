@@ -609,3 +609,40 @@ test "net tcp: drain runs the handler's drain, and the connections left open clo
     try checking.await(app.io());
     try std.testing.expectEqual(@as(u32, 2), Goodbye.drains.load(.acquire));
 }
+
+test "net tcp: metrics count connections and bytes per listener" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    const registry = app.metrics(.{});
+    try app.tcp("127.0.0.1:0", Stats, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            try s.writer().writeAll("abcde");
+            try s.writer().flush();
+            try expectRead(s, "abcde");
+            s.close();
+            try waitUntil(a, "anole_net_closes_total{listener=\"tcp-0\",reason=\"peer\"} 1");
+        }
+
+        fn waitUntil(a: *App, needle: []const u8) !void {
+            const registry_ = a.extras.metrics.?;
+            for (0..2000) |_| {
+                var out: std.Io.Writer.Allocating = .init(alloc);
+                defer out.deinit();
+                try registry_.render(&out.writer);
+                const text = out.written();
+                if (std.mem.indexOf(u8, text, needle) != null) {
+                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_connections_total{listener=\"tcp-0\"} 1") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_bytes_received_total{listener=\"tcp-0\"} 5") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_bytes_sent_total{listener=\"tcp-0\"} 5") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_connections_open{listener=\"tcp-0\"} 0") != null);
+                    return;
+                }
+                try a.io().sleep(.fromMilliseconds(2), .awake);
+            }
+            return error.TimedOut;
+        }
+    }.run);
+    _ = registry;
+}

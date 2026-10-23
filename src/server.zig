@@ -3323,6 +3323,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             // The live console: its socket and rings, and what it may ask of
             // this loop (/restart).
+            // ---- p3/net ----
+            self.attachNetMetrics();
+            // ---- end p3/net ----
             self.startConsole();
             defer if (self.console != null) self.stopConsole(false);
             if (self.console != null) {
@@ -3582,6 +3585,30 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         }
 
         // ---- p3/net ----
+        /// The raw listeners' Prometheus series, when the app has metrics
+        /// (`app.metrics`): one label set per listener.
+        fn attachNetMetrics(self: *Self) void {
+            const registry = self.extras.metrics orelse return;
+            for (self.net_tcp.items, 0..) |t, i| {
+                if (t.series != null) continue;
+                t.series = net_mod.metrics.TcpSeries.init(registry, self.arena.allocator(), self.tcpName(i)) catch null;
+            }
+            for (self.net_udp.items) |g| {
+                if (g.series != null) continue;
+                g.series = net_mod.metrics.UdpSeries.init(registry, self.arena.allocator(), g.name) catch null;
+            }
+        }
+
+        /// The name of the `i`th raw TCP listener.
+        fn tcpName(self: *const Self, i: usize) []const u8 {
+            var n: usize = 0;
+            for (self.server.config.listeners) |l| if (l.raw != null) {
+                if (n == i) return l.name;
+                n += 1;
+            };
+            return "tcp";
+        }
+
         /// Every UDP listener's tasks, until canceled; a listener that fails
         /// to run ends the server with that error.
         fn serveNet(self: *Self) anyerror!void {

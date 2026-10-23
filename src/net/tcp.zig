@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole_log = @import("anole_log");
 const framing_mod = @import("framing.zig");
+const net_metrics = @import("metrics.zig");
 
 pub const Framing = framing_mod.Framing;
 pub const FrameIterator = framing_mod.FrameIterator;
@@ -541,6 +542,8 @@ pub const TcpListener = struct {
     service: TcpService,
     drivers: []Driver,
     stats: ListenerStats = .{},
+    /// The Prometheus series, set before serving when the app has metrics.
+    series: ?*net_metrics.TcpSeries = null,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, service: TcpService) !*TcpListener {
         const self = try gpa.create(TcpListener);
@@ -762,6 +765,10 @@ const TcpConn = struct {
         t.adopter.deadline = t.lifetimeAt();
         _ = listener.stats.open.fetchAdd(1, .monotonic);
         _ = listener.stats.total.fetchAdd(1, .monotonic);
+        if (listener.series) |m| {
+            m.total.inc();
+            m.open.add(1);
+        }
         info.drain_hooks.add(info.io, &t.drain_hook);
         if (table.open) |f| {
             t.callLock();
@@ -798,6 +805,10 @@ const TcpConn = struct {
         const stats = &t.listener.stats;
         _ = stats.open.fetchSub(1, .monotonic);
         _ = stats.closes[@intFromEnum(reason)].fetchAdd(1, .monotonic);
+        if (t.listener.series) |m| {
+            m.open.add(-1);
+            m.closes[@intFromEnum(reason)].inc();
+        }
         _ = stats.bytes_in.fetchAdd(t.bytes_in, .monotonic);
         const out = t.bytes_out.load(.monotonic);
         _ = stats.bytes_out.fetchAdd(out, .monotonic);
@@ -934,6 +945,7 @@ const TcpConn = struct {
             if (total > 0 and q + total > o.write_max) {
                 t.want_writable.store(true, .release);
                 _ = t.listener.stats.queue_full.fetchAdd(1, .monotonic);
+                if (t.listener.series) |m| m.queue_full.inc();
                 return error.QueueFull;
             }
             if (total > 0) {
@@ -1185,6 +1197,7 @@ const TcpConn = struct {
             }
         }
         _ = t.bytes_out.fetchAdd(n, .monotonic);
+        if (t.listener.series) |m| m.bytes_out.add(n);
         const was = t.queued.fetchSub(@intCast(n), .acq_rel);
         const now_queued = was - @as(u32, @intCast(n));
         if (t.waiters.load(.acquire) != 0) t.io.futexWake(u32, &t.queued.raw, std.math.maxInt(u32));
@@ -1464,6 +1477,7 @@ const TcpConn = struct {
             r.end = 0;
             t.last_input = std.Io.Clock.Timestamp.now(t.io, .awake);
             t.bytes_in += bytes.len;
+            if (t.listener.series) |m| m.bytes_in.add(bytes.len);
             if (t.close_graceful.load(.acquire)) continue; // input is dropped
             if (!(try t.deliver(bytes))) return .close;
             _ = o;
@@ -1699,6 +1713,7 @@ const TcpConn = struct {
             r.toss(bytes.len);
             t.last_input = std.Io.Clock.Timestamp.now(t.io, .awake);
             t.bytes_in += bytes.len;
+            if (t.listener.series) |m| m.bytes_in.add(bytes.len);
             if (o.framing == .none) return bytes;
             t.decoder.feed(bytes, &t.frames, t.gpa) catch |err| return switch (err) {
                 error.FrameTooLarge => error.FrameTooLarge,

@@ -12,6 +12,7 @@ const dusty = @import("dusty");
 const low = @import("udp.zig");
 const sessions_mod = @import("sessions.zig");
 const handoff = @import("../handoff.zig");
+const net_metrics = @import("metrics.zig");
 
 const placement = dusty.placement;
 const Duration = std.Io.Duration;
@@ -299,6 +300,19 @@ pub const UdpSocket = struct {
         }
     }
 
+    /// A drop, counted here and in the Prometheus series.
+    fn countDrop(s: *UdpSocket, why: net_metrics.DropReason, n: u64) void {
+        const field = switch (why) {
+            .kernel => &s.stats.dropped_kernel,
+            .truncated => &s.stats.dropped_truncated,
+            .queue_full => &s.stats.dropped_queue_full,
+            .send_failed => &s.stats.dropped_send_failed,
+            .sessions_full => &s.stats.dropped_sessions_full,
+        };
+        _ = field.fetchAdd(n, .monotonic);
+        if (s.group.series) |m| m.drop(why, n);
+    }
+
     fn lockQ(s: *UdpSocket) void {
         while (!s.qlock.tryLock()) std.atomic.spinLoopHint();
     }
@@ -313,7 +327,7 @@ pub const UdpSocket = struct {
         if (s.queue_bytes + bytes.len > cap) {
             s.want_writable = true;
             s.qlock.unlock();
-            _ = s.stats.dropped_queue_full.fetchAdd(1, .monotonic);
+            s.countDrop(.queue_full, 1);
             return error.QueueFull;
         }
         const was_empty = s.pending.items.len == 0;
@@ -355,7 +369,7 @@ pub const UdpSocket = struct {
         if (s.queue_bytes + total > cap) {
             s.want_writable = true;
             s.qlock.unlock();
-            _ = s.stats.dropped_queue_full.fetchAdd(items.len, .monotonic);
+            s.countDrop(.queue_full, items.len);
             return error.QueueFull;
         }
         const was_empty = s.pending.items.len == 0;
@@ -408,6 +422,7 @@ pub const UdpSocket = struct {
         const n = box.datagrams;
         s.udp.sendOutbox(s.group.io, box);
         _ = s.stats.datagrams_out.fetchAdd(n, .monotonic);
+        if (s.group.series) |m| m.sent.add(n);
         _ = s.stats.send_flushes.fetchAdd(1, .monotonic);
     }
 
@@ -460,13 +475,13 @@ pub const UdpSocket = struct {
                     if (d0.dropped != last) {
                         const delta = d0.dropped -% last;
                         dropped +%= delta;
-                        _ = s.stats.dropped_kernel.fetchAdd(delta, .monotonic);
+                        s.countDrop(.kernel, delta);
                     }
                 }
                 s.last_dropped = d0.dropped;
             }
             if (m.flags.trunc or d0.data.len > o.max_datagram) {
-                _ = s.stats.dropped_truncated.fetchAdd(1, .monotonic);
+                s.countDrop(.truncated, 1);
                 continue;
             }
             s.dgrams[count] = .{
@@ -478,6 +493,7 @@ pub const UdpSocket = struct {
             count += 1;
         }
         _ = s.stats.datagrams_in.fetchAdd(count, .monotonic);
+        if (s.group.series) |m| m.received.add(count);
         s.replying = true;
         defer {
             s.replying = false;
@@ -509,7 +525,7 @@ pub const UdpSocket = struct {
         const hstate = s.group.service.state;
         const node = t.get(key) orelse blk: {
             const node = t.open(key, now, .{ .socket_ = s, .remote_ = d.remote }) catch |err| {
-                if (err == error.Full) _ = s.stats.dropped_sessions_full.fetchAdd(1, .monotonic);
+                if (err == error.Full) s.countDrop(.sessions_full, 1);
                 return;
             };
             const sess = &node.value;
@@ -523,6 +539,7 @@ pub const UdpSocket = struct {
                 sess.context = sess.state_buf.ptr;
             }
             _ = s.stats.sessions.fetchAdd(1, .monotonic);
+            if (s.group.series) |m| m.sessions.add(1);
             if (table.session_open) |f| f(hstate, sess) catch |err| {
                 log.debug("udp {s}: session open failed: {t}", .{ s.group.name, err });
                 s.endSession(node, .local);
@@ -560,6 +577,7 @@ pub const UdpSocket = struct {
             sess.state_buf = &.{};
         }
         _ = s.stats.sessions.fetchSub(1, .monotonic);
+        if (s.group.series) |m| m.sessions.add(-1);
     }
 
     fn expireSessions(s: *UdpSocket) void {
@@ -611,7 +629,7 @@ pub const UdpSocket = struct {
         if (s.work.items.len == 0) return;
         if (s.send_box == null) s.send_box = low.Udp.Outbox.init(gpa) catch {
             // No memory for a box: the datagrams are dropped, counted.
-            _ = s.stats.dropped_send_failed.fetchAdd(s.work.items.len, .monotonic);
+            s.countDrop(.send_failed, s.work.items.len);
             s.finishWork();
             return;
         };
@@ -630,6 +648,7 @@ pub const UdpSocket = struct {
         if (n == 0) return;
         s.udp.sendOutbox(s.group.io, box);
         _ = s.stats.datagrams_out.fetchAdd(n, .monotonic);
+        if (s.group.series) |m| m.sent.add(n);
         _ = s.stats.send_flushes.fetchAdd(1, .monotonic);
     }
 
@@ -665,6 +684,8 @@ pub const UdpGroup = struct {
     /// `go` tasks of every socket.
     tasks: std.Io.Group = .init,
     handed_over: std.atomic.Value(bool) = .init(false),
+    /// The Prometheus series, set before serving when the app has metrics.
+    series: ?*net_metrics.UdpSeries = null,
 
     pub const BindOptions = struct {
         address: std.Io.net.IpAddress,

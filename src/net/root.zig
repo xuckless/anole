@@ -21,6 +21,8 @@ pub const Framing = tcp_mod.Framing;
 pub const FrameIterator = tcp_mod.FrameIterator;
 /// A TCP listener's options (`Tcp.Options`).
 pub const Tcp = tcp_mod.Tcp;
+/// The Prometheus series of the raw listeners (`app.metrics`).
+pub const metrics = @import("metrics.zig");
 /// The connection a TCP handler sees.
 pub const Conn = tcp_mod.Conn;
 pub const CloseReason = tcp_mod.CloseReason;
