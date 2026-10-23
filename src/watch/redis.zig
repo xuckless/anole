@@ -593,7 +593,7 @@ fn streamSession(r: *StreamReader, first: bool) !void {
             };
         };
         if (r.consumer.len == 0) {
-            var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            var host_buf: [if (builtin.os.tag == .windows) 1 else std.posix.HOST_NAME_MAX]u8 = undefined;
             const host = if (builtin.os.tag == .windows) "anole" else (std.posix.gethostname(&host_buf) catch "anole");
             const pid: i64 = if (builtin.os.tag == .windows) 0 else std.c.getpid();
             r.consumer = if (g.consumer) |c| try r.gpa.dupe(u8, c) else try std.fmt.allocPrint(r.gpa, "{s}-{d}", .{ host, pid });

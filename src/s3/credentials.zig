@@ -227,7 +227,7 @@ pub const Provider = struct {
         const w = &form.writer;
         try w.writeAll("Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=");
         try sigv4.uriEncode(w, role, false);
-        try w.print("&RoleSessionName=anole-{d}&WebIdentityToken=", .{std.c.getpid()});
+        try w.print("&RoleSessionName=anole-{d}&WebIdentityToken=", .{if (@import("builtin").os.tag == .windows) @as(i64, 0) else std.c.getpid()});
         try sigv4.uriEncode(w, token, false);
         const res = try fetch.simple(self.http, a, url, .post, &.{
             .{ "Content-Type", "application/x-www-form-urlencoded" },
