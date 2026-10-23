@@ -305,6 +305,10 @@ test "s3: push upload: waitWritable returns after a part completes" {
     const stored = try up.finish(env.c());
     try testing.expectEqual(@as(u32, 2), stored.parts);
     try testing.expectEqual(6 * mib, env.fake.getObject("b", "push2.bin").?.len);
+    up.deinit();
+    // Every part buffer was given back.
+    try testing.expectEqual(@as(u64, 0), env.client.memory_used.load(.acquire));
+    up = try env.client.upload(env.c(), "again", .{});
 }
 
 test "s3: a part failing three times aborts the upload; later writes fail with its error" {

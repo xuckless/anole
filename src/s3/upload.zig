@@ -239,6 +239,7 @@ pub const Upload = struct {
             if (self.next_part > max_parts) return self.client.failOur(c, .invalid, "too_many_parts", "the upload would need more than 10000 parts; raise part_size");
             try self.ready.append(self.gpa, .{ .data = self.cur.allocatedSlice(), .len = self.cur.items.len, .number = self.next_part });
             self.cur = .empty;
+            self.cur_charged = false;
             self.next_part += 1;
         }
         self.finishing = true;

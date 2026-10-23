@@ -1283,4 +1283,5 @@ test {
     _ = download_;
     _ = testing;
     _ = @import("s3_test.zig");
+    _ = @import("live_test.zig");
 }
