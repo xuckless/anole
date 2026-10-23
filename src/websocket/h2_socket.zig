@@ -61,7 +61,9 @@ pub const H2Socket = struct {
         self.out = try res.stream(&self.out_buf);
         // Out now, so the client may start sending frames.
         try self.out.interface.flush();
-        self.body = try req.reader(&self.in_buf);
+        // No lifetime cap on the stream: the message layer enforces
+        // max_message_size per message.
+        self.body = try req.readerLimited(&self.in_buf, null);
         return self;
     }
 

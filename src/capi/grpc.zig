@@ -503,7 +503,8 @@ fn readUnary(call: *Call, m: *const Method, whole: bool) ![]const u8 {
         }
     } else {
         var in_buf: [16 * 1024]u8 = undefined;
-        var body = try call.req.reader(&in_buf);
+        // Each message is bounded by max_message_size; no lifetime cap.
+        var body = try call.req.readerLimited(&in_buf, null);
         const p = (try serving.readPayload(call, &body, false)) orelse
             return call.fail(.unimplemented, "a unary call needs one request message");
         defer p.deinit();
@@ -622,7 +623,8 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     var reader: std.Io.Group = .init;
     defer reader.cancel(r.io);
     if (m.kind == .client_streaming or m.kind == .bidi_streaming) {
-        body = r.reader(&in_buf) catch |err| {
+        // Each message is bounded by max_message_size; no lifetime cap.
+        body = r.readerLimited(&in_buf, null) catch |err| {
             g.read_error = err;
             return wait(x, si, gen, call, canceled);
         };

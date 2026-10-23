@@ -447,7 +447,9 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
     if (call.impl.get) call.impl.get_message = getMessage(&call) catch |err| return finish(&call, err);
 
     var in_buf: [16 * 1024]u8 = undefined;
-    var body = try req.reader(&in_buf);
+    // A streaming call's body has no lifetime cap: each message is bounded
+    // by max_message_size.
+    var body = try req.readerLimited(&in_buf, null);
 
     const result = switch (M.kind) {
         .unary => runUnary(M, handler, &call, &body),
@@ -921,7 +923,8 @@ pub fn transcodedBody(call: *Call, has_body: bool, whole: ?[]const u8) ![]const 
     if (!has_body) return "";
     const body_text = whole orelse blk: {
         var in_buf: [16 * 1024]u8 = undefined;
-        var reader = try call.req.reader(&in_buf);
+        // Bounded by max_message_size below, not by limits.body_max.
+        var reader = try call.req.readerLimited(&in_buf, null);
         break :blk reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size +| 1)) catch |err| switch (err) {
             error.StreamTooLong => return error.MessageTooLarge,
             else => |e| return e,

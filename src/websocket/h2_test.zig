@@ -169,7 +169,7 @@ const Client = struct {
     /// Queues one masked frame on the stream.
     fn sendFrame(self: *Client, opcode: wsc.Opcode, payload: []const u8) !void {
         var w: std.Io.Writer = .fixed(self.outgoing[self.out_len..]);
-        var copy: [256]u8 = undefined;
+        var copy: [2048]u8 = undefined;
         @memcpy(copy[0..payload.len], payload);
         try wsc.writeFrame(&w, copy[0..payload.len], .{ .opcode = opcode });
         self.out_len += w.buffered().len;
@@ -250,6 +250,9 @@ const Client = struct {
         const self: *Client = @ptrCast(@alignCast(source.*.ptr.?));
         const rest = self.outgoing[self.out_sent..self.out_len];
         if (rest.len == 0) {
+            // All sent: reuse the buffer from the start.
+            self.out_sent = 0;
+            self.out_len = 0;
             if (!self.finished) return c.NGHTTP2_ERR_DEFERRED;
             flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
             return 0;
@@ -330,6 +333,58 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
         if (std.mem.indexOf(u8, out.written(), "route=\"/chat\",status=\"101\"} 1") != null) break;
         try io.sleep(.fromMilliseconds(2), .awake);
     } else return error.TestUnexpectedResult;
+}
+
+test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total" {
+    // Regression: the stream's body reader used the request body limit
+    // (1 MiB) as a lifetime cap, so a socket died with BodyTooBig after 1 MiB
+    // of traffic. Per-message limits apply; the stream has no total limit.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", echo);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+
+    var msg: [1024]u8 = undefined;
+    var back: [1024 + 64]u8 = undefined;
+    var op: wsc.Opcode = undefined;
+    // 1536 x 1 KiB = 1.5 MiB, past the default body_max of 1 MiB.
+    for (0..1536) |i| {
+        @memset(&msg, @truncate(i));
+        try client.sendFrame(.binary, &msg);
+        const got = try client.nextFrame(&op, &back);
+        try std.testing.expectEqual(wsc.Opcode.binary, op);
+        try std.testing.expectEqualSlices(u8, &msg, got);
+    }
+
+    try client.sendFrame(.close, &.{ 0x03, 0xe8 });
+    _ = try client.nextFrame(&op, &back);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    client.finished = true;
+    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
 }
 
 test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does not wait out timeout.shutdown" {
