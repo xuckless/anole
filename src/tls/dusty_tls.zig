@@ -825,7 +825,15 @@ fn handshake(sh: *Shared) HandshakeError!void {
         sh.output.flush() catch return error.WriteFailed;
 
         switch (code) {
-            c.SSL_ERROR_NONE => return,
+            c.SSL_ERROR_NONE => {
+                // A post-quantum ClientHello alone is over `stash_len`: the
+                // first request's read goes into the stash, as for any
+                // connection not receiving big messages.
+                sh.lock();
+                sh.busy = 0;
+                sh.unlock();
+                return;
+            },
             c.SSL_ERROR_WANT_READ => try sh.fill(),
             c.SSL_ERROR_ZERO_RETURN => return error.EndOfStream,
             c.SSL_ERROR_SYSCALL => return if (eof) error.EndOfStream else error.TlsFailure,
@@ -1376,9 +1384,12 @@ const Shared = struct {
     /// and the next read goes into a block.
     read_full: bool = false,
     /// A socket read of at least `stash_len` bytes sets it to `busy_reads`;
-    /// every smaller read counts it down. The read block is kept while it is
-    /// above 0, so a connection receiving big messages makes one `recv` per
-    /// message, and one that went quiet is back on the stash after a few reads.
+    /// every smaller read counts it down. While it is above 0 socket reads
+    /// go into a block, so a connection receiving big messages makes one
+    /// `recv` per message, and one that went quiet is back on the stash
+    /// after a few reads. The block still goes back to the pool once the BIO
+    /// drains it, so between reads a busy connection holds only the stash.
+    /// The handshake's flights do not count.
     busy: u8 = 0,
 
     /// Owned by the writing side: the other half of the double buffer.
@@ -1431,8 +1442,8 @@ const Shared = struct {
     /// Picks the buffer the next socket read goes into, with `filling` set.
     /// With nothing buffered (always, after WANT_READ: the BIO hands
     /// BoringSSL every byte it asks for), that is a block if the last read
-    /// filled its buffer and the stash otherwise, so a connection waiting
-    /// for its peer holds no block. Unconsumed bytes are kept, moved to a
+    /// filled its buffer or the connection is `busy`, and the stash
+    /// otherwise, so a quiet connection waiting for its peer holds no block. Unconsumed bytes are kept, moved to a
     /// block when there is no room left behind them.
     fn prepareInput(sh: *Shared) error{ReadFailed}!void {
         const r = sh.input;
@@ -1665,7 +1676,7 @@ fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
     const n = @min(got.len, @as(usize, @intCast(len)));
     @memcpy(out[0..n], got[0..n]);
     sh.input.toss(n);
-    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full and sh.busy == 0))) sh.useStash();
+    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full))) sh.useStash();
     return @intCast(n);
 }
 
