@@ -74,6 +74,9 @@ test "net udp: echo, the replies of a batch go out together" {
             const st = a.netStats();
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_in);
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_out);
+            // UDP only: no TCP listener either (the core's 127.0.0.1:8080
+            // default used to be bound beside it).
+            try std.testing.expectEqual(@as(usize, 0), a.addresses().len);
         }
     }.run);
 }

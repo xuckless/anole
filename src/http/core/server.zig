@@ -1492,7 +1492,8 @@ pub fn Server(comptime Ctx: type) type {
 
             self.addresses = addresses;
             defer self.addresses = &.{};
-            self.address = addresses[0];
+            // None without listeners (`default_listener` false).
+            if (addresses.len > 0) self.address = addresses[0];
             self.ready.set(self.io);
             self.settled.set(self.io);
 
@@ -1709,7 +1710,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn configuredListeners(self: *const Self) []const Listener {
-            return if (self.config.listeners.len == 0) &default_listeners else self.config.listeners;
+            return if (self.config.listeners.len == 0 and self.config.default_listener) &default_listeners else self.config.listeners;
         }
 
         /// Loads the listener's TLS material and binds its socket.

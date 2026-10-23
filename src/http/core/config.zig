@@ -223,6 +223,10 @@ pub const ServerConfig = struct {
     /// the server's life, and requests point back into it through
     /// `Request.listener`.
     listeners: []const Listener = &default_listeners,
+    /// Whether an empty `listeners` falls back to 127.0.0.1:8080. Anole
+    /// names every listener itself and sets it false: an app with only
+    /// UDP listeners serves no TCP at all.
+    default_listener: bool = true,
     /// Number of reverse-proxy hops between the server and the client. Zero
     /// reports the socket peer and ignores `X-Forwarded-For`. A positive
     /// value selects that address from the right of the forwarding chain:

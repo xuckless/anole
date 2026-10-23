@@ -354,8 +354,10 @@ test "capi net: a connection never has more than read_ahead unpolled" {
         }
     }
     try std.testing.expectEqual(@as(usize, 64 * 1024), total);
-    // The limit and at most one more record (a window and its header).
-    try std.testing.expect(max_unpolled <= 4096 + 4096 + 64);
+    // What is unpolled is under the limit, or one record (a window and its
+    // 40-byte header) posted when nothing was; plus the record just taken,
+    // up to a window and its header too.
+    try std.testing.expect(max_unpolled <= 2 * (4096 + 64));
 }
 
 const udp_json = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"game\", \"address\": \"127.0.0.1\", \"port\": 0, \"udp\": {\"handler\": 3}}]}";

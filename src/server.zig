@@ -711,6 +711,9 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
         .response = opts.response,
         .http2 = opts.http2,
         .listeners = &.{},
+        // Anole names every listener (127.0.0.1:8080 is its own default):
+        // an app with only UDP listeners has no TCP one.
+        .default_listener = false,
         .trusted_proxy_hops = opts.proxy.trusted_hops,
         .trusted_proxies = mode.trusted,
         .warn_untrusted_peer = mode.warn_untrusted_peer,
