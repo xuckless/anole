@@ -343,7 +343,7 @@ typedef struct anole_stats {
   uint64_t gone;          /* calls refused with ANOLE_E_GONE */
   uint64_t busy;          /* refused 503: limits.max_inflight reached */
   uint64_t wakes;         /* doorbells rung */
-  uint64_t rewakes;       /* doorbells rung again: the first was lost */
+  uint64_t rewakes;       /* doorbells rung again: a ring stayed unpolled for timeouts.rewake_ms */
   uint64_t websockets;    /* open now */
   uint64_t ws_messages_in;
   uint64_t ws_messages_out;

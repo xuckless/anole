@@ -2,10 +2,7 @@
   <img src="assets/banner.png" alt="Anole: a Zig backend server" width="720">
 </p>
 
-<p align="center">
-  <b>One Zig server for your whole backend.</b><br>
-  REST, WebSockets, gRPC and WebTransport over HTTP/1.1, HTTP/2 and HTTP/3. TLS, auth and observability are built in, on one listener and one router.
-</p>
+<h3 align="center">Anole is a backend framework for Zig, and a native server engine for Node and Python.</h3>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/xuckless/anole?color=green"></a>
@@ -31,14 +28,28 @@
 </p>
 
 
-An anole is a small lizard that changes colour to fit wherever it lands, and
-that's the idea: one server core that speaks whatever protocol the client
-showed up with. (Zig's mascot is a lizard too.)
+## What Anole offers
+
+1. **REST:** HTTP/1.1, HTTP/2 and HTTP/3, one router for all three ([routing](https://xuckless.github.io/anole/routing/), [server](https://xuckless.github.io/anole/server/)).
+2. **WebSockets:** over HTTP/1.1, HTTP/2 and HTTP/3, with rooms and topics ([docs](https://xuckless.github.io/anole/websocket/)).
+3. **gRPC:** server and client over HTTP/2, plus gRPC-Web, Connect and JSON transcoding; HTTP/3 is coming in 0.4 ([docs](https://xuckless.github.io/anole/grpc/)).
+4. **WebTransport:** over HTTP/3 (draft-02), streams and datagrams ([docs](https://xuckless.github.io/anole/webtransport/)).
+5. **Auth:** JWT and JWKS, OIDC sign-in, sessions, CSRF, API keys, RBAC and rate limits ([docs](https://xuckless.github.io/anole/auth/)).
+6. **Databases:** PostgreSQL, SQLite, MongoDB and Redis/Valkey, with request deadlines and transactions; MySQL/MariaDB is planned ([docs](https://xuckless.github.io/anole/database/)).
+7. **Caching built in:** request coalescing, a TTL result cache and an HTTP response cache ([docs](https://xuckless.github.io/anole/database/)).
+8. **TLS everywhere:** BoringSSL with mutual TLS, hot certificate reload and 0-RTT on HTTP/3 ([server](https://xuckless.github.io/anole/server/)).
+9. **Observability:** structured access logs, Prometheus metrics, OpenTelemetry tracing and health checks ([docs](https://xuckless.github.io/anole/observability/)).
+10. **Outbound clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients on the same TLS stack ([docs](https://xuckless.github.io/anole/clients/)).
+11. **Operations:** graceful drain, zero-downtime restarts, systemd socket activation and the PROXY protocol ([server](https://xuckless.github.io/anole/server/)).
+12. **Node and Python:** a C ABI that lets Node and Python apps run on Anole's engine; the bindings, anole-node and anole-py, are on the way ([docs](https://xuckless.github.io/anole/c-abi/)).
+
+Coming next: typed config and `.env` files, validation, OpenAPI and `anole new` (0.3); SSE topics, background jobs and cron, webhooks, S3 and SMTP connectors, raw TCP/UDP servers and AWS Lambda (0.4).
 
 Anole doesn't reinvent the hard parts. It stands on libraries that have
 already survived the internet:
 - [zio](https://github.com/lalinsky/zio) for async I/O;
 - [dusty](https://github.com/lalinsky/dusty) for HTTP, adapted into Anole as its HTTP core;
+- [zig-protobuf](https://github.com/Arwalk/zig-protobuf) for protobuf generation;
 - nghttp2 for HTTP/2;
 - BoringSSL for TLS;
 - ngtcp2 and nghttp3 for HTTP/3.
@@ -80,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#v0.1.3`
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.2.1`
    (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
@@ -269,7 +280,7 @@ Hello, World is about 1.3 MB; everything on is about 6 MB.
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.1.3
+zig fetch --save git+https://github.com/xuckless/anole#v0.2.1
 ```
 
 Any later tag (see the [releases](https://github.com/xuckless/anole/releases))

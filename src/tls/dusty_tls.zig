@@ -1384,13 +1384,18 @@ const Shared = struct {
     /// and the next read goes into a block.
     read_full: bool = false,
     /// A socket read of at least `stash_len` bytes sets it to `busy_reads`;
-    /// every smaller read counts it down. While it is above 0 socket reads
-    /// go into a block, so a connection receiving big messages makes one
-    /// `recv` per message, and one that went quiet is back on the stash
-    /// after a few reads. The block still goes back to the pool once the BIO
-    /// drains it, so between reads a busy connection holds only the stash.
+    /// every smaller read counts it down. While it is above 0 a socket read
+    /// that completes a record (`mid_record`) goes into a block, so a big
+    /// record takes one more `recv`, not several into the stash; a read that
+    /// waits for the peer still uses the stash, so a connection between
+    /// messages holds no block. The block goes back to the pool once the BIO
+    /// drains it.
     /// The handshake's flights do not count.
     busy: u8 = 0,
+    /// Set by `fill`: BoringSSL holds part of a record, so the read
+    /// completes it rather than wait for the peer. Only then does `busy`
+    /// take a block.
+    mid_record: bool = false,
 
     /// Owned by the writing side: the other half of the double buffer.
     sending: Buf = .{},
@@ -1415,6 +1420,9 @@ const Shared = struct {
     fn fill(sh: *Shared) error{ReadFailed}!void {
         sh.lock();
         sh.filling = true;
+        // BoringSSL holds part of a record: this read completes it rather
+        // than wait for the peer.
+        sh.mid_record = c.SSL_has_pending(sh.ssl) != 0;
         sh.unlock();
         const had = sh.input.end - sh.input.seek;
         const result: std.Io.Reader.Error!void = if (sh.prepareInput()) |_| sh.input.fillMore() else |err| err;
@@ -1442,16 +1450,17 @@ const Shared = struct {
     /// Picks the buffer the next socket read goes into, with `filling` set.
     /// With nothing buffered (always, after WANT_READ: the BIO hands
     /// BoringSSL every byte it asks for), that is a block if the last read
-    /// filled its buffer or the connection is `busy`, and the stash
-    /// otherwise, so a quiet connection waiting for its peer holds no block. Unconsumed bytes are kept, moved to a
-    /// block when there is no room left behind them.
+    /// filled its buffer, or the connection is `busy` and the read completes
+    /// a record BoringSSL holds part of, and the stash otherwise: a read
+    /// that waits for the peer never holds a block. Unconsumed bytes are
+    /// kept, moved to a block when there is no room left behind them.
     fn prepareInput(sh: *Shared) error{ReadFailed}!void {
         const r = sh.input;
         const buffered = r.end - r.seek;
         if (buffered == 0) {
             r.seek = 0;
             r.end = 0;
-            if (!sh.read_full and sh.busy == 0) {
+            if (!sh.read_full and !(sh.busy > 0 and sh.mid_record)) {
                 sh.useStash();
             } else if (sh.block == null) {
                 // Out of memory: the stash still works, a little slower.

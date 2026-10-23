@@ -499,14 +499,14 @@ requests per `window`, with a bucket of `burst`, which defaults to
 answers 429 with `Retry-After`.
 
 ```zig
-var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle_ms 300_000
+var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle 5 minutes
 defer limiter.deinit();
 var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window = .fromSeconds(60) });
 var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKeyOwner, .on_error = .deny });
 ```
 
 - `MemoryLimiter` is for one process. It holds at most `max_entries` keys
-  and forgets a key idle for `idle_ms` once its bucket is full again. When
+  and forgets a key idle for `idle` once its bucket is full again. When
   the table is full, a new key takes the place of a least recently used
   bucket that is full again, else of one that still has tokens; a throttled
   bucket is never pushed out, so a flood of new keys can't refill it. If

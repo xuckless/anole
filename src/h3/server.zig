@@ -320,8 +320,9 @@ pub const Stats = struct {
     /// Requests for `no_wait` routes run inline, without a task
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
-    /// The endpoint's 4 KiB send and receive blocks: handed out, and kept
-    /// for reuse (`Endpoint.sampleStats` fills them in).
+    /// The endpoint's 4 KiB send and receive blocks: handed out (a pooled
+    /// request stream keeps one), and kept for reuse
+    /// (`Endpoint.sampleStats` fills them in).
     blocks_live: std.atomic.Value(u64) = .init(0),
     blocks_pooled: std.atomic.Value(u64) = .init(0),
 };
@@ -540,7 +541,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },
-                .blocks = .init(gpa, 256),
+                .blocks = .initAdaptive(gpa, 256),
             };
             self.inbox = .init(&self.inbox_buf);
             return self;
@@ -599,7 +600,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             while ((self.inbox.getUncancelable(self.io, &left, 0) catch 0) == 1) self.freeForwarded(left[0]);
             self.gpa.free(self.rx);
             for (&self.tx) |*o| o.deinit(self.gpa);
-            for (self.pool.items) |s| s.destroy(self.gpa);
+            for (self.pool.items) |s| s.destroy(self.gpa, &self.blocks);
             self.pool.deinit(self.gpa);
             self.blocks.deinit();
             self.gpa.destroy(self);
@@ -610,7 +611,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         /// Copies the block pool's counts into `stats`.
         pub fn sampleStats(self: *Self) void {
-            self.stats.blocks_live.store(self.blocks.live.load(.monotonic), .monotonic);
+            self.stats.blocks_live.store(self.blocks.liveCount(), .monotonic);
             self.stats.blocks_pooled.store(self.blocks.pooled(), .monotonic);
         }
 
@@ -819,7 +820,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gen = self.drive_gen.load(.acquire);
                 if (self.dirty.load(.acquire) == null) {
                     const t = now(io);
-                    const next = self.nextTimer();
+                    // The block pool's trim is due too, while it keeps
+                    // more than its floor.
+                    const next = @min(self.nextTimer(), self.blocks.trimAt());
                     if (next > t) {
                         const wait: std.Io.Timeout = if (next == std.math.maxInt(u64)) .none else .{ .duration = .{
                             .raw = .fromNanoseconds(@intCast(next - t)),
@@ -856,6 +859,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             // it took, which is no earlier than `t`.
             const t = now(self.io);
             while (self.timers.items.len > 0 and self.timers.items[0].timer_at <= t) self.timers.items[0].service();
+            self.blocks.trim(t);
         }
 
         /// Has the driver service `conn` in its next round, waking it if it
@@ -2287,20 +2291,26 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// nghttp3 asked for data and got none: resume it on the next.
             deferred: bool = false,
             /// The response body until the peer acknowledges it.
-            out: bridge.SendQueue = .{},
+            /// Keeps its first block across responses while the stream is
+            /// pooled, so a small response takes none from the pool.
+            out: bridge.SendQueue = .{ .keep_first = true },
             /// The response's Content-Length, when the head named one:
             /// sizes the body buffer.
             length_hint: ?usize = null,
 
-            /// What a stream keeps when it goes back to the pool: enough
-            /// for a typical request's head. Its queues keep nothing.
-            const arena_keep = 4 * 1024;
+            /// The most a stream's arena keeps when it goes back to the pool:
+            /// a typical request's head and response, so the reset at close
+            /// reallocates nothing. Its send queue keeps its first block;
+            /// the receive queue keeps nothing.
+            const arena_keep = 16 * 1024;
 
             fn create(conn: *Conn, id: i64) !*Stream {
                 const ep = conn.ep;
                 if (ep.takeStream()) |s| {
                     const arena = s.arena;
+                    const first = s.out.first;
                     s.* = .{ .conn = conn, .id = id, .arena = arena };
+                    s.out.first = first;
                     return s;
                 }
                 const s = try ep.gpa.create(Stream);
@@ -2315,11 +2325,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.conn.budget.unlink(&s.waiter);
                 s.out.deinit(&ep.blocks, &s.conn.budget);
                 s.body.deinit(&ep.blocks);
-                _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
-                if (!ep.keepStream(s)) s.destroy(gpa);
+                // One chunk within the limit, as usual: kept as it is.
+                const st = s.arena.state;
+                const single = st.free_list == null and (st.used_list == null or st.used_list.?.next == null);
+                if (single and s.arena.queryCapacity() <= arena_keep) {
+                    _ = s.arena.reset(.retain_capacity);
+                } else {
+                    _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
+                }
+                if (!ep.keepStream(s)) s.destroy(gpa, &ep.blocks);
             }
 
-            fn destroy(s: *Stream, gpa: std.mem.Allocator) void {
+            fn destroy(s: *Stream, gpa: std.mem.Allocator, blocks: *bridge.BlockPool) void {
+                s.out.releaseFirst(blocks);
                 s.arena.deinit();
                 gpa.destroy(s);
             }

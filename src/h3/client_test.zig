@@ -1597,11 +1597,12 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
     const body = try get(conn, "/download?n=4194304", gpa);
     defer gpa.free(body);
     try std.testing.expectEqual(@as(usize, 4 << 20), body.len);
-    // Once the request is over and acknowledged, the stream holds nothing.
+    // Once the request is over and acknowledged, the stream holds nothing
+    // but the one block it keeps in the stream pool for its next response.
     var tries: usize = 0;
     while (true) : (tries += 1) {
         f.ep.sampleStats();
-        if (f.ep.stats.blocks_live.load(.monotonic) == 0) break;
+        if (f.ep.stats.blocks_live.load(.monotonic) <= 1) break;
         if (tries > 200) return error.TestUnexpectedResult;
         try io.sleep(.fromMilliseconds(10), .awake);
     }

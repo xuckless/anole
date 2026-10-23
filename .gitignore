@@ -40,3 +40,5 @@ zig-pkg/
 __pycache__/
 *.pyc
 *.actual.json
+
+SECURITY_REVIEW.md

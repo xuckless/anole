@@ -179,13 +179,32 @@ pub const BlockPool = struct {
     lock: std.atomic.Mutex = .unlocked,
     free: ?*Block = null,
     free_count: u32 = 0,
-    /// Blocks kept for reuse; the rest go back to the allocator.
+    /// Blocks kept for reuse; the rest go back to the allocator. Adaptive
+    /// (`initAdaptive`): at least the most blocks live at once in the last
+    /// window, so a steady load never mallocs or frees one.
     keep: u32,
-    /// Blocks handed out and not yet returned.
-    live: std.atomic.Value(u32) = .init(0),
+    /// The fewest `keep` falls to, adaptive only.
+    keep_min: u32,
+    adaptive: bool = false,
+    /// Blocks handed out and not yet returned. Under `lock`.
+    live: u32 = 0,
+    /// The most blocks live at once since `window_start`. Under `lock`.
+    peak: u32 = 0,
+    /// When the window began (`trim`), in `net.now` nanoseconds; written
+    /// by the owner only.
+    window_start: u64 = 0,
+
+    /// How long a peak keeps its blocks.
+    pub const window_ns: u64 = 2 * std.time.ns_per_s;
 
     pub fn init(gpa: std.mem.Allocator, keep: u32) BlockPool {
-        return .{ .gpa = gpa, .keep = keep };
+        return .{ .gpa = gpa, .keep = keep, .keep_min = keep };
+    }
+
+    /// A pool that keeps as many free blocks as were live at once in the
+    /// last `window_ns`, at least `keep_min`: the owner calls `trim`.
+    pub fn initAdaptive(gpa: std.mem.Allocator, keep_min: u32) BlockPool {
+        return .{ .gpa = gpa, .keep = keep_min, .keep_min = keep_min, .adaptive = true };
     }
 
     fn acquire(p: *BlockPool) void {
@@ -194,24 +213,32 @@ pub const BlockPool = struct {
 
     pub fn get(p: *BlockPool) error{OutOfMemory}!*Block {
         p.acquire();
+        p.live += 1;
+        if (p.live > p.peak) {
+            p.peak = p.live;
+            if (p.adaptive and p.peak > p.keep) p.keep = p.peak;
+        }
         if (p.free) |b| {
             p.free = b.next;
             p.free_count -= 1;
             p.lock.unlock();
             b.next = null;
-            _ = p.live.fetchAdd(1, .monotonic);
             return b;
         }
         p.lock.unlock();
-        const b = try p.gpa.create(Block);
+        const b = p.gpa.create(Block) catch |err| {
+            p.acquire();
+            p.live -= 1;
+            p.lock.unlock();
+            return err;
+        };
         b.next = null;
-        _ = p.live.fetchAdd(1, .monotonic);
         return b;
     }
 
     pub fn put(p: *BlockPool, b: *Block) void {
-        _ = p.live.fetchSub(1, .monotonic);
         p.acquire();
+        p.live -= 1;
         if (p.free_count < p.keep) {
             b.next = p.free;
             p.free = b;
@@ -221,6 +248,46 @@ pub const BlockPool = struct {
         }
         p.lock.unlock();
         p.gpa.destroy(b);
+    }
+
+    /// Adaptive: once a window has passed since the last, `keep` becomes
+    /// that window's peak (at least `keep_min`) and the free blocks past it
+    /// go back to the allocator. By the owner, with `t` from `net.now`.
+    pub fn trim(p: *BlockPool, t: u64) void {
+        if (!p.adaptive or t -% p.window_start < window_ns) return;
+        p.window_start = t;
+        var extra: ?*Block = null;
+        p.acquire();
+        p.keep = @max(p.keep_min, p.peak);
+        p.peak = p.live;
+        while (p.free_count > p.keep) {
+            const b = p.free.?;
+            p.free = b.next;
+            p.free_count -= 1;
+            b.next = extra;
+            extra = b;
+        }
+        p.lock.unlock();
+        while (extra) |b| {
+            extra = b.next;
+            p.gpa.destroy(b);
+        }
+    }
+
+    /// When `trim` next has something to give back, if it may: never while
+    /// the pool keeps no more than `keep_min`. By the owner.
+    pub fn trimAt(p: *BlockPool) u64 {
+        if (!p.adaptive) return std.math.maxInt(u64);
+        p.acquire();
+        const idle = p.keep <= p.keep_min and p.free_count <= p.keep_min;
+        p.lock.unlock();
+        return if (idle) std.math.maxInt(u64) else p.window_start + window_ns;
+    }
+
+    pub fn liveCount(p: *BlockPool) u32 {
+        p.acquire();
+        defer p.lock.unlock();
+        return p.live;
     }
 
     pub fn pooled(p: *BlockPool) u32 {
@@ -335,9 +402,17 @@ pub const Budget = struct {
 /// Send data until the peer acknowledges it. Offsets only grow: [acked,
 /// sent) is handed to ngtcp2/nghttp3 (they point into it) and [sent,
 /// written) is not yet. Blocks are freed as `acked` passes their end; when
-/// acked == written every block goes (an idle stream holds none). Only the
-/// tail block is partly filled, so offsets map to blocks by arithmetic.
+/// acked == written every block goes (an idle stream holds none, unless it
+/// keeps its first: `keep_first`). Only the tail block is partly filled, so
+/// offsets map to blocks by arithmetic.
 pub const SendQueue = struct {
+    /// The queue keeps the block it first takes (`first`) when it would go
+    /// back to the pool, and starts with it whenever it is empty: a pooled
+    /// stream that sends small responses takes no block from the pool per
+    /// response. Its owner gives it back (`releaseFirst`) when the queue
+    /// goes for good.
+    keep_first: bool = false,
+    first: ?*Block = null,
     head: ?*Block = null,
     tail: ?*Block = null,
     /// Stream offset of head.data[0] and tail.data[0].
@@ -374,7 +449,7 @@ pub const SendQueue = struct {
         var done: usize = 0;
         while (done < want) {
             if (q.tail == null or q.written - q.tail_base == block_data) {
-                const b = pool.get() catch {
+                const b = q.newBlock(pool) catch {
                     budget.charge(done);
                     if (done > 0) return done;
                     return error.OutOfMemory;
@@ -398,6 +473,33 @@ pub const SendQueue = struct {
         }
         budget.charge(done);
         return done;
+    }
+
+    fn newBlock(q: *SendQueue, pool: *BlockPool) error{OutOfMemory}!*Block {
+        if (!q.keep_first or q.head != null) return pool.get();
+        if (q.first) |b| {
+            b.next = null;
+            return b;
+        }
+        const b = try pool.get();
+        q.first = b;
+        return b;
+    }
+
+    /// A block the queue is done with: back to the pool, unless it is the
+    /// one it keeps.
+    fn release(q: *SendQueue, pool: *BlockPool, b: *Block) void {
+        if (b == q.first) return;
+        pool.put(b);
+    }
+
+    /// Gives back the block the queue keeps (`keep_first`). With nothing
+    /// queued (after `deinit`).
+    pub fn releaseFirst(q: *SendQueue, pool: *BlockPool) void {
+        std.debug.assert(q.head == null);
+        const b = q.first orelse return;
+        q.first = null;
+        pool.put(b);
     }
 
     /// The block holding offset `off` (>= acked), and its base.
@@ -479,7 +581,7 @@ pub const SendQueue = struct {
                     q.cursor = b.next;
                     q.cursor_base += block_data;
                 }
-                pool.put(b);
+                q.release(pool, b);
             }
         }
         budget.release(m);
@@ -489,7 +591,7 @@ pub const SendQueue = struct {
         var it = q.head;
         while (it) |b| {
             it = b.next;
-            pool.put(b);
+            q.release(pool, b);
         }
         q.head = null;
         q.tail = null;
@@ -581,7 +683,7 @@ test "send queue spans blocks, frees acked ones and holds none when idle" {
     defer gpa.free(big);
     for (big, 0..) |*b, i| b.* = @truncate(i *% 7);
     try std.testing.expectEqual(big.len, try q.write(&pool, &budget, big, 1 << 20, false));
-    try std.testing.expectEqual(@as(u32, 4), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), pool.liveCount());
     try std.testing.expectEqual(big.len, budget.used);
     // unsent over a block boundary: four runs, in order.
     var runs: [4][]const u8 = undefined;
@@ -600,14 +702,14 @@ test "send queue spans blocks, frees acked ones and holds none when idle" {
     try std.testing.expectEqual(@as(usize, 0), q.unsent(&runs));
     // Acking frees the blocks passed.
     q.ack(&pool, &budget, block_data * 2);
-    try std.testing.expectEqual(@as(u32, 2), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), pool.liveCount());
     try std.testing.expectEqual(big.len - block_data * 2, budget.used);
     // More data after a partial free still maps right.
     try std.testing.expectEqual(@as(usize, 20), try q.write(&pool, &budget, big[0..20], 1 << 20, false));
     try std.testing.expectEqual(@as(usize, 1), q.unsent(&runs));
     try std.testing.expectEqualSlices(u8, big[0..20], runs[0]);
     q.ack(&pool, &budget, q.written - q.acked);
-    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
     try std.testing.expectEqual(@as(usize, 0), budget.used);
     try std.testing.expect(q.head == null);
     // And it starts again from the offset it reached.
@@ -615,7 +717,7 @@ test "send queue spans blocks, frees acked ones and holds none when idle" {
     try std.testing.expectEqual(@as(usize, 1), q.unsent(&runs));
     try std.testing.expectEqualStrings("abc", runs[0]);
     q.deinit(&pool, &budget);
-    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
     try std.testing.expectEqual(@as(usize, 0), budget.used);
 }
 
@@ -665,18 +767,18 @@ test "recv queue appends and takes across blocks and frees every block when drai
     try q.append(&pool, data[0..10]);
     try q.append(&pool, data[10..]);
     try std.testing.expectEqual(data.len, q.len);
-    try std.testing.expectEqual(@as(u32, 3), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), pool.liveCount());
     const out = try gpa.alloc(u8, data.len);
     defer gpa.free(out);
     var got: usize = 0;
     while (got < data.len) got += q.take(&pool, out[got..@min(out.len, got + 1000)]);
     try std.testing.expectEqualSlices(u8, data, out);
-    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
     try std.testing.expectEqual(@as(usize, 0), q.take(&pool, out));
     // Usable again after it drained.
     try q.append(&pool, "xyz");
     try std.testing.expectEqual(@as(usize, 3), q.take(&pool, out));
-    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
 }
 
 test "block pool keeps up to `keep` blocks and frees the rest" {
@@ -690,7 +792,64 @@ test "block pool keeps up to `keep` blocks and frees the rest" {
     pool.put(b);
     pool.put(c3);
     try std.testing.expectEqual(@as(u32, 2), pool.pooled());
-    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
+}
+
+test "adaptive block pool keeps the last window's peak, then trims to its floor" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.initAdaptive(gpa, 2);
+    defer pool.deinit();
+    const t0: u64 = 1000 * BlockPool.window_ns;
+    pool.trim(t0);
+    var held: [5]*Block = undefined;
+    for (&held) |*b| b.* = try pool.get();
+    for (held) |b| pool.put(b);
+    // All five kept: as many were live at once.
+    try std.testing.expectEqual(@as(u32, 5), pool.pooled());
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
+    // Within the window nothing changes.
+    pool.trim(t0 + BlockPool.window_ns / 2);
+    try std.testing.expectEqual(@as(u32, 5), pool.pooled());
+    try std.testing.expectEqual(t0 + BlockPool.window_ns, pool.trimAt());
+    // The next window keeps the last one's peak; the one after, idle,
+    // falls back to the floor.
+    pool.trim(t0 + BlockPool.window_ns);
+    try std.testing.expectEqual(@as(u32, 5), pool.pooled());
+    pool.trim(t0 + 2 * BlockPool.window_ns);
+    try std.testing.expectEqual(@as(u32, 2), pool.pooled());
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pool.trimAt());
+}
+
+test "send queue with keep_first keeps its first block across idle spells and gives it back once" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 0);
+    defer pool.deinit();
+    var budget = Budget.init(testIo(), 1 << 20);
+    var q: SendQueue = .{ .keep_first = true };
+    _ = try q.write(&pool, &budget, "small", 1 << 20, false);
+    const first = q.first.?;
+    try std.testing.expectEqual(@as(u32, 1), pool.liveCount());
+    q.ack(&pool, &budget, 5);
+    try std.testing.expect(q.head == null);
+    try std.testing.expectEqual(@as(u32, 1), pool.liveCount());
+    // The next response starts in the same block, from the pool's view
+    // still the one live block.
+    const data: [block_data + 10]u8 = @splat(3);
+    _ = try q.write(&pool, &budget, &data, 1 << 20, false);
+    try std.testing.expectEqual(first, q.head.?);
+    try std.testing.expectEqual(@as(u32, 2), pool.liveCount());
+    // Acked past the first block only: it is kept, not pooled, and the
+    // next empty start takes it again with its link cleared.
+    q.ack(&pool, &budget, block_data);
+    try std.testing.expectEqual(@as(u32, 2), pool.liveCount());
+    q.deinit(&pool, &budget);
+    try std.testing.expectEqual(@as(u32, 1), pool.liveCount());
+    _ = try q.write(&pool, &budget, "again", 1 << 20, false);
+    try std.testing.expectEqual(first, q.head.?);
+    try std.testing.expect(first.next == null);
+    q.deinit(&pool, &budget);
+    q.releaseFirst(&pool);
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
 }
 
 test "signal: a notify between epoch and wait makes wait return at once; no sleepers, no futex call" {
