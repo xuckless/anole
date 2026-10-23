@@ -271,6 +271,8 @@ export fn anole_has_feature(name: Str) i32 {
         .{ "postgres", f.postgres },
         .{ "redis", f.redis },
         .{ "mongodb", f.mongodb },
+        .{ "nats", f.nats },
+        .{ "kafka", f.kafka },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;

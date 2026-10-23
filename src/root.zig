@@ -253,6 +253,11 @@ pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 /// metrics and tracing hooks.
 pub const db = @import("db/root.zig");
 
+/// Retries with backoff, retry throttling and circuit breakers: the
+/// policies the HTTP and gRPC clients, the database connectors and the
+/// brokers share.
+pub const resilience = @import("resilience/root.zig");
+
 /// PostgreSQL (`-Dpostgres`): `state.db = try app.postgres(.{})`
 /// (DATABASE_URL), then `state.db.all(Post, req, sql, .{args})` and the other `anole.db` verbs,
 /// on Anole's fork of pg.zig with a pool per executor.
@@ -321,6 +326,7 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = http;
+    _ = resilience;
     _ = tls;
     _ = h2;
     _ = h3;

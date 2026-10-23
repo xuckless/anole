@@ -81,13 +81,17 @@ pub const Features = struct {
     /// The MongoDB client (`anole.mongodb`) and its BSON codec
     /// (`anole.bson`).
     mongodb: bool,
+    /// The NATS client (`anole.nats`).
+    nats: bool,
+    /// The Kafka client (`anole.kafka`); needs `compression`.
+    kafka: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true },
         };
     }
 
@@ -96,6 +100,7 @@ pub const Features = struct {
         if (f.grpc and !f.http2) return "-Dgrpc=true requires -Dhttp2=true (gRPC runs over HTTP/2 with trailers)";
         if (f.http3 and f.tls == .none) return "-Dhttp3=true requires -Dtls=boringssl (QUIC always uses TLS 1.3)";
         if (f.brotli and !f.compression) return "-Dbrotli=true requires -Dcompression=true (Brotli is one of the Compress middleware's codings)";
+        if (f.kafka and !f.compression) return "-Dkafka=true requires -Dcompression=true (Kafka batches use gzip and zstd)";
         return null;
     }
 
@@ -110,7 +115,8 @@ pub const Features = struct {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
             (!f.compression or have.compression) and (!f.brotli or have.brotli) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
             (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth) and
-            (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb);
+            (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb) and
+            (!f.nats or have.nats) and (!f.kafka or have.kafka);
     }
 };
 
@@ -129,6 +135,14 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
         var f = Features.preset(.full);
         f.compression = false;
         f.brotli = false;
+        f.kafka = false;
+        break :blk f;
+    } },
+    // Everything but the brokers.
+    .{ .name = "brokers-none", .features = blk: {
+        var f = Features.preset(.full);
+        f.nats = false;
+        f.kafka = false;
         break :blk f;
     } },
     // zstd and gzip without Brotli.
@@ -400,6 +414,8 @@ pub fn build(b: *std.Build) void {
     const redis_test_url = b.option([]const u8, "redis-test-url", "Run the Redis tests against a live Redis/Valkey at this URL (redis://, rediss://...)");
     const postgres_test_url = b.option([]const u8, "postgres-test-url", "Run the PostgreSQL tests against a live server at this URL (postgres://...)");
     const mongodb_test_url = b.option([]const u8, "mongodb-test-url", "Run the MongoDB tests against a live server at this URL (mongodb://...)");
+    const nats_test_url = b.option([]const u8, "nats-test-url", "Run the NATS tests against a live server at this URL (nats://...)");
+    const kafka_test_url = b.option([]const u8, "kafka-test-url", "Run the Kafka tests against a live broker at this address (host:port)");
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
@@ -461,7 +477,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
@@ -1266,6 +1282,8 @@ fn resolveFeatures(b: *std.Build) Features {
     const postgres = b.option(bool, "postgres", "PostgreSQL client (overrides the profile)");
     const sqlite = b.option(bool, "sqlite", "SQLite, built in (overrides the profile)");
     const mongodb = b.option(bool, "mongodb", "MongoDB client (overrides the profile)");
+    const nats = b.option(bool, "nats", "NATS client (overrides the profile)");
+    const kafka = b.option(bool, "kafka", "Kafka client; needs -Dcompression=true (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -1281,10 +1299,13 @@ fn resolveFeatures(b: *std.Build) Features {
     if (postgres) |v| f.postgres = v;
     if (sqlite) |v| f.sqlite = v;
     if (mongodb) |v| f.mongodb = v;
+    if (nats) |v| f.nats = v;
+    if (kafka) |v| f.kafka = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
     if (!f.compression and brotli == null) f.brotli = false;
+    if (!f.compression and kafka == null) f.kafka = false;
 
     if (f.invalid()) |msg| {
         std.debug.print("error: invalid Anole feature flags: {s}\n", .{msg});
@@ -1335,6 +1356,9 @@ const Core = struct {
     h2_client_by: [2][2][2][2]?*std.Build.Module,
     /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
+    /// src/resilience/core.zig (retries, breakers): imported as
+    /// `resilience_core` by every HTTP core instance and by anole.
+    resilience: *std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
@@ -1350,7 +1374,8 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
+        var core: Core = .{ .resilience = resilience, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -1371,6 +1396,7 @@ const Core = struct {
                             target,
                             optimize,
                         );
+                        dusty_mod.addImport("resilience_core", resilience);
                         core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
                         if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
                             b,
@@ -1668,6 +1694,8 @@ const AnoleModuleOptions = struct {
     redis_test_url: ?[]const u8 = null,
     postgres_test_url: ?[]const u8 = null,
     mongodb_test_url: ?[]const u8 = null,
+    nats_test_url: ?[]const u8 = null,
+    kafka_test_url: ?[]const u8 = null,
     /// src/bson as a module, for -Dmongodb.
     bson: ?*std.Build.Module = null,
 };
@@ -1691,6 +1719,8 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "postgres", f.postgres);
     options.addOption(bool, "sqlite", f.sqlite);
     options.addOption(bool, "mongodb", f.mongodb);
+    options.addOption(bool, "nats", f.nats);
+    options.addOption(bool, "kafka", f.kafka);
     // Live servers for tests (`-Dredis-test-port=6379` or
     // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
@@ -1699,6 +1729,8 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(?[]const u8, "redis_test_url", o.redis_test_url);
     options.addOption(?[]const u8, "postgres_test_url", o.postgres_test_url);
     options.addOption(?[]const u8, "mongodb_test_url", o.mongodb_test_url);
+    options.addOption(?[]const u8, "nats_test_url", o.nats_test_url);
+    options.addOption(?[]const u8, "kafka_test_url", o.kafka_test_url);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
@@ -1710,6 +1742,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
+    mod.addImport("resilience_core", o.core.resilience);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));
