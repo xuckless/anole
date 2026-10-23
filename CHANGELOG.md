@@ -208,6 +208,15 @@ handlers, JSON Lines logs, OpenAPI documents, project templates and the
   `ANOLE_EV_KAFKA_RECORDS`, `_DELIVERY`, `_ASSIGN`, `_REVOKE`, `_WRITABLE`
   and `_GROUP_END` (80-85).
 
+### Fixed
+
+- HTTP/3 client: a download could stall after a NAT rebinding moved the
+  client's port while it had nothing left to acknowledge (the server kept
+  sending to the old port and never heard from the new one) until the
+  request timed out (#98). A new `ConnectOptions.keep_alive` (5 s, null for
+  none) sends a PING after that long without traffic while a stream is
+  open, so the server sees the new address and follows it.
+
 ## 0.2.1 (2026-10-23)
 
 The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2
