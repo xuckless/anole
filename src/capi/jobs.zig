@@ -20,7 +20,7 @@ const log = std.log.scoped(.anole);
 pub const State = struct {
     /// The queue behind `"jobs"` in the configuration, once `open` ran
     /// (the webhooks lane reads it); null when there is none.
-    client: ?*anole.jobs.Client = null,
+    client: if (anole.features.jobs) ?*anole.jobs.Client else ?*anyopaque = null,
 
     pub fn init(s: *State, first_gen: u32) void {
         _ = s;
@@ -63,7 +63,10 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     if (comptime !anole.features.jobs) {
         log.err("jobs: jobs are not built in (-Djobs)", .{});
         return error.InvalidOptions;
-    }
+    } else openJobs(e, app, jc) catch |err| return err;
+}
+
+fn openJobs(e: *Engine, app: *anole.App, jc: @import("config.zig").Config.Jobs) !void {
     var queues = try gpa.alloc(anole.jobs.QueueOptions, jc.queues.len);
     for (jc.queues, queues[0..]) |q, *d| d.* = .{ .name = q.name, .concurrency = q.concurrency };
     var kinds = try gpa.alloc(anole.jobs.Kind, jc.kinds.len);
@@ -82,9 +85,15 @@ pub fn open(e: *Engine, app: *anole.App) !void {
             return error.InvalidOptions;
         };
         switch (d.client) {
-            .postgres => |c| store = .{ .postgres = c },
-            .sqlite => |c| store = .{ .sqlite = c },
-            .redis => |c| store = .{ .redis = c },
+            .postgres => |c| if (comptime anole.features.postgres) {
+                store = .{ .postgres = c };
+            } else unreachable,
+            .sqlite => |c| if (comptime anole.features.sqlite) {
+                store = .{ .sqlite = c };
+            } else unreachable,
+            .redis => |c| if (comptime anole.features.redis) {
+                store = .{ .redis = c };
+            } else unreachable,
             else => {
                 log.err("jobs.store \"{s}\": MongoDB cannot hold jobs", .{jc.store});
                 return error.InvalidOptions;
