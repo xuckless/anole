@@ -408,9 +408,17 @@ test "capi net: datagrams batch, udp_send replies in one call, udp_find, listene
         const msg = try c.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
         try std.testing.expectEqualStrings(t, msg.data);
     }
-    // Found by name, and invalid sizes.
+    // Found by name: the listener's first socket, the one the datagrams
+    // came on unless Linux has a socket per executor. It sends too.
     const found = try engine.net.udpFind(rig.e, "game");
-    try std.testing.expectEqual(handle, found);
+    if (builtin.os.tag != .linux) try std.testing.expectEqual(handle, found);
+    _ = try engine.net.udpSend(rig.e, found, replies[0..1], 0);
+    {
+        var buf: [16]u8 = undefined;
+        const msg = try c.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        try std.testing.expectEqualStrings("r0", msg.data);
+    }
+    // Invalid sizes.
     try std.testing.expectError(error.Invalid, engine.net.udpFind(rig.e, "nope"));
     var big: [1]abi.NetDatagram = .{.{ .to = from, .from = .{}, .data = texts[0].ptr, .len = 70000 }};
     try std.testing.expectError(error.Invalid, engine.net.udpSend(rig.e, handle, &big, 0));
