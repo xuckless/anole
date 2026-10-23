@@ -5,3 +5,6 @@ include/anole.abi.json text eol=lf
 include/anole.h text eol=lf
 include/anole.schema.json text eol=lf
 tests/openapi/*.json text eol=lf
+# The live console's screen goldens, compared byte for byte by
+# console-ui-test: LF on Windows checkouts too.
+src/console/ui/golden/*.txt text eol=lf
