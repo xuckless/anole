@@ -378,6 +378,7 @@ Bindings may switch on it; tokens are only ever added.
 | `CertificateFileUnreadable`, `KeyFileUnreadable`, `ClientCaFileUnreadable` | `ANOLE_E_SYSTEM` | TLS files (errno set) |
 | `InvalidCertificate`, `InvalidKey`, `KeyMismatch`, `InvalidClientCa` | `ANOLE_E_INVALID` from a reload, `ANOLE_E_CONFIG` from start | TLS contents |
 | `DatabaseUnavailable` | `ANOLE_E_SYSTEM` | `connect_at_start` failed |
+| `Canceled` | `ANOLE_E_STATE` | the call was canceled (a stop or drain raced it) |
 | `Unexpected` | `ANOLE_E_SYSTEM` | anything not named (the text has the Zig error) |
 
 The member names of `anole.ServerError` and `anole.TlsLoadError` are tokens

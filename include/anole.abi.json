@@ -1581,6 +1581,7 @@
     "AddressInUse",
     "AddressNotAvailable",
     "Again",
+    "Canceled",
     "CertificateFileUnreadable",
     "ClientCaFileUnreadable",
     "Config",

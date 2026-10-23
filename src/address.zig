@@ -103,6 +103,8 @@ pub fn dualStackAvailable() bool {
 test "listen addresses: Go's notation" {
     const cases = [_]struct { text: []const u8, host: []const u8, port: u16 }{
         .{ .text = ":3000", .host = "", .port = 3000 },
+        .{ .text = "3000", .host = "", .port = 3000 },
+        .{ .text = "0", .host = "", .port = 0 },
         .{ .text = "0.0.0.0:3000", .host = "0.0.0.0", .port = 3000 },
         .{ .text = "127.0.0.1:8080", .host = "127.0.0.1", .port = 8080 },
         .{ .text = "localhost:443", .host = "127.0.0.1", .port = 443 },
@@ -116,7 +118,7 @@ test "listen addresses: Go's notation" {
         try std.testing.expectEqualStrings(c.host, p.host);
         try std.testing.expectEqual(c.port, p.port);
     }
-    for ([_][]const u8{ "3000", ":", ":65536", ":-1", "example.com:80", "::1:80", "[127.0.0.1]:80", "[::1]", "1.2.3:80", "" }) |bad| {
+    for ([_][]const u8{ "3000x", "65536", ":", ":65536", ":-1", "example.com:80", "::1:80", "[127.0.0.1]:80", "[::1]", "1.2.3:80", "" }) |bad| {
         try std.testing.expectError(error.InvalidListenAddress, parse(bad));
     }
 }

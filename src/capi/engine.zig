@@ -2296,7 +2296,11 @@ fn pumpBody(x: *Exec, si: u32, gen: u32, reader: *std.Io.Reader, body: *dusty.Re
         const chunk = gpa.alloc(u8, 16 * 1024) catch return failBody(x, si, gen, .internal_server_error);
         const n = reader.readSliceShort(chunk) catch {
             gpa.free(chunk);
-            if (body.err) |err| if (err == error.Canceled) return error.Canceled;
+            if (body.err) |err| {
+                if (err == error.Canceled) return error.Canceled;
+                // The core bounds a chunked body at `limits.body_max` itself.
+                if (err == error.BodyTooBig) return failBody(x, si, gen, .payload_too_large);
+            }
             return failBody(x, si, gen, .bad_request);
         };
         total += n;

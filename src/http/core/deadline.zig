@@ -197,7 +197,11 @@ pub const Deadline = struct {
     /// wins over the deadline and comes back as `error.Canceled`.
     pub fn run(self: Deadline, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Result(func) {
         if (self.timeout == .none) return @call(.auto, func, args);
-        if (comptime have_auto_cancel) return self.runAutoCanceled(func, args);
+        // Off a zio task (std.Io.Threaded, a blocking-pool thread) there is
+        // no task to arm a timer against.
+        if (comptime have_auto_cancel) {
+            if (placement.currentTask(self.io) != null) return self.runAutoCanceled(func, args);
+        }
         return self.runWatched(func, args);
     }
 
@@ -234,7 +238,12 @@ pub const Deadline = struct {
 
         var watch: Watch = .{};
         watch.set(self.io, self.timeout);
-        var future = try self.io.concurrent(Runner.run, .{ &watch, self.io, args });
+        var future = self.io.concurrent(Runner.run, .{ &watch, self.io, args }) catch |err| {
+            // Off a zio task a call that cannot get a second thread runs
+            // unbounded rather than failing; elsewhere the error stands.
+            if (comptime have_auto_cancel) return @call(.auto, func, args);
+            return err;
+        };
 
         watch.wait(self.io) catch |err| switch (err) {
             // The call may have finished in the window between the deadline

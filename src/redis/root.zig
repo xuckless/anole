@@ -89,7 +89,7 @@ const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
 
 const has_tls = features.tls == .boringssl;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 const Duration = std.Io.Duration;
 
 /// A reply, as the server sent it. Strings point into the arena of the

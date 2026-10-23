@@ -203,7 +203,7 @@ const Fixture = struct {
     bundle: std.crypto.Certificate.Bundle,
 
     fn start(gpa: std.mem.Allocator, io: std.Io) !Fixture {
-        return startWith(gpa, io, .{ .listeners = &.{} }, .{});
+        return startWith(gpa, io, .{ .listeners = &.{}, .request = .{ .max_body_size = 8 << 20 } }, .{});
     }
 
     /// What `startWith` sets on the endpoint beyond the defaults.

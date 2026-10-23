@@ -78,7 +78,7 @@ const pg = driver;
 const dusty_tls = if (has_tls) @import("anole_dusty_tls") else struct {};
 
 const has_tls = features.tls == .boringssl;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 const placement = dusty.placement;
 const Duration = std.Io.Duration;
 

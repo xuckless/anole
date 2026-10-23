@@ -732,7 +732,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// be read.
             fn readPem(gpa: std.mem.Allocator, io_: std.Io, path: []const u8, what: []const u8) ![]u8 {
                 return std.Io.Dir.cwd().readFileAlloc(io_, path, gpa, .limited(max_pem_len)) catch |err| {
-                    std.log.scoped(.anole).err("cannot read the TLS {s} \"{s}\": {t}", .{ what, path, err });
+                    errors.log.err("cannot read the TLS {s} \"{s}\": {t}", .{ what, path, err });
                     return err;
                 };
             }
@@ -1029,7 +1029,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 var why_buf: [512]u8 = undefined;
                 var why: std.Io.Writer = .fixed(&why_buf);
                 checkSpecs(specs, opts, &why) catch |err| {
-                    std.log.scoped(.anole).err("{s}", .{why.buffered()});
+                    errors.log.err("{s}", .{why.buffered()});
                     return err;
                 };
             }
@@ -1136,7 +1136,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 var h3_buf: [handoff.max_listeners]handoff.Fd = undefined;
                 const h3_fds: []const handoff.Fd = if (inherited) |inh| inh.findAll("h3", listeners.len, &h3_buf) else &.{};
                 for (h3_fds) |fd| handoff.checkInherited(fd, .datagram, true) catch |err| {
-                    std.log.scoped(.anole).err("inherited fd {any} for HTTP/3 is not a UDP socket", .{fd});
+                    errors.log.err("inherited fd {any} for HTTP/3 is not a UDP socket", .{fd});
                     return err;
                 };
                 const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
@@ -1224,7 +1224,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| {
                 handoff.checkInherited(fd, .listener, address == .ip) catch |err| {
-                    std.log.scoped(.anole).err("inherited fd {any} for listener \"{s}\" is not a listening {s} socket", .{ fd, name, if (address == .ip) "TCP" else "unix" });
+                    errors.log.err("inherited fd {any} for listener \"{s}\" is not a listening {s} socket", .{ fd, name, if (address == .ip) "TCP" else "unix" });
                     return err;
                 };
                 return fd;
@@ -1255,7 +1255,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (stat.kind != .unix_domain_socket) return;
             if (address.connect(io_)) |stream| {
                 stream.close(io_);
-                std.log.scoped(.anole).err("unix:{s} is already in use: another process is listening on it", .{address.path});
+                errors.log.err("unix:{s} is already in use: another process is listening on it", .{address.path});
                 return error.AddressInUse;
             } else |err| switch (err) {
                 error.ConnectionRefused => cwd.deleteFile(io_, address.path) catch {},
@@ -1321,7 +1321,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn listenInner(self: *Self, address: []const u8) !void {
             var opts = try self.takePending("listen");
             const at = address_mod.parse(address) catch |err| {
-                std.log.scoped(.anole).err("listen(\"{s}\"): not an address to listen on; use a port (\"3000\", every interface), \":3000\", or \"127.0.0.1:3000\" (this machine only)", .{address});
+                errors.log.err("listen(\"{s}\"): not an address to listen on; use a port (\"3000\", every interface), \":3000\", or \"127.0.0.1:3000\" (this machine only)", .{address});
                 return err;
             };
             opts.http = .{ .address = at.host, .port = at.port };
@@ -1343,7 +1343,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn listenTlsInner(self: *Self, address: []const u8, cert: Cert) !void {
             var opts = try self.takePending("listenTls");
             const at = address_mod.parse(address) catch |err| {
-                std.log.scoped(.anole).err("listenTls(\"{s}\"): not an address to listen on; use a port (\"443\", every interface), \":443\", or \"127.0.0.1:8443\" (this machine only)", .{address});
+                errors.log.err("listenTls(\"{s}\"): not an address to listen on; use a port (\"443\", every interface), \":443\", or \"127.0.0.1:8443\" (this machine only)", .{address});
                 return err;
             };
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
@@ -1356,7 +1356,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn takePending(self: *Self, comptime what: []const u8) !Options {
             return self.pending orelse {
                 // Not the end of the server: `run` still serves those.
-                std.log.scoped(.anole).err(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
+                errors.log.err(what ++ "(): this server's listeners come from its init options (http, https); serve them with run(), or leave both out of init", .{});
                 return error.ListenersAlreadySet;
             };
         }
@@ -1652,7 +1652,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn openDir(self: *Self, path: []const u8) !std.Io.Dir {
             const io_ = self.rt.io();
             const dir = std.Io.Dir.cwd().openDir(io_, path, .{}) catch |err| {
-                std.log.scoped(.anole).err("cannot open the static directory \"{s}\": {t}", .{ path, err });
+                errors.log.err("cannot open the static directory \"{s}\": {t}", .{ path, err });
                 return err;
             };
             self.extras.dirs.append(self.arena.allocator(), dir) catch {
@@ -2278,7 +2278,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // helper routes collided with.
             if (self.router.conflict != null) return self.failStart(error.RouteConflict);
             self.startConnectors() catch |err| {
-                std.log.scoped(.anole).err("a database connector could not start: {t}", .{err});
+                errors.log.err("a database connector could not start: {t}", .{err});
                 return self.failStart(error.DatabaseUnavailable);
             };
             const rt_io = self.rt.io();

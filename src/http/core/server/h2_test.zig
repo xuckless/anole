@@ -430,6 +430,7 @@ const Fixture = struct {
     fn start(self: *Fixture, io: std.Io) !void {
         self.server = dusty.Server(void).init(std.testing.allocator, io, .{
             .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+            .request = .{ .max_body_size = 8 << 20 },
         }, {});
         self.server.router.get("/hello", Handlers.hello);
         self.server.router.get("/fields", Handlers.fields);

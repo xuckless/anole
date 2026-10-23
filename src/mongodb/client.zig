@@ -30,7 +30,7 @@ const Connection = conn_mod.Connection;
 pub const Database = coll_mod.Database;
 pub const Collection = coll_mod.Collection;
 const placement = dusty.placement;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 /// `app.mongodb(options)` and `Client.init`. Every field has a
 /// default, so `.{}` connects from `MONGODB_URI`.

@@ -127,6 +127,12 @@ pub const config = struct {
             for (chain.items) |x| {
                 if (c.SSL_CTX_add1_chain_cert(ctx, x) != 1) return sslError("SSL_CTX_add1_chain_cert", error.TlsInvalidCertificate);
             }
+            // A well-formed key that belongs to another certificate is a
+            // mismatch, not an invalid key.
+            if (c.X509_check_private_key(cert, key) != 1) {
+                c.ERR_clear_error();
+                return error.TlsKeyMismatch;
+            }
             if (c.SSL_CTX_use_PrivateKey(ctx, key) != 1) return sslError("SSL_CTX_use_PrivateKey", error.TlsInvalidPrivateKey);
             if (c.SSL_CTX_check_private_key(ctx) != 1) return sslError("SSL_CTX_check_private_key", error.TlsKeyMismatch);
 

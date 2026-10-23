@@ -396,8 +396,8 @@ pub fn registerWith(comptime Ctx: type, target: anytype, comptime Service: type,
     }
 }
 
-/// The router behind a registration target: a `*dusty.Router(Ctx)`, or a
-/// `dusty.Router(Ctx).Group`.
+/// The router behind a registration target: a `*Router(Ctx)` or a
+/// `Router(Ctx).Group`.
 pub fn routerOf(comptime Ctx: type, target: anytype) *dusty.Router(Ctx) {
     const R = dusty.Router(Ctx);
     return if (@TypeOf(target) == *R) target else if (@TypeOf(target) == R.Group) target.router else @compileError("a gRPC service is registered on a *Router or a Router.Group");

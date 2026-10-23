@@ -674,6 +674,7 @@ pub const error_names = [_][]const u8{
     "AddressInUse",
     "AddressNotAvailable",
     "Again",
+    "Canceled",
     "CertificateFileUnreadable",
     "ClientCaFileUnreadable",
     "Config",
