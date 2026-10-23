@@ -1418,7 +1418,7 @@ Without `access_key_id` and `secret_access_key` the AWS credential chain runs wh
 | `anole_s3_delete`, `anole_s3_delete_many` | `DELETE`, `DELETE_MANY` | failures in `entries_off` as `anole_s3_failure` |
 | `anole_s3_list` | `LIST` | `anole_s3_entry` records, `prefixes_off` spans, `next`; `ANOLE_S3_RES_F_TRUNCATED` |
 | `anole_s3_copy` | `COPY` | up to 5 GiB |
-| `anole_s3_multipart_create`, `_complete`, `_abort` | `MULTIPART_*` | for browsers uploading parts with presigned URLs |
+| `anole_s3_multipart_create`, `anole_s3_multipart_complete`, `anole_s3_multipart_abort` | `MULTIPART_CREATE`, `MULTIPART_COMPLETE`, `MULTIPART_ABORT` | for browsers uploading parts with presigned URLs |
 | `anole_s3_presign` | none | synchronous; returns the URL's length, written into `buf` when it fits |
 | `anole_s3_serve`, `anole_s3_put_body` | `SERVE`, `PUT_BODY` | the request's body or answer never enters the language |
 
