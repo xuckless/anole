@@ -558,6 +558,7 @@ test "WebTransport: the server closes with a code; a reset carries its code; the
         // close, both seen here; the open stream is reset.
         f.http.draining.set(io);
         defer f.http.draining.reset();
+        f.http.drain_hooks.fire(io);
         try std.testing.expectError(error.SessionClosed, session.acceptUniStream());
         try std.testing.expect(session.draining());
         const info = session.closeInfo().?;

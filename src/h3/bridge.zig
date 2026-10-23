@@ -265,6 +265,16 @@ pub const Signal = struct {
         try io.futexWait(u32, &s.gen.raw, seen);
     }
 
+    /// `wait`, giving up at `timeout` (returns normally then too).
+    pub fn waitTimeout(s: *Signal, io: std.Io, seen: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        _ = s.sleepers.fetchAdd(1, .seq_cst);
+        defer {
+            _ = s.sleepers.fetchSub(1, .seq_cst);
+            if (builtin.is_test) _ = s.returns.fetchAdd(1, .monotonic);
+        }
+        try io.futexWaitTimeout(u32, &s.gen.raw, seen, timeout);
+    }
+
     pub fn notify(s: *Signal, io: std.Io) void {
         _ = s.gen.fetchAdd(1, .seq_cst);
         if (s.sleepers.load(.seq_cst) > 0) {
