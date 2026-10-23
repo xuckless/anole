@@ -80,6 +80,16 @@ pub const ConnectOptions = struct {
     /// HTTP/3 only: QUIC closes the connection after this long with
     /// nothing received (its idle timeout). HTTP/2 over TCP has none.
     idle_timeout: std.Io.Duration = .fromSeconds(30),
+    /// HTTP/3 only: while a stream is open, a PING after this long with
+    /// nothing sent or received. A client that only receives (a download)
+    /// sends nothing once it has acknowledged what came; if a NAT rebinding
+    /// then moves its port, the server's packets go to the old one and are
+    /// lost, the server never hears from the new address, and the stream
+    /// stalls until a timeout. The PING comes from the new address, which
+    /// the server then validates and follows. It also keeps a quiet
+    /// stream's NAT mapping, and the idle timeout, from running out. Null
+    /// for none.
+    keep_alive: ?std.Io.Duration = .fromSeconds(5),
     /// For `connect`: resolving `host` and the QUIC handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -268,6 +278,10 @@ pub const ClientConnection = struct {
     peer_settings: ?PeerSettings = null,
     /// `ConnectOptions.max_header_list_size`.
     max_header_list_size: u32 = 64 * 1024,
+    /// `ConnectOptions.keep_alive` in nanoseconds (0: none), and whether
+    /// ngtcp2's keep-alive timer is on: while a stream is open (`drive`).
+    keep_alive: u64 = 0,
+    keep_alive_on: bool = false,
 
     /// What the server's SETTINGS allow (`waitSettings`).
     pub const PeerSettings = struct {
@@ -315,6 +329,7 @@ pub const ClientConnection = struct {
             .rx = rx,
             .timeout = timeoutFrom(options.timeout),
             .max_header_list_size = options.max_header_list_size,
+            .keep_alive = if (options.keep_alive) |d| std.math.lossyCast(u64, @max(1, d.toNanoseconds())) else 0,
         };
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
@@ -964,6 +979,12 @@ pub const ClientConnection = struct {
             if (self.state == .closed) {
                 self.unlock();
                 return;
+            }
+            // Keep-alive while a stream is open (`ConnectOptions.keep_alive`).
+            const keep_alive = self.keep_alive != 0 and self.live.first != null;
+            if (keep_alive != self.keep_alive_on) {
+                self.keep_alive_on = keep_alive;
+                c.ngtcp2_conn_set_keep_alive_timeout(self.q, if (keep_alive) self.keep_alive else 0);
             }
             const t = now(io);
             const deadline = c.ngtcp2_conn_get_expiry2(self.q);

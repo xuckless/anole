@@ -191,6 +191,8 @@ fn fakeNow() i64 {
 }
 
 test "client: handshake, requests and frames over pipes" {
+    // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
+    if (!sys.supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const to_client = try sys.pipe();
     const to_server = try sys.pipe();
@@ -247,6 +249,8 @@ test "client: handshake, requests and frames over pipes" {
 }
 
 test "client: handshake refused with busy and with a newer version" {
+    // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
+    if (!sys.supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     {
         const to_client = try sys.pipe();

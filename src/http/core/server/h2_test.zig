@@ -1110,8 +1110,10 @@ test "HTTP/2: a finished tunnel is reset even when the peer keeps its side open"
 /// wait itself is canceled; elsewhere `peerGone` tells.
 const Waiter = struct {
     var done: std.atomic.Value(bool) = .init(false);
+    var started: std.atomic.Value(bool) = .init(false);
 
     fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        started.store(true, .release);
         defer done.store(true, .release);
         for (0..200) |_| {
             try req.io.sleep(.fromMilliseconds(50), .awake);
@@ -1121,9 +1123,12 @@ const Waiter = struct {
     }
 
     /// Sends what the client has queued (the request) and waits until the
-    /// handler is surely running.
+    /// handler is running (a fixed sleep was not enough on a busy Windows
+    /// runner: the reset then came before the handler started, so it never
+    /// ran and never set `done`).
     fn start(client: *TestClient, io: std.Io) !void {
         done.store(false, .release);
+        started.store(false, .release);
         while (true) {
             var data: [*c]const u8 = undefined;
             const n = c.nghttp2_session_mem_send2(client.session, &data);
@@ -1131,7 +1136,11 @@ const Waiter = struct {
             try client.w.writeAll(data[0..@intCast(n)]);
         }
         try client.w.flush();
-        try io.sleep(.fromMilliseconds(100), .awake);
+        const sent_at: std.Io.Clock.Timestamp = .now(io, .awake);
+        while (!started.load(.acquire)) {
+            try std.testing.expect(sent_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 10_000);
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
         try std.testing.expect(!done.load(.acquire));
     }
 
