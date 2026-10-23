@@ -875,7 +875,11 @@ fn alpnSelect(
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
     _ = arg;
+    // An SSL on this context that is driven through another BIO (a test's
+    // SSL_set_fd) has no server list here: NOACK, as with no list.
     const bio = c.SSL_get_rbio(ssl) orelse return c.SSL_TLSEXT_ERR_NOACK;
+    const own = @atomicLoad(c_int, &bio_type, .acquire);
+    if (own == 0 or c.BIO_method_type(bio) != own) return c.SSL_TLSEXT_ERR_NOACK;
     const prefs = bioShared(bio).alpn;
     const offered = in[0..in_len];
     for (prefs) |want| {
@@ -1642,12 +1646,17 @@ const Buf = struct {
 };
 
 var bio_method: ?*c.BIO_METHOD = null;
+/// The type `bio_method` was made with (from BIO_get_new_index), so a
+/// callback can tell Anole's BIO from another one on the same SSL_CTX.
+var bio_type: c_int = 0;
 
 fn bioMethod() HandshakeError!*c.BIO_METHOD {
     lockGlobal();
     defer global_lock.unlock();
     if (bio_method) |m| return m;
-    const m = c.BIO_meth_new(0, "anole std.Io") orelse return error.OutOfMemory;
+    const index = c.BIO_get_new_index();
+    if (index < 0) return error.OutOfMemory;
+    const m = c.BIO_meth_new(index | c.BIO_TYPE_SOURCE_SINK, "anole std.Io") orelse return error.OutOfMemory;
     if (c.BIO_meth_set_read(m, bioRead) != 1 or
         c.BIO_meth_set_write(m, bioWrite) != 1 or
         c.BIO_meth_set_ctrl(m, bioCtrl) != 1 or
@@ -1657,6 +1666,7 @@ fn bioMethod() HandshakeError!*c.BIO_METHOD {
         return error.OutOfMemory;
     }
     bio_method = m;
+    @atomicStore(c_int, &bio_type, index | c.BIO_TYPE_SOURCE_SINK, .release);
     return m;
 }
 
