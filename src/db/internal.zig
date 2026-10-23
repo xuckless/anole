@@ -181,6 +181,8 @@ pub const Guard = struct {
             .redis => .redis,
             .nats => .nats,
             .kafka => .kafka,
+            .s3 => .s3,
+            .smtp => .smtp,
             .sqlite => .postgresql,
         };
         return .{

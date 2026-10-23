@@ -113,12 +113,31 @@ pub const System = enum {
     redis,
     nats,
     kafka,
+    /// S3-compatible object storage (`anole.s3`).
+    s3,
+    /// Mail over SMTP (`anole.smtp`).
+    smtp,
 
     /// NATS and Kafka are brokers: their spans are OpenTelemetry
     /// *messaging* spans.
     pub fn isMessaging(self: System) bool {
-        return self == .nats or self == .kafka;
+        return self.kind() == .messaging;
     }
+
+    /// What kind of service it is, for its spans (`observe.zig`).
+    pub fn kind(self: System) Kind {
+        return switch (self) {
+            .postgresql, .sqlite, .mongodb, .redis => .database,
+            .nats, .kafka => .messaging,
+            .s3 => .rpc,
+            .smtp => .mail,
+        };
+    }
+
+    /// A database (OpenTelemetry *database* spans), a message broker
+    /// (*messaging* spans), a service called over an API (*rpc* spans: S3)
+    /// or a mail server (spans with Anole's own `smtp.*` attributes).
+    pub const Kind = enum { database, messaging, rpc, mail };
 };
 
 /// A call's context outside a handler (startup, a background task, a
@@ -337,6 +356,9 @@ pub const ErrorMap = struct {
     unavailable: Answer = .service_unavailable,
     timeout: Answer = .gateway_timeout,
     other: Answer = .internal_server_error,
+    not_found: Answer = .not_found,
+    precondition: Answer = .conflict,
+    invalid: Answer = .bad_request,
 
     /// The status a class answers with; each one is an `Error`.
     pub const Answer = enum {
@@ -398,6 +420,15 @@ pub const Class = enum {
     timeout,
     /// Everything else.
     other,
+    /// The object, bucket or upload does not exist (S3 404).
+    not_found,
+    /// A condition the call set did not hold: S3 412 (If-Match,
+    /// If-None-Match: *), 409 ConditionalRequestConflict.
+    precondition,
+    /// The service refused the input: a range past the end, a key too
+    /// long, every mail recipient refused, a message over the size limit,
+    /// a bad address.
+    invalid,
 };
 
 /// A failed call's detail, for logs: what `lastError` returns.
@@ -482,10 +513,17 @@ test "errors: each one's status, and what ErrorMap changes" {
         .{ .not_null, error.Database },
         .{ .check, error.Database },
         .{ .other, error.Database },
+        .{ .not_found, error.NotFound },
+        .{ .precondition, error.Conflict },
+        .{ .invalid, error.BadRequest },
     }) |case| try testing.expectEqual(case[1], defaults.errorFor(case[0]));
 
     const validating: ErrorMap = .{ .foreign_key = .unprocessable_entity, .check = .bad_request };
     try testing.expectEqual(error.UnprocessableEntity, validating.errorFor(.foreign_key));
     try testing.expectEqual(error.BadRequest, validating.errorFor(.check));
     try testing.expectEqual(error.Conflict, validating.errorFor(.unique));
+    const moved: ErrorMap = .{ .not_found = .internal_server_error, .precondition = .unprocessable_entity, .invalid = .unprocessable_entity };
+    try testing.expectEqual(error.Database, moved.errorFor(.not_found));
+    try testing.expectEqual(error.UnprocessableEntity, moved.errorFor(.precondition));
+    try testing.expectEqual(error.UnprocessableEntity, moved.errorFor(.invalid));
 }

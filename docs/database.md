@@ -261,6 +261,12 @@ the response:
 | 57014 (`statement_timeout`), a call past its `timeout` | `GatewayTimeout` | 504 |
 | everything else: foreign key, not-null, check, syntax, permissions | `Database` | 500 |
 
+`anole.db.Class` also has `not_found` (404), `precondition` (409) and
+`invalid` (400), with `ErrorMap` fields of the same names: the object
+storage and mail connectors (`anole.s3`, `anole.smtp`) answer with them
+(a missing object, a failed `If-Match`, a refused recipient), and no
+database does. An exhaustive `switch` on `Class` needs the three cases.
+
 `.errors` moves a class to another status, for an app that validates
 input through its constraints:
 

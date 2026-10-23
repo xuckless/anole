@@ -10,7 +10,7 @@ pub const Duration = std.Io.Duration;
 
 /// Which client or connector a breaker or retry belongs to (the metrics'
 /// `client` label).
-pub const Kind = enum { http, grpc, h3, postgresql, mongodb, redis, nats, kafka };
+pub const Kind = enum { http, grpc, h3, postgresql, mongodb, redis, nats, kafka, s3, smtp };
 
 // ---------------------------------------------------------------------------
 // Backoff

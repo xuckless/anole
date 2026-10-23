@@ -106,6 +106,12 @@ pub const Observer = struct {
         };
     }
 
+    /// Which spans it makes: database, messaging (NATS, Kafka), rpc (S3) or
+    /// mail (SMTP).
+    pub fn kind(self: *const Observer) db.System.Kind {
+        return self.system.kind();
+    }
+
     /// Marks the start of a call (a statement, a command) made with `c`.
     pub fn start(self: *const Observer, c: anytype) Call {
         return .{
@@ -164,7 +170,13 @@ pub const Call = struct {
             target,
             if (err) |e| @errorName(e) else null,
         );
-        span_db.messaging = o.system.isMessaging();
+        switch (o.kind()) {
+            .database => {},
+            .messaging => span_db.messaging = true,
+            // S3 and SMTP: their span attributes come with their areas
+            // (p3/s3, p3/smtp); a database span until then.
+            .rpc, .mail => {},
+        }
         exporter.child(req, self.real_ns, std.Io.Clock.real.now(c.io).nanoseconds, span_db);
     }
 };

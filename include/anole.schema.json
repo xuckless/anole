@@ -1835,6 +1835,42 @@
                 "gateway_timeout"
               ],
               "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
             }
           },
           "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
@@ -3433,6 +3469,42 @@
                 "gateway_timeout"
               ],
               "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
             }
           },
           "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
