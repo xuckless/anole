@@ -285,6 +285,20 @@ pub const UdpSocket = struct {
         return s.group.service.state;
     }
 
+    /// `ip` as the socket sends to it: an IPv4 peer of a dual-stack socket
+    /// is addressed in IPv4-mapped form (the handlers see plain IPv4).
+    fn onWire(s: *const UdpSocket, ip: std.Io.net.IpAddress) std.Io.net.IpAddress {
+        if (!s.udp.ip6) return ip;
+        switch (ip) {
+            .ip6 => return ip,
+            .ip4 => |a| {
+                var bytes: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 };
+                @memcpy(bytes[12..16], &a.bytes);
+                return .{ .ip6 = .{ .bytes = bytes, .port = a.port } };
+            },
+        }
+    }
+
     fn lockQ(s: *UdpSocket) void {
         while (!s.qlock.tryLock()) std.atomic.spinLoopHint();
     }
@@ -308,7 +322,7 @@ pub const UdpSocket = struct {
             s.qlock.unlock();
             return error.OutOfMemory;
         };
-        s.pending.append(s.group.gpa, .{ .to = to, .from = from, .off = off, .len = bytes.len }) catch {
+        s.pending.append(s.group.gpa, .{ .to = s.onWire(to), .from = if (from) |f| s.onWire(f) else null, .off = off, .len = bytes.len }) catch {
             s.pending_buf.shrinkRetainingCapacity(off);
             s.qlock.unlock();
             return error.OutOfMemory;
@@ -356,7 +370,7 @@ pub const UdpSocket = struct {
         for (items) |it| {
             const off = s.pending_buf.items.len;
             s.pending_buf.appendSliceAssumeCapacity(it.bytes);
-            s.pending.appendAssumeCapacity(.{ .to = it.to, .from = it.from, .off = off, .len = it.bytes.len });
+            s.pending.appendAssumeCapacity(.{ .to = s.onWire(it.to), .from = if (it.from) |f| s.onWire(f) else null, .off = off, .len = it.bytes.len });
         }
         s.queue_bytes += total;
         if (s.queue_bytes > cap / 2) s.want_writable = true;
@@ -385,7 +399,7 @@ pub const UdpSocket = struct {
             box = &s.outbox.?;
         }
         @memcpy(box.space()[0..bytes.len], bytes);
-        box.commit(&s.udp, to, from, 0, bytes.len, 0);
+        box.commit(&s.udp, s.onWire(to), if (from) |f| s.onWire(f) else null, 0, bytes.len, 0);
     }
 
     fn flushOutbox(s: *UdpSocket) void {

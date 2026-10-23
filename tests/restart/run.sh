@@ -12,6 +12,8 @@
 #   - TCP and HTTP/3 serve throughout, each listener's socket reaching the
 #     successor under its own name (LISTEN_FDNAMES), so each port still
 #     speaks what it did; a second restart works too;
+#   - a raw TCP echo and a UDP echo listener (anole.net) are handed over by
+#     name as well, and answer throughout;
 #   - SIGHUP reloads the certificate (RELOADING=1, then READY=1) and the
 #     process goes on serving.
 #   tests/restart/run.sh [path-to-full]
@@ -29,6 +31,8 @@ port=18580
 tls_port=18581
 h1_tls_port=18582
 h2c_port=18583
+raw_tcp_port=18584
+raw_udp_port=18585
 
 fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[f]ull $port" || true; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
 # Waits up to 10 s for a line matching $1 in the notification log, after
@@ -51,13 +55,31 @@ check_all() {
   out=$(curl -s --http2-prior-knowledge -w ' %{http_version}' "http://127.0.0.1:$h2c_port/") || fail "h2c ($1)"
   [ "$out" = "hello 2" ] || fail "h2c ($1): $out"
   if curl -s --http1.1 "http://127.0.0.1:$h2c_port/" >/dev/null; then fail "h2c ($1): served HTTP/1.1"; fi
+  # Raw TCP and UDP echo: the sockets reach the successor under their names.
+  out=$($py - "$raw_tcp_port" "$raw_udp_port" "$1" <<'PY'
+import socket, sys
+tcp, udp, tag = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+s = socket.create_connection(("127.0.0.1", tcp), timeout=5)
+s.sendall(b"tcp " + tag.encode())
+got = s.recv(100)
+assert got == b"tcp " + tag.encode(), got
+s.close()
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(5)
+u.sendto(b"udp " + tag.encode(), ("127.0.0.1", udp))
+got = u.recvfrom(100)[0]
+assert got == b"udp " + tag.encode(), got
+print("raw ok")
+PY
+  ) || fail "raw TCP/UDP echo ($1): $out"
+  [ "$out" = "raw ok" ] || fail "raw TCP/UDP echo ($1): $out"
 }
 
 : >"$work/notify.log"
 $py "$here/notify.py" "$work/notify" "$work/notify.log" &
 pids="$!"
 sleep 0.5
-NOTIFY_SOCKET="$work/notify" "$server_bin" $port $tls_port $h1_tls_port $h2c_port >"$work/server.log" 2>&1 &
+NOTIFY_SOCKET="$work/notify" "$server_bin" $port $tls_port $h1_tls_port $h2c_port $raw_tcp_port $raw_udp_port >"$work/server.log" 2>&1 &
 first=$!
 pids="$pids $first"
 await_notify "^READY=1$"

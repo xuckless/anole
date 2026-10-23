@@ -825,6 +825,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "hello", .needs = true, .about = "the smallest server, on port 3000" },
         .{ .name = "rest", .needs = true, .about = "a JSON REST API: CRUD in memory, behind an API key, on port 3000" },
         .{ .name = "websocket", .needs = features.websocket, .about = "WebSocket echo and a broadcast room" },
+        .{ .name = "net", .needs = features.net, .about = "a line chat over TCP, a UDP responder with sessions and an HTTP /stats page (ports 7000, 7001, 3000)" },
         .{ .name = "grpc", .needs = features.grpc, .about = "a gRPC Greeter, also over gRPC-Web, Connect and REST (JSON transcoding)" },
         .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
         .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },

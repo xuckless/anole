@@ -233,3 +233,23 @@ test "net udp: per-core sockets keep a peer on one socket" {
         }
     }.run);
 }
+
+test "net udp: a dual-stack listener answers an IPv4 peer (replies leave in mapped form)" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.udp(":0", Pong, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const io = a.io();
+            const c = try client(io);
+            defer c.close(io);
+            const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(portOf(a)) };
+            try c.send(io, &to, "v4");
+            try expectDatagram(io, c, "v4");
+            // From another thread too.
+            const sock = a.udpSocket("udp-0").?;
+            try sock.send(c.address, null, "queued");
+            try expectDatagram(io, c, "queued");
+        }
+    }.run);
+}
