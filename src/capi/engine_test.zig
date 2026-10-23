@@ -1711,3 +1711,16 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
     try e.drain();
     try std.testing.expect(e.wait(5000));
 }
+
+test "capi engine: ANOLE_EV_DRAINING reaches every consumer once when the drain starts, before ANOLE_EV_STOPPED" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    try e.drain();
+    // A second drain call tells nobody.
+    try e.drain();
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2, 5000);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
+    try std.testing.expect(e.wait(5000));
+}

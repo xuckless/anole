@@ -1531,8 +1531,19 @@ pub const Engine = struct {
         // on its own.
         const app = e.enter() orelse return;
         defer e.leave();
-        _ = e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire);
+        // The first drain call tells every consumer (once each), before the
+        // server starts closing sockets and cutting requests.
+        if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) e.notifyDraining();
         app.stop();
+    }
+
+    /// `ANOLE_EV_DRAINING` (handle 0) to every consumer, once: long-poll,
+    /// SSE and similar consumers finish up before the drain's deadline.
+    fn notifyDraining(e: *Engine) void {
+        for (e.consumers.items) |c| {
+            if (c.execs.items.len == 0) continue;
+            c.execs.items[0].postEvent(.draining, 0);
+        }
     }
 
     /// Waits for the stop; false when `timeout_ms` passed first.

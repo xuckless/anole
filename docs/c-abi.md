@@ -255,7 +255,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_WT_STREAM_STOP` | `anole_wt_code_event`: the peer asked this side to stop sending | `anole_wt_stream` | none |
 | `ANOLE_EV_WT_DATAGRAM` | `anole_wt_datagram_event`, then the bytes | `anole_wt` | none |
 | `ANOLE_EV_WS_UPGRADE` (40) | `anole_request_event`: a WebSocket handshake the consumer accepts (`anole_ws_accept`) or refuses (any request answer); only on routes with `"accept": "consumer"` | `anole_req` | accept or a refusing answer |
-| `ANOLE_EV_DRAINING` (41) | `anole_event`: the drain started | 0 | none |
+| `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
 20-29 WebTransport; 30-39 database; 40-49 HTTP and WebSocket additions;
