@@ -239,6 +239,13 @@ pub const Producer = struct {
             };
             const a = try self.accum(ts, p);
             if (a.leader == resolver_id) a.leader = self.cluster.leader(topic, p) orelse resolver_id;
+            // Everything that can fail comes before the record (and the
+            // slot's reference) goes into a batch: past that point the
+            // batch owns it, and an error here would let the caller release
+            // a slot the batch still finishes.
+            _ = try self.ensureSender(a.leader);
+            try a.ready.ensureUnusedCapacity(self.gpa, 1);
+            try self.active.ensureUnusedCapacity(self.gpa, 1);
             const fresh = a.open == null;
             const batch = a.open orelse try self.newBatch(now);
             {
@@ -248,8 +255,10 @@ pub const Producer = struct {
                 const v2: ?[]const u8 = if (value) |v| try arena.dupe(u8, v) else null;
                 const hs = try arena.alloc(records.Header, headers.len);
                 for (headers, hs) |h, *o| o.* = .{ .key = try arena.dupe(u8, h.key), .value = if (h.value) |v| try arena.dupe(u8, v) else null };
-                try batch.recs.append(arena, .{ .key = k2, .value = v2, .headers = hs, .timestamp_ms = timestamp_ms });
-                try batch.slots.append(arena, slot);
+                try batch.recs.ensureUnusedCapacity(arena, 1);
+                try batch.slots.ensureUnusedCapacity(arena, 1);
+                batch.recs.appendAssumeCapacity(.{ .key = k2, .value = v2, .headers = hs, .timestamp_ms = timestamp_ms });
+                batch.slots.appendAssumeCapacity(slot);
             }
             batch.bytes += size;
             a.open = batch;
@@ -258,19 +267,16 @@ pub const Producer = struct {
             if (self.tel) |t| t.buffer.set(@intCast(self.buffered));
             var sealed = false;
             if (batch.bytes >= self.cfg.batch_bytes) {
-                try a.ready.append(self.gpa, batch);
+                a.ready.appendAssumeCapacity(batch);
                 a.open = null;
                 sealed = true;
                 if (key == null and explicit_partition == null) ts.sticky = self.randomPartition(count, p);
             }
             if (!a.in_active) {
-                try self.active.append(self.gpa, a);
+                self.active.appendAssumeCapacity(a);
                 a.in_active = true;
             }
-            if (fresh or sealed) {
-                _ = try self.ensureSender(a.leader);
-                wake_id = a.leader;
-            }
+            if (fresh or sealed) wake_id = a.leader;
         }
         if (wake_id) |id| self.wake(id);
     }
