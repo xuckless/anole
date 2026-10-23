@@ -388,6 +388,60 @@ jobs:
             ${{ runner.temp }}/wt-interop-browsers/logs
           retention-days: 7
 
+  templates:
+    name: anole new templates (${{ matrix.os }}; build, test, openapi, lint)
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS builds the minimal template only (the full profile is the
+        # slow part of the Linux run).
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # rest-postgres runs its database tests against this server on Linux.
+    services:
+      postgres:
+        image: ${{ matrix.os == 'ubuntu-latest' && 'postgres:17' || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: templates-${{ matrix.os }}
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The goldens of tests/openapi must be valid OpenAPI 3.1.
+      - name: Lint the golden documents
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oav"
+          "$RUNNER_TEMP/oav/bin/pip" install --quiet openapi-spec-validator==0.7.1
+          "$RUNNER_TEMP/oav/bin/openapi-spec-validator" tests/openapi/*.json
+      - name: Every template (Linux)
+        if: runner.os == 'Linux'
+        run: DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres tests/templates/run.sh
+      - name: The minimal template (macOS)
+        if: runner.os != 'Linux'
+        run: tests/templates/run.sh minimal
+
+  cli:
+    name: anole command line (cross-build of the release binaries)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: cli
+      # Std only: no C library is fetched. The five targets include Windows.
+      - name: cli-test and cli-dist
+        run: zig build cli-test cli-dist -Dprofile=minimal
+      - name: The files a release gets
+        run: ls -l zig-out/dist && cat zig-out/dist/SHA256SUMS
+
   consumer:
     name: A project that adds Anole with zig fetch (fresh cache)
     # The commit must be fetchable from this repository, so pushes only.
