@@ -23,6 +23,7 @@ PAGES = {
     "getting-started.md": ("Getting-Started", "Install Zig, add Anole, write and run a first app."),
     "routing.md": ("Routing", "Routes, parameters, middleware, requests and responses, errors."),
     "server.md": ("Server", "Listeners, TLS, HTTP/2 and HTTP/3, limits, timeouts, drain and restarts."),
+    "config.md": ("Config", "Typed settings, .env files, environment and deployment modes, trusted proxies."),
     "websocket.md": ("WebSocket", "WebSocket over HTTP/1.1, HTTP/2 and HTTP/3; the loop and callback APIs."),
     "webtransport.md": ("WebTransport", "WebTransport sessions, streams and datagrams over HTTP/3."),
     "grpc.md": ("gRPC", "gRPC services, gRPC-Web, Connect and JSON transcoding."),
