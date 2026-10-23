@@ -2537,12 +2537,16 @@ static int finish_get(async_req *a, pthread_t t, const char *want) {
   return status;
 }
 
+/* Routes with a deadline give it 1 s where the test must poll the request
+   before the deadline: a request that expires unpolled is skipped by
+   anole_poll (the consumer never saw it), and `zig build` runs the ASan
+   suite beside this one, so 100-200 ms was not always enough. */
 #define HOLD_CONFIG                                                                                   \
   "{\"listeners\":[{\"name\":\"main\",\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"       \
   "\"timeouts\":{\"request_ms\":%d,\"shutdown_ms\":%d},"                                             \
   "\"limits\":{\"body_max\":20000,\"inline_body_max\":1000},"                                        \
   "\"routes\":[{\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1},"                               \
-  "{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":200},"                       \
+  "{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":1000},"                      \
   "{\"method\":\"POST\",\"path\":\"/echo\",\"handler\":2}%s]}"
 
 static anole_server *hold_server(anole_consumer **c, int request_ms, int shutdown_ms, const char *extra) {
@@ -2735,7 +2739,7 @@ static void test_db_request_tie(void) {
   const char *json =
       "{\"executors\":1,\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],"
       " \"timeouts\":{\"request_ms\":5000,\"shutdown_ms\":500},"
-      " \"routes\":[{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":100},"
+      " \"routes\":[{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":1000},"
       "             {\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1}],"
       " \"databases\":[{\"name\":\"d\",\"timeout_ms\":200,\"sqlite\":{\"path\":\":memory:\","
       "  \"init\":\"CREATE TABLE tt (n);\"}}]}";
@@ -2843,7 +2847,7 @@ static void test_db_postgres_tx(void) {
   char json[4096];
   snprintf(json, sizeof json,
            "{\"executors\": 2, \"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}],"
-           " \"routes\": [{\"method\": \"GET\", \"path\": \"/short\", \"handler\": 1, \"timeout_ms\": 100}],"
+           " \"routes\": [{\"method\": \"GET\", \"path\": \"/short\", \"handler\": 1, \"timeout_ms\": 1000}],"
            " \"databases\": [{\"name\": \"pg\", \"postgres\": {\"url\": \"%s\", \"max_connections\": 6,"
            "   \"init\": \"DROP TABLE IF EXISTS anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct;"
            " CREATE TABLE anole_capi_acct (id int PRIMARY KEY, n int NOT NULL); INSERT INTO anole_capi_acct VALUES (1, 0), (2, 0);"
