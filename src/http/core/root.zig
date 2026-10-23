@@ -38,6 +38,8 @@ pub const Detached = @import("detach.zig").Detached;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+/// Live connection and stream counts per executor.
+pub const gauges = @import("gauges.zig");
 
 /// Tests that provoke `err` logs on purpose declare it here.
 pub const expect_log = @import("expect_log.zig");

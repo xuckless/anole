@@ -1440,7 +1440,7 @@ const Core = struct {
         // anole.Server refuses to compile with work stealing declared. And
         // `fast_accept` (see `anole.zio_options`), so a program whose own
         // `zio_options` leave it out still has it.
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true }).module("zio");
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true }).module("zio");
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,

@@ -98,7 +98,7 @@ const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
 /// backlog directly, and the accept and spawn budgets grow with the run
 /// queue, so new connections, parked ones waking and new HTTP/2 streams are
 /// not left behind thousands of busy connections.
-pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true };
+pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .diagnostics = true };
 
 /// Anole's own build of zio is pinned by default (build.zig), so a program
 /// that declares no `zio_options` gets it; one that declares them must not
@@ -2112,6 +2112,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (opts.http and self.router.has_routes) @panic("app.metrics() adds a middleware, so it goes before the routes, with app.use()");
             const r = self.arena.allocator().create(observe.metrics.Registry) catch @panic("OOM");
             r.* = .init(self.gpa, self.rt.io());
+            r.runtime_gauges = true;
             self.extras.metrics = r;
             self.extras.metrics_path = opts.path;
             self.extras.metrics_listener = opts.listener;

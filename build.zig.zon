@@ -26,9 +26,11 @@
         // net.ReadyWatch is gone (Anole parks through CompletionQueue). The
         // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
+        // Plus `diagnostics` (88f6d69): comptime-gated per-executor task
+        // counters and stack stats for the runtime gauges on /metrics.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#b4974873565677327cb45f8731b4f393ff637bad",
-            .hash = "zio-0.19.0-xHbVVCTMLQD1ucYoMOJfO8bzSuHnrjjXYubniBKtnu8F",
+            .url = "git+https://github.com/xuckless/zio#88f6d6985c78deac16d937a0a8d95e7c649eba6d",
+            .hash = "zio-0.19.0-xHbVVFndLQBjQr_KxPh7mRuZ-dllPXBf8YBFu6FX-mok",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

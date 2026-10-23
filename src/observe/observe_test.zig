@@ -398,3 +398,29 @@ test "tracing: OTEL_SERVICE_NAME from the process environment without .process" 
     const exporter = try app.tracing(.{ .endpoint = "http://127.0.0.1:9", .interval = .fromSeconds(60) });
     try std.testing.expectEqualStrings("from-the-environment", exporter.options.service_name);
 }
+
+test "observe: runtime gauges appear on /metrics" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    registry.runtime_gauges = true;
+
+    var app = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer app.deinit();
+    registry.serveOn(void, &app.router, "/metrics");
+    var app_future = try io.concurrent(serve, .{&app});
+    defer app_future.cancel(io) catch {};
+    try app.waitReady(io);
+
+    var out: [16384]u8 = undefined;
+    const metrics = try get(io, app.address.ip.getPort(), "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_connections{executor=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_streams{executor=\"0\",protocol=\"h2\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_tasks{executor=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_run_queue{executor=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_stack_committed_bytes ") != null);
+}

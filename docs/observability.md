@@ -270,6 +270,24 @@ anole_http_request_duration_seconds_sum{method="GET",route="/chain/:id"} 0.00128
 anole_http_request_duration_seconds_count{method="GET",route="/chain/:id"} 1
 ```
 
+### Runtime gauges
+
+`app.metrics` also serves gauges per executor, refreshed on every scrape:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `anole_runtime_tasks` | `executor` | Tasks alive (spawned minus finished). |
+| `anole_runtime_run_queue` | `executor` | Tasks waiting in the executor's run queue. |
+| `anole_runtime_stack_committed_bytes` | none | Memory held by coroutine stacks in use (a lower bound: stacks times their initial committed size). |
+| `anole_connections` | `executor` | Open connections. |
+| `anole_streams` | `executor`, `protocol` | Open HTTP/2 and HTTP/3 request streams. |
+
+The `anole_runtime_*` series come from zio's `diagnostics` option, which
+`anole.zio_options` turns on (one relaxed atomic add per task spawned and
+finished). A program that declares its own `zio_options` without it gets
+only `anole_connections` and `anole_streams`. A registry of your own gets
+them with `registry.runtime_gauges = true`.
+
 ## Tracing
 
 `trace.Middleware` makes one server span per request. If the request has a

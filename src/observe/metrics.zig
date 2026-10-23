@@ -238,6 +238,9 @@ pub const Registry = struct {
     counters: std.ArrayList(*Family(Counter)) = .empty,
     gauges: std.ArrayList(*Family(Gauge)) = .empty,
     histograms: std.ArrayList(*Family(Histogram)) = .empty,
+    /// Whether a scrape first refreshes the runtime gauges
+    /// (`observe/runtime.zig`); `app.metrics` turns it on.
+    runtime_gauges: bool = false,
 
     /// An empty registry.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Registry {
@@ -293,6 +296,7 @@ pub const Registry = struct {
 
     /// Every metric in the text exposition format (version 0.0.4).
     pub fn render(self: *Registry, w: *std.Io.Writer) !void {
+        if (self.runtime_gauges) @import("runtime.zig").refresh(self);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.counters.items) |f| try f.render(w);
