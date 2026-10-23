@@ -1563,27 +1563,30 @@ pub fn build(b: *std.Build) void {
         cli_options.addOption([]const u8, "version", @import("build.zig.zon").version);
         const templates_mod = b.createModule(.{ .root_source_file = b.path("templates/index.zig") });
         const CliBuild = struct {
-            fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+            /// `strip`: no debug information (the release binaries; null keeps
+            /// the optimize mode's default).
+            fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode, strip: ?bool) *std.Build.Module {
                 return bb.createModule(.{
                     .root_source_file = bb.path("tools/anole/main.zig"),
                     .target = tgt,
                     .optimize = opt,
+                    .strip = strip,
                     .imports = &.{
                         .{ .name = "cli_options", .module = opts.createModule() },
                         .{ .name = "templates", .module = tmpl },
                         // The startup banner (src/banner.zig, std only).
                         .{ .name = "banner", .module = bb.createModule(.{ .root_source_file = bb.path("src/banner.zig") }) },
                         // The live console's client and terminal UI (src/console/ui, std only).
-                        .{ .name = "anole_console_ui", .module = bb.createModule(.{ .root_source_file = bb.path("src/console/ui/root.zig"), .target = tgt, .optimize = opt, .link_libc = true }) },
+                        .{ .name = "anole_console_ui", .module = bb.createModule(.{ .root_source_file = bb.path("src/console/ui/root.zig"), .target = tgt, .optimize = opt, .strip = strip, .link_libc = true }) },
                     },
                 });
             }
         };
-        const cli = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize) });
+        const cli = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
         const install_cli = b.addInstallArtifact(cli, .{});
         b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
 
-        const cli_tests = b.addTest(.{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize) });
+        const cli_tests = b.addTest(.{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
         b.step("cli-test", "Run the anole command line's unit tests").dependOn(&b.addRunArtifact(cli_tests).step);
 
         const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
@@ -1602,7 +1605,9 @@ pub fn build(b: *std.Build) void {
             .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows }, .name = "anole-x86_64-windows.exe" },
         };
         for (dist_targets) |dt| {
-            const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe) });
+            // Stripped: the release binaries carry no debug information
+            // (ReleaseSafe keeps it otherwise; the Linux ones were ~7x larger).
+            const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe, true) });
             const installed = b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "dist" }, dt.name);
             dist.dependOn(&installed.step);
             // The sums are over the built files, named as they are installed.
