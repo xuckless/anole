@@ -3020,6 +3020,36 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         // ---- end p3/jobs ----
 
         // ---- p3/webhooks ----
+        /// Webhooks out: endpoints, signed deliveries run as jobs, retries,
+        /// and the delivery log, on `options.jobs`' store. Owned by the
+        /// server (started and freed with it). See `anole.webhooks`.
+        ///
+        ///     const hooks = try app.webhooks(.{ .jobs = jobs });
+        ///     _ = try hooks.publish(req, .{ .owner = "acme", .type = "invoice.paid" }, .{ .id = 7 });
+        pub fn webhooks(self: *Self, config: @import("webhooks/root.zig").Options) !*@import("webhooks/root.zig").Client {
+            if (comptime !features.webhooks) @compileError("app.webhooks needs webhooks (-Dwebhooks, on in the web and full profiles)");
+            const wh = @import("webhooks/root.zig");
+            const w = try wh.Client.init(self.gpa, self.rt.io(), config);
+            errdefer w.deinit();
+            try w.register(self);
+            try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
+            if (self.extras.connectors_started) try w.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return w;
+        }
+
+        /// A middleware that checks the signature of an incoming webhook
+        /// and drops duplicate deliveries; freed with the server. Panics
+        /// with the reason when the options are invalid (startup code).
+        ///
+        ///     const hook = app.webhookVerify(.{ .preset = .stripe, .secrets = &.{secret} });
+        ///     app.with(.{hook}).post("/hooks/stripe", stripeHook);
+        pub fn webhookVerify(self: *Self, config: @import("webhooks/root.zig").Verify.Options) *@import("webhooks/root.zig").Verify {
+            if (comptime !features.webhooks) @compileError("app.webhookVerify needs webhooks (-Dwebhooks, on in the web and full profiles)");
+            const wh = @import("webhooks/root.zig");
+            const v = wh.Verify.init(self.gpa, self.rt.io(), config) catch |err| @panic(@errorName(err));
+            self.extras.connectors.append(self.arena.allocator(), .of(wh.Verify, v)) catch @panic("OOM");
+            return v;
+        }
         // ---- end p3/webhooks ----
 
         // ---- p3/realtime ----

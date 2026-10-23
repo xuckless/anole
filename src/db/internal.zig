@@ -41,7 +41,7 @@ pub fn fail(c: anytype, map: ErrorMap, detail: ErrorDetail) Error {
 fn record(c: anytype, detail: ErrorDetail, err: Error) void {
     keepError(c, detail);
     const kept = lastError(c).?;
-    const id = if (comptime @hasField(Pointee(@TypeOf(c)), "id")) c.id else "";
+    const id: []const u8 = if (comptime @hasField(Pointee(@TypeOf(c)), "id") and @FieldType(Pointee(@TypeOf(c)), "id") == []const u8) c.id else "";
     switch (err) {
         error.Database, error.ServiceUnavailable, error.GatewayTimeout => log.warn("{s}{s}database error: {f}", .{ id, if (id.len > 0) " " else "", kept }),
         else => log.debug("{s}{s}database error: {f}", .{ id, if (id.len > 0) " " else "", kept }),

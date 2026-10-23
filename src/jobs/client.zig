@@ -614,13 +614,13 @@ pub const Client = struct {
         _ = opts;
         const def = comptime kindOf(Args);
         const Info = @typeInfo(@TypeOf(handler)).@"fn";
-        const with_state = Info.params.len == 3;
+        const with_state = Info.param_types.len == 3;
         const state: ?*anyopaque = if (with_state) @ptrCast(server.server.ctx) else null;
         const Tramp = struct {
             fn run(ctx: ?*anyopaque, job: *Job) anyerror!void {
                 const args = try job.bind(Args);
                 if (with_state) {
-                    const P = Info.params[0].type.?;
+                    const P = Info.param_types[0].?;
                     return handler(@as(P, @ptrCast(@alignCast(ctx.?))), job, args);
                 }
                 return handler(job, args);
@@ -633,12 +633,12 @@ pub const Client = struct {
     pub fn handleRaw(self: *Client, server: anytype, kind: Kind, opts: root.HandleOptions, comptime handler: anytype) !void {
         _ = opts;
         const Info = @typeInfo(@TypeOf(handler)).@"fn";
-        const with_state = Info.params.len == 2;
+        const with_state = Info.param_types.len == 2;
         const state: ?*anyopaque = if (with_state) @ptrCast(server.server.ctx) else null;
         const Tramp = struct {
             fn run(ctx: ?*anyopaque, job: *Job) anyerror!void {
                 if (with_state) {
-                    const P = Info.params[0].type.?;
+                    const P = Info.param_types[0].?;
                     return handler(@as(P, @ptrCast(@alignCast(ctx.?))), job);
                 }
                 return handler(job);

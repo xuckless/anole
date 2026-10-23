@@ -823,3 +823,10 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+src/webhooks/sign.zig: the test vector in it comes from the Standard Webhooks
+libraries' tests (https://github.com/standard-webhooks/standard-webhooks,
+Apache-2.0, libraries/python/tests/test_webhooks.py). The signing scheme is
+the Standard Webhooks specification (Apache-2.0), implemented here from the
+spec; no code is copied. The Apache-2.0 text is the one given for BoringSSL
+above.

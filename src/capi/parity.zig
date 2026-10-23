@@ -544,6 +544,39 @@ pub const jobs_cron = [_]Entry{
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----
+
+/// `anole.webhooks.Options` against `webhooks`.
+pub const webhooks_options = [_]Entry{
+    .{ .zig = "jobs", .omitted = "the ABI's \"jobs\" configuration is the one jobs client" },
+    .{ .zig = "queue", .json = "webhooks.queue" },
+    .{ .zig = "timeout", .json = "webhooks.timeout_ms", .kind = .ms },
+    .{ .zig = "attempts", .json = "webhooks.attempts" },
+    .{ .zig = "backoff", .json = "webhooks.backoff", .kind = .custom, .note = "base_ms, max_ms, multiplier and jitter (\"full\", \"equal\", \"none\")" },
+    .{ .zig = "breaker", .json = "webhooks.breaker", .kind = .custom, .note = "an object as databases[].breaker, or null" },
+    .{ .zig = "allow_private_addresses", .json = "webhooks.allow_private_addresses" },
+    .{ .zig = "require_https", .json = "webhooks.require_https" },
+    .{ .zig = "user_agent", .json = "webhooks.user_agent" },
+    .{ .zig = "max_payload", .json = "webhooks.max_payload" },
+    .{ .zig = "response_kept", .json = "webhooks.response_kept" },
+    .{ .zig = "keep_messages", .json = "webhooks.keep_messages_ms", .kind = .ms },
+    .{ .zig = "keep_attempts", .json = "webhooks.keep_attempts_ms", .kind = .ms },
+    .{ .zig = "disable_after", .json = "webhooks.disable_after_ms", .kind = .ms },
+    .{ .zig = "secrets_key", .json = "webhooks.secrets_key_env", .kind = .custom, .note = "the name of an environment variable that holds the key" },
+    .{ .zig = "max_endpoints_per_owner", .json = "webhooks.max_endpoints_per_owner" },
+    .{ .zig = "on_event", .omitted = "anole_webhooks_watch delivers ANOLE_EV_WEBHOOK_STATUS" },
+    .{ .zig = "clock", .omitted = "tests / Zig only" },
+};
+
+/// `anole.webhooks.Verify.Options` against the `webhook_verify` middleware.
+pub const webhook_verify_options = [_]Entry{
+    .{ .zig = "preset", .json = "middleware[].webhook_verify.preset" },
+    .{ .zig = "secrets", .json = "middleware[].webhook_verify.secrets", .kind = .custom, .note = "secrets, or secrets_env naming a variable with one secret or several separated by spaces" },
+    .{ .zig = "tolerance", .json = "middleware[].webhook_verify.tolerance_ms", .kind = .ms },
+    .{ .zig = "dedup", .json = "middleware[].webhook_verify.dedup", .kind = .custom, .note = "\"memory\", \"none\" or \"redis:<database>\"; dedup_ttl_ms is the ttl" },
+    .{ .zig = "on_store_error", .json = "middleware[].webhook_verify.on_store_error" },
+    .{ .zig = "hmac", .json = "middleware[].webhook_verify.hmac", .kind = .custom, .note = "header, algorithm, encoding, prefix, id_header" },
+    .{ .zig = "clock", .omitted = "tests / Zig only" },
+};
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----

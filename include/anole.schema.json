@@ -187,6 +187,17 @@
     "jobs": {
       "$ref": "#/$defs/Jobs",
       "description": "The durable job queue for anole_jobs_*."
+    },
+    "webhooks": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Webhooks"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Webhooks out (needs jobs)."
     }
   },
   "$defs": {
@@ -1540,6 +1551,137 @@
           },
           "required": [
             "rate_limit"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "webhook_verify": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Checks an incoming webhook's signature before the handler runs (400 when wrong) and drops duplicate deliveries (200 for one already processed, 409 while it is being processed).",
+              "properties": {
+                "preset": {
+                  "enum": [
+                    "standard",
+                    "stripe",
+                    "github",
+                    "slack",
+                    "hmac"
+                  ]
+                },
+                "secrets": {
+                  "anyOf": [
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "One or more (rotation). standard: whsec_<base64> (v1) or whpk_<base64> (v1a public key); stripe: the whsec_ text as it is; github, slack, hmac: the shared secret."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "secrets_env": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "description": "An environment variable holding one secret, or several separated by spaces."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tolerance_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 300000,
+                  "description": "The timestamp window, both directions (standard, stripe, slack)."
+                },
+                "dedup": {
+                  "type": "string",
+                  "default": "memory",
+                  "pattern": "^(memory|none|redis:.+)$",
+                  "description": "\"memory\", \"none\" or \"redis:<databases[].name>\"."
+                },
+                "dedup_ttl_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 86400000
+                },
+                "on_store_error": {
+                  "enum": [
+                    "reject",
+                    "process"
+                  ],
+                  "default": "reject",
+                  "description": "When the duplicate store fails: answer 503, or run the handler without it."
+                },
+                "hmac": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "header": {
+                          "type": "string"
+                        },
+                        "algorithm": {
+                          "enum": [
+                            "sha1",
+                            "sha256",
+                            "sha512"
+                          ],
+                          "default": "sha256"
+                        },
+                        "encoding": {
+                          "enum": [
+                            "hex",
+                            "base64"
+                          ],
+                          "default": "hex"
+                        },
+                        "prefix": {
+                          "type": "string",
+                          "default": "",
+                          "description": "Stripped from the header value first (\"sha256=\")."
+                        },
+                        "id_header": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "description": "A header with the delivery's id, for duplicates."
+                        }
+                      },
+                      "required": [
+                        "header"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "With preset hmac."
+                }
+              },
+              "required": [
+                "preset"
+              ]
+            }
+          },
+          "required": [
+            "webhook_verify"
           ]
         }
       ]
@@ -3997,6 +4139,203 @@
         },
         "missed": { "enum": ["once", "skip", "all"], "default": "once" },
         "catch_up_ms": { "type": "integer", "minimum": 0, "default": 86400000 }
+      }
+    },
+    "Webhooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Webhooks out (-Dwebhooks; needs \"jobs\"): endpoints, signed deliveries run as jobs, retries with backoff and the delivery log. Endpoint management and replay go through anole_jobs_admin; anole_webhooks_publish sends events.",
+      "properties": {
+        "queue": {
+          "type": "string",
+          "default": "webhooks",
+          "description": "The jobs queue deliveries run on."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 32,
+          "description": "Deliveries at once in this process."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 15000,
+          "description": "Per attempt."
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 10,
+          "description": "Every try, the first included."
+        },
+        "backoff": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "base_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 5000,
+              "description": "The first retry's ceiling."
+            },
+            "max_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 86400000
+            },
+            "multiplier": {
+              "type": "number",
+              "minimum": 1,
+              "default": 5,
+              "description": "Ceilings 5 s, 25 s, 2 min, 10 min, 52 min, 4.3 h, 21.7 h, 24 h."
+            },
+            "jitter": {
+              "enum": [
+                "full",
+                "equal",
+                "none"
+              ],
+              "default": "equal"
+            }
+          }
+        },
+        "breaker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "consecutive_failures": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5,
+                  "description": "Open after this many failures in a row; 0: not this rule."
+                },
+                "failure_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.5,
+                  "description": "Open when failures / calls reaches this over window_ms, once min_calls calls are in it; 0: not this rule."
+                },
+                "min_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 20
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000,
+                  "description": "The failure ratio's sliding window."
+                },
+                "open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5000,
+                  "description": "The first open period; it doubles after each failed probe."
+                },
+                "max_open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 60000
+                },
+                "half_open_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255,
+                  "default": 1,
+                  "description": "Calls let through at once while half-open."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A circuit breaker per endpoint origin (scheme, host and port): while open, deliveries wait without an attempt. null: none."
+        },
+        "allow_private_addresses": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Deliver to loopback and private addresses. null: allowed in development, refused in production."
+        },
+        "require_https": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Refuse http:// endpoints. null: not required in development, required in production."
+        },
+        "user_agent": {
+          "type": "string",
+          "default": "Anole-Webhooks"
+        },
+        "max_payload": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "A larger data is refused (ANOLE_E_INVALID)."
+        },
+        "response_kept": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 4096,
+          "description": "Bytes of an endpoint's answer kept in the log."
+        },
+        "keep_messages_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2592000000
+        },
+        "keep_attempts_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2592000000
+        },
+        "disable_after_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 432000000,
+          "description": "An endpoint whose deliveries have all failed for this long is disabled."
+        },
+        "secrets_key_env": {
+          "type": "string",
+          "default": "ANOLE_WEBHOOKS_KEY",
+          "description": "The environment variable holding the 32-byte base64 key that encrypts stored secrets; \"\" for none."
+        },
+        "max_endpoints_per_owner": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 100
+        }
       }
     }
   }

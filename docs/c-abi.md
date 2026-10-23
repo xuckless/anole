@@ -301,8 +301,8 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_JOB_CANCEL` (106) | `anole_job_cancel_event`: a held job was canceled | `anole_job` | ends it |
 | `ANOLE_EV_JOB_WORKER_END` (107) | `anole_job_worker_end_event`: the worker stopped | `anole_job_worker` | ends it |
 | `ANOLE_EV_JOBS_RESULT` (108) | `anole_jobs_result_event`: the answer to an admin call | 0 | none |
-| `ANOLE_EV_WEBHOOK_PUBLISHED` (109) | `anole_webhook_published_event`: the answer to `anole_webhooks_publish` (p3/webhooks) | 0, or the `anole_db_tx` | none |
-| `ANOLE_EV_WEBHOOK_STATUS` (110) | `anole_webhook_status_event` | 0 | none |
+| `ANOLE_EV_WEBHOOK_PUBLISHED` (109) | `anole_webhook_published_event`: the answer to `anole_webhooks_publish` without a transaction (p3/webhooks; with `tx`, the answer is `ANOLE_EV_DB_RESULT` on the transaction) | 0 | none |
+| `ANOLE_EV_WEBHOOK_STATUS` (110) | `anole_webhook_status_event`: a delivery ran out of attempts, or an endpoint was disabled; only after `anole_webhooks_watch` | 0 | none |
 | (111) | reserved for jobs and webhooks | | |
 | `ANOLE_EV_SSE_SUBSCRIBE` (112) | `anole_request_event`: a subscriber on a consumer's SSE route (ABI 0.10, p3/realtime) | `anole_req` | `anole_sse_accept`, or any request answer (a refusal) |
 | `ANOLE_EV_SSE_CLOSE` (113) | `anole_sse_close_event`: the subscriber is gone | `anole_sse` | ends it |
@@ -1832,3 +1832,28 @@ Auth beyond the configured `jwt` middleware comes later.
 ## Breakers and retries (databases)
 
 Every `databases[]` entry of a network connector (PostgreSQL, Redis, MongoDB) takes `"breaker"` (an object with `consecutive_failures`, `failure_ratio`, `min_calls`, `window_ms`, `open_ms`, `max_open_ms`, `half_open_calls`; `null` turns it off; ignored for SQLite) and `"retry"` (`attempts`, `base_ms`, `max_ms`, `multiplier`, `attempt_timeout_ms`, `max_retry_after_ms`). `ANOLE_DB_F_RETRY` marks a query that may run again on a transient failure; it is refused (`ANOLE_E_INVALID`) on `anole_db_tx_query` and `anole_db_tx_exec`, and SQLite and MongoDB ignore it. An open breaker answers `ANOLE_EV_DB_RESULT` with `status = ANOLE_E_DB`, `error_class = ANOLE_DB_ERR_UNAVAILABLE`, `http_status = 503` and `error_code = "circuit_open"`.
+
+## Webhooks
+
+Two things, both native: sending signed webhooks to your customers' endpoints, and checking the ones you receive. Neither needs your language except to say what happened.
+
+### Out (`-Dwebhooks`, needs `"jobs"`)
+
+The `"webhooks"` configuration turns on endpoints, signed deliveries and the delivery log. Each delivery runs as a job: signed as [Standard Webhooks](https://www.standardwebhooks.com) (`webhook-id`, `webhook-timestamp`, `webhook-signature`), sent through a client that refuses private addresses in production, retried with backoff for about three days (5 s, 25 s, 2 min, 10 min, 52 min, 4.3 h, 21.7 h, 24 h), and recorded. A `410` disables the endpoint. An endpoint whose deliveries all failed for `disable_after_ms` (5 days) is disabled. Secrets are encrypted at rest with XChaCha20-Poly1305 when the variable named by `secrets_key_env` holds a 32-byte base64 key.
+
+- `anole_webhooks_publish(jobs, consumer, &out, user_data)` sends one event (copied) to the owner's matching endpoints. It returns at once; `ANOLE_EV_WEBHOOK_PUBLISHED` answers with the message id, the number of deliveries and `duplicate` (the `id` was published before: nothing new is enqueued). `anole_webhook_out.tx` names an open `anole_db_tx`: the deliveries are enqueued in that transaction, so they exist only if it commits, and the answer is `ANOLE_EV_DB_RESULT` on the transaction (`rows_affected` is the number of deliveries).
+- `anole_webhooks_watch(jobs, consumer, user_data)` sends `ANOLE_EV_WEBHOOK_STATUS` to that consumer when a delivery is dead or an endpoint was disabled, so your app can tell its customer. Calling it again replaces the consumer.
+- Endpoints (create, update, delete, list, rotate the secret, enable) and replaying or recovering messages go through `anole_jobs_admin` (`webhooks.*`).
+
+A send returns once the event is buffered; a slow endpoint never blocks the caller.
+
+### In (`webhook_verify`)
+
+A native middleware, on the whole server or a route:
+
+```json
+{ "webhook_verify": { "preset": "stripe", "secrets_env": "STRIPE_WEBHOOK_SECRET" } }
+```
+
+Presets: `standard` (v1 HMAC and v1a Ed25519), `stripe`, `github`, `slack`, `hmac` (a header, algorithm, encoding and prefix of your choice). The signature is checked over the body as received; several secrets are tried (rotation). A missing or wrong signature, or a timestamp outside `tolerance_ms` (5 minutes), answers 400 with no detail. A delivery id seen before answers 200 without reaching your handler; one still being processed answers 409 with `Retry-After`. `dedup` is `"memory"` (the default), `"none"` or `"redis:<database>"`. Read the body with the request's body and parse that, never a re-serialized copy.
+
