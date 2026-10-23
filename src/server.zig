@@ -2727,6 +2727,33 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         // ---- end p3/s3 ----
 
         // ---- p3/smtp ----
+        const smtp_mod = if (features.smtp) @import("smtp/root.zig") else struct {
+            pub const Options = struct {};
+            pub const Client = struct {};
+        };
+
+        /// An SMTP client for sending mail, owned by the server:
+        /// `state.mail = try app.smtp(.{});` reads `SMTP_URL`
+        /// (`smtp://user:pass@host:587` for STARTTLS, `smtps://` for TLS from
+        /// the first byte), else sends to Mailpit's `smtp://127.0.0.1:1025`
+        /// outside production; in production a missing `SMTP_URL` is
+        /// `error.InvalidOptions`. Nothing connects before the first send.
+        /// Once serving, it reports to `app.metrics`, `app.tracing` and
+        /// `app.health` when the app has them, and is drained and closed with
+        /// the server. See `anole.smtp`.
+        pub fn smtp(self: *Self, config: smtp_mod.Options) !*smtp_mod.Client {
+            if (comptime !features.smtp) @compileError("app.smtp needs SMTP (-Dsmtp, on in the web and full profiles)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            if (opts.environment == null) opts.environment = self.environment();
+            const m = try smtp_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer m.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(smtp_mod.Client, m));
+            if (self.extras.connectors_started) try m.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return m;
+        }
         // ---- end p3/smtp ----
 
         // ---- p3/lambda ----
