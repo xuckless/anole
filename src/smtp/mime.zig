@@ -844,7 +844,7 @@ test "writeData: stuffs the parts and streams a file attachment" {
     // The base64 decodes to the file.
     const marker = "Content-Transfer-Encoding: base64\r\nContent-Disposition: attachment;\r\n filename=\"big.bin\"\r\n\r\n";
     const start = std.mem.indexOf(u8, out, marker).? + marker.len;
-    const end = std.mem.lastIndexOf(u8, out, "\r\n------").?;
+    const end = std.mem.lastIndexOf(u8, out, "\r\n----").?;
     var decoded: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitSequence(u8, out[start..end], "\r\n");
     while (lines.next()) |line| {

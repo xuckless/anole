@@ -418,7 +418,7 @@ pub const Session = struct {
     fn noRecipients(self: *Session, ctx: *const Ctx, map: db.ErrorMap, deferred: bool, first: ?Reply, rejected: []const Rejected) db.Error {
         _ = self;
         const f = first.?;
-        const detail = std.fmt.allocPrint(ctx.arena, "{s}: {d} {s}", .{ rejected[0].address, f.code, rejected[0].message }) catch "every recipient was refused";
+        const detail = std.fmt.allocPrint(ctx.arena, "{d} {s} (recipient {s})", .{ f.code, rejected[0].message, rejected[0].address }) catch "every recipient was refused";
         if (f.code == 421) return ctx.fail(map, .{ .system = .smtp, .class = .unavailable, .code = "service_unavailable", .message = detail });
         if (deferred) return ctx.fail(map, .{ .system = .smtp, .class = .unavailable, .code = "recipients_deferred", .message = detail });
         return ctx.fail(map, .{ .system = .smtp, .class = .invalid, .code = "recipient_rejected", .message = detail });

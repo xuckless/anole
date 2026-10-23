@@ -98,6 +98,7 @@ fn unquote(arena: std.mem.Allocator, phrase: []const u8) Error!?[]const u8 {
 /// literal, no spaces, no control characters.
 pub fn checkAddress(address: []const u8) error{InvalidAddress}!void {
     if (address.len < 3 or address.len > max_address) return error.InvalidAddress;
+    for (address) |b| if (b < 0x20 or b == 0x7f) return error.InvalidAddress;
     var in_quote = false;
     var escaped = false;
     var at: ?usize = null;

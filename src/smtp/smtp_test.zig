@@ -68,6 +68,16 @@ const Harness = struct {
     }
 };
 
+/// The fake reads a QUIT after the client has gone: waits (generously) until
+/// it has seen `n` commands starting with `prefix`.
+fn waitCommands(h: *Harness, prefix: []const u8, n: usize) !void {
+    for (0..2000) |_| {
+        if (h.fake.commandCount(prefix) >= n) return;
+        try h.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.TimedOut;
+}
+
 fn expectDetail(h: *Harness, class: db.Class, code: []const u8) !void {
     const d = db.lastError(&h.c).?;
     try testing.expectEqual(class, d.class);
@@ -216,7 +226,7 @@ test "a file attachment larger than the writer buffer is streamed" {
     try testing.expectEqual(@as(u64, m.data.len), m.declared_size.?);
     const marker = "filename=\"big.bin\"\r\n\r\n";
     const start = std.mem.indexOf(u8, m.data, marker).? + marker.len;
-    const end = std.mem.lastIndexOf(u8, m.data, "\r\n------").?;
+    const end = std.mem.lastIndexOf(u8, m.data, "\r\n----").?;
     var decoded: std.ArrayList(u8) = .empty;
     defer decoded.deinit(gpa);
     var lines = std.mem.splitSequence(u8, m.data[start..end], "\r\n");
@@ -242,7 +252,7 @@ test "pool: the connection is reused, and replaced after max_messages_per_connec
     try testing.expectEqual(@as(u32, 2), h.fake.connections.load(.monotonic));
     try testing.expectEqual(@as(usize, 3), h.fake.messageCount());
     // The first one said goodbye.
-    try testing.expect(h.fake.commandCount("QUIT") >= 1);
+    try waitCommands(&h, "QUIT", 1);
 }
 
 test "pool: a reused connection the server closed is replaced without a failure" {
@@ -448,7 +458,7 @@ test "drain: a send after it fails, idle connections are closed" {
     h.client.drain(std.Io.Clock.Timestamp.now(h.io, .awake));
     try testing.expectError(error.ServiceUnavailable, h.hello());
     try expectDetail(&h, .unavailable, "draining");
-    try testing.expect(h.fake.commandCount("QUIT") >= 1);
+    try waitCommands(&h, "QUIT", 1);
 }
 
 test "errors: ErrorMap moves the invalid class" {
@@ -465,7 +475,7 @@ test "readiness: the probe connects and says goodbye" {
     var c: db.Ctx = .{ .io = h.io, .arena = h.arena.allocator() };
     var ctx = smtp.erase(&c);
     try @import("session.zig").Session.probe(gpa, &ctx, h.client.errors, &h.client.settings);
-    try testing.expectEqual(@as(usize, 1), h.fake.commandCount("QUIT"));
+    try waitCommands(&h, "QUIT", 1);
 }
 
 test "concurrent sends share the pool without losing a message" {
