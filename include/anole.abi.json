@@ -2,8 +2,8 @@
   "anole_abi_json": 1,
   "abi": {
     "major": 0,
-    "minor": 9,
-    "version": 9
+    "minor": 10,
+    "version": 10
   },
   "endian": "little",
   "record_align": 8,

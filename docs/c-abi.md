@@ -2000,6 +2000,31 @@ server in C and its client in Zig (`tests/capi/wt_client.zig`, built with
 the suite and passed to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
 
+## From ABI 0.9
+
+ABI 0.10 comes with Anole 0.4.0. A 0.9 binding rebuilds against the new
+`anole.h` (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0). What it
+notices:
+
+- A handle's kind takes five bits (28-32): Kafka groups and batches are
+  kinds 17 and 18 (`anole_kafka_group`, `anole_kafka_batch`), no longer NATS
+  kinds with a marker bit, so a NATS handle given to a Kafka call (or the
+  reverse) is `ANOLE_E_INVALID` (`WrongHandleKind`). Handles stay opaque.
+- One new status, `ANOLE_E_SERVICE` (-13), for the object store and mail
+  calls.
+- New event types, each sent only to a consumer that configures its area:
+  raw TCP/UDP 96-100, jobs 104-108, webhooks 109-110, SSE 112-113, watch
+  116-118, S3 124-125, SMTP 126; and handle kinds 10-16 (`anole_net_conn`,
+  `anole_net_udp`, `anole_job_worker`, `anole_job`, `anole_sse`,
+  `anole_watch_sub`, `anole_s3_transfer`). A `switch` over every event type
+  needs the new names; a default case keeps working.
+- `anole_stats` has six more `u64` fields at the end (the raw TCP/UDP
+  counters); a caller that passes its `size` gets the fields it knows.
+- New configuration keys: `"tcp"`/`"udp"` listeners, `"jobs"`,
+  `"webhooks"`, `"storage"`, `"mail"`, `"sse"` (and `"sse"` routes),
+  `"watches"`, `"lambda"`, and `"deployment": "lambda"`, which no longer
+  fails with `DeploymentUnavailable`.
+
 ## From ABI 0.6
 
 ABI 0.8 only adds `anole_wt_stream_set_priority`; nothing from 0.7 changes.
@@ -2055,7 +2080,9 @@ reasons, the SENT contract and a poll that never drops an event. 0.8 adds
 `anole_wt_stream_set_priority`. 0.9 is the developer-experience release:
 environment and deployment modes with `.env` files, the NATS and Kafka
 brokers, breakers and retries on databases, JSON Lines logs, the banner and
-the live console. Before 1.0
+the live console. 0.10 adds raw TCP and UDP listeners, jobs and webhooks,
+SSE topics and watches, S3 and SMTP, gRPC over HTTP/3 for services in the
+language, and AWS Lambda, with five bits for a handle's kind. Before 1.0
 every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
 The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 

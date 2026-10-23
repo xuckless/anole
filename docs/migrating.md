@@ -9,6 +9,7 @@
 | An exhaustive `switch` on `anole.ServerError` | add the cases `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`, `TcpAndUdp`, `UdpWithTls`, `UdpOnUnixSocket`, `UdpWithProxyProtocol`, `InvalidFraming` and `NetHandlerContext` |
 | A restart (`process`) with up to 255 HTTP/3 sockets | `handoff.max_listeners` is 64 TCP listeners (raw TCP ones among them) and 1024 UDP sockets (HTTP/3's and every raw UDP listener's); no program that fit before fails |
 | `ServerOptions.Listener` built field by field | new fields `tcp` and `udp` (null); a server that names only raw listeners opens no HTTP listener, where before `run()` with no `http` or `https` always opened 127.0.0.1:8080 (a server that names a listener of any kind never did) |
+| A binding built against C ABI 0.9 | rebuild against the new `anole.h`: the ABI is 0.10 (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0); Kafka groups and batches are handle kinds 17 and 18, so a NATS handle given to a Kafka call is `ANOLE_E_INVALID`; new status `ANOLE_E_SERVICE` (-13); docs/c-abi.md, "From ABI 0.9" |
 | The C ABI's `anole_stats` of 0.9 | six more `u64` fields at the end (`net_connections` ... `udp_datagrams_dropped`); a caller passing its `size` gets the fields it knows |
 | `anole.http.Client` over HTTPS offered only HTTP/1.1 | it offers h2 too (`ClientOptions.http2` is on by default) and shares one connection per origin and executor; `.http2 = false` keeps 0.3's behaviour |
 | `channel.conn` (read) | `channel.conn.?` (the field is optional; `h3` is the other connection) |

@@ -162,10 +162,13 @@ breaking changes are listed anyway.
 - `deployment = .lambda` no longer fails with `DeploymentUnavailable`; that
   error is gone.
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
-- C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
-  batches are kinds of their own (17 and 18): a NATS handle given to a
-  Kafka call is now `ANOLE_E_INVALID` (`WrongHandleKind`). Handles stay
-  opaque.
+- C ABI 0.10: the C ABI is now 0.10 (`ANOLE_ABI_VERSION`, `x-anole-abi`;
+  before 1.0 a binding needs the exact version). A handle's kind takes five
+  bits (28-32), so Kafka groups and batches are kinds of their own (17 and
+  18): a NATS handle given to a Kafka call is now `ANOLE_E_INVALID`
+  (`WrongHandleKind`). Handles stay opaque. New status `ANOLE_E_SERVICE`
+  (-13); events 96-126 and handle kinds 10-16 as listed above
+  (docs/c-abi.md, "From ABI 0.9").
 
 ### Fixed
 

@@ -105,7 +105,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 9 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
+#define ANOLE_ABI_VERSION_MINOR 10 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 /* Whether a library reporting anole_abi_version() == v serves code built
    against this header. Before 1.0 both numbers must match (every 0.x minor
@@ -157,7 +157,7 @@ enum {
   ANOLE_E_DB = -11,         /* a database refused a statement (anole_db_result_event) */
   ANOLE_E_BROKER = -12,     /* a message broker refused a call or could not be reached
                                (anole_nats_reply_event: error_class says why) */
-  ANOLE_E_SERVICE = -13     /* an object store or mail server refused a call or could not be
+  ANOLE_E_SERVICE = -13     /* ABI 0.10: an object store or mail server refused a call or could not be
                                reached (the record's error_class, http_status and error_code
                                say why) */
 };
@@ -189,10 +189,10 @@ ANOLE_API anole_str anole_version(void);
 ANOLE_API int32_t anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
-   (a request, a WebSocket, a gRPC call, a WebTransport session or stream, a
-   database transaction), and a function given a handle of another
-   kind, or 0, answers ANOLE_E_INVALID. The bits are Anole's: treat them as
-   opaque. */
+   (one typedef below each), and a function given a handle of another kind,
+   or 0, answers ANOLE_E_INVALID. The bits are Anole's: treat them as opaque
+   (since ABI 0.10 the kind has five bits, so Kafka groups and batches are
+   kinds of their own). */
 typedef uint64_t anole_req;       /* one request: from ANOLE_EV_REQUEST until answered */
 typedef uint64_t anole_ws;        /* one WebSocket: from ANOLE_EV_WS_OPEN until ANOLE_EV_WS_CLOSE */
 typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL until finished or aborted */
