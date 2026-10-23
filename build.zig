@@ -459,8 +459,12 @@ pub fn build(b: *std.Build) void {
 
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
+    // `zig build test -Dtest-filter="WebSocket over HTTP/2"` runs only the
+    // main suite's tests whose names contain the text (repeatable).
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only the main suite's tests whose names contain this text") orelse &.{};
     const tests = b.addTest(.{
         .name = "anole-test",
+        .filters = test_filters,
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
         .use_llvm = use_llvm,
     });
