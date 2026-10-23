@@ -34,6 +34,7 @@ const nghttp3_build = @import("build/nghttp3.zig");
 const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
 const brotli_build = @import("build/brotli.zig");
+const lz4_build = @import("build/lz4.zig");
 const yyjson_build = @import("build/yyjson.zig");
 const upb_build = @import("build/upb.zig");
 const hiredis_build = @import("build/hiredis.zig");
@@ -1592,6 +1593,8 @@ const CModules = struct {
     zstd: ?*std.Build.Module = null,
     /// brotli/encode.h and brotli/decode.h (brotli)
     brotli: ?*std.Build.Module = null,
+    /// lz4.h, lz4hc.h and lz4frame.h (kafka)
+    lz4: ?*std.Build.Module = null,
     /// xuckless/websocket-zig, the sans-IO frame codec for WebSocket over
     /// HTTP/2 (websocket). Pure Zig, but fetched lazily like the C libraries.
     websocket: ?*std.Build.Module = null,
@@ -1628,6 +1631,7 @@ const CModules = struct {
         const zlib_ng_dep = if (f.compression) b.lazyDependency("zlib_ng", .{}) else null;
         const zstd_dep = if (f.compression) b.lazyDependency("zstd", .{}) else null;
         const brotli_dep = if (f.brotli) b.lazyDependency("brotli", .{}) else null;
+        const lz4_dep = if (f.kafka) b.lazyDependency("lz4", .{}) else null;
         // Only its src/root.zig is used (its module would compile a second,
         // vendored zlib).
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
@@ -1652,6 +1656,7 @@ const CModules = struct {
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
         if (f.brotli and brotli_dep == null) return null;
+        if (f.kafka and lz4_dep == null) return null;
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
@@ -1712,6 +1717,10 @@ const CModules = struct {
         if (brotli_dep) |up| {
             const lib = brotli_build.library(b, up, target, optimize);
             m.brotli = brotli_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
+        if (lz4_dep) |up| {
+            const lib = lz4_build.library(b, up, target, optimize);
+            m.lz4 = lz4_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
 
         if (nghttp2_dep) |up| {
@@ -1877,6 +1886,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         mod.addImport("anole_zstd_c", o.c.zstd.?);
     }
     if (f.brotli) mod.addImport("anole_brotli_c", o.c.brotli.?);
+    if (f.kafka) mod.addImport("anole_lz4_c", o.c.lz4.?);
     if (f.needsTls()) {
         mod.addImport("anole_boringssl_c", o.c.boringssl.?);
         mod.addImport("anole_dusty_tls", o.core.tls_seam.?);
