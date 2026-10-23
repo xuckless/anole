@@ -382,10 +382,10 @@ fn retire(x: *Exec, s: *SseSlot, g: u32, reason: u32) void {
 fn onWritten(sub: *sse.Subscriber, bytes: usize) void {
     const ctx = sub.context orelse return;
     const slot: *SseSlot = @ptrCast(@alignCast(ctx));
-    const before = slot.pending_bytes.fetchSub(bytes, .acq_rel);
+    const before = slot.pending_bytes.fetchSub(bytes, .seq_cst);
     const left = before -| bytes;
     const cap = sub.hub.options.max_queued_bytes;
-    if (left <= cap / 4 and slot.want_event.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null) {
+    if (left <= cap / 4 and slot.want_event.cmpxchgStrong(true, false, .seq_cst, .seq_cst) == null) {
         slot.exec.postEvent(.writable, slot.handle(slot.gen()));
     }
 }
@@ -426,7 +426,7 @@ fn run(cmd: *Command, x: *Exec) void {
 fn dropCmd(e: *Engine, c: *SseCmd) void {
     if (c.kind == .send) if (c.payload) |p| {
         if (slotOf(e, c.handle)) |found| {
-            _ = found[0].pending_bytes.fetchSub(p.len, .acq_rel);
+            _ = found[0].pending_bytes.fetchSub(p.cost(), .acq_rel);
         } else |_| {}
     };
     const counted = c.counted;
@@ -442,7 +442,7 @@ fn applyCmd(e: *Engine, s: *SseSlot, c: *SseCmd) void {
         .send => {
             const p = c.payload.?;
             sub._sendPayload(p) catch {
-                _ = s.pending_bytes.fetchSub(p.len, .acq_rel);
+                _ = s.pending_bytes.fetchSub(p.cost(), .acq_rel);
             };
         },
         .close => sub.close(),
@@ -504,16 +504,25 @@ pub fn send(e: *Engine, hv: u64, event: []const u8, data: []const u8) AnswerErro
     };
     errdefer p.release(gpa);
     const cap = topics.options.max_queued_bytes;
-    const before = s.pending_bytes.fetchAdd(p.len, .acq_rel);
-    if (before > 0 and before + p.len > cap) {
-        _ = s.pending_bytes.fetchSub(p.len, .acq_rel);
-        s.want_event.store(true, .release);
+    // Counted as the hub counts (its queue refuses past `cap` of costs),
+    // and until the bytes are written, so this refuses no later than it.
+    const cost = p.cost();
+    var before: usize = undefined;
+    while (true) {
+        before = s.pending_bytes.fetchAdd(cost, .seq_cst);
+        if (before == 0 or before + cost <= cap) break;
+        _ = s.pending_bytes.fetchSub(cost, .seq_cst);
+        s.want_event.store(true, .seq_cst);
+        // The writes may all have finished before the flag was up, and
+        // nothing is left to raise the WRITABLE: look again, and if so
+        // take the event after all.
+        if (s.pending_bytes.load(.seq_cst) == 0 and s.want_event.cmpxchgStrong(true, false, .seq_cst, .seq_cst) == null) continue;
         return error.Again;
     }
-    const busy = before + p.len > cap / 2;
+    const busy = before + cost > cap / 2;
     if (busy) s.want_event.store(true, .release);
     const c = gpa.create(SseCmd) catch {
-        _ = s.pending_bytes.fetchSub(p.len, .acq_rel);
+        _ = s.pending_bytes.fetchSub(cost, .acq_rel);
         return error.OutOfMemory;
     };
     c.* = .{ .handle = hv, .kind = .send, .payload = p };
@@ -530,6 +539,8 @@ const PublishCmd = struct {
     topic: []u8,
     payload: *sse.Payload,
     record: bool,
+    /// What was added to `publish_bytes` for it.
+    size: usize,
     /// `Engine.sse_state.topic_changes` when it was taken.
     after: u32,
     next: ?*PublishCmd = null,
@@ -537,7 +548,7 @@ const PublishCmd = struct {
     fn free(p: *PublishCmd) void {
         const st = &p.engine.sse_state;
         _ = st.publishing.fetchSub(1, .monotonic);
-        _ = st.publish_bytes.fetchSub(p.topic.len + p.payload.len, .monotonic);
+        _ = st.publish_bytes.fetchSub(p.size, .monotonic);
         gpa.free(p.topic);
         p.payload.release(gpa);
         gpa.destroy(p);
@@ -586,7 +597,7 @@ pub fn publish(e: *Engine, topic: []const u8, event: []const u8, data: []const u
         error.OutOfMemory => error.OutOfMemory,
         else => error.Invalid,
     };
-    p.* = .{ .engine = e, .topic = t, .payload = payload, .record = flags & abi.SSE_F_NO_REPLAY == 0, .after = st.topic_changes.load(.acquire) };
+    p.* = .{ .engine = e, .topic = t, .payload = payload, .record = flags & abi.SSE_F_NO_REPLAY == 0, .size = size, .after = st.topic_changes.load(.acquire) };
     // One executor per topic, so publishes to a topic fan out in the order
     // they were taken.
     const xi: usize = @intCast(std.hash.Wyhash.hash(0, topic) % e.execs.len);

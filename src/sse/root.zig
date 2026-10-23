@@ -961,7 +961,7 @@ pub const Topics = struct {
                             }
                             parts[np] = p.body();
                             np += 1;
-                            if (p.seq == 0) sent_bytes += p.len;
+                            if (p.seq == 0) sent_bytes += p.cost();
                         },
                         else => {
                             parts[np] = p.body();
