@@ -2744,6 +2744,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const j = try jobs_mod.Client.init(self.gpa, self.rt.io(), config);
             errdefer j.deinit();
             j.suppress_workers = self.mode.deployment == .lambda;
+            j.drain_event = &self.server.draining;
             try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
             if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return j;

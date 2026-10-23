@@ -261,6 +261,15 @@ server)
             dbcc9677e6364997d1c897dc813985d76504e2b0
   Linked:   -Dnats=true
 
+src/cron/vectors_test.zig (cron next-time test vectors)
+  The expressions and expected fire times of the 5-field cases in
+  src/cron.zig's tests, adapted (6 and 7 field forms, `L<weekday>` and the
+  both-day-fields-must-match case are left out). Test code only.
+  Licence:  MIT. Copyright (c) 2023 Hanaasagi
+  Source:   https://github.com/dying-will-bullet/cron, commit
+            91ab895b5a910449e20a6e873cc01a8b27001ad6
+  Linked:   tests only
+
 src/http/core/llhttp/ (llhttp 9.3.1, the HTTP/1.1 parser, as dusty
 vendored it; its licence is src/http/core/llhttp/LICENSE)
   Licence:  MIT. Copyright Fedor Indutny, 2018

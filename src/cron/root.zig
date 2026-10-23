@@ -326,6 +326,19 @@ fn parseDow(text: []const u8, base: usize, d: *Diagnostic, s: *Schedule) error{B
             s.dow_last |= @as(u8, 1) << @intCast(wd);
             continue;
         }
+        if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
+            if (std.mem.indexOfScalar(u8, item, '/') == null) {
+                const a = dowValue(item[0..dash]) orelse return fail(d, "day-of-week", base, "bad weekday");
+                const b = dowValue(item[dash + 1 ..]) orelse return fail(d, "day-of-week", base, "bad weekday");
+                // A range may wrap past Saturday ("sat-sun", "5-7").
+                var v = a;
+                while (true) : (v = (v + 1) % 7) {
+                    s.dow |= @as(u8, 1) << @intCast(v);
+                    if (v == b) break;
+                }
+                continue;
+            }
+        }
         var tmp: Schedule = .{};
         // Names and 7 = Sunday: map to 0..6 before the generic parser.
         var buf: [32]u8 = undefined;
@@ -357,6 +370,7 @@ fn dowValue(tok: []const u8) ?u8 {
 
 test {
     _ = zone;
+    _ = @import("vectors_test.zig");
 }
 
 fn at(y: i64, mo: i64, d: i64, h: i64, mi: i64) Time {

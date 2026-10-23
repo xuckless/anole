@@ -5,6 +5,7 @@
 //! is the reference.
 const std = @import("std");
 const root = @import("root.zig");
+const anole = @import("../root.zig");
 
 pub const Time = root.Time;
 pub const Id = root.Id;
@@ -124,11 +125,23 @@ pub const VTable = struct {
     cronTick: *const fn (ptr: *anyopaque, now: Time, name: []const u8, spec: []const u8, tick: Time, job: ?NewJob) anyerror!CronTick,
     leaderTake: *const fn (ptr: *anyopaque, owner: []const u8, now: Time, ttl: root.Duration) anyerror!bool,
     leaderRelease: *const fn (ptr: *anyopaque, owner: []const u8) anyerror!void,
+    /// `Client.enqueueIn`: the insert on the caller's open transaction (`tx`
+    /// is the connector's `*Tx`, whose kind `Backend.tx_kind` names). Null
+    /// for a store without transactions.
+    insertIn: ?*const fn (ptr: *anyopaque, tx: *anyopaque, ctx: *anole.db.Ctx, now: Time, job: NewJob) anyerror!root.Enqueued = null,
+    /// `Client.completeIn`: the conditional finish on the caller's transaction.
+    finishIn: ?*const fn (ptr: *anyopaque, tx: *anyopaque, ctx: *anole.db.Ctx, f: Finish) anyerror!bool = null,
 };
+
+/// Which connector's transaction a store takes in `insertIn`/`finishIn`.
+pub const TxKind = enum { none, sqlite, postgres };
 
 pub const Backend = struct {
     ptr: *anyopaque,
     vt: *const VTable,
     /// Whether `enqueueIn`/`completeIn` work (a PostgreSQL or SQLite store).
     transactional: bool = false,
+    tx_kind: TxKind = .none,
+    /// The connector client behind the store, to check a transaction belongs to it.
+    owner: ?*anyopaque = null,
 };

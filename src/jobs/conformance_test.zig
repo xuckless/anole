@@ -10,10 +10,7 @@ const testing_mod = @import("../testing/root.zig");
 
 fn Suite(comptime B: Backend) type {
     return struct {
-        const Ctx = struct {
-            io: std.Io,
-            arena: std.mem.Allocator,
-        };
+        const Ctx = anole.db.Ctx;
 
         const Fx = struct {
             arena_state: std.heap.ArenaAllocator,
@@ -307,7 +304,6 @@ fn Suite(comptime B: Backend) type {
             try std.testing.expectError(error.InvalidJob, fx.client.enqueueRaw(&fx.ctx, "t.plain", "{}", .{ .delay = .fromSeconds(1), .run_at = Time.fromSeconds(5) }));
             try std.testing.expectError(error.InvalidJob, fx.client.enqueueRaw(&fx.ctx, "bad kind!", "{}", .{}));
             try std.testing.expectError(error.InvalidJob, fx.client.enqueueRaw(&fx.ctx, "t.plain", "{}", .{ .meta = "[1]" }));
-            try std.testing.expectError(error.InvalidJob, fx.client.enqueueIn(undefined, &fx.ctx, @as(struct {}, .{}), .{}));
         }
 
         test "jobs: leader: two clients on one store, exactly one leads" {
@@ -385,6 +381,68 @@ fn Suite(comptime B: Backend) type {
             const r1 = try be.vt.cronTick(be.ptr, t, "tick", "*/10 * * * *", t, null);
             const r2 = try be.vt.cronTick(be.ptr, t, "tick", "*/10 * * * *", t, null);
             try std.testing.expect(r1.recorded and !r2.recorded);
+        }
+
+        const Typed = struct {
+            n: i64,
+            pub const job: root.Kind = plain;
+        };
+
+        var tx_fx: *Fx = undefined;
+        fn completingHandler(_: ?*anyopaque, job: *root.Job) anyerror!void {
+            var tx = try tx_fx.sq.begin(&tx_fx.ctx, .{});
+            defer tx.deinit();
+            try tx_fx.client.completeIn(&tx, job);
+            try tx.commit(&tx_fx.ctx);
+        }
+
+        test "jobs: enqueueIn rolls back with the transaction and commits with it" {
+            if (B != .sqlite) return error.SkipZigTest;
+            var fx: Fx = undefined;
+            try setup(&fx);
+            defer fx.deinit();
+            {
+                var tx = try fx.sq.begin(&fx.ctx, .{});
+                defer tx.deinit();
+                _ = try fx.client.enqueueIn(&tx, &fx.ctx, Typed{ .n = 1 }, .{});
+                try tx.rollback(&fx.ctx);
+            }
+            try std.testing.expectEqual(@as(u32, 0), (try fx.client.step(&fx.ctx)).ran);
+            {
+                var tx = try fx.sq.begin(&fx.ctx, .{});
+                defer tx.deinit();
+                _ = try fx.client.enqueueIn(&tx, &fx.ctx, Typed{ .n = 2 }, .{});
+                try tx.commit(&fx.ctx);
+            }
+            try std.testing.expectEqual(@as(u32, 1), (try fx.client.step(&fx.ctx)).completed);
+        }
+
+        test "jobs: completeIn completes inside the handler's transaction" {
+            if (B != .sqlite) return error.SkipZigTest;
+            var fx: Fx = undefined;
+            Probe.reset();
+            try fx.init(&.{.{ .name = "default" }});
+            defer fx.deinit();
+            tx_fx = &fx;
+            try fx.client.addHandler(plain, null, completingHandler);
+            try fx.client.start(null, null, null);
+            const e = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
+            const rep = try fx.client.step(&fx.ctx);
+            try std.testing.expectEqual(@as(u32, 1), rep.completed);
+            try std.testing.expectEqual(root.State.completed, (try fx.client.get(&fx.ctx, e.id)).?.state);
+        }
+
+        test "jobs: enqueueIn on a memory store is refused" {
+            if (B != .memory) return error.SkipZigTest;
+            if (!anole.features.sqlite) return error.SkipZigTest;
+            var fx: Fx = undefined;
+            try setup(&fx);
+            defer fx.deinit();
+            const sq = try anole.sqlite.Client.init(std.testing.allocator, std.testing.io, .{ .path = ":memory:" });
+            defer sq.deinit();
+            var tx = try sq.begin(&fx.ctx, .{});
+            defer tx.deinit();
+            try std.testing.expectError(error.InvalidJob, fx.client.enqueueIn(&tx, &fx.ctx, Typed{ .n = 1 }, .{}));
         }
 
         var bg_event: std.Io.Event = .unset;
