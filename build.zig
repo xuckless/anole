@@ -89,13 +89,17 @@ pub const Features = struct {
     /// OpenAPI 3.1 documents (`anole.openapi`, `app.openapi`). Pure Zig:
     /// no C library. libanole is always built without it.
     openapi: bool,
+    /// The live console (`anole console`, `c` + Enter in development): the
+    /// control socket, log and error rings and the terminal UI. Pure Zig:
+    /// no C library.
+    console: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false, .openapi = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false, .openapi = true },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true, .openapi = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false, .openapi = false, .console = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false, .openapi = true, .console = true },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true, .openapi = true, .console = true },
         };
     }
 
@@ -575,14 +579,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // The live console's std-only part (src/console/ui): protocol, client, TUI,
-    // restart logic. Part 2 imports it as "anole_console_ui" into the anole
-    // module, libanole and the CLI. libc is linked for the terminal calls.
-    const console_ui = b.createModule(.{
-        .root_source_file = b.path("src/console/ui/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
+    // restart logic. Imported as "anole_console_ui" into the anole module
+    // (and so libanole) and the CLI. Its own tests run here.
     {
         const ui_tests = b.addTest(.{
             .name = "console-ui-test",
@@ -601,7 +599,6 @@ pub fn build(b: *std.Build) void {
         compile_tests_step.dependOn(&ui_tests.step);
         b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
     }
-    _ = console_ui;
 
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
@@ -1364,6 +1361,8 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "templates", .module = tmpl },
                         // The startup banner (src/banner.zig, std only).
                         .{ .name = "banner", .module = bb.createModule(.{ .root_source_file = bb.path("src/banner.zig") }) },
+                        // The live console's client and terminal UI (src/console/ui, std only).
+                        .{ .name = "anole_console_ui", .module = bb.createModule(.{ .root_source_file = bb.path("src/console/ui/root.zig"), .target = tgt, .optimize = opt, .link_libc = true }) },
                     },
                 });
             }
@@ -1480,6 +1479,7 @@ fn resolveFeatures(b: *std.Build) Features {
     const nats = b.option(bool, "nats", "NATS client (overrides the profile)");
     const kafka = b.option(bool, "kafka", "Kafka client; needs -Dcompression=true (overrides the profile)");
     const openapi = b.option(bool, "openapi", "OpenAPI 3.1 document generation (overrides the profile)");
+    const console_opt = b.option(bool, "console", "The live console: control socket, rings and terminal UI (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -1498,6 +1498,7 @@ fn resolveFeatures(b: *std.Build) Features {
     if (nats) |v| f.nats = v;
     if (kafka) |v| f.kafka = v;
     if (openapi) |v| f.openapi = v;
+    if (console_opt) |v| f.console = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
@@ -1562,6 +1563,9 @@ const Core = struct {
     /// src/logging (the JSON Lines logger, no imports): `anole_log` in the
     /// HTTP core (`req.log()`) and in anole.
     anole_log: *std.Build.Module,
+    /// src/console/ui (the live console's std-only protocol, client, terminal
+    /// UI and restart logic): `anole_console_ui` in anole.
+    console_ui: *std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
@@ -1580,7 +1584,8 @@ const Core = struct {
         const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
         const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
-        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -1937,6 +1942,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "nats", f.nats);
     options.addOption(bool, "kafka", f.kafka);
     options.addOption(bool, "openapi", f.openapi);
+    options.addOption(bool, "console", f.console);
     // Live servers for tests (`-Dredis-test-port=6379` or
     // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
@@ -1961,6 +1967,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("resilience_core", o.core.resilience);
     mod.addImport("validate", o.core.validate);
     mod.addImport("anole_log", o.core.anole_log);
+    mod.addImport("anole_console_ui", o.core.console_ui);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));

@@ -24,6 +24,9 @@ pub const RouteInfo = struct {
     /// back (`Router.addRoute`). Null for the routes `get`, `post` and the
     /// like register.
     data: ?*const anyopaque = null,
+    /// 1-based, in registration order; 0 is "no route". The live console
+    /// keys its per-route numbers on it.
+    index: u32 = 0,
 };
 
 const NodeKind = enum {
@@ -100,6 +103,8 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
             /// See `RouteOptions.no_wait`.
             no_wait: bool = false,
+            /// The method it was registered for; null for `any`.
+            method: ?Method = null,
         };
 
         /// One method's route in `static_routes`; the methods for one path
@@ -129,6 +134,9 @@ pub fn Router(comptime Ctx: type) type {
         has_routes: bool = false,
         /// Some route was registered with `no_wait`.
         has_no_wait: bool = false,
+        /// Every route in registration order (`info.index - 1`), for the
+        /// live console's `/routes` and per-route names.
+        routes: std.ArrayList(*const Route) = .empty,
         /// A route that conflicts with one registered before it panics
         /// (a programmer error in Zig code) unless this is set: then it is
         /// left out, and the first conflict's message is kept in `conflict`
@@ -334,11 +342,13 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const route = try alloc.create(Route);
             route.* = .{
-                .info = .{ .path = try alloc.dupe(u8, path), .data = opts.data },
+                .info = .{ .path = try alloc.dupe(u8, path), .data = opts.data, .index = @intCast(self.routes.items.len + 1) },
                 .action = handler,
                 .middlewares = middlewares,
                 .no_wait = opts.no_wait,
+                .method = method,
             };
+            try self.routes.append(alloc, route);
             current.route = @ptrCast(route);
 
             if (method) |m| if (std.mem.indexOfAny(u8, path, ":*") == null) {

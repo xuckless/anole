@@ -921,6 +921,8 @@ pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
     config: Config,
     signals: bool,
+    /// `anole_console_close` is closing the console: no event 132.
+    console_quiet: std.atomic.Value(bool) = .init(false),
     consumers: std.ArrayList(*Consumer) = .empty,
     execs: []Exec = &.{},
     thread: ?std.Thread = null,
@@ -1274,6 +1276,18 @@ pub const Engine = struct {
             .error_detail = cfg.error_detail,
             .log = .{ .format = cfg.log.format, .service = cfg.log.service },
             .banner = cfg.banner,
+            .console = .{
+                .enabled = cfg.console.enabled,
+                .name = cfg.console.name,
+                .socket = cfg.console.socket,
+                .allow_restart = cfg.console.allow_restart,
+                .read_only = cfg.console.read_only,
+                .keys = false,
+                .log_buffer = cfg.console.log_buffer,
+                .errors_kept = cfg.console.errors_kept,
+                .max_routes = cfg.console.max_routes,
+            },
+            ._console_runtime = cfg.console.runtime,
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
@@ -1654,6 +1668,65 @@ pub const Engine = struct {
         const app = e.enter() orelse return error.State;
         defer e.leave();
         try app.setCertificate(cert);
+    }
+
+    // ---- the live console ---------------------------------------------------
+
+    pub const ConsoleError = error{ State, Disabled, OutOfMemory } || anole.console.inprocess.OpenError;
+
+    /// `anole_console_open`.
+    pub fn consoleOpen(e: *Engine) ConsoleError!void {
+        if (e.phase.load(.acquire) != .running) return error.State;
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
+        const c = app.console orelse return error.Disabled;
+        e.console_quiet.store(false, .release);
+        c.openInProcess(consoleClosed, e) catch |err| return switch (err) {
+            error.AlreadyOpen, error.NotRunning => error.State,
+            else => |x| x,
+        };
+    }
+
+    /// `anole_console_close`: no event.
+    pub fn consoleClose(e: *Engine) void {
+        const app = e.enter() orelse return;
+        defer e.leave();
+        const c = app.console orelse return;
+        if (!anole.console.inprocess.isOpen()) return;
+        e.console_quiet.store(true, .release);
+        c.closeInProcess();
+    }
+
+    pub fn consoleAttached(e: *Engine) i32 {
+        const app = e.enter() orelse return 0;
+        defer e.leave();
+        const c = app.console orelse return 0;
+        return @intCast(c.attached());
+    }
+
+    pub fn consoleReport(e: *Engine, items: []const anole.console.service.Metric) !void {
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
+        const c = app.console orelse return;
+        try c.service.setMetrics(items);
+    }
+
+    pub fn consoleLog(e: *Engine, level: std.log.Level, scope: []const u8, msg: []const u8) void {
+        const app = e.enter() orelse return;
+        defer e.leave();
+        const c = app.console orelse return;
+        c.logRecord(level, scope, "", "", msg);
+    }
+
+    /// On the console's thread: event 132 to consumer 0.
+    fn consoleClosed(ctx: ?*anyopaque, reason: anole.console.inprocess.CloseReason) void {
+        const e: *Engine = @ptrCast(@alignCast(ctx.?));
+        if (e.console_quiet.swap(false, .acq_rel)) return;
+        if (e.consumers.items.len == 0 or e.consumers.items[0].execs.items.len == 0) return;
+        const rec = newRecord(@sizeOf(abi.ConsoleClosedEvent), .console_closed, 0) catch return;
+        const ev: *abi.ConsoleClosedEvent = @ptrCast(rec.ptr);
+        ev.reason = @intFromEnum(reason);
+        e.consumers.items[0].execs.items[0].postRecord(rec, false);
     }
 
     pub fn destroy(e: *Engine) void {

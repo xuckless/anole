@@ -9,7 +9,14 @@ const value = @import("value.zig");
 const Writer = std.Io.Writer;
 
 /// The request a record belongs to; empty strings are left out.
-pub const Context = struct { request_id: []const u8 = "", trace_id: []const u8 = "", span_id: []const u8 = "" };
+pub const Context = struct {
+    request_id: []const u8 = "",
+    trace_id: []const u8 = "",
+    span_id: []const u8 = "",
+    /// The route pattern the record belongs to, for the live console's
+    /// `route=` filter. Never written to the output records.
+    route: []const u8 = "",
+};
 
 /// A record's fixed parts.
 pub const Head = struct {

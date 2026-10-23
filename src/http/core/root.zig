@@ -40,6 +40,7 @@ pub const Detached = @import("detach.zig").Detached;
 pub const placement = @import("placement.zig");
 /// Live connection and stream counts per executor.
 pub const gauges = @import("gauges.zig");
+pub const hooks = @import("hooks.zig");
 
 /// Tests that provoke `err` logs on purpose declare it here.
 pub const expect_log = @import("expect_log.zig");

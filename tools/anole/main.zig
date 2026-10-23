@@ -6,6 +6,7 @@
 //!     anole new <dir> [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
 //!     anole init [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
 //!     anole templates
+//!     anole console [<name>|<pid>|<socket path>] [options]
 //!     anole version
 //!     anole help [command]
 //!
@@ -15,6 +16,7 @@ const std = @import("std");
 const options = @import("cli_options");
 const index = @import("templates");
 const banner = @import("banner");
+const console_cmd = @import("console.zig");
 
 const Io = std.Io;
 
@@ -41,6 +43,10 @@ const EnvReader = struct {
     }
 };
 
+fn consoleEnv(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
+    return getEnv(name);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -61,9 +67,7 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "new")) return newCommand(gpa, io, args[1..], .new);
     if (std.mem.eql(u8, cmd, "init")) return newCommand(gpa, io, args[1..], .init);
-    // ---- console slot (dx/console2 replaces consoleCommand below) ----
-    if (std.mem.eql(u8, cmd, "console")) return consoleCommand(gpa, io, args[1..]);
-    // ---- end console slot ----
+    if (std.mem.eql(u8, cmd, "console")) return console_cmd.command(gpa, io, args[1..], .{ .get = consoleEnv });
     if (std.mem.eql(u8, cmd, "templates")) {
         try listTemplates(io);
         return 0;
@@ -74,7 +78,9 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     }
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         const topic: ?[]const u8 = if (args.len > 1) args[1] else null;
-        try say(io, "{s}", .{if (topic != null and (std.mem.eql(u8, topic.?, "new") or std.mem.eql(u8, topic.?, "init"))) new_help else usage_text});
+        const is_new = topic != null and (std.mem.eql(u8, topic.?, "new") or std.mem.eql(u8, topic.?, "init"));
+        const text = if (is_new) new_help else if (topic != null and std.mem.eql(u8, topic.?, "console")) console_cmd.help_text else usage_text;
+        try say(io, "{s}", .{text});
         return 0;
     }
     std.debug.print("anole: unknown command \"{s}\"\n\n{s}", .{ cmd, usage_text });
@@ -88,6 +94,7 @@ const usage_text =
     \\  anole new <dir> [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
     \\  anole init [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
     \\  anole templates
+    \\  anole console [<name>|<pid>|<socket path>] [options]
     \\  anole version
     \\  anole help [command]
     \\
@@ -303,16 +310,6 @@ fn exists(io: Io, dir: Io.Dir, path: []const u8) bool {
     dir.access(io, path, .{}) catch return false;
     return true;
 }
-
-// ---- console slot: dx/console2 replaces this function ----
-fn consoleCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
-    _ = gpa;
-    _ = io;
-    _ = args;
-    std.debug.print("anole console: not available in this build\n", .{});
-    return exit_usage;
-}
-// ---- end console slot ----
 
 /// The anole, when stdout is a terminal (not under NO_COLOR's colour, nor
 /// with ANOLE_NO_BANNER=1).

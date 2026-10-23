@@ -376,6 +376,11 @@ pub const grpc = if (features.grpc) @import("grpc/root.zig") else struct {};
 /// `zig build openapi` writes the file.
 pub const openapi = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
 
+/// The live console (`-Dconsole`, on in the web and full profiles): options,
+/// the control socket's service and the terminal UI behind `anole console`
+/// and `c` + Enter in development. docs/console.md.
+pub const console = @import("console/root.zig");
+
 /// Auth (`-Dauth`): JWT/JWKS verification and signing, OIDC, CSRF,
 /// passwords, API keys, roles.
 pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
@@ -424,6 +429,7 @@ test {
     _ = ratelimit;
     _ = auth;
     _ = observe;
+    _ = console;
     _ = capi;
 }
 

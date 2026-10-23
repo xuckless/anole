@@ -83,6 +83,28 @@ before including `anole.h`. There is no doorbell fd and no
   the late answer gets `ANOLE_E_GONE`. One sweeper per executor checks them,
   no timer per request.
 
+## Console
+
+The live console ([console.md](console.md)). The `console` configuration group
+(`enabled`, `name`, `socket`, `allow_restart`, `read_only`, `log_buffer`,
+`errors_kept`, `max_routes`, `runtime`) sets up the control socket that
+`anole console` attaches to; a binding passes `name` (its package or module)
+and `runtime` (`"node 22.11.0"`). libanole never reads stdin: the binding does,
+stops reading and calls `anole_console_open(s, 0)` when the user asks, and
+resumes after `ANOLE_EV_CONSOLE_CLOSED`. While it is open, descriptors 1 and 2
+are captured and show in `/logs` as `stdout` and `stderr`.
+
+| Call | Answers |
+|---|---|
+| `anole_console_open` | `ANOLE_E_STATE` (not running, or open already), `ANOLE_E_UNSUPPORTED` (`NoTerminal`), `ANOLE_E_CONFIG` (`ConsoleOff`) |
+| `anole_console_close` | `ANOLE_OK`, also when it was not open (no event) |
+| `anole_console_attached` | the consoles attached now, 0 or more |
+| `anole_console_report` | `ANOLE_E_INVALID` (more than 32, a bad name or unit) |
+| `anole_console_log` | `ANOLE_OK`, also when nothing is kept |
+
+`anole_console_log` keeps the record for `/logs` only; the request handle
+argument is accepted and not yet used to attach the request id.
+
 ## Rules
 
 Fourteen rules, the same ones `anole.h` states at its top.
@@ -268,6 +290,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_KAFKA_WRITABLE` (84) | `anole_broker_status_event`: a produce refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_KAFKA_GROUP_END` (85) | `anole_broker_end_event`: the group membership is over (`reason`) | `anole_kafka_group` | ends it |
 | (86-95) | reserved for Kafka | | |
+| `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open`. 133-135 are reserved for the console | 0 | none: resume reading stdin |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
