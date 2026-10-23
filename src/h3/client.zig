@@ -82,6 +82,19 @@ pub const ConnectOptions = struct {
     /// HTTP/3 only: QUIC closes the connection after this long with
     /// nothing received (its idle timeout). HTTP/2 over TCP has none.
     idle_timeout: std.Io.Duration = .fromSeconds(30),
+    /// HTTP/3 only: while a stream is open, a PING after this long with
+    /// nothing sent or received. A client that only receives (a download)
+    /// sends nothing once it has acknowledged what came; if a NAT rebinding
+    /// then moves its port, the server's packets go to the old one and are
+    /// lost, the server never hears from the new address, and the stream
+    /// stalls until a timeout. The PING comes from the new address, which
+    /// the server then validates and follows. It also keeps a quiet
+    /// stream's NAT mapping, and the idle timeout, from running out: the
+    /// PING comes at most half the smaller idle timeout (at least 1 s)
+    /// after the last packet. With no stream open nothing is sent, so an
+    /// idle connection still closes at `idle_timeout`. Null for none (a
+    /// call then quiet for the idle timeout ends with the connection).
+    keep_alive: ?std.Io.Duration = .fromSeconds(5),
     /// For `connect`: resolving `host` and the QUIC handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
     connect_timeout: ?std.Io.Duration = .fromSeconds(10),
@@ -274,6 +287,9 @@ pub const ClientConnection = struct {
     peer_settings: ?PeerSettings = null,
     /// `ConnectOptions.max_header_list_size`.
     max_header_list_size: u32 = 64 * 1024,
+    /// `ConnectOptions.keep_alive` in nanoseconds (0: none; armed by
+    /// `updateKeepAlive`).
+    keep_alive: u64 = 0,
 
     /// What the server's SETTINGS allow (`waitSettings`).
     pub const PeerSettings = struct {
@@ -322,6 +338,7 @@ pub const ClientConnection = struct {
             .timeout = timeoutFrom(options.timeout),
             .idle_ns = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds()),
             .max_header_list_size = options.max_header_list_size,
+            .keep_alive = if (options.keep_alive) |d| std.math.lossyCast(u64, @max(1, d.toNanoseconds())) else 0,
         };
         self.conn_ref = .{ .get_conn = getConn, .user_data = self };
         c.ngtcp2_ccerr_default(&self.last_error);
@@ -687,16 +704,18 @@ pub const ClientConnection = struct {
         return self.keep_alive_on;
     }
 
-    /// Arms ngtcp2's keep-alive (a PING after half the smaller idle
-    /// timeout of silence, at least 1 s) while a request stream is live, so
-    /// a quiet call outlives the idle timeout; disarms it when the last
-    /// goes. Locked.
+    /// Arms ngtcp2's keep-alive while a request stream is live and
+    /// disarms it when the last goes (`ConnectOptions.keep_alive`; never
+    /// with it null). The PING comes after `keep_alive` of silence, or
+    /// sooner, half the smaller idle timeout but at least 1 s, so a quiet
+    /// call outlives the idle timeout and a download whose port a NAT
+    /// rebinding moved is heard from the new address. Locked.
     fn updateKeepAlive(self: *ClientConnection) void {
         if (self.state == .closed) {
             self.keep_alive_on = false;
             return;
         }
-        const want = self.live.first != null and self.state == .open;
+        const want = self.keep_alive != 0 and self.live.first != null and self.state == .open;
         if (want == self.keep_alive_on) return;
         self.keep_alive_on = want;
         var interval: u64 = std.math.maxInt(u64);
@@ -706,7 +725,7 @@ pub const ClientConnection = struct {
                 const peer = p.*.max_idle_timeout;
                 if (peer != 0 and peer < idle) idle = peer;
             }
-            interval = @max(idle / 2, std.time.ns_per_s);
+            interval = @min(self.keep_alive, @max(idle / 2, std.time.ns_per_s));
         }
         c.ngtcp2_conn_set_keep_alive_timeout(self.q, interval);
         self.kick();

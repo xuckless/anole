@@ -281,9 +281,12 @@ do for HTTP/2, with the same types; the stream window's default is larger
 because an HTTP/3 stream's buffer grows as data arrives.
 `max_header_list_size` (64 KiB) and the limit of five informational
 responses are the same too (SETTINGS_MAX_FIELD_SECTION_SIZE over HTTP/3). Only HTTP/3 has
-`idle_timeout` (30 s, QUIC's idle timeout), `session_cache`, `early_data`
-and `webtransport` (below), and `RequestOptions.early`; `tls` is not
-optional. `anole.h3` exports the names `anole.h2` does:
+`idle_timeout` (30 s, QUIC's idle timeout), `keep_alive` (5 s: while a
+stream is open, a PING after that long, or half the idle timeout if that is
+shorter, with nothing sent or received, so a
+download whose client's port a NAT rebinding moved resumes instead of
+stalling; null for none), `session_cache`, `early_data` and `webtransport`
+(below), and `RequestOptions.early`; `tls` is not optional. `anole.h3` exports the names `anole.h2` does:
 `ClientConnection`, `Stream`, `Header`, `ConnectOptions`, `RequestOptions`,
 `StreamError` and `version()` ("ngtcp2/1.25.0 nghttp3/1.18.0", against
 `anole.h2.version()`'s "nghttp2/1.70.0").
