@@ -1,0 +1,162 @@
+{
+ "phases": [
+  {
+   "phase": 1,
+   "seconds": 601.6728229522705,
+   "cpu": 0.48647662413400644,
+   "rss_start_mb": 10.14453125,
+   "rss_end_mb": 15.421875,
+   "rss_max_mb": 19.1171875,
+   "rss_slope_kb_per_min": 79.84869993287528,
+   "anon_slope_kb_per_min": 53.78953157780495,
+   "ok": 6272399,
+   "errors": 1,
+   "streams": {
+    "h1ka": {
+     "ok": 2540997,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 4234.988498855039,
+     "p50_ms": 0.073803,
+     "p99_ms": 0.5220090000000001
+    },
+    "h1close": {
+     "ok": 418800,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 697.9986578486274,
+     "p50_ms": 0.155722,
+     "p99_ms": 0.820585
+    },
+    "tlsclose": {
+     "ok": 210600,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 350.99905653150097,
+     "p50_ms": 0.586489,
+     "p99_ms": 1.400323
+    },
+    "h2big": {
+     "ok": 2817001,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 4694.991071081242,
+     "p50_ms": 0.319072,
+     "p99_ms": 0.818539
+    },
+    "h2cecho": {
+     "ok": 147601,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 246.0012336212651,
+     "p50_ms": 0.45677,
+     "p99_ms": 1.231309
+    },
+    "h3": {
+     "ok": 137400,
+     "non2xx": 0,
+     "errors": 1,
+     "error_kinds": {
+      "HTTP3 Stream: Remote is closing the connection": 1
+     },
+     "ok_per_s": 228.99935920025314,
+     "p50_ms": 0.155351,
+     "p99_ms": 0.8263969999999999
+    }
+   }
+  },
+  {
+   "phase": 2,
+   "seconds": 600.8448369503021,
+   "cpu": 0.48374541385479564,
+   "rss_start_mb": 18.55078125,
+   "rss_end_mb": 16.60546875,
+   "rss_max_mb": 20.31640625,
+   "rss_slope_kb_per_min": 71.62915126948657,
+   "anon_slope_kb_per_min": 60.699424745521405,
+   "ok": 6272393,
+   "errors": 1,
+   "streams": {
+    "h1ka": {
+     "ok": 2540996,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 4234.98738600644,
+     "p50_ms": 0.07213800000000001,
+     "p99_ms": 0.51141
+    },
+    "h1close": {
+     "ok": 418800,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 697.9983527297042,
+     "p50_ms": 0.147672,
+     "p99_ms": 0.754765
+    },
+    "tlsclose": {
+     "ok": 210600,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 350.99909582691413,
+     "p50_ms": 0.565748,
+     "p99_ms": 1.25105
+    },
+    "h2big": {
+     "ok": 2816996,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 4694.986834845556,
+     "p50_ms": 0.316001,
+     "p99_ms": 0.759125
+    },
+    "h2cecho": {
+     "ok": 147601,
+     "non2xx": 0,
+     "errors": 0,
+     "error_kinds": {},
+     "ok_per_s": 246.00130223787752,
+     "p50_ms": 0.442795,
+     "p99_ms": 1.1537030000000001
+    },
+    "h3": {
+     "ok": 137400,
+     "non2xx": 0,
+     "errors": 1,
+     "error_kinds": {
+      "HTTP3 Stream: Remote is closing the connection": 1
+     },
+     "ok_per_s": 228.9995373533797,
+     "p50_ms": 0.154917,
+     "p99_ms": 0.750718
+    }
+   }
+  }
+ ],
+ "idle": [
+  {
+   "when": "before",
+   "rss_mb": 10.14453125
+  },
+  {
+   "when": "after phase 1",
+   "rss_mb": 14.5078125
+  },
+  {
+   "when": "after phase 2",
+   "rss_mb": 15.7109375
+  }
+ ],
+ "leak_lines": [],
+ "leak_count": 0,
+ "exit_code": "0",
+ "stopped_cleanly": true
+}
