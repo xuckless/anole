@@ -158,7 +158,9 @@ pub const ClientOptions = struct {
     /// effective with an injected HTTP/2 client (the `h2_client` import);
     /// ignored without one, and for cleartext (http://) connections. A
     /// connection on which the server picks h2 carries one request at a time
-    /// and is pooled like an HTTP/1.1 one. Defaults off.
+    /// and is pooled like an HTTP/1.1 one. Defaults off for now: without
+    /// requests sharing a connection, h2 saves no connections, and its fixed
+    /// 64 KiB stream window slows large downloads. Sharing comes in 0.4.
     http2: bool = false,
     /// Decides every redirect before it is followed (within
     /// `max_redirects`). Without one, redirects are followed, except one
