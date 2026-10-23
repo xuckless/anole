@@ -194,8 +194,10 @@ pub const Options = struct {
     /// large buffers on the stack. Below 1 MiB is not advised: some
     /// bundled code takes a lot of stack at once (zlib-ng's CRC-32 for
     /// gzip, 128 KiB in one frame; the DNS resolver, 73 KiB), and a
-    /// handler's own needs are the application's to know.
-    max_stack_size: usize = 1024 * 1024,
+    /// handler's own needs are the application's to know. On Windows (a
+    /// development target) the default is 4 MiB: its Debug frames are much
+    /// larger, and BoringSSL's certificate loading overflowed 1 MiB there.
+    max_stack_size: usize = if (builtin.os.tag == .windows) 4 * 1024 * 1024 else 1024 * 1024,
     /// Raise the soft open-file limit to the hard one when the server is
     /// made, as Go does at startup: every connection is a file descriptor,
     /// and the soft limit is often 1024. `limits.max_connections` follows
