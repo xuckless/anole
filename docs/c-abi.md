@@ -589,6 +589,8 @@ none.
 | `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 100, false, 30000, true, false, true, null, true, true | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
+| `databases[].timeout_ms` | 30000 | the connectors' `timeout` (0 is null: none); also a transaction's bound when its `timeout_ms` is 0 |
+| `databases[].mongodb.max_connections`, `databases[].sqlite.ping_timeout_ms` | null (100), 2000 | `mongodb.Options.max_connections`, `sqlite.Options.ping_timeout` |
 
 Keys with no Zig option: `limits.inline_body_max`, `max_inflight`, `queue`,
 `stream_high_water`, `ws_high_water`, `db_result_max`; `timeouts.rewake_ms`;

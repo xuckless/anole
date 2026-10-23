@@ -566,6 +566,8 @@ One table; the C ABI's defaults are the same (the schema test checks them).
 | `proxy.trusted_hops` | 0 |
 | `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 5 |
 | `executors` | one per CPU |
+| databases: `timeout` / transaction bound | 30 s (`timeout_ms` 30000) / the database's |
+| databases: MongoDB `max_connections` / SQLite `ping_timeout` | 100 (null) / 2 s |
 
 ### IPv6 and IPv4
 
