@@ -894,12 +894,19 @@ pub fn build(b: *std.Build) void {
             const embed = b.addWriteFiles();
             _ = embed.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
             _ = embed.addCopyFile(b.path("docs/c-abi.md"), "c-abi.md");
+            _ = embed.addCopyFile(b.path("include/anole.h"), "anole.h");
             const schema_mod = b.createModule(.{ .root_source_file = embed.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
             const guide_mod = b.createModule(.{ .root_source_file = embed.add("guide.zig", "pub const text = @embedFile(\"c-abi.md\");\n") });
+            const header_text_mod = b.createModule(.{ .root_source_file = embed.add("header.zig", "pub const text = @embedFile(\"anole.h\");\n") });
             const version_mod = b.createModule(.{ .root_source_file = embed.add("version.zig", b.fmt("pub const text = \"{s}\";\n", .{@import("build.zig.zon").version})) });
             const abi_for_test = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize });
             const abi_test = b.addTest(.{
                 .name = "capi-abi-test",
+                // The test inspects every declaration of the translated
+                // header; the self-hosted x86_64 backend writes debug info
+                // for the extern functions among them, which then need the
+                // C symbols. LLVM drops the unused ones, as on aarch64.
+                .use_llvm = true,
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/capi/abi_test.zig"),
                     .target = target,
@@ -915,6 +922,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "anole_h", .module = header.mod },
                         .{ .name = "anole_schema", .module = schema_mod },
                         .{ .name = "anole_guide", .module = guide_mod },
+                        .{ .name = "anole_header_text", .module = header_text_mod },
                         .{ .name = "anole_version", .module = version_mod },
                     },
                 }),

@@ -10,6 +10,7 @@ const c = @import("anole_h");
 const gen = @import("capi_abi_json");
 const schema_text = @import("anole_schema").text;
 const guide_text = @import("anole_guide").text;
+const header_text = @import("anole_header_text").text;
 const build_version = @import("anole_version").text;
 
 fn expectSameLayout(comptime Zig: type, comptime C: type) !void {
@@ -41,9 +42,11 @@ test "anole.h: every struct the header declares is in abi.records" {
     @setEvalBranchQuota(1_000_000);
     const decls = @typeInfo(c).@"struct".decl_names;
     inline for (decls) |name| {
-        if (comptime std.mem.startsWith(u8, name, "anole_")) {
+        // Types only: reading a function declaration as a value would make
+        // the linker want the C symbol.
+        if (comptime std.mem.startsWith(u8, name, "anole_") and @TypeOf(@field(c, name)) == type) {
             const v = @field(c, name);
-            if (comptime @TypeOf(v) == type and @typeInfo(v) == .@"struct") {
+            if (comptime @typeInfo(v) == .@"struct") {
                 const found = comptime blk: {
                     for (abi.records) |r| if (std.mem.eql(u8, r[0], name)) break :blk true;
                     break :blk false;
@@ -167,13 +170,23 @@ test "docs/c-abi.md names every event type and every anole_* function" {
             return error.UndocumentedEvent;
         }
     }
-    const decls = @typeInfo(c).@"struct".decl_names;
-    inline for (decls) |name| {
-        if (comptime std.mem.startsWith(u8, name, "anole_") and @typeInfo(@TypeOf(@field(c, name))) == .@"fn") {
-            if (std.mem.indexOf(u8, guide_text, name) == null) {
-                std.debug.print("docs/c-abi.md does not mention {s}\n", .{name});
-                return error.UndocumentedFunction;
-            }
+    // The function names come from the header's text: touching a function
+    // declaration of the translated header, even through @TypeOf, makes the
+    // self-hosted backends link against the C symbol.
+    var rest: []const u8 = header_text;
+    var count: usize = 0;
+    while (std.mem.indexOf(u8, rest, "ANOLE_API ")) |at| {
+        rest = rest[at + "ANOLE_API ".len ..];
+        const paren = std.mem.indexOfScalar(u8, rest, '(') orelse break;
+        var start = paren;
+        while (start > 0 and (std.ascii.isAlphanumeric(rest[start - 1]) or rest[start - 1] == '_')) start -= 1;
+        const name = rest[start..paren];
+        if (!std.mem.startsWith(u8, name, "anole_")) continue;
+        count += 1;
+        if (std.mem.indexOf(u8, guide_text, name) == null) {
+            std.debug.print("docs/c-abi.md does not mention {s}\n", .{name});
+            return error.UndocumentedFunction;
         }
     }
+    try std.testing.expect(count > 50);
 }

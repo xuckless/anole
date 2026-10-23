@@ -474,7 +474,7 @@ fn abortConnection(socket: *Socket) void {
             const protection = socket.io.swapCancelProtection(.blocked);
             defer _ = socket.io.swapCancelProtection(protection);
             if (ws.transport.tcp_reader) |r| r.stream.shutdown(socket.io, .both) catch {};
-            if (comptime abort_cancels_h1_reader) if (socket.task) |t| placement.cancelTask(t);
+            if (comptime abort_cancels_h1_reader) if (socket._task) |t| placement.cancelTask(t);
         },
         .stream => |ws| {
             ws.write_mutex.lockUncancelable(socket.io);
