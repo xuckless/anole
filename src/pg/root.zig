@@ -65,6 +65,7 @@
 //!   HTTP/2 reset, `QueryOptions.timeout`) sends a CancelRequest so the
 //!   server stops the statement, and the connection is closed.
 const std = @import("std");
+const builtin = @import("builtin");
 const features = @import("build_options");
 const dusty = @import("dusty");
 const db = @import("../db/root.zig");
@@ -455,7 +456,24 @@ const Shard = struct {
 const Lease = struct {
     shard: *Shard,
     conn: *pg.Conn,
+    /// Taken idle from the pool, not dialed for this call: the server may
+    /// have closed it while it waited.
+    reused: bool = false,
+    /// `conn.bytesSent()` when it was taken: unchanged after a failure,
+    /// nothing of the call reached the server.
+    sent: u64 = 0,
+
+    /// Whether a call on this lease that failed with a broken connection
+    /// can run once more on another, transparently: the connection came
+    /// idle from the pool and not one byte of the call left on it.
+    fn untouched(self: Lease) bool {
+        return self.reused and self.conn.bytesSent() == self.sent;
+    }
 };
+
+/// Tests only: runs on every connection `takeFrom` hands out (to break it
+/// before the call writes).
+pub var test_after_take: if (builtin.is_test) ?*const fn (*pg.Conn) void else void = if (builtin.is_test) null else {};
 
 /// A PostgreSQL database: the handle in the App state. Its calls take the
 /// request (or an `anole.db.Ctx`) first; see `anole.db`.
@@ -861,8 +879,9 @@ pub const Client = struct {
         return struct {
             fn run(self: *Client, ctx: *Ctx, deadline: ?dusty.Deadline, j: *J, tx: ?*Tx, sql: []const u8) internal.Bounded(J.run) {
                 const first = self.guarded(ctx, deadline, J.run, .{ j, self, ctx, tx, sql });
-                // A statement outside a transaction whose write failed on a
-                // pooled connection (the server closed it while idle) did not
+                // A statement outside a transaction that failed on a
+                // connection taken idle from the pool (the server closed it
+                // while it waited) before one byte of it was sent did not
                 // run: once more on another, outside the retry policy.
                 if (tx == null) if (first) |_| {} else |_| {
                     const d = ctx.lastDetail() orelse return first;
@@ -913,7 +932,11 @@ pub const Client = struct {
         const conn = got catch |err| return self.unavailable(ctx, shard, err, refused.err);
         self.observer.acquired(started.durationTo(.now(io, .awake)).raw);
         self.report(shard);
-        return .{ .shard = shard, .conn = conn };
+        // Opened before this call asked: it waited idle in the pool.
+        const reused = conn._opened_at.nanoseconds < started.raw.nanoseconds;
+        const lease: Lease = .{ .shard = shard, .conn = conn, .reused = reused, .sent = conn.bytesSent() };
+        if (builtin.is_test) if (test_after_take) |f| f(conn);
+        return lease;
     }
 
     /// Why no connection could be had, as `ServiceUnavailable`.
@@ -997,9 +1020,12 @@ pub const Client = struct {
                 });
                 if (tx) |t| t.state = .broken;
                 if (brokenConnection(err)) {
-                    // A write that failed: nothing of the statement reached the
-                    // server (`boundedRun` runs it once more, transparently).
-                    const code: []const u8 = if (err == error.BrokenPipe or err == error.TlsWriteFailed) write_failed_code else "";
+                    // Broken before one byte of the call left a connection
+                    // that waited idle in the pool: the server never saw the
+                    // statement (`boundedRun` runs it once more, transparently).
+                    // Once anything was sent it may have run, and a second
+                    // run could repeat an INSERT.
+                    const code: []const u8 = if (tx == null and lease.untouched()) write_failed_code else "";
                     return ctx.fail(self.errors, .{
                         .system = .postgresql,
                         .class = .unavailable,
@@ -1068,12 +1094,15 @@ fn sendCancel(io: std.Io, conn: *pg.Conn) void {
     deadline.run(pg.Conn.cancel, .{conn}) catch |err| log.debug("postgres: CancelRequest: {t}", .{err});
 }
 
-/// The error code of a call whose write failed (see `Client.failed`).
+/// The error code of a call that broke before sending anything on a
+/// connection taken idle from the pool (see `Client.failed`, `Lease.untouched`).
 const write_failed_code = "connection_write_failed";
 
 fn brokenConnection(err: anyerror) bool {
     return switch (err) {
-        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow, error.SessionResetFailed => true,
+        // SocketUnconnected: std's name for a send on a socket whose
+        // sending side is shut (EPIPE)
+        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.SocketUnconnected, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow, error.SessionResetFailed => true,
         else => false,
     };
 }

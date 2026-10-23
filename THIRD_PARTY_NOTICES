@@ -154,8 +154,9 @@ pg.zig (PostgreSQL client)
             channel binding, and an optional session reset on release,
             every time or only when the SQL may have changed the session;
             for the C ABI: parameters as a slice of tagged unions, and
-            results in PostgreSQL's text format)
-  Pinned:   commit 6f47a57bd5f7d9e96440526d5b51bd7a043a8203 of the fork
+            results in PostgreSQL's text format; the bytes the socket
+            accepted, so a failed call is run again only when none left)
+  Pinned:   commit 6327fc61f3a3e90aa5b014af21e12bbb073e0fcc of the fork
   Linked:   -Dpostgres=true
 
 buffer.zig (byte buffers; a dependency of pg.zig)
