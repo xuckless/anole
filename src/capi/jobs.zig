@@ -12,9 +12,16 @@ const abi = @import("abi.zig");
 const Engine = engine.Engine;
 const AnswerError = engine.AnswerError;
 const db = @import("db.zig");
+const db_cap = db;
+const gpa = engine.gpa;
+const log = std.log.scoped(.anole);
 
 /// Engine-wide state (`Engine.jobs_state`).
 pub const State = struct {
+    /// The queue behind `"jobs"` in the configuration, once `open` ran
+    /// (the webhooks lane reads it); null when there is none.
+    client: ?*anole.jobs.Client = null,
+
     pub fn init(s: *State, first_gen: u32) void {
         _ = s;
         _ = first_gen;
@@ -52,8 +59,56 @@ pub const ExecState = struct {
 /// The server's main thread, before the listeners open (after `db.open`,
 /// `nats.open` and `kafka.open`).
 pub fn open(e: *Engine, app: *anole.App) !void {
-    _ = e;
-    _ = app;
+    const jc = e.config.jobs orelse return;
+    if (comptime !anole.features.jobs) {
+        log.err("jobs: jobs are not built in (-Djobs)", .{});
+        return error.InvalidOptions;
+    }
+    var queues = try gpa.alloc(anole.jobs.QueueOptions, jc.queues.len);
+    for (jc.queues, queues[0..]) |q, *d| d.* = .{ .name = q.name, .concurrency = q.concurrency };
+    var kinds = try gpa.alloc(anole.jobs.Kind, jc.kinds.len);
+    for (jc.kinds, kinds[0..]) |k, *d| d.* = .{
+        .name = k.name,
+        .queue = k.queue,
+        .priority = std.meta.stringToEnum(anole.jobs.Priority, k.priority) orelse .normal,
+        .attempts = k.attempts,
+        .timeout = .fromMilliseconds(@intCast(k.timeout_ms)),
+    };
+    const ms = std.Io.Duration.fromMilliseconds;
+    var store: anole.jobs.Store = .memory;
+    if (!std.mem.eql(u8, jc.store, "memory")) {
+        const d = db_cap.find(e, jc.store) orelse {
+            log.err("jobs.store \"{s}\": no such database", .{jc.store});
+            return error.InvalidOptions;
+        };
+        switch (d.client) {
+            .postgres => |c| store = .{ .postgres = c },
+            .sqlite => |c| store = .{ .sqlite = c },
+            .redis => |c| store = .{ .redis = c },
+            else => {
+                log.err("jobs.store \"{s}\": MongoDB cannot hold jobs", .{jc.store});
+                return error.InvalidOptions;
+            },
+        }
+    }
+    e.jobs_state.client = try app.jobs(.{
+        .store = store,
+        .queues = queues,
+        .run = .auto,
+        .lease = ms(jc.lease_ms),
+        .poll_interval = ms(jc.poll_ms),
+        .migrate = jc.migrate,
+        .notify = jc.notify,
+        .table_prefix = jc.table_prefix,
+        .key_prefix = jc.key_prefix,
+        .kinds = kinds,
+        .keep = .{ .completed = ms(@intCast(jc.keep.completed_ms)), .dead = ms(@intCast(jc.keep.dead_ms)), .cancelled = ms(@intCast(jc.keep.cancelled_ms)) },
+        .leader = .{
+            .method = std.meta.stringToEnum(anole.jobs.Options.Leader.Method, jc.leader.method) orelse .auto,
+            .ttl = ms(jc.leader.ttl_ms),
+            .renew = ms(jc.leader.renew_ms),
+        },
+    });
 }
 
 /// The drain started (`anole_server_drain`, once).

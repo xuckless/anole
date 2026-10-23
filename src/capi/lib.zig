@@ -1349,6 +1349,17 @@ export fn anole_db_tx_release(tx: u64) i32 {
 // ---- end p3/net ----
 
 // ---- p3/jobs ----
+/// The configuration's job queue (`anole_jobs *`): the engine's own state,
+/// valid until `anole_server_destroy`. `ANOLE_E_UNSUPPORTED` when the
+/// configuration has no "jobs".
+export fn anole_jobs_get(s: ?*anyopaque, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    if (e.config.jobs == null) return named(abi.E_UNSUPPORTED, "Unsupported", 0, "the configuration has no \"jobs\"", .{});
+    dst.* = @ptrCast(&e.jobs_state);
+    return abi.OK;
+}
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----

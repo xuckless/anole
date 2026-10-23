@@ -14,6 +14,18 @@ breaking changes are listed anyway.
 
 ### Added
 
+- `anole.jobs` (`-Djobs`, on in the web and full profiles): background jobs
+  with retries and backoff, delays, priorities, unique jobs, leases with
+  heartbeats, an admin API and JSON routes, on the memory and SQLite stores
+  (PostgreSQL and Redis stores follow). Job kinds are types
+  (`pub const job: anole.jobs.Kind`), `app.jobs(...)` owns the queue.
+- `anole.cron`: cron expressions (5 or 6 fields, `L`, `5L`, `MON#2`,
+  nicknames, `@every`), time zones from the system's tzdata with the DST
+  rules written down in docs/cron.md, and `jobs.cron(...)`, which enqueues
+  one job per tick across instances.
+- `anole.pg.Client.session`: a connection of its own outside the pools.
+- C ABI: `"jobs"` in the configuration and `anole_jobs_get`.
+
 ### Changed
 
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.

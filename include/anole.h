@@ -1790,6 +1790,12 @@ typedef struct anole_kafka_assign_event {
 /* ---- end p3/net ---- */
 
 /* ---- p3/jobs ---- */
+typedef struct anole_jobs anole_jobs; /* opaque; lives until anole_server_destroy */
+
+/* The configuration's "jobs" (the durable job queue). ANOLE_E_UNSUPPORTED when
+   the configuration has none or -Djobs is off. Enqueueing, workers and the
+   admin calls come with the rest of the jobs ABI. */
+ANOLE_API anole_status anole_jobs_get(anole_server *s, anole_jobs **out);
 /* ---- end p3/jobs ---- */
 
 /* ---- p3/webhooks ---- */
