@@ -65,6 +65,7 @@ pub const Redis = struct {
         .cronTick = cronTick,
         .leaderTake = leaderTake,
         .leaderRelease = leaderRelease,
+        .runWake = runWake,
     };
 
     fn me(ptr: *anyopaque) *Redis {
@@ -474,6 +475,21 @@ pub const Redis = struct {
         sc.start(self);
         defer sc.deinit();
         return asInt(try self.call(&sc.ctx, "leader_take", &.{ owner, try num(sc.ctx.arena, root.millis(ttl)) })) == 1;
+    }
+
+    /// SUBSCRIBE to `<key prefix>jobs:wake` (the scripts PUBLISH the queue name there).
+    fn runWake(ptr: *anyopaque, io: std.Io, wake: store.Wake) anyerror!void {
+        const self = me(ptr);
+        if (!self.notify) return;
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        var ctx: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+        const channel = try std.fmt.allocPrint(ctx.arena, "{s}jobs:wake", .{self.prefix});
+        const sub = try self.client.subscribe(&ctx, .{channel});
+        defer sub.close();
+        wake.kick(wake.context, "");
+        while (try sub.next(&ctx)) |m| wake.kick(wake.context, m.payload);
+        return error.SubscriptionClosed;
     }
 
     fn leaderRelease(ptr: *anyopaque, owner: []const u8) anyerror!void {

@@ -128,9 +128,22 @@ pub const VTable = struct {
     /// `Client.enqueueIn`: the insert on the caller's open transaction (`tx`
     /// is the connector's `*Tx`, whose kind `Backend.tx_kind` names). Null
     /// for a store without transactions.
+    /// Blocks listening for the store's wake-ups (PostgreSQL LISTEN, Redis
+    /// pub/sub) and calls `wake.kick` for each, until it fails or is
+    /// canceled. The client runs it in a task and reconnects with backoff.
+    /// Null: in-process wakes and polling only.
+    runWake: ?*const fn (ptr: *anyopaque, io: std.Io, wake: Wake) anyerror!void = null,
     insertIn: ?*const fn (ptr: *anyopaque, tx: *anyopaque, ctx: *anole.db.Ctx, now: Time, job: NewJob) anyerror!root.Enqueued = null,
     /// `Client.completeIn`: the conditional finish on the caller's transaction.
     finishIn: ?*const fn (ptr: *anyopaque, tx: *anyopaque, ctx: *anole.db.Ctx, f: Finish) anyerror!bool = null,
+};
+
+/// Where a store's wake-ups go: `kick` with a queue name wakes that queue's
+/// fetcher, with "" every queue's (after a reconnect: notifications may have
+/// been missed).
+pub const Wake = struct {
+    context: ?*anyopaque,
+    kick: *const fn (context: ?*anyopaque, queue: []const u8) void,
 };
 
 /// Which connector's transaction a store takes in `insertIn`/`finishIn`.

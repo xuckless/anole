@@ -15,6 +15,7 @@ const pg_store = if (anole.features.postgres) @import("store_pg.zig") else struc
 const redis_store = if (anole.features.redis) @import("store_redis.zig") else struct {};
 const cron_mod = @import("../cron/root.zig");
 const metrics_mod = @import("metrics.zig");
+const resilience = @import("../resilience/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 const placement = dusty.placement;
@@ -103,6 +104,8 @@ pub const Client = struct {
     drain_event: ?*std.Io.Event = null,
     metrics: ?*metrics_mod.Series = null,
     last_gauges: i64 = 0,
+    /// Set before the tasks are canceled (drain, deinit).
+    closing: std.atomic.Value(bool) = .init(false),
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -151,6 +154,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        self.closing.store(true, .release);
         if (self.started and !self.draining.load(.acquire)) {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
@@ -292,6 +296,7 @@ pub const Client = struct {
             return;
         }
         if (self.drain_event != null) try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, drainWatcher, .{self});
+        if (self.backend.vt.runWake != null and self.options.notify) try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, wakeTask, .{self});
         try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, maintenanceTask, .{self});
         try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, heartbeatTask, .{self});
         for (self.queues, 0..) |*q, i| {
@@ -315,6 +320,36 @@ pub const Client = struct {
         c.zone_loaded = true;
     }
 
+    fn kickFromStore(context: ?*anyopaque, queue: []const u8) void {
+        const self: *Client = @ptrCast(@alignCast(context.?));
+        if (queue.len == 0) {
+            for (self.queues) |*q| q.signal.set(self.io);
+        } else self.wakeQueue(queue);
+    }
+
+    /// Listens for the store's wake-ups (PostgreSQL LISTEN, Redis pub/sub),
+    /// reconnecting with backoff; every fetcher also polls, so a lost wake
+    /// costs one poll interval.
+    fn wakeTask(self: *Client) std.Io.Cancelable!void {
+        const backoff: resilience.Backoff = .{ .base = .fromSeconds(1), .max = .fromSeconds(30), .jitter = .equal };
+        var failures: u32 = 0;
+        while (!self.closing.load(.acquire)) {
+            if (self.backend.vt.runWake.?(self.backend.ptr, self.io, .{ .context = self, .kick = kickFromStore })) |_| {
+                return;
+            } else |err| {
+                if (self.closing.load(.acquire)) {
+                    // The cancel may have been taken by the listener's read.
+                    self.io.recancel();
+                    return error.Canceled;
+                }
+                if (err == error.Canceled) return error.Canceled;
+                failures += 1;
+                log.warn("jobs: the wake listener failed ({t}); trying again", .{err});
+            }
+            try self.io.sleep(backoff.delay(failures, self.random()), .awake);
+        }
+    }
+
     /// Waits for the server's drain, then drains the queue within `drain_timeout`.
     fn drainWatcher(self: *Client) std.Io.Cancelable!void {
         const ev = self.drain_event orelse return;
@@ -330,6 +365,7 @@ pub const Client = struct {
 
     /// Stops claiming; running jobs finish by `deadline`, then are put back (J14).
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
+        self.closing.store(true, .release);
         if (self.draining.swap(true, .acq_rel)) return;
         for (self.queues) |*q| q.signal.set(self.io);
         self.maint_signal.set(self.io);

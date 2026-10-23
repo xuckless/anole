@@ -92,6 +92,7 @@ pub const Postgres = struct {
         .cronTick = cronTick,
         .leaderTake = leaderTake,
         .leaderRelease = leaderRelease,
+        .runWake = runWake,
         .insertIn = insertIn,
         .finishIn = finishInErased,
     };
@@ -651,6 +652,22 @@ pub const Postgres = struct {
         if (self.held_owner) |h| self.gpa.free(h);
         self.held_owner = null;
         return false;
+    }
+
+    /// LISTEN on `<prefix>jobs` (the inserts and the stager NOTIFY it with the queue name).
+    fn runWake(ptr: *anyopaque, io: std.Io, wake: store.Wake) anyerror!void {
+        _ = io;
+        const self = me(ptr);
+        if (!self.notify) return;
+        var channel_buf: [96]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&channel_buf, "{s}jobs", .{self.prefix});
+        var l = try self.client.listener();
+        defer l.deinit();
+        try l.listen(channel, .{});
+        // Notifications may have been missed before the LISTEN.
+        wake.kick(wake.context, "");
+        while (l.next()) |n| wake.kick(wake.context, n.payload);
+        return error.ListenerClosed;
     }
 
     fn leaderRelease(ptr: *anyopaque, owner: []const u8) anyerror!void {
