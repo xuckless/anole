@@ -1,0 +1,20 @@
+04:50:30 anolemain ws: ramp
+04:58:01 anolemain ws: stopped: collapsed (under 10% of video frames shown for 30s) at 910 users after 7m31s [running exit=0 oom=false]
+04:59:11 anolerelay ws: ramp
+05:07:10 anolerelay ws: stopped: collapsed (under 10% of video frames shown for 30s) at 960 users after 7m58s [running exit=0 oom=false]
+05:08:20 anolerelay ws-h2: ramp
+05:13:58 anolerelay ws-h2: stopped: collapsed (under 10% of video frames shown for 30s) at 670 users after 5m35s [running exit=0 oom=false]
+05:15:09 anolemain ws-h2: ramp
+05:20:55 anolemain ws-h2: stopped: collapsed (under 10% of video frames shown for 30s) at 700 users after 5m46s [running exit=0 oom=false]
+05:22:05 anolemain wt: ramp
+05:26:53 anolemain wt: stopped: collapsed (under 10% of video frames shown for 30s) at 580 users after 4m48s [running exit=0 oom=false]
+05:28:04 anolerelay wt: ramp
+05:32:59 anolerelay wt: stopped: collapsed (under 10% of video frames shown for 30s) at 590 users after 4m55s [running exit=0 oom=false]
+05:32:59 quality pass
+/run: 90 steps scored (intact VMAF 99.88)
+/run: 69 steps scored (intact VMAF 99.88)
+/run: 57 steps scored (intact VMAF 99.88)
+/run: 95 steps scored (intact VMAF 99.88)
+/run: 66 steps scored (intact VMAF 99.88)
+/run: 58 steps scored (intact VMAF 99.88)
+05:34:37 chart: /home/xuckl/Dev/anole/bench/results/20261023-relay-pass-ab/videocall/index.html

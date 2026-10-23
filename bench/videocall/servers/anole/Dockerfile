@@ -13,10 +13,14 @@ ENV PATH=/opt/zig:$PATH
 WORKDIR /app
 COPY bench/videocall/servers/anole/build.zig bench/videocall/servers/anole/build.zig.zon ./
 COPY bench/videocall/servers/anole/src/ src/
+# ANOLE_REF (a commit) builds against another Anole revision: zig fetch
+# --save re-pins the dependency, as an application updating would.
+ARG ANOLE_REF=
 # ReleaseSafe, as Anole's docs tell applications to build. Baseline x86-64,
 # as Go (GOAMD64=v1) and Rust build by default.
 RUN --mount=type=cache,target=/root/.cache/zig \
-    for i in 1 2 3; do zig build --fetch && break; sleep 2; done \
+    if [ -n "$ANOLE_REF" ]; then for i in 1 2 3; do zig fetch --save=anole "git+https://github.com/xuckless/anole#$ANOLE_REF" && break; sleep 2; done; fi \
+ && for i in 1 2 3; do zig build --fetch && break; sleep 2; done \
  && zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
 FROM debian:trixie-20251020-slim

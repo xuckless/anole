@@ -1,0 +1,36 @@
+vcload ws-h2 https://127.0.0.1:8443: 1800 frames (GOP 60, 4.02 Mbit/s), 3001 audio packets (64 kbit/s); one user every 5s
+   10s users   20 connected   20 in call   20  video ok 100.0%  p99    1.9 ms  mem     34 MB  cpu 0.02  load 0.07
+   20s users   40 connected   40 in call   40  video ok 100.0%  p99    2.4 ms  mem     61 MB  cpu 0.04  load 0.12
+   30s users   60 connected   60 in call   60  video ok 100.1%  p99    1.8 ms  mem     87 MB  cpu 0.06  load 0.19
+   40s users   80 connected   80 in call   80  video ok 100.0%  p99    2.2 ms  mem    114 MB  cpu 0.08  load 0.24
+   50s users  100 connected  100 in call  100  video ok 100.0%  p99    2.1 ms  mem    140 MB  cpu 0.11  load 0.33
+   60s users  120 connected  120 in call  120  video ok 100.0%  p99    4.2 ms  mem    166 MB  cpu 0.13  load 0.41
+   70s users  140 connected  140 in call  140  video ok 100.0%  p99    4.2 ms  mem    194 MB  cpu 0.16  load 0.48
+   80s users  160 connected  160 in call  160  video ok  99.9%  p99    5.9 ms  mem    220 MB  cpu 0.19  load 0.54
+   90s users  180 connected  180 in call  180  video ok  99.9%  p99    6.8 ms  mem    246 MB  cpu 0.22  load 0.62
+  100s users  200 connected  200 in call  200  video ok 100.0%  p99    7.0 ms  mem    272 MB  cpu 0.25  load 0.70
+  110s users  220 connected  220 in call  220  video ok 100.0%  p99    9.0 ms  mem    299 MB  cpu 0.27  load 0.76
+  120s users  240 connected  240 in call  240  video ok 100.0%  p99    8.3 ms  mem    326 MB  cpu 0.31  load 0.85
+  130s users  260 connected  260 in call  260  video ok 100.0%  p99   11.9 ms  mem    352 MB  cpu 0.34  load 0.91
+  140s users  280 connected  280 in call  280  video ok 100.0%  p99   15.6 ms  mem    379 MB  cpu 0.37  load 1.01
+  150s users  300 connected  300 in call  300  video ok 100.0%  p99   18.9 ms  mem    406 MB  cpu 0.40  load 1.06
+  160s users  320 connected  320 in call  320  video ok  99.9%  p99   23.8 ms  mem    432 MB  cpu 0.43  load 1.15
+  170s users  340 connected  340 in call  340  video ok 100.1%  p99   20.7 ms  mem    459 MB  cpu 0.46  load 1.21
+  180s users  360 connected  360 in call  360  video ok 100.0%  p99   27.0 ms  mem    486 MB  cpu 0.50  load 1.29
+  190s users  380 connected  380 in call  380  video ok 100.2%  p99   28.1 ms  mem    512 MB  cpu 0.52  load 1.36
+  200s users  400 connected  400 in call  400  video ok 100.0%  p99   30.1 ms  mem    541 MB  cpu 0.56  load 1.43
+  210s users  420 connected  420 in call  420  video ok 100.1%  p99   45.1 ms  mem    567 MB  cpu 0.60  load 1.49
+  220s users  440 connected  440 in call  440  video ok 100.2%  p99   61.9 ms  mem    597 MB  cpu 0.64  load 1.57
+  230s users  460 connected  460 in call  460  video ok  99.7%  p99   73.4 ms  mem    625 MB  cpu 0.68  load 1.66
+  240s users  480 connected  480 in call  480  video ok  99.9%  p99   84.2 ms  mem    653 MB  cpu 0.70  load 1.70
+  250s users  500 connected  500 in call  500  video ok  99.9%  p99   94.3 ms  mem    681 MB  cpu 0.74  load 1.73
+  260s users  520 connected  520 in call  520  video ok  99.9%  p99  107.1 ms  mem    711 MB  cpu 0.78  load 1.84
+  270s users  540 connected  540 in call  540  video ok 100.7%  p99  114.8 ms  mem    738 MB  cpu 0.81  load 1.87
+  280s users  560 connected  560 in call  560  video ok 100.5%  p99  160.4 ms  mem    769 MB  cpu 0.87  load 1.90
+  290s users  580 connected  580 in call  580  video ok  97.0%  p99  179.1 ms  mem    802 MB  cpu 0.88  load 1.95
+  300s users  600 connected  600 in call  600  video ok  46.3%  p99  198.7 ms  mem    837 MB  cpu 0.87  load 2.06
+  310s users  620 connected  620 in call  620  video ok  19.5%  p99  214.8 ms  mem    867 MB  cpu 0.88  load 2.08
+  320s users  640 connected  640 in call  640  video ok   9.8%  p99  240.1 ms  mem    898 MB  cpu 0.88  load 2.14
+  330s users  660 connected  660 in call  660  video ok   3.2%  p99  258.1 ms  mem    929 MB  cpu 0.89  load 2.22
+  340s users  680 connected  680 in call  680  video ok   3.4%  p99  278.2 ms  mem    962 MB  cpu 0.89  load 2.26
+stopped: collapsed (under 10% of video frames shown for 30s) at 700 users after 5m46s
