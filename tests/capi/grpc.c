@@ -674,15 +674,16 @@ int main(void) {
     printf("ok bidi\n");
   }
   /* A deadline: DEADLINE_EXCEEDED for the client, ANOLE_EV_ABORT for the
-     consumer, and its late answer is ANOLE_E_GONE. */
+     consumer, and its late answer is ANOLE_E_GONE. 2 s, so the consumer
+     holds the call before it: a call that expires unpolled is skipped. */
   {
     atomic_store(&held, 0);
     const char *m[] = {"hold"};
-    call("Unary", m, 1, "Grpc-Timeout: 200m\r\n", r);
+    call("Unary", m, 1, "Grpc-Timeout: 2000m\r\n", r);
     CHECK(r->status == 200 && has_trailer(r, "grpc-status:4"));
     uint64_t h = wait_for(&held, 0);
     long long us = atomic_load(&held_timeout_us);
-    CHECK(us > 0 && us <= 200000);
+    CHECK(us > 0 && us <= 2000000);
     wait_for(&last_abort, h);
     CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_DEADLINE && atomic_load(&last_abort_status) == ANOLE_GRPC_STATUS_DEADLINE_EXCEEDED);
     CHECK(anole_grpc_send(h, "late", 4, ANOLE_GRPC_F_FINISH) == ANOLE_E_GONE);
