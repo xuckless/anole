@@ -51,7 +51,13 @@ const Events = struct {
                 const rec: *const abi.S3ResultEvent = @ptrCast(@alignCast(r.bytes.ptr));
                 if (rec.user_data == user_data) return rec;
             };
-            if (waited >= 15000) return error.TimedOut;
+            if (waited >= 15000) {
+                for (ev.list.items) |r| if (r.typ == @backingInt(abi.EventType.s3_result)) {
+                    const rec: *const abi.S3ResultEvent = @ptrCast(@alignCast(r.bytes.ptr));
+                    std.debug.print("result user_data {d} op {d} status {d} class {d}: {s} ({s})\n", .{ rec.user_data, rec.op, rec.status, rec.error_class, text(rec, rec.@"error"), text(rec, rec.error_code) });
+                };
+                return error.TimedOut;
+            }
             try ev.pump(50);
             waited += 50;
         }
@@ -77,13 +83,15 @@ const Rig = struct {
     json: []u8,
 
     fn start(r: *Rig, route: bool) !void {
-        r.rt = try zio.Runtime.init(alloc, .{ .executors = .exact(2) });
+        // Workers only: the test thread polls the consumer and must not be an executor the fake needs.
+        r.rt = try zio.Runtime.init(alloc, .{ .executors = .exact(2), .enable_main_executor = false });
         errdefer r.rt.deinit();
         r.fake = try anole.s3.testing.FakeServer.start(alloc, r.rt.io());
         errdefer r.fake.stop();
         r.json = try std.fmt.allocPrint(alloc,
-            \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
+            \\{{"executors": 2, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+            \\ "limits": {{"body_max": 33554432}},
             \\ "routes": [{s}],
             \\ "storage": [{{"name": "files", "s3": {{"endpoint": "{s}", "bucket": "b",
             \\   "access_key_id": "{s}", "secret_access_key": "{s}", "part_size": 5242880}},
@@ -274,6 +282,7 @@ test "capi s3: a push upload: write OK, BORROW refused, finish answers UPLOAD_FI
         }
     }
     try engine.s3.uploadFinish(r.e, t, 11);
+    errdefer for (r.fake.log.items) |l| std.debug.print("fake saw {s} {s} -> {d}\n", .{ l.method, l.target, l.status });
     const fin = try r.ev.result(11);
     try std.testing.expectEqual(abi.OK, fin.status);
     try std.testing.expectEqual(abi.S3_OP_UPLOAD_FINISH, fin.op);
@@ -377,7 +386,7 @@ test "capi s3: put_body stores the request body without the consumer reading it;
     var r: Rig = undefined;
     try r.start(true);
     defer r.deinit();
-    const body = try alloc.alloc(u8, 3 * mib);
+    const body = try alloc.alloc(u8, 12 * mib);
     defer alloc.free(body);
     pattern(body, 2);
     const io = r.rt.io();
