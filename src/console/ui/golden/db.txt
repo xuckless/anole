@@ -1,0 +1,30 @@
+ api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ SYSTEM       NAME        TARGET      MAX   OPEN   IDLE   USED   WAIT   CALLS/S       P50       P99 
+ postgresql   main        db.inter     16     14      3     11      2         -         -         - 
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ >                                                                                                  
+ Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       

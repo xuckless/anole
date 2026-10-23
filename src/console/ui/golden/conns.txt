@@ -1,0 +1,30 @@
+ api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ EXEC     CONNS      H1      H2      H3      WS      WT    GRPC    TASKS    RUNQ                    
+ 0           20      10       8       1       1       0       0      120       2                    
+ 1           17       9       6       0       2       0       0       90       0                    
+ all         37      19      14       1       3       0       0      210       2                    
+                                                                                                    
+ stack memory committed: 9.0 MiB                                                                    
+ listeners                                                                                          
+ http  http://127.0.0.1:3000  (h1, h2c)                                                             
+ https  https://0.0.0.0:8443  (h1, h2, h3)                                                          
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ >                                                                                                  
+ Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       

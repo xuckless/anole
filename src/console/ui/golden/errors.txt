@@ -1,0 +1,30 @@
+ api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ TIME      STATUS  METHOD   PATH             ROUTE            ERROR            REQUEST    DURATION  
+ 09:41:06  502     GET      /users/42        /users/:id       ConnectionRefus  7f3a91cc    31.5 ms  
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ >                                                                                                  
+ Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       

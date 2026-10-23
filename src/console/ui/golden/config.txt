@@ -1,0 +1,30 @@
+ api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ environment = development (from Debug build)                                                       
+ deployment = standalone                                                                            
+ http.port = 3000                                                                                   
+ tls.key = [REDACTED]                                                                               
+ database = postgres://app:[REDACTED]@db:5432/app                                                   
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ >                                                                                                  
+ Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       

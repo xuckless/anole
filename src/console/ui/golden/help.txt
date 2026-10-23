@@ -1,0 +1,30 @@
+ api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ /config             resolved settings, with secrets redacted                                       
+ /conns              connections, streams and tasks per executor                                    
+ /db [name]          database pools and call latency                                                
+ /drain              stop accepting, finish open requests, then stop the server                     
+ /errors [route=<pa  the last 5xx answers                                                           
+ /exit               leave the console                                                              
+ /full-restart [--k  drop everything and restart the process                                        
+ /h3                 HTTP/3 endpoints                                                               
+ /help [command]     this list, or one command                                                      
+ /logs [level=] [sc  live log tail with server-side filters                                         
+ /quit               leave the console                                                              
+ /reload             reload TLS certificates from their files                                       
+ /requests [sort=rp  req/s, p50 and p99 per route                                                   
+ /restart            hand over to a new process without dropping connections                        
+ /routes [text]      registered routes                                                              
+ /runtime            process, memory, descriptors and language metrics                              
+ /tasks              per-task view (needs a task registry in the runtime; not available yet)        
+ /ws                 WebSockets, WebTransport, rooms and topics                                     
+                                                                                                    
+ Anything without a leading / filters the current view.                                             
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ >                                                                                                  
+ Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       
