@@ -850,7 +850,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
             fn systemOf(comptime T: type) []const u8 {
                 const n = @typeName(T);
-                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka" }) |pair| {
+                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka", "smtp:smtp", "s3:s3" }) |pair| {
                     const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
                     if (std.mem.find(u8, n, pair[colon + 1 ..]) != null) return pair[0..colon];
                 }
