@@ -104,7 +104,11 @@ pub fn command(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, env: 
         return exit_unsupported;
     }
     const a = parseArgs(args) catch |err| {
-        warn("anole console: {t}\n\n{s}", .{ err, help_text });
+        warn("anole console: {s}\n\n{s}", .{ switch (err) {
+            error.UnknownOption => "unknown option",
+            error.MissingValue => "an option needs a value (--snapshot <view>, --wedge-timeout <secs>)",
+            error.BadValue => "--wedge-timeout takes a whole number of seconds",
+        }, help_text });
         return 1;
     };
     var dir_buf: [256]u8 = undefined;
@@ -128,7 +132,7 @@ pub fn command(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, env: 
         const now_ms = sys.wallMs();
         for (entries) |e| {
             const up_s: i64 = @max(0, @divTrunc(now_ms - @as(i64, @intCast(@divTrunc(e.mtime_ns, std.time.ns_per_ms))), 1000));
-            say("{s:<24} {d:>8} {d:>9}s  {s}\n", .{ e.name, e.pid, up_s, e.path });
+            say("{s:<24} {d:>8} {d:>9}s  {s}\n", .{ e.name, @as(u64, @intCast(@max(0, e.pid))), @as(u64, @intCast(up_s)), e.path });
         }
         return 0;
     }
