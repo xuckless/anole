@@ -535,6 +535,7 @@ static void on_event(consumer_state *cs, const anole_event *ev) {
   }
   case ANOLE_EV_BODY:
   case ANOLE_EV_WRITABLE:
+  case ANOLE_EV_DRAINING:
     break;
   default:
     CHECK(!"unknown event type");
@@ -2401,8 +2402,8 @@ static void test_tls(void) {
     CHECK(anole_last_error().len > 0);
   }
   /* Settings it takes. */
-  anole_server *p = make_server("{\"trusted_proxy_hops\": 1, \"trust_forwarded_proto\": false,"
-                                " \"trust_forwarded_host\": true, \"listeners\": [{\"port\": 0,"
+  anole_server *p = make_server("{\"proxy\": {\"trusted_hops\": 1, \"trust_forwarded_proto\": false,"
+                                " \"trust_forwarded_host\": true}, \"listeners\": [{\"port\": 0,"
                                 " \"proxy_protocol\": true, \"proxy_protocol_from\": [\"127.0.0.1\", \"10.0.0.0/8\"]}]}");
   CHECK(anole_server_start(p) == ANOLE_OK);
   /* No TLS listener: nothing to reload. */
