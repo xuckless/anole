@@ -229,6 +229,11 @@ pub const ClientConnection = struct {
         return start(gpa, io, socket, owned, r, w, opts.stream_window, opts.max_data, opts.max_header_list_size, timeoutFrom(opts.timeout));
     }
 
+    /// The receive window per stream of an adopted connection (the HTTP
+    /// client's). Its queue is sized per response (`allocBody`), so a large
+    /// window costs nothing for small answers.
+    const adopted_stream_window: u31 = 1 << 20;
+
     /// Takes over a connection on which the TLS handshake picked "h2", as
     /// the core's client does (its `h2_client` seam): `reader` and `writer`
     /// carry the cleartext from here on, and only this connection's tasks
@@ -237,7 +242,7 @@ pub const ClientConnection = struct {
     /// `close`. Requests have no timeout unless they ask for one.
     pub fn adopt(gpa: std.mem.Allocator, io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer, socket: std.Io.net.Stream) !*ClientConnection {
         const defaults: ConnectOptions = .{ .host = "", .port = 0 };
-        return start(gpa, io, socket, null, reader, writer, defaults.stream_window, defaults.max_data, defaults.max_header_list_size, .none);
+        return start(gpa, io, socket, null, reader, writer, adopted_stream_window, defaults.max_data, defaults.max_header_list_size, .none);
     }
 
     fn dial(io: std.Io, opts: ConnectOptions) !std.Io.net.Stream {
@@ -601,6 +606,7 @@ pub const ClientConnection = struct {
         switch (hd.type) {
             c.NGHTTP2_HEADERS => {
                 if (!stream.head_ready and stream.status >= 200) {
+                    if (!end) stream.allocBody() catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                     stream.head_ready = true;
                     stream.head_event.set(self.io);
                 } else if (!stream.head_ready) {
@@ -713,7 +719,9 @@ pub const Stream = struct {
         };
         errdefer self.arena.deinit();
         const a = self.arena.allocator();
-        self.body = .init(try a.alloc(u8, conn.stream_window));
+        // The receive queue comes with the response head (`allocBody`),
+        // sized by what the response says it will carry.
+        self.body = .init(&.{});
         self.body_reader.buffer = try a.alloc(u8, 16 * 1024);
         if (has_body) {
             self.out = .init(try a.alloc(u8, 32 * 1024));
@@ -735,6 +743,22 @@ pub const Stream = struct {
         conn.unlock();
         self.arena.deinit();
         conn.gpa.destroy(self);
+    }
+
+    /// Under the connection's mutex, when the final response head is in:
+    /// the receive queue. As large as the flow-control window needs to be,
+    /// but no larger than a response with a `content-length` will fill, so
+    /// a stream for a small answer costs a small buffer whatever the
+    /// window is.
+    fn allocBody(self: *Stream) !void {
+        var size: usize = self.conn.stream_window;
+        for (self.headers.items) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "content-length")) continue;
+            const n = std.fmt.parseInt(usize, f.value, 10) catch break;
+            size = @min(size, @max(n, 1));
+            break;
+        }
+        self.body = .init(try self.arena.allocator().alloc(u8, size));
     }
 
     /// Under the connection's mutex: END_STREAM arrived. The reader sees
