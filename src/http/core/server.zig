@@ -198,6 +198,8 @@ const TlsMaterial = struct {
             return error.MissingTlsCertificate;
         } else tls.config.CertKeyPair.fromFilePath(allocator, io, dir, cfg.cert_path, cfg.key_path);
         var auth = loaded catch |err| {
+            // (Tests provoke these on purpose, and a logged error fails one.)
+            if (builtin.is_test) return err;
             if (cfg.pem != null) {
                 log.err("cannot load the TLS certificate and key (PEM in memory): {t}", .{err});
             } else {

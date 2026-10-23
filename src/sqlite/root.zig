@@ -73,7 +73,7 @@ pub const c = sqlite.c;
 /// blobs, backups, virtual tables.
 pub const driver = sqlite;
 
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 const Duration = std.Io.Duration;
 
 /// `app.sqlite(options)` and `Client.init`: the file, its connections and
@@ -964,7 +964,13 @@ pub fn Rows(comptime T: type) type {
             else
                 Client.onReader(self.io, self.conn, leftOpenJob, .{ self.conn, &failure });
             checked catch |err| switch (err) {
-                error.Failed => return self.fail_fn(self.fail_ctx, self.db, &failure),
+                error.Failed => {
+                    const fail_err = self.fail_fn(self.fail_ctx, self.db, &failure);
+                    // Rolled back already: give the connection back now, so
+                    // the caller's next call is not queued behind these Rows.
+                    self.deinit();
+                    return fail_err;
+                },
                 error.NeedsWriter => unreachable,
                 else => |e| return e,
             };
