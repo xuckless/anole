@@ -73,7 +73,12 @@ test "examples/rest: create, list, get, update, delete, the API key and JSON err
             try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"field\":\"name\",\"code\":\"validation.not_blank\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, rules.body, "\"field\":\"email\",\"code\":\"validation.email\"") != null);
             const missing = try std.fmt.allocPrint(arena, "{s}/99", .{base});
-            try expectReply(.not_found, "{\"error\":\"Not Found\"}", try call(io, arena, .put, missing, key, "{\"name\":\"X\",\"email\":\"x\"}"));
+            // The body is checked first: a valid one for the 404, a broken
+            // rule on a user that exists is 422.
+            try expectReply(.not_found, "{\"error\":\"Not Found\"}", try call(io, arena, .put, missing, key, "{\"name\":\"X\",\"email\":\"x@example.com\"}"));
+            const bad_put = try call(io, arena, .put, one, key, "{\"name\":\"X\",\"email\":\"x\"}");
+            try std.testing.expectEqual(anole.http.Status.unprocessable_entity, bad_put.status);
+            try std.testing.expect(std.mem.indexOf(u8, bad_put.body, "\"field\":\"email\",\"code\":\"validation.email\"") != null);
             const not_a_number = try std.fmt.allocPrint(arena, "{s}/abc", .{base});
             try expectReply(.not_found, "{\"error\":\"Not Found\"}", try call(io, arena, .get, not_a_number, key, null));
 
