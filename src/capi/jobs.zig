@@ -560,7 +560,8 @@ fn abiRun(ctx: ?*anyopaque, job: *J.Job) anyerror!void {
             return error.Application;
         },
         abi.JOB_SNOOZE => job.snooze(.fromMilliseconds(slot.delay_ms)),
-        else => job.discard(slot.text),
+        // The reason outlives the slot: it is stored after this handler returns.
+        else => job.discard(job.arena.dupe(u8, slot.text) catch ""),
     }
 }
 

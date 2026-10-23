@@ -130,6 +130,8 @@ const Rig = struct {
         };
         errdefer r.e.destroy();
         r.c = try r.e.attach(null, null, false);
+        // anole_server_open: the queue exists, workers may register.
+        try r.e.open();
         r.ev = .{ .c = r.c };
     }
 
@@ -236,7 +238,8 @@ test "capi jobs: admin answers JSON, and a discarded job is dead with the reason
         try std.testing.expectEqual(abi.OK, rec.status);
         const json = r.ev.span(i, rec.json);
         if (std.mem.indexOf(u8, json, "not today") != null) break;
-        if (tries > 50) return error.TimedOut;
+        if (tries > 400) return error.TimedOut;
+        try Io.sleep(engine.threadedIo(), .fromMilliseconds(20), .awake);
     }
     try engine.jobs.admin(r.e, r.c, "{\"op\":\"jobs.nope\"}", 1);
     const bad = try r.ev.waitFor(.jobs_result, tries + 1, 5000);
