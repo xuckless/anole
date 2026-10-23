@@ -17,7 +17,7 @@ const util = @import("util.zig");
 const sigv4 = @import("sigv4.zig");
 
 const placement = dusty.placement;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 /// How long before expiry the credentials are renewed.
 pub const renew_before_s: i64 = 300;

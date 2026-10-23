@@ -586,6 +586,8 @@ test "s3: a call without a bucket is a BadRequest with a clear code; bucket(name
 test "s3: bad options are refused at init" {
     try Rt.start();
     defer Rt.stop();
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
     const q = Quiet.on();
     defer q.done();
     try testing.expectError(error.InvalidOptions, s3.Client.init(testing.allocator, tio(), .{ .part_size = 1024 }));

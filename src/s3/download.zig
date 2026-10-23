@@ -215,6 +215,10 @@ pub fn serve(b: Bucket, req: *anole.Request, res: *anole.Response, key: []const 
         return meta;
     }
     try hdr(res, "Content-Length", try std.fmt.allocPrint(req.arena, "{d}", .{meta.content_length}));
+    if (is_head) {
+        res.body = "";
+        return meta;
+    }
     const buf = try req.arena.alloc(u8, 64 * 1024);
     var w = res.stream(buf) catch |err| return mapRespErr(err);
     if (dl) |*d| {

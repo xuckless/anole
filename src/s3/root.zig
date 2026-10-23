@@ -32,7 +32,7 @@ pub const download_ = @import("download.zig");
 pub const testing = @import("testing.zig");
 
 const Duration = std.Io.Duration;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 pub const Header = [2][]const u8;
 

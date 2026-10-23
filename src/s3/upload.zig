@@ -28,7 +28,7 @@ const Client = root.Client;
 const PutOptions = root.PutOptions;
 const Stored = root.Stored;
 const Duration = std.Io.Duration;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 
 pub const max_parts = 10_000;
 const mib: u64 = 1024 * 1024;

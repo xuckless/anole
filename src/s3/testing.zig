@@ -222,6 +222,10 @@ pub const FakeServer = struct {
         if (o.content_encoding) |v| self.gpa.free(v);
     }
 
+    fn removeObject(self: *FakeServer, k: []const u8) void {
+        if (self.objects.fetchSwapRemove(k)) |kv| self.freeObject(kv.value);
+    }
+
     fn dupe(self: *FakeServer, bytes: []const u8) ![]u8 {
         return self.gpa.dupe(u8, bytes);
     }
@@ -360,7 +364,7 @@ pub const FakeServer = struct {
                 try self.lock();
                 defer self.unlock();
                 const k = try std.fmt.allocPrint(arena, "{s}/{s}", .{ bucket, key });
-                _ = self.objects.swapRemove(k);
+                self.removeObject(k);
                 res.status = .no_content;
             },
             .post => {
@@ -727,7 +731,7 @@ pub const FakeServer = struct {
             .start => |name| in_key = std.mem.eql(u8, name, "Key"),
             .text => |t| if (in_key) {
                 const k = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{ bucket, t });
-                _ = self.objects.swapRemove(k);
+                self.removeObject(k);
                 n += 1;
             },
             .end => in_key = false,
