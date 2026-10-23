@@ -5,6 +5,74 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
+The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2
+WebSocket overhead, and HTTP/3 and WebTransport memory and wake-ups. The C
+ABI is now 0.8.
+
+### Added
+
+- `http2.tunnel_window` (Zig option and the C ABI JSON key, default 128 KiB):
+  the one fixed window and buffer of a WebSocket over HTTP/2, in place of
+  the 1 MiB window a stream gets once it reads its body. About 1 MB less
+  memory per HTTP/2 WebSocket; raise it for bulk uploads over long round
+  trips.
+- WebTransport stream urgency: `Stream.setPriority(urgency)`, 0 (most urgent)
+  to 7, RFC 9218 classes with round-robin inside each; the default stays 3
+  for every stream. C ABI 0.8: `anole_wt_stream_set_priority`.
+
+### Changed
+
+- A WebSocket send to another socket from a task that is in the middle of
+  its own batch of buffered messages now waits for the receiver's batch
+  instead of costing a TLS record and a `send` each. Sends outside a batch
+  are unchanged.
+- A batch now continues across a message bigger than the reader window when
+  the TLS layer already holds bytes of it.
+- A room member's sender and the C ABI's per-socket sender write everything
+  queued for a socket and flush once; `anole_ws_send` keeps a burst's bytes
+  in one buffer per socket and `anole_ws_publish` makes one copy of the
+  message, not three.
+- TLS: a connection that receives big messages keeps its 16.5 KiB read
+  block while it stays busy (one `recv` per message), `SSL_read` calls that
+  could only say "want read" are skipped, the error queue is cleared only
+  when it holds something, a large message's records leave together (a
+  keyframe in two socket writes, not eight) and a frame header no longer
+  becomes a TLS record of its own.
+- HTTP/2 WebSocket: a stream's response bytes go straight into a growable
+  per-stream queue (freed when idle, a send waits only past 1 MiB queued)
+  instead of a fixed 32 KiB ring, the connection's writer is woken for a
+  body read only when nghttp2 queued a WINDOW_UPDATE, and the socket reads
+  16 KiB at a time.
+- The message buffers a WebSocket keeps between messages are capped at
+  64 KiB on HTTP/1.1 and HTTP/2, so a socket that once received a keyframe
+  does not hold it.
+- HTTP/3 receive windows no longer auto-tune past the initial ones
+  (`max_window` = `max_data`, `max_stream_window` = `max_stream_data`, was
+  six times each): a peer can no longer park up to 6 MiB of unread data per
+  stream when the app falls behind. One stream's upload now tops out near
+  `max_stream_data` per round trip (about 80 Mbit/s at 100 ms); raise
+  `max_stream_data` for more.
+
+### Fixed
+
+- HTTP/3 and WebTransport memory: send and receive queues are shared 4 KiB
+  blocks held only while data is unacknowledged or unread (a stream used to
+  keep a 64 KiB ring for its whole life, plus 8 KiB reader and writer
+  buffers); the request-stream pool keeps 64 streams of 4 KiB (was 256 of 8
+  KiB plus rings). A connection's streams hold at most 4 MiB unacknowledged.
+- WebTransport writes no longer wait for the peer's acknowledgments below
+  1 MiB per stream: a 1080p keyframe larger than the old 64 KiB ring blocked
+  mid-write, and audio behind the same lock waited with it.
+- Every waiter of an HTTP/3 connection no longer wakes on every packet: a
+  stream's reader and writer, and a session's `acceptStream`, `openStream`
+  and datagram calls, each wait on their own signal.
+- A WebTransport session on the server runs no tasks of its own: capsules are
+  parsed as they arrive and the drain is a hook (it was two tasks).
+- The WebSocket-over-HTTP/3 and WebTransport CONNECT streams hold up to 1 MiB
+  unacknowledged (ordinary responses keep 64 KiB).
+
+## 0.2.0
+
 The API review before the Node and Python bindings: every breaking change
 of 0.2 is listed below, and [docs/migrating.md](docs/migrating.md)
 has the old -> new table for each area. The C ABI is now 0.7.
@@ -170,40 +238,6 @@ and docs/c-abi.md ("From ABI 0.6").
   6 is a database transaction.
 
 ### Added
-
-- `http2.tunnel_window` (Zig option and the C ABI JSON key, default 128 KiB):
-  the one fixed window and buffer of a WebSocket over HTTP/2, in place of
-  the 1 MiB window a stream gets once it reads its body. About 1 MB less
-  memory per HTTP/2 WebSocket; raise it for bulk uploads over long round
-  trips.
-
-### Changed (relay pass: WebSocket, TLS, HTTP/2)
-
-- A WebSocket send to another socket from a task that is in the middle of
-  its own batch of buffered messages now waits for the receiver's batch
-  instead of costing a TLS record and a `send` each. Sends outside a batch
-  are unchanged.
-- A batch now continues across a message bigger than the reader window when
-  the TLS layer already holds bytes of it.
-- A room member's sender and the C ABI's per-socket sender write everything
-  queued for a socket and flush once; `anole_ws_send` keeps a burst's bytes
-  in one buffer per socket and `anole_ws_publish` makes one copy of the
-  message, not three.
-- TLS: a connection that receives big messages keeps its 16.5 KiB read
-  block while it stays busy (one `recv` per message), `SSL_read` calls that
-  could only say "want read" are skipped, the error queue is cleared only
-  when it holds something, a large message's records leave together (a
-  keyframe in two socket writes, not eight) and a frame header no longer
-  becomes a TLS record of its own.
-- HTTP/2 WebSocket: a stream's response bytes go straight into a growable
-  per-stream queue (freed when idle, a send waits only past 1 MiB queued)
-  instead of a fixed 32 KiB ring, the connection's writer is woken for a
-  body read only when nghttp2 queued a WINDOW_UPDATE, and the socket reads
-  16 KiB at a time.
-- The message buffers a WebSocket keeps between messages are capped at
-  64 KiB on HTTP/1.1 and HTTP/2, so a socket that once received a keyframe
-  does not hold it.
-
 
 - `app.listen("3000")` (a bare port) listens on every interface, like
   `":3000"`. A listen address Anole cannot read is now logged with examples.

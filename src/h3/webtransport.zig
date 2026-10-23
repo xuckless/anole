@@ -123,8 +123,20 @@ fn readVarint(r: *std.Io.Reader) std.Io.Reader.Error!u64 {
 /// How `Core` reaches the connection it belongs to.
 pub const Host = struct {
     ctx: *anyopaque,
-    /// Bumped on every change; `wait` sleeps on it.
-    gen: *std.atomic.Value(u32),
+    /// Bumped on every change; the C ABI's session driver sleeps on it.
+    gen: *bridge.Signal,
+    /// The endpoint's (or client connection's) free blocks, and what the
+    /// connection holds unacknowledged.
+    pool: *bridge.BlockPool,
+    budget: *bridge.Budget,
+    /// Server only: gives the session the CONNECT stream's bytes that are
+    /// already queued (`Session.onCapsuleBytes`) and routes later ones to
+    /// it (`Options.inline_capsules`). Called with the connection locked.
+    bind_session_fn: ?*const fn (*anyopaque, i64, *Session) void = null,
+    /// Server only: ends the CONNECT stream's response without waiting;
+    /// false while its 200 has not gone out. Called with the connection
+    /// locked.
+    end_connect_fn: ?*const fn (*anyopaque, i64) bool = null,
     lock_fn: *const fn (*anyopaque) void,
     unlock_fn: *const fn (*anyopaque) void,
     kick_fn: *const fn (*anyopaque) void,
@@ -160,6 +172,8 @@ pub const Limits = struct {
     /// Datagrams waiting to go out on one connection; `sendDatagram` waits
     /// while there are this many. Each is at most a packet.
     datagrams_out: usize = 256,
+    /// Bytes one stream holds unacknowledged before a write waits.
+    send_buffer: usize = 1 << 20,
 };
 
 /// The bytes a peer's stream started with while its first varint is not
@@ -209,11 +223,12 @@ pub const Core = struct {
     /// The last sessions that ended, so their late streams are refused.
     gone: [16]i64 = @splat(-1),
     gone_next: usize = 0,
-    /// Streams with something to send, in turn.
-    send_queue: std.DoublyLinkedList = .{},
+    /// Streams with something to send, by urgency and in turn.
+    sched: Sched = .{},
     /// Datagrams to send, oldest first, each with its session prefix.
     datagrams_out: std.ArrayList([]u8) = .empty,
-    /// Which of WebTransport's streams and nghttp3's leads the next packet.
+    /// Which of WebTransport's streams and nghttp3's leads the next packet
+    /// (when no WebTransport stream is more urgent than nghttp3's default).
     turn: bool = false,
     /// The connection is gone: nothing reaches QUIC anymore.
     closed: bool = false,
@@ -241,8 +256,19 @@ pub const Core = struct {
         gpa.destroy(core);
     }
 
-    fn wait(core: *Core, gen: u32) std.Io.Cancelable!void {
-        try core.io.futexWait(u32, &core.host.gen.raw, gen);
+    fn pool(core: *const Core) *bridge.BlockPool {
+        return core.host.pool;
+    }
+
+    fn budget(core: *const Core) *bridge.Budget {
+        return core.host.budget;
+    }
+
+    /// The peer raised its stream limits: sessions waiting to open wake.
+    /// Locked.
+    pub fn onStreamCredit(core: *Core) void {
+        var it = core.sessions.valueIterator();
+        while (it.next()) |session| session.*.ev.notify(core.io);
     }
 
     fn isUni(stream_id: i64) bool {
@@ -272,7 +298,10 @@ pub const Core = struct {
             const stream = s.*;
             if (stream.recv_err == null and !stream.in_fin) stream.recv_err = error.ConnectionClosed;
             if (stream.send_err == null) stream.send_err = error.ConnectionClosed;
+            stream.wakeAll();
         }
+        var sit = core.sessions.valueIterator();
+        while (sit.next()) |session| session.*.ev.notify(core.io);
         core.host.kick();
     }
 
@@ -362,6 +391,7 @@ pub const Core = struct {
             return;
         };
         session.datagrams_in_bytes += copy.len;
+        session.ev.notify(core.io);
         core.host.kick();
     }
 
@@ -369,7 +399,8 @@ pub const Core = struct {
     /// WebTransport's. Locked.
     pub fn onAcked(core: *Core, stream_id: i64, len: u64) bool {
         const s = core.streams.get(stream_id) orelse return false;
-        s.out.acked += len;
+        s.out.ack(core.pool(), core.budget(), len);
+        s.tx.notify(core.io);
         core.host.kick();
         return true;
     }
@@ -393,6 +424,7 @@ pub const Core = struct {
         // Reset before it said its session: no use to anyone. Refused
         // both ways, so QUIC closes it and it is freed.
         if (!s.prefix_done) s.disown(error_id);
+        s.wakeAll();
         core.host.kick();
         return true;
     }
@@ -405,6 +437,7 @@ pub const Core = struct {
             s.stop_code = fromHttp3Error(code);
         }
         s.dequeue();
+        s.wakeAll();
         core.host.kick();
         return true;
     }
@@ -425,6 +458,7 @@ pub const Core = struct {
             // `dropOrphans` frees it if the session never comes.
             if (s.in_fin and s.recv_err == null) {
                 s.dequeue();
+                s.wakeAll();
                 core.host.kick();
                 return true;
             }
@@ -437,6 +471,7 @@ pub const Core = struct {
         if (!s.in_fin and s.recv_err == null and s.kind != .uni_out) s.recv_err = error.StreamReset;
         if (!s.fin_sent and s.send_err == null and s.kind != .uni_in) s.send_err = error.StreamReset;
         s.dequeue();
+        s.wakeAll();
         s.maybeFree();
         core.host.kick();
         return true;
@@ -461,7 +496,11 @@ pub const Core = struct {
 
     // -- Out (inside `bridge.writePacket`, locked) ---------------------------
 
-    pub fn takeTurn(core: *Core) bool {
+    /// Whether WebTransport's streams lead the next packet: always when
+    /// one is more urgent than nghttp3's default (3), else they alternate
+    /// with nghttp3's.
+    pub fn leads(core: *Core) bool {
+        if (core.sched.mostUrgent()) |u| if (u < 3) return true;
         core.turn = !core.turn;
         return core.turn;
     }
@@ -478,6 +517,9 @@ pub const Core = struct {
         if (accepted != 0 or n == c.NGTCP2_ERR_INVALID_ARGUMENT or n == c.NGTCP2_ERR_INVALID_STATE) {
             _ = core.datagrams_out.orderedRemove(0);
             core.gpa.free(d);
+            // A slot is free: sessions waiting to send wake.
+            var sit = core.sessions.valueIterator();
+            while (sit.next()) |session| session.*.ev.notify(core.io);
             core.host.kick();
         }
         return switch (n) {
@@ -491,25 +533,24 @@ pub const Core = struct {
     /// The next stream in turn into the packet; null when none has
     /// anything to send.
     pub fn writeStream(core: *Core, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: []u8, ts: u64) ?Wrote {
-        while (core.send_queue.first) |node| {
-            const s: *Stream = @alignCast(@fieldParentPtr("node", node));
-            var runs: [2][]const u8 = undefined;
+        while (core.sched.first()) |s| {
+            var runs: [4][]const u8 = undefined;
             const count = s.out.unsent(&runs);
-            const pending = s.out.written - s.out.sent;
+            const pending = s.out.pending();
             const fin = s.send_closed and !s.fin_sent;
             if (pending == 0 and !fin) {
                 s.dequeue();
                 continue;
             }
-            var vec: [2]c.ngtcp2_vec = undefined;
+            var vec: [4]c.ngtcp2_vec = undefined;
             for (runs[0..count], vec[0..count]) |run, *v| v.* = .{ .base = @constCast(run.ptr), .len = run.len };
             var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
             if (fin) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
             var data_len: c.ngtcp2_ssize = -1;
             const n = ngtcp2.connWritevStream(core.q, p, pi, dest, &data_len, flags, s.id, vec[0..count], ts);
             if (data_len >= 0) {
-                s.out.sent += @intCast(data_len);
-                if (fin and s.out.sent == s.out.written) s.fin_sent = true;
+                s.out.advance(@intCast(data_len));
+                if (fin and s.out.allSent()) s.fin_sent = true;
             }
             if (n < 0) switch (n) {
                 c.NGTCP2_ERR_STREAM_DATA_BLOCKED => {
@@ -520,6 +561,7 @@ pub const Core = struct {
                 c.NGTCP2_ERR_STREAM_SHUT_WR, c.NGTCP2_ERR_STREAM_NOT_FOUND => {
                     if (s.send_err == null) s.send_err = error.StreamReset;
                     s.dequeue();
+                    s.wakeAll();
                     core.host.kick();
                     continue;
                 },
@@ -533,6 +575,134 @@ pub const Core = struct {
             return .{ .packet = n };
         }
         return null;
+    }
+};
+
+// -- Scheduling and capsules ------------------------------------------------
+
+/// WebTransport streams with something to send, by urgency (RFC 9218: 0
+/// most urgent, 7 least, 3 the default) and, within one, in turn.
+pub const Sched = struct {
+    lists: [8]std.DoublyLinkedList = @splat(.{}),
+    /// Bit u is set while `lists[u]` is not empty.
+    ready: u8 = 0,
+
+    pub fn push(q: *Sched, node: *std.DoublyLinkedList.Node, urgency: u3) void {
+        q.lists[urgency].append(node);
+        q.ready |= @as(u8, 1) << urgency;
+    }
+
+    pub fn remove(q: *Sched, node: *std.DoublyLinkedList.Node, urgency: u3) void {
+        q.lists[urgency].remove(node);
+        if (q.lists[urgency].first == null) q.ready &= ~(@as(u8, 1) << urgency);
+    }
+
+    /// The node first in turn in the most urgent class that has any.
+    pub fn firstNode(q: *const Sched) ?*std.DoublyLinkedList.Node {
+        if (q.ready == 0) return null;
+        return q.lists[@ctz(q.ready)].first;
+    }
+
+    /// The most urgent class with a stream waiting.
+    pub fn mostUrgent(q: *const Sched) ?u3 {
+        if (q.ready == 0) return null;
+        return @intCast(@ctz(q.ready));
+    }
+
+    pub fn first(q: *const Sched) ?*Stream {
+        const node = q.firstNode() orelse return null;
+        return @alignCast(@fieldParentPtr("node", node));
+    }
+};
+
+/// Parses the capsules on a session's CONNECT stream (RFC 9297), fed in
+/// pieces of any size. Only the close and the drain are understood; others
+/// are skipped.
+pub const CapsuleParser = struct {
+    state: enum { kind, length, payload, skip, done } = .kind,
+    in_varint: bool = false,
+    vleft: u8 = 0,
+    acc: u64 = 0,
+    kind: u64 = 0,
+    len: u64 = 0,
+    have: usize = 0,
+    payload: [4 + max_close_message]u8 = undefined,
+
+    pub const Event = union(enum) {
+        /// The reason points into the parser, valid until the next feed.
+        close: struct { code: u32, reason: []const u8 },
+        drain,
+        /// A close capsule that is too short or too long; the parser stops.
+        malformed,
+    };
+
+    pub const Fed = struct { used: usize, event: ?Event = null };
+
+    /// Takes bytes until one event, or all of them. Call again with the
+    /// rest until `used` covers it.
+    pub fn feed(p: *CapsuleParser, bytes: []const u8) Fed {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            switch (p.state) {
+                .done => return .{ .used = bytes.len },
+                .kind, .length => {
+                    const b = bytes[i];
+                    i += 1;
+                    if (!p.in_varint) {
+                        p.in_varint = true;
+                        p.vleft = (@as(u8, 1) << @intCast(b >> 6)) - 1;
+                        p.acc = b & 0x3f;
+                    } else {
+                        p.acc = p.acc << 8 | b;
+                        p.vleft -= 1;
+                    }
+                    if (p.vleft != 0) continue;
+                    p.in_varint = false;
+                    if (p.state == .kind) {
+                        p.kind = p.acc;
+                        p.state = .length;
+                        continue;
+                    }
+                    p.len = p.acc;
+                    p.have = 0;
+                    switch (p.kind) {
+                        capsule_close => {
+                            if (p.len < 4 or p.len > 4 + max_close_message) {
+                                p.state = .done;
+                                return .{ .used = i, .event = .malformed };
+                            }
+                            p.state = .payload;
+                        },
+                        capsule_drain => {
+                            p.state = if (p.len == 0) .kind else .skip;
+                            return .{ .used = i, .event = .drain };
+                        },
+                        else => p.state = if (p.len == 0) .kind else .skip,
+                    }
+                },
+                .payload => {
+                    const want: usize = @intCast(p.len);
+                    const take = @min(bytes.len - i, want - p.have);
+                    @memcpy(p.payload[p.have..][0..take], bytes[i..][0..take]);
+                    p.have += take;
+                    i += take;
+                    if (p.have == want) {
+                        p.state = .done;
+                        return .{ .used = i, .event = .{ .close = .{
+                            .code = std.mem.readInt(u32, p.payload[0..4], .big),
+                            .reason = p.payload[4..want],
+                        } } };
+                    }
+                },
+                .skip => {
+                    const take: usize = @intCast(@min(@as(u64, bytes.len - i), p.len - p.have));
+                    p.have += take;
+                    i += take;
+                    if (p.have == p.len) p.state = .kind;
+                },
+            }
+        }
+        return .{ .used = i };
     }
 };
 
@@ -604,22 +774,75 @@ pub const Session = struct {
     datagrams_in_bytes: usize = 0,
     /// Unregistered from the core (`deinit`).
     detached: bool = false,
+    /// Woken by what a waiting `acceptFrom`, `open`, `receiveDatagram` or
+    /// `sendDatagram` looks at: a new stream, a datagram, the session's end,
+    /// the drain, stream credit.
+    ev: bridge.Signal = .{},
+    /// The CONNECT stream's capsules are parsed as they arrive
+    /// (`onCapsuleBytes`), not by a task.
+    inline_capsules: bool = false,
+    parser: CapsuleParser = .{},
 
     /// Over the channel's writer: capsules from the handler and from the
-    /// watch tasks.
+    /// drain watch.
     write_mutex: std.Io.Mutex = .init,
+    /// The CONNECT stream's sending side is ended (or being ended). Under
+    /// the connection's lock.
     ended: bool = false,
-    /// The capsule reader and the drain watch.
+    /// A capsule is being written: the channel ends after it
+    /// (`end_pending`). Under the connection's lock.
+    writing: bool = false,
+    end_pending: bool = false,
+    /// The capsule reader of a client session.
     tasks: std.Io.Group = .init,
+    drain_watch: DrainWatch = .{},
 
     /// For `start`: `anole.webtransport.accept` fills it from its
     /// `AcceptOptions`.
     pub const Options = struct {
-        /// The server's drain signal: on it, a DRAIN_WEBTRANSPORT_SESSION
-        /// capsule goes out, and with `close_on_drain` the session closes.
-        drain: ?*std.Io.Event = null,
+        /// The server's drain hooks: on the drain, a task sends a
+        /// DRAIN_WEBTRANSPORT_SESSION capsule, and with `close_on_drain`
+        /// the session closes.
+        drain_hooks: ?*dusty.DrainHooks = null,
         close_on_drain: bool = true,
         drain_reason: []const u8 = "server shutting down",
+        /// Parse the CONNECT stream's capsules as they arrive, with no task
+        /// (the server's connection must offer `Host.bind_session_fn`).
+        inline_capsules: bool = false,
+    };
+
+    /// Sends the drain's capsule, through the server's drain hooks: no task
+    /// waits for the drain, only this record; the capsule goes from a task
+    /// started when the drain does, on the session's executor.
+    const DrainWatch = struct {
+        hook: dusty.DrainHooks.Hook = .{ .callback = onDrain },
+        hooks: ?*dusty.DrainHooks = null,
+        session: *Session = undefined,
+        close_on_drain: bool = true,
+        reason: []const u8 = "",
+        executor: ?usize = null,
+        sender: std.Io.Group = .init,
+
+        fn onDrain(hook: *dusty.DrainHooks.Hook) void {
+            const self: *DrainWatch = @fieldParentPtr("hook", hook);
+            const where: placement.Where = if (self.executor) |i| .{ .executor = i } else .local;
+            placement.concurrent(&self.sender, self.session.core.io, where, run, .{self}) catch {};
+        }
+
+        fn run(self: *DrainWatch) std.Io.Cancelable!void {
+            const session = self.session;
+            const host = session.core.host;
+            host.lock();
+            session.draining_flag = true;
+            host.unlock();
+            session.ev.notify(session.core.io);
+            host.kick();
+            var capsule: [8 + 1]u8 = undefined;
+            var n = putVarint(&capsule, capsule_drain);
+            n += putVarint(capsule[n..], 0);
+            session.writeCapsule(capsule[0..n]) catch {};
+            if (self.close_on_drain) session.close(0, self.reason) catch {};
+        }
     };
 
     /// Starts the session: it takes the streams that arrived for it, and
@@ -628,6 +851,8 @@ pub const Session = struct {
     fn start(self: *Session, core: *Core, id: i64, channel: Channel, options: Options) !void {
         self.* = .{ .core = core, .id = id, .channel = channel };
         const host = core.host;
+        const inline_mode = options.inline_capsules and host.bind_session_fn != null;
+        self.inline_capsules = inline_mode;
         host.lock();
         if (core.closed or core.isGone(id)) {
             host.unlock();
@@ -647,13 +872,23 @@ pub const Session = struct {
             _ = core.orphans.orderedRemove(i);
             self.deliver(s);
         }
+        // Capsules that arrived before the session did, and the ones to
+        // come, are parsed in place.
+        if (inline_mode) host.bind_session_fn.?(host.ctx, id, self);
         host.unlock();
         host.kick();
         errdefer self.detach();
-        try placement.concurrent(&self.tasks, core.io, .local, readCapsules, .{self});
-        if (options.drain) |drain| {
-            const reason = options.drain_reason[0..@min(options.drain_reason.len, max_close_message)];
-            placement.concurrent(&self.tasks, core.io, .local, watchDrain, .{ self, drain, options.close_on_drain, reason }) catch {};
+        if (!inline_mode) try placement.concurrent(&self.tasks, core.io, .local, readCapsules, .{self});
+        if (options.drain_hooks) |hooks| {
+            const w = &self.drain_watch;
+            w.* = .{
+                .hooks = hooks,
+                .session = self,
+                .close_on_drain = options.close_on_drain,
+                .reason = options.drain_reason[0..@min(options.drain_reason.len, max_close_message)],
+                .executor = placement.currentExecutor(core.io),
+            };
+            hooks.add(core.io, &w.hook);
         }
     }
 
@@ -662,6 +897,8 @@ pub const Session = struct {
     /// Streams must not be used after.
     pub fn deinit(self: *Session) void {
         self.close(0, "") catch {};
+        if (self.drain_watch.hooks) |hooks| hooks.remove(self.core.io, &self.drain_watch.hook);
+        self.drain_watch.sender.cancel(self.core.io);
         self.tasks.cancel(self.core.io);
         self.detach();
         self.endChannel();
@@ -691,6 +928,7 @@ pub const Session = struct {
         self.members.deinit(core.gpa);
         for (self.datagrams_in.items) |d| core.gpa.free(d);
         self.datagrams_in.deinit(core.gpa);
+        self.ev.notify(core.io);
         host.kick();
     }
 
@@ -709,6 +947,7 @@ pub const Session = struct {
             s.session = null;
             return s.disown(error_buffered_stream_rejected);
         };
+        self.ev.notify(self.core.io);
         self.core.host.kick();
     }
 
@@ -727,7 +966,9 @@ pub const Session = struct {
             if (s.send_err == null) s.send_err = error.SessionClosed;
             s.discardInput();
             s.dequeue();
+            s.wakeAll();
         }
+        self.ev.notify(core.io);
         core.host.kick();
     }
 
@@ -768,10 +1009,10 @@ pub const Session = struct {
 
     fn acceptFrom(self: *Session, kind: Stream.Kind) Error!*Stream {
         while (true) {
-            const gen = self.generation();
+            const seen = self.ev.epoch();
             if (self.tryAccept(if (kind == .bidi) .bidi else .uni)) |s| return s;
             if (!self.isOpen()) return error.SessionClosed;
-            try self.core.wait(gen);
+            try self.ev.wait(self.core.io, seen);
         }
     }
 
@@ -788,9 +1029,9 @@ pub const Session = struct {
 
     fn open(self: *Session, kind: Stream.Kind) (Error || error{OutOfMemory})!*Stream {
         while (true) {
-            const gen = self.generation();
+            const seen = self.ev.epoch();
             if (try self.tryOpen(if (kind == .bidi) .bidi else .uni)) |s| return s;
-            try self.core.wait(gen);
+            try self.ev.wait(self.core.io, seen);
         }
     }
 
@@ -802,12 +1043,12 @@ pub const Session = struct {
 
     /// The connection's change count: read it before looking.
     fn generation(self: *Session) u32 {
-        return self.core.host.gen.load(.acquire);
+        return self.core.host.gen.epoch();
     }
 
     /// Waits until something on the connection changes after `gen`.
     fn waitChange(self: *Session, gen: u32) std.Io.Cancelable!void {
-        return self.core.wait(gen);
+        return self.core.host.gen.wait(self.core.io, gen);
     }
 
     /// Wakes `waitChange` (and the connection's other waiters). From a
@@ -886,7 +1127,15 @@ pub const Session = struct {
         defer host.unlock();
         const queue = if (dir == .bidi) &self.incoming_bidi else &self.incoming_uni;
         if (queue.items.len == 0) return null;
-        return queue.orderedRemove(0);
+        const s = queue.orderedRemove(0);
+        // The reader's buffer only now that a handler has the stream.
+        s.allocReader() catch {
+            s.refuse(error_session_gone);
+            s.user_done = true;
+            s.maybeFree();
+            return null;
+        };
+        return s;
     }
 
     /// Opens a stream (`.uni`: write-only), or null while the peer's
@@ -1000,7 +1249,7 @@ pub const Session = struct {
         if (rv != 0) return error.StreamIdBlocked;
         const s = try Stream.create(core, id, kind, true);
         s.user_done = true;
-        _ = try s.out.write(core.gpa, head);
+        _ = try s.out.write(core.pool(), core.budget(), head, 0, true);
         try core.streams.put(core.gpa, id, s);
         s.enqueue();
         core.host.kick();
@@ -1027,7 +1276,8 @@ pub const Session = struct {
         var prefix: [16]u8 = undefined;
         var n = putVarint(&prefix, if (kind == .bidi) signal_bidi else stream_type_uni);
         n += putVarint(prefix[n..], @intCast(self.id));
-        _ = try s.out.write(core.gpa, prefix[0..n]);
+        _ = try s.out.write(core.pool(), core.budget(), prefix[0..n], 0, true);
+        if (kind == .bidi) try s.allocReader();
         try self.members.append(core.gpa, s);
         errdefer _ = self.members.pop();
         try core.streams.put(core.gpa, id, s);
@@ -1042,7 +1292,7 @@ pub const Session = struct {
     pub fn receiveDatagram(self: *Session, buf: []u8) (Error || error{NoSpaceLeft})![]u8 {
         const core = self.core;
         while (true) {
-            const gen = self.generation();
+            const seen = self.ev.epoch();
             core.host.lock();
             if (self.datagrams_in.items.len > 0) {
                 const d = self.datagrams_in.items[0];
@@ -1060,7 +1310,7 @@ pub const Session = struct {
             const still_open = self.state == .open;
             core.host.unlock();
             if (!still_open) return error.SessionClosed;
-            try core.wait(gen);
+            try self.ev.wait(core.io, seen);
         }
     }
 
@@ -1096,12 +1346,12 @@ pub const Session = struct {
         var queued = false;
         defer if (!queued) self.core.gpa.free(d);
         while (true) {
-            const gen = self.generation();
+            const seen = self.ev.epoch();
             if (try self.queueDatagram(d, data.len)) {
                 queued = true;
                 return;
             }
-            try self.core.wait(gen);
+            try self.ev.wait(self.core.io, seen);
         }
     }
 
@@ -1134,9 +1384,25 @@ pub const Session = struct {
     }
 
     fn writeCapsule(self: *Session, bytes: []const u8) !void {
+        const host = self.core.host;
         self.write_mutex.lockUncancelable(self.core.io);
         defer self.write_mutex.unlock(self.core.io);
-        if (self.ended) return error.SessionClosed;
+        host.lock();
+        if (self.ended) {
+            host.unlock();
+            return error.SessionClosed;
+        }
+        self.writing = true;
+        host.unlock();
+        defer {
+            host.lock();
+            self.writing = false;
+            if (self.end_pending) {
+                self.end_pending = false;
+                self.endChannelLocked();
+            }
+            host.unlock();
+        }
         const w = self.channel.writer;
         try w.writeAll(bytes);
         try w.flush();
@@ -1144,37 +1410,100 @@ pub const Session = struct {
 
     /// Ends the CONNECT stream's sending side, once.
     fn endChannel(self: *Session) void {
+        const host = self.core.host;
         self.write_mutex.lockUncancelable(self.core.io);
         defer self.write_mutex.unlock(self.core.io);
-        if (self.ended) return;
+        host.lock();
+        if (self.ended) {
+            host.unlock();
+            return;
+        }
         self.ended = true;
+        host.unlock();
         self.channel.end_fn(self.channel.ctx);
     }
 
-    /// Reads the peer's capsules until the CONNECT stream ends. Runs
-    /// beside the handler until `deinit` cancels it.
+    /// Ends the CONNECT stream's sending side from a callback, which can't
+    /// wait: right away, unless a capsule is being written (it ends the
+    /// stream when it is done) or the 200 has not gone out (the handler's
+    /// `deinit` ends it). Locked.
+    fn endChannelLocked(self: *Session) void {
+        if (self.ended) return;
+        if (self.writing) {
+            self.end_pending = true;
+            return;
+        }
+        const host = self.core.host;
+        const f = host.end_connect_fn orelse return;
+        if (f(host.ctx, self.id)) self.ended = true;
+    }
+
+    /// The CONNECT stream's bytes (inline capsules): the parser takes them,
+    /// and what they say happens now. Locked.
+    pub fn onCapsuleBytes(self: *Session, bytes: []const u8) void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const fed = self.parser.feed(rest);
+            rest = rest[fed.used..];
+            const event = fed.event orelse continue;
+            switch (event) {
+                .close => |info| {
+                    self.endLocked(.{ .code = info.code, .reason = info.reason, .by = .peer });
+                    // Our side ends too (draft-02 §5).
+                    self.endChannelLocked();
+                },
+                .drain => {
+                    self.draining_flag = true;
+                    self.ev.notify(self.core.io);
+                    self.core.host.kick();
+                },
+                .malformed => {
+                    self.endLocked(.{ .code = 0, .reason = "", .by = .connection });
+                    self.endChannelLocked();
+                },
+            }
+        }
+    }
+
+    /// The CONNECT stream ended: by the peer's FIN (our side ends too), or
+    /// with the connection. Locked.
+    pub fn onChannelEnd(self: *Session, by: enum { peer, connection }) void {
+        self.endLocked(.{ .code = 0, .reason = "", .by = if (by == .peer) .peer else .connection });
+        if (by == .peer) self.endChannelLocked();
+    }
+
+    /// Reads the peer's capsules until the CONNECT stream ends (a client's
+    /// session; the server parses them as they arrive). Runs beside the
+    /// handler until `deinit` cancels it.
     fn readCapsules(self: *Session) std.Io.Cancelable!void {
         const r = self.channel.reader;
-        var payload: [4 + max_close_message]u8 = undefined;
-        const info: CloseInfo = while (true) {
-            const kind = readVarint(r) catch |err| break self.readFailed(err);
-            const len = readVarint(r) catch |err| break self.readFailed(err);
-            switch (kind) {
-                capsule_close => {
-                    if (len < 4 or len > 4 + max_close_message) break .{ .code = 0, .reason = "", .by = .connection };
-                    r.readSliceAll(payload[0..@intCast(len)]) catch |err| break self.readFailed(err);
-                    break .{ .code = std.mem.readInt(u32, payload[0..4], .big), .reason = payload[4..@intCast(len)], .by = .peer };
-                },
-                capsule_drain => {
-                    const host = self.core.host;
-                    host.lock();
-                    self.draining_flag = true;
-                    host.unlock();
-                    host.kick();
-                    r.discardAll64(len) catch |err| break self.readFailed(err);
-                },
-                // Unknown capsules are skipped (RFC 9297 §3.2).
-                else => r.discardAll64(len) catch |err| break self.readFailed(err),
+        var parser: CapsuleParser = .{};
+        var buf: [256]u8 = undefined;
+        const info: CloseInfo = outer: while (true) {
+            const avail = r.peekGreedy(1) catch |err| break self.readFailed(err);
+            const n = @min(avail.len, buf.len);
+            @memcpy(buf[0..n], avail[0..n]);
+            r.toss(n);
+            var rest: []const u8 = buf[0..n];
+            while (rest.len > 0) {
+                const fed = parser.feed(rest);
+                rest = rest[fed.used..];
+                const event = fed.event orelse continue;
+                switch (event) {
+                    .close => |c_info| {
+                        // The reason lives in the parser; `endLocked` copies it.
+                        break :outer .{ .code = c_info.code, .reason = c_info.reason, .by = .peer };
+                    },
+                    .drain => {
+                        const host = self.core.host;
+                        host.lock();
+                        self.draining_flag = true;
+                        host.unlock();
+                        self.ev.notify(self.core.io);
+                        host.kick();
+                    },
+                    .malformed => break :outer .{ .code = 0, .reason = "", .by = .connection },
+                }
             }
         };
         const host = self.core.host;
@@ -1193,22 +1522,6 @@ pub const Session = struct {
             error.EndOfStream => .{ .code = 0, .reason = "", .by = .peer },
             error.ReadFailed => .{ .code = 0, .reason = "", .by = .connection },
         };
-    }
-
-    /// On the server's drain: DRAIN_WEBTRANSPORT_SESSION, and the close if
-    /// asked for.
-    fn watchDrain(self: *Session, drain: *std.Io.Event, close_on_drain: bool, reason: []const u8) std.Io.Cancelable!void {
-        try drain.wait(self.core.io);
-        const host = self.core.host;
-        host.lock();
-        self.draining_flag = true;
-        host.unlock();
-        host.kick();
-        var capsule: [8 + 1]u8 = undefined;
-        var n = putVarint(&capsule, capsule_drain);
-        n += putVarint(capsule[n..], 0);
-        self.writeCapsule(capsule[0..n]) catch {};
-        if (close_on_drain) self.close(0, reason) catch {};
     }
 };
 
@@ -1237,9 +1550,19 @@ pub const Stream = struct {
     prefix_done: bool,
 
     /// Received and not yet read.
-    in: std.ArrayList(u8) = .empty,
-    in_start: usize = 0,
+    in: bridge.RecvQueue = .{},
     in_fin: bool = false,
+    /// Woken by new data, the end, or an error on the receiving side; and
+    /// by room to write (acknowledgments, the connection's budget), or an
+    /// error on the sending side.
+    rx: bridge.Signal = .{},
+    tx: bridge.Signal = .{},
+    /// RFC 9218 urgency of the stream's data against the other streams'
+    /// (`setPriority`).
+    urgency: u3 = 3,
+    waiter: bridge.Budget.Waiter = .{ .signal = undefined },
+    /// Small writes (lengths, audio) collect here before they are queued.
+    wbuf: [256]u8 = undefined,
     /// Nobody will read: credit goes back as data arrives.
     discarding: bool = false,
     recv_err: ?Error = null,
@@ -1248,7 +1571,7 @@ pub const Stream = struct {
     reader_iface: std.Io.Reader,
 
     /// Sent until the peer acknowledges it, then dropped.
-    out: bridge.Ring = .{},
+    out: bridge.SendQueue = .{},
     send_closed: bool = false,
     fin_sent: bool = false,
     blocked: bool = false,
@@ -1281,19 +1604,30 @@ pub const Stream = struct {
             .reader_iface = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = readStream } },
             .writer_iface = .{ .buffer = &.{}, .vtable = &.{ .drain = drainOut, .flush = flushOut } },
         };
-        if (kind != .uni_out) s.reader_iface.buffer = try gpa.alloc(u8, 8 * 1024);
-        errdefer if (kind != .uni_out) gpa.free(s.reader_iface.buffer);
-        if (kind != .uni_in) s.writer_iface.buffer = try gpa.alloc(u8, 8 * 1024);
+        if (kind != .uni_in) s.writer_iface.buffer = &s.wbuf;
         return s;
+    }
+
+    /// The reader's buffer, once a handler has the stream: refused and
+    /// orphan streams never get one.
+    fn allocReader(s: *Stream) error{OutOfMemory}!void {
+        if (s.kind == .uni_out or s.reader_iface.buffer.len > 0) return;
+        s.reader_iface.buffer = try s.core.gpa.alloc(u8, 4 * 1024);
     }
 
     fn free(s: *Stream) void {
         const gpa = s.core.gpa;
-        s.in.deinit(gpa);
-        s.out.deinit(gpa);
-        if (s.kind != .uni_out) gpa.free(s.reader_iface.buffer);
-        if (s.kind != .uni_in) gpa.free(s.writer_iface.buffer);
+        s.core.budget().unlink(&s.waiter);
+        s.in.deinit(s.core.pool());
+        s.out.deinit(s.core.pool(), s.core.budget());
+        if (s.reader_iface.buffer.len > 0) gpa.free(s.reader_iface.buffer);
         gpa.destroy(s);
+    }
+
+    /// Wakes the stream's reader and writer. Locked.
+    fn wakeAll(s: *Stream) void {
+        s.rx.notify(s.core.io);
+        s.tx.notify(s.core.io);
     }
 
     /// Frees the stream once nothing holds it. Locked.
@@ -1318,19 +1652,19 @@ pub const Stream = struct {
     fn enqueue(s: *Stream) void {
         if (s.queued or s.blocked) return;
         s.queued = true;
-        s.core.send_queue.append(&s.node);
+        s.core.sched.push(&s.node, s.urgency);
     }
 
     fn dequeue(s: *Stream) void {
         if (!s.queued) return;
         s.queued = false;
-        s.core.send_queue.remove(&s.node);
+        s.core.sched.remove(&s.node, s.urgency);
     }
 
     /// To the back of the queue if it has more to send, else out of it.
     fn rotate(s: *Stream) void {
         s.dequeue();
-        if (s.out.written > s.out.sent or (s.send_closed and !s.fin_sent)) s.enqueue();
+        if (s.out.pending() > 0 or (s.send_closed and !s.fin_sent)) s.enqueue();
     }
 
     /// Data from the peer. Locked.
@@ -1369,12 +1703,13 @@ pub const Stream = struct {
             bridge.consume(core.q, s.id, data.len);
         } else if (data.len > 0) {
             // Bounded by the stream's flow-control window.
-            s.in.appendSlice(core.gpa, data) catch {
+            s.in.append(core.pool(), data) catch {
                 s.refuse(error_session_gone);
                 return;
             };
         }
         if (fin) s.in_fin = true;
+        s.rx.notify(core.io);
         core.host.kick();
     }
 
@@ -1395,6 +1730,7 @@ pub const Stream = struct {
         if (s.send_err == null) s.send_err = error.StreamReset;
         s.discardInput();
         s.dequeue();
+        s.tx.notify(core.io);
     }
 
     /// Whatever is buffered, and arrives from now on, is dropped, its
@@ -1402,10 +1738,10 @@ pub const Stream = struct {
     fn discardInput(s: *Stream) void {
         const core = s.core;
         s.discarding = true;
-        const left = s.in.items.len - s.in_start;
+        const left = s.in.len;
         if (left > 0 and !s.protocol_done and !core.closed) bridge.consume(core.q, s.id, left);
-        s.in.clearAndFree(core.gpa);
-        s.in_start = 0;
+        s.in.deinit(core.pool());
+        s.rx.notify(core.io);
     }
 
     /// Received data (`error.EndOfStream` at the peer's FIN). A stream
@@ -1445,6 +1781,25 @@ pub const Stream = struct {
         return s.stop_code;
     }
 
+    /// Sets the stream's urgency (RFC 9218): 0 most urgent, 7 least, 3 the
+    /// default. Its data goes out before any more-urgent-numbered stream's
+    /// (higher numbers), and streams of one urgency take turns packet by
+    /// packet. A busy stream at a low number starves the higher ones, as in
+    /// the RFC: mark audio or control 2, not 0. Takes effect for the next
+    /// packet.
+    pub fn setPriority(s: *Stream, urgency: u3) void {
+        const host = s.core.host;
+        host.lock();
+        if (s.urgency != urgency) {
+            const was_queued = s.queued;
+            s.dequeue();
+            s.urgency = urgency;
+            if (was_queued) s.enqueue();
+        }
+        host.unlock();
+        host.kick();
+    }
+
     /// Sends what is buffered and then the end of the stream (FIN).
     pub fn closeSend(s: *Stream) !void {
         try s.writer_iface.flush();
@@ -1467,6 +1822,7 @@ pub const Stream = struct {
         if (!s.protocol_done and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_write(core.q, 0, s.id, toHttp3Error(code));
         s.send_err = error.StreamReset;
         s.dequeue();
+        s.tx.notify(core.io);
         core.host.kick();
     }
 
@@ -1480,6 +1836,7 @@ pub const Stream = struct {
         if (!s.protocol_done and !core.closed) _ = c.ngtcp2_conn_shutdown_stream_read(core.q, 0, s.id, toHttp3Error(code));
         s.recv_err = error.StreamReset;
         s.discardInput();
+        s.rx.notify(core.io);
         core.host.kick();
     }
 
@@ -1496,7 +1853,7 @@ pub const Stream = struct {
                 s.send_err = error.StreamReset;
                 s.dequeue();
             }
-            const all_read = s.in_fin and s.in_start == s.in.items.len;
+            const all_read = s.in_fin and s.in.len == 0;
             if (s.kind != .uni_out and !all_read and s.recv_err == null) {
                 _ = c.ngtcp2_conn_shutdown_stream_read(core.q, 0, s.id, toHttp3Error(0));
                 s.recv_err = error.StreamReset;
@@ -1504,6 +1861,7 @@ pub const Stream = struct {
         }
         s.discardInput();
         s.user_done = true;
+        s.wakeAll();
         s.maybeFree();
         core.host.kick();
     }
@@ -1535,6 +1893,10 @@ pub const Stream = struct {
         pub fn sendError(s: *Stream) ?Error {
             return s.sendError();
         }
+        /// Sets the stream's urgency, 0..7 (`Stream.setPriority`).
+        pub fn setPriority(s: *Stream, urgency: u3) void {
+            s.setPriority(urgency);
+        }
     };
 
     /// Reads what has arrived into `buf`, without waiting.
@@ -1545,7 +1907,7 @@ pub const Stream = struct {
         const n = s.takeLocked(buf);
         const out: Driver.Poll = .{
             .n = n,
-            .fin = s.in_fin and s.in_start == s.in.items.len,
+            .fin = s.in_fin and s.in.len == 0,
             .err = if (n == 0 and !s.in_fin) s.recv_err else null,
         };
         core.host.unlock();
@@ -1565,7 +1927,7 @@ pub const Stream = struct {
             core.host.unlock();
             return err;
         }
-        const n = s.out.write(core.gpa, bytes) catch {
+        const n = s.out.write(core.pool(), core.budget(), bytes, core.limits.send_buffer, false) catch {
             core.host.unlock();
             return error.ConnectionClosed;
         };
@@ -1588,18 +1950,8 @@ pub const Stream = struct {
     /// Locked.
     fn takeLocked(s: *Stream, dest: []u8) usize {
         const core = s.core;
-        const avail = s.in.items[s.in_start..];
-        if (avail.len == 0 or dest.len == 0) return 0;
-        const n = @min(avail.len, dest.len);
-        @memcpy(dest[0..n], avail[0..n]);
-        s.in_start += n;
-        if (s.in_start == s.in.items.len) {
-            s.in.clearRetainingCapacity();
-            s.in_start = 0;
-        } else if (s.in_start >= 64 * 1024) {
-            s.in.replaceRangeAssumeCapacity(0, s.in_start, &.{});
-            s.in_start = 0;
-        }
+        if (s.in.len == 0 or dest.len == 0) return 0;
+        const n = s.in.take(core.pool(), dest);
         // The peer may send that much more.
         if (!s.protocol_done and !core.closed) bridge.consume(core.q, s.id, n);
         return n;
@@ -1612,7 +1964,7 @@ pub const Stream = struct {
         const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
         while (true) {
-            const gen = core.host.gen.load(.acquire);
+            const seen = s.rx.epoch();
             core.host.lock();
             const n = s.takeLocked(dest);
             if (n > 0) {
@@ -1629,7 +1981,7 @@ pub const Stream = struct {
                 s.read_err = e;
                 return error.ReadFailed;
             }
-            core.wait(gen) catch {
+            s.rx.wait(core.io, seen) catch {
                 s.read_err = error.Canceled;
                 return error.ReadFailed;
             };
@@ -1643,24 +1995,29 @@ pub const Stream = struct {
         if (s.kind == .uni_in) return error.WriteFailed;
         var rest = bytes;
         while (rest.len > 0) {
-            const gen = core.host.gen.load(.acquire);
+            const seen = s.tx.epoch();
             core.host.lock();
             if (s.send_err != null or s.send_closed or core.closed) {
                 s.write_err = s.send_err orelse if (core.closed) error.ConnectionClosed else error.StreamReset;
                 core.host.unlock();
                 return error.WriteFailed;
             }
-            const n = s.out.write(core.gpa, rest) catch {
+            const n = s.out.write(core.pool(), core.budget(), rest, core.limits.send_buffer, false) catch {
                 core.host.unlock();
                 return error.WriteFailed;
             };
             if (n > 0) {
                 rest = rest[n..];
                 s.enqueue();
+            } else {
+                // Woken by an acknowledgment, or when the connection's
+                // budget has room.
+                s.waiter.signal = &s.tx;
+                core.budget().link(&s.waiter);
             }
             core.host.unlock();
             // Kick only for new bytes; see the server's StreamSink.put.
-            if (n > 0) core.host.kick() else core.wait(gen) catch {
+            if (n > 0) core.host.kick() else s.tx.wait(core.io, seen) catch {
                 s.write_err = error.Canceled;
                 return error.WriteFailed;
             };
@@ -1725,4 +2082,136 @@ test "WebTransport error codes map onto HTTP/3's and back, skipping the reserved
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), fromHttp3Error(app_error_last));
     try std.testing.expectEqual(@as(?u32, null), fromHttp3Error(0x100));
     try std.testing.expectEqual(@as(?u32, null), fromHttp3Error(error_session_gone));
+}
+
+test "Sched: the most urgent class goes first, a class takes turns, the ready mask stays consistent" {
+    var q: Sched = .{};
+    var a: std.DoublyLinkedList.Node = .{};
+    var b: std.DoublyLinkedList.Node = .{};
+    var c3: std.DoublyLinkedList.Node = .{};
+    try std.testing.expect(q.firstNode() == null);
+    try std.testing.expectEqual(@as(?u3, null), q.mostUrgent());
+    q.push(&a, 3);
+    q.push(&b, 3);
+    q.push(&c3, 1);
+    try std.testing.expect(q.firstNode().? == &c3);
+    try std.testing.expectEqual(@as(?u3, 1), q.mostUrgent());
+    try std.testing.expectEqual(@as(u8, 0b1010), q.ready);
+    // Round-robin within class 3 once class 1 is empty.
+    q.remove(&c3, 1);
+    try std.testing.expectEqual(@as(u8, 0b1000), q.ready);
+    try std.testing.expect(q.firstNode().? == &a);
+    q.remove(&a, 3);
+    q.push(&a, 3);
+    try std.testing.expect(q.firstNode().? == &b);
+    // Removing the last of a class clears its bit; re-pushing sets it.
+    q.remove(&b, 3);
+    q.remove(&a, 3);
+    try std.testing.expectEqual(@as(u8, 0), q.ready);
+    q.push(&a, 7);
+    try std.testing.expectEqual(@as(u8, 0b10000000), q.ready);
+    q.remove(&a, 7);
+    try std.testing.expect(q.firstNode() == null);
+}
+
+fn makeCapsule(buf: []u8, kind: u64, payload: []const u8) []const u8 {
+    var n = putVarint(buf, kind);
+    n += putVarint(buf[n..], payload.len);
+    @memcpy(buf[n..][0..payload.len], payload);
+    return buf[0 .. n + payload.len];
+}
+
+/// Feeds `bytes` in pieces of `step` and records what the parser said.
+fn parseAll(bytes: []const u8, step: usize, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
+    var p: CapsuleParser = .{};
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const piece = bytes[i..@min(bytes.len, i + step)];
+        i += piece.len;
+        var rest = piece;
+        while (rest.len > 0) {
+            const fed = p.feed(rest);
+            rest = rest[fed.used..];
+            const event = fed.event orelse continue;
+            switch (event) {
+                .close => |cl| {
+                    try out.print(gpa, "C{d}:{s};", .{ cl.code, cl.reason });
+                },
+                .drain => try out.appendSlice(gpa, "D;"),
+                .malformed => try out.appendSlice(gpa, "M;"),
+            }
+        }
+    }
+}
+
+test "CapsuleParser: a close split at every byte, a drain, an unknown capsule skipped, an over-long close malformed" {
+    const gpa = std.testing.allocator;
+    var buf: [2048]u8 = undefined;
+    var close_payload: [4 + 5]u8 = undefined;
+    std.mem.writeInt(u32, close_payload[0..4], 42, .big);
+    @memcpy(close_payload[4..], "bye!!");
+    const close = makeCapsule(&buf, capsule_close, &close_payload);
+    var whole: std.ArrayList(u8) = .empty;
+    defer whole.deinit(gpa);
+    try parseAll(close, close.len, &whole, gpa);
+    try std.testing.expectEqualStrings("C42:bye!!;", whole.items);
+    for (1..close.len + 1) |step| {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        try parseAll(close, step, &got, gpa);
+        try std.testing.expectEqualStrings(whole.items, got.items);
+    }
+
+    // Unknown (with a payload, and without), then a drain, then a close.
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(gpa);
+    var tmp: [64]u8 = undefined;
+    try seq.appendSlice(gpa, makeCapsule(&tmp, 0x1234, "xyz"));
+    try seq.appendSlice(gpa, makeCapsule(&tmp, 0x99, ""));
+    try seq.appendSlice(gpa, makeCapsule(&tmp, capsule_drain, ""));
+    try seq.appendSlice(gpa, close);
+    for ([_]usize{ 1, 2, 3, 7, seq.items.len }) |step| {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        try parseAll(seq.items, step, &got, gpa);
+        try std.testing.expectEqualStrings("D;C42:bye!!;", got.items);
+    }
+
+    // A close longer than 4 + 1024 is malformed, and the parser stops.
+    var big: [4 + max_close_message + 1]u8 = @splat(0);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const over = try gpa.alloc(u8, 16 + big.len);
+    defer gpa.free(over);
+    try parseAll(makeCapsule(over, capsule_close, &big), 5, &out, gpa);
+    try std.testing.expectEqualStrings("M;", out.items);
+    // A close shorter than its code too.
+    out.clearRetainingCapacity();
+    try parseAll(makeCapsule(&tmp, capsule_close, "ab"), 1, &out, gpa);
+    try std.testing.expectEqualStrings("M;", out.items);
+}
+
+test "fuzz: WebTransport capsules" {
+    var tmp: [64]u8 = undefined;
+    var close_payload: [4 + 3]u8 = undefined;
+    std.mem.writeInt(u32, close_payload[0..4], 7, .big);
+    @memcpy(close_payload[4..], "end");
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) anyerror!void {
+            const gpa = std.testing.allocator;
+            var whole: std.ArrayList(u8) = .empty;
+            defer whole.deinit(gpa);
+            try parseAll(input, input.len + 1, &whole, gpa);
+            // Fed a byte at a time, it says the same.
+            var bytewise: std.ArrayList(u8) = .empty;
+            defer bytewise.deinit(gpa);
+            try parseAll(input, 1, &bytewise, gpa);
+            try std.testing.expectEqualStrings(whole.items, bytewise.items);
+        }
+    }.check, &.{
+        makeCapsule(&tmp, capsule_close, &close_payload),
+        makeCapsule(&tmp, capsule_drain, ""),
+        makeCapsule(&tmp, 0x1234, "skip me"),
+        &.{ 0xc0, 0, 0, 0, 0, 0, 0, 0x28, 0x43 },
+    });
 }

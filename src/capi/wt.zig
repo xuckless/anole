@@ -199,6 +199,8 @@ pub const StreamSlot = struct {
     fin: bool = false,
     reset_code: ?u32 = null,
     stop_code: ?u32 = null,
+    /// A new urgency (0..7) for the executor to apply to the stream.
+    priority: ?u3 = null,
     released: bool = false,
     /// A write got ANOLE_BUSY: ANOLE_EV_WRITABLE when there is room.
     want_writable: bool = false,
@@ -270,6 +272,7 @@ pub const StreamSlot = struct {
         s.fin = false;
         s.reset_code = null;
         s.stop_code = null;
+        s.priority = null;
         s.released = false;
         s.want_writable = false;
         s.send_over = dir == .uni_in;
@@ -541,8 +544,11 @@ fn serveStream(s: *SessionSlot, st: *StreamSlot, session: *Session, buf: []u8, h
     st.reset_code = null;
     const stop_code = st.stop_code;
     st.stop_code = null;
+    const priority = st.priority;
+    st.priority = null;
     const released = st.released;
     st.lock.unlock();
+    if (priority) |p| Stream.Driver.setPriority(stream, p);
 
     // Released with its end asked for: what was written still goes out
     // first, then the stream is let go.
@@ -801,6 +807,25 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, fin: bool, borrow: bool) eng
     st.lock.unlock();
     session.wake();
     return busy;
+}
+
+/// Sets the stream's urgency (0 most urgent, 7 least, 3 the default; RFC
+/// 9218) for its next packets.
+pub fn setPriority(e: *Engine, hv: u64, urgency: u3) engine.AnswerError!void {
+    const st, const g = streamOf(e, hv) catch |err| return e.badHandle(err);
+    spin(&st.lock);
+    if (!st.live(g)) {
+        st.lock.unlock();
+        return e.gone();
+    }
+    if (st.dir == .uni_in) {
+        st.lock.unlock();
+        return error.Invalid;
+    }
+    st.priority = urgency;
+    const session = st.session;
+    st.lock.unlock();
+    session.wake();
 }
 
 pub const Op = enum { reset, stop, release };

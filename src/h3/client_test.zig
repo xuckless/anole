@@ -1583,3 +1583,26 @@ test "h3 server: a reload that changes the client CAs stops earlier sessions fro
         } else |_| {}
     } else |_| {}
 }
+
+test "h3 server: a response streamed past its send buffer completes and leaves no blocks" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    // 4 MiB through a 64 KiB per-stream queue and a 4 MiB connection budget.
+    const body = try get(conn, "/download?n=4194304", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqual(@as(usize, 4 << 20), body.len);
+    // Once the request is over and acknowledged, the stream holds nothing.
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        f.ep.sampleStats();
+        if (f.ep.stats.blocks_live.load(.monotonic) == 0) break;
+        if (tries > 200) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+}

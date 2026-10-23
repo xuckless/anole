@@ -146,6 +146,20 @@ stop. A read that ends early fails with `error.ReadFailed`, and
 `error.SessionClosed`, ...); `writeError()` and `stopCode()` do the same for
 writes.
 
+A write returns once the bytes are buffered, never waiting for the peer to
+acknowledge them: a stream holds up to 1 MiB unacknowledged, and the
+connection's streams 4 MiB together. Only past that does a write wait (it
+resumes as acknowledgments come in), so a message under 1 MiB never blocks
+on the network. Don't hold one lock across the writes of several streams
+of a user, or a slow stream stalls the others behind it: lock per stream.
+
+`stream.setPriority(urgency)` sets the stream's RFC 9218 urgency, 0 (most
+urgent) to 7 (least); every stream starts at 3. Data of a more urgent
+stream goes out before any less urgent one's, and streams of one urgency
+take turns packet by packet. A busy stream at a low number starves the
+higher ones: mark audio or control 2, not 0. From C it is
+`anole_wt_stream_set_priority` (ABI 0.8).
+
 `release()` when you are done with a stream. A sending side not ended with
 `closeSend` is reset then, and a receiving side not read to its end is
 stopped. One task may read a stream while another writes it.
@@ -198,6 +212,12 @@ itself, before `timeouts.shutdown` (10 s) cuts it. `draining()` is also true
 when the peer sent DRAIN_WEBTRANSPORT_SESSION.
 
 ## Limits
+
+Buffers are 4 KiB blocks shared by every stream of an endpoint, held only
+while data is unacknowledged (sending) or unread (receiving), so an idle
+stream costs a few hundred bytes. A session costs no task of its own on the
+server: the CONNECT stream's close and drain capsules are parsed as they
+arrive.
 
 Per connection, the peer may open 100 unidirectional WebTransport streams at
 once (beside HTTP/3's own three); its bidirectional streams share

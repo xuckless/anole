@@ -809,6 +809,15 @@ export fn anole_wt_stream_write(st: u64, data: ?*const anyopaque, len: usize, fl
     return if (busy) abi.BUSY else abi.OK;
 }
 
+export fn anole_wt_stream_set_priority(st: u64, urgency: u32) i32 {
+    if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
+    if (badKind(st, .wt_stream)) return wrongKind();
+    if (urgency > 7) return failCode(abi.E_INVALID);
+    const e = live() orelse return failCode(abi.E_GONE);
+    engine.wt.setPriority(e, st, @intCast(urgency)) catch |err| return answer(err);
+    return abi.OK;
+}
+
 export fn anole_wt_stream_reset(st: u64, code: u32) i32 {
     if (comptime !have_wt) return failCode(abi.E_UNSUPPORTED);
     if (badKind(st, .wt_stream)) return wrongKind();
