@@ -581,32 +581,31 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     const borrow = flags & abi.BODY_BORROW != 0;
     const frame = flags & abi.NET_F_FRAME != 0;
     // The SENT record first: a call that fails takes nothing.
-    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
+    var sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
     s.acquire();
     defer s.release();
     const conn = s.conn orelse return e.gone();
     if (!s.live(g)) return e.gone();
-    const result = blk: {
-        if (frame) {
-            // Framed bytes are copied; a borrowed body is let go at once.
-            const r = conn.sendFrame(data);
-            if (sent) |rec| {
-                if (r) |_| {
-                    s.exec.postSentRec(s.handle(g), rec);
-                } else |_| engine.freeRecord(rec.ptr);
-            }
-            break :blk r;
-        }
-        if (sent) |rec| break :blk conn.sendBorrowed(data, @intFromPtr(rec.ptr));
-        break :blk conn.send(data);
-    } catch |err| return switch (err) {
+    // A framed or empty write is copied (there is nothing to borrow): its
+    // SENT follows at once, when the call took it.
+    const copy = frame or data.len == 0;
+    const result = (if (frame)
+        conn.sendFrame(data)
+    else if (sent != null and !copy)
+        conn.sendBorrowed(data, @intFromPtr(sent.?.ptr))
+    else
+        conn.send(data)) catch |err| return switch (err) {
         error.Closed => e.gone(),
         error.Ended => invalid("Ended", "this side of the connection was ended already (ANOLE_NET_F_END, or a close)"),
         error.NoFraming => invalid("NoFraming", "ANOLE_NET_F_FRAME on a listener without framing"),
         error.FrameTooLarge => invalid("FrameTooLarge", "the payload is over the listener's framing max"),
         error.QueueFull => error.Again,
         error.OutOfMemory => error.OutOfMemory,
+    };
+    if (sent) |rec| if (copy) {
+        s.exec.postSentRec(s.handle(g), rec);
+        sent = null;
     };
     if (flags & abi.NET_F_END != 0) conn.end();
     return result == .busy;

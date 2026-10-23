@@ -62,6 +62,10 @@ const Chat = struct {
 };
 ```
 
+A `*Conn` stays valid until its `close` callback returns, wherever you keep
+it: drop it from your own tables in `close` (taking the lock senders take
+before they use it), and no send can reach a connection that is gone.
+
 Callbacks may take the server's `*Ctx` first, as route handlers do. They run
 one at a time on a task on the connection's executor, and may wait (a
 database); input that arrives meanwhile waits in the kernel. A callback that
