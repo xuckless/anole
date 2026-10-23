@@ -3555,6 +3555,32 @@ static void test_log_callback_per_server(void) {
   printf("ok the log callback belongs to its server\n");
 }
 
+/* log.format "json": every line the callback gets is one JSON record. */
+static atomic_int json_ok, json_bad;
+static void on_json_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
+  (void)ud;
+  (void)level;
+  (void)scope;
+  if (msg.len > 2 && msg.ptr[0] == '{' && msg.ptr[msg.len - 1] == '}' && memmem(msg.ptr, msg.len, "\"time\":\"", 8) != NULL &&
+      memmem(msg.ptr, msg.len, "\"service\":\"capi\"", 16) != NULL)
+    atomic_fetch_add(&json_ok, 1);
+  else
+    atomic_fetch_add(&json_bad, 1);
+}
+
+static void test_log_json_records(void) {
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"log\":{\"format\":\"json\",\"service\":\"capi\"}}";
+  anole_server_options o = {sizeof o, {json, strlen(json)}, 0, 0, on_json_log, NULL};
+  anole_server *s = NULL;
+  CHECK(anole_server_create(&o, &s) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  stop_polled(s);
+  /* the startup line was logged on the way, as a JSON record */
+  CHECK(atomic_load(&json_ok) > 0);
+  CHECK(atomic_load(&json_bad) == 0);
+  printf("ok log.format json: the callback gets whole JSON records\n");
+}
+
 static pthread_t sig_main;
 static atomic_int sig_count, sig_wrong;
 static void on_usr1(int sig) {
@@ -3951,6 +3977,7 @@ static int run_tests(void) {
   test_open_before_start();
   test_destroy_on_consumer_thread();
   test_log_callback_per_server();
+  test_log_json_records();
   test_signals_stay_off_anole_threads();
   test_fork_child();
   test_consumer_without_executor();
