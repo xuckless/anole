@@ -76,7 +76,7 @@ pub fn resolveEnvironment(explicit: ?Environment, vars: Vars, build: Build, why:
     }
     if (build.is_test) return .{ .environment = .production, .source = .tests };
     if (build.embedded) return .{ .environment = .production, .source = .default };
-    return .{ .environment = if (build.mode == .Debug) .development else .production, .source = .build };
+    return .{ .environment = if (build.mode == .debug) .development else .production, .source = .build };
 }
 
 pub const Resolved = struct {
@@ -135,7 +135,7 @@ pub fn resolve(
     r.forward_proto = opts.proxy.trust_forwarded_proto;
     r.forward_host = opts.proxy.trust_forwarded_host;
     r.trusted_hops = opts.proxy.trusted_hops;
-    r.debug_production = environment == .production and builtin.mode == .Debug and !builtin.is_test and environment_source != .default;
+    r.debug_production = environment == .production and builtin.mode == .debug and !builtin.is_test and environment_source != .default;
 
     // 1. deployment
     if (opts.deployment) |d| {
@@ -305,7 +305,7 @@ fn sourceText(s: Source, build_mode: std.builtin.OptimizeMode) []const u8 {
         .options => "options",
         .variable => "ANOLE_ENV",
         .dotenv => "ANOLE_ENV in .env",
-        .build => if (build_mode == .Debug) "Debug build" else "release build",
+        .build => if (build_mode == .debug) "Debug build" else "release build",
         .tests => "tests",
         .default => "default",
     };
@@ -455,18 +455,18 @@ test "modes: environment resolution" {
     try testing.expectEqual(Environment.development, explicit.environment);
     try testing.expectEqual(Source.options, explicit.source);
     const set: TestVars = .{ .real = &.{.{ "ANOLE_ENV", "development" }} };
-    const from_var = try resolveEnvironment(null, set.vars(), .{ .mode = .ReleaseFast, .is_test = false }, &why);
+    const from_var = try resolveEnvironment(null, set.vars(), .{ .mode = .fast, .is_test = false }, &why);
     try testing.expectEqual(Environment.development, from_var.environment);
     try testing.expectEqual(Source.variable, from_var.source);
-    const dbg = try resolveEnvironment(null, none.vars(), .{ .mode = .Debug, .is_test = false }, &why);
+    const dbg = try resolveEnvironment(null, none.vars(), .{ .mode = .debug, .is_test = false }, &why);
     try testing.expectEqual(Environment.development, dbg.environment);
     try testing.expectEqual(Source.build, dbg.source);
-    const rel = try resolveEnvironment(null, none.vars(), .{ .mode = .ReleaseSafe, .is_test = false }, &why);
+    const rel = try resolveEnvironment(null, none.vars(), .{ .mode = .safe, .is_test = false }, &why);
     try testing.expectEqual(Environment.production, rel.environment);
-    const tst = try resolveEnvironment(null, none.vars(), .{ .mode = .Debug, .is_test = true }, &why);
+    const tst = try resolveEnvironment(null, none.vars(), .{ .mode = .debug, .is_test = true }, &why);
     try testing.expectEqual(Environment.production, tst.environment);
     try testing.expectEqual(Source.tests, tst.source);
-    const emb = try resolveEnvironment(null, none.vars(), .{ .mode = .Debug, .is_test = false, .embedded = true }, &why);
+    const emb = try resolveEnvironment(null, none.vars(), .{ .mode = .debug, .is_test = false, .embedded = true }, &why);
     try testing.expectEqual(Environment.production, emb.environment);
     try testing.expectEqual(Source.default, emb.source);
     const bad: TestVars = .{ .real = &.{.{ "ANOLE_ENV", "prod" }} };
@@ -665,7 +665,7 @@ test "modes: startup lines" {
         var r = try resolve(a, &.{}, .development, .build, &files, tv.vars(), &why);
         var w: std.Io.Writer = .fixed(&out);
         try writeLines(&r, .{}, &w);
-        const want = if (builtin.mode == .Debug) "Debug build" else "release build";
+        const want = if (builtin.mode == .debug) "Debug build" else "release build";
         const expected = try std.fmt.allocPrint(a, "environment development ({s}): read .env (3 values), .env.local (1 value); 500 answers name the error\n", .{want});
         try testing.expectEqualStrings(expected, w.buffered());
     }

@@ -316,6 +316,11 @@ pub const server_options = [_]Entry{
     .{ .zig = "restart_timeout", .omitted = "embedded mode: no hand-off, SIGUSR2, LISTEN_FDS or sd_notify" },
     .{ .zig = "blocking", .omitted = "the ABI starts a pool when SQLite is configured; WSGI runs on anole-py's own threads" },
     .{ .zig = "client", .omitted = "no outbound client in the ABI v0" },
+    .{ .zig = "environment", .json = "environment" },
+    .{ .zig = "deployment", .json = "deployment" },
+    .{ .zig = "error_detail", .json = "error_detail" },
+    .{ .zig = "env_files", .omitted = "the binding reads .env files into its language's environment (anole_dotenv_read)" },
+    .{ .zig = "_resolved", .omitted = "internal: the C ABI resolves the modes at create" },
 };
 
 // ---------------------------------------------------------------------------

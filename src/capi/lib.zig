@@ -309,6 +309,8 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
     const e = Engine.create(if (json.len == 0) "{}" else json, o.flags & abi.SERVER_F_SIGNALS != 0, &why) catch |err| switch (err) {
         error.Config => return named(abi.E_CONFIG, engine.config.last_problem, 0, "{s}", .{why.buffered()}),
         error.OutOfMemory => return fail(abi.E_NOMEM, "anole_server_create", err),
+        // The modes: ANOLE_ENV, ANOLE_DEPLOYMENT, PORT, ANOLE_PROXY_TRUSTED, "deployment": "lambda".
+        else => |other| return named(abi.E_CONFIG, engine.errorName(other), 0, "{s}", .{if (why.buffered().len > 0) why.buffered() else @errorName(other)}),
     };
     log_max.store(if (o.log_level == 0) abi.LOG_INFO else o.log_level, .monotonic);
     // This server's log callback, or stderr (a later server without one

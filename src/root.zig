@@ -95,6 +95,20 @@ pub const Ca = @import("http/root.zig").Ca;
 pub const ClientAuth = ServerOptions.ClientAuth;
 /// A length of time: `.fromSeconds(30)`.
 pub const Duration = @import("server.zig").Duration;
+/// Typed settings from a JSON or INI file, `.env` files and the
+/// environment: `try anole.config.load(Config, init, .{})`. docs/config.md.
+pub const config = @import("config/root.zig");
+/// A string that never prints (`{f}` writes `[REDACTED]`): for keys and
+/// passwords in a config struct. Read it with `expose()`.
+pub const Secret = config.Secret;
+/// The environment as Anole reads it, `.env` files included:
+/// `anole.env.get("DATABASE_URL")`, `anole.env.environment()`.
+pub const env = @import("env.zig");
+/// `development` or `production` (`ServerOptions.environment`, `ANOLE_ENV`).
+pub const Environment = @import("modes.zig").Environment;
+/// What sits in front of the server (`ServerOptions.deployment`,
+/// `ANOLE_DEPLOYMENT`): standalone, behind_proxy, anole_lb, platform, lambda.
+pub const Deployment = @import("modes.zig").Deployment;
 /// The outbound HTTP client's settings (`ServerOptions.client`).
 pub const ClientOptions = @import("http/root.zig").ClientOptions;
 /// Every way `init`, `listen`, `listenTls`, `run` and `waitReady` fail.

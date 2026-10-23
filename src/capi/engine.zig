@@ -41,6 +41,7 @@ const http = anole.http;
 const zio = anole.zio;
 const placement = dusty.placement;
 const server_mod = @import("../server.zig");
+const modes = @import("../modes.zig");
 const Detached = dusty.Detached;
 const Pipe = pipe_mod.Pipe;
 const Chunk = pipe_mod.Chunk;
@@ -905,6 +906,8 @@ pub const ListenerState = struct {
 /// Tests: runs inside a control call (drain, reload) once it holds the
 /// server, before it calls into it.
 pub var test_control_hook: ?*const fn () void = null;
+/// Tests only: the environment lookups `create` resolves the modes with.
+pub var _test_vars: ?modes.Vars = null;
 
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
@@ -938,6 +941,11 @@ pub const Engine = struct {
     io: std.Io = undefined,
     /// The configuration's listeners, in order.
     listeners: []ListenerState = &.{},
+    /// The server's options as the configuration gives them, with the modes
+    /// filled in (`create`); `mainThread` hands them to `App.init`.
+    options: anole.ServerOptions = undefined,
+    /// The environment and deployment, resolved at `create`.
+    resolved: modes.Resolved = undefined,
     /// The listener whose socket could not be bound (a failed start).
     failed_listener: ?usize = null,
     /// Readiness flags of `observe.health.checks` (`anole_server_set_ready`).
@@ -1022,8 +1030,16 @@ pub const Engine = struct {
         e.timeouts[0] = if (cfg.timeouts.request_ms) |ms| @as(i96, ms) * std.time.ns_per_ms else no_deadline;
         e.dbs = try a.alloc(db.Db, cfg.databases.len);
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
-        e.listeners = try a.alloc(ListenerState, cfg.listeners.len);
-        for (cfg.listeners, e.listeners) |l, *ls| ls.* = try listenerState(a, l);
+        // The modes (docs/config.md): resolved once, here, so a binding sees
+        // $PORT and the filled addresses before it starts.
+        var opts = try e.serverOptions(a);
+        const vars = _test_vars orelse modes.Vars.process;
+        const env_res = try modes.resolveEnvironment(cfg.environment, vars, .abi, why);
+        e.resolved = try modes.resolve(a, &opts, env_res.environment, env_res.source, null, vars, why);
+        try modes.fillListeners(a, &opts, &e.resolved);
+        e.options = opts;
+        e.listeners = try a.alloc(ListenerState, opts.listeners.len);
+        for (opts.listeners, e.listeners) |l, *ls| ls.* = try listenerState(a, l);
         if (cfg.observe.health) |h| {
             e.ready = try a.alloc(std.atomic.Value(bool), h.checks.len);
             for (e.ready) |*r| r.* = .init(false);
@@ -1110,62 +1126,9 @@ pub const Engine = struct {
         // take none.
         if (!e.signals) blockSignals();
         server_mod.failed_listener_index = null;
-        const cfg = e.config;
-        const a = e.arena.allocator();
-        // Anole's own backstop, past the consumer deadline.
-        const request: ?std.Io.Duration = if (cfg.timeouts.request_ms) |default_ms| blk: {
-            var longest: u32 = default_ms;
-            for (cfg.routes) |r| if (r.timeout_ms) |t| {
-                longest = @max(longest, t);
-            };
-            break :blk .fromMilliseconds(@as(i64, longest) + 5000);
-        } else null;
-        const listeners = buildListeners(a, cfg) catch |err| return e.failStart(err);
-        var app = anole.App.init(gpa, .{
-            .listeners = listeners,
-            .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
-            .signals = e.signals,
-            .raise_fd_limit = true,
-            .timeouts = .{
-                .request = request,
-                .read_header = msOrNull(cfg.timeouts.read_header_ms),
-                .write = msOrNull(cfg.timeouts.write_ms),
-                .keepalive = msOrNull(cfg.timeouts.keepalive_ms),
-                .idle_park = msOrNull(cfg.timeouts.idle_park_ms),
-                .shutdown = msOrNull(cfg.timeouts.shutdown_ms),
-            },
-            .limits = .{
-                .body_max = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize),
-                .max_head_size = cfg.limits.max_head_size,
-                .max_header_count = cfg.limits.max_header_count,
-                .max_param_count = cfg.limits.max_param_count,
-                .max_query_count = cfg.limits.max_query_count,
-                .max_form_count = cfg.limits.max_form_count,
-                .max_multiform_count = cfg.limits.max_multiform_count,
-                .max_connections = cfg.limits.max_connections,
-                .max_requests_per_connection = cfg.limits.max_requests_per_connection,
-                .ws_max_message = cfg.limits.ws_max_message,
-            },
-            .proxy = cfg.proxy,
-            .request = cfg.request,
-            .response = cfg.response,
-            .http2 = cfg.http2,
-            .errors = cfg.errors,
-            .http3 = if (comptime features.http3) if (!wantsHttp3(cfg)) null else .{
-                .address = cfg.http3.address,
-                .port = cfg.http3.port,
-                .max_streams_bidi = cfg.http3.max_streams_bidi,
-                .validate_address = cfg.http3.validate_address,
-                .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
-                .alt_svc = cfg.http3.alt_svc,
-                .early_data = cfg.http3.early_data,
-                .prefer_v2 = cfg.http3.prefer_v2,
-                .sockets = cfg.http3.sockets,
-                .enable_connect_protocol = cfg.http3.enable_connect_protocol,
-                .inline_no_wait = cfg.http3.inline_no_wait,
-                .webtransport = wantsWebTransport(cfg),
-            } else null,
-        }) catch |err| return e.failStart(err);
+        var init_opts = e.options;
+        init_opts._resolved = &e.resolved;
+        var app = anole.App.init(gpa, init_opts) catch |err| return e.failStart(err);
         e.app = &app;
         e.io = app.io();
         const nexec = app.rt.executors.items.len;
@@ -1243,6 +1206,69 @@ pub const Engine = struct {
             c.wake();
         }
         e.stopped.set(threadedIo());
+    }
+
+    /// The server options this configuration describes, with the modes
+    /// still unresolved (`create` fills them).
+    fn serverOptions(e: *Engine, a: std.mem.Allocator) !anole.ServerOptions {
+        const cfg = e.config;
+        // Anole's own backstop, past the consumer deadline.
+        const request: ?std.Io.Duration = if (cfg.timeouts.request_ms) |default_ms| blk: {
+            var longest: u32 = default_ms;
+            for (cfg.routes) |r| if (r.timeout_ms) |t| {
+                longest = @max(longest, t);
+            };
+            break :blk .fromMilliseconds(@as(i64, longest) + 5000);
+        } else null;
+        const listeners = try buildListeners(a, cfg);
+        return .{
+            .listeners = listeners,
+            .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
+            .signals = e.signals,
+            .raise_fd_limit = true,
+            .environment = cfg.environment,
+            .deployment = cfg.deployment,
+            .error_detail = cfg.error_detail,
+            .timeouts = .{
+                .request = request,
+                .read_header = msOrNull(cfg.timeouts.read_header_ms),
+                .write = msOrNull(cfg.timeouts.write_ms),
+                .keepalive = msOrNull(cfg.timeouts.keepalive_ms),
+                .idle_park = msOrNull(cfg.timeouts.idle_park_ms),
+                .shutdown = msOrNull(cfg.timeouts.shutdown_ms),
+            },
+            .limits = .{
+                .body_max = std.math.cast(usize, cfg.limits.body_max) orelse std.math.maxInt(usize),
+                .max_head_size = cfg.limits.max_head_size,
+                .max_header_count = cfg.limits.max_header_count,
+                .max_param_count = cfg.limits.max_param_count,
+                .max_query_count = cfg.limits.max_query_count,
+                .max_form_count = cfg.limits.max_form_count,
+                .max_multiform_count = cfg.limits.max_multiform_count,
+                .max_connections = cfg.limits.max_connections,
+                .max_requests_per_connection = cfg.limits.max_requests_per_connection,
+                .ws_max_message = cfg.limits.ws_max_message,
+            },
+            .proxy = cfg.proxy,
+            .request = cfg.request,
+            .response = cfg.response,
+            .http2 = cfg.http2,
+            .errors = cfg.errors,
+            .http3 = if (comptime features.http3) if (!wantsHttp3(cfg)) null else .{
+                .address = cfg.http3.address,
+                .port = cfg.http3.port,
+                .max_streams_bidi = cfg.http3.max_streams_bidi,
+                .validate_address = cfg.http3.validate_address,
+                .idle_timeout = .fromMilliseconds(cfg.http3.idle_timeout_ms),
+                .alt_svc = cfg.http3.alt_svc,
+                .early_data = cfg.http3.early_data,
+                .prefer_v2 = cfg.http3.prefer_v2,
+                .sockets = cfg.http3.sockets,
+                .enable_connect_protocol = cfg.http3.enable_connect_protocol,
+                .inline_no_wait = cfg.http3.inline_no_wait,
+                .webtransport = wantsWebTransport(cfg),
+            } else null,
+        };
     }
 
     fn wantsWebTransport(cfg: Config) bool {
@@ -1715,28 +1741,28 @@ pub const Engine = struct {
     }
 };
 
-fn listenerState(a: std.mem.Allocator, l: Config.Listener) !ListenerState {
+fn listenerState(a: std.mem.Allocator, l: anole.ServerOptions.Listener) !ListenerState {
     var flags: u32 = 0;
     if (l.tls != null) flags |= abi.LISTENER_F_TLS;
     if (l.http1) flags |= abi.LISTENER_F_HTTP1;
     if (l.http2 and features.http2) flags |= abi.LISTENER_F_HTTP2;
     if (l.http3) flags |= abi.LISTENER_F_HTTP3;
     if (l.unix != null) flags |= abi.LISTENER_F_UNIX;
-    if (l.proxy_protocol) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
+    if (l.proxy_protocol orelse false) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
     const scheme = if (l.tls != null) "https" else "http";
     const name: []const u8 = l.name orelse if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix-{s}", .{path})
     else
-        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port });
+        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port.? });
     // "127.0.0.1:8080", "[::]:8443", "unix:/run/app.sock".
     const address: []const u8 = if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix:{s}", .{path})
-    else if (l.address.len == 0)
-        try std.fmt.allocPrint(a, "[::]:{d}", .{l.port})
-    else if (std.mem.indexOfScalar(u8, l.address, ':') != null)
-        try std.fmt.allocPrint(a, "[{s}]:{d}", .{ l.address, l.port })
+    else if (l.address.?.len == 0)
+        try std.fmt.allocPrint(a, "[::]:{d}", .{l.port.?})
+    else if (std.mem.indexOfScalar(u8, l.address.?, ':') != null)
+        try std.fmt.allocPrint(a, "[{s}]:{d}", .{ l.address.?, l.port.? })
     else
-        try std.fmt.allocPrint(a, "{s}:{d}", .{ l.address, l.port });
+        try std.fmt.allocPrint(a, "{s}:{d}", .{ l.address.?, l.port.? });
     return .{ .name = name, .cfg_address = address, .flags = flags };
 }
 
