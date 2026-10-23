@@ -34,6 +34,7 @@ const v = @import("validate");
 const strings = @import("bind_strings.zig");
 const violations = @import("bind_violations.zig");
 const dto = violations;
+const http = @import("http.zig");
 
 const Allocator = std.mem.Allocator;
 const Token = std.json.Token;
@@ -416,6 +417,84 @@ fn checkType(comptime X: type, comptime where: []const u8, comptime stack: []con
     @compileError("anole: " ++ where ++ ": " ++ @typeName(X) ++ " does not come from JSON; req.bind reads integers, floats, bool, enums, []const u8 and structs, alone, as ?T or as []const T");
 }
 
+// ------------------------------------------------------------------ the entry points
+
+pub const UnknownFields = violations.UnknownFields;
+
+pub const BindOptions = struct {
+    /// The most bytes the items of the lists take (4 x the body limit for
+    /// `req.bind`).
+    max_list_bytes: usize = 4 * 1024 * 1024,
+    /// Null: the type's own `pub const unknown_fields`, else ignored.
+    unknown_fields: ?UnknownFields = null,
+};
+
+pub fn BindResult(comptime T: type) type {
+    return union(enum) { ok: T, invalid: http.Violations };
+}
+
+/// The collected mapping violations as the request's, with `in` set.
+pub fn toViolations(arena: Allocator, sink: *const Collector, in: http.Violation.Source) Allocator.Error!http.Violations {
+    const out = try arena.alloc(http.Violation, sink.items().len);
+    for (sink.items(), out) |item, *o| o.* = .{ .in = in, .field = item.field, .code = item.code, .message = item.message };
+    return .{ .items = out, .truncated = sink.truncated };
+}
+
+/// Runs the transforms of `value`'s `field_rules`, then its rules. Null
+/// when every rule holds. `fix` rewrites a rule path (headers).
+pub fn applyRules(comptime T: type, arena: Allocator, value: *T, in: http.Violation.Source) error{ OutOfMemory, TransformFailed }!?http.Violations {
+    v.transform(arena, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TransformFailed,
+    };
+    const report = try v.checkAll(arena, value);
+    if (report.violations.len == 0) return null;
+    const out = try arena.alloc(http.Violation, report.violations.len);
+    for (report.violations, out) |item, *o| {
+        const field = if (in == .header and item.field != null) try strings.headerPath(T, arena, item.field.?) else item.field;
+        o.* = .{ .in = in, .field = field, .code = item.code, .message = item.message };
+    }
+    return .{ .items = out, .truncated = report.truncated };
+}
+
+/// `bytes` as a `T` and checked by its `field_rules`; the context-free
+/// entry point `req.bind` is built on (NATS and Kafka messages use it too).
+/// A body that is not JSON, repeats a key or nests past 64 levels is
+/// `error.InvalidJsonBody`; lists past `max_list_bytes` are
+/// `error.BodyTooBig`; a value that does not fit, or breaks a rule, is
+/// `.invalid` with every violation (in = body). Types the mapper does not
+/// read are parsed with std.json (unknown fields ignored); renames need the
+/// mapper's types.
+pub fn bindJson(comptime T: type, arena: Allocator, bytes: []const u8, options: BindOptions) error{ InvalidJsonBody, BodyTooBig, OutOfMemory }!BindResult(T) {
+    var value: T = undefined;
+    if (comptime supported(T)) {
+        comptime check(T);
+        var sink: Collector = .init(arena);
+        const parsed = parse(T, arena, bytes, .{
+            .unknown = options.unknown_fields orelse .ignore,
+            .max_list_bytes = options.max_list_bytes,
+        }, &sink) catch |err| switch (err) {
+            error.InvalidRequest => return error.InvalidJsonBody,
+            error.PayloadTooLarge => return error.BodyTooBig,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        value = parsed orelse return .{ .invalid = try toViolations(arena, &sink, .body) };
+    } else {
+        comptime if (usesRename(T)) @compileError("anole: binding " ++ @typeName(T) ++ ": a field is renamed with v.rename, but the type holds something the request mapper does not read " ++
+            "([N]T, unions, std.json.Value, []u8, a type with jsonParse); renames need the mapper's types: integers, floats, bool, enums, []const u8, structs, ?T and []const T");
+        value = std.json.parseFromSliceLeaky(T, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidJsonBody,
+        };
+    }
+    const bad = applyRules(T, arena, &value, .body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TransformFailed => return error.InvalidJsonBody,
+    };
+    if (bad) |violations_found| return .{ .invalid = violations_found };
+    return .{ .ok = value };
+}
+
 const testing = std.testing;
 
 const Priority = enum { low, normal, high };
@@ -714,4 +793,60 @@ test "bind: usesRename sees renames inside optionals, lists and fields" {
     try testing.expect(usesRename(Line));
     try testing.expect(usesRename(struct { x: ?[]const Line }));
     try testing.expect(!usesRename(struct { a: u8 }));
+}
+
+test "bindJson: ok, invalid with every violation, and the errors" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Todo = struct {
+        title: []const u8,
+        tags: []const []const u8 = &.{},
+        pub const field_rules = .{ .title = .{ v.trim, v.notBlank }, .tags = v.each(v.notEmpty) };
+    };
+    const ok = try bindJson(Todo, arena, "{\"title\":\"  hi \"}", .{});
+    try testing.expectEqualStrings("hi", ok.ok.title);
+    const bad = try bindJson(Todo, arena, "{\"title\":\"   \",\"tags\":[\"a\",\"\"]}", .{});
+    try testing.expectEqual(@as(usize, 2), bad.invalid.items.len);
+    try testing.expectEqualStrings("title", bad.invalid.items[0].field.?);
+    try testing.expectEqualStrings("tags[1]", bad.invalid.items[1].field.?);
+    const wrong = try bindJson(Todo, arena, "{\"title\":1}", .{});
+    try testing.expectEqualStrings("http.invalid_type", wrong.invalid.items[0].code);
+    try testing.expectError(error.InvalidJsonBody, bindJson(Todo, arena, "nope", .{}));
+    try testing.expectError(error.BodyTooBig, bindJson([]const u64, arena, "[1,2,3]", .{ .max_list_bytes = 8 }));
+    // A fallback type maps with std.json and still runs rules.
+    const Fallback = struct {
+        pair: [2]i32,
+        name: []const u8,
+        pub const field_rules = .{ .name = v.notBlank };
+    };
+    const fb = try bindJson(Fallback, arena, "{\"pair\":[1,2],\"name\":\"x\"}", .{});
+    try testing.expectEqual(@as(i32, 2), fb.ok.pair[1]);
+    const fb_bad = try bindJson(Fallback, arena, "{\"pair\":[1,2],\"name\":\" \"}", .{});
+    try testing.expectEqualStrings("validation.not_blank", fb_bad.invalid.items[0].code);
+}
+
+fn fuzzBind(bytes: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Item = struct {
+        n: u8 = 0,
+        s: []const u8 = "",
+        pub const field_rules = .{ .s = v.maxLength(8) };
+    };
+    const Doc = struct { items: []const Item = &.{}, flag: ?bool = null, kind: enum { a, b } = .a };
+    if (bindJson(Doc, arena, bytes, .{ .max_list_bytes = 4096 })) |res| switch (res) {
+        .ok => {},
+        .invalid => |vs| try testing.expect(vs.items.len <= v.max_report_violations),
+    } else |_| {}
+}
+
+test "fuzz: bindJson" {
+    try @import("fuzz.zig").bytes(fuzzBind, &.{
+        "{}",
+        "{\"items\":[{\"n\":1,\"s\":\"abc\"}],\"flag\":true,\"kind\":\"b\"}",
+        "{\"items\":[{\"n\":300}]}",
+        "[[[[",
+    });
 }
