@@ -147,6 +147,8 @@ test "relaunch: starts a program detached, output appended, then killAndWait" {
 }
 
 test "relaunch: waitForSocket finds a newer pid and times out otherwise" {
+    // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
+    if (!sys.supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
