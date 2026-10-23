@@ -2176,7 +2176,7 @@ typedef struct {
   wt_ent ents[32];
   anole_wt session;
   anole_wt_stream first_stream; /* for the stale check after the close */
-  int opened, closed, released, drains, borrow_sent;
+  int opened, closed, released, drains, borrow_sent, datagram_sent;
   uint32_t close_code, close_by;
   char reason[64];
 } wt_state;
@@ -2211,12 +2211,14 @@ static void wt_forget(wt_state *st, wt_ent *e) {
 /* Borrowed by a WebTransport write: static, as it must stay until
    ANOLE_EV_SENT. */
 static const char wt_borrowed[] = "hello ";
+static const char wt_thanked[] = "thanked";
 
 static void wt_event(wt_state *st, const anole_event *ev) {
   switch (ev->type) {
   case ANOLE_EV_SENT: {
     const anole_sent_event *se = (const anole_sent_event *)ev;
     if (se->data == (uint64_t)(uintptr_t)wt_borrowed && se->len == 6) st->borrow_sent++;
+    if (se->data == (uint64_t)(uintptr_t)wt_thanked && se->len == 7) st->datagram_sent++;
     break;
   }
   case ANOLE_EV_WT_OPEN: {
@@ -2259,17 +2261,18 @@ static void wt_event(wt_state *st, const anole_event *ev) {
       e->len += d.len;
       if (!fin) break;
       char out[32];
-      int n;
+      anole_wt session = e->session;
       if (e->uni) {
-        n = snprintf(out, sizeof out, "uni:%zu", e->len);
+        int n = snprintf(out, sizeof out, "uni:%zu", e->len);
+        CHECK(anole_wt_send_datagram(session, out, (size_t)n, 0) == ANOLE_OK);
       } else {
         CHECK(e->len == 6 && memcmp(e->got, "thanks", 6) == 0);
-        n = snprintf(out, sizeof out, "thanked");
+        /* A borrowed datagram: WebTransport datagrams are copied at once,
+           so ANOLE_EV_SENT comes right away (exactly once). */
+        CHECK(anole_wt_send_datagram(session, wt_thanked, sizeof wt_thanked - 1, ANOLE_BODY_BORROW) == ANOLE_OK);
       }
       /* Released after the answer: a release is a cleanup call, safe also
          once the client has closed the session. */
-      anole_wt session = e->session;
-      CHECK(anole_wt_send_datagram(session, out, (size_t)n, 0) == ANOLE_OK);
       wt_forget(st, e);
     } else {
       anole_status rc = anole_wt_stream_write(ev->handle, d.ptr, d.len, fin ? ANOLE_WT_F_FIN : 0);
@@ -2359,6 +2362,7 @@ static void test_webtransport(void) {
   CHECK(st.close_code == 7 && st.close_by == ANOLE_WT_CLOSED_PEER && strcmp(st.reason, "done") == 0);
   CHECK(st.released >= 3);
   CHECK(st.borrow_sent == 1);
+  CHECK(st.datagram_sent == 1);
   /* The session and its streams are stale after the close. */
   CHECK(anole_wt_close(st.session, 0, LIT("")) == ANOLE_OK); /* a cleanup call */
   CHECK(anole_wt_send_datagram(st.session, "x", 1, 0) == ANOLE_E_GONE);
