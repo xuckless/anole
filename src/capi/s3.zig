@@ -442,10 +442,10 @@ const Res = struct {
         const nmeta: usize = if (r.meta) |m| m.metadata.len else 0;
         var bytes: usize = r.body.len + r.next.len + r.upload_id.len + r.etag.len + r.version_id.len + r.message.len + r.code.len + r.request_id.len;
         if (r.meta) |m| {
-            bytes += (m.content_type orelse "").len + (m.cache_control orelse "").len + (m.content_disposition orelse "").len + (m.content_encoding orelse "").len;
+            bytes += str(m.content_type).len + str(m.cache_control).len + str(m.content_disposition).len + str(m.content_encoding).len;
             for (m.metadata) |kv| bytes += kv[0].len + kv[1].len;
         }
-        for (r.entries) |en| bytes += en.key.len + en.etag.len + (en.storage_class orelse "").len;
+        for (r.entries) |en| bytes += en.key.len + en.etag.len + str(en.storage_class).len;
         for (r.failures) |f| bytes += f.key.len + f.code.len + f.message.len;
         for (r.prefixes) |p| bytes += p.len;
         const meta_off = @sizeOf(Ev);
@@ -474,10 +474,10 @@ const Res = struct {
         ev.etag = w.put(r.etag);
         ev.version_id = w.put(r.version_id);
         if (r.meta) |m| {
-            ev.content_type = w.put(m.content_type orelse "");
-            ev.cache_control = w.put(m.cache_control orelse "");
-            ev.content_disposition = w.put(m.content_disposition orelse "");
-            ev.content_encoding = w.put(m.content_encoding orelse "");
+            ev.content_type = w.put(str(m.content_type));
+            ev.cache_control = w.put(str(m.cache_control));
+            ev.content_disposition = w.put(str(m.content_disposition));
+            ev.content_encoding = w.put(str(m.content_encoding));
             ev.metadata_off = @intCast(meta_off);
             ev.nmetadata = @intCast(nmeta);
             const spans: [*]abi.Span = @ptrCast(@alignCast(rec.ptr + meta_off));
@@ -496,7 +496,7 @@ const Res = struct {
             for (r.entries, 0..) |en, i| es[i] = .{
                 .key = w.put(en.key),
                 .etag = w.put(en.etag),
-                .storage_class = w.put(en.storage_class orelse ""),
+                .storage_class = w.put(str(en.storage_class)),
                 .size = en.size,
                 .last_modified_ms = if (en.last_modified) |t| t.toMillis() else 0,
             };
@@ -514,6 +514,10 @@ const Res = struct {
         return rec;
     }
 };
+
+fn str(o: ?[]const u8) []const u8 {
+    return o orelse "";
+}
 
 fn httpStatus(err: anyerror) u16 {
     return switch (err) {
@@ -1477,8 +1481,12 @@ fn putBodyTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket, r: *Res) std.Io.C
     s.in.release();
     const result: anyerror!s3.Stored = blk: {
         if (!streamed) break :blk b.put(ctx, c.key, .{ .bytes = s.body }, po);
+        const buffer = ctx.arena.alloc(u8, 16 * 1024) catch {
+            r.status = abi.E_NOMEM;
+            return;
+        };
         var br: BodyReader = .{
-            .interface = .{ .vtable = &.{ .stream = BodyReader.streamFn }, .buffer = try ctx.arena.alloc(u8, 16 * 1024), .seek = 0, .end = 0 },
+            .interface = .{ .vtable = &.{ .stream = BodyReader.streamFn }, .buffer = buffer, .seek = 0, .end = 0 },
             .x = x,
             .slot = s,
             .gen = h.gen,
