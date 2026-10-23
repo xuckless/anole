@@ -117,6 +117,7 @@ pub const EventType = enum(u32) {
     nats_reply = 65,
     nats_js_msg = 66,
     nats_sub_end = 67,
+    nats_status = 68,
     nats_writable = 69,
 };
 
@@ -787,6 +788,7 @@ pub const events = [_]EventInfo{
     .{ .type = 65, .name = "ANOLE_EV_NATS_REPLY", .record = "anole_nats_reply_event" },
     .{ .type = 66, .name = "ANOLE_EV_NATS_JS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_msg"}, .obligation = "ack" },
     .{ .type = 67, .name = "ANOLE_EV_NATS_SUB_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
+    .{ .type = 68, .name = "ANOLE_EV_NATS_STATUS", .record = "anole_broker_status_event" },
     .{ .type = 69, .name = "ANOLE_EV_NATS_WRITABLE", .record = "anole_broker_status_event" },
 };
 

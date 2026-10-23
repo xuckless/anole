@@ -1519,7 +1519,8 @@ typedef struct anole_broker_end_event {
   anole_span error;
 } anole_broker_end_event; /* 48 bytes */
 
-/* ANOLE_EV_NATS_WRITABLE. */
+/* ANOLE_EV_NATS_STATUS (CONNECTED, DISCONNECTED, RECONNECTED, LAME_DUCK) and
+   ANOLE_EV_NATS_WRITABLE (WRITABLE). */
 #define ANOLE_BROKER_CONNECTED 0u
 #define ANOLE_BROKER_DISCONNECTED 1u
 #define ANOLE_BROKER_RECONNECTED 2u
@@ -1528,7 +1529,7 @@ typedef struct anole_broker_end_event {
 typedef struct anole_broker_status_event {
   anole_event ev;        /* handle 0 */
   uint32_t broker;       /* anole_nats_index */
-  uint32_t status;       /* ANOLE_BROKER_WRITABLE */
+  uint32_t status;       /* ANOLE_BROKER_* */
 } anole_broker_status_event; /* 24 bytes */
 
 #ifdef __cplusplus

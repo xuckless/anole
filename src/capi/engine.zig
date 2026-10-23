@@ -1169,6 +1169,7 @@ pub const Engine = struct {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
         };
+        nats.watchStatus(e, app.io());
         // The databases connect now (`connect_at_start` included): the
         // consumers can query before anything listens.
         app.startConnectors() catch |err| {

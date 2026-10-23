@@ -303,6 +303,13 @@
       "obligation": null
     },
     {
+      "type": 68,
+      "name": "ANOLE_EV_NATS_STATUS",
+      "record": "anole_broker_status_event",
+      "handles": [],
+      "obligation": null
+    },
+    {
       "type": 69,
       "name": "ANOLE_EV_NATS_WRITABLE",
       "record": "anole_broker_status_event",
@@ -470,6 +477,7 @@
       "ANOLE_EV_NATS_REPLY": 65,
       "ANOLE_EV_NATS_JS_MSG": 66,
       "ANOLE_EV_NATS_SUB_END": 67,
+      "ANOLE_EV_NATS_STATUS": 68,
       "ANOLE_EV_NATS_WRITABLE": 69
     },
     "grpc_call_flag": {
