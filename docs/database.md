@@ -1163,3 +1163,12 @@ When not to use them:
 
 For whole responses rather than rows, see `ResponseCache` in
 [routing.md](routing.md#response-cache).
+
+## Watching changes
+
+PostgreSQL (`LISTEN`/`NOTIFY`, one shared connection per client), Redis
+(pub/sub on one shared connection, and streams with or without a consumer
+group) and MongoDB (`Collection.watch`, `Database.watch`, `Client.watch`:
+change streams with automatic resume from the cached resume token, a replica
+set needed) can feed SSE topics, WebSocket rooms and handlers through
+`app.watch`. Delivery guarantees and gaps are in [realtime](realtime.md).

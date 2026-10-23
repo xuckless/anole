@@ -484,3 +484,11 @@ defer ws.deinit();
 try ws.send(.text, "hello");
 const reply = try ws.receive();
 ```
+
+## Feeding rooms from database changes
+
+`app.watch(source, .{ .to = &.{.{ .ws = .{ .rooms = rooms, .room = "orders" } }} })`
+broadcasts each PostgreSQL notification, Redis message, stream entry or MongoDB
+change to a room with no handler in between; the room may be a template such
+as `"room:{data.room}"`. `gap_message` is broadcast to a fixed room when the
+source may have lost events. See [realtime](realtime.md).
