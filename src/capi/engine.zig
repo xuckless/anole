@@ -71,6 +71,7 @@ pub const wt = if (features.http3) @import("wt.zig") else struct {
 };
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
+pub const nats = @import("nats.zig");
 pub const config = config_mod;
 
 const log = std.log.scoped(.anole_capi);
@@ -140,6 +141,10 @@ pub const Handle = packed struct(u64) {
         db_tx = 6,
         /// Reserved for a per-query handle.
         db_query = 7,
+        /// A NATS subscription or JetStream consume (`anole_nats_sub`).
+        broker_sub = 8,
+        /// A JetStream message (`anole_nats_msg`).
+        broker_msg = 9,
         _,
     };
 
@@ -444,6 +449,7 @@ pub const Exec = struct {
     grpc: grpc.ExecState = .{},
     wt: wt.ExecState = .{},
     db: db.ExecState = .{},
+    nats: nats.ExecState = .{},
 
     /// The capi task is asleep for a whole request timeout: wakes it, as a
     /// deadline (or a lost doorbell) now needs watching.
@@ -987,6 +993,9 @@ pub const Engine = struct {
     wt_datagrams_dropped: std.atomic.Value(u64) = .init(0),
     /// The configuration's databases (`anole_db *`).
     dbs: []db.Db = &.{},
+    /// The configuration's brokers (`anole_nats *`), and their handles.
+    brokers: []nats.Broker = &.{},
+    nats_state: nats.State = .{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
     /// gRPC services, methods, descriptors and health.
@@ -1022,6 +1031,9 @@ pub const Engine = struct {
         e.timeouts[0] = if (cfg.timeouts.request_ms) |ms| @as(i96, ms) * std.time.ns_per_ms else no_deadline;
         e.dbs = try a.alloc(db.Db, cfg.databases.len);
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
+        e.brokers = try a.alloc(nats.Broker, cfg.brokers.len);
+        for (e.brokers, cfg.brokers, 0..) |*b, bc, i| b.* = .{ .engine = e, .config = bc, .index = @intCast(i) };
+        e.nats_state.init(e.first_gen);
         e.listeners = try a.alloc(ListenerState, cfg.listeners.len);
         for (cfg.listeners, e.listeners) |l, *ls| ls.* = try listenerState(a, l);
         if (cfg.observe.health) |h| {
@@ -1189,6 +1201,7 @@ pub const Engine = struct {
             return e.failStartDeinit(&app, error.RouteConflict);
         }
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
@@ -1198,6 +1211,7 @@ pub const Engine = struct {
         app.startConnectors() catch |err| {
             e.tasks.cancel(app.io());
             db.close(e);
+            nats.close(e);
             return e.failStartDeinit(&app, err);
         };
         e.phase.store(.open, .release);
@@ -1209,6 +1223,7 @@ pub const Engine = struct {
             watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
                 e.tasks.cancel(app.io());
                 db.close(e);
+                nats.close(e);
                 return e.failStartDeinit(&app, err);
             };
             // Control calls may reach the server from here until `run` returns.
@@ -1221,7 +1236,9 @@ pub const Engine = struct {
         e.tasks.cancel(app.io());
         if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
         for (e.execs) |*x| x.db.cancel(app.io());
+        for (e.execs) |*x| x.nats.cancel(app.io());
         db.close(e);
+        nats.close(e);
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
                 e.noteFailedListener(app.failedListenerIndex(), err);
@@ -1608,6 +1625,7 @@ pub const Engine = struct {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
             last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
         }
+        last = @max(last, e.nats_state.maxGen());
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -1635,7 +1653,9 @@ pub const Engine = struct {
             x.grpc.deinit();
             x.wt.deinit();
             x.db.deinit();
+            x.nats.deinit();
         }
+        e.nats_state.deinit();
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
         for (e.consumers.items) |c| {
@@ -3164,6 +3184,16 @@ pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
         .db_tx => {
             if (comptime !features.sqlite and !features.postgres) return error.Over;
             return db.txRelease(e, hv);
+        },
+        // A NATS subscription or JetStream consume ends; a JetStream message
+        // is NAK'd (cleanup calls).
+        .broker_sub => {
+            nats.unsubscribe(e, hv);
+            return error.Over;
+        },
+        .broker_msg => {
+            nats.ack(e, hv, abi.NATS_NAK, 0) catch return error.Over;
+            return;
         },
         .db_query, _ => return error.WrongKind,
     }

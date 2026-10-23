@@ -777,7 +777,7 @@ const Handler = struct {
 /// micro error headers.
 fn handlerFailed(cl: *Client, msg: *Msg, err: anyerror) void {
     const status = dusty.errorStatus(err);
-    const code: u16 = if (status) |s| @intFromEnum(s) else 500;
+    const code: u16 = if (status) |s| @intCast(@intFromEnum(s)) else 500;
     if (code >= 500) log.warn("{s} handler for {s} failed: {t}", .{ msg.id, msg.subject, err }) else log.debug("{s} handler for {s} failed: {t}", .{ msg.id, msg.subject, err });
     const to = msg.reply_to orelse return;
     var code_text: [8]u8 = undefined;

@@ -310,7 +310,7 @@ pub const PublishNowError = PublishError || error{
 /// Queues `message` if there is room now and never waits (the write rule:
 /// a send returns once the data is buffered). `.busy` says the queue is
 /// past half its limit. See `limits.outbound_bytes`.
-pub fn publishNow(client: *Client, message: PublishMessage) PublishNowError!enum { ok, busy } {
+pub fn publishNow(client: *Client, message: PublishMessage) PublishNowError!Outbound.Room {
     client.checkHome();
     const header_len = try client.prepare(message, .publish);
     try client.checkLine(message, header_len);

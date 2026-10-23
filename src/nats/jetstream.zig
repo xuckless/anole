@@ -200,6 +200,30 @@ pub const JetStream = struct {
         try cl.addHook(.{ .context = p, .begin = Puller.begin, .free = Puller.free });
     }
 
+    /// Starts a pull consumer at once (the client has started) whose
+    /// messages go to `run(state, msg)`; stop it with `Puller.stop`. For the
+    /// C ABI, which runs the handler as "post the message, wait for the
+    /// consumer's ack".
+    pub fn consumeRaw(self: JetStream, stream: []const u8, consumer: []const u8, opts: ConsumeOptions, state: ?*anyopaque, run: *const fn (?*anyopaque, *JsMsg) anyerror!void) !*Puller {
+        const cl = self.client;
+        const p = try cl.gpa.create(Puller);
+        errdefer cl.gpa.destroy(p);
+        p.* = .{
+            .client = cl,
+            .stream = try cl.gpa.dupe(u8, stream),
+            .consumer = try cl.gpa.dupe(u8, consumer),
+            .opts = opts,
+            .state = state,
+            .run = run,
+            .domain = cl.js_options.domain,
+            .standalone = true,
+        };
+        errdefer cl.gpa.free(p.stream);
+        errdefer cl.gpa.free(p.consumer);
+        try Puller.begin(p);
+        return p;
+    }
+
     // -- API plumbing ------------------------------------------------------
 
     fn prefix(self: JetStream, a: std.mem.Allocator) ![]const u8 {
@@ -367,7 +391,7 @@ pub fn parseAckSubject(subject: []const u8) ?AckInfo {
 // ---------------------------------------------------------------------------
 // Pull consumption
 
-const Puller = struct {
+pub const Puller = struct {
     client: *Client,
     stream: []const u8,
     consumer: []const u8,
@@ -377,6 +401,14 @@ const Puller = struct {
     domain: ?[]const u8,
     inflight: std.atomic.Value(u32) = .init(0),
     rr: std.atomic.Value(usize) = .init(0),
+    stopped: std.atomic.Value(bool) = .init(false),
+    /// Made by `consumeRaw`: owns its strings, ends itself.
+    standalone: bool = false,
+
+    /// Ends the pulling; messages already delivered finish.
+    pub fn stop(p: *Puller) void {
+        p.stopped.store(true, .release);
+    }
 
     fn begin(context: *anyopaque) anyerror!void {
         const p: *Puller = @ptrCast(@alignCast(context));
@@ -385,6 +417,10 @@ const Puller = struct {
 
     fn free(context: *anyopaque) void {
         const p: *Puller = @ptrCast(@alignCast(context));
+        if (p.standalone) {
+            p.client.gpa.free(p.stream);
+            p.client.gpa.free(p.consumer);
+        }
         p.client.gpa.destroy(p);
     }
 
@@ -406,8 +442,10 @@ const Puller = struct {
         var pull_subject_buf: [320]u8 = undefined;
         const pull_subject = std.fmt.bufPrint(&pull_subject_buf, "{s}.CONSUMER.MSG.NEXT.{s}.{s}", .{ prefix, p.stream, p.consumer }) catch return;
         var requested: u32 = 0;
+        var pulled_at: std.Io.Clock.Timestamp = .now(io, .awake);
         const max = @max(1, p.opts.max_inflight);
         while (true) {
+            if (p.stopped.load(.acquire)) return;
             const inflight = p.inflight.load(.acquire);
             const want = max -| inflight -| requested;
             if (requested == 0 and want >= @max(1, max / 2)) {
@@ -415,12 +453,14 @@ const Puller = struct {
                 const text = std.fmt.bufPrint(&body, "{{\"batch\":{d},\"expires\":{d}}}", .{ want, @max(1, p.opts.expires.nanoseconds - 1_000_000_000) }) catch return;
                 if (k.publishNow(.{ .subject = pull_subject, .reply_to = inbox, .payload = text })) |_| {
                     requested = want;
+                    pulled_at = .now(io, .awake);
                 } else |_| {}
             }
-            const wait: Duration = if (requested == 0) .fromMilliseconds(100) else p.opts.expires;
+            const wait: Duration = if (requested == 0) .fromMilliseconds(100) else .{ .nanoseconds = @min(p.opts.expires.nanoseconds, std.time.ns_per_s) };
             const got = sub.next(.{ .timeout = .{ .duration = .{ .raw = wait, .clock = .awake } } }) catch |err| switch (err) {
                 error.Timeout => {
-                    if (requested != 0) requested = 0;
+                    // The pull ends at `expires` on the server's side.
+                    if (requested != 0 and pulled_at.durationTo(.now(io, .awake)).raw.nanoseconds > p.opts.expires.nanoseconds) requested = 0;
                     continue;
                 },
                 error.Canceled => return error.Canceled,

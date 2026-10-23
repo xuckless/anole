@@ -144,7 +144,7 @@ fn slotLive(x: *Exec, h: Handle) bool {
 
 /// The executor of the request or gRPC call `hv`, which must be live; `c`,
 /// when given, must be its consumer.
-fn resolveReq(e: *Engine, hv: u64, c: ?*Consumer) QueryError!*Exec {
+pub fn resolveReq(e: *Engine, hv: u64, c: ?*Consumer) QueryError!*Exec {
     const h = Handle.decode(hv);
     if (h.gen == 0 or (h.kind != .request and h.kind != .grpc_call)) return error.Invalid;
     if (h.exec >= e.execs.len) return error.Gone;

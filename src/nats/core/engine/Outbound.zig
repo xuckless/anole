@@ -298,7 +298,9 @@ pub const TryPutError = PutError || error{
 /// Queues a frame only if there is room now; it never waits. `.busy` says
 /// the queue is past half its limit (the caller should slow down). A
 /// reconnect buffer that is full is BufferFull, as for `put`.
-pub fn tryPut(q: *Outbound, io: Io, kind: Kind, len: usize, encode: anytype, args: anytype) TryPutError!enum { ok, busy } {
+pub const Room = enum { ok, busy };
+
+pub fn tryPut(q: *Outbound, io: Io, kind: Kind, len: usize, encode: anytype, args: anytype) TryPutError!Room {
     q.mutex.lockUncancelable(io);
     defer q.mutex.unlock(io);
     if (q.stopped(kind)) return error.ConnectionDraining;
