@@ -244,3 +244,18 @@ test "Store: the total cap evicts the globally oldest across rings" {
     try std.testing.expect(a.complete_after >= 1);
     try std.testing.expectEqual(@as(u64, 0), b.complete_after);
 }
+
+test "fuzz: Last-Event-ID parser" {
+    try @import("../fuzz.zig").bytes(fuzzId, &.{ "0a1b2c3d-42", "ffffffff-0", "", "0a1b2c3d-", "zz", "0a1b2c3d-18446744073709551615" });
+}
+
+fn fuzzId(input: []const u8) anyerror!void {
+    if (parseLastEventId(input)) |id| {
+        var buf: [40]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{x:0>8}-{d}", .{ id.epoch, id.seq });
+        // A parsed id round-trips as the same numbers.
+        const again = parseLastEventId(text) orelse return error.NoRoundTrip;
+        try std.testing.expectEqual(id.epoch, again.epoch);
+        try std.testing.expectEqual(id.seq, again.seq);
+    }
+}
