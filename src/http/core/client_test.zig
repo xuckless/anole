@@ -2520,11 +2520,12 @@ test "client breaker: refused connects open it and the next fetch fails CircuitO
     var buf: [64]u8 = undefined;
     const url = try flakyUrl(&buf, port);
 
-    for (0..3) |_| try std.testing.expect(std.meta.isError(client.fetch(url, .{})));
-    const dials = client.dials.load(.monotonic);
-    try std.testing.expect(dials >= 3);
+    // `dials` counts connections opened, so refused connects leave it at
+    // 0; the errors tell instead: three refusals, then CircuitOpen, which
+    // a fetch that dialed would not return (it would be refused again).
+    for (0..3) |_| try std.testing.expectError(error.ConnectionRefused, client.fetch(url, .{}));
     try std.testing.expectError(error.CircuitOpen, client.fetch(url, .{}));
-    try std.testing.expectEqual(dials, client.dials.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), client.dials.load(.monotonic));
 }
 
 test "client breaker: 404 answers never open it" {
