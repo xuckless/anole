@@ -1780,7 +1780,7 @@ pub fn errorErrno(err: anyerror) i32 {
         error.NotDir => .NOTDIR,
         else => return 0,
     };
-    return @intFromEnum(code);
+    return @backingInt(code);
 }
 
 // ---------------------------------------------------------------------------
@@ -3169,7 +3169,7 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     }
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     const st = file.stat(threadedIo()) catch {
-        engine_errno = @intFromEnum(std.posix.E.BADF);
+        engine_errno = @backingInt(std.posix.E.BADF);
         return error.Invalid;
     };
     if (st.kind != .file) return error.Invalid;

@@ -235,12 +235,12 @@ test "public surface: Request, Response and websocket.Socket expose only the fie
         const request_decls = [_][]const u8{
             "host",     "peerCertificate", "setTimeout", "setDeadline", "reader",        "readerLimited", "body",
             "param",    "queryParam",      "bind",       "bindWith",    "json",          "jsonValue",     "jsonObject",
-            "setLocal", "local",           "cookies",    "formData",    "multiFormData", "urlUnescape", "paramDecoded",
+            "setLocal", "local",           "cookies",    "formData",    "multiFormData", "urlUnescape",   "paramDecoded",
         };
         const socket_fields = [_][]const u8{ "io", "max_message_size", "end_error", "close_code", "context", "subprotocol" };
         const socket_decls = [_][]const u8{
-            "Conn",  "draining", "receive", "contextAs", "send",  "ping",
-            "next",  "close",    "deinit",  "httpVersion", "isClosed",
+            "Conn", "draining", "receive", "contextAs",   "send",     "ping",
+            "next", "close",    "deinit",  "httpVersion", "isClosed",
         };
         const response_fields = [_][]const u8{
             "status",         "body",      "headers",  "content_type", "arena",          "body_buffer", "io",

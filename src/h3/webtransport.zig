@@ -1511,7 +1511,6 @@ pub const Stream = struct {
     /// What `tryRead` found: `n` bytes; `fin` when the peer's end has
     /// been read (with them or before); `err` when the stream ended early
     /// (`resetCode` for the peer's code). All empty: nothing yet.
-
     /// The calls Anole's own drivers make on a stream: they never wait.
     /// Not for handlers; they change without notice.
     pub const Driver = struct {
