@@ -312,6 +312,7 @@ pub const DB_F_WRITE: u32 = 1;
 pub const DB_F_COALESCE: u32 = 2;
 pub const DB_F_NO_PREPARE: u32 = 4;
 pub const DB_F_DROP_EMPTY: u32 = 8;
+pub const DB_F_RETRY: u32 = 16;
 
 pub const DbOptions = extern struct {
     size: usize,

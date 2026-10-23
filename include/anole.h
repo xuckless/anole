@@ -1078,11 +1078,16 @@ typedef struct anole_db_value {
    parameters) share one run, each caller getting its own answer.
    ANOLE_DB_F_NO_PREPARE: do not keep the prepared statement (SQL built at run
    time). ANOLE_DB_F_DROP_EMPTY: with a cache_ttl_ms, an answer with no row is
-   served but not kept (cache-aside). */
+   served but not kept (cache-aside). ANOLE_DB_F_RETRY: the query may run
+   again on a transient failure (the server unreachable, a connection lost),
+   with the database's "retry" configuration; only for statements safe to
+   repeat. Refused (ANOLE_E_INVALID) on anole_db_tx_*; SQLite and MongoDB
+   ignore it. */
 #define ANOLE_DB_F_WRITE 1u
 #define ANOLE_DB_F_COALESCE 2u
 #define ANOLE_DB_F_NO_PREPARE 4u
 #define ANOLE_DB_F_DROP_EMPTY 8u
+#define ANOLE_DB_F_RETRY 16u
 
 /* anole_db_options.timeout_ms: no bound for this query. */
 #define ANOLE_DB_TIMEOUT_NONE 0xFFFFFFFFu

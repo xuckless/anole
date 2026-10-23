@@ -139,6 +139,12 @@ pub const Config = struct {
         /// request or not; past it the statement is interrupted
         /// (ANOLE_E_TIMEOUT). 0: none.
         timeout_ms: u32 = 30_000,
+        /// A circuit breaker: after repeated connection failures calls fail
+        /// fast with ANOLE_E_DB, class UNAVAILABLE, error_code
+        /// "circuit_open" and http_status 503. null: none. Ignored for SQLite.
+        breaker: ?Breaker = .{},
+        /// What queries with ANOLE_DB_F_RETRY are retried with.
+        retry: Retry = .{},
         /// What status each class of database error becomes, as
         /// `anole.db.ErrorMap`: a class name to "bad_request", "not_found",
         /// "conflict", "unprocessable_entity", "internal_server_error",
@@ -298,6 +304,25 @@ pub const Config = struct {
         /// Select a server and open a connection per executor at start, and
         /// fail the start if that fails.
         connect_at_start: bool = false,
+    };
+
+    pub const Breaker = struct {
+        consecutive_failures: u32 = 5,
+        failure_ratio: f32 = 0.5,
+        min_calls: u32 = 20,
+        window_ms: u32 = 10_000,
+        open_ms: u32 = 5_000,
+        max_open_ms: u32 = 60_000,
+        half_open_calls: u8 = 1,
+    };
+
+    pub const Retry = struct {
+        attempts: u8 = 3,
+        base_ms: u32 = 50,
+        max_ms: u32 = 1_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
     };
 
     pub const CacheBounds = struct {

@@ -227,6 +227,29 @@ fn openSqlite(d: *Db, app: *anole.App, sq: config_mod.Config.Sqlite) !void {
     }
 }
 
+fn breakerOf(d: *const Db) ?anole.resilience.Breaker.Options {
+    const b = d.config.breaker orelse return null;
+    return .{
+        .consecutive_failures = b.consecutive_failures,
+        .failure_ratio = b.failure_ratio,
+        .min_calls = b.min_calls,
+        .window = ms(b.window_ms),
+        .open_for = ms(b.open_ms),
+        .max_open_for = ms(b.max_open_ms),
+        .half_open_calls = b.half_open_calls,
+    };
+}
+
+fn retryOf(d: *const Db) anole.resilience.Retry {
+    const r = d.config.retry;
+    return .{
+        .attempts = r.attempts,
+        .backoff = .{ .base = ms(r.base_ms), .max = ms(r.max_ms), .multiplier = r.multiplier },
+        .attempt_timeout = if (r.attempt_timeout_ms > 0) ms(r.attempt_timeout_ms) else null,
+        .max_retry_after = ms(r.max_retry_after_ms),
+    };
+}
+
 fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
     const client = try app.postgres(anole.pg.Options{
         .url = p.url,
@@ -243,6 +266,8 @@ fn openPostgres(d: *Db, app: *anole.App, p: config_mod.Config.Postgres) !void {
         .tls = tlsOf(p),
         .ping_timeout = ms(p.ping_timeout_ms),
         .timeout = callBound(d),
+        .breaker = breakerOf(d),
+        .retry = retryOf(d),
         .errors = d.config.errors,
         .connect_at_start = p.connect_at_start,
         .application_name = p.application_name,
@@ -278,6 +303,8 @@ fn openRedis(d: *Db, app: *anole.App, r: config_mod.Config.Redis) !void {
         .tls = tlsOf(r),
         .ping_timeout = ms(r.ping_timeout_ms),
         .timeout = callBound(d),
+        .breaker = breakerOf(d),
+        .retry = retryOf(d),
         .errors = d.config.errors,
         .connect_at_start = r.connect_at_start,
         .cache = .{
@@ -305,6 +332,8 @@ fn openMongodb(d: *Db, app: *anole.App, m: config_mod.Config.Mongodb) !void {
         .connect_at_start = m.connect_at_start,
         .ping_timeout = ms(m.ping_timeout_ms),
         .timeout = callBound(d),
+        .breaker = breakerOf(d),
+        .retry = retryOf(d),
         .errors = d.config.errors,
         .cache = .{
             .max_entries = d.config.cache.max_entries,
@@ -470,6 +499,7 @@ fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
         .write = q.flags & abi.DB_F_WRITE != 0,
         .prepare = q.flags & abi.DB_F_NO_PREPARE == 0,
         .coalesce = q.flags & abi.DB_F_COALESCE != 0,
+        .retry = q.flags & abi.DB_F_RETRY != 0,
     };
     // Zero takes the database's bound (`databases[].timeout_ms`).
     if (q.timeout_ms == abi.DB_TIMEOUT_NONE) options.timeout = .max else if (q.timeout_ms > 0) options.timeout = .fromMilliseconds(q.timeout_ms);

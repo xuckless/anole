@@ -343,7 +343,8 @@
       "ANOLE_DB_F_WRITE": 1,
       "ANOLE_DB_F_COALESCE": 2,
       "ANOLE_DB_F_NO_PREPARE": 4,
-      "ANOLE_DB_F_DROP_EMPTY": 8
+      "ANOLE_DB_F_DROP_EMPTY": 8,
+      "ANOLE_DB_F_RETRY": 16
     },
     "db_isolation": {
       "ANOLE_DB_ISOLATION_DEFAULT": 0,
