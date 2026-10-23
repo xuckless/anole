@@ -1047,6 +1047,35 @@ test "parse: the defaults, a full document, and what is refused" {
     }
 }
 
+test "parse: a gRPC service takes middleware; one that fetches keys keeps its calls attached" {
+    if (!features.grpc) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const cfg = try parse(a,
+        \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}],
+        \\  "middleware": [{"rate_limit": {"limit": 5}}]}]}}
+    , &why);
+    try std.testing.expectEqual(@as(usize, 1), cfg.grpc.?.services[0].middleware.len);
+    try std.testing.expect(neverWaits(cfg.grpc.?.services[0].middleware));
+    if (features.auth) {
+        const waits = try parse(a,
+            \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}],
+            \\  "middleware": [{"jwt": {"jwks_url": "https://issuer.example/jwks", "audience": "api"}}]}]}}
+        , &why);
+        try std.testing.expect(!neverWaits(waits.grpc.?.services[0].middleware));
+        // Checked like a route's: both key sources is a config error naming the service.
+        why.end = 0;
+        try std.testing.expectError(error.Config, parse(a,
+            \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}],
+            \\  "middleware": [{"jwt": {"jwks_url": "https://i/jwks", "jwks": {"keys": []}}}]}]}}
+        , &why));
+        try std.testing.expect(std.mem.indexOf(u8, why.buffered(), "grpc.services[0].middleware") != null);
+    }
+}
+
 test "parse: include/anole.schema.json names every field Config has, and no other" {
     const text = @import("anole_capi_schema").text;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
