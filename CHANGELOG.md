@@ -169,6 +169,12 @@ handlers, JSON Lines logs, OpenAPI documents, project templates and the
 
 ### C ABI
 
+- C ABI 0.9: the C ABI is now 0.9 (`ANOLE_ABI_VERSION`; before 1.0 a
+  binding needs the exact version). It adds the `environment` and
+  `deployment` keys and `anole_dotenv_read`; the brokers, NATS (events 64-69)
+  and Kafka (events 80-85), with handle kinds 8 and 9 and `ANOLE_E_BROKER`;
+  `ANOLE_DB_F_RETRY` and `"breaker"`/`"retry"` on databases; the `"log"`
+  callback format keys; `"banner"`; and the console calls with event 132.
 - `anole_dotenv_read`; JSON keys `environment`, `deployment`,
   `error_detail` and `proxy.trusted`.
 - `"log": {"format", "service"}` and `"banner"` in the configuration;

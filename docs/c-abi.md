@@ -1554,6 +1554,17 @@ routes with native ones.
 
 ABI 0.8 only adds `anole_wt_stream_set_priority`; nothing from 0.7 changes.
 
+ABI 0.9 adds the `environment`, `deployment`, `error_detail`, `proxy.trusted`,
+`log`, `banner` and `console` keys, `anole_dotenv_read`, the brokers (NATS
+events 64-69, Kafka events 80-85, handle kinds 8 and 9, `ANOLE_E_BROKER`),
+`ANOLE_DB_F_RETRY` with `breaker` and `retry` on databases, and the console
+calls with event 132. What a 0.8 binding notices: with `environment` unset
+(production) the log callback's `msg` is a whole JSON record (`"log":
+{"format": "text"}` keeps messages) and access lines reach the callback;
+`timeouts.keepalive_ms` defaults to 75 s; `listeners[].address`, `port` and
+`proxy_protocol` default to null (the deployment's default); a malformed
+route pattern is `ANOLE_E_CONFIG` ([migrating.md](migrating.md#c-abi-json-config-abi-09)).
+
 | 0.6 | 0.7 |
 | --- | --- |
 | `anole_respond(r, ...)` | `anole_req_respond(r, ...)` |
@@ -1591,7 +1602,10 @@ send-type call's flags `ANOLE_BODY_BORROW`, so `ANOLE_WT_F_FIN` moved from 1 to
 `anole_handle_release`, the `anole_req_` names and the constant families,
 stable error tokens, `anole_server_open`, `anole_listener_info`, abort
 reasons, the SENT contract and a poll that never drops an event. 0.8 adds
-`anole_wt_stream_set_priority`. Before 1.0
+`anole_wt_stream_set_priority`. 0.9 is the developer-experience release:
+environment and deployment modes with `.env` files, the NATS and Kafka
+brokers, breakers and retries on databases, JSON Lines logs, the banner and
+the live console. Before 1.0
 every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
 The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 

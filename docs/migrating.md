@@ -3,7 +3,8 @@
 ## 0.2 to 0.3
 
 0.3 adds settings, `.env` files, deployment modes, retries and circuit
-breakers, and the NATS and Kafka clients. Nothing you set is changed; the
+breakers, the NATS and Kafka clients, validation and typed handlers, JSON
+Lines logs, OpenAPI documents and a live console. Nothing you set is changed; the
 table lists what reads or behaves differently.
 
 | 0.2 | 0.3 |
@@ -25,6 +26,20 @@ table lists what reads or behaves differently.
 | Access log JSON: `{"ts":1792333306429,"method":...}` | the shared record: `{"time":"2026-10-23T09:41:07.415Z","level":"info","scope":"access","message":"GET /users/7 200",...,"method":...}`; `AccessLog.init(.{})` follows the log format (JSON in production), `.format = .text` keeps text |
 | A route conflict in a test build crashed the test binary | `run`, `listen` and `anole.testing.client` fail with `error.RouteConflict`; `app.routeConflict()` has the message |
 | C ABI: the log callback's `msg` was the message | with `log.format` `"json"` (the default when `environment` is production, which is what an unset `environment` gets) it is a whole JSON record; `"log": {"format": "text"}` keeps messages. Access log lines now reach the callback (scope `access`); `"access_log".format` defaults to `"auto"` |
+
+### C ABI JSON config (ABI 0.9)
+
+The C ABI moves to 0.9; rebuild against the new `anole.h` (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0).
+
+| 0.8 | 0.9 |
+| --- | --- |
+| `listeners[].address`, `port`, `proxy_protocol` defaulted to `"127.0.0.1"`, 8080, `false` | default `null`: the deployment's value (the same three under `standalone`) |
+| `timeouts.keepalive_ms` 60000 | 75000 |
+| `proxy_protocol_from` empty: any peer | empty: `proxy.trusted` when set, else any peer |
+| the log callback's `msg` was the message | a whole JSON record when `log.format` resolves to `"json"` (an unset `environment` is production); `"log": {"format": "text"}` keeps messages; access lines reach the callback (scope `access`) |
+| a malformed route pattern was accepted | `ANOLE_E_CONFIG` naming the route |
+| PostgreSQL, Redis and MongoDB entries tried to connect on every call while the database was down | a breaker is on by default (503, `error_code` `circuit_open`); `"breaker": null` keeps 0.8's behaviour |
+| (none) | `environment`, `deployment`, `error_detail`, `proxy.trusted`, `log` (`format`, `service`), `banner`, `console`, `brokers` (`nats`, `kafka`); `databases[].breaker`, `retry`; `anole_dotenv_read`, `anole_nats_*`, `anole_kafka_*`, `anole_console_*`, `ANOLE_E_BROKER`, `ANOLE_DB_F_RETRY` |
 
 ## 0.1 to 0.2
 

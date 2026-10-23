@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 8;
+pub const version_minor: u32 = 9;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;

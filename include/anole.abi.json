@@ -2,8 +2,8 @@
   "anole_abi_json": 1,
   "abi": {
     "major": 0,
-    "minor": 8,
-    "version": 8
+    "minor": 9,
+    "version": 9
   },
   "endian": "little",
   "record_align": 8,
@@ -2643,6 +2643,9 @@
     "NoTlsListener",
     "NotRunning",
     "OneServerPerProcess",
+    "OpenApiNameClash",
+    "OpenApiNotBuilt",
+    "OpenApiOutOfDate",
     "OutOfMemory",
     "ProxyProtocolNoPeers",
     "ReservedNotZero",
