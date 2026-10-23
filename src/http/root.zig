@@ -26,6 +26,10 @@ pub const Address = dusty.Address;
 pub const Listener = dusty.Listener;
 /// A peer range for `Listener.proxy_protocol_from` ("10.0.0.0/8").
 pub const ProxyNetwork = dusty.ProxyNetwork;
+/// The named groups of `proxy.trusted`: `loopback`, `private`, `link_local`.
+pub const proxy_networks = dusty.proxy_networks;
+/// Whether an address is public (not loopback, private, link-local, CGNAT, unspecified or multicast).
+pub const isPublicAddress = dusty.isPublicAddress;
 /// The radix-tree router with `:param` and `*wildcard` segments;
 /// `app.router` is one.
 pub const Router = dusty.Router;

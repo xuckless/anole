@@ -99,9 +99,90 @@ fn forwardedRemoteAddress(headers: *const Headers, trusted_proxy_hops: usize) ?s
     var parsing = ForwardedForIterator.init(headers);
     while (parsing.next()) |text| : (index += 1) {
         if (index != wanted) continue;
-        return std.Io.net.IpAddress.parse(text, 0) catch unknown_client;
+        return parseForwardedEntry(text) orelse unknown_client;
     }
     unreachable;
+}
+
+/// An X-Forwarded-For entry as an address: "203.0.113.9", with a port
+/// ("203.0.113.9:4711"), IPv6 ("2001:db8::1", "[2001:db8::1]:443"). Null
+/// for anything else ("unknown", "_hidden", empty). The port is dropped.
+fn parseForwardedEntry(raw: []const u8) ?std.Io.net.IpAddress {
+    const text = std.mem.trim(u8, raw, " \t");
+    if (text.len == 0) return null;
+    if (text[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse return null;
+        return std.Io.net.IpAddress.parse(text[1..close], 0) catch null;
+    }
+    if (std.mem.indexOfScalar(u8, text, ':')) |colon| {
+        // Exactly one colon after dots: IPv4 with a port.
+        if (std.mem.indexOfScalarPos(u8, text, colon + 1, ':') == null and std.mem.indexOfScalar(u8, text[0..colon], '.') != null) {
+            return std.Io.net.IpAddress.parse(text[0..colon], 0) catch null;
+        }
+    }
+    return std.Io.net.IpAddress.parse(text, 0) catch null;
+}
+
+/// How many of the rightmost X-Forwarded-For entries the walk keeps.
+const max_forwarded_entries = 32;
+
+/// The client behind trusted proxies: the rightmost entry that is not in
+/// `nets`. Null when there is no entry at all; the unspecified address when
+/// an entry on the way is no address (or the chain is longer than the walk
+/// keeps and trusted throughout).
+fn rightmostUntrusted(headers: *const Headers, nets: []const proxy_protocol.Network) ?std.Io.net.IpAddress {
+    var ring: [max_forwarded_entries][]const u8 = undefined;
+    var count: usize = 0;
+    var it = ForwardedForIterator.init(headers);
+    while (it.next()) |entry| : (count += 1) ring[count % max_forwarded_entries] = entry;
+    if (count == 0) return null;
+    const kept = @min(count, max_forwarded_entries);
+    var last: ?std.Io.net.IpAddress = null;
+    var i: usize = 0;
+    while (i < kept) : (i += 1) {
+        const text = ring[(count - 1 - i) % max_forwarded_entries];
+        const addr = parseForwardedEntry(text) orelse return unknown_client;
+        if (!proxy_protocol.containsAny(nets, addr)) return addr;
+        last = addr;
+    }
+    return if (count <= max_forwarded_entries) last else unknown_client;
+}
+
+var warned_untrusted: std.atomic.Value(bool) = .init(false);
+
+fn peerText(buf: []u8, peer: std.Io.net.IpAddress) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{f}", .{peer}) catch return "a peer";
+    var t = w.buffered();
+    if (std.mem.endsWith(u8, t, ":0")) t = t[0 .. t.len - 2];
+    if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') t = t[1 .. t.len - 1];
+    return t;
+}
+
+/// Logs the one warning about a peer outside `proxy.trusted`; true when this
+/// call logged it.
+fn warnUntrustedPeer(peer: std.Io.net.IpAddress) bool {
+    if (warned_untrusted.load(.monotonic) or warned_untrusted.swap(true, .monotonic)) return false;
+    var buf: [64]u8 = undefined;
+    const text = peerText(&buf, peer);
+    if (proxy_protocol.isPublic(peer)) {
+        log.warn("{s} reached this server directly, not through a trusted proxy: its X-Forwarded-* headers are ignored. Firewall this port, or add your proxy's address to proxy.trusted (ANOLE_PROXY_TRUSTED)", .{text});
+    } else {
+        log.warn("{s} is not in proxy.trusted: its X-Forwarded-* headers are ignored. If it is your proxy, add it to proxy.trusted (ANOLE_PROXY_TRUSTED)", .{text});
+    }
+    return true;
+}
+
+/// The same warning flag, for a connection closed before its PROXY header.
+fn warnUntrustedPeerProxy(peer: std.Io.net.IpAddress) bool {
+    if (warned_untrusted.load(.monotonic) or warned_untrusted.swap(true, .monotonic)) return false;
+    var buf: [64]u8 = undefined;
+    log.warn("{s} is not in proxy.trusted, so its connection was closed before a PROXY header was read. If it is your load balancer, add it to proxy.trusted (ANOLE_PROXY_TRUSTED)", .{peerText(&buf, peer)});
+    return true;
+}
+
+pub fn resetUntrustedWarningForTest() void {
+    warned_untrusted.store(false, .monotonic);
 }
 
 /// What `remote_address` is when a trusted proxy's entry names no address.
@@ -133,9 +214,17 @@ const Forwarding = struct {
     hops: usize = 0,
     proto: bool = true,
     host: bool = false,
+    trusted: ?[]const proxy_protocol.Network = null,
+    warn: bool = false,
 
     fn of(config: *const ServerConfig) Forwarding {
-        return .{ .hops = config.trusted_proxy_hops, .proto = config.trust_forwarded_proto, .host = config.trust_forwarded_host };
+        return .{
+            .hops = config.trusted_proxy_hops,
+            .proto = config.trust_forwarded_proto,
+            .host = config.trust_forwarded_host,
+            .trusted = config.trusted_proxies,
+            .warn = config.warn_untrusted_peer,
+        };
     }
 };
 
@@ -145,9 +234,22 @@ const Forwarding = struct {
 /// (`X-Forwarded-Host`, only when turned on). With no trusted hops, only
 /// the peer address applies.
 fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, forwarding: Forwarding) void {
-    request.remote_address = remoteAddress(peer, &request.headers, forwarding.hops);
     request.forwarded_host = null;
-    if (forwarding.hops == 0) return;
+    if (forwarding.trusted) |nets| {
+        if (!proxy_protocol.containsAny(nets, peer)) {
+            request.remote_address = unmapIpv4(peer);
+            if (forwarding.warn) _ = warnUntrustedPeer(peer);
+            return;
+        }
+        const client = if (forwarding.hops > 0)
+            forwardedRemoteAddress(&request.headers, forwarding.hops)
+        else
+            rightmostUntrusted(&request.headers, nets);
+        request.remote_address = unmapIpv4(client orelse peer);
+    } else {
+        request.remote_address = remoteAddress(peer, &request.headers, forwarding.hops);
+        if (forwarding.hops == 0) return;
+    }
     if (forwarding.proto) if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
         if (std.ascii.eqlIgnoreCase(proto, "https")) request.secure = true;
         if (std.ascii.eqlIgnoreCase(proto, "http")) request.secure = false;
@@ -2142,8 +2244,10 @@ pub fn Server(comptime Ctx: type) type {
             // The PROXY protocol header comes first, ahead of TLS.
             var proxied: proxy_protocol.Header = .{};
             if (l.config.proxy_protocol) {
-                if (l.config.address == .ip and !proxy_protocol.trustedPeer(l.config.proxy_protocol_from, stream.socket.address)) {
-                    log.info("PROXY protocol: connection from {f} refused, not a trusted proxy", .{stream.socket.address});
+                const from = if (l.config.proxy_protocol_from.len > 0) l.config.proxy_protocol_from else self.config.trusted_proxies orelse &.{};
+                if (l.config.address == .ip and !proxy_protocol.trustedPeer(from, stream.socket.address)) {
+                    if (!(self.config.warn_untrusted_peer and warnUntrustedPeerProxy(stream.socket.address)))
+                        log.info("PROXY protocol: connection from {f} refused, not a trusted proxy", .{stream.socket.address});
                     return .close;
                 }
                 defer timer.clear(self.io);
@@ -2384,12 +2488,22 @@ pub fn Server(comptime Ctx: type) type {
             res._brotli_quality = self.config.response.brotli_quality;
             res._error_format = self.config.errors;
             res._write_timeout = self.config.timeout.write;
+            res._error_detail = self.config.error_detail;
         }
 
         /// The client address for a request from `peer` with `headers`,
         /// through `X-Forwarded-For` as far as `trusted_proxy_hops` allows.
         pub fn clientAddress(self: *const Self, peer: std.Io.net.IpAddress, headers: *const Headers) std.Io.net.IpAddress {
-            return remoteAddress(peer, headers, self.config.trusted_proxy_hops);
+            const hops = self.config.trusted_proxy_hops;
+            if (self.config.trusted_proxies) |nets| {
+                if (!proxy_protocol.containsAny(nets, peer)) {
+                    if (self.config.warn_untrusted_peer) _ = warnUntrustedPeer(peer);
+                    return unmapIpv4(peer);
+                }
+                const client = if (hops > 0) forwardedRemoteAddress(headers, hops) else rightmostUntrusted(headers, nets);
+                return unmapIpv4(client orelse peer);
+            }
+            return remoteAddress(peer, headers, hops);
         }
 
         /// `remote_address`, `secure` and `forwarded_host` for a request
@@ -3169,4 +3283,94 @@ test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
         // never gets a handler, and must not hold the connection open.
         preface ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++ "\x00\x00\x04\x01\x01\x00\x00\x00\x01" ++ "\x82\x86\x84\x41",
     });
+}
+
+fn xff(headers: *Headers, value: []const u8) !void {
+    _ = headers.remove("X-Forwarded-For");
+    try headers.add("X-Forwarded-For", value);
+}
+
+test "forwarded: rightmost untrusted" {
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    const nets = proxy_protocol.networks.private ++ proxy_protocol.networks.loopback;
+    const Case = struct { header: []const u8, want: [4]u8 };
+    for ([_]Case{
+        .{ .header = "198.51.100.1, 10.0.0.2", .want = .{ 198, 51, 100, 1 } },
+        .{ .header = "198.51.100.1, 203.0.113.5, 10.0.0.2", .want = .{ 203, 0, 113, 5 } },
+        .{ .header = "10.0.0.5, 10.0.0.2", .want = .{ 10, 0, 0, 5 } },
+        .{ .header = "garbage, 203.0.113.5, 10.0.0.2", .want = .{ 203, 0, 113, 5 } },
+        .{ .header = "203.0.113.5, garbage", .want = .{ 0, 0, 0, 0 } },
+        .{ .header = "198.51.100.1:4711", .want = .{ 198, 51, 100, 1 } },
+    }) |c| {
+        try xff(&headers, c.header);
+        const got = rightmostUntrusted(&headers, &nets).?;
+        try std.testing.expectEqual(c.want, got.ip4.bytes);
+        try std.testing.expectEqual(@as(u16, 0), got.ip4.port);
+    }
+    try xff(&headers, "[2001:db8::1]:443");
+    try std.testing.expect(rightmostUntrusted(&headers, &nets).? == .ip6);
+    // 33 trusted entries name no client we can see.
+    var long: [33 * 10]u8 = undefined;
+    var n: usize = 0;
+    for (0..33) |_| {
+        @memcpy(long[n..][0..10], "10.0.0.1, ");
+        n += 10;
+    }
+    try xff(&headers, long[0 .. n - 2]);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, rightmostUntrusted(&headers, &nets).?.ip4.bytes);
+    // Two header lines read as one list.
+    _ = headers.remove("X-Forwarded-For");
+    try headers.add("X-Forwarded-For", "198.51.100.1");
+    try headers.add("X-Forwarded-For", "10.0.0.2");
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 1 }, rightmostUntrusted(&headers, &nets).?.ip4.bytes);
+    // No header at all.
+    _ = headers.remove("X-Forwarded-For");
+    try std.testing.expect(rightmostUntrusted(&headers, &nets) == null);
+}
+
+test "forwarded: an untrusted peer's headers are ignored, with one warning" {
+    resetUntrustedWarningForTest();
+    defer resetUntrustedWarningForTest();
+    const nets = proxy_protocol.networks.private;
+    const stranger = try std.Io.net.IpAddress.parse("203.0.113.9", 0);
+    try std.testing.expect(!proxy_protocol.containsAny(&nets, stranger));
+    try std.testing.expect(warnUntrustedPeer(stranger));
+    try std.testing.expect(!warnUntrustedPeer(stranger));
+    try std.testing.expect(!warnUntrustedPeerProxy(stranger));
+    // An IPv4-mapped peer of a proxy on the private network is trusted.
+    try std.testing.expect(proxy_protocol.containsAny(&nets, try std.Io.net.IpAddress.parse("::ffff:10.0.0.2", 0)));
+}
+
+test "forwarded: 0.2 hops, entries with a port" {
+    var headers = try Headers.init(std.testing.allocator, 2);
+    defer headers.deinit(std.testing.allocator);
+    try xff(&headers, "203.0.113.9:4711, 198.51.100.2:80");
+    const peer = try std.Io.net.IpAddress.parse("127.0.0.1", 1);
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 2 }, remoteAddress(peer, &headers, 1).ip4.bytes);
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, remoteAddress(peer, &headers, 2).ip4.bytes);
+}
+
+test "proxy protocol: the gate falls back to proxy.trusted" {
+    const trusted = proxy_protocol.networks.private;
+    const own = [_]proxy_protocol.Network{try .parse("192.0.2.0/24")};
+    const inside = try std.Io.net.IpAddress.parse("10.1.2.3", 0);
+    const outside = try std.Io.net.IpAddress.parse("203.0.113.9", 0);
+    try std.testing.expect(proxy_protocol.trustedPeer(&trusted, inside));
+    try std.testing.expect(!proxy_protocol.trustedPeer(&trusted, outside));
+    try std.testing.expect(!proxy_protocol.trustedPeer(&own, inside));
+}
+
+test "fuzz: parseForwardedEntry and rightmostUntrusted" {
+    const fuzz = @import("fuzz.zig");
+    try fuzz.bytes(struct {
+        fn check(input: []const u8) anyerror!void {
+            _ = parseForwardedEntry(input);
+            var headers = try Headers.init(std.testing.allocator, 2);
+            defer headers.deinit(std.testing.allocator);
+            try headers.add("X-Forwarded-For", input);
+            const nets = proxy_protocol.networks.private;
+            _ = rightmostUntrusted(&headers, &nets);
+        }
+    }.check, &.{ "198.51.100.1, 10.0.0.2", "[2001:db8::1]:443, ::1", "1.2.3.4:5, , x", "unknown" });
 }
